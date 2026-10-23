@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(nrvk_small LANGUAGES CXX)
+project(nrvk_model LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(NR_MODEL_DIR "" CACHE PATH "Output directory of extract_model.py and build_assets.py")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract and verify the supported NR Small model from a user-supplied DLL.
+"""Extract and verify the supported NR model from a user-supplied DLL.
 
 Offline only. The DLL is parsed as data, never loaded or executed. No DLL,
 CUDA kernels or model bytes are downloaded or distributed by this repository.
@@ -18,8 +18,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_TOOLS = ROOT / "third_party" / "dlssnr_amd_model_tools"
-DLL_SHA256 = "2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f"
-RESOURCE = "WEIGHTS_CC_SMALL_FP8"
+PROFILES = json.loads((ROOT / "tools/model_profiles.json").read_text(encoding="utf-8"))
 
 
 def file_hash(path: Path) -> str:
@@ -35,26 +34,29 @@ def run_tool(name: str, *arguments: object) -> None:
                     *(str(x) for x in arguments)], check=True)
 
 
-def extract(dll: Path, output: Path) -> dict:
+def extract(dll: Path, output: Path, requested_profile: str = "auto") -> dict:
     sys.path.insert(0, str(MODEL_TOOLS))
     from inspect_nr import PE, checked, load_input, parse_weights
 
     data = load_input(dll)
     digest = hashlib.sha256(data).hexdigest()
-    if digest != DLL_SHA256:
-        raise ValueError(f"Unsupported model DLL: SHA256 {digest}. "
-                         "This release supports the pinned 310.9.16.0 DLL only.")
+    matching = [key for key, value in PROFILES.items() if value["dll_sha256"] == digest]
+    if not matching or requested_profile not in ("auto", matching[0]):
+        raise ValueError(f"Unsupported model DLL/profile: SHA256 {digest}; supported: Small 310.9.16.0, VK102 310.8.0.0")
+    profile_key = matching[0]
+    profile = PROFILES[profile_key]
+    resource_name = profile["resource"]
     pe = PE(data)
-    resources = [x for x in pe.resources() if RESOURCE in x["path"]]
+    resources = [x for x in pe.resources() if resource_name in x["path"]]
     if len(resources) != 1:
-        raise ValueError(f"Expected one {RESOURCE} resource, found {len(resources)}")
+        raise ValueError(f"Expected one {resource_name} resource, found {len(resources)}")
     resource = resources[0]
     weights = checked(data, resource["file_offset"], resource["size"])
     records = parse_weights(weights)
     blocks = sorted({int(m.group(1)) for r in records
                      if (m := re.match(r"block(\d+)\.", r["name"]))})
-    if len(records) != 77 or blocks != list(range(31)):
-        raise ValueError("Small model record/block layout differs from this release")
+    if len(records) != profile["records"] or blocks != list(range(profile["blocks"])):
+        raise ValueError("Model record/block layout differs from this release")
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"Output must be a new or empty directory: {output}")
 
@@ -77,7 +79,7 @@ def extract(dll: Path, output: Path) -> dict:
     }, indent=2) + "\n", encoding="utf-8")
     graph = extracted / "graph"
     graph.mkdir()
-    shutil.copyfile(MODEL_TOOLS / "descriptor-small.json", graph / "descriptor.json")
+    shutil.copyfile(MODEL_TOOLS / profile["descriptor"], graph / "descriptor.json")
     # Parse only the model resource: do not emit the input DLL or embedded CUDA code.
     del weights, data
 
@@ -89,11 +91,11 @@ def extract(dll: Path, output: Path) -> dict:
              "--output", extracted / "unpacked-vit")
     run_tool("unpack_preblock.py", target / "block0.layer0.layer.bin",
              extracted / "unpacked-preblock")
-    run_tool("unpack_postblock.py", target / "block30.layer0.layer.bin",
+    run_tool("unpack_postblock.py", target / f"block{profile['post_block']}.layer0.layer.bin",
              extracted / "unpacked-postblock")
 
     checksums = {}
-    for line in (MODEL_TOOLS / "model-files-small.sha256").read_text(encoding="utf-8").splitlines():
+    for line in (MODEL_TOOLS / profile["tensor_hashes"]).read_text(encoding="utf-8").splitlines():
         if line.strip():
             expected, name = line.split(None, 1)
             name = name.strip()
@@ -101,15 +103,15 @@ def extract(dll: Path, output: Path) -> dict:
             if actual != expected:
                 raise ValueError(f"Extracted tensor hash mismatch: {name}")
             checksums[name] = actual
-    if len(checksums) != 255:
-        raise ValueError(f"Expected 255 checked files, found {len(checksums)}")
-    packed = output / "dlssnr-small.bin"
+    if len(checksums) != profile["tensor_files"]:
+        raise ValueError(f"Expected {profile['tensor_files']} checked files, found {len(checksums)}")
+    packed = output / profile["packed_model"]
     run_tool("pack_model.py", "--root", extracted,
-             "--list", MODEL_TOOLS / "model-files-small.txt", "--out", packed,
-             "--verify", MODEL_TOOLS / "model-files-small.sha256")
+             "--list", MODEL_TOOLS / profile["tensor_list"], "--out", packed,
+             "--verify", MODEL_TOOLS / profile["tensor_hashes"])
     receipt = {
-        "model": "310.9.16.0 Small", "dll_sha256": digest,
-        "resource": RESOURCE, "blocks": 31, "records": len(records),
+        "model": profile["name"], "profile": profile_key, "dll_sha256": digest,
+        "resource": resource_name, "blocks": profile["blocks"], "records": len(records),
         "verified_tensor_files": len(checksums), "tensor_sha256": checksums,
         "packed_model": {"file": packed.name, "bytes": packed.stat().st_size,
                          "sha256": file_hash(packed)},
@@ -123,6 +125,7 @@ def extract(dll: Path, output: Path) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", choices=["auto", *PROFILES], default="auto")
     parser.add_argument("--dll", type=Path, required=True,
                         help="Local nvngx_dlssnr.dll or ZIP containing it")
     parser.add_argument("--out", type=Path, required=True,
@@ -136,17 +139,18 @@ def main() -> int:
     if output.exists() and any(output.iterdir()):
         parser.error("--out must be a new or empty directory")
     try:
-        receipt = extract(args.dll.resolve(), output if args.raw_only else output / "model")
+        receipt = extract(args.dll.resolve(), output if args.raw_only else output / "model", args.profile)
         if not args.raw_only:
             subprocess.run([
                 sys.executable, "-B", str(Path(__file__).with_name("pack_b580_weights.py")),
+                "--profile", receipt["profile"],
                 "--extracted", str(output / "model" / "extracted"),
                 "--out", str(output / "assets" / "cold"),
                 "--manifest", str(output / "manifest"),
             ], check=True)
             cold = json.loads((output / "manifest" / "cold_resources_index.json").read_text(encoding="utf-8"))
             summary = {
-                "status": "MODEL_WEIGHTS_PREPARED", "verified_tensors": receipt["verified_tensor_files"],
+                "status": "MODEL_WEIGHTS_PREPARED", "profile": receipt["profile"], "verified_tensors": receipt["verified_tensor_files"],
                 "dll_sha256": receipt["dll_sha256"], "cold_resources": len(cold),
                 "cold_bytes": sum(x["bytes"] for x in cold.values()),
                 "generated_weights_are_local_only": True,

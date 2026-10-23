@@ -7,4 +7,4 @@
 - Khronos Vulkan headers and glslang are external development dependencies with their own licenses.
 - NVIDIA's DLL/weights/SDK redistributables, Intel/AMD upscaler libraries and game files are excluded. Users obtain them separately under their applicable terms.
 
-No vendor endorsement or model redistribution right is asserted. No game sample, capture, test output, native binary or compiled shader belongs in the source publication.
+No vendor endorsement or model redistribution right is asserted. The seven user-supplied screenshots in `docs/images/` are published as documentation illustrations, with game and third-party visual rights retained by their respective owners. Runtime fixtures, test outputs, model data, native binaries and compiled shaders are excluded.

@@ -1,4 +1,4 @@
-"""Compile the frozen Small shaders and prepare relocatable game assets."""
+"""Compile the frozen Small/VK102 shaders and prepare relocatable game assets."""
 from pathlib import Path
 import argparse
 import hashlib
@@ -54,7 +54,14 @@ def prepare(model, compiler):
     model = model.resolve()
     manifest = model / 'manifest'
     cold = json.loads((manifest / 'cold_resources_index.json').read_text(encoding='utf-8'))
-    recipes = json.loads((ROOT / 'source/network/recipes.json').read_text(encoding='utf-8'))['shaders']
+    profile_key = json.loads((model / 'model/extraction-receipt.json').read_text(encoding='utf-8'))['profile']
+    profile = json.loads((ROOT / 'tools/model_profiles.json').read_text(encoding='utf-8'))[profile_key]
+    network = ROOT / profile['network_dir']
+    recipes = json.loads((network / 'recipes.json').read_text(encoding='utf-8'))['shaders']
+    if (network / 'cold-hashes.json').is_file():
+        expected = json.loads((network / 'cold-hashes.json').read_text(encoding='utf-8'))
+        if set(expected) != set(cold) or any(cold[k]['sha256'] != v['sha256'] or cold[k]['bytes'] != v['bytes'] for k, v in expected.items()):
+            raise ValueError('Cold packing differs from the frozen model profile')
     spv = model / 'assets/spv'
     spv.mkdir(parents=True, exist_ok=True)
     shaders = {}
@@ -70,7 +77,7 @@ def prepare(model, compiler):
         record = compile_shader(compiler, {'source': 'source/vulkan/' + filename.replace('.spv', '.comp')}, output)
         record['path'] = '../assets/spv/' + filename
         bridge[name] = record
-    template = (ROOT / 'source/network/runtime.template.txt').read_text(encoding='utf-8')
+    template = (network / 'runtime.template.txt').read_text(encoding='utf-8')
     for name, record in cold.items():
         file = Path(record['path'])
         if not file.is_file():
@@ -85,8 +92,9 @@ def prepare(model, compiler):
     runtime = manifest / 'port_network_runtime.txt'
     runtime.write_text(template, encoding='utf-8', newline='\n')
     data = {
-        'schema': 'intel-dlss5nr-small-game-1', 'model': '310.9.16.0 Small',
-        'rows': 76, 'buffers': 223, 'passes': 118, 'outputs': 1, 'history_links': 2,
+        'schema': 'intel-dlss5nr-game-1', 'model': profile['name'],
+        'profile': profile_key, 'backend_key': profile['backend_key'],
+        'rows': profile['rows'], 'buffers': profile['buffers'], 'passes': profile['passes'], 'outputs': 1, 'history_links': 2,
         'input': [1280, 720], 'network_shaders': shaders, 'bridge_shaders': bridge,
         'cold': {name: {'path': '../assets/cold/' + Path(v['path']).name,
                         'bytes': v['bytes'], 'sha256': v['sha256']} for name, v in cold.items()},
@@ -95,10 +103,10 @@ def prepare(model, compiler):
     (manifest / 'port_network_manifest.json').write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
     generated = model / 'generated'
     generated.mkdir(exist_ok=True)
-    generated.joinpath('port_network_bridge_backend_small_identity.inc').write_text(
-        'static constexpr size_t kPlanRows=76,kPlanBuffers=223,kPlanPasses=118,kPlanOutputs=1,kPlanHistory=2;\n'
+    generated.joinpath('port_network_bridge_backend_model_identity.inc').write_text(
+        f'static constexpr size_t kPlanRows={profile["rows"]},kPlanBuffers={profile["buffers"]},kPlanPasses={profile["passes"]},kPlanOutputs=1,kPlanHistory=2;\n'
         'static constexpr const char* kPreImageName="ioport_0_ioport_images";\n'
-        'static constexpr const char* kPostImageName="ioport_30_ioport_images";\n', encoding='utf-8')
+        f'static constexpr const char* kPostImageName="ioport_{profile["post_block"]}_ioport_images";\n', encoding='utf-8')
     manifest_sha = digest((manifest / 'port_network_manifest.json').read_bytes())
     runtime_sha = digest(runtime.read_bytes())
     lines = ['struct FrozenFile { const char* path; const char* sha; };',
@@ -113,7 +121,7 @@ def prepare(model, compiler):
         lines.append(f'static constexpr const char* {name}_spv=' + json.dumps(record['path']) + ';')
     generated.joinpath('port_network_bridge_backend_frozen.inc').write_text('\n'.join(lines) + '\n', encoding='utf-8')
     generated.joinpath('nrvk_build_identity.inc').write_text(
-        'static constexpr const char* kFrozenBuildId="intel-dlss5nr-small-source";\n'
+        f'static constexpr const char* kFrozenBuildId="intel-dlss5nr-{profile_key}-source";\n'
         f'static constexpr const char* kFrozenManifestSha="{manifest_sha}";\n'
         f'static constexpr const char* kFrozenRuntimeSha="{runtime_sha}";\n', encoding='utf-8')
     print(json.dumps({'status': 'GAME_ASSETS_PREPARED', 'network_shaders': len(shaders),

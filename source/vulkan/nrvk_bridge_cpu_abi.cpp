@@ -15,6 +15,6 @@ int main(int argc,char**argv){
   int rc=probe(argv[3]);
   if(rc!=0){std::printf("FAIL backend probe rc=%d err=%s\n",rc,last());return 1;}
   FreeLibrary(b);FreeLibrary(c);
-  std::printf("NRVK_CPU_ABI_PASS exports_ok idle_shutdown_ok null_attach_guard_ok small_plan_probe_ok\n");
+  std::printf("NRVK_CPU_ABI_PASS exports_ok idle_shutdown_ok null_attach_guard_ok model_plan_probe_ok\n");
   return 0;
 }

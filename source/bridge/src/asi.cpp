@@ -310,7 +310,7 @@ bool parse(Values& v,std::string& text) {
     v.skin_structure=number("skin_structure",v.skin_structure);
     v.display_strength=number("display_strength",v.display_strength);
     const std::string backend=lookup(text,"NR","backend");
-    v.backend=backend=="102"?"102":"small";
+    v.backend=backend.empty()?boot_key:(backend=="102"?"102":"small");
     return true;
 }
 void log_values(const char* what,const Values& v) {
@@ -1167,6 +1167,12 @@ static void load_bridge_config() {
                     value=panel::lookup(text,"bridge","panel_state");
                     if(!value.empty()) strcpy_s(g_panel_state,value.c_str());
                     panel::backend_manifest=g_manifest_dir;
+                    value=panel::lookup(text,"bridge","backend");
+                    if(value=="small"||value=="102") {
+                        panel::boot_key=value;
+                        panel::backend_key=value;
+                        panel::applied.backend=value;
+                    }
                     value=panel::lookup(text,"bridge","tail_profile");
                     if(!value.empty()) g_tail_profile=atoi(value.c_str());
                 }

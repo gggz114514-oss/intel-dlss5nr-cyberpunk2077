@@ -10,6 +10,9 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 ALLOWED = {'.md', '.txt', '.json', '.py', '.ps1', '.cmd', '.cpp', '.h', '.comp', '.glsl', '.hlsl', '.inc', '.sha256', '.yml'}
 SPECIAL = {'.gitignore', '.gitattributes', 'LICENSE', 'CMakeLists.txt'}
+SCREENSHOTS = {'docs/images/' + name + '.png' for name in
+               ('nr-off', 'vk102-classic', 'vk102-natural', 'vk102-cinematic',
+                'small-classic', 'small-natural', 'small-cinematic')}
 
 
 def check(output, archive):
@@ -17,13 +20,18 @@ def check(output, archive):
     rows = []
     for name in names:
         path = ROOT/name
-        if path.suffix.lower() not in ALLOWED and path.name not in SPECIAL:
+        if path.suffix.lower() not in ALLOWED and path.name not in SPECIAL and name not in SCREENSHOTS:
             raise ValueError('Not an allowed source file: '+name)
         if name.startswith('.github/') and name != '.github/workflows/publish-experimental.yml':
             raise ValueError('Unexpected publication workflow: '+name)
-        if name.split('/')[0] not in ('source', 'tools', 'panel', 'third_party', '.github') and '/' in name:
+        if name.split('/')[0] not in ('source', 'tools', 'panel', 'third_party', '.github', 'docs') and '/' in name:
             raise ValueError('Unexpected top-level folder: '+name)
         data = path.read_bytes()
+        if name in SCREENSHOTS:
+            if not data.startswith(b'\x89PNG\r\n\x1a\n'):
+                raise ValueError('Invalid documentation screenshot: '+name)
+            rows.append({'path': name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+            continue
         text = data.decode('utf-8-sig')
         if '\0' in text:
             raise ValueError('Binary payload in source: '+name)
@@ -32,7 +40,8 @@ def check(output, archive):
         if re.search(r'github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----', text):
             raise ValueError('Credential-like content in publication: '+name)
         rows.append({'path': name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
-    result = {'source_only': True, 'files': len(rows), 'bytes': sum(x['bytes'] for x in rows),
+    result = {'source_and_documentation_only': True, 'files': len(rows), 'bytes': sum(x['bytes'] for x in rows),
+              'documentation_screenshots': sum(x['path'] in SCREENSHOTS for x in rows),
               'weights': 0, 'compiled_shaders': 0, 'native_binaries': 0,
               'game_samples': 0, 'uploaded': False, 'entries': rows}
     output.write_text(json.dumps(result, indent=2)+'\n', encoding='utf-8')

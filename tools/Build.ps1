@@ -5,14 +5,21 @@ param(
     [Parameter(Mandatory=$true)][string]$VulkanInclude,
     [string]$Python = "python",
     [string]$CMake = "cmake",
-    [string]$Output = "local/small"
+    [ValidateSet("small", "vk102")][string]$Profile = "small",
+    [string]$Output = "",
+    [string]$PackageOutput = ""
 )
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Push-Location -LiteralPath $repoRoot
 try {
+    if (!(Test-Path -LiteralPath (Join-Path $VulkanInclude "vulkan/vulkan.h"))) {
+        throw "-VulkanInclude must name the include directory containing vulkan/vulkan.h"
+    }
+    if (!$Output) { $Output = "local/$Profile" }
+    if (!$PackageOutput) { $PackageOutput = if ($Profile -eq "small") { "local/game-package" } else { "local/game-package-vk102" } }
     $modelPath = [IO.Path]::GetFullPath((Join-Path $repoRoot $Output))
-    & $Python -B tools/extract_model.py --dll $Dll --out $modelPath
+    & $Python -B tools/extract_model.py --profile $Profile --dll $Dll --out $modelPath
     if ($LASTEXITCODE) { throw "Model extraction failed" }
     & $Python -B tools/build_assets.py --model $modelPath --glslang $Glslang
     if ($LASTEXITCODE) { throw "Shader/plan preparation failed" }
@@ -29,9 +36,9 @@ try {
     if ($LASTEXITCODE) { throw "ASI build failed" }
     & $ctestPath --test-dir build/bridge -C Release --output-on-failure
     if ($LASTEXITCODE) { throw "Bridge CPU tests failed" }
-    & $Python -B tools/test_panel.py --out build/panel-test
+    & $Python -B tools/test_panel.py --out "build/panel-test-$Profile" --backend $(if ($Profile -eq "small") { "small" } else { "102" })
     if ($LASTEXITCODE) { throw "Panel test failed" }
-    & $Python -B tools/assemble_package.py --model $modelPath --out local/game-package
+    & $Python -B tools/assemble_package.py --model $modelPath --out $PackageOutput
     if ($LASTEXITCODE) { throw "Game package assembly failed" }
-    Write-Host "Built local/game-package. Read INSTALL.md before copying game-files. No game files were changed."
+    Write-Host "Built $PackageOutput. Read INSTALL.md before copying game-files. No game files were changed."
 } finally { Pop-Location }

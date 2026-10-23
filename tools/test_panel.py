@@ -12,10 +12,10 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run(output):
+def run(output, backend):
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    config = {'ini': str(output/'nr_panel.ini'), 'state': str(output/'panel_state.json'),
+    config = {'backend': backend, 'ini': str(output/'nr_panel.ini'), 'state': str(output/'panel_state.json'),
               'manifest': str(output/'manifest'), 'optiscaler_ini': str(output/'OptiScaler.ini')}
     cfg = output/'panel-config.json'
     cfg.write_text(json.dumps(config), encoding='utf-8')
@@ -30,11 +30,17 @@ def run(output):
     thread.start()
     base = 'http://127.0.0.1:' + str(server.server_port)
     try:
+        other = '102' if backend == 'small' else 'small'
         with urllib.request.urlopen(base+'/') as response:
-            assert '<option value=102>' not in response.read().decode()
-        panel.VK102 = str(output/'vk102/manifest')
+            page = response.read().decode()
+            assert f'<option value={other}>' not in page
+            assert f'<option value={backend}>' in page
+        assert panel.load()['backend'] == backend
+        panel.BACKENDS[other] = str(output/'other/manifest')
         with urllib.request.urlopen(base+'/') as response:
-            assert '<option value=102>VK102 310.8</option>' in response.read().decode()
+            page = response.read().decode()
+            assert '<option value=102>VK102 310.8</option>' in page
+            assert '<option value=small>Small 310.9.16</option>' in page
         with urllib.request.urlopen(base+'/status') as response:
             status = json.load(response)
             assert status['state']['processed'] == 7
@@ -56,7 +62,7 @@ def run(output):
                 assert json.load(response)['backend'] == backend
             controls = configparser.ConfigParser()
             controls.read(config['ini'], encoding='utf-8')
-            assert controls['Backends']['102'] == panel.VK102
+            assert controls['Backends'][other] == panel.BACKENDS[other]
             assert panel.load()['style'] == 2 and panel.load()['intensity'] == 0.7
         assert Path(config['ini']).is_file()
         assert json.loads(Path(config['state']).read_text())['processed'] == 7
@@ -73,4 +79,6 @@ def run(output):
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out', type=Path, required=True)
-    run(p.parse_args().out)
+    p.add_argument('--backend', choices=['small', '102'], default='small')
+    args = p.parse_args()
+    run(args.out, args.backend)

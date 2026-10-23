@@ -15,7 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include "port_network_bridge_backend_small_identity.inc"
+#include "port_network_bridge_backend_model_identity.inc"
 #include "port_network_bridge_backend_plan.inc"
 #include "port_network_bridge_backend_frozen.inc"
 
@@ -76,7 +76,7 @@ static Plan checked_plan(const char* directory) {
     for(const auto& f:frozen_files)if(sha256(dir/f.path)!=f.sha)throw std::runtime_error(std::string("frozen file hash: ")+f.path);
     Plan p=read_plan((dir/"port_network_runtime.txt").string());
     if(p.passes.size()!=kPlanPasses || p.outputs.size()!=kPlanOutputs || p.history.size()!=kPlanHistory || p.buffers.size()!=kPlanBuffers)
-        throw std::runtime_error("expected 76 rows/118 passes/223 buffers/2 history links for Small");
+        throw std::runtime_error("prepared plan dimensions differ from this build profile");
     return p;
 }
 extern "C" int nrvk_backend_probe(const char* dir) {

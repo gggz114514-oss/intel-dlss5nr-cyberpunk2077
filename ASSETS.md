@@ -3,14 +3,17 @@
 The only model input is the supported local `nvngx_dlssnr.dll` or its ZIP. Extraction parses PE resources without executing the DLL.
 
 ```powershell
-python tools/extract_model.py --dll "C:/Models/nvngx_dlssnr.dll" --out local/small
+python tools/extract_model.py --profile small --dll "C:/Models/Small/nvngx_dlssnr.dll" --out local/small
 python tools/build_assets.py --model local/small --glslang "C:/Tools/glslang/bin/glslang.exe"
+
+python tools/extract_model.py --profile vk102 --dll "C:/Models/VK102/nvngx_dlssnr.dll" --out local/vk102
+python tools/build_assets.py --model local/vk102 --glslang "C:/Tools/glslang/bin/glslang.exe"
 ```
 
-The first command checks **255** tensor SHA-256 hashes, packs NRMODEL1 and generates **70** FP16/FP32 model cold resources. NumPy is needed for B580 packing. `--raw-only` performs standard-library extraction only, not backend preparation.
+Small checks **255** tensor SHA-256 hashes and generates **70** FP16/FP32 model cold resources. VK102 checks **599** tensor hashes and generates **150** model cold resources, including its distinct split16 and final-head layouts. Both pack NRMODEL1. NumPy is needed for B580 packing. `--raw-only` performs standard-library extraction only, not backend preparation. With `--profile auto` (the extractor default), the pinned DLL SHA selects the profile; `Build.ps1` requests it explicitly.
 
-The second builds **40** network modules and three bridge shaders from GLSL, restores/verifies the frozen precision identity, writes the 118-dispatch plan, and generates C++ build identity includes. Asset paths are relative to the manifest. The built backend checks the manifest, plan and every model/shader file before mounting.
+Each profile builds **40** network modules and three bridge shaders from GLSL, restores/verifies the frozen precision identity, writes its plan (**Small 76 rows / 223 buffers / 118 dispatches; VK102 152 rows / 487 buffers / 266 dispatches**), and generates C++ build identity includes. Shared sources are reused where the deployed shader bytes match; five VK102 down/up-sampling variants have separate included sources. Asset paths are relative to the manifest. The built backend checks the manifest, plan and every model/shader file before mounting.
 
 Two old image bundles were developer fixtures, not weights, and are absent. The runtime initializes their buffers to zero, then game gather/controls/history provide frame data. The first pass selects procedural noise from the current frame seed. No developer screenshot, captured activation or pre-exported blob is needed.
 
-`Build.ps1` runs both steps. `local/`, `assets/`, `models/`, `weights/` and `build/` are ignored. Generated weights, SPIR-V, CUDA code and proprietary binaries are not repository contents and are not covered by the source license.
+`Build.ps1` runs extraction, shader preparation, native builds, CPU checks and package assembly for the selected profile. `local/`, `assets/`, `models/`, `weights/` and `build/` are ignored. Generated weights, SPIR-V, CUDA code and proprietary binaries are not repository contents and are not covered by the source license. The seven explicitly supplied screenshots in `docs/images/` are documentation assets, not runtime fixtures.

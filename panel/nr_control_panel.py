@@ -18,8 +18,11 @@ settings = json.loads(CONFIG.read_text(encoding="utf-8"))
 STATE = Path(settings["state"])
 OPTI = Path(settings["optiscaler_ini"])
 INI = Path(settings["ini"])
-SMALL = settings["manifest"]
-VK102 = settings.get("vk102_manifest", "")
+PRIMARY = settings.get("backend", "small")
+BACKENDS = dict(settings.get("backends", {}))
+BACKENDS[PRIMARY] = settings["manifest"]
+if settings.get("vk102_manifest"):
+    BACKENDS["102"] = settings["vk102_manifest"]
 OPTI_KEYS = ("SpoofedVendorId", "SpoofedDeviceId", "SpoofedGPUName",
              "Dxgi", "StreamlineSpoofing", "SpoofHAGS", "DxgiVRAM")
 OPTI_PRESETS = {
@@ -32,7 +35,7 @@ OPTI_PRESETS = {
 }
 
 DEFAULTS = {
-    "backend": "small", "enabled": 1, "style": 0,
+    "backend": PRIMARY, "enabled": 1, "style": 0,
     "intensity": 1.0, "local_structure": 1.0, "local_tone": 0.0,
     "skin_structure": 0.0, "auto_mask": 1, "display_strength": 1.0,
 }
@@ -67,7 +70,7 @@ def save(values):
         "auto_mask": str(int(values["auto_mask"])),
         "display_strength": f"{values['display_strength']:.4f}",
     }
-    cfg["Backends"] = {k: v for k, v in (("small", SMALL), ("102", VK102)) if v}
+    cfg["Backends"] = BACKENDS
     tmp = INI.with_suffix(".tmp")
     try:
         tmp.write_text("", encoding="utf-8")
@@ -155,7 +158,7 @@ button{padding:10px 18px;background:#26344b;color:#fff;border:1px solid #537096;
 <div>桥内区间 <b id=lvTotal>—</b> ms <span id=lvStage></span></div>
 <div>参数 <span id=lvParams></span></div>
 </div><small>桥内区间含跨帧重叠等待，不是游戏帧时。风格/强度/遮罩为逐帧控制；后端切换在帧边界生效。</small>
-<label>后端 <select id=backend><option value=small>Small 310.9.16</option>__VK102_OPTION__</select></label>
+<label>后端 <select id=backend>__BACKEND_OPTIONS__</select></label>
 <label>启用 <input id=enabled type=checkbox></label>
 <div class=style>风格：<span id=style><button data-v=0>经典</button><button data-v=1>自然</button><button data-v=2>电影</button></span></div>
 <label>强度 <input id=intensity type=range min=0 max=2 step=.05><output></output></label>
@@ -266,7 +269,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/":
-            page = PAGE.replace("__VK102_OPTION__", '<option value=102>VK102 310.8</option>' if VK102 else '')
+            options = ''.join(f'<option value={key}>{label}</option>' for key, label in
+                              (("small", "Small 310.9.16"), ("102", "VK102 310.8")) if key in BACKENDS)
+            page = PAGE.replace("__BACKEND_OPTIONS__", options)
             self._send(200, page.replace("__TOKEN__", TOKEN), "text/html; charset=utf-8")
         elif self.path == "/api":
             self._send(200, json.dumps(load()))

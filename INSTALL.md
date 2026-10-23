@@ -14,11 +14,11 @@ git clone https://github.com/optiscaler/OptiScaler.git C:\Dev\OptiScaler
 git -C C:\Dev\OptiScaler checkout 7534ad00bf9e590eedb99e8dd9fd8c89dae3654f
 ```
 
-Use a writable ASCII path: the existing Windows bridge uses ANSI file APIs. Keep the model DLL outside the source tree. No system Python, registry or driver changes are made.
+Use a short, writable ASCII path: the existing Windows bridge uses ANSI file APIs and remains subject to Windows path-length limits. Keep the model DLL outside the source tree. No system Python, registry or driver changes are made.
 
 ## Build
 
-Run the main README command from the repository root with a new/empty `local/small` directory. The script stops on any extraction, shader identity, compile or CPU-check failure.
+Run the commands in [README.md](README.md) or [README.zh-CN.md](README.zh-CN.md) from the repository root. Choose `-Profile small` for the supported 310.9.16.0 Small DLL, or `-Profile vk102` for the supported 310.8.0.0 full-model DLL. Both start from the local DLL; no existing model package is needed. Use new/empty model and package directories. The script stops on any extraction, shader identity, compile or CPU-check failure.
 
 The two native targets can also be configured after asset preparation:
 
@@ -31,7 +31,7 @@ cmake --build build/bridge --config Release
 
 Historical `*_TEST` switches select the existing experimental game path. One-frame readback and developer GPU probes are disabled in the default build. The separate legacy Python/Triton runtime is not part of this publication.
 
-`local/game-package/` contains generated runtime assets, your locally built bridge, D3D12 proxy shader source, panel and configuration. Raw extraction/debug outputs are not copied into it.
+The Small output is `local/game-package/`; VK102 uses `local/game-package-vk102/`. Each contains generated runtime assets, its matching component in `bin/`, locally built game bridge, D3D12 proxy shader source, panel and configuration. Raw extraction/debug outputs are not copied into it. The manual native commands above illustrate Small; use `local/vk102` as `NR_MODEL_DIR` for VK102. `Build.ps1` selects it automatically.
 
 ## Configure, install, run
 
@@ -48,24 +48,32 @@ This updates the package's shared manifest/panel/status paths and the panel's Op
 3. Keep the separately installed working OptiScaler/upscaler. No `dxgi.dll`, NVIDIA/FSR/XeSS or frame-generation DLL is provided.
 4. Start `Launch-NR-Panel-Game.cmd` in the package; panel address: `http://127.0.0.1:8788/`.
 5. Known 1080p configuration: 1920×1080 display output + DLSS Quality input (1280×720) through the working OptiScaler route. Other output settings must still supply exactly 1280×720 to NR. Do not edit shader grids to unlock model input.
-6. Confirm mounted Small and increasing `processed`. A loaded DLL or idle `attach rc=0` is insufficient.
+6. Confirm the chosen backend is mounted and `processed` increases. A loaded DLL or idle `attach rc=0` is insufficient.
 7. Check motion, appearance, scene cuts, exposure and history reset; use external frame-time measurements.
 
 The local game setup used the OptiScaler NVIDIA spoof preset to expose DLSS input. The panel can edit that preset with the game closed, retaining a backup. Compatible upscaler installation is separate; no unverified third-party signed replacement is bundled/downloaded.
 
 The generated `game-files/plugins/nr_bridge.ini` and panel config point to the same manifest, INI and status paths in your package. If you move it, regenerate those paths before installation; an already copied INI cannot follow a moved folder.
 
-### Keep an existing VK102 backend
+### Use a newly built VK102 backend, alone or alongside Small
 
-The panel also supports Small/VK102 hot switching. To retain an existing VK102 310.8 package, register its manifest directory:
+Build VK102 with `Build.ps1 -Profile vk102` and its supported full-model DLL. To boot VK102 alone, configure that package and copy its `game-files/` contents:
 
 ```powershell
-python local/game-package/panel/configure_game.py --package local/game-package --game-bin "C:/Games/Cyberpunk2077/bin/x64" --vk102-manifest "C:/NR/VK102/manifest"
+python local/game-package-vk102/panel/configure_game.py --package local/game-package-vk102 --game-bin "C:/Games/Cyberpunk2077/bin/x64"
 ```
 
-Keep that package's matching `bin/nrvk_bridge.dll` (or `nrvk_bridge.dll` at its root), runtime, shaders and weights together. The panel then shows **VK102 310.8** alongside Small; select it and Save. The bridge switches at a frame boundary and resets history. Existing appearance settings are retained. Registering VK102 does not replace the Small component in the game folder.
+For both models, build both profiles and choose one boot package. Register the other package before installing:
 
-The extraction/build profile in this source release currently builds Small only. This option connects an already built VK102 package; it does not extract a full 310.8 model from the Small DLL. Neither package's generated model assets belong in GitHub.
+```powershell
+# Small boot package, with newly built VK102 available in the selector.
+python local/game-package/panel/configure_game.py --package local/game-package --game-bin "C:/Games/Cyberpunk2077/bin/x64" --vk102-manifest local/game-package-vk102/manifest
+
+# Alternatively, VK102 boot package, with Small available.
+python local/game-package-vk102/panel/configure_game.py --package local/game-package-vk102 --game-bin "C:/Games/Cyberpunk2077/bin/x64" --small-manifest local/game-package/manifest
+```
+
+Install only the chosen boot package's `game-files/`. Keep both packages' matching `bin/nrvk_bridge.dll`, runtime, shaders and weights together. The selector switches at a frame boundary and resets history, preserving appearance settings. The boot key in the installed bridge INI must match the component copied from that boot package. Neither package's generated model assets belong in GitHub.
 
 ## Roll back
 

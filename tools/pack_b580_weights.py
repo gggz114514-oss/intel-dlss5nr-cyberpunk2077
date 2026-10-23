@@ -1,4 +1,4 @@
-"""Pack and transform all 31 blocks of 310.9.16 Small (WEIGHTS_CC_SMALL_FP8) into B580 FP16/FP32 cold buffers."""
+"""Pack and transform Small or full VK102 model blocks into B580 FP16/FP32 cold buffers."""
 from __future__ import annotations
 
 import argparse
@@ -14,6 +14,7 @@ import numpy as np
 MODEL_TOOLS = Path(__file__).resolve().parents[1] / "third_party/dlssnr_amd_model_tools"
 EXTRACTED: Path
 COLD_OUT: Path
+PROFILE: dict
 
 # Every finite E4M3 value is exactly representable in binary16.
 def e4m3_half_bits(code: int) -> int:
@@ -85,19 +86,20 @@ def fragment_indices(N: int, K: int, inner: int) -> np.ndarray:
 
 
 def pack_ioport(block: int, C: int, family_mod) -> tuple[bytes, bytes]:
+    shape_block = int(PROFILE["ioport_shapes"][str(block)])
     name = f"block{block}.layer0.layer"
     payload = (EXTRACTED / "inventory" / "weights" / f"{name}.bin").read_bytes()
-    if block in (0, 30):
-        regions = PRE_REGIONS if block == 0 else POST_REGIONS
-        directory = "unpacked-preblock" if block == 0 else "unpacked-postblock"
-    elif block == 19:
+    if shape_block in (0, 30):
+        regions = PRE_REGIONS if shape_block == 0 else POST_REGIONS
+        directory = "unpacked-preblock" if shape_block == 0 else "unpacked-postblock"
+    elif shape_block == 19:
         regions = [
             ("weight", 0, 524288, 512, 1024, 32, "matrix"),
             ("skip_weight", 524288, 525312, None, None, None, "fp16"),
         ]
         directory = "unpacked-splitswin"
     else:
-        ci, co = (C, 2 * C) if block in (2, 4, 6, 8) else (2 * C, C)
+        ci, co = (C, 2 * C) if shape_block in (2, 4, 6, 8) else (2 * C, C)
         regions = family_mod.regions(C, C // 32, ci, co)
         directory = "unpacked"
 
@@ -141,19 +143,19 @@ def pack_ioport(block: int, C: int, family_mod) -> tuple[bytes, bytes]:
         put(role, data)
 
     aux = bytearray()
-    if block != 19:
+    if shape_block != 19:
         rs = np.frombuffer(raw_parts["residual_scale"], "<u2")
         rbase = 8 if np.all(rs[:8] == 0) else 0
-        if block in (0, 30):
+        if shape_block in (0, 30):
             normalized = bytes(16) + rs[rbase : rbase + C].tobytes() + bytes(16)
             put("body_residual_scale", normalized)
-        if block in (22, 24, 26, 28):
+        if shape_block in (22, 24, 26, 28):
             gain = np.frombuffer(raw_parts["upsample_gain"], "<u2")
             if C > 32:
                 gain = np.concatenate((rs[C : C + 16], gain))
             assert len(gain) == C
             put("blend_gain", gain.tobytes())
-        if block == 30:
+        if shape_block == 30:
             put("blend_gain", raw_parts["skip_gain"] + raw_parts["main_gain"])
         bias = np.frombuffer(raw_parts["attn_pos_bias"], "<u2")
         i, j = np.indices((64, 64))
@@ -171,27 +173,27 @@ def pack_ioport(block: int, C: int, family_mod) -> tuple[bytes, bytes]:
     # Apply S1 / R4 16x16 B-tile transformations.
     # GPU A/B (runs 005 vs 007) rejects the "canonical pre/post pack" hypothesis:
     # canonical made b0 worse (mean_abs 0.094 -> 0.394), so keep TILE16.
-    if block == 0:
+    if shape_block == 0:
         ranges = [(0, 8192, 128, 32), (8192, 16384, 32, 128), (17664, 23808, 96, 32), (32256, 34304, 32, 32)]
-    elif block == 30:
+    elif shape_block == 30:
         ranges = [(0, 8192, 128, 32), (8192, 16384, 32, 128), (17152, 23296, 96, 32), (31744, 33792, 32, 32)]
-    elif block == 19:
+    elif shape_block == 19:
         ranges = [(0, 1048576, 512, 1024)]
-    elif block == 2:
+    elif shape_block == 2:
         ranges = [(33536, 37632, 64, 32)]
-    elif block == 4:
+    elif shape_block == 4:
         ranges = [(107264, 123648, 128, 64)]
-    elif block == 6:
+    elif shape_block == 6:
         ranges = [(361472, 427008, 256, 128)]
-    elif block == 8:
+    elif shape_block == 8:
         ranges = [(1312256, 1574400, 512, 256)]
-    elif block == 22:
+    elif shape_block == 22:
         ranges = [(720896, 983040, 256, 512)]
-    elif block == 24:
+    elif shape_block == 24:
         ranges = [(196608, 262144, 128, 256)]
-    elif block == 26:
+    elif shape_block == 26:
         ranges = [(57344, 73728, 64, 128)]
-    elif block == 28:
+    elif shape_block == 28:
         ranges = [(16384, 20480, 32, 64)]
     else:
         raise ValueError(block)
@@ -259,11 +261,11 @@ def pack_swin(block: int, c: int, unpacked_manifest: dict) -> tuple[bytes, bytes
         ranges = [(0, 2048, 32, 32), (10496, 18688, 32, 128), (18688, 26880, 128, 32), (26880, 33024, 96, 32)]
     elif c == 64:
         ranges = [(0, 8192, 64, 64), (24832, 33024, 64, 64), (33024, 65792, 256, 64), (82176, 106752, 192, 64)]
-    elif c == 128 and block == 6:
+    elif c == 128 and block == PROFILE["downsample_blocks"][2]:
         ranges = [(0, 32768, 128, 128), (65792, 98560, 128, 128), (98560, 229632, 512, 128), (262400, 360704, 384, 128)]
     elif c == 128:
         ranges = [(0, 32768, 128, 128), (66048, 98816, 128, 128), (98816, 229888, 512, 128), (262656, 360960, 384, 128)]
-    elif c == 256 and block == 8:
+    elif c == 256 and block == PROFILE["downsample_blocks"][3]:
         ranges = [(197120, 328192, 256, 256), (328192, 852480, 1024, 256)]
     elif c == 256:
         ranges = [(197376, 328448, 256, 256), (328448, 852736, 1024, 256)]
@@ -275,7 +277,7 @@ def pack_swin(block: int, c: int, unpacked_manifest: dict) -> tuple[bytes, bytes
     # (c256_common.glsl / c256_d4_epi_only.comp: coopMatLoad(b, pack,
     # wo + n0*256 + k0, 256, LCOL)).  Apply the same (N/16,K/16,16,16)
     # transform the C32/C64/C128 packs already use.
-    if c == 256:
+    if c == 256 and PROFILE["backend_key"] == "small":
         for role, n, k in (("attn_out_proj", 256, 256), ("qkv", 768, 256)):
             off = role_off[role]
             ranges.append((off, off + n * k * 2, n, k))
@@ -338,12 +340,20 @@ def pack_split16(block: int) -> tuple[bytes, bytes]:
     # (524288,786432,2048,64), (786432,1048576,512,256) ranges below apply the
     # consumer TILE16 transform once.  The old ffwd_maps pre-permuted them and
     # then the ranges permuted again.
-    a = LUT_U16[np.frombuffer((sw / f"block{block}.layer0.layer.ffwd_a.bin").read_bytes(), np.uint8)].tobytes()
-    b = LUT_U16[np.frombuffer((sw / f"block{block}.layer0.layer.ffwd_b.bin").read_bytes(), np.uint8)].tobytes()
-    assert len(a) == 524288 and len(b) == 524288, (block, len(a), len(b))
-    add(a)
-    add(b[:262144])
-    add(b[262144:])
+    if PROFILE["backend_key"] == "102":
+        # VK102 S20 consumes the original per-head ffwd maps before TILE16.
+        raw = np.frombuffer((EXTRACTED / "inventory/weights" / f"block{block}.layer0.layer.bin").read_bytes(), np.uint8)
+        amap, bmap0, bmap2 = ffwd_maps()
+        add(LUT_U16[raw[amap]].tobytes())
+        add(LUT_U16[raw[bmap0]].tobytes())
+        add(LUT_U16[raw[bmap2]].tobytes())
+    else:
+        a = LUT_U16[np.frombuffer((sw / f"block{block}.layer0.layer.ffwd_a.bin").read_bytes(), np.uint8)].tobytes()
+        b = LUT_U16[np.frombuffer((sw / f"block{block}.layer0.layer.ffwd_b.bin").read_bytes(), np.uint8)].tobytes()
+        assert len(a) == 524288 and len(b) == 524288, (block, len(a), len(b))
+        add(a)
+        add(b[:262144])
+        add(b[262144:])
 
     auxiliary = b""
     for layer, role, N in ((1, "ff_proj", 512), (2, "qkv", 1536), (3, "out_proj", 512)):
@@ -372,7 +382,7 @@ def pack_split16(block: int) -> tuple[bytes, bytes]:
             assert scales.size == 16 and np.all(np.isfinite(scales))
             auxiliary = bias.tobytes() + scales.tobytes()
 
-    if block == 10:
+    if block == PROFILE["split_last"]:
         name = f"block{block}.layer4.layer"
         raw4 = (EXTRACTED / "inventory" / "weights" / f"{name}.bin").read_bytes()
         ext4 = EXTRACTED / "unpacked-splitswin" / f"{name}.weight.bin"
@@ -389,7 +399,10 @@ def pack_split16(block: int) -> tuple[bytes, bytes]:
         (1573888, 3146752, 1536, 512),
         (3146752, 3671040, 512, 512),
     ]
-    if block == 10:
+    if block == PROFILE["split_last"] and PROFILE["backend_key"] == "102":
+        # Frozen VK102 S24 and S25 retain canonical last-head projection weights.
+        ranges = [r for r in ranges if r[0] != 3146752]
+    if block == PROFILE["split_last"] and PROFILE["backend_key"] == "small":
         # Final-head L4.weight is read as MAT_B 16x16 tiles; it is outside the
         # L0-L3 ranges above.
         ranges.append((3672064, 4720640, 1024, 512))
@@ -466,12 +479,14 @@ def save_cold(logical_name: str, filename_suffix: str, data: bytes, index: dict)
 
 
 def main():
-    global EXTRACTED, COLD_OUT
-    parser = argparse.ArgumentParser(description="Prepare B580 FP16 model cold resources from verified Small tensors")
+    global EXTRACTED, COLD_OUT, PROFILE
+    parser = argparse.ArgumentParser(description="Prepare B580 FP16 cold resources from verified model tensors")
+    parser.add_argument("--profile", choices=["small", "vk102"], default="small")
     parser.add_argument("--extracted", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     args = parser.parse_args()
+    PROFILE = json.loads((Path(__file__).with_name("model_profiles.json")).read_text(encoding="utf-8"))[args.profile]
     EXTRACTED = args.extracted.resolve()
     COLD_OUT = args.out.resolve()
     if COLD_OUT.exists() and any(COLD_OUT.iterdir()):
@@ -485,71 +500,32 @@ def main():
     unpacked_manifest = json.loads((EXTRACTED / "unpacked" / "manifest.json").read_text(encoding="utf-8"))
     index = {}
 
-    # 1. IO Port & Resample packs
-    ioport_blocks = {
-        0: 32,
-        2: 32,
-        4: 64,
-        6: 128,
-        8: 256,
-        19: 512,
-        22: 256,
-        24: 128,
-        26: 64,
-        28: 32,
-        30: 32,
-    }
-    for b, c in ioport_blocks.items():
+    shape_width = {0:32, 2:32, 4:64, 6:128, 8:256, 19:512, 22:256, 24:128, 26:64, 28:32, 30:32}
+    for block, shape in PROFILE["ioport_shapes"].items():
+        b, c = int(block), shape_width[shape]
         w, aux = pack_ioport(b, c, family_mod)
         save_cold(f"ioport_{b}_ioport_pack", f"ioport_{b}_ioport_pack.fp16.bin", w, index)
-        if b in (0, 30):
+        if b in (0, PROFILE["post_block"]):
             save_cold(f"ioport_{b}_ioport_body_aux", "ioport_aux.f32.bin", aux, index)
         print(f"Packed ioport_{b}: weights={len(w)}B aux={len(aux)}B")
-
-    # 2. Swin body packs
-    swin_blocks = {
-        1: 32,
-        2: 32,
-        3: 64,
-        4: 64,
-        5: 128,
-        6: 128,
-        7: 256,
-        8: 256,
-        22: 256,
-        23: 256,
-        24: 128,
-        25: 128,
-        26: 64,
-        27: 64,
-        28: 32,
-        29: 32,
-    }
-    for b, c in swin_blocks.items():
+    for block, c in PROFILE["swin_blocks"].items():
+        b = int(block)
         w, aux = pack_swin(b, c, unpacked_manifest)
         save_cold(f"swin_{b}_weights", f"swin_{b}_weights.fp16.bin", w, index)
         save_cold(f"swin_{b}_aux", f"c{c}_aux.bin", aux, index)
-        print(f"Packed swin_{b} (C={c}): weights={len(w)}B aux={len(aux)}B")
-
-    # 3. SplitSwin16H packs
-    for b in (9, 10, 20, 21):
+    for b in PROFILE["split_blocks"]:
         w, aux = pack_split16(b)
         save_cold(f"split16_b{b}_weights", f"split16_b{b}_weights.fp16.bin", w, index)
         save_cold(f"split16_b{b}_aux", "split16_aux.bin", aux, index)
-        print(f"Packed split16_b{b}: weights={len(w)}B aux={len(aux)}B")
-
-    # 4. ViT packs
-    for b in range(11, 19):
+    for b in PROFILE["vit_blocks"]:
         w, scales = pack_vit(b)
-        save_cold(f"vit_b{b}_weights", "vit_weights.fp16.bin", w, index)
-        save_cold(f"vit_b{b}_scales", "vit_scales.fp32.bin", scales, index)
-        print(f"Packed vit_b{b}: weights={len(w)}B scales={len(scales)}B")
-
-    # No developer fixture images: these 70 resources are model data only.
-    blend = (EXTRACTED / "inventory" / "weights" / "block30.layer0.blend_scale.bin").read_bytes()
-    assert blend == bytes.fromhex("233a"), blend.hex()
-    blend = blend + bytes(2)  # consumer buffer is 4 B: fp16 scalar + zero pad
-    save_cold("ioport_30_ioport_blend_scale", "ioport_blend_scale.fp16.bin", blend, index)
+        prefix = f"vit_block{b}" if args.profile == "vk102" else f"vit_b{b}"
+        save_cold(prefix + "_weights", "vit_weights.fp16.bin", w, index)
+        save_cold(prefix + "_scales", "vit_scales.fp32.bin", scales, index)
+    post = PROFILE["post_block"]
+    blend = (EXTRACTED / "inventory" / "weights" / f"block{post}.layer0.blend_scale.bin").read_bytes()
+    assert len(blend) == 2
+    save_cold(f"ioport_{post}_ioport_blend_scale", "ioport_blend_scale.fp16.bin", blend + bytes(2), index)
 
     manifest_dir = args.manifest.resolve()
     manifest_dir.mkdir(parents=True, exist_ok=True)
