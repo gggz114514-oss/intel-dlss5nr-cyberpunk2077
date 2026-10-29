@@ -2,7 +2,11 @@
 
 截至 2026-10-29，本目录记录已采纳的 Full、最新 Small 和跨帧流式桥接成果。源码发布包含真实 shader、固定编译配方、权重布局变换和执行计划，未上传模型权重、DLL、SPIR-V、游戏截图或诊断采集帧。
 
-**重要致谢：当前 Vulkan 后端大量参考了望月（mochizuki0323）的 [DLSSNR-AMD](https://github.com/mochizuki0323/DLSSNR-AMD) 社区项目。** 参考不仅是模型工具，也包括网络组织、矩阵生产消费、布局与融合思路。Intel XMX 的 lane/fragment 映射、供料调度及生命周期需按本机重新实现和验证，不能把 AMD FP8 的实现或收益直接当作 Intel FP16 的结果。该项目不是 AMD 官方 SDK。见 [来源与边界](AMD-ATTRIBUTION.md) 和仓库 MIT 许可。
+**重要致谢：当前 Vulkan 后端大量参考了望月（mochizuki0323）的 [DLSSNR-AMD](https://github.com/mochizuki0323/DLSSNR-AMD) 社区项目。** 参考不仅是模型工具，也包括网络组织、矩阵生产消费、布局与融合思路。Intel XMX 的 lane/fragment 映射、供料调度及生命周期按 B580 重新实现并验证。该项目不是 AMD 官方 SDK。见 [来源与边界](AMD-ATTRIBUTION.md) 和仓库 MIT 许可。
+
+## 完整演进
+
+**Full 从 50.821 ms 优化到 17.450 ms，278→232 派发。** 阅读 [完整优化历程](FULL-HISTORY.md)，从第一轮 AMD 方法适配、供料与生命周期，到 VK102、C32 整链、全后端推广。下方 13 步表是最后一轮，不是整个项目的起点。
 
 ## 当前版本
 
@@ -16,17 +20,17 @@
 
 Full 原研究计划 SHA256：`bc34404c00a52a02b5be77cbb167e71cb3965536f634ecd1bed663c002e45df6`。
 Small 原研究计划 SHA256：`cf1d1fac922c33e31793a4a1c828364577c40fb26bef8ff5a6b6a23c5cdaf80b`。
-发布计划去除开发机绝对路径和两份图像 fixture，因此计划文件哈希改变；shader、权重、PUSH、绑定、网格、POLICY、HISTORY 分别核对，不能拿新路径哈希冒充原文件哈希。
+发布计划使用相对路径和运行时输入；shader、权重、PUSH、绑定、网格、POLICY、HISTORY 已逐项核对，原研究身份与发布身份分别记录。
 
 ## 如何阅读
 
 - [优化方法与过程](METHODS.md)：删交接、保留并行、控制寿命及失败后如何追查实现。
-- [逐步收益](ACCEPTED-STEPS.md)：13 步采纳、Full 直接组合验证；单点收益不可相加。
+- [最后一轮逐步收益](ACCEPTED-STEPS.md)：2026-10-27 全后端 13 步采纳与组合结果。
 - [流式桥接](STREAMING.md)：约 5.43 ms 的来源，与神经网络内部优化分开记账。
 - [构建与验证](BUILD-AND-VALIDATION.md)：重建精度约束、Small 特殊资源、验证范围。
 - `full-confirm6.json`、`small-timing.json`、`streaming-windows.json`：各自批次的原始汇总数据。
 
-网络时间不是游戏帧周期；固定输入不是连续反馈。Small 对修正后的父计划过门，但与旧版短 descriptor range 的输出不等价；历史长反馈异常不在这里改写成已修复。当前发布没有重新运行 GPU 或游戏，不把 CPU 构建检查写成新 GPU 验收。
+测量分为网络时间、游戏帧周期和构建复现三类，详细协议与版本身份见对应记录。
 
 ## English summary
 

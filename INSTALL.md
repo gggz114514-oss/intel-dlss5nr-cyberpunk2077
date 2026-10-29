@@ -1,5 +1,16 @@
 # Build and install
 
+## Download the current source / 下载当前源码
+
+```powershell
+git clone https://github.com/gggz114514-oss/intel-dlss5nr-cyberpunk2077.git C:\Dev\intel-dlss5nr-cyberpunk2077
+cd C:\Dev\intel-dlss5nr-cyberpunk2077
+```
+
+Or select **Code → Download ZIP** on the repository's main branch and extract it to a short writable path. This is a source distribution: build the local game package using the instructions below. Supply the supported model DLLs separately; the repository supplies the extractor, packing recipes, shaders, native backend, game bridge and panel.
+
+当前主分支包含 Full 232 派发、新 Small 108 派发和默认启用的跨帧流式桥接。下载源码后先构建 Full，再构建 Small；随后配置包路径、复制游戏文件、用包内启动脚本启动面板与游戏。中文命令详见 [README.zh-CN.md](README.zh-CN.md)。
+
 ## Build prerequisites
 
 - Windows x64, Intel Arc B580 and a driver exposing the features in `source/vulkan/port_network_bridge_backend.h`.

@@ -1,6 +1,6 @@
 # Intel DLSS5 NR — 赛博朋克 2077
 
-**2026-10-29 更新：Full 232 派发（约 17.45 ms）与新版 Small 108 派发（约 9.98 ms）已接入默认构建；同时发布约 5.43 ms 实机帧周期收益的流式桥接。** 详见 [优化过程、方法与验证](docs/optimization/README.md)。当前 Vulkan 大量参考望月 **mochizuki0323 / DLSSNR-AMD** 社区项目，见 [致谢](docs/optimization/AMD-ATTRIBUTION.md)。Small 构建现在需 `-FullModel local/vk102`，先构建 Full。以下旧版本测试表属于历史记录。
+**2026-10-29 更新：Full 232 派发（约 17.45 ms）与新版 Small 108 派发（约 9.98 ms）已接入默认构建；同时发布约 5.43 ms 实机帧周期收益的流式桥接。** 详见 [优化过程、方法与验证](docs/optimization/README.md)。当前 Vulkan 大量参考望月 **mochizuki0323 / DLSSNR-AMD** 社区项目，见 [致谢](docs/optimization/AMD-ATTRIBUTION.md)。Small 构建现在需 `-FullModel local/vk102`，先构建 Full。
 
 
 [English](README.md) · [开发依赖和安装说明（英文）](INSTALL.md)
@@ -24,20 +24,21 @@ NR 负责神经图像处理与风格控制；FSR XMX 负责超分；XeSS FG / Xe
 
 仓库不提供模型 DLL、权重、提取后的张量、预编译 SPIR-V、自有二进制安装包或第三方游戏 DLL。所有模型资产和本机二进制均由用户在本地生成。
 
-## 720p 实机性能怎么理解
+## 当前性能与完整优化历程
 
-测试组合：**NR + FSR XMX + XeSS FG**，显卡 B580。用户确认以下数字是 **XeSS 帧生成之前的基础渲染 FPS**：
+B580、1280×720 NR 输入。最新默认后端如下：
 
-| NR 后端 | NR 输入分辨率 | 近似基础帧率 |
-|---|---|---:|
-| VK102 | 1280×720 / 720p | **约 24 FPS** |
-| Small | 1280×720 / 720p | **约 34 FPS** |
+| 测量范围 | 结果 |
+|---|---|
+| Full 网络历史起点 → 当前链头 | **50.821 → 17.450 ms** |
+| 最新 Full 最后一轮同批对照 | **18.724 → 17.450 ms（−1.273 ms）** |
+| 新版 Small 同批固定输入 | **14.324 → 9.980 ms，108 派发** |
+| 流式桥接，赛博朋克同场景帧周期 | **34.81 → 29.38 ms（−5.43 ms）** |
+| 对应基础帧率，帧生成前 | **28.74 → 34.04 FPS** |
 
-这是用户本机的观察值，不是跨场景统一基准或帧率保证。本页 Small 截图的瞬时基础帧率约为 30–32 FPS；截图中的约 93–94 / 126–127 FPS 是另外的插帧后呈现读数，不能拿来与基础 FPS 混算。
+[完整优化历程：50 多 ms 如何降到现在](docs/optimization/FULL-HISTORY.md) · [下载安装](INSTALL.md) · [其他游戏接入](PORTING.md)
 
-**720p 指 NR 输入，不等于显示输出。** 当前模型输入固定 1280×720。已有本机 1080p / 1440p 显示输出记录，不代表可以随意修改模型输入尺寸或派发网格。
-
-面板 `total`、`tail` 等数值是桥内区间，包含跨帧重叠等待，不能当成游戏帧时，也不能当成纯后端网络耗时。
+网络行测量 NR 推理；流式行测量游戏帧周期。历史起点和当前链头来自各阶段记录，同批收益在表内单列。面板的跨帧桥内区间用于运行诊断；FPS 使用游戏基础帧率，XeSS FG 呈现帧率另列。NR 输入固定 1280×720，显示输出可经超分放大。
 
 ## 准备开发依赖
 
@@ -64,20 +65,20 @@ $opti = "C:\Dev\OptiScaler"
 $glslang = "C:\Tools\glslang\bin\glslang.exe"
 $vk = "C:\VulkanSDK\Include"
 
-# Small：生成 local/small 与 local/game-package。
-.\tools\Build.ps1 -Profile small -FullModel "local/vk102" -Dll "C:\Models\Small\nvngx_dlssnr.dll" `
-  -OptiScalerSource $opti -Glslang $glslang -VulkanInclude $vk -Python $py
-
 # VK102：生成 local/vk102 与 local/game-package-vk102。
 .\tools\Build.ps1 -Profile vk102 -Dll "C:\Models\VK102\nvngx_dlssnr.dll" `
   -OptiScalerSource $opti -Glslang $glslang -VulkanInclude $vk -Python $py
+
+# Small：生成 local/small 与 local/game-package。
+.\tools\Build.ps1 -Profile small -FullModel "local/vk102" -Dll "C:\Models\Small\nvngx_dlssnr.dll" `
+  -OptiScalerSource $opti -Glslang $glslang -VulkanInclude $vk -Python $py
 ```
 
-只用一种模型就只执行对应命令；希望在面板中切换则两种都构建。入口会依次完成：DLL 身份检查 → 解包及张量哈希检查 → B580 冷权重重排 → 网络/桥着色器编译及身份检查 → 原生 DLL/ASI 构建 → CPU 检查 → 游戏包装配。
+先构建 Full；使用 Small 或双后端切换时再执行 Small 命令。入口会依次完成：DLL 身份检查 → 解包及张量哈希检查 → B580 冷权重重排 → 网络/桥着色器编译及身份检查 → 原生 DLL/ASI 构建 → CPU 检查 → 游戏包装配。
 
 **不会自动安装或启动游戏。** 模型和包输出目录应为新目录或空目录；再次构建可用 `-Output`、`-PackageOutput` 指定另一个位置，不必覆盖已经在使用的包。
 
-VK102 完整链包括 **599 个原始张量文件、150 个模型冷资源、40 个网络着色器**，不需要旧权重文件或本机输入样本。每个包均包含自己的 `manifest/`、`assets/`、`bin/nrvk_bridge.dll`、`game-files/`、`panel/` 和 `config/`，应整体保留。
+VK102 完整链包括 **599 个原始张量文件、165 个冷资源、39 个网络着色器**，不需要旧权重文件或本机输入样本。每个包均包含自己的 `manifest/`、`assets/`、`bin/nrvk_bridge.dll`、`game-files/`、`panel/` 和 `config/`，应整体保留。
 
 ## 配置和安装进游戏
 
@@ -139,7 +140,7 @@ python local/game-package/panel/configure_game.py --package local/game-package -
 
 正常退出游戏，恢复备份的 `nrvk_bridge.dll`、`plugins/CyberpunkNRBridge.asi`、`plugins/nr_hdr_proxy.hlsl`、`plugins/nr_bridge.ini`、`plugins/NRB-deferred-identity.enable`。只移除本次新增的文件；若改过伪装设置，恢复对应 OptiScaler INI 备份。不要处理无关的游戏文件。
 
-本发布为 **Experimental**。本机用户初测和资产逐字节重建不等于长稳、所有场景画质、4K 或 Small 对参考逐位一致已验收。`local/`、`build/` 中生成的权重、DLL、SPV 等应留在用户本地，不提交到仓库。
+本发布为 **Experimental**，适用配置为 Windows x64、Intel Arc B580、1280×720 NR 输入。仓库发布源码与构建配方；`local/`、`build/` 中生成的权重、DLL、SPV 保留在用户本地。
 
 构建验证记录见 [BUILD-VERIFICATION.md](BUILD-VERIFICATION.md)。着色器先检查编译器原始输出，再恢复冻结的 `NoContraction` 装饰并核对最终哈希；脚本没有内嵌预编译 SPIR-V。
 

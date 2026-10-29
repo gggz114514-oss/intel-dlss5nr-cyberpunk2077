@@ -1,6 +1,6 @@
 # Intel DLSS5 NR — Cyberpunk 2077
 
-**2026-10-29: Default builds now use optimized Full (232 dispatches, ~17.45 ms) and optimized Small (108 dispatches, ~9.98 ms), plus late-latch streaming (~5.43 ms game frame-period improvement in the recorded scene).** See [optimization history and evidence](docs/optimization/README.md). The Vulkan backend substantially references the community **mochizuki0323 / DLSSNR-AMD** project; see [attribution](docs/optimization/AMD-ATTRIBUTION.md). Build Full first, then pass `-FullModel local/vk102` when building Small. Older performance tables below are historical.
+**2026-10-29: Default builds now use optimized Full (232 dispatches, ~17.45 ms) and optimized Small (108 dispatches, ~9.98 ms), plus late-latch streaming (~5.43 ms game frame-period improvement in the recorded scene).** See [optimization history and evidence](docs/optimization/README.md). The Vulkan backend substantially references the community **mochizuki0323 / DLSSNR-AMD** project; see [attribution](docs/optimization/AMD-ATTRIBUTION.md). Build Full first, then pass `-FullModel local/vk102` when building Small.
 
 
 [中文说明](README.zh-CN.md) · [Build dependencies and installation](INSTALL.md)
@@ -16,7 +16,7 @@ Provide the appropriate **local `nvngx_dlssnr.dll`**. Both backends can now be e
 | `small` | 310.9.16.0 Small | `WEIGHTS_CC_SMALL_FP8` | 76 rows / 108 dispatches | `2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f` |
 | `vk102` | 310.8.0.0 full model | `WEIGHTS_HT` | 152 rows / 232 dispatches | `8270b350cd82de5ce89806872cdd6b6a9249b80836b91bbeb3573470744cc206` |
 
-Use separate folders for the two DLLs. Other DLL identities are rejected. A ZIP containing one supported DLL is accepted too. These are the existing game backends; the accepted 232-pass FP16 chain is now included; INT8 experiments are not included.
+Use separate folders for the two DLLs. Other DLL identities are rejected. A ZIP containing one supported DLL is accepted too. The profiles select the current optimized FP16 backends. INT8 remains a separate development branch.
 
 ## The tested combination and performance
 
@@ -27,16 +27,21 @@ Use separate folders for the two DLLs. Other DLL identities are rejected. A ZIP 
 | XeSS FG / XeFG | Frame generation | No third-party DLLs |
 | OptiScaler | Upscaler/frame-generation routing and the working game integration | External dependency |
 
-**User-reported base rendering FPS, before XeSS frame generation**, with 1280×720 NR input on B580:
+## Current performance
 
-| NR backend | Input | Approximate base FPS |
-|---|---|---:|
-| VK102 | 720p | **24 FPS** |
-| Small | 720p | **34 FPS** |
+Intel Arc B580, 1280×720 NR input:
 
-These are local observations, not a cross-scene benchmark or a performance guarantee. Live Small screenshots below show roughly 30–32 base FPS at those instants. The higher OSD readings around 93–94 / 126–127 FPS are separate frame-generation presentation readings; do not compare them to base FPS. Panel `total`/`tail` values are internal bridge intervals with cross-frame overlap, not game frame time or isolated network time.
+| Measurement | Result |
+|---|---|
+| Full network, historical starting point → current head | **50.821 → 17.450 ms** |
+| Latest Full campaign, paired batch | **18.724 → 17.450 ms (−1.273 ms)** |
+| Optimized Small, paired fixed-input batch | **14.324 → 9.980 ms; 108 dispatches** |
+| Cyberpunk streaming, same-scene game frame period | **34.81 → 29.38 ms (−5.43 ms)** |
+| Corresponding base FPS, before frame generation | **28.74 → 34.04 FPS** |
 
-**720p means the NR input, not necessarily the display output.** Keep NR input at 1280×720. Known local 1080p / 1440p display observations do not establish support for arbitrary model input dimensions or all output modes.
+[Complete optimization history](docs/optimization/FULL-HISTORY.md) · [Download and install](INSTALL.md) · [Integrate another game](PORTING.md)
+
+Network rows measure NR inference. Streaming measures game frame period. The historical endpoints span development stages; paired results use the baseline recorded for that batch. NR input is fixed at 1280×720; super resolution produces the display image. Frame-generation presentation FPS and panel bridge intervals have their own measurement scopes.
 
 ## Build either model from its DLL
 
@@ -54,18 +59,18 @@ $opti = "C:\Dev\OptiScaler"
 $glslang = "C:\Tools\glslang\bin\glslang.exe"
 $vk = "C:\VulkanSDK\Include"
 
-# Small: local/small -> local/game-package
-.\tools\Build.ps1 -Profile small -FullModel "local/vk102" -Dll "C:\Models\Small\nvngx_dlssnr.dll" `
-  -OptiScalerSource $opti -Glslang $glslang -VulkanInclude $vk -Python $py
-
 # VK102: local/vk102 -> local/game-package-vk102
 .\tools\Build.ps1 -Profile vk102 -Dll "C:\Models\VK102\nvngx_dlssnr.dll" `
   -OptiScalerSource $opti -Glslang $glslang -VulkanInclude $vk -Python $py
+
+# Small: local/small -> local/game-package
+.\tools\Build.ps1 -Profile small -FullModel "local/vk102" -Dll "C:\Models\Small\nvngx_dlssnr.dll" `
+  -OptiScalerSource $opti -Glslang $glslang -VulkanInclude $vk -Python $py
 ```
 
-Build only the model you want, or run both commands for switching. The entry point verifies the DLL and extracted tensors, packs the exact B580 weight layout, compiles the frozen network and bridge shaders, builds the native component and ASI, runs CPU checks and assembles a local game package. **It does not install or start the game.** Use new/empty model and package output directories; `-Output` and `-PackageOutput` can select different locations for another build.
+Build Full first; build Small afterward for the Small backend or model switching. The entry point verifies the DLL and extracted tensors, packs the exact B580 weight layout, compiles the frozen network and bridge shaders, builds the native component and ASI, runs CPU checks and assembles a local game package. **It does not install or start the game.** Use new/empty model and package output directories; `-Output` and `-PackageOutput` can select different locations for another build.
 
-Each package contains its own `manifest/`, generated `assets/`, matching `bin/nrvk_bridge.dll`, `game-files/`, `panel/` and `config/`. Keep it together at its final location. The new VK102 path verifies **599 tensor files, 150 model-derived cold resources and 40 network shaders**; developer fixture images are not used.
+Each package contains its own `manifest/`, generated `assets/`, matching `bin/nrvk_bridge.dll`, `game-files/`, `panel/` and `config/`. Keep it together at its final location. The new VK102 path verifies **599 tensor files, 165 cold resources and 39 network shaders**; developer fixture images are not used.
 
 ## Configure and install
 
@@ -126,7 +131,7 @@ Click an image for its original resolution. Screenshots are documentation assets
 
 Close the game. Restore your backed-up `nrvk_bridge.dll`, `plugins/CyberpunkNRBridge.asi`, `plugins/nr_hdr_proxy.hlsl`, `plugins/nr_bridge.ini` and `plugins/NRB-deferred-identity.enable`; remove only files introduced by this installation. Restore the intended OptiScaler INI backup if you changed spoof settings. Leave unrelated game files alone.
 
-This is an Experimental source release. Local user smoke tests and byte-verified asset builds do not establish extended stability, all-scene quality, 4K support or bit-identical Small reference output. Keep generated `local/` and `build/` data private. Do not commit DLLs, extracted model data or game fixture captures.
+This Experimental source release targets Windows x64, Intel Arc B580 and 1280×720 NR input. Keep generated `local/` and `build/` assets on your own machine; the repository distributes source and build recipes.
 
 [BUILD-VERIFICATION.md](BUILD-VERIFICATION.md) records build checks. GLSL builds verify raw compiler output before restoring the frozen `NoContraction` decorations, then verify final SPIR-V hashes. No precompiled shader payload is embedded in scripts.
 
