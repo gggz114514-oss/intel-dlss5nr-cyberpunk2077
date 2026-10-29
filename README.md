@@ -9,6 +9,8 @@ Experimental **NR + FSR XMX upscaling + XeSS Frame Generation** on Intel Arc B58
 
 **Detailed guides:** [Installation walkthrough (中文)](docs/USER-GUIDE.zh-CN.md) · [Full development history](docs/optimization/FULL-HISTORY.md) · [Technical retrospective](docs/optimization/TECHNICAL-RETROSPECTIVE.md) · [Other-game integration](PORTING.md)
 
+**Download current main via Code → Download ZIP or git clone. The v0.2.0 release archive is historical; main contains the optimized profiles documented here.**
+
 ## What you need to supply
 
 Provide the appropriate **local `nvngx_dlssnr.dll`**. Both backends can now be extracted and built from source; **an existing VK102 package is not required**. DLLs are read as data and never executed. No model DLL, weights, extracted tensors, compiled shaders or third-party game DLLs are distributed.
@@ -102,9 +104,9 @@ The configuration command updates paths inside the package only. It requires you
 
 ## Use the panel
 
-Run `Launch-NR-Panel-Game.cmd` from the chosen boot package. Default address: **http://127.0.0.1:8788/**. To use another port, set `NR_PANEL_PORT` before launching. Local screenshots use port 8789 because another panel was already running.
+Run `Launch-NR-Panel-Game.cmd` from the chosen boot package to open the control panel, then launch Cyberpunk from your normal game launcher. This script starts the panel only. It uses Windows Python Launcher (`py -3`); alternatively run `python panel/nr_control_panel.py` from the package directory. Default address: **http://127.0.0.1:8788/**. To use another port, set `NR_PANEL_PORT` before launching. Local screenshots use port 8789 because another panel was already running.
 
-- **Backend**: only configured backends are shown. Select Small or VK102 and Save. The bridge switches at a frame boundary, resets history and uses that model's own component and assets.
+- **Backend**: `VK102 310.8` / key `102` selects optimized Full; `Small 310.9.16` selects optimized Small. Only configured backends are shown. Select Small or VK102 and Save. The bridge switches at a frame boundary, resets history and uses that model's own component and assets.
 - **Enabled / style / strength / structure / tone / skin / mask / display strength**: per-frame appearance controls; they do not rebuild a model. Styles are Classic, Natural and Cinematic.
 - **Mounted + increasing processed count**: check actual processing, not just DLL loading. Inspect scene cuts, loading/reset, motion and exposure changes yourself.
 - **OptiScaler spoof presets**: game restart required. Edit only with the game closed; the panel retains an INI backup. No elevation or alternate-shell bypass is used.

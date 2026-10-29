@@ -13,6 +13,8 @@ NR 负责神经图像处理与风格控制；FSR XMX 负责超分；XeSS FG / Xe
 
 **详细文档：** [完整安装与使用教程](docs/USER-GUIDE.zh-CN.md) · [50 ms→17 ms 完整时间线](docs/optimization/FULL-HISTORY.md) · [逐项代码与性能复盘](docs/optimization/TECHNICAL-RETROSPECTIVE.md) · [其他游戏接入](PORTING.md)
 
+**下载最新版：请使用本页 main 分支的 Code → Download ZIP 或 git clone。旧 v0.2.0 Release 压缩包是历史版本，当前优化版以 main 为准。**
+
 ## 两种模型都能从本地 DLL 开始构建
 
 **不再要求用户已经拥有 VK102 包。** 只需提供对应版本的本地 `nvngx_dlssnr.dll` 作为模型输入，再准备下文列出的开发依赖。提取器把 DLL 当数据解析，不加载或执行 DLL。
@@ -110,9 +112,9 @@ python local/game-package/panel/configure_game.py --package local/game-package -
 
 ## 面板操作
 
-运行选定启动包中的 `Launch-NR-Panel-Game.cmd`。默认地址 **http://127.0.0.1:8788/**；可通过 `NR_PANEL_PORT` 改端口。本页截图使用 8789，因为当时另一个面板占用了默认端口。
+运行选定启动包中的 `Launch-NR-Panel-Game.cmd` 打开面板，再从游戏平台启动赛博朋克。脚本只启动面板，使用 Windows Python Launcher（`py -3`）；也可在包目录执行 `python panel/nr_control_panel.py`。默认地址 **http://127.0.0.1:8788/**；可通过 `NR_PANEL_PORT` 改端口。本页截图使用 8789，因为当时另一个面板占用了默认端口。
 
-- **后端**：只显示已注册的模型。选 Small 或 VK102 后保存；桥会在帧边界切换，重置 history，并加载对应包自己的组件和权重。
+- **后端**：`VK102 310.8` / 状态键 `102` 是当前优化 Full，`Small 310.9.16` 是新版 Small；只显示已注册的模型。选 Small 或 VK102 后保存；桥会在帧边界切换，重置 history，并加载对应包自己的组件和权重。
 - **启用、经典/自然/电影、强度、局部结构、局部色调、皮肤/遮罩、自动遮罩、风格强度**：逐帧控制，不会重新构建模型。
 - **实况**：检查“已挂载”与持续增长的处理计数。单纯 DLL 加载成功不足以说明正在出帧。
 - **切镜和重置**：自行检查加载存档、转动镜头、曝光变化、切场景后的画面恢复。

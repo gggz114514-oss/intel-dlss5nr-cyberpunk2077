@@ -4,6 +4,8 @@
 
 Full 是 232 派发、约 17.45 ms 的版本；Small 是 108 派发、约 9.98 ms 的版本。默认流式桥接已启用。上述网络时间对应 B580、1280×720 NR 输入的记录。
 
+下载入口统一使用当前 **main** 分支。旧 v0.2.0 Release 是历史源码包；当前 Full 232 / Small 108 派发及流式默认开启版本均在 main。
+
 ## 1. 下载与目录准备
 
 下载入口：[GitHub 仓库](https://github.com/gggz114514-oss/intel-dlss5nr-cyberpunk2077)。可使用 Code → Download ZIP，或：
@@ -117,11 +119,11 @@ plugins/NRB-deferred-identity.enable
 
 ## 7. 启动并确认挂载
 
-运行启动包内 `Launch-NR-Panel-Game.cmd`。面板默认地址是 `http://127.0.0.1:8788/`。游戏使用 1280×720 NR 输入；已使用的 1080p 组合为 1920×1080 显示输出配 DLSS Quality 输入，再由 OptiScaler 路由到兼容的超分实现。
+运行启动包内 `Launch-NR-Panel-Game.cmd` 打开面板，再从游戏平台启动赛博朋克。脚本只启动面板，使用 Windows Python Launcher（`py -3`）；也可在包目录执行 `python panel/nr_control_panel.py`。面板默认地址是 `http://127.0.0.1:8788/`。游戏使用 1280×720 NR 输入；已使用的 1080p 组合为 1920×1080 显示输出配 DLSS Quality 输入，再由 OptiScaler 路由到兼容的超分实现。
 
 进入存档后检查：
 
-1. 面板列出已注册的 Full / Small。
+1. 面板列出已注册的 `VK102 310.8`（优化 Full，状态键 `102`）与 `Small 310.9.16`（新版 Small）。
 2. 当前后端显示已挂载，处理计数持续增加。
 3. 改变风格或强度后，画面对应更新。
 4. 切换后端后，实际挂载状态更新，处理继续运行。

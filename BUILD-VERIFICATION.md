@@ -15,3 +15,13 @@ The plans reproduce bindings, PUSH values, dispatch grids, POLICY and HISTORY fr
 Small keeps its five offset-specific kernels and its own weights. Build Full first: Small reads the shared final blend scalar from that output to reproduce the accepted game package.
 
 [Current build details](docs/optimization/BUILD-AND-VALIDATION.md) · [Recorded GPU results](docs/optimization/README.md) · [Earlier source-build record](docs/optimization/BUILD-VERIFICATION-20261024.md)
+
+## Fresh new-user build walkthrough
+
+A fresh source-only directory ran the documented sequence: `Build.ps1 -Profile vk102`, followed by `Build.ps1 -Profile small -FullModel local/vk102`. Both complete builds exited successfully, including extraction, shader verification, native builds, CPU checks, panel tests and package assembly.
+
+The resulting Full package has 232 dispatches, 39 network shaders and 165 cold resources; Small has 108 dispatches, 39 shaders and 70 cold resources. Every packaged asset hash was checked. Dual-backend configuration was exercised in both boot directions against a configuration fixture: boot keys, manifests, matching components and shared panel paths agree. The fixture game files remained unchanged.
+
+Late-latch defaults to 1 in the bridge and diagnostic configuration; packaged `tail_profile` defaults to 0. The panel launcher starts the panel only; users launch Cyberpunk from their normal game launcher.
+
+[Machine-readable walkthrough result](docs/optimization/new-user-validation.json). This walkthrough validates local builds and configuration; network timings remain those of the accepted GPU measurement batches.

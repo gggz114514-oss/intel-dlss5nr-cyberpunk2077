@@ -2,6 +2,8 @@
 
 [中文完整操作教程](docs/USER-GUIDE.zh-CN.md)：从下载源码到双后端挂载，附常见问题与恢复步骤。
 
+下载入口统一使用当前 **main** 分支。旧 v0.2.0 Release 是历史源码包；当前 Full 232 / Small 108 派发及流式默认开启版本均在 main。
+
 ## Download the current source / 下载当前源码
 
 ```powershell
@@ -11,7 +13,7 @@ cd C:\Dev\intel-dlss5nr-cyberpunk2077
 
 Or select **Code → Download ZIP** on the repository's main branch and extract it to a short writable path. This is a source distribution: build the local game package using the instructions below. Supply the supported model DLLs separately; the repository supplies the extractor, packing recipes, shaders, native backend, game bridge and panel.
 
-当前主分支包含 Full 232 派发、新 Small 108 派发和默认启用的跨帧流式桥接。下载源码后先构建 Full，再构建 Small；随后配置包路径、复制游戏文件、用包内启动脚本启动面板与游戏。中文命令详见 [README.zh-CN.md](README.zh-CN.md)。
+当前主分支包含 Full 232 派发、新 Small 108 派发和默认启用的跨帧流式桥接。下载源码后先构建 Full，再构建 Small；随后配置包路径、复制游戏文件、用包内脚本启动面板，再从游戏平台启动游戏。中文命令详见 [README.zh-CN.md](README.zh-CN.md)。
 
 ## Build prerequisites
 
@@ -59,7 +61,7 @@ This updates the package's shared manifest/panel/status paths and the panel's Op
 1. Back up any existing `nrvk_bridge.dll` and same-name files under `plugins/`.
 2. Copy the **contents** of `local/game-package/game-files/` into the game's `bin/x64/`.
 3. Keep the separately installed working OptiScaler/upscaler. No `dxgi.dll`, NVIDIA/FSR/XeSS or frame-generation DLL is provided.
-4. Start `Launch-NR-Panel-Game.cmd` in the package; panel address: `http://127.0.0.1:8788/`.
+4. Start `Launch-NR-Panel-Game.cmd` in the package to open the panel, then launch Cyberpunk from your normal game launcher. The script starts the panel only, using Windows Python Launcher (`py -3`); alternatively run `python panel/nr_control_panel.py` from the package. Panel address: `http://127.0.0.1:8788/`.
 5. Known 1080p configuration: 1920×1080 display output + DLSS Quality input (1280×720) through the working OptiScaler route. Other output settings must still supply exactly 1280×720 to NR. Do not edit shader grids to unlock model input.
 6. Confirm the chosen backend is mounted and `processed` increases. A loaded DLL or idle `attach rc=0` is insufficient.
 7. Check motion, appearance, scene cuts, exposure and history reset; use external frame-time measurements.
