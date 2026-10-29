@@ -1,0 +1,120 @@
+"""Final self-check of the R10/R11 card (CPU only).
+
+Re-verifies, from the files themselves:
+  * every file hash recorded in CANDIDATE.json
+  * every SPV path referenced by all 287 PASS lines of the candidate plan exists
+  * every BUFFER file declared by the plan exists at the declared size
+  * the two changed PASS lines carry the expected spv / shared / nbind / push
+  * the operand audit verdicts are FP16_FREE with 6 INT8 sites each
+  * no PASS name is duplicated, PASS count / OUTPUT / HISTORY unchanged vs G3
+"""
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+C = Path("@NR_WORKSPACE@/work/dsh-int8-fullnet-impl-20261024/"
+         "candidates/r10-r11-ds")
+R = Path("@NR_WORKSPACE@")
+BUILD = R / "work/dsh-int8-fullnet-impl-20261024/build/r10-r11-ds"
+G3 = R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt"
+TOKEN = re.compile(r'"[^"]*"|\S+')
+problems = []
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def parse(path):
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    h = lines[0].split()
+    nb, npass = int(h[2]), int(h[3])
+    bufs = []
+    for ln in lines[1:1 + nb]:
+        t = TOKEN.findall(ln)
+        bufs.append((t[1].strip('"'), int(t[2]), t[3].strip('"')))
+    i, passes = 1 + nb, []
+    for _ in range(npass):
+        t = TOKEN.findall(lines[i])
+        n = int(t[6])
+        passes.append({"line": lines[i], "order": int(t[1]), "name": t[2].strip('"'),
+                       "spv": t[3].strip('"'), "shared": int(t[5]), "nbind": n,
+                       "grid": [int(t[8]), int(t[9]), int(t[10])],
+                       "push": lines[i + n + 1]})
+        i += n + 2
+    return {"head": h, "bufs": bufs, "passes": passes, "tail": lines[i:]}
+
+
+cand = parse(C / "plan-r10-r11-ds.txt")
+par = parse(G3)
+# 1. hashes recorded in CANDIDATE.json
+doc = json.loads((C / "CANDIDATE.json").read_text(encoding="utf-8"))
+bad = [f["rel"] for f in doc["files"] if sha(C / f["rel"]) != f["sha256"]]
+if bad:
+    problems.append("hash mismatch: %s" % bad)
+# 2. every referenced SPV exists
+for p in cand["passes"]:
+    if not Path(p["spv"]).exists():
+        problems.append("missing spv: %s" % p["spv"])
+# 3. every declared buffer file exists at the declared size
+for nm, size, path in cand["bufs"]:
+    if path == "-":
+        continue
+    f = Path(path)
+    if not f.exists():
+        problems.append("missing buffer file %s (%s)" % (nm, path))
+    elif f.stat().st_size != size:
+        problems.append("buffer size %s declared %d actual %d"
+                        % (nm, size, f.stat().st_size))
+# 4. the two changed PASS lines
+want = {"f3c128_body_ds": ("r10_f3c128_body_ds_wo_ds_i8.spv", 23560, 14),
+        "f3c256_body_ds": ("r11_f3c256_body_ds_wo_ds_i8.spv", 37896, 14)}
+for name, (spv_tail, shared, nbind) in want.items():
+    p = [x for x in cand["passes"] if x["name"] == name]
+    q = [x for x in par["passes"] if x["name"] == name]
+    if len(p) != 1 or len(q) != 1:
+        problems.append("pass %s not unique" % name)
+        continue
+    p, q = p[0], q[0]
+    if not p["spv"].endswith(spv_tail) or p["shared"] != shared or p["nbind"] != nbind:
+        problems.append("pass %s line wrong: %s" % (name, p["line"]))
+    if p["push"] != q["push"] or p["grid"] != q["grid"] or p["order"] != q["order"]:
+        problems.append("pass %s push/grid/order changed" % name)
+# 5. audit verdicts
+for tag in ("r10", "r11"):
+    d = json.loads((BUILD / ("%s.audit.json" % tag)).read_text(encoding="utf-8"))
+    cand_mods = [m for m in d["modules"] if "r10-r11-ds/spv/" in m["path"].replace("\\", "/")]
+    if len(cand_mods) != 1:
+        problems.append("%s audit: candidate module not found" % tag)
+        continue
+    m = cand_mods[0]
+    if not (m["fp16_matrix_multiplies"] == 0 and m["int8_matrix_multiplies"] == 6):
+        problems.append("%s audit verdict %s fp16=%d int8=%d"
+                        % (tag, m["verdict"], m["fp16_matrix_multiplies"],
+                           m["int8_matrix_multiplies"]))
+    if m["sha256"] != sha(C / "spv" / Path(m["path"]).name):
+        problems.append("%s audit module hash drift" % tag)
+# 6. names unique, counts and tail preserved
+names = [p["name"] for p in cand["passes"]]
+if len(names) != len(set(names)):
+    problems.append("duplicate PASS names")
+if len(cand["passes"]) != len(par["passes"]) or cand["head"][3] != par["head"][3]:
+    problems.append("PASS count changed")
+if [ln for ln in cand["tail"] if ln.startswith("OUTPUT")] != \
+        [ln for ln in par["tail"] if ln.startswith("OUTPUT")]:
+    problems.append("OUTPUT line changed")
+if [ln for ln in cand["tail"] if ln.startswith("HISTORY")] != \
+        [ln for ln in par["tail"] if ln.startswith("HISTORY")]:
+    problems.append("HISTORY line changed")
+
+print(json.dumps({"ok": not problems, "problems": problems,
+                  "candidate_plan_sha256": sha(C / "plan-r10-r11-ds.txt"),
+                  "candidate_header": " ".join(cand["head"]),
+                  "buffers": len(cand["bufs"]), "passes": len(cand["passes"]),
+                  "files_hash_checked": len(doc["files"]),
+                  "buffer_files_checked": len([b for b in cand["bufs"] if b[2] != "-"]),
+                  "spv_references_checked": len(cand["passes"])}, indent=1))
+sys.exit(0 if not problems else 1)

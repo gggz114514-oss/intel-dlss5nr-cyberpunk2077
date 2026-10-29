@@ -1,0 +1,130 @@
+"""n22-f15-den-pv: read-only cost breakdown of the F15 parent ISA.
+
+Inputs (read-only):
+  parent ISA  queue/n13-vit-attn/native/captures/native-native-base/ISA/*.asm
+  resources   cards/n13-vit-attn/RESOURCE-REPORT-existing-run.json (scratch/IC)
+  SPIR-V      zcode-fp16-fullnet-handoff-20261024/candidates/f15l-vit-pv/spv/vit_attn_f15l.spv
+
+Output: cards/n22-f15-den-pv/build/ISA-COST.json (counts only; no GPU).
+"""
+import json, re, sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+BASE = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(BASE))
+import ISA  # noqa: E402
+
+ASM = BASE / 'queue/n13-vit-attn/native/captures/native-native-base/ISA/CS_asm059648fd95fa9a9d_simd32_000000000000001a_25_orig.asm'
+OUT = BASE / 'cards/n22-f15-den-pv/build/ISA-COST.json'
+
+
+def msg_of(i):
+    """Message descriptor string from the trailing // comment."""
+    c = i['comment'] or ''
+    m = re.search(r';\s*(.+)$', c)
+    return m.group(1).strip() if m else (c.strip() or '?')
+
+
+def main():
+    isa = ISA.parse(ASM)
+    res = dict(isa=str(ASM), instructions=len(isa))
+
+    ops = Counter(i['op'] for i in isa)
+    res['op_histogram'] = dict(ops.most_common())
+    # grouped opcode family (dpas.8x8 -> dpas)
+    fam = Counter(i['op'].split('.')[0] for i in isa)
+    res['op_family'] = dict(fam.most_common())
+
+    # ---- messages: op + descriptor + (wr/rd header)
+    msgs = Counter()
+    for i in isa:
+        if i['op'].startswith('send'):
+            wr = re.search(r'wr:(\d+)\+(\d+),\s*rd:(\d+)', i['comment'] or '')
+            msgs[(i['op'], msg_of(i), wr.group(0).replace(',', '') if wr else '?')] += 1
+    res['messages'] = [dict(op=k[0], desc=k[1], hdr=k[2], count=v) for k, v in sorted(msgs.items(), key=lambda kv: -kv[1])]
+
+    # bytes per message *per lane* from the descriptor width, and per message total (x32 lanes)
+    def width_dwords(desc, hdr):
+        m = re.search(r'd(\d+)u?(\d+)?', desc)
+        if desc.startswith(('load', 'store')):
+            if 'x' in desc.split('.')[1]:
+                pass
+        # explicit 'dNxM' -> N lanes-width ... use xM form for the transposed/vector messages
+        m2 = re.search(r'\.d(\d+)x(\d+)(t?)', desc)
+        if m2:
+            return int(m2.group(2))
+        m3 = re.search(r'\.d(\d+)u(\d+)', desc)   # d16u32 / d32u16 -> 16-bit elems
+        if m3:
+            return 2 if m3.group(1) == '16' else 1
+        m4 = re.search(r'\.d(\d+)\.', desc)
+        if m4:
+            return int(m4.group(1)) // 32
+        return None
+
+    msg_bytes = []
+    for m in res['messages']:
+        w = width_dwords(m['desc'], m['hdr'])
+        msg_bytes.append(dict(m, dwords_per_lane=w,
+                              bytes_total=(w * 4 * 32 if w else None)))
+    res['messages'] = msg_bytes
+
+    tot = defaultdict(int)
+    for m in msg_bytes:
+        if m['bytes_total']:
+            tot[m['desc'].split('.')[0] + ' ' + m['op']] += m['bytes_total'] * m['count']
+    res['bytes_by_kind'] = dict(tot)
+
+    # ---- dpas / sync / barrier / fence
+    res['dpas'] = [dict(addr=i['addr'], raw=i['raw']) for i in isa if i['op'].startswith('dpas')]
+    res['dpas_count'] = len(res['dpas'])
+    syncs = [i for i in isa if i['op'].startswith('sync')]
+    res['sync_histogram'] = dict(Counter(i['op'] for i in syncs))
+    res['sync_count'] = len(syncs)
+    res['barrier_count'] = sum(1 for i in isa if i['op'].startswith(('barrier', 'fence')))
+    res['fence_histogram'] = dict(Counter(i['op'] for i in isa if i['op'].startswith(('barrier', 'fence'))))
+
+    # ---- SLM round trips: send.slm store -> sync -> send.slm load clusters
+    # Walk the stream; a "round trip" is any send.slm store whose next SLM reader is a
+    # send.slm load with a sync in between (this is how subgroupShuffle lowers on Xe).
+    clusters = []
+    last_store = None
+    pending_store = []
+    for idx, i in enumerate(isa):
+        if i['op'] == 'send.slm' and msg_of(i).startswith('store'):
+            pending_store.append(idx)
+        elif i['op'] == 'send.slm' and msg_of(i).startswith('load'):
+            if pending_store:
+                clusters.append(dict(store=isa[pending_store[0]]['addr'],
+                                     load=i['addr'], span=idx - pending_store[0],
+                                     n_stores=len(pending_store)))
+                pending_store = []
+    res['slm_roundtrips'] = clusters
+    res['slm_roundtrips_count'] = len(clusters)
+
+    # ---- shuffles: count distinct `mov` patterns after slm loads (dword gather)
+    # register high-water mark and per-region mov density
+    regs = set()
+    for i in isa:
+        for o in i['ops']:
+            for m in re.finditer(r'\br(\d+)(\.(\d+))?', o):
+                regs.add((int(m.group(1)), int(m.group(3) or 0)))
+    res['max_reg'] = max(r for r, s in regs)
+    res['max_reg_sub'] = max(s for r, s in regs if r == res['max_reg'])
+    res['mov_count'] = sum(1 for i in isa if i['op'].startswith('mov'))
+    res['mov32'] = sum(1 for i in isa if i['op'].startswith('mov') and re.match(r'^mov \(32\|', i['raw'].split(')')[0] + ')'))
+
+    # ---- hot-region map: instruction count per 0x100 address bucket
+    buckets = Counter(i['addr'] >> 8 for i in isa)
+    res['addr_histogram_0x100'] = {hex(k << 8): v for k, v in sorted(buckets.items())}
+
+    # ---- "shuffle-like" mov density: runs of (send.slm load -> mov) pairs
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(json.dumps(res, indent=2), encoding='utf-8')
+    print(json.dumps({k: v for k, v in res.items() if k not in ('dpas', 'slm_roundtrips', 'addr_histogram_0x100')}, indent=2)[:8000])
+    print('dpas_count', res['dpas_count'], 'sync', res['sync_count'], 'slm_roundtrips', res['slm_roundtrips_count'])
+    print('wrote', OUT)
+
+
+if __name__ == '__main__':
+    main()

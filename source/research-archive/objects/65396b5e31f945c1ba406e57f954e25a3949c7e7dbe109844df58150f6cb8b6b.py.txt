@@ -1,0 +1,469 @@
+"""N10 / F10 card build: kc A-slice publish/retire across the two M blocks.
+
+Writes only into this card directory.  No GPU, no deployment, no shared edits.
+
+Pipeline
+  1. parent byte reproduction: accepted baseline source -> glslang -> must equal
+     the accepted baseline SPV byte for byte (raw, no decoration patching).
+  2. candidate source (one 20 KiB arena + per-slice alternating A window + one
+     publish barrier per slice instead of publish+retire).
+  3. structural proof: NoContraction sites pair 1:1 with the parent and the
+     candidate's own decorations are already exactly that set.
+  4. candidate.spv must pass spv_validate_cpu.
+  5. plan.txt: exactly the 16 F10 PASSes swapped, 232 PASS blocks preserved.
+  6. plan must pass clock_runner --cpu-check.
+"""
+from pathlib import Path
+import hashlib, json, subprocess, sys, difflib
+
+W = Path('@NR_WORKSPACE@')
+A = W / 'work/codex-astra-fp16-int8-audit-20261024'
+D = A / 'fullnet-mechanism-transfer-20261026'
+B = D / 'f10-weight-return-separation-20261027'          # accepted baseline (read-only)
+S = Path(__file__).resolve().parent                       # this card
+SITE = W / 'work/zcode-fp16-fullnet-handoff-20261024/candidates/f10p-s22-pblock/source'
+GLSLANG = W / 'src/project/tools/glslang-16.5.0/bin/glslang.exe'
+VALIDATE = W / 'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'
+RUNNER = A / 'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe'
+
+sys.path.insert(0, str(W / 'build/zcode-fp16-compute-backend-20261021/scripts'))
+import spv_tools_local as ST
+
+sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+ident = lambda p: dict(path=str(p), sha256=sha(p))
+
+
+def run(argv, allow_fail=False):
+    r = subprocess.run(list(map(str, argv)), capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    if r.returncode != 0 and not allow_fail:
+        raise RuntimeError('FAILED %s\n%s\n%s' % (argv, r.stdout, r.stderr))
+    return r.returncode, (r.stdout or '') + (r.stderr or '')
+
+
+def compile_glsl(comp, out):
+    return run([GLSLANG, '-V', '--target-env', 'vulkan1.3', '-I' + str(SITE), comp, '-o', out])
+
+
+# ---------------------------------------------------------------- 1. parent
+BASELINE_SPV = B / 'candidate.spv'
+BASELINE_SPV_SHA = '6b7d2bd95f0c08044075dd0dceefc470bffc501d0c7406525b84fe023c2a4c48'
+BASELINE_SRC = B / 'candidate.comp'
+PARENT_PLAN = B / 'plan.txt'
+PARENT_PLAN_SHA = 'a024c3c5aa1d1432ab3f0591bf03a897880d86be2c99d6de1e1492a2a7b2befe'
+assert sha(BASELINE_SPV) == BASELINE_SPV_SHA, 'baseline SPV identity moved'
+assert sha(PARENT_PLAN) == PARENT_PLAN_SHA, 'baseline plan identity moved'
+
+parent_src = BASELINE_SRC.read_text(encoding='utf-8-sig')
+(S / 'parent-rebuild.comp').write_text(parent_src, encoding='utf-8')
+rc, log = compile_glsl(S / 'parent-rebuild.comp', S / 'parent-rebuild.spv')
+assert rc == 0, log
+parent_raw_sha = sha(S / 'parent-rebuild.spv')
+PARENT_REPRO = parent_raw_sha == BASELINE_SPV_SHA
+
+# ---------------------------------------------------------------- 2. candidate
+cand = parent_src
+edits = []
+
+
+def sub(old, new, count=1):
+    global cand
+    n = cand.count(old)
+    assert n == count, 'expected %d occurrence(s), found %d for %r' % (count, n, old[:80])
+    cand = cand.replace(old, new)
+    edits.append(dict(count=count, before=old, after=new))
+
+
+# 2a. header note
+sub('// NOT CHANGED: bindings, push constants, local_size 256, phase/qkv shared\n'
+    '// allocation (20480 B), QKV/norm debug echoes, necessary T clear (runner-side).',
+    '// NOT CHANGED: bindings, push constants, local_size 256, phase/qkv shared\n'
+    '// allocation (20480 B), QKV/norm debug echoes, necessary T clear (runner-side).\n'
+    '//\n'
+    '// N10-F10 (2026-10-27) kc A-feed address and slice lifetime.  Two hunks, both in\n'
+    '// the QKV kc loop, both integer/address only:\n'
+    '//   (1) the four staging bases are linear in kc, so they are built once and\n'
+    '//       advanced by 1024 halves per slice instead of recomputed by tiled();\n'
+    '//   (2) the staged 64x64 slice is consumed jointly by both M blocks of every SG\n'
+    '//       (a0 = rows mA..mA+7, a1 = rows mB..mB+7) and by both SGs of an SG pair,\n'
+    '//       so it needs one publish barrier, not publish+retire: the two arrays are\n'
+    '//       one arena and the slice window alternates between the halves, so the next\n'
+    '//       slice publish retires the previous slice.\n'
+    '// Unchanged: staged bytes, load/store counts, A fragments, the three independent\n'
+    '// weight return regions and the weight read count, DPAS order, every floating\n'
+    '// expression, shared 20480 B, grid, lane activity.')
+
+# 2b. one arena instead of two arrays
+sub('// Y\'s final QKV read retires before score writes P into the same phase.\n'
+    'shared float16_t phase[4096],qkv[6144];\n'
+    '#define sy phase\n'
+    '#define sp phase',
+    '// One 20 KiB arena.  [0,4096) is the A staging / P window (the former `phase`);\n'
+    '// [4096,10240) is the QKV handoff (the former `qkv`, QBASE..VBASE+2048).  The A\n'
+    '// feed alternates its slice between the two halves; slice 7 is odd, so the last\n'
+    '// staged slice lives in [0,4096) and the handoff stores below cannot race it.\n'
+    'shared float16_t smem[10240];\n'
+    '#define QKV_OFF 4096u\n'
+    '#define sp smem')
+
+sub('#define QBUF qkv\n#define KBUF qkv\n#define VBUF qkv',
+    '#define QBUF smem\n#define KBUF smem\n#define VBUF smem')
+sub('#define Q(E) qkv[QBASE+(E)]\n#define K(E) qkv[KBASE+(E)]',
+    '#define Q(E) smem[QKV_OFF+QBASE+(E)]\n#define K(E) smem[QKV_OFF+KBASE+(E)]')
+
+# 2c. every qkv[] address becomes smem[QKV_OFF + ...]; pure constant translation
+sub('coopMatLoad(a,qkv,KBASE+', 'coopMatLoad(a,smem,QKV_OFF+KBASE+', 2)
+sub('coopMatStore(value,qkv,(column/32u)*2048u',
+    'coopMatStore(value,smem,QKV_OFF+(column/32u)*2048u')
+sub('coopMatStore(value,qkv,4096u+(column-64u)*64u',
+    'coopMatStore(value,smem,QKV_OFF+4096u+(column-64u)*64u')
+sub('dbg[qdbg(e/2048u,w,h,e%2048u)]=float(qkv[v_raw(e)]);',
+    'dbg[qdbg(e/2048u,w,h,e%2048u)]=float(smem[QKV_OFF+v_raw(e)]);')
+sub('coopMatLoad(bq0,qkv,QBASE+qg*32u,32u,COL);',
+    'coopMatLoad(bq0,smem,QKV_OFF+QBASE+qg*32u,32u,COL);')
+sub('coopMatLoad(bq1,qkv,QBASE+qg*32u+16u,32u,COL);',
+    'coopMatLoad(bq1,smem,QKV_OFF+QBASE+qg*32u+16u,32u,COL);')
+sub('coopMatLoad(a,qkv,VBASE+', 'coopMatLoad(a,smem,QKV_OFF+VBASE+', 16)
+
+# 2d. A staging and A fragments take the slice window
+sub('#define STAGE(A,V,O) sy[qkv_a_offset(lid+(O))]=(V)?gy[(A)]:float16_t(0.0)',
+    '#define STAGE(A,V,O) smem[abase+qkv_a_offset(lid+(O))]=(V)?gy[(A)]:float16_t(0.0)')
+sub('coopMatLoad(a0,sy,((mA/8u)*4u+k/16u)*128u,8u,COL);',
+    'coopMatLoad(a0,smem,abase+((mA/8u)*4u+k/16u)*128u,8u,COL);')
+sub('coopMatLoad(a1,sy,((mB/8u)*4u+k/16u)*128u,8u,COL);',
+    'coopMatLoad(a1,smem,abase+((mB/8u)*4u+k/16u)*128u,8u,COL);')
+
+# 2e. hoist the four staging bases and alternate the slice window; drop the
+#     per-slice retire barrier (the next publish retires this slice).
+sub('        for(uint kc=0u;kc<512u;kc+=64u) {\n'
+    '            // C2 v5 staging address hoist (T1 s22-stage-addr-hoist-v1):\n'
+    '            // the 16 elements of a thread are e=lid+256*i, i.e. tokens\n'
+    '            // t=q+4i with q=lid/64.  window_token(t) only sees the four\n'
+    '            // (tx,ty) combinations below and tiled() advances by exactly\n'
+    '            // 64*(i%4) inside a group and 256*i for the shared element, so\n'
+    '            // four bases per kc slice reproduce all sixteen parent addresses.\n'
+    '            // Same sixteen coalesced 2-byte residual loads, same sixteen\n'
+    '            // shared stores, same zero padding, same following barrier.\n'
+    '            {\n'
+    '                uint q=lid>>6u,c0=lid&63u;\n'
+    '                int tx=2*int(wx)+pc.p1.z,ty=2*int(wy)+pc.p1.w;\n'
+    '                int w4=pc.p0.x/4,h4=pc.p0.y/4;\n'
+    '                bool v00=all(bvec4(tx>=0,ty>=0,tx<w4,ty<h4));\n'
+    '                bool v10=all(bvec4(tx+1>=0,ty>=0,tx+1<w4,ty<h4));\n'
+    '                bool v01=all(bvec4(tx>=0,ty+1>=0,tx<w4,ty+1<h4));\n'
+    '                bool v11=all(bvec4(tx+1>=0,ty+1>=0,tx+1<w4,ty+1<h4));\n'
+    '                uint a00=v00?tiled(uint((ty*w4+tx)*16)+q,kc+c0,512u):0u;\n'
+    '                uint a10=v10?tiled(uint((ty*w4+tx+1)*16)+q,kc+c0,512u):0u;\n'
+    '                uint a01=v01?tiled(uint(((ty+1)*w4+tx)*16)+q,kc+c0,512u):0u;\n'
+    '                uint a11=v11?tiled(uint(((ty+1)*w4+tx+1)*16)+q,kc+c0,512u):0u;\n',
+    '        // N10-F10 address hoist: tiled(t,kc+c0,512) is linear in kc while kc%64==0\n'
+    '        // (only its channel term contributes, (kc/16)*256), so the four staging\n'
+    '        // bases advance by exactly 1024 halves per slice.  They are built once\n'
+    '        // here and incremented; an invalid tile keeps its zero base and the store\n'
+    '        // select still writes 0, so no stored value and no valid read address\n'
+    '        // changes.  Same sixteen loads, sixteen shared stores, same padding.\n'
+    '        uint q=lid>>6u,c0=lid&63u;\n'
+    '        int tx=2*int(wx)+pc.p1.z,ty=2*int(wy)+pc.p1.w;\n'
+    '        int w4=pc.p0.x/4,h4=pc.p0.y/4;\n'
+    '        bool v00=all(bvec4(tx>=0,ty>=0,tx<w4,ty<h4));\n'
+    '        bool v10=all(bvec4(tx+1>=0,ty>=0,tx+1<w4,ty<h4));\n'
+    '        bool v01=all(bvec4(tx>=0,ty+1>=0,tx<w4,ty+1<h4));\n'
+    '        bool v11=all(bvec4(tx+1>=0,ty+1>=0,tx+1<w4,ty+1<h4));\n'
+    '        uint a00=v00?tiled(uint((ty*w4+tx)*16)+q,c0,512u):0u;\n'
+    '        uint a10=v10?tiled(uint((ty*w4+tx+1)*16)+q,c0,512u):0u;\n'
+    '        uint a01=v01?tiled(uint(((ty+1)*w4+tx)*16)+q,c0,512u):0u;\n'
+    '        uint a11=v11?tiled(uint(((ty+1)*w4+tx+1)*16)+q,c0,512u):0u;\n'
+    '        // N10-F10 slice lifetime: the staged 64x64 slice is consumed jointly by\n'
+    '        // both M blocks of every SG (a0 = rows mA..mA+7, a1 = rows mB..mB+7) and\n'
+    '        // by both SGs of a pair, so one publish barrier covers it and the next\n'
+    '        // publish retires it: no per-slice trailing barrier.  The window parity is\n'
+    '        // picked so the final (odd) slice retires before the QKV handoff stores.\n'
+    '        uint abase=QKV_OFF;\n'
+    '        for(uint kc=0u;kc<512u;kc+=64u) {\n'
+    '            {\n')
+
+sub('#undef STAGE\n'
+    '            }\n'
+    '            barrier();\n',
+    '#undef STAGE\n'
+    '            }\n'
+    '            // the next slice starts 64 channels further into the same tiles\n'
+    '            a00+=1024u;a10+=1024u;a01+=1024u;a11+=1024u;\n'
+    '            barrier();\n')
+
+sub('                acc12=coopMatMulAdd(a1,b2,acc12);\n'
+    '            }\n'
+    '            barrier();\n'
+    '        }',
+    '                acc12=coopMatMulAdd(a1,b2,acc12);\n'
+    '            }\n'
+    '            // Retire point: the next slice\'s publish barrier covers this slice for\n'
+    '            // every reader; no workgroup barrier is needed here.\n'
+    '            abase=QKV_OFF-abase;\n'
+    '        }')
+
+code_only = '\n'.join(l for l in cand.splitlines() if not l.strip().startswith('//'))
+assert 'qkv[' not in code_only and 'sy[' not in code_only
+assert code_only.count('barrier();') == 5, code_only.count('barrier();')   # 197, 222, 227, 254, 264
+(S / 'candidate.comp').write_text(cand, encoding='utf-8')
+
+rc, log = compile_glsl(S / 'candidate.comp', S / 'candidate.spv')
+assert rc == 0, log
+
+# ---------------------------------------------------------------- 3. NoContraction
+#
+# Two independent checks, both CPU-only:
+#  (a) every floating instruction keeps its parent operand signature (the parent's
+#      own F10 recipe compared 88 such sites);
+#  (b) the NoContraction decoration set pairs one-to-one by instruction position
+#      over the parent's NC opcode set, and the paired set is *exactly* the set the
+#      candidate's own `precise` source sites already carry, with an equal
+#      (opcode, operand-signature, occurrence) multiset.
+pm = ST.Module(S / 'parent-rebuild.spv')
+cm = ST.Module(S / 'candidate.spv')
+parent_nc = set(ST.no_contraction_ids(pm))
+cand_nc = set(ST.no_contraction_ids(cm))
+INTS = {128, 130, 132, 134, 135, 137, 138, 139}
+FLOAT_OPS = {129, 131, 133, 139, 140}          # OpFAdd/FSub/FMul/FRem/FMod
+float_NC_checked = 0
+mismatch = []
+pr_all = ST.function_regions(pm)
+cr_all = ST.function_regions(cm)
+assert len(pr_all) == len(cr_all), 'function count changed: %d -> %d' % (len(pr_all), len(cr_all))
+for fi, (pr, cr) in enumerate(zip(pr_all, cr_all)):
+    ps = [pm.instructions[i] for i in pr if pm.instructions[i][0] in FLOAT_OPS]
+    cs = [cm.instructions[i] for i in cr if cm.instructions[i][0] in FLOAT_OPS]
+    assert len(ps) == len(cs), 'function %d float-op count %d -> %d' % (fi, len(ps), len(cs))
+    for x, y in zip(ps, cs):
+        assert (x[0], x[3]) == (y[0], y[3]), 'float op shape changed in function %d' % fi
+        xi = ST.result_id_of(x[0], x[1])
+        yi = ST.result_id_of(y[0], y[1])
+        if pm.operand_signature(xi, 3) != cm.operand_signature(yi, 3):
+            mismatch.append(dict(function=fi, opcode=x[0]))
+        float_NC_checked += 1
+assert not mismatch, 'floating operand signatures changed: %r' % mismatch[:3]
+
+# (b) NC placement: pair by position over the parent's NC opcode set.
+def classify(m, ids):
+    out = {}
+    for op, a, _, _ in m.instructions:
+        if ST.result_id_of(op, a) in ids:
+            out[op] = out.get(op, 0) + 1
+    return dict(sorted(out.items()))
+
+
+def op_seq(m, opcodes):
+    out = []
+    for fi, reg in enumerate(ST.function_regions(m)):
+        for i in reg:
+            op = m.instructions[i][0]
+            if op in opcodes:
+                out.append((fi, op, ST.result_id_of(op, m.instructions[i][1])))
+    return out
+
+
+nc_hist_parent = classify(pm, parent_nc)
+nc_hist_cand = classify(cm, cand_nc)
+assert nc_hist_parent == nc_hist_cand, 'NC opcode histogram differs'
+pair_ops = sorted(nc_hist_parent)
+ps_all, cs_all = op_seq(pm, pair_ops), op_seq(cm, pair_ops)
+assert len(ps_all) == len(cs_all), 'NC-capable opcode sequence length %d -> %d' % (
+    len(ps_all), len(cs_all))
+keep = set()
+for (fi, op, xi), (fj, op2, yi) in zip(ps_all, cs_all):
+    assert (fi, op) == (fj, op2), 'NC-capable sequence shape changed'
+    if xi in parent_nc:
+        keep.add(yi)
+assert len(keep) == len(parent_nc)
+nc_self_consistent = (keep == cand_nc)
+assert nc_self_consistent, 'candidate NC decorations are not the paired parent set'
+
+
+def nc_multiset(m, ids):
+    seen, out = {}, []
+    for op, a, _, _ in m.instructions:
+        rid = ST.result_id_of(op, a)
+        if rid in ids:
+            key = (op, str(m.operand_signature(rid, 3)))
+            seen[key] = seen.get(key, 0) + 1
+            out.append((key, seen[key]))
+    return sorted(out)
+
+
+nc_multiset_equal = nc_multiset(pm, parent_nc) == nc_multiset(cm, cand_nc)
+assert nc_multiset_equal, 'NC (opcode, signature) multiset differs'
+# Re-emitting the paired set must not change the module: the compiled candidate
+# already carries exactly those decorations from its own `precise` sites.
+ST.set_no_contraction(cm, list(keep), S / 'candidate-nc-check.spv')
+nc_reemit_identical = sha(S / 'candidate-nc-check.spv') == sha(S / 'candidate.spv')
+cm = ST.Module(S / 'candidate.spv')
+
+# static SPIR-V size / control delta
+def opcount(m):
+    c = {}
+    for op, a, _, _ in m.instructions:
+        c[op] = c.get(op, 0) + 1
+    return c
+
+
+pc_counts, cc_counts = opcount(pm), opcount(cm)
+spirv_delta = dict(
+    parent_instructions=len(pm.instructions), candidate_instructions=len(cm.instructions),
+    parent_words=len(pm.words), candidate_words=len(cm.words),
+    control_barriers=dict(parent=pc_counts.get(224, 0), candidate=cc_counts.get(224, 0)),
+    memory_barriers=dict(parent=pc_counts.get(225, 0), candidate=cc_counts.get(225, 0)),
+    integer_add=dict(parent=pc_counts.get(128, 0), candidate=cc_counts.get(128, 0)),
+    integer_sub=dict(parent=pc_counts.get(130, 0), candidate=cc_counts.get(130, 0)),
+    iadd_ops_total=dict(parent=sum(pc_counts.get(o, 0) for o in INTS),
+                        candidate=sum(cc_counts.get(o, 0) for o in INTS)),
+)
+
+rc, vlog = run([VALIDATE, S / 'candidate.spv'], allow_fail=True)
+spv_valid = rc == 0
+
+# ---------------------------------------------------------------- 4. plan
+parent_plan_text = PARENT_PLAN.read_text(encoding='utf-8-sig')
+base_path = BASELINE_SPV.as_posix()
+n_base = parent_plan_text.count(base_path)
+assert n_base == 16, 'baseline F10 SPV path occurs %d times in the plan' % n_base
+plan_text = parent_plan_text.replace(base_path, (S / 'candidate.spv').as_posix())
+assert plan_text.count('PASS ') == 232
+assert plan_text.count((S / 'candidate.spv').as_posix()) == 16
+(S / 'plan.txt').write_text(plan_text, encoding='utf-8')
+plan_sha = sha(S / 'plan.txt')
+
+rc, cpu_log = run([RUNNER, '--plan', S / 'plan.txt', '--cpu-check'], allow_fail=True)
+cpu_ok = rc == 0 and 'CPU_PLAN_OK' in cpu_log
+
+# the non-F10 PASS blocks must be byte-identical to the parent plan
+p_lines = parent_plan_text.splitlines()
+c_lines = plan_text.splitlines()
+assert len(p_lines) == len(c_lines)
+diff_lines = [i for i, (a, b) in enumerate(zip(p_lines, c_lines)) if a != b]
+only_f10 = all(BASELINE_SPV.as_posix() in p_lines[i] for i in diff_lines)
+
+# ---------------------------------------------------------------- 5. artifacts
+patch = list(difflib.unified_diff(parent_src.splitlines(keepends=True), cand.splitlines(keepends=True),
+                                  fromfile='A-parent/candidate.comp', tofile='B-n10/candidate.comp',
+                                  n=6))
+(S / 'SOURCE-DIFF.patch').write_text(''.join(patch), encoding='utf-8')
+
+# ------------------------------------------- mapping / lifetime / barrier proof
+# (a) staged layout is untouched: element (r,k) of a slice still lands at
+#     qkv_a_offset(r*64+k); adding the window base is a pure translation.
+def a_off(e):
+    r, k = e // 64, e % 64
+    return ((r // 8) * 4 + k // 16) * 128 + (k % 16) * 8 + r % 8
+
+cells = {}
+for r in range(64):
+    for k in range(64):
+        addr = a_off(r * 64 + k)
+        assert addr not in cells
+        cells[addr] = (r, k)
+assert set(cells) == set(range(4096)), 'staged slice is not a bijection'
+fragment_ok = 0
+for sg in range(8):
+    for abase in (0, 4096):
+        for m in ((sg // 2) * 16, (sg // 2) * 16 + 8):
+            for k0 in range(0, 64, 16):
+                base = abase + ((m // 8) * 4 + k0 // 16) * 128
+                for r in range(8):
+                    for c in range(16):
+                        assert cells[base - abase + c * 8 + r] == (m + r, k0 + c)
+                        fragment_ok += 1
+
+# (b) slice -> window map and the barrier that retires each window use
+slices = []
+window = 4096
+for i in range(8):
+    slices.append(dict(index=i, kc=64 * i, window=window))
+    window = 4096 - window
+uses = {}
+for s in slices:
+    uses.setdefault(s['window'], []).append(s['index'])
+retire = {}
+for w, idxs in uses.items():
+    retire[w] = []
+    for a, b in zip(idxs, idxs[1:]):
+        # the publish barrier of slice a+1 sits between the two uses of w
+        assert b - a >= 2, (w, a, b)
+        retire[w].append(dict(from_slice=a, to_slice=b, barrier_of_slice=a + 1))
+last_window = slices[-1]['window']
+barrier_check = dict(
+    slice_window=[dict(index=s['index'], kc=s['kc'], base=s['window']) for s in slices],
+    window_uses={str(k): v for k, v in uses.items()},
+    separation={str(k): v for k, v in retire.items()},
+    last_slice_window=last_window,
+    handoff_window=4096,
+    handoff_store_barrier=None,
+    note='odd slices stage into [0,4096); the last slice is odd, so the QKV handoff '
+         'stores in [4096,10240) are ordered behind the slice-7 publish barrier and '
+         'behind the existing post-store barrier only.')
+
+
+# (c) address hoist: tiled(token, 64i+c0, 512) == tiled(token, c0, 512) + 1024*i
+def tiled(token, c, C=512):
+    return ((token // 16) * (C // 16) + c // 16) * 256 + (token % 16) * 16 + c % 16
+
+
+hoist_checks = 0
+for token in range(1024):
+    base_c0 = [tiled(token, c0) for c0 in range(64)]
+    for i in range(8):
+        for c0 in range(64):
+            ref = tiled(token, 64 * i + c0)
+            assert base_c0[c0] + 1024 * i == ref, (token, i, c0, ref, base_c0[c0] + 1024 * i)
+            hoist_checks += 1
+# the same identity has to hold for the four quadrant token expressions, which only
+# differ in `token`; the loop above is therefore exhaustive over the formula.
+max_invalid_addr = 1024 * 7 + 192
+input_halves = 1179648 // 2
+assert max_invalid_addr < input_halves
+
+build = dict(
+    card='n10-f10-next',
+    family='F10',
+    pass_ordinals=[62, 66, 70, 74, 78, 82, 86, 90, 136, 140, 144, 148, 152, 156, 160, 164],
+    parent=dict(plan=ident(PARENT_PLAN), spv=ident(BASELINE_SPV), source=ident(BASELINE_SRC)),
+    parent_reproduction=dict(raw_sha256=parent_raw_sha, baseline_sha256=BASELINE_SPV_SHA,
+                             exact=PARENT_REPRO,
+                             note='glslang 16.5.0 -V --target-env vulkan1.3 with the site '
+                                  'include dir; no decoration transfer needed'),
+    candidate=dict(spv=ident(S / 'candidate.spv'), source=ident(S / 'candidate.comp')),
+    plan=dict(path=str(S / 'plan.txt'), sha256=plan_sha, parent_sha256=PARENT_PLAN_SHA,
+              passes_replaced=16, passes_in_plan=232, differing_lines=len(diff_lines),
+              only_f10_lines_changed=only_f10),
+    float_NC_checked=float_NC_checked,
+    nc_parent_ids=len(parent_nc),
+    nc_paired_ids=len(keep),
+    nc_candidate_raw_ids=len(cand_nc),
+    nc_histogram=nc_hist_parent,
+    nc_self_consistent=nc_self_consistent,
+    nc_multiset_equal=nc_multiset_equal,
+    nc_reemit_identical=nc_reemit_identical,
+    nc_operand_signature_mismatches=mismatch,
+    spirv_static=spirv_delta,
+    spv_validate_cpu=dict(ok=spv_valid, output=vlog.strip()[:400]),
+    cpu_check=dict(ok=cpu_ok, output=cpu_log.strip()),
+    proofs=dict(staged_slice_bijection=len(cells), fragment_addresses_checked=fragment_ok,
+                address_hoist_identity_checks=hoist_checks,
+                address_hoist_max_invalid_address=max_invalid_addr,
+                input_buffer_halves=input_halves,
+                barrier_lifetime=barrier_check),
+    edits=[dict(count=e['count'], before=e['before'][:400], after=e['after'][:400]) for e in edits],
+)
+(S / 'BUILD.json').write_text(json.dumps(build, indent=2), encoding='utf-8')
+
+print(json.dumps(dict(parent_repro=PARENT_REPRO,
+                      cand_spv_sha=sha(S / 'candidate.spv'),
+                      plan_sha=plan_sha,
+                      float_NC_checked=float_NC_checked,
+                      nc_parent=len(parent_nc), nc_cand_raw=len(cand_nc),
+                      nc_self_consistent=nc_self_consistent,
+                      nc_reemit_identical=nc_reemit_identical,
+                      nc_sig_mismatch=len(mismatch),
+                      spv_valid=spv_valid, cpu_ok=cpu_ok,
+                      diff_lines=len(diff_lines), only_f10=only_f10,
+                      fragment_checked=fragment_ok), indent=2))
+print(cpu_log.strip())

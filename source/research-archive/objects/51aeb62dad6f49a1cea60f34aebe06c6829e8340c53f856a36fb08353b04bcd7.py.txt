@@ -1,0 +1,150 @@
+"""N17B F20 ISA accounting (read-only): message composition of the ord-230 capture.
+
+Input (read-only, hashed below):
+  .../fullnet-continuous-20261027/queue/n17-f20-body/native/captures/native-native-base/ISA/
+      CS_asm76902ef344609c8a_simd32_0000000000000027_38_orig.asm
+  sha256 121a38aab2c6f26bb75eda1ec089a024cb21e2383c0471f4bf77c57cf248b8e1, kernel 76902ef344609c8a
+
+What it establishes (all counted, nothing inferred from source alone):
+  1. the instruction histogram and the `send` class histogram of the parent dispatch;
+  2. the per-class message cost of a cooperative-matrix fragment transfer, by dividing
+     each class count by the independent source-site inventory (loops unrolled):
+        load.slm.d32x8t   304 = 38 shared fragment loads  x 8
+        store.slm.d32x8t  160 = 20 shared fragment stores x 8
+        load.ugm.d32x8     40 = 40 LCOL weight-B loads    x 1
+        load.ugm.d32x8t    32 =  4 stride-0 H loads       x 8
+        store.ugm.d32x8t   96 = 12 debug fragment stores  x 8
+        load.ugm.d32x16t   36 =  4 C-fragment bias loads  x 9
+     The point of the last four lines: a *global* fragment load/store is NOT cheaper
+     than a shared one (8-9 messages vs 8) unless the tile is a contiguous LCOL
+     weight block, which is exactly why an SLM -> global variant cannot test the
+     marginal cost of a fragment transport (see PROBE-ANALYSIS.md section 2).
+  3. the derived dispatch arithmetic (169x97 WGs, 8 warps/WG, 131144 warps).
+Writes build/isa.json.
+"""
+import collections
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+CAMP = CARD.parent.parent
+W = pathlib.Path(r'@NR_WORKSPACE@')
+ISA = CAMP / 'queue/n17-f20-body/native/captures/native-native-base/ISA/CS_asm76902ef344609c8a_simd32_0000000000000027_38_orig.asm'
+ISA_SHA = '121a38aab2c6f26bb75eda1ec089a024cb21e2383c0471f4bf77c57cf248b8e1'
+
+# source-site inventory of the parent kernel (cooperative-matrix transfers), with the
+# loops already unrolled by IGC: (kind, sites, source lines)
+SITES = {
+    'shared_fragment_loads': dict(sites=38, source='coopMatLoad from shArena/shX/shY: '
+                                  'stage1 A 8 (2 rounds x 2 ki x 2 blocks), stage3 A 8 + seed 2, '
+                                  'stage6 Q 2 + K 4, stage8 V 8, stage9 seed 2'),
+    'shared_fragment_stores': dict(sites=20, source='coopMatStore to shArena/shY/shX: '
+                                   'stage1 M 8 (2 rounds x 4), stage2/3 Y 2, stage4 QKV 6, '
+                                   'stage8 debug ctx 2 (debug-only), stage9 O 2'),
+    'weight_B_loads': dict(sites=40, source='coopMatLoad(b, wb, ..., LCOL): stage1 2x2x2, '
+                          'stage3 2x8, stage4 2x2x3, stage9 2x2'),
+    'H_stride0_loads': dict(sites=4, source='coopMatLoad(scale, wb, ..., stride 0, LROW): '
+                           'stage3 x2, stage9 x2'),
+    'debug_fragment_stores': dict(sites=12, source='coopMatStore(..., dbg, ...): stage1 4x2, '
+                                 'stage8 1x4'),
+    'C_fragment_loads': dict(sites=4, source='coopMatLoad(bias, fb, ..., LROW): stage6 2x2'),
+}
+
+LINE = re.compile(r'^/\* \[([0-9A-F]+)\]\s+\*/\s+(?P<body>.*)$')
+
+
+def parse_kind(body):
+    """instruction mnemonic + optional message annotation."""
+    b = body.strip()
+    ann = ''
+    if '//' in b:
+        b, ann = b.split('//', 1)
+        ann = ann.strip()
+    toks = b.split()
+    while toks and toks[0].startswith('(') and toks[0].endswith(')'):
+        toks = toks[1:]              # execution-mode / predicate prefix: (W), (W&f0.0), ...
+    if not toks:
+        return None, ''
+    mnem = toks[0]
+    return mnem, ann
+
+
+def main():
+    data = ISA.read_bytes()
+    sha = hashlib.sha256(data).hexdigest()
+    assert sha == ISA_SHA, 'ISA capture sha changed: ' + sha
+    text = data.decode('utf-8', 'replace')
+
+    hist = collections.Counter()
+    sends = collections.Counter()
+    syncs = collections.Counter()
+    regs = set()
+    n = 0
+    for line in text.splitlines():
+        m = LINE.match(line)
+        if not m:
+            continue
+        n += 1
+        mnem, ann = parse_kind(m.group('body'))
+        hist[mnem] += 1
+        if mnem in ('send.slm', 'send.ugm', 'send.gtwy'):
+            cls = ann.split(';', 1)[-1].strip() if ';' in ann else ann
+            sends['%s %s' % (mnem, cls)] += 1
+        if mnem.startswith('sync') or mnem.startswith('fence'):
+            syncs[mnem] += 1
+        for r in re.findall(r'\br(\d+)(?:\.\d+)?', m.group('body')):
+            regs.add(int(r))
+
+    res = {'isa': str(ISA), 'isa_sha256': sha, 'kernel': '76902ef344609c8a', 'ordinal': 230,
+           'instructions': n, 'distinct_registers': len(regs),
+           'max_register': max(regs) if regs else None,
+           'instruction_histogram': dict(hist.most_common()),
+           'send_histogram': dict(sends.most_common()),
+           'sync_histogram': dict(syncs.most_common()),
+           'send_total': sum(sends.values())}
+
+    # per-class message cost, cross-checked against the unrolled source inventory
+    checks = [
+        ('send.slm load.slm.d32x8t.a32', 'shared_fragment_loads', 304),
+        ('send.slm store.slm.d32x8t.a32', 'shared_fragment_stores', 160),
+        ('send.ugm load.ugm.d32x8.a32.bss[a0.0]', 'weight_B_loads', 40),
+        ('send.ugm load.ugm.d32x8t.a32.bss[a0.0]', 'H_stride0_loads', 32),
+        ('send.ugm store.ugm.d32x8t.a32.bss[a0.0]', 'debug_fragment_stores', 96),
+        ('send.ugm load.ugm.d32x16t.a32.bss[a0.0]', 'C_fragment_loads', 36),
+    ]
+    per_class = {}
+    for key, site_key, expected in checks:
+        got = sends.get(key, 0)
+        sites = SITES[site_key]['sites']
+        per_class[key] = {'messages': got, 'source_sites': sites,
+                          'messages_per_site': (got / sites) if sites else None,
+                          'expected_messages': expected, 'matches': got == expected,
+                          'source': SITES[site_key]['source']}
+    res['fragment_transfer_cost'] = per_class
+    res['all_checks_match'] = all(v['matches'] for v in per_class.values())
+
+    # debug-only population (uniform debug==0 at runtime, p0.z = 0)
+    debug_only = (sends.get('send.ugm store.ugm.d32x8t.a32.bss[a0.0]', 0)
+                  + sends.get('send.ugm store.ugm.d16u32.a32.bss[a0.0]', 0))
+    res['runtime_messages_per_warp'] = res['send_total'] - debug_only
+    res['debug_only_messages'] = debug_only
+    res['dispatch'] = {'workgroups': 169 * 97, 'warps_per_wg': 256 // 32,
+                       'warps': 169 * 97 * 8,
+                       'runtime_messages': (res['send_total'] - debug_only) * 169 * 97 * 8,
+                       'instructions_total': n * 169 * 97 * 8}
+    (CARD / 'build').mkdir(exist_ok=True)
+    (CARD / 'build/isa.json').write_text(json.dumps(res, indent=1), encoding='utf-8')
+    print(json.dumps({'instructions': n, 'send_total': res['send_total'],
+                      'runtime_messages_per_warp': res['runtime_messages_per_warp'],
+                      'all_checks_match': res['all_checks_match'],
+                      'fragment_transfer_cost': {k: [v['messages'], v['source_sites'],
+                                                     v['messages_per_site']]
+                                                 for k, v in per_class.items()},
+                      'top_instructions': dict(hist.most_common(12))}, indent=1))
+
+
+if __name__ == '__main__':
+    main()

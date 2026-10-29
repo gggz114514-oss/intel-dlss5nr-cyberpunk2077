@@ -1,0 +1,688 @@
+"""S13: temporal stability + error attribution of the 8-frame autonomous-feedback chain.
+
+CPU/offline only.  Reads captured FP16 outputs (the reference), the measured feedback
+chain outputs, the independent-frame (captured-history) candidate outputs and the
+corrected-INT8-base chain, and writes FEEDBACK-TEMPORAL.json.
+
+Reference definition (do not restate differently): the same frame's *captured FP16
+network output* replayed with the captured FP16 history -- a teacher/relative
+reference, NOT ground truth and NOT an HR target.
+
+All metrics are computed per frame and per transition; nothing here is a GPU result.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import sys
+from pathlib import Path
+
+import numpy as np
+
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029"
+S13 = W / "S13-quality"
+QA = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+DS = QA / "dataset"
+C64 = QA / "real-int8-24/c64-family-static"
+BASE = QA / "real-int8-24"
+
+SEQ = "day-street-static-formal-01"
+FRAMES = list(range(34189, 34197))
+H, WD = 720, 1280
+PLANE_FLOATS = H * WD * 4
+OUT_BYTES = 2 * PLANE_FLOATS * 4
+PEAK = 1.0
+TILE = 8  # 8x8 tile grid -> 90 x 160 pixels per tile
+
+
+# --------------------------------------------------------------------------- io
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_output(path: Path) -> np.ndarray:
+    if path.stat().st_size != OUT_BYTES:
+        raise SystemExit(f"{path}: {path.stat().st_size} bytes, expected {OUT_BYTES}")
+    return np.fromfile(path, dtype="<f4").reshape(2, H, WD, 4)
+
+
+def luma(rgb: np.ndarray) -> np.ndarray:
+    return (0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]).astype(np.float32)
+
+
+def laplacian_energy(img: np.ndarray) -> float:
+    """Mean squared 3x3 Laplacian on interior pixels (spatial HF energy)."""
+    lap = (4.0 * img[1:-1, 1:-1] - img[:-2, 1:-1] - img[2:, 1:-1]
+           - img[1:-1, :-2] - img[1:-1, 2:])
+    return float(np.mean(lap.astype(np.float64) ** 2))
+
+
+def gradient_magnitude(img: np.ndarray) -> np.ndarray:
+    gx = np.zeros_like(img)
+    gy = np.zeros_like(img)
+    gx[:, 1:-1] = 0.5 * (img[:, 2:] - img[:, :-2])
+    gy[1:-1, :] = 0.5 * (img[2:, :] - img[:-2, :])
+    return np.hypot(gx, gy)
+
+
+def psnr_from_mse(mse: float) -> float:
+    return float(-10.0 * math.log10(max(mse, 1e-30)))
+
+
+def part1(x: np.ndarray, mask: np.ndarray) -> float:
+    return float(np.mean(x[mask].astype(np.float64) ** 2)) if mask.any() else 0.0
+
+
+def share(x: np.ndarray, mask: np.ndarray) -> float:
+    tot = float(np.sum(x.astype(np.float64) ** 2))
+    if tot <= 0.0:
+        return 0.0
+    return float(np.sum(x[mask].astype(np.float64) ** 2)) / tot
+
+
+# --------------------------------------------------------------------- arms
+def arm_table() -> dict:
+    head_chain = C64 / "run-34189/replayed-network.bin"
+    head_base = BASE / "run-34189/replayed-network.bin"
+    return {
+        "reference": {
+            "label": "captured FP16 network output (same frame, captured FP16 history)",
+            "paths": {f: DS / SEQ / f"0-{f}/network-output.bin" for f in FRAMES},
+            "kind": "REFERENCE_NOT_GROUND_TRUTH",
+        },
+        "chain": {
+            "label": "autonomous feedback chain, current candidate (c64-family-static)",
+            "paths": {f: (S13 / f"runs-static01/run-{f}/feedback-network.bin") if f != FRAMES[0] else head_chain
+                      for f in FRAMES},
+            "kind": "MEASURED_GPU_CHAIN",
+        },
+        "single": {
+            "label": "same candidate, independent frame replay with captured FP16 history",
+            "paths": {f: C64 / f"run-{f}/replayed-network.bin" for f in FRAMES},
+            "kind": "MEASURED_GPU_SINGLE_FRAME",
+        },
+        "base_chain": {
+            "label": "corrected INT8 base, autonomous feedback chain",
+            "paths": {f: (S13 / f"base-int8-runs/run-{f}/feedback-network.bin") if f != FRAMES[0] else head_base
+                      for f in FRAMES},
+            "kind": "MEASURED_GPU_CHAIN",
+        },
+        "base_single": {
+            "label": "corrected INT8 base, independent frame replay with captured FP16 history",
+            "paths": {f: BASE / f"run-{f}/replayed-network.bin" for f in FRAMES},
+            "kind": "MEASURED_GPU_SINGLE_FRAME",
+        },
+    }
+
+
+ARM_ORDER = ["reference", "chain", "single", "base_chain", "base_single"]
+
+
+# --------------------------------------------------------------- per frame
+def frame_metrics(cand: np.ndarray, ref: np.ndarray) -> dict:
+    app = cand[0, :, :, :3].astype(np.float32)
+    hist = cand[1, :, :, :3].astype(np.float32)
+    rapp = ref[0, :, :, :3].astype(np.float32)
+    rhist = ref[1, :, :, :3].astype(np.float32)
+
+    e = app.astype(np.float64) - rapp.astype(np.float64)
+    mse = float(np.mean(e * e))
+    mse_c = [float(np.mean(e[..., c] ** 2)) for c in range(3)]
+    bias = [float(np.mean(e[..., c])) for c in range(3)]
+    var_c = [float(np.var(e[..., c])) for c in range(3)]
+    dc_energy = float(sum(b * b for b in bias))
+    eh = hist.astype(np.float64) - rhist.astype(np.float64)
+    mse_h = float(np.mean(eh * eh))
+    bias_h = [float(np.mean(eh[..., c])) for c in range(3)]
+
+    lum = luma(app)
+    ref_lum = luma(rapp)
+    e_lum = lum.astype(np.float64) - ref_lum.astype(np.float64)
+    hf_ref = laplacian_energy(ref_lum)
+    hf_arm = laplacian_energy(lum)
+
+    # tiles
+    err2 = (e * e).mean(axis=2)
+    tiles = err2.reshape(TILE, H // TILE, TILE, WD // TILE).mean(axis=(1, 3))
+    flat = np.sort(tiles.ravel())[::-1]
+    total = float(tiles.sum())
+    top5_share = float(flat[:5].sum() / total) if total > 0 else 0.0
+
+    # texture bands from the reference luma gradient
+    grad = gradient_magnitude(ref_lum)
+    q1, q2 = np.percentile(grad, [33.333, 66.667])
+    bands = {
+        "flat_low_gradient": grad <= q1,
+        "mid_gradient": (grad > q1) & (grad <= q2),
+        "textured_high_gradient": grad > q2,
+    }
+    band_stats = {}
+    for name, mask in bands.items():
+        band_stats[name] = {
+            "pixel_share": float(mask.mean()),
+            "error_energy_share": share(e_lum, mask),
+            "error_rms": float(np.sqrt(part1(e_lum, mask))),
+        }
+
+    # error vs reference DC level (dark / mid / bright pixels of the reference)
+    ref_dc = ref_lum
+    level_bands = {
+        "dark_lt_0.10": ref_dc < 0.10,
+        "mid_0.10_0.60": (ref_dc >= 0.10) & (ref_dc < 0.60),
+        "bright_ge_0.60": ref_dc >= 0.60,
+    }
+    level_stats = {}
+    for name, mask in level_bands.items():
+        level_stats[name] = {
+            "pixel_share": float(mask.mean()),
+            "error_energy_share": share(e_lum, mask),
+            "error_rms": float(np.sqrt(part1(e_lum, mask))),
+        }
+
+    return {
+        "psnr_app_db": psnr_from_mse(mse),
+        "mse_app": mse,
+        "rmse_app": math.sqrt(mse),
+        "mae_app": float(np.mean(np.abs(e))),
+        "psnr_rgb_db": [psnr_from_mse(m) for m in mse_c],
+        "mse_rgb": mse_c,
+        "bias_rgb": bias,
+        "var_rgb": var_c,
+        "dc_energy_share": dc_energy / mse if mse > 0 else 0.0,
+        "ac_energy_share": 1.0 - (dc_energy / mse if mse > 0 else 0.0),
+        "psnr_hist_db": psnr_from_mse(mse_h),
+        "mse_hist": mse_h,
+        "bias_hist_rgb": bias_h,
+        "history_plane_error_rms": math.sqrt(mse_h),
+        "hist_minus_app_rms": float(np.sqrt(np.mean((hist.astype(np.float64) - app.astype(np.float64)) ** 2))),
+        "hf_luma_energy": hf_arm,
+        "hf_ref_energy": hf_ref,
+        "hf_ratio_db": float(10.0 * math.log10(max(hf_arm, 1e-30) / max(hf_ref, 1e-30))),
+        "hf_error_ratio_db": float(10.0 * math.log10(max(laplacian_energy(e_lum.astype(np.float32)), 1e-30)
+                                                    / max(hf_ref, 1e-30))),
+        "tile_mse_8x8": [[float(v) for v in row] for row in tiles],
+        "tile_top5_energy_share": top5_share,
+        "tile_top5_cells": [f"{i//TILE},{i%TILE}" for i in np.argsort(tiles.ravel())[::-1][:5]],
+        "error_by_texture_band": band_stats,
+        "error_by_reference_level": level_stats,
+        "_app": app, "_hist": hist, "_ref_app": rapp, "_ref_hist": rhist,
+        "_luma": lum, "_ref_luma": ref_lum, "_e_luma": e_lum,
+    }
+
+
+# ------------------------------------------------------------- transitions
+def transition_metrics(cur: dict, prev: dict) -> dict:
+    d_arm = cur["_luma"].astype(np.float64) - prev["_luma"].astype(np.float64)
+    d_ref = cur["_ref_luma"].astype(np.float64) - prev["_ref_luma"].astype(np.float64)
+    e_cur = cur["_e_luma"]
+    e_prev = prev["_e_luma"]
+    e_delta = e_cur.astype(np.float64) - e_prev.astype(np.float64)
+
+    energy_arm = float(np.mean(d_arm * d_arm))
+    energy_ref = float(np.mean(d_ref * d_ref))
+    energy_res = float(np.mean(e_delta * e_delta))
+    err_energy = float(np.mean(e_cur.astype(np.float64) ** 2))
+    err_energy_prev = float(np.mean(e_prev.astype(np.float64) ** 2))
+
+    denom = math.sqrt(max(err_energy * err_energy_prev, 1e-30))
+    persistence = float(np.mean(e_cur.astype(np.float64) * e_prev)) / denom if denom > 0 else 0.0
+
+    lag_signal = prev["_ref_luma"].astype(np.float64) - cur["_ref_luma"].astype(np.float64)
+    lag_energy = float(np.mean(lag_signal * lag_signal))
+    beta = (float(np.mean(e_cur.astype(np.float64) * lag_signal)) / lag_energy) if lag_energy > 1e-12 else 0.0
+    lag_denom = math.sqrt(max(err_energy * lag_energy, 1e-30))
+    lag_corr = float(np.mean(e_cur.astype(np.float64) * lag_signal) / lag_denom) if lag_denom > 0 else 0.0
+
+    rgb_delta = cur["_app"].astype(np.float64) - prev["_app"].astype(np.float64)
+    hist_delta = cur["_hist"].astype(np.float64) - prev["_hist"].astype(np.float64)
+    ref_hist_delta = cur["_ref_hist"].astype(np.float64) - prev["_ref_hist"].astype(np.float64)
+
+    hf_diff_arm = laplacian_energy(d_arm.astype(np.float32))
+    hf_diff_ref = laplacian_energy(d_ref.astype(np.float32))
+    hf_res = laplacian_energy(e_delta.astype(np.float32))
+
+    # how much of the reference frame-to-frame change survives in the candidate
+    dref_energy = float(np.mean(d_ref * d_ref))
+    slope = (float(np.mean(d_arm * d_ref)) / dref_energy) if dref_energy > 1e-12 else 0.0
+    d_corr = (float(np.mean(d_arm * d_ref))
+              / math.sqrt(max(energy_arm * dref_energy, 1e-30))) if dref_energy > 0 else 0.0
+
+    # error conditioned on where the reference actually moved (top decile of |ref diff|)
+    moving = np.abs(d_ref) > np.percentile(np.abs(d_ref), 90.0)
+    moving_share = float(moving.mean())
+    err_moving = float(np.mean(e_cur[moving].astype(np.float64) ** 2)) if moving.any() else 0.0
+    err_static = float(np.mean(e_cur[~moving].astype(np.float64) ** 2)) if (~moving).any() else 0.0
+
+    return {
+        "frame_diff_slope_vs_reference": slope,
+        "frame_diff_corr_vs_reference": d_corr,
+        "moving_pixel_share_top_decile": moving_share,
+        "error_rms_moving_pixels": math.sqrt(err_moving),
+        "error_rms_static_pixels": math.sqrt(err_static),
+        "error_energy_share_moving_pixels": share(e_cur, moving),
+        "error_energy_share_static_pixels": 1.0 - share(e_cur, moving),
+        "ref_temporal_energy_luma": energy_ref,
+        "ref_temporal_rms_luma": math.sqrt(energy_ref),
+        "arm_temporal_energy_luma": energy_arm,
+        "arm_temporal_rms_luma": math.sqrt(energy_arm),
+        "temporal_energy_ratio": energy_arm / energy_ref if energy_ref > 0 else None,
+        "rgb_temporal_rms": float(np.sqrt(np.mean(rgb_delta * rgb_delta))),
+        "temporal_consistency_psnr_db": psnr_from_mse(energy_res),
+        "error_temporal_rms": math.sqrt(energy_res),
+        "error_temporal_ratio": math.sqrt(energy_res / err_energy) if err_energy > 0 else None,
+        "error_rms_luma": math.sqrt(err_energy),
+        "error_persistence_corr": persistence,
+        "ghost_lag_beta": beta,
+        "ghost_lag_corr": lag_corr,
+        "hf_frame_diff_ratio_db": float(10.0 * math.log10(max(hf_diff_arm, 1e-30) / max(hf_diff_ref, 1e-30))),
+        "hf_error_residual_over_ref_diff_db": float(
+            10.0 * math.log10(max(hf_res, 1e-30) / max(hf_diff_ref, 1e-30))),
+        "history_plane_temporal_rms": float(np.sqrt(np.mean(hist_delta * hist_delta))),
+        "ref_history_plane_temporal_rms": float(np.sqrt(np.mean(ref_hist_delta * ref_hist_delta))),
+        "history_plane_temporal_ratio": float(np.sqrt(np.mean(hist_delta * hist_delta))
+                                              / max(math.sqrt(np.mean(ref_hist_delta * ref_hist_delta)), 1e-30)),
+    }
+
+
+# ------------------------------------------------------- history substitution
+def history_substitution(chain_path: Path, next_capture_pre: Path | None, ref_hist_prev, ref_hist_cur) -> dict:
+    """Distance between the history plane the chain would feed forward and the plane the
+    next frame actually consumed (definition used for the first-step feedback distance)."""
+    plane = np.fromfile(chain_path, dtype="<f4", count=PLANE_FLOATS, offset=PLANE_FLOATS * 4)
+    h = plane.reshape(H, WD, 4)[:, :, :3]
+    out = {
+        "chain_history_plane_rms_vs_reference": float(np.sqrt(np.mean((h - ref_hist_cur) ** 2))),
+    }
+    if next_capture_pre is not None and next_capture_pre.is_file():
+        consumed = np.fromfile(next_capture_pre, dtype="<f4", count=PLANE_FLOATS, offset=14745680)
+        c = consumed.reshape(H, WD, 4)[:, :, :3]
+        d = (h - c).astype(np.float64)
+        out["fed_history_vs_consumed_history_rms"] = float(np.sqrt(np.mean(d * d)))
+        out["fed_history_vs_consumed_history_psnr_db"] = psnr_from_mse(float(np.mean(d * d)))
+        out["fed_history_vs_consumed_bias_rgb"] = [float(np.mean(d[..., i])) for i in range(3)]
+        out["fed_history_vs_reference_history_rms"] = float(np.sqrt(np.mean((c - ref_hist_cur) ** 2)))
+    return out
+
+
+def history_delta_luma(prev_chain_path: Path, capture_pre_path: Path) -> np.ndarray:
+    """Luma difference between the history the chain actually fed to frame k (its own previous
+    output history plane) and the history that frame k consumed in the capture (FP16)."""
+    fed = np.fromfile(prev_chain_path, dtype="<f4", count=PLANE_FLOATS,
+                      offset=PLANE_FLOATS * 4).reshape(H, WD, 4)[:, :, :3]
+    consumed = np.fromfile(capture_pre_path, dtype="<f4", count=PLANE_FLOATS,
+                           offset=14745680).reshape(H, WD, 4)[:, :, :3]
+    return luma(fed.astype(np.float32)) - luma(consumed.astype(np.float32))
+
+
+# --------------------------------------------------------------- attribution
+def attribution(chain: dict, single: dict) -> dict:
+    """Exact three-term split of the chain error.  Same frame, same plan, one variable
+    changed (the history plane) => the delta is causally attributable to that substitution
+    for this frame's output; it says nothing about which weights produce it.
+
+    e_chain = e_single + de   (exactly)
+    MSE_chain = MSE_single + ||de||^2 + 2<e_single, de>
+      - MSE increase share  : (MSE_chain - MSE_single)/MSE_chain  (how much of the error the
+                              substitution added)
+      - new component share : ||de||^2/MSE_chain  (a genuinely new error pattern)
+      - alignment share     : 2<e_single,de>/MSE_chain  (the substitution pushing the existing
+                              error further in its own direction)
+    """
+    e1 = (chain["_app"] - chain["_ref_app"]).astype(np.float64)
+    e2 = (single["_app"] - single["_ref_app"]).astype(np.float64)
+    de = e1 - e2
+    n1 = float(np.mean(e1 * e1))
+    n2 = float(np.mean(e2 * e2))
+    nd = float(np.mean(de * de))
+    cross = float(np.mean(e1 * e2))
+    two = 2.0 * (cross - n2)
+    out = {
+        "mse_chain": n1,
+        "mse_single_captured_history": n2,
+        "new_component_energy": nd,
+        "cross_term_2_esingle_de": two,
+        "identity_check_reconstructed_mse": n2 + nd + two,
+        "mse_increase_share": (n1 - n2) / n1 if n1 > 0 else None,
+        "new_component_share": nd / n1 if n1 > 0 else None,
+        "alignment_share": two / n1 if n1 > 0 else None,
+        "corr_esingle_de": (float(np.mean(e2 * de))
+                            / math.sqrt(max(n2 * nd, 1e-30))) if nd > 0 else None,
+        "per_channel": {},
+        "texture_band_delta": {},
+        "tiles_delta": None,
+    }
+    total_delta_ch = sum(float(np.mean(de[..., c] ** 2)) for c in range(3))
+    for c, name in enumerate("RGB"):
+        a = float(np.mean(e1[..., c] ** 2))
+        b = float(np.mean(e2[..., c] ** 2))
+        d = float(np.mean(de[..., c] ** 2))
+        out["per_channel"][name] = {
+            "mse_chain": a, "mse_single": b, "mse_delta": d,
+            "mse_increase_share": (a - b) / a if a > 0 else None,
+            "new_component_share_of_total_delta": d / total_delta_ch if total_delta_ch > 0 else None,
+            "bias_chain": float(np.mean(e1[..., c])),
+            "bias_single": float(np.mean(e2[..., c])),
+            "bias_delta": float(np.mean(de[..., c])),
+            "var_chain": float(np.var(e1[..., c])),
+            "var_single": float(np.var(e2[..., c])),
+        }
+    e1_l = chain["_e_luma"]
+    de_l = e1_l.astype(np.float64) - single["_e_luma"].astype(np.float64)
+    grad = gradient_magnitude(chain["_ref_luma"])
+    q1, q2 = np.percentile(grad, [33.333, 66.667])
+    for name, mask in {"flat_low_gradient": grad <= q1,
+                       "mid_gradient": (grad > q1) & (grad <= q2),
+                       "textured_high_gradient": grad > q2}.items():
+        out["texture_band_delta"][name] = {
+            "pixel_share": float(mask.mean()),
+            "delta_energy_share": share(de_l, mask),
+            "chain_error_share": share(e1_l, mask),
+            "single_error_share": share(single["_e_luma"], mask),
+        }
+    d2 = (de * de).mean(axis=2)
+    delta_tiles = d2.reshape(TILE, H // TILE, TILE, WD // TILE).mean(axis=(1, 3))
+    order = np.argsort(delta_tiles.ravel())[::-1]
+    out["tiles_delta"] = {
+        "tile_mse_delta_8x8": [[float(v) for v in row] for row in delta_tiles],
+        "top5_cells": [f"{i//TILE},{i%TILE}" for i in order[:5]],
+        "top5_energy_share": float(np.sort(delta_tiles.ravel())[::-1][:5].sum() / delta_tiles.sum())
+        if delta_tiles.sum() > 0 else None,
+        "worst_cell_value": float(delta_tiles.ravel()[order[0]]),
+    }
+    return out
+
+
+# --------------------------------------------------------------------- main
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", type=Path, default=S13 / "FEEDBACK-TEMPORAL.json")
+    args = ap.parse_args(argv)
+
+    arms = arm_table()
+    paths = {name: arms[name]["paths"] for name in ARM_ORDER}
+    for name in ARM_ORDER:
+        for f in FRAMES:
+            if not paths[name][f].is_file():
+                raise SystemExit(f"missing {name} frame {f}: {paths[name][f]}")
+
+    per_frame = []
+    per_transition = []
+    prev = {}
+    prev_hist_ref = None
+    history_rows = []
+
+    for idx, f in enumerate(FRAMES):
+        ref = load_output(paths["reference"][f])
+        row = {"frame": f, "arms": {}}
+        cur = {}
+        for name in ARM_ORDER:
+            cand = load_output(paths[name][f])
+            m = frame_metrics(cand, ref)
+            cur[name] = m
+            row["arms"][name] = {k: v for k, v in m.items() if not k.startswith("_")}
+        # history substitution distances (chain feeds its own output history forward)
+        ref_hist_cur = cur["reference"]["_ref_hist"]
+        sub = history_substitution(paths["chain"][f],
+                                   DS / SEQ / f"0-{FRAMES[idx + 1]}/pre.bin" if idx + 1 < len(FRAMES) else None,
+                                   prev_hist_ref, ref_hist_cur)
+        history_rows.append({"frame": f, "chain_output_history": sub,
+                             "chain_hist_rms_vs_reference": cur["chain"]["history_plane_error_rms"]})
+        row["history_substitution"] = sub
+
+        # exact error decomposition against the single-frame (captured-history) arm
+        row["attribution_chain_vs_single"] = attribution(cur["chain"], cur["single"])
+        row["attribution_basechain_vs_basesingle"] = attribution(cur["base_chain"], cur["base_single"])
+
+        # coupling: does the injected history delta explain the history-induced output delta?
+        if idx > 0:
+            delta_h = history_delta_luma(paths["chain"][FRAMES[idx - 1]],
+                                         DS / SEQ / f"0-{f}/pre.bin")
+            de_l = cur["chain"]["_e_luma"].astype(np.float64) - cur["single"]["_e_luma"].astype(np.float64)
+            dh = delta_h.astype(np.float64)
+            eh = float(np.mean(dh * dh))
+            ed = float(np.mean(de_l * de_l))
+            cross_hd = float(np.mean(dh * de_l))
+            row["history_coupling"] = {
+                "injected_history_delta_rms_luma": math.sqrt(eh),
+                "output_error_delta_rms_luma": math.sqrt(ed),
+                "corr_injected_history_vs_error_delta": (cross_hd / math.sqrt(max(eh * ed, 1e-30)))
+                if eh > 0 and ed > 0 else None,
+                "regression_gain_error_on_history": cross_hd / eh if eh > 0 else None,
+                "explained_error_delta_fraction_r2": (cross_hd * cross_hd) / (eh * ed) if eh > 0 and ed > 0 else None,
+            }
+        if idx > 0:
+            tr = {"from": FRAMES[idx - 1], "to": f, "arms": {}}
+            for name in ARM_ORDER:
+                if name == "reference":
+                    continue
+                tr["arms"][name] = transition_metrics(cur[name], prev[name])
+            # motion-masked attribution: error where the reference moved (top decile)
+            d_ref_lum = (cur["reference"]["_ref_luma"].astype(np.float64)
+                         - prev["reference"]["_ref_luma"].astype(np.float64))
+            moving = np.abs(d_ref_lum) > np.percentile(np.abs(d_ref_lum), 90.0)
+            de_l = cur["chain"]["_e_luma"].astype(np.float64) - cur["single"]["_e_luma"].astype(np.float64)
+            tr["motion_masked"] = {
+                "moving_pixel_share": float(moving.mean()),
+                "error_energy_share_moving": {
+                    name: share(cur[name]["_e_luma"], moving) for name in ARM_ORDER if name != "reference"},
+                "history_induced_delta_energy_share_moving": share(de_l, moving),
+                "history_induced_delta_rms_moving": math.sqrt(part1(de_l, moving)),
+                "history_induced_delta_rms_static": math.sqrt(part1(de_l, ~moving)),
+                "chain_error_rms_moving": math.sqrt(part1(cur["chain"]["_e_luma"], moving)),
+                "chain_error_rms_static": math.sqrt(part1(cur["chain"]["_e_luma"], ~moving)),
+            }
+            per_transition.append(tr)
+            row["temporal"] = {k: v for k, v in tr["arms"].items()}
+            row["motion_masked"] = tr["motion_masked"]
+        per_frame.append(row)
+        prev = cur
+
+    # ------------------------------------------------------------ summaries
+    def series(name, key):
+        return [r["arms"][name][key] for r in per_frame if key in r["arms"][name]]
+
+    summary = {}
+    for name in ARM_ORDER:
+        if name == "reference":
+            continue
+        psnrs = series(name, "psnr_app_db")
+        hps = series(name, "psnr_hist_db")
+        slopes = {}
+        for label, vals in (("psnr_app_db", psnrs), ("psnr_hist_db", hps)):
+            x = np.arange(len(vals))
+            slopes[label] = float(np.polyfit(x, vals, 1)[0])
+        summary[name] = {
+            "mean_psnr_app_db": float(np.mean(psnrs)),
+            "min_psnr_app_db": float(np.min(psnrs)),
+            "max_psnr_app_db": float(np.max(psnrs)),
+            "psnr_app_db": [round(v, 6) for v in psnrs],
+            "mean_psnr_hist_db": float(np.mean(hps)),
+            "psnr_hist_db": [round(v, 6) for v in hps],
+            "psnr_slope_db_per_frame": slopes,
+            "mean_bias_rgb": [float(np.mean([r["arms"][name]["bias_rgb"][c] for r in per_frame])) for c in range(3)],
+            "bias_rgb_per_frame": [[round(r["arms"][name]["bias_rgb"][c], 6) for c in range(3)] for r in per_frame],
+            "mean_dc_energy_share": float(np.mean([r["arms"][name]["dc_energy_share"] for r in per_frame])),
+            "mean_tile_top5_energy_share": float(np.mean(
+                [r["arms"][name]["tile_top5_energy_share"] for r in per_frame])),
+            "mean_hf_ratio_db": float(np.mean([r["arms"][name]["hf_ratio_db"] for r in per_frame])),
+            "mean_hf_error_ratio_db": float(np.mean([r["arms"][name]["hf_error_ratio_db"] for r in per_frame])),
+        }
+
+    temporal_summary = {}
+    for name in ["chain", "single", "base_chain", "base_single"]:
+        rows = [t["arms"][name] for t in per_transition]
+        temporal_summary[name] = {
+            "mean_ref_temporal_rms_luma": float(np.mean([r["ref_temporal_rms_luma"] for r in rows])),
+            "mean_arm_temporal_rms_luma": float(np.mean([r["arm_temporal_rms_luma"] for r in rows])),
+            "temporal_energy_ratio_per_transition": [round(r["temporal_energy_ratio"], 6) for r in rows],
+            "mean_temporal_energy_ratio": float(np.mean([r["temporal_energy_ratio"] for r in rows])),
+            "mean_temporal_consistency_psnr_db": float(np.mean([r["temporal_consistency_psnr_db"] for r in rows])),
+            "mean_error_temporal_rms": float(np.mean([r["error_temporal_rms"] for r in rows])),
+            "mean_error_temporal_ratio": float(np.mean([r["error_temporal_ratio"] for r in rows])),
+            "mean_error_persistence_corr": float(np.mean([r["error_persistence_corr"] for r in rows])),
+            "mean_ghost_lag_corr": float(np.mean([r["ghost_lag_corr"] for r in rows])),
+            "mean_ghost_lag_beta": float(np.mean([r["ghost_lag_beta"] for r in rows])),
+            "mean_hf_frame_diff_ratio_db": float(np.mean([r["hf_frame_diff_ratio_db"] for r in rows])),
+            "mean_hf_error_residual_over_ref_diff_db": float(np.mean(
+                [r["hf_error_residual_over_ref_diff_db"] for r in rows])),
+            "mean_history_plane_temporal_ratio": float(np.mean([r["history_plane_temporal_ratio"] for r in rows])),
+        }
+
+    # reference motion proxy from the *input* colour plane (scene motion, input side)
+    input_motion = []
+    prev_in = None
+    for f in FRAMES:
+        raw = np.fromfile(DS / SEQ / f"0-{f}/pre.bin", dtype="<f4", count=PLANE_FLOATS)
+        rgb = raw.reshape(H, WD, 4)[:, :, :3]
+        lum = luma(rgb.astype(np.float32))
+        if prev_in is not None:
+            d = lum.astype(np.float64) - prev_in.astype(np.float64)
+            input_motion.append({"frame": f, "input_color_temporal_rms_luma": float(np.sqrt(np.mean(d * d)))})
+        prev_in = lum
+    input_motion_json = {
+        "rows": input_motion,
+        "mean_rms": float(np.mean([r["input_color_temporal_rms_luma"] for r in input_motion])),
+    }
+
+    # --------------------------------------------------------------- verdict
+    chain_psnr = series("chain", "psnr_app_db")
+    single_psnr = series("single", "psnr_app_db")
+    ts = temporal_summary["chain"]
+    ref_motion = float(np.mean([r["ref_temporal_rms_luma"] for t in per_transition for r in [t["arms"]["chain"]]]))
+    att = [r["attribution_chain_vs_single"] for r in per_frame[1:]]
+    flags = {
+        "psnr_gap_chain_vs_single_db": float(np.mean(chain_psnr) - np.mean(single_psnr)),
+        "extra_temporal_energy_ratio_chain": ts["mean_temporal_energy_ratio"],
+        "new_flicker_evidence": bool(ts["mean_error_temporal_ratio"] > 0.5
+                                     and ts["mean_error_persistence_corr"] < 0.5),
+        "persistent_static_pattern_evidence": bool(ts["mean_error_persistence_corr"] > 0.7),
+        "motion_lag_ghost_evidence": bool(ts["mean_ghost_lag_corr"] > 0.25 and ts["mean_ghost_lag_beta"] > 0.0),
+        "temporal_attenuation_evidence": bool(ts["mean_temporal_energy_ratio"] < 0.9
+                                              and ts["mean_error_persistence_corr"] > 0.7),
+        "hf_energy_ratio_db_chain": summary["chain"]["mean_hf_ratio_db"],
+        "hf_error_over_reference_db_chain": summary["chain"]["mean_hf_error_ratio_db"],
+        "chain_saturates": bool(np.max(chain_psnr[-3:]) - np.min(chain_psnr[-3:]) < 0.1),
+        "error_attribution": {
+            "mse_increase_share_mean_first7": float(np.mean([a["mse_increase_share"] for a in att])),
+            "mse_increase_share_last3": float(np.mean([a["mse_increase_share"] for a in att[-3:]])),
+            "new_component_share_last3": float(np.mean([a["new_component_share"] for a in att[-3:]])),
+            "alignment_share_last3": float(np.mean([a["alignment_share"] for a in att[-3:]])),
+            "corr_esingle_de_mean": float(np.mean([a["corr_esingle_de"] for a in att])),
+            "dc_share_chain_mean": summary["chain"]["mean_dc_energy_share"],
+            "dc_share_single_mean": summary["single"]["mean_dc_energy_share"],
+            "tile_top5_share_chain_mean": summary["chain"]["mean_tile_top5_energy_share"],
+            "tile_top5_share_single_mean": summary["single"]["mean_tile_top5_energy_share"],
+            "r_channel_share_of_new_error_last3": float(np.mean(
+                [a["per_channel"]["R"]["new_component_share_of_total_delta"] for a in att[-3:]])),
+            "g_channel_share_of_new_error_last3": float(np.mean(
+                [a["per_channel"]["G"]["new_component_share_of_total_delta"] for a in att[-3:]])),
+            "b_channel_share_of_new_error_last3": float(np.mean(
+                [a["per_channel"]["B"]["new_component_share_of_total_delta"] for a in att[-3:]])),
+            "history_coupling_corr_mean": float(np.mean(
+                [r["history_coupling"]["corr_injected_history_vs_error_delta"]
+                 for r in per_frame if "history_coupling" in r])),
+            "history_coupling_r2_mean": float(np.mean(
+                [r["history_coupling"]["explained_error_delta_fraction_r2"]
+                 for r in per_frame if "history_coupling" in r])),
+        },
+    }
+    flags["reading"] = (
+        "Temporal activity of the chain output is NOT above the captured FP16 reference (ratio "
+        f"{ts['mean_temporal_energy_ratio']:.3f}); the degradation is a persistent, spatially concentrated "
+        "error (frame-to-frame error persistence "
+        f"{ts['mean_error_persistence_corr']:.3f}, new temporal HF "
+        f"{ts['mean_hf_error_residual_over_ref_diff_db']:.1f} dB below reference motion).  So: no new "
+        "flicker; a mild temporal attenuation plus a quasi-static error imprint.  The exact "
+        "chain-vs-single contrast (only the history plane differs) attributes ~"
+        f"{100*flags['error_attribution']['mse_increase_share_last3']:.0f}% of the steady-state error energy "
+        "to the substituted history, of which most is amplification of the pre-existing error rather than a "
+        "new pattern.  WHICH weights/blocks generate the residual is NOT_ESTABLISHED; no motion-vector plane "
+        "could be identified, so 'motion energy' means the captured FP16 temporal difference (cross-checked "
+        "with the input colour temporal difference)."
+    )
+
+    out = {
+        "schema": 1,
+        "kind": "FEEDBACK_TEMPORAL_STABILITY_AND_ATTRIBUTION",
+        "card": "S13",
+        "sequence": SEQ,
+        "frames": FRAMES,
+        "generated_by": "S13-quality/temporal_stability.py",
+        "reference_definition": (
+            "Each frame's captured FP16 network output (captured FP16 history, independent-frame "
+            "capture replay).  This is a teacher/relative reference, NOT ground truth, NOT an HR "
+            "target, NOT a perceptual verdict."),
+        "geometry": {"planes": 2, "height": H, "width": WD, "channels": 4,
+                     "app_plane_floats": PLANE_FLOATS, "history_plane_offset_bytes": PLANE_FLOATS * 4,
+                     "output_bytes": OUT_BYTES, "application_rgb": "plane 0 channels 0..2",
+                     "history_rgb": "plane 1 channels 0..2", "peak": PEAK},
+        "arms": {name: {"label": arms[name]["label"], "kind": arms[name]["kind"],
+                        "files": {str(f): {"path": str(paths[name][f]), "sha256": sha256_file(paths[name][f]),
+                                           "bytes": paths[name][f].stat().st_size} for f in FRAMES}}
+                 for name in ARM_ORDER},
+        "metric_definitions": {
+            "psnr_app_db": "-10*log10(mean over 720x1280x3 of (candidate-reference)^2), peak=1",
+            "psnr_hist_db": "same on the output history plane (plane 1, RGB)",
+            "hf_luma_energy": "mean squared 3x3 Laplacian of luma on interior pixels",
+            "hf_ratio_db": "10*log10(HF(candidate luma)/HF(reference luma)) -- >0 means more spatial detail/noise",
+            "hf_error_ratio_db": "10*log10(HF(error luma)/HF(reference luma))",
+            "ref_temporal_energy_luma": "mean squared luma difference between this frame and the previous one (captured FP16 reference)",
+            "temporal_energy_ratio": "candidate / reference temporal energy; >1 = more frame-to-frame change than the correct output",
+            "temporal_consistency_psnr_db": "PSNR between (candidate_k-candidate_k-1) and (reference_k-reference_k-1) luma diffs",
+            "error_temporal_ratio": "RMS(e_k-e_k-1)/RMS(e_k); ~0 => the error is a frozen pattern, ~1.41 => independent per frame",
+            "error_persistence_corr": "zero-lag correlation between this frame's error and the previous frame's error (same pixels)",
+            "ghost_lag_beta": "least-squares coefficient of e_k on (ref_k-1 - ref_k); >0 means the output carries a delayed copy of the previous frame",
+            "ghost_lag_corr": "correlation between e_k and (ref_k-1 - ref_k)",
+            "dc_energy_share": "sum_c bias_c^2 / MSE; the fraction of error energy that is a constant colour offset",
+            "mse_increase_share": "(MSE_chain - MSE_single)/MSE_chain at the same frame; the two arms differ only in the history plane",
+            "new_component_share": "||e_chain - e_single||^2 / MSE_chain (a genuinely new error pattern)",
+            "alignment_share": "2<e_single, e_chain-e_single> / MSE_chain (the substitution pushing the existing error further)",
+            "history_coupling": "correlation between the injected history delta (fed minus consumed history luma) and the history-induced output error delta",
+        },
+        "per_frame": per_frame,
+        "per_transition": per_transition,
+        "sequence_summary": summary,
+        "temporal_summary": temporal_summary,
+        "history_substitution": history_rows,
+        "reference_motion": {
+            "primary_proxy": "captured FP16 temporal difference (what a correct output does between adjacent frames)",
+            "primary_mean_rms_luma": ref_motion,
+            "cross_check_input_color": input_motion_json,
+            "motion_vector_plane": ("NOT_IDENTIFIED.  pre.bin plane candidates were probed (float32 RG at +29491280 "
+                                    "bytes gives 99.7% of pixels above 1e-2 in a static scene and ~0 correlation "
+                                    "with the frame difference), so no trustworthy motion-vector decode was "
+                                    "claimed; motion energy is therefore a frame-difference proxy, stated as such."),
+        },
+        "verdict": {
+            "quality_accepted": False,
+            "feedback_stable": False,
+            "flags": flags,
+            "claim_boundary": ("CPU/offline analysis of measured GPU outputs.  No GPU run performed here.  "
+                               "All numbers are versus the captured FP16 output, not truth.  Causal claims are "
+                               "limited to the exact one-variable contrast chain-vs-single (history plane only); "
+                               "which weights/blocks generate the residual error is NOT_ESTABLISHED."),
+        },
+        "reproduce": (f'"{sys.executable}" -X utf8 "{Path(__file__).as_posix()}" '
+                      f'--out "{args.out.as_posix()}"'),
+    }
+    args.out.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps({"out": str(args.out),
+                      "bytes": args.out.stat().st_size,
+                      "chain_mean_psnr": summary["chain"]["mean_psnr_app_db"],
+                      "single_mean_psnr": summary["single"]["mean_psnr_app_db"],
+                      "base_chain_mean_psnr": summary["base_chain"]["mean_psnr_app_db"],
+                      "temporal": temporal_summary["chain"],
+                      "flags": {k: v for k, v in flags.items() if k != "reading"}},
+                     indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

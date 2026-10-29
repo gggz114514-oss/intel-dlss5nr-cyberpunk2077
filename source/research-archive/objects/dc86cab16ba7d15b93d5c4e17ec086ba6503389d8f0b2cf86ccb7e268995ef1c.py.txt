@@ -1,0 +1,76 @@
+exec(open('f10_retirement_diagnosis.py',encoding='utf-8').read().split('tool=A/')[0])
+prefix={arm:len((O/f'{arm}-qkv-prefix.asm').read_text().splitlines()) for arm in paths}
+addresses={}
+for arm in paths:
+ ls=(O/f'{arm}-producer.asm').read_text().splitlines()
+ regs=sorted({int(m[1]) for l in ls if (m:=re.search(r'send.slm.*?null\s+r(\d+)\s+r\d+:2.*store.slm',l))})
+ addresses[arm]=regs
+assert len(addresses['parent'])==len(addresses['candidate'])==16
+report='''F10退化审计：方向不否定，候选不采纳。2026-10-27
+
+身份：父为接受的F08组合cc0b6ad7，候选2da01656。历史无效tile实验没有混入。
+本次不修改优化代码，不修改两臂SPV/计划。基线指针不动。
+端到端六进程对/360样本：父19.008827952ms，候选19.304901730ms，慢0.296073778ms，95%慢[0.220676241,0.371471316]。这是整体候选因果，不是某条指令因果。
+
+一、生产者：不能把新增复杂映射直接算成每次写入的额外指令。
+父producer[05B0,0E00)，候选[0680,0EC0)都是141条静态指令、38mov、16条UGM读、28条静态SLM写。
+28含padding/有效分支；每次执行实际16次写，不可用静态28算流量。
+两臂都是16组SIMD32地址payload，预计算后跨8次kc迭代保留。不是候选凭空新增16组长期地址。
+候选额外映射工作主要在循环前；prefix静态条数见CPU-LIFETIME.json。这部分不能按32次内循环放大。
+真正变化是写地址排列：父相邻lane写相邻half；候选在每16lane段内相邻lane相差8half，即16字节；16lane边界另加tile偏移。
+写入有效字节总量相同，store消息描述符相同。物理银行服务/序列化是否改变仍未知；没有硬件证据不能报冲突倍数。
+
+二、消费者：局部静态138→119条，mov61→71；SLM16→2，UGM3、DPAS6均不变。
+整核mov+16与局部mov+10不是同口径。DPAS累加顺序对各输出保持，独立输出的native调度显著改变。
+候选A0：1100返回r40..43 → 1160..1190跨步halfword搬运 → 11B0..11E0紧凑r59..62 → 1298/1470/1490三个消费者。
+候选A1：1140返回r44..47 → 11F0..1220跨步搬运 → 1250..1280紧凑r25..28 → 12C0/1480/14A0三个消费者。
+这些都是位搬运，非浮点数值转换。片段完成后仍须活到第三权重块的最后消费者。
+原始返回块在搬运后可以退役；临时块按最后读退役，不把所有出现过的r编号相加当峰值。
+
+三、权重供料重叠出现了具体结构变化（不是已测等待）。
+父W0=1040→1300/1410；W1=1290→13F0/1420；W2=1380→1490/14A0。
+候选W0=1120→1298/12C0；W1=13B0→1470/1480；W2=13C0→1490/14A0。
+父W1在第一条DPAS之前已发出，W2在W1第一条DPAS之前发出。
+候选W1/W2均在W0两条DPAS之后才发出。独立读请求与前一组计算的重叠机会减少。
+候选12C0的acc输出占r86..93；1370/1390..13A0保存到r126..133后，13C0的W2返回再使用r86..93。
+这是可核验的寄存器复用先后链：W0第二累加器完成→保存→W2返回使用同一银行。不能把源级独立当native独立。
+W1返回r96..103另有位置，不把W2的冲突泛化给W1。W1晚发也可能是地址/指令调度选择。
+scratch=0只排除本编译结果的scratch溢出；pipeline统计不提供实际GRF分配或occupancy，二者UNKNOWN。
+
+四、诊断设计和可判别范围。
+现有phaseclock在指定Before PC开始/结束计时，最终只在退出写结果；不插fake consumer，不改算术、屏障或源代码。
+其单寄存器计时会被循环覆盖：producer只保留kc=448；consumer只保留kc=448,k=48。明确只比较末迭代，不乘8/32估计全阶段。
+producer停止点在fence之前：测发布发出路径，不能测SLM完成，也不能排除写入成本延迟到fence暴露。
+consumer区间包含供料、重组、六DPAS和acc保存，是混合区间，不拆成真实纯load/mov时间。
+第一批每臂每区间1发可行性检查；通过后补足预定3次交替重复，另用clock_only同点同活值/相同退出写作扰动对照。
+每项必须frame=gold、目标native hash匹配且输出非NA。失败即收口工具限制，不补跑追结论。
+判别：若consumer候选稳定增大且producer无同向增大，支持消费端调度/重组为优先解释；反之支持发布路径。
+两者都变化则保留共同解释；都不变时不能排除同步排空/非末迭代/全核驻留。计时不直接给出0.296ms各成本占比。
+若clock_only显著改变两臂相对行为或重复离散吞没差异，区间因果裁决无效。单次均值不可宣布定位。
+
+五、后续可识别的对照（未授权为优化候选）。
+只有消费区间支持且扰动可接受，才设计保留当前sy布局和A路径、单独分离W2返回银行的源级诊断。
+它必须经native确认：A读取/重组与producer不变，W2确实跨越W0计算提前、累加链不变且scratch不增。
+若编译器同时改变多个机制，只能称调度整体响应，不宣称独立寄存器是唯一原因。
+若producer支持，优先隔离写入地址服务与循环前地址开销；不能同时改producer owner和consumer重组后称单变量。
+本轮不凭静态数继续换布局，布局方向保持开放。
+'''
+(O/'ANALYSIS.txt').write_text(report,encoding='utf-8')
+(O/'CPU-LIFETIME.json').write_text(json.dumps({'prefix_static_instructions':prefix,'producer_address_payload_base_registers':addresses,'notes':['16 SIMD32 address payloads each arm; long lived across kc loop. Not 16 new arrays in candidate.','Physical allocator count and true occupancy UNKNOWN; max register index is not either metric.','Candidate W0 acc bank r86..93 saved before W2 reuse; see ANALYSIS.txt PC chain.']},indent=2),encoding='utf-8')
+print(prefix,addresses)
+schedule={}
+for arm in paths:
+ lines=(O/f'{arm}-consumer.asm').read_text().splitlines()
+ pcs={int(re.search(r'\[([0-9A-F]+)\]',line)[1],16):i for i,line in enumerate(lines)}
+ edges=({'W0':(0x1040,0x1300),'W1':(0x1290,0x13f0),'W2':(0x1380,0x1490)} if arm=='parent' else {'W0':(0x1120,0x1298),'W1':(0x13b0,0x1470),'W2':(0x13c0,0x1490)})
+ schedule[arm]={name:{'send':hex(a),'first_dpas':hex(b),'intervening_static_instructions':pcs[b]-pcs[a]-1} for name,(a,b) in edges.items()}
+(O/'WEIGHT-ISSUE-DISTANCES.json').write_text(json.dumps({'warning':'Static distances, not cycles. A larger distance alone is not proof of hidden latency.','edges':schedule},indent=2),encoding='utf-8')
+store=[]
+for sg in range(8):
+ for off in range(0,4096,256):
+  e=[sg*32+lane+off for lane in range(32)]
+  old=[2*x for x in e];new=[2*(((x//64//8)*4+(x%64)//16)*128+(x%16)*8+(x//64)%8) for x in e]
+  store.append(dict(sg=sg,offset=off,parent_distinct_dwords=len({x//4 for x in old}),candidate_distinct_dwords=len({x//4 for x in new}),parent_address_span=max(old)-min(old)+2,candidate_address_span=max(new)-min(new)+2))
+assert all(x['parent_distinct_dwords']==16 and x['candidate_distinct_dwords']==32 for x in store)
+(O/'PRODUCER-ADDRESS-GEOMETRY.json').write_text(json.dumps({'warning':'Address geometry only. Dword counts are not physical transactions or measured bank conflicts. Both store 64 useful bytes per SG invocation.','all128_store_instances':store},indent=2),encoding='utf-8')
+(O/'LOGICAL-FEED-COST.json').write_text(json.dumps({'scope':'16 F10 dispatches, same grid; useful source payload, not DRAM traffic or hardware serviced bytes','subgroup_invocations':43008,'kc_iterations_per_sg':8,'k16_iterations_per_sg':32,'stage_half_stores_per_sg_per_kc':512,'stage_useful_bytes_all_dispatches':43008*8*512*2,'qkv_A_useful_bytes_per_k16':512,'qkv_A_useful_bytes_all_dispatches':43008*32*512,'qkv_A_slm_read_instructions_parent':43008*32*16,'qkv_A_slm_read_instructions_candidate':43008*32*2,'note':'Load messages reduced, useful A bytes unchanged. Parent transposed block reads and candidate vector reads have different payload shape; do not infer bandwidth saving from instruction count.'},indent=2),encoding='utf-8')

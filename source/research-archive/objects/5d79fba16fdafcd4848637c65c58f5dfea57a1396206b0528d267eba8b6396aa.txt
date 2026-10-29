@@ -1,0 +1,87 @@
+n05c-f05-mbatch — RESUME（2026-10-27）
+
+状态：BUILT / AWAITING-GPU（本卡未跑任何 Vulkan 任务、未取 GPU 锁、未部署、未改基线 plan / 指针 / COMMON.py / 其他卡目录）
+
+一、这一版的结论（预算先行）
+1. 每 acc = 8 GRF（实测：C128 与 C64 的 DPAS 目标基址都是 8 间隔，6 acc = 48 GRF；两个宽度同值）。
+2. C128 父形态 QKV 段实测活跃峰值 71/128 GRF（逐定义模型；粗模型上界 117，n04b 引用的 107 是子窗上界）。
+   其中 acc 占 41–45，非 acc 26–30。
+3. **全 M 翻倍（12 acc = 96 GRF）装不下**：96 + 非 acc（23…30）= 119…126，已压到 ~120 门槛；
+   再加第二 A 片段的返回/打包（+8…12）与收尾的 12 个窄化片段 → 127…138 > 128。**判 D1 不实现。**
+4. 卡里举例的"按 Q/K/V 分三遍、每遍 4 acc"**数学上不成立**：sealed Q/K 归一树
+   （nr_norm_qk_pair 把 f16vec2(q0[ci],k0[ci]) 与 f16vec2(q1[ci],k1[ci]) 配对归约）要求 Q 与 K 的
+   累加器同时存在。可分的边界只有 **(Q,K) ∣ V**。
+5. 因此实现 **D2 = Q/K 一遍 8 acc + V 一遍 4 acc**（峰值估计 102/128 ≤ ~120）：
+   权重 tile 载入 96 → 48（−50%，本卡机制目标），A 行载入 128 → 256（+128，本形态的代价），
+   DPAS 96 不变，K 序 / 舍入点 / token / 通道 / store 地址全部不变（预期 bit-exact）。
+6. C64 只出预算：父 6 acc / QKV 48 DPAS；D1 同样不通过（96+29=125，加第二 A 片段 >128），D2 可行
+   （104 上下），按"只做一个宽度"本卡不做。
+7. 卡正文的"C64 每 SG 192 DPAS"是笔误（那是 n05a 的 C256 数）：实测 C64 = 80 DPAS/SG
+   （QKV 48 + attention 32）。本卡一切按实测。
+
+二、已证（CPU，可复核）
+1. 父源 + RECIPES.json 的 raw 配方（pinned headers, sha 核对）**字节复现**父 SPV
+   20f4074f…（`_build/build.py`，raw_match=true，无需 decoration transfer）。
+2. candidate.spv = bc2cc0ea…124b（62,736 B，比父 +7,944 B），过 spv_validate_cpu（exit 0）。
+3. plan.txt = 5b742996…867b，在**当前接受链头**（CURRENT.json 的 n06 plan ae9fe38d…）上只替换
+   F05 C128 的 12 行 PASS；与链头逐行 diff 恰好 12 行，且只有 SPV 路径 token 变化；
+   cpu_check（--cpu-check）exit 0：CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded。
+4. 算术对齐：NoContraction 站点 73 对 73，父的 73 个站点 1:1 匹配进候选
+   （parent_ids_matched_into_candidate=73），候选自有装饰 0（child_own_decorations_outside_pattern=0）。
+   QKV 段两个臂都没有 NC 站点；norm 树 / score bias 的 precise 站点原样保留。
+5. 结构对齐（SPIR-V 静态）：CoopMatMulAdd 23→29（QKV 循环体 6→12；动态仍 96 = 父 6×8×2）、
+   CoopMatLoad 26→29（+3：Q/K 遍 4B+2A、V 遍 2B+2A；动态 112→80）、CoopMatStore 33→47
+   （Q/K/V 发布 6→12 + debug 镜像 8→16；动态不变）、OpLoopMerge 7→7（去掉 row_phase、加 V 的 ki 循环）、
+   workgroup 共享 24,576 B 与 8 个 binding 均不变。
+6. 源码改动范围：SOURCE-DIFF.patch 只有 **1 个 hunk**（父 149–201 行的 QKV 段 + 头部注释，+108/−38 行）；
+   父文件其余 344 行逐字节不变。每条 coopMatLoad/Store 的地址表达式都能在父里逐条找到
+   （m0 → m0a=(sg%4)*8 / m0b=m0a+32，即父的两个 row_phase 值）。
+7. 寄存器预算实测表：`_build/budget-isa.json`（`_build/budget_isa.py` 生成，纯 CPU 读既有 ISA）。
+
+三、未证（必须 GPU 侧闭环）
+1. 权重消息是否真的 96 → 48（N1，落地主判据）；A 行是否真的 128 → 256（N2）。
+2. IGC 是否在 8 acc 下无 spill（N4：scratch = 0；本卡预算投影 102/128）。
+3. 整体 ordinary 收益：−48 条 8-GRF 权重消息 与 +128 条 1-GRF A 行消息 的净效果。
+   注意三种度量方向不同：消息条数 +35.7%，返回区 GRF −28.6%，活跃 lane 发送 −38.5%（BUDGET.md §5.1）。
+4. Q/K 遍与 V 遍之间没有屏障是否被硬件/驱动看成"更长的串行段"（源级无依赖，native 见 N6/N7）。
+
+四、分诊（无 GPU 结果，按合同 §6 预登记判据）
+· N1 成立而 N2 不成立 → A（实现未落地），先读 ISA 解释 A 为何没翻倍。
+· N1/N2/N3 成立但 scratch > 0 或出现等待 → B（副作用），最大副作用就是第二遍的 A 重读，
+  第一修法是"V 遍的 A 载入提前"或"Q/K 遍两块 B 分槽返回"。
+· 全成立、门通过、整体不显著/变慢 → C 或 D；归因写"权重减半 vs A 读翻倍的净权衡"，
+  **不**写成"C128 权重复用方向无效"。
+· 数值失败 → E，先查 m0a/m0b 的 K 列主序边界（(m0/8*2+1)*128 在 m0b=56 时到 1920+128）。
+· 若主代理愿意再花一个 native 槽位：可以只捕获 12 acc 的 D1 版（不计时、不过门），用
+  scratch / max_r / DPAS 目标组数**证伪或证实**本卡的预算结论（NATIVE-PREDICTION.md §4）。
+
+五、下一处具体代码改动（两选一，都已算清）
+A) 若 N1 成立但 N2 也成立且整体变慢（本卡最可能的形态）→ 攻 A 侧而不是继续堆权重：
+   本 shader 的 QKV 段 A 行是 256 条 1-GRF 消息（父 128），而"同一 head 的 4 个 SG 各自载入同一批
+   96 个权重 tile"是 **4× 重复**（比 SG 内 2× 更大）。下一卡：WG 内权重复用（每 ki 切片 3 KiB
+   shared + 2 个屏障/ki），或由 F04 生产侧直接发布 DPAS 友好布局（跨派发，属 N03/N15）。
+B) 若 D1 的 native 捕获显示 scratch=0 且累加器被紧排 → 改为提交 D1（12 acc、A 读不翻倍），
+   本卡的 D2 作为对照臂保留。这条路径需要主代理先给一个 native 槽位。
+
+六、恢复点 / 文件
+· 候选源：candidate.comp；候选 SPV：candidate.spv（bc2cc0ea…）；父重编译：parent-rebuild.spv（=20f4074f…）
+· plan：plan.txt（5b742996…）；GPU 请求：GPU-REQUEST.json；构建身份与 cpu_check：BUILD.json
+· 预算：BUDGET.md + `_build/budget-isa.json`；六问：ANALYSIS.md；证明：PROOF.json；
+  成本账：COST-LEDGER.json；native 判据：NATIVE-PREDICTION.md；源码 diff：SOURCE-DIFF.patch
+· 可复跑脚本（全部 CPU 只读）：`_build/` 下 budget_isa.py / splice.py / build.py / decl_check.py /
+  nc_check.py / address_check.py / mkplan.py / emit_docs.py / pcwin.py
+  （以及早先的 regs*.py 粗模型，保留原样）
+  一键复核（**必须按此顺序**，后面的脚本会往 _build/build.json 追加证据）：
+  splice.py → build.py → decl_check.py → nc_check.py → address_check.py → mkplan.py → emit_docs.py
+· 本卡只写了 cards/n05c-f05-mbatch/。复核：基线 plan a024c3c5…、链头 plan ae9fe38d…、
+  CURRENT.json、COMMON.py、n05a 的 candidate.spv 7a9576d1…、c128 族 SPV 20f4074f…、
+  c64 族 SPV 0d83192b… **哈希均未变**。
+
+七、未决项（不阻塞，交主代理裁决）
+1. **D2 值不值得测**：机制目标（权重 tile 减半）达成，但消息条数 +35.7%。本卡不做"值不值"的判断，
+   只把三种度量与 native 判据交出去。
+2. 预算用的是"逐定义活跃区间"模型（下界估计）。若主代理有更权威的 IGC 分配读数，D1 的判定
+   （96+23…30 = 119…126 + 第二 A 片段）应重算；但"先减 acc"这条卡规则在任何模型下都成立。
+3. GPU-REQUEST.json 里我加了 `purpose` 字段（说明这是性能臂而不是预算验证臂）；
+   `shader_group.spv_sha256_candidate` 也保留了。若主代理的 manifest 生成器不接受额外键，删掉即可。
+4. 本卡没有做 C64 的实现（卡要求只做一个宽度），C64 的 D2 预算已算好（101/128），随时可开卡。

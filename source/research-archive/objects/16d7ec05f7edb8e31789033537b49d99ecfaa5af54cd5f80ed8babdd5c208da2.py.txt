@@ -1,0 +1,108 @@
+"""S07 reconnaissance: decode split16 b23 l0/l1 packs and check magnitudes."""
+import json
+import struct
+import sys
+from pathlib import Path
+
+import numpy as np
+
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029"
+sys.path.insert(0, str(W / "tools"))
+from planlib import Plan  # noqa: E402
+
+D = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+PLAN = D / "c64-family-static/combo-34189.txt"
+TEACHERS = [D / "dump-fp16", D / "teacher-diagnostics/teacher-41444", D / "teacher-diagnostics/teacher-43654"]
+
+
+def half(x):
+    return x.astype(np.float16).astype(np.float32)
+
+
+def tiled(t, c, C):
+    return ((t // 16) * (C // 16) + c // 16) * 256 + (t % 16) * 16 + c % 16
+
+
+def unload(raw, tokens, C):
+    """raw half buffer in tiled layout -> [tokens, C] float32."""
+    idx = np.fromiter((tiled(t, c, C) for t in range(tokens) for c in range(C)), dtype=np.int64, count=tokens * C)
+    return raw[idx].reshape(tokens, C)
+
+
+def main():
+    p = Plan(PLAN)
+    d0 = p.dispatch_by_name("split16_b23_l0")
+    d1 = p.dispatch_by_name("split16_b23_l1")
+    dqx = p.dispatch_by_name("split16_b23_l0_qx_producer")
+    out = {}
+    out["plan_sha"] = p.sha256()
+    out["ordinals"] = {"l0": d0.ordinal, "l1": d1.ordinal, "qx_producer": dqx.ordinal}
+    invx = struct.unpack("<f", struct.pack("<I", int(dqx.push[1])))[0]
+    out["invX_push_float"] = invx
+    # inv files
+    for nm in ["split16_b23_l1qxinv", "split16_b23_qxinv", "split16_b24_l0qxinv"]:
+        b = p.buffer(nm)
+        v = np.fromfile(b.file, dtype="<f4")
+        out[nm] = {"file": b.file, "values": v.tolist()}
+    l0pack = Path(p.buffers[d0.binds[10].buffer].file)
+    l1pack = Path(p.buffers[d1.binds[10].buffer].file)
+    wfp = Path(p.buffers[d0.binds[0].buffer].file)
+    out["packs"] = {"l0": str(l0pack), "l0_bytes": l0pack.stat().st_size,
+                    "l1": str(l1pack), "l1_bytes": l1pack.stat().st_size,
+                    "fp16_weights": str(wfp), "fp16_bytes": wfp.stat().st_size,
+                    "fp16_sha_note": "see CONTRACT.json"}
+    p0 = [int(x) for x in d0.push]
+    out["push_p0_p7"] = [p0[i*4:(i+1)*4] for i in range(8)]
+    # l0 pack
+    raw0 = np.fromfile(l0pack, dtype="u1")
+    w8 = raw0[:262144].view(np.int8).astype(np.int32)
+    wsc = raw0[262144:262144 + 2048].view("<f4")
+    w2 = raw0[264192:264192 + 131072].view(np.int8).astype(np.int32)
+    wsc2 = raw0[395264:395264 + 8192].view("<f4")
+    w3 = raw0[403456:403456 + 131072].view(np.int8).astype(np.int32)
+    wsc3 = raw0[534528:534528 + 2048].view("<f4")
+    invs = raw0[536576:536584].view("<f4")
+    out["l0_offsets"] = {"w8": 0, "wsc": 262144, "w2": 264192, "wsc2": 395264,
+                         "w3": 403456, "wsc3": 534528, "invs": 536576}
+    out["l0_invs"] = invs.tolist()
+    out["l0_wsc_range"] = [float(wsc.min()), float(wsc.max())]
+    out["l0_wsc2_range"] = [float(wsc2.min()), float(wsc2.max())]
+    out["l0_wsc3_range"] = [float(wsc3.min()), float(wsc3.max())]
+    out["l0_w8_range"] = [int(w8.min()), int(w8.max())]
+    out["l0_w2_range"] = [int(w2.min()), int(w2.max())]
+    out["l0_w3_range"] = [int(w3.min()), int(w3.max())]
+    out["l0_w8_zero_frac"] = float(np.mean(w8 == 0))
+    # l1 pack
+    raw1 = np.fromfile(l1pack, dtype="u1")
+    wc = raw1[:262144].view(np.int8).astype(np.int32)
+    wscL = raw1[262144:264192].view("<f4")
+    out["l1_wsc_range"] = [float(wscL.min()), float(wscL.max())]
+    out["l1_wc_range"] = [int(wc.min()), int(wc.max())]
+    out["l1_wsc_mean"] = float(wscL.mean())
+    out["l0_wsc_mean"] = float(wsc.mean())
+
+    # fp16 weights decode
+    wp = np.fromfile(wfp, dtype="<f2").astype(np.float32)
+    out["fp16_half_count"] = int(wp.size)
+    X_half = unload(np.fromfile(TEACHERS[0] / "dump_block22_out.bin", dtype="<f2").astype(np.float32), 1152, 512)
+    F_half = unload(np.fromfile(TEACHERS[0] / "dump_split16_b23_F.bin", dtype="<f2").astype(np.float32), 1152, 512)
+    Y_half = unload(np.fromfile(TEACHERS[0] / "dump_split16_b23_Y.bin", dtype="<f2").astype(np.float32), 1152, 512)
+    out["stats"] = {
+        "X_absmax": float(np.abs(X_half).max()), "X_absmax_per_ch_max": float(np.abs(X_half).max(0).max()),
+        "F_absmax": float(np.abs(F_half).max()), "Y_absmax": float(np.abs(Y_half).max()),
+        "X_rms": float(np.sqrt((X_half ** 2).mean())), "F_rms": float(np.sqrt((F_half ** 2).mean())),
+        "Y_rms": float(np.sqrt((Y_half ** 2).mean())),
+        "valid_tokens": 1056, "padded_tokens": 1152,
+    }
+    # padded tail should be zero
+    out["stats"]["X_pad_absmax"] = float(np.abs(X_half[1056:]).max())
+    out["stats"]["F_pad_absmax"] = float(np.abs(F_half[1056:]).max())
+    # check sX implied
+    out["implied_sX"] = 1.0 / invx
+    out["implied_X_absmax"] = 127.0 / invx
+    print(json.dumps(out, indent=1, default=str))
+
+
+if __name__ == "__main__":
+    main()

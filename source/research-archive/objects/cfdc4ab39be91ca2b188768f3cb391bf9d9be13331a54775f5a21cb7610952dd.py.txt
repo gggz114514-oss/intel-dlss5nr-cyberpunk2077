@@ -1,0 +1,307 @@
+import json, os, datetime
+
+ROOT = r"@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\fullnet-continuous-20261027"
+CARD = os.path.join(ROOT, "cards", "n16-crossdispatch")
+fg = json.load(open(os.path.join(ROOT, "evidence", "FAMILY-GROUPS.json"), encoding="utf-8"))
+isa = json.load(open(os.path.join(CARD, "tools", "isa-stats.json"), encoding="utf-8"))
+rows = {}
+for sha, g in fg["groups"].items():
+    for o in g["ordinals"]:
+        rows[o] = dict(g, ordinal=o)
+
+def row(o):
+    g = rows[o]
+    return {"ordinals": g["ordinals"], "name": g["names"][0], "family": g["family"],
+            "spv": g["spv"], "spv_sha256": g["spv_sha256"]}
+
+def msgs(pid, prefix):
+    out = {}
+    for k, v in isa[str(pid)]["counts"].items():
+        if k.startswith(prefix):
+            parts = k.split(".")
+            shape = ".".join(parts[2:]) if len(parts) > 2 else k
+            out[shape] = out.get(shape, 0) + v
+    return out
+
+P = {"F01": 0, "F02": 1, "F03": 3, "F04c64": 4, "F05c64": 5, "F06c64": 6,
+     "F04c128": 8, "F05c128": 9, "F06c128": 10, "F04c256": 12, "F05c256": 13, "F06c256": 14,
+     "F08l0": 16, "F09l1": 17, "F10l2": 18, "F11l3": 19,
+     "F13expand": 22, "F13contract": 23, "F14qkv": 24, "F15attn": 25, "F16proj": 26,
+     "F18pre128": 31, "F18body128": 32, "F18contract128": 33,
+     "F18body64": 35, "F18contract64": 36, "F19": 37, "F20": 38, "F21": 39}
+
+def istats(pid):
+    return {"instructions": isa[str(pid)]["instructions"], "dpas": isa[str(pid)]["dpas"],
+            "shared_bytes": isa[str(pid)]["shared_bytes"],
+            "loads": msgs(pid, "load."), "stores": msgs(pid, "store."),
+            "slm": {k: v for k, v in isa[str(pid)]["counts"].items() if ".slm" in k or k.startswith(("fence", "barrier"))},
+            "isa": isa[str(pid)]["isa"]}
+
+sites = []
+
+sites.append({
+    "id": "S1-F13-aHidden",
+    "kind": "cross-dispatch producer-store / consumer-load (A-fragment handoff)",
+    "family": "F13", "width": "ViT-4096-FFN", "pass_scope": "8 expand + 8 contract = 16 PASS",
+    "producer": dict(row(93), pipeline=P["F13expand"], isa=istats(P["F13expand"])),
+    "consumer": dict(row(94), pipeline=P["F13contract"], isa=istats(P["F13contract"])),
+    "buffer": {"plan_name": "vit_blockNN_A", "bytes_per_block": 2359296, "elements": 1179648,
+               "layout_now": "row-major [token][channel], stride 4096 halves",
+               "potential_layout": "tile-major [token/8][channel/16][8][16]"},
+    "byte_stream": {
+        "producer_isa_total": {"store.ugm.d32x8t": 64},
+        "producer_edge_attribution": "source has 4 aHidden stores (2 group x 2 side), each an 8x16 MH LROW block = 32 row messages; the other 32 are the gated dbg echo. Derived, not labelled by ISA.",
+        "consumer_isa_total": {"load.ugm.d32x8t": 608, "load.ugm.d32x8": 64, "load.ugm.d16u32": 20},
+        "consumer_edge_attribution": "all 608 d32x8t are A rows from aHidden (n13b IDs; fast path 4 A tiles per 32-K step x 8 rows)",
+        "barrier": "full vkCmdPipelineBarrier(COMPUTE->COMPUTE, SHADER_WRITE->SHADER_READ|WRITE) after every dispatch (clock_runner.cpp 472-473); unchanged by the fold",
+        "slm_roundtrip": "none at the boundary; consumer Workgroup Memory 0, no barrier inside contract (n13b)",
+        "counts_note": "static per thread-program from CURRENT ISA; dynamic = static x trip count, not measured"
+    },
+    "fold": {
+        "what": "producer writes each completed 8x16 MH tile contiguously (stride 16); consumer loads one 256 B block per (m/8, k/16)",
+        "before": "store aHidden[m*4096 + n0 + side*16], RM stride 4096; load aHidden[mA*4096 + k0], RM stride 4096",
+        "after": "store aHidden[((m/8)*256 + (n0+side*16)/16)*128 + r*16 + c]; load base(mA/8,k0/16)*128 + r*16 + c",
+        "expected_native_signature": "load.ugm.d32x8t 608 -> ~76 plus ~76 load.ugm.d32x64t; store.ugm.d32x8t 64 -> ~8 d32x64t; total bytes identical",
+        "precedent": "n06d-f06-c256-atile did exactly this on SLM: load.slm.d32x8t 1025 -> 129, send 1597 -> 741, measured -0.0025 ms INDISTINCT on 15 PASS"
+    },
+    "memory_model_proof": [
+        "reader set: aHidden is written by expand and read only by contract (same shader pair; other F13-F16 PASSes bind it in the plan but do not reference it in source - re-check per recipe, binding is not use)",
+        "write domain: every (token<live, channel<4096) written exactly once; rows m>=live skipped by the existing guard; zero-fill semantics of skipped rows preserved",
+        "address range: new max index < 2359296 B",
+        "debug: dbg echo is a separate buffer gated by pc.p0.w=0",
+        "no feedback/history interaction (HISTORY touches frame_out only)",
+        "the dispatch boundary barrier stays; the fold removes no synchronization, so no acquire/release proof is required for correctness"
+    ],
+    "risks": [
+        "16 PASS is at/below the detection floor (L3/L12); identical mechanism at 15 PASS was D (n06d)",
+        "IGC may keep 8 row messages if the 256 B tile base is not provably aligned (L14)",
+        "each 256 B block still needs ~4 mov to spread into the DPAS A fragment (n03), so the net is -7 messages +4 mov per tile",
+        "32 N-slices re-read the same A tile; the fold cuts messages per read, not the 32x logical re-read"
+    ],
+    "worth_card": {"verdict": "NO (single card)", "reason": "8+8 PASS; the exact mechanism is already D at 15 PASS (n06d)",
+                   "condition": "only inside a >=32-PASS ViT A-handoff package with one ordinary measurement"}
+})
+
+sites.append({
+    "id": "S2-F13-y",
+    "kind": "cross-dispatch producer-store / consumer-load (A handoff + scalar skip reader)",
+    "family": "F13/F14", "width": "ViT-1024", "pass_scope": "8 contract + 8 qkv (+8 projection skip) = 24 PASS",
+    "producer": dict(row(94), pipeline=P["F13contract"], isa=istats(P["F13contract"])),
+    "consumer": dict(row(95), pipeline=P["F14qkv"], isa=istats(P["F14qkv"])),
+    "buffer": {"plan_name": "vit_blockNN_Y", "bytes_per_block": 589824, "elements": 294912,
+               "layout_now": "row-major [token][channel], stride 1024 halves"},
+    "byte_stream": {
+        "producer_isa_total": {"store.ugm.d32x8t": 32},
+        "producer_edge_attribution": "16 y stores (2 group x 2 side x 8 rows) + 16 gated dbg; derived",
+        "consumer_isa_total": {"load.ugm.d32x8t": 1024, "load.ugm.d32x8": 128},
+        "consumer_edge_attribution": "all 1024 d32x8t are A rows from y (K=1024, 2 M blocks x 2 samples/step)",
+        "barrier": "full dispatch-boundary barrier (unchanged)",
+        "slm_roundtrip": "none in either PASS"
+    },
+    "fold": {"what": "y stored tile-major; qkv loads one 256 B block per A tile",
+             "expected_native_signature": "load.ugm.d32x8t 1024 -> ~128 plus 128 d32x64t"},
+    "memory_model_proof": [
+        "readers: F14 qkv (A) AND F16 projection epilogue reads y as residual skip (scalar); both must be re-addressed",
+        "write domain: every (token<288, channel<1024) once",
+        "scalar skip reader is layout-agnostic only if rewritten with the same tile map",
+        "debug gated off; no feedback interaction; barrier unchanged"
+    ],
+    "risks": ["two consumers with different access shapes", "24 PASS", "same D precedent"],
+    "worth_card": {"verdict": "NO", "reason": "second reader (scalar skip) makes it a less clean probe", "condition": "ViT package only"}
+})
+
+sites.append({
+    "id": "S3-F15-context",
+    "kind": "cross-dispatch producer-store / consumer-load (A handoff)",
+    "family": "F15/F16", "width": "ViT-1024", "pass_scope": "8 attention + 8 projection = 16 PASS",
+    "producer": dict(row(96), pipeline=P["F15attn"], isa=istats(P["F15attn"])),
+    "consumer": dict(row(97), pipeline=P["F16proj"], isa=istats(P["F16proj"])),
+    "buffer": {"plan_name": "vit_blockNN_context", "bytes_per_block": 589824, "elements": 294912,
+               "layout_now": "row-major [token][channel], stride 1024 halves"},
+    "byte_stream": {
+        "producer_isa_total": {"store.ugm.d16u32": 50, "store.ugm.d32": 64, "store.ugm.d32x4": 4},
+        "producer_edge_attribution": "context + debug/denominator stores are mixed in the ISA; split UNKNOWN without re-capture",
+        "consumer_isa_total": {"load.ugm.d32x8t": 1024, "load.ugm.d32x8": 64},
+        "barrier": "full dispatch-boundary barrier (unchanged)",
+        "slm_roundtrip": "producer has 256 load.slm + 4 fences inside the PASS (qkv staging); boundary itself has no SLM"
+    },
+    "fold": {"what": "context stored tile-major; projection loads one 256 B block per A tile",
+             "expected_native_signature": "load.ugm.d32x8t 1024 -> ~128 plus 128 d32x64t"},
+    "memory_model_proof": ["reader set: F16 only (verify no debug/other block reader)", "write domain: every (token,channel) once; live guard unchanged",
+                            "range < 589824", "barrier unchanged"],
+    "risks": ["producer store split UNKNOWN", "same D precedent"],
+    "worth_card": {"verdict": "NO", "reason": "16 PASS, same prior", "condition": "ViT package only"}
+})
+
+sites.append({
+    "id": "S4-F16-o",
+    "kind": "cross-block producer-store / consumer-load (A handoff)",
+    "family": "F16->F13(next)", "width": "ViT-1024", "pass_scope": "8 projection + 8 expand = 16 PASS",
+    "producer": dict(row(97), pipeline=P["F16proj"], isa=istats(P["F16proj"])),
+    "consumer": dict(row(98), pipeline=P["F13expand"], isa=istats(P["F13expand"])),
+    "buffer": {"plan_name": "blockNN_out", "bytes_per_block": 589824, "elements": 294912,
+               "layout_now": "row-major [token][channel], stride 1024 halves"},
+    "byte_stream": {
+        "producer_isa_total": {"store.ugm.d32x8t": 16},
+        "consumer_isa_total": {"load.ugm.d32x8t": 1024, "load.ugm.d32x8": 128},
+        "barrier": "full dispatch-boundary barrier (unchanged)",
+        "slm_roundtrip": "none"
+    },
+    "fold": {"what": "o stored tile-major; next block's expand loads one 256 B block per A tile",
+             "expected_native_signature": "load.ugm.d32x8t 1024 -> ~128 plus 128 d32x64t"},
+    "memory_model_proof": ["reader set: next block expand; last block's o may have a different consumer - enumerate per block from plan",
+                            "write domain and byte range per block", "barrier unchanged"],
+    "risks": ["8 block edges; last edge consumer differs", "same D precedent"],
+    "worth_card": {"verdict": "NO (single)", "reason": "16 PASS and the last edge is not homogeneous", "condition": "ViT package only"}
+})
+
+sites.append({
+    "id": "S5-F18-gM",
+    "kind": "cross-dispatch producer-store / consumer-load (A handoff), single reader",
+    "family": "F18", "width": "C128 (C64/C256 analogous)", "pass_scope": "2 PASS (C128 only); 6 PASS for all widths",
+    "producer": dict(row(193), pipeline=P["F18body128"], isa=istats(P["F18body128"])),
+    "consumer": dict(row(194), pipeline=P["F18contract128"], isa=istats(P["F18contract128"])),
+    "buffer": {"plan_name": "swin_56_M", "bytes_per_block": 4325376, "elements": 2162688,
+               "layout_now": "row-major [window*64+tokens][128 channels], stride 128 halves"},
+    "byte_stream": {
+        "producer_isa_total": {"store.ugm.d32x8t": 160, "store.ugm.d16u32": 4, "load.slm.d32x8t": 64, "store.slm.d32x8t": 64},
+        "producer_edge_attribution": "source-derived: gM 8 MH stores x 8 rows = 64, gY 4 x 8 = 32, gM dbg 8 x 8 = 64; total 160. Derived, not labelled by ISA.",
+        "consumer_isa_total": {"load.ugm.d32x8t": 256, "load.ugm.d32x8": 32, "load.ugm.d32x64t": 8, "store.ugm.d32x8t": 128, "load.ugm.d16u32": 2},
+        "consumer_edge_attribution": "all 256 d32x8t are A rows from gM (n20); 32 d32x8 are weights; 8 d32x64t are imgin seed; 128 stores are 64 gY + 64 gated dbg (n20)",
+        "barrier": "full dispatch-boundary barrier (unchanged)",
+        "slm_roundtrip": "none: contract Workgroup Memory 0, send.slm 0 (n20); producer has internal shA staging (not at the boundary)"
+    },
+    "fold": {"what": "body's mid epilogue stores each MH 8x16 tile contiguously; contract loads one 256 B block instead of 8 x 32 B rows",
+             "before": "store gM[(w*64+m0)*128 + 32g + 0/16] RM stride 128; load gM[(w*64+mA)*128 + k0] RM stride 128",
+             "expected_native_signature": "A rows 256 -> ~32 d32x64t; gM stores 64 -> ~8 d32x64t; total send falls ~224/thread; bytes and DPAS identical"},
+    "memory_model_proof": [
+        "reader set: gM (swin_NN_M) is bound only by pre/body/body_2 of this block; source-level the only reader is this contract - re-verify C64/C256 recipes",
+        "write domain: body writes every (w<grid, token<64, channel<128) once; image-OOB tokens are written too (canonical M, n20)",
+        "no aliasing: M is a dedicated buffer with its own POLICY window; no overlap with Y/T",
+        "byte range: 4325376 B = 264*64*128*2",
+        "barrier unchanged; no memory-model relaxation proposed"
+    ],
+    "risks": [
+        "n20 rejected this fold only because its card was limited to one PASS; as a 2-PASS card it is legal",
+        "the 4x A re-read across column groups remains (ownership, not layout); the fold cuts messages, not bytes",
+        "n06d precedent: an 8x message drop was D at 15 PASS; 2 PASS is far below the floor, so this is a mechanism probe, not a ms bet"
+    ],
+    "worth_card": {"verdict": "YES - one representative probe (2 PASS, C128 only)",
+                   "reason": "cleanest single-reader cross-dispatch instance; exact falsifiable native signature; settles whether a global A-handoff fold can move at all before any 32/102-PASS package",
+                   "condition": "native first: d32x8t A rows 256->~32 and d32x64t appears, bytes/DPAS unchanged; only then ordinary 2-arm; a D result closes the direction at global scope"}
+})
+
+sites.append({
+    "id": "S6-F04-gY",
+    "kind": "cross-dispatch producer-store / multiple consumer-loads (A + MH seed)",
+    "family": "F04->F05/F06", "width": "C64/C128/C256", "pass_scope": "33+36 (+33 F06 seed) = 69-102 PASS",
+    "producer": dict(row(6), pipeline=P["F04c64"], isa=istats(P["F04c64"])),
+    "consumer": dict(row(7), pipeline=P["F05c64"], isa=istats(P["F05c64"])),
+    "buffer": {"plan_name": "swin_NN_Y", "bytes_per_block": 8257536,
+               "layout_now": "row-major [window*64+tokens][64 channels], stride 64 halves (C64)"},
+    "byte_stream": {
+        "producer_isa_total": {"store.ugm.d32x8t": 224},
+        "producer_edge_attribution": "gY is 4 MH stores in source; the 224 total also contains gated debug; split UNKNOWN from ISA",
+        "consumer_isa_total": {"load.ugm.d32x8t": 64, "load.ugm.d32x8": 56, "load.ugm.d16u32": 16},
+        "consumer_edge_attribution": "C64 64 A rows from gY; C128 128; C256 512 (ISA p9/p13, same key)",
+        "barrier": "full dispatch-boundary barrier (unchanged)",
+        "slm_roundtrip": "producer has internal mLocal SLM (64 store / 64-256 load); boundary none"
+    },
+    "fold": {"what": "gY stored tile-major; F05 A and F06 seed (both 8x16) load one 256 B block",
+             "expected_native_signature": "A row messages /8 in F05/F06; gY store messages /8 in F04"},
+    "memory_model_proof": [
+        "reader set: F05 (A), F06 (MH seed), F07 (gY), debug echo - enumerate per width from 33+36+33 sources",
+        "write domain: F04 writes every (w, token, channel) once per block",
+        "each block owns swin_NN_Y; verify POLICY first/last pass",
+        "barrier unchanged"
+    ],
+    "risks": ["3 consumers per width and two fragment shapes; one layout must serve A and MH loads",
+              "69-102 PASS package, large change surface", "n06d D precedent"],
+    "worth_card": {"verdict": "NO (now)", "reason": "multi-reader and very large; only after the 2-PASS probe shows a non-D signal", "condition": "package after S5"}
+})
+
+sites.append({
+    "id": "S7-F02-blockout",
+    "kind": "cross-dispatch store/load inside the shared io_at image layout",
+    "family": "F01/F02/F03/F04/F19/F20/F21", "width": "C32/C64 image domain", "pass_scope": "45 PASS bind blockNN_out in this family",
+    "producer": dict(row(0), pipeline=P["F01"], isa=istats(P["F01"])),
+    "consumer": dict(row(1), pipeline=P["F02"], isa=istats(P["F02"])),
+    "buffer": {"plan_name": "blockNN_out", "bytes_per_block": 16515072,
+               "layout_now": "io_at layout id 0 (spatial 4x4 tiles, 16-channel groups), selected by push p2.x/p2.y"},
+    "byte_stream": {
+        "producer_isa_total": {"store.ugm.d32x8t": 384, "store.ugm.d32": 8, "store.ugm.d32x64t": 4},
+        "consumer_isa_total": {"load.ugm.d32x8t": 64, "load.ugm.d64x64t": 48, "load.ugm.d32x16t": 64},
+        "barrier": "full dispatch-boundary barrier (unchanged)",
+        "slm_roundtrip": "F01/F02 stage K/V in SLM with fence.slm (F01 no WG barrier; F02 1 barrier)"
+    },
+    "fold": {"what": "the image layout is a runtime push-constant choice (io_at layout 0..3); a static fold would change the shared image contract for every PASS in this family",
+             "expected_native_signature": "UNKNOWN without a full reader census"},
+    "memory_model_proof": ["readers span 45+ PASSes and both image directions",
+                            "layout ids are push constants, so the same SPV serves multiple layouts; no static fold without changing the push contract"],
+    "risks": ["touching the image layout invalidates the fixed-frame gold contract", "no static proof all readers use the same layout id"],
+    "worth_card": {"verdict": "NO", "reason": "not a static repack site; layout is a runtime push-constant contract", "condition": "never in this campaign"}
+})
+
+sites.append({
+    "id": "S8-F20-F21-residual",
+    "kind": "cross-dispatch record handoff (4 scalar stores -> 16 B read)",
+    "family": "F20/F21", "width": "C32 tail", "pass_scope": "2 PASS",
+    "producer": dict(row(230), pipeline=P["F20"], isa=istats(P["F20"])),
+    "consumer": dict(row(231), pipeline=P["F21"], isa=istats(P["F21"])),
+    "buffer": {"plan_name": "ioport_70_ioport_body (residual_out region)", "bytes_per_block": 14745600,
+               "layout_now": "16 B record per pixel (rgb + blend); producer splits it into 4 x 4 B stores"},
+    "byte_stream": {"producer_isa_total": {"store.ugm.d32": 4}, "consumer_isa_total": {"load": "16 B record"},
+                    "barrier": "full dispatch-boundary barrier", "slm_roundtrip": "none"},
+    "fold": {"what": "producer writes one 16 B record instead of four 4 B stores",
+             "expected_native_signature": "store.ugm.d32 4 -> 0, d32x4 0 -> 1"},
+    "memory_model_proof": ["already proven in n02b: 921,600 records, 0 duplicate writes, 3,686,400 byte pairs equal", "no new memory-model obligation"],
+    "risks": ["already measured"],
+    "worth_card": {"verdict": "NO - CLOSED", "reason": "n02b built it; native landed exactly (store.ugm.d32 4->0, d32x4 0->1); 2-PASS package +0.004435 ms INDISTINCT (D)", "condition": "do not reopen"}
+})
+
+closed = [
+    {"site": "F03 ord 5 ioport_block4_0", "why": "not a layout pass: 4 DPAS + 80 d16u32 reads, 2 stores; 1x1 GEMM/pool with register packing", "evidence": "source ds_complete_fp16.comp; ISA pipeline 3"},
+    {"site": "F11 ord 63 ... l3", "why": "KIND=1 direct coopMatStore; half_tail repack branch (KIND=4) is not in the module", "evidence": "L7; n09 ANALYSIS 23"},
+    {"site": "F12 ord 92 l4", "why": "final-head GEMM with direct epilogue, 64 DPAS; gh_store is the final canonical store, no separate repack", "evidence": "source b30_l4; ISA pipeline 21"},
+    {"site": "F18 pre -> body (192->193, 212->213)", "why": "already store-in-consumer-layout: pre writes canonical io_at0, body loads contiguous 256-half runs (row stride 16)", "evidence": "c3x_pre_c128.comp 9-12; c3x_body_c128.comp 64-73"},
+    {"site": "F14 -> F15 qkv", "why": "producer writes qkv[token*3072 + S + head*32 + c]; consumer requires exactly that; F15 SLM staging is cross-SG broadcast, not layout", "evidence": "n12 ANALYSIS 33/65-69; F15 ISA 256 load.slm"},
+    {"site": "F04 -> F05 K/V (shK/shV)", "why": "K stored LCOL and V LROW already produce the consumer B layout; the remaining WG barrier is required for cross-SG visibility", "evidence": "n01 ANALYSIS 111-112"},
+    {"site": "F01/F02 image entry", "why": "layout id is a runtime push constant; no static single-reader contract", "evidence": "ioport_common.glsl io_at"},
+    {"site": "F20 -> F21 residual_out", "why": "measured D in n02b", "evidence": "n02b RESULTS.json"}
+]
+
+out = {
+    "schema": "n16-repack-census/v1",
+    "card": "n16-crossdispatch",
+    "generated": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S%z"),
+    "baseline": {"plan": fg["baseline_plan"], "sha256": fg["baseline_sha"]},
+    "method": {
+        "layout_only_dispatch_test": "per-pipeline DPAS count from CURRENT ISA + source role; a layout-only PASS would have dpas=0 and only load/store",
+        "boundary_test": "producer store formula vs consumer load formula from source + exact ISA message shapes from CURRENT captures",
+        "identity": "spv sha256 from evidence/FAMILY-GROUPS.json; counts from n09c full capture, F10 capture fallback for 6 pipelines",
+        "no_gpu": True,
+        "definitions": "static counts are per thread-program; d32x8t = 32 B/lane block, d32x64t = 256 B block (n15/n20 convention)"
+    },
+    "summary": {
+        "layout_only_dispatches": 0,
+        "layout_only_note": "no PASS in the 232 is a pure layout mover; the only dpas=0 pipeline is F21 (ord 231), which computes residual+blend and writes two surfaces",
+        "sites": len(sites),
+        "worth_card_now": [s["id"] for s in sites if s["worth_card"]["verdict"].startswith("YES")],
+        "closed_checked": len(closed)
+    },
+    "pass_evidence": {k: {"instructions": isa[str(v)]["instructions"], "dpas": isa[str(v)]["dpas"],
+                          "shared_bytes": isa[str(v)]["shared_bytes"], "messages": isa[str(v)]["messages"]}
+                      for k, v in P.items()},
+    "sites": sites,
+    "closed_or_checked": closed,
+    "unknowns": [
+        "dynamic per-dispatch message counts are not measured; all counts are static per thread-program",
+        "per-edge producer attributions marked 'derived' are not separable from gated debug stores in the ISA",
+        "F15 context store split (context vs denominator/debug) is UNKNOWN without re-capture",
+        "reader sets are source-level for the representative width; C64/C256 and all 8 ViT blocks must be re-enumerated per recipe before any build"
+    ]
+}
+json.dump(out, open(os.path.join(CARD, "REPACK-CENSUS.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+print("wrote REPACK-CENSUS.json", len(sites), "sites")
+for s in sites:
+    print(" ", s["id"], "|", s["pass_scope"], "|", s["worth_card"]["verdict"])

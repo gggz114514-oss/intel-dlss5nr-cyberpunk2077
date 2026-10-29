@@ -1,0 +1,625 @@
+"""Plan parser/patcher for PORT_NETWORK_1 plans.
+
+Preserves the original line text for untouched lines; structured views are
+derived from the text.  This is intentionally stricter than string replace:
+buffers are addressed by name, dispatches by 0-based ordinal, and every edit
+is followed by structural validation.
+"""
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import re
+import shlex
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+BUFFER_RE = re.compile(r'^BUFFER\s+"([^"]+)"\s+(\d+)\s+"([^"]*)"\s*$')
+PASS_RE = re.compile(r'^PASS\s+(\d+)\s+"([^"]+)"\s+"([^"]+)"(.*)$')
+BIND_RE = re.compile(r'^BIND\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$')
+POLICY_RE = re.compile(r'^POLICY\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$')
+OUTPUT_RE = re.compile(r'^OUTPUT\s+(\d+)\s+(\S+)\s+"([^"]+)"\s*$')
+
+
+def sha256_file(path: Path | str, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+@dataclass
+class Buffer:
+    index: int
+    name: str
+    bytes: int
+    file: str
+    line: int
+
+
+@dataclass
+class Binding:
+    binding: int
+    buffer: int
+    offset: int
+    bytes: int
+    line: int
+
+
+@dataclass
+class Pass:
+    ordinal: int
+    group: int
+    name: str
+    spv: str
+    tail_tokens: List[str]
+    line: int
+    binds: List[Binding] = field(default_factory=list)
+    push_line: Optional[int] = None
+    push: Optional[List[str]] = None
+
+
+@dataclass
+class Policy:
+    buffer: int
+    resident: int
+    first: int
+    last: int
+    clear_first: int
+    line: int
+
+
+class PlanError(RuntimeError):
+    pass
+
+
+class Plan:
+    def __init__(self, path: Path | str):
+        self.path = Path(path)
+        self.raw = self.path.read_bytes()
+        self.text = self.raw.decode("utf-8")
+        self.newline = "\r\n" if b"\r\n" in self.raw else "\n"
+        self.lines: List[str] = self.text.splitlines()
+        self.trailing_newline = self.text.endswith("\n")
+        self.header_line: int = -1
+        self.header: Tuple[int, int, int, int] = (0, 0, 0, 0)
+        self.buffers: List[Buffer] = []
+        self.buffers_by_name: Dict[str, Buffer] = {}
+        self.passes: List[Pass] = []
+        self.outputs: List[Tuple[int, str, str, int]] = []
+        self.policies: List[Policy] = []
+        self.history: List[Tuple[List[str], int]] = []
+        self._parse()
+
+    # ---------- parsing ----------
+    def _parse(self) -> None:
+        for i, line in enumerate(self.lines):
+            if line.startswith("PORT_NETWORK_1 "):
+                if self.header_line != -1:
+                    raise PlanError("duplicate PORT_NETWORK_1 header")
+                parts = line.split()
+                if len(parts) != 5:
+                    raise PlanError(f"bad header at line {i+1}: {line!r}")
+                self.header = (int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4]))
+                self.header_line = i
+                break
+        if self.header_line == -1:
+            raise PlanError("missing PORT_NETWORK_1 header")
+        current: Optional[Pass] = None
+        for i in range(self.header_line + 1, len(self.lines)):
+            line = self.lines[i]
+            if not line or line.lstrip().startswith("#"):
+                continue
+            m = BUFFER_RE.match(line)
+            if m:
+                idx = len(self.buffers)
+                b = Buffer(idx, m.group(1), int(m.group(2)), m.group(3), i)
+                if b.name in self.buffers_by_name:
+                    raise PlanError(f"duplicate BUFFER name {b.name!r}")
+                self.buffers.append(b)
+                self.buffers_by_name[b.name] = b
+                continue
+            m = PASS_RE.match(line)
+            if m:
+                p = Pass(
+                    ordinal=len(self.passes),
+                    group=int(m.group(1)),
+                    name=m.group(2),
+                    spv=m.group(3),
+                    tail_tokens=shlex.split(m.group(4)),
+                    line=i,
+                )
+                self.passes.append(p)
+                current = p
+                continue
+            m = BIND_RE.match(line)
+            if m:
+                if current is None:
+                    raise PlanError(f"BIND before PASS at line {i+1}")
+                current.binds.append(Binding(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), i))
+                continue
+            if line.startswith("PUSH "):
+                if current is None:
+                    raise PlanError(f"PUSH before PASS at line {i+1}")
+                current.push_line = i
+                current.push = line.split()[1:]
+                continue
+            m = OUTPUT_RE.match(line)
+            if m:
+                self.outputs.append((int(m.group(1)), m.group(2), m.group(3), i))
+                current = None
+                continue
+            m = POLICY_RE.match(line)
+            if m:
+                self.policies.append(Policy(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)), i))
+                current = None
+                continue
+            if line.startswith("HISTORY "):
+                self.history.append((line.split()[1:], i))
+                current = None
+                continue
+            raise PlanError(f"unparsed line {i+1}: {line!r}")
+        if self.passes and self.passes[0].ordinal != 0:
+            raise PlanError("first dispatch ordinal is not 0")
+
+    # ---------- validation ----------
+    def validate(self) -> List[str]:
+        problems: List[str] = []
+        distinct_groups = len({p.group for p in self.passes})
+        if self.header != (distinct_groups, len(self.buffers), len(self.passes), len(self.outputs)):
+            problems.append(
+                f"header {self.header} != derived {(distinct_groups, len(self.buffers), len(self.passes), len(self.outputs))}"
+            )
+        # PASS ordinals contiguous
+        for k, p in enumerate(self.passes):
+            if p.ordinal != k:
+                problems.append(f"dispatch ordinal gap at {p.name}")
+            if not p.spv.lower().endswith(".spv"):
+                problems.append(f"dispatch {p.ordinal} {p.name}: spv is not .spv: {p.spv}")
+            if len({b.binding for b in p.binds}) != len(p.binds):
+                problems.append(f"dispatch {p.ordinal} {p.name}: duplicate binding numbers")
+            for b in p.binds:
+                if b.buffer >= len(self.buffers):
+                    problems.append(f"dispatch {p.ordinal} {p.name}: BIND {b.binding} buffer {b.buffer} out of range")
+                    continue
+                buf = self.buffers[b.buffer]
+                if b.offset + b.bytes > buf.bytes:
+                    problems.append(
+                        f"dispatch {p.ordinal} {p.name}: BIND {b.binding} {buf.name} range {b.offset}+{b.bytes} > {buf.bytes}"
+                    )
+            if p.push is None:
+                problems.append(f"dispatch {p.ordinal} {p.name}: missing PUSH")
+        # policy coverage and ordering
+        pol_map: Dict[int, Policy] = {}
+        for pol in self.policies:
+            if pol.buffer in pol_map:
+                problems.append(f"duplicate POLICY for buffer {pol.buffer}")
+            pol_map[pol.buffer] = pol
+            if pol.buffer >= len(self.buffers):
+                problems.append(f"POLICY for out-of-range buffer {pol.buffer}")
+            if pol.last and pol.first > pol.last:
+                problems.append(f"POLICY buffer {pol.buffer}: first > last")
+            if pol.last > len(self.passes):
+                problems.append(f"POLICY buffer {pol.buffer}: last > dispatches")
+        missing = [b.name for b in self.buffers if b.index not in pol_map]
+        # Plans may omit POLICY for buffers that are never resident and whose
+        # lifetime is implied by the writer/reader order.  Record the count but
+        # only fail when a buffer is explicitly used by a resident policy target
+        # that does not exist (handled above).
+        self.buffers_without_policy = missing
+        # outputs before policies
+        if self.outputs and self.policies:
+            if max(o[3] for o in self.outputs) > min(p.line for p in self.policies):
+                problems.append("OUTPUT lines are not all before POLICY lines")
+        for idx, fmt, name, _ in self.outputs:
+            if idx >= len(self.buffers):
+                problems.append(f"OUTPUT buffer {idx} out of range")
+        return problems
+
+    def assert_valid(self) -> None:
+        problems = self.validate()
+        if problems:
+            raise PlanError("plan validation failed:\n  " + "\n  ".join(problems))
+
+    # ---------- accessors ----------
+    def buffer(self, name: str) -> Buffer:
+        try:
+            return self.buffers_by_name[name]
+        except KeyError as e:
+            raise PlanError(f"no buffer named {name!r}") from e
+
+    def dispatch(self, ordinal: int) -> Pass:
+        if not 0 <= ordinal < len(self.passes):
+            raise PlanError(f"dispatch ordinal {ordinal} out of range")
+        return self.passes[ordinal]
+
+    def find_dispatches(self, name: str) -> List[Pass]:
+        return [p for p in self.passes if p.name == name]
+
+    def dispatch_by_name(self, name: str) -> Pass:
+        found = self.find_dispatches(name)
+        if len(found) != 1:
+            raise PlanError(f"expected exactly one dispatch named {name!r}, found {len(found)}")
+        return found[0]
+
+    # ---------- mutation ----------
+    def set_buffer(self, name: str, *, file: Optional[str] = None, bytes_: Optional[int] = None) -> Dict[str, object]:
+        b = self.buffer(name)
+        old = {"bytes": b.bytes, "file": b.file}
+        new_bytes = b.bytes if bytes_ is None else int(bytes_)
+        new_file = b.file if file is None else file
+        if new_bytes <= 0:
+            raise PlanError(f"buffer {name}: non-positive size")
+        if new_file != "-" and not Path(new_file).is_file():
+            raise PlanError(f"buffer {name}: new file does not exist: {new_file}")
+        # BIND ranges that exactly covered the whole old buffer follow the resize.
+        for p in self.passes:
+            for bind in p.binds:
+                if bind.buffer == b.index and bind.offset == 0 and bind.bytes == b.bytes:
+                    self.lines[bind.line] = f"BIND {bind.binding} {bind.buffer} 0 {new_bytes}"
+                    bind.bytes = new_bytes
+                elif bind.buffer == b.index and bind.offset + bind.bytes > new_bytes:
+                    raise PlanError(
+                        f"resize {name} {b.bytes}->{new_bytes} breaks BIND {bind.binding} at dispatch {p.ordinal}"
+                    )
+        # POLICY unchanged (byte count is not in POLICY).
+        self.lines[b.line] = f'BUFFER "{b.name}" {new_bytes} "{new_file}"'
+        b.bytes = new_bytes
+        b.file = new_file
+        return {"buffer": name, "old": old, "new": {"bytes": b.bytes, "file": b.file}}
+
+    def set_spv(self, ordinal: int, spv: str, *, name: Optional[str] = None) -> Dict[str, object]:
+        p = self.dispatch(ordinal)
+        if name is not None and p.name != name:
+            raise PlanError(f"dispatch {ordinal} is {p.name!r}, not {name!r}")
+        if not Path(spv).is_file():
+            raise PlanError(f"new SPV does not exist: {spv}")
+        old = p.spv
+        m = PASS_RE.match(self.lines[p.line])
+        assert m
+        self.lines[p.line] = f'PASS {m.group(1)} "{m.group(2)}" "{spv}"{m.group(4)}'
+        p.spv = spv
+        return {"ordinal": ordinal, "name": p.name, "old_spv": old, "new_spv": spv}
+
+    def set_push_word(self, ordinal: int, word: int, value: int) -> Dict[str, object]:
+        p = self.dispatch(ordinal)
+        if p.push is None or p.push_line is None:
+            raise PlanError(f"dispatch {ordinal} has no PUSH")
+        if not 0 <= word < len(p.push):
+            raise PlanError(f"dispatch {ordinal}: PUSH word {word} out of range ({len(p.push)})")
+        old = p.push[word]
+        p.push[word] = str(int(value) & 0xFFFFFFFF)
+        self.lines[p.push_line] = "PUSH " + " ".join(p.push)
+        return {"ordinal": ordinal, "name": p.name, "word": word, "old": old, "new": p.push[word]}
+
+    def set_output(self, filename: str) -> None:
+        if not self.outputs:
+            raise PlanError("plan has no OUTPUT")
+        idx, fmt, old, line = self.outputs[0]
+        self.lines[line] = f'OUTPUT {idx} {fmt} "{filename}"'
+        self.outputs[0] = (idx, fmt, filename, line)
+
+    def add_output(self, buffer_name: str, fmt: str, filename: str) -> None:
+        """Add a diagnostic OUTPUT for an existing buffer (inserted before POLICY)."""
+        buf = self.buffer(buffer_name)
+        if any(o[0] == buf.index for o in self.outputs):
+            raise PlanError(f"buffer {buffer_name} already has an OUTPUT")
+        if fmt not in ("float32", "float16", "raw"):
+            raise PlanError(f"unsupported OUTPUT format {fmt!r}")
+        pos = (max(o[3] for o in self.outputs) + 1) if self.outputs else self.header_line + 1
+        self._insert_line(pos, f'OUTPUT {buf.index} {fmt} "{filename}"')
+        self.outputs.append((buf.index, fmt, filename, pos))
+        self._update_header()
+
+    # ---------- structural insertion ----------
+    def _shift_lines(self, pos: int) -> None:
+        for b in self.buffers:
+            if b.line >= pos:
+                b.line += 1
+        for p in self.passes:
+            if p.line >= pos:
+                p.line += 1
+            for bind in p.binds:
+                if bind.line >= pos:
+                    bind.line += 1
+            if p.push_line is not None and p.push_line >= pos:
+                p.push_line += 1
+        self.outputs = [(i, f, n, ln + 1 if ln >= pos else ln) for (i, f, n, ln) in self.outputs]
+        for pol in self.policies:
+            if pol.line >= pos:
+                pol.line += 1
+        self.history = [(t, ln + 1 if ln >= pos else ln) for (t, ln) in self.history]
+        if self.header_line >= pos:
+            self.header_line += 1
+
+    def _insert_line(self, pos: int, text: str) -> None:
+        self._shift_lines(pos)
+        self.lines.insert(pos, text)
+
+    def _update_header(self) -> None:
+        distinct_groups = len({p.group for p in self.passes})
+        self.header = (distinct_groups, len(self.buffers), len(self.passes), len(self.outputs))
+        self.lines[self.header_line] = (
+            f"PORT_NETWORK_1 {self.header[0]} {self.header[1]} {self.header[2]} {self.header[3]}"
+        )
+
+    def add_buffer(self, name: str, bytes_: int, file: str = "-") -> Buffer:
+        if name in self.buffers_by_name:
+            raise PlanError(f"buffer {name!r} already exists")
+        if bytes_ <= 0:
+            raise PlanError("non-positive buffer size")
+        if file != "-" and not Path(file).is_file():
+            raise PlanError(f"buffer file does not exist: {file}")
+        pos = max((b.line for b in self.buffers), default=self.header_line) + 1
+        idx = len(self.buffers)
+        self._insert_line(pos, f'BUFFER "{name}" {int(bytes_)} "{file}"')
+        b = Buffer(idx, name, int(bytes_), file, pos)
+        self.buffers.append(b)
+        self.buffers_by_name[name] = b
+        # Policy for the new buffer: non-resident unless the caller changes it.
+        policy_line = len(self.lines)
+        self.lines.append(f"POLICY {idx} 0 0 0 0")
+        self.policies.append(Policy(idx, 0, 0, 0, 0, policy_line))
+        self._update_header()
+        return b
+
+    def add_bind(self, ordinal: int, binding: int, buffer_name: str, offset: int = 0, bytes_: Optional[int] = None) -> Dict[str, object]:
+        p = self.dispatch(ordinal)
+        if any(b.binding == binding for b in p.binds):
+            raise PlanError(f"dispatch {ordinal} {p.name}: binding {binding} already exists")
+        buf = self.buffer(buffer_name)
+        size = buf.bytes if bytes_ is None else int(bytes_)
+        if offset < 0 or size <= 0 or offset + size > buf.bytes:
+            raise PlanError(f"BIND {binding} range {offset}+{size} outside {buf.name} ({buf.bytes})")
+        pos = (max((b.line for b in p.binds)) + 1) if p.binds else (p.line + 1)
+        self._insert_line(pos, f"BIND {binding} {buf.index} {offset} {size}")
+        p.binds.append(Binding(binding, buf.index, offset, size, pos))
+        p.binds.sort(key=lambda x: x.binding)
+        # The third numeric token after the SPV is the declared binding count.
+        toks = shlex.split(self.lines[p.line])
+        if len(toks) > 6 and toks[6].isdigit():
+            toks[6] = str(len(p.binds))
+            self.lines[p.line] = f'PASS {toks[1]} "{toks[2]}" "{toks[3]}" ' + " ".join(toks[4:])
+        return {"ordinal": ordinal, "name": p.name, "binding": binding, "buffer": buffer_name,
+                "offset": offset, "bytes": size}
+
+    def set_bind(self, ordinal: int, binding: int, *, buffer_name: Optional[str] = None,
+                 offset: Optional[int] = None, bytes_: Optional[int] = None) -> Dict[str, object]:
+        p = self.dispatch(ordinal)
+        b = next((x for x in p.binds if x.binding == binding), None)
+        if b is None:
+            raise PlanError(f"dispatch {ordinal} {p.name}: no binding {binding}")
+        if buffer_name is not None:
+            buf = self.buffer(buffer_name)
+            b.buffer = buf.index
+        else:
+            buf = self.buffers[b.buffer]
+        if offset is not None:
+            b.offset = int(offset)
+        if bytes_ is not None:
+            b.bytes = int(bytes_)
+        if b.offset < 0 or b.bytes <= 0 or b.offset + b.bytes > buf.bytes:
+            raise PlanError(f"BIND {binding} range {b.offset}+{b.bytes} outside {buf.name} ({buf.bytes})")
+        self.lines[b.line] = f"BIND {b.binding} {b.buffer} {b.offset} {b.bytes}"
+        return {"ordinal": ordinal, "name": p.name, "binding": binding,
+                "buffer": buf.name, "offset": b.offset, "bytes": b.bytes}
+
+    def set_policy(self, buffer_name: str, *, resident: Optional[int] = None, first: Optional[int] = None,
+                   last: Optional[int] = None, clear_first: Optional[int] = None) -> Dict[str, object]:
+        buf = self.buffer(buffer_name)
+        pol = next((x for x in self.policies if x.buffer == buf.index), None)
+        if pol is None:
+            pol = Policy(buf.index, 0, 0, 0, 0, -1)
+            self.policies.append(pol)
+        old = {"resident": pol.resident, "first": pol.first, "last": pol.last, "clear": pol.clear_first}
+        if resident is not None:
+            pol.resident = int(resident)
+        if first is not None:
+            pol.first = int(first)
+        if last is not None:
+            pol.last = int(last)
+        if clear_first is not None:
+            pol.clear_first = int(clear_first)
+        text = f"POLICY {pol.buffer} {pol.resident} {pol.first} {pol.last} {pol.clear_first}"
+        if pol.line == -1:
+            pol.line = len(self.lines)
+            self.lines.append(text)
+        else:
+            self.lines[pol.line] = text
+        return {"buffer": buffer_name, "old": old,
+                "new": {"resident": pol.resident, "first": pol.first, "last": pol.last, "clear": pol.clear_first}}
+
+    def add_history(self, words: List[str]) -> None:
+        pos = max((ln for _, ln in self.history), default=max(o[3] for o in self.outputs)) + 1
+        self._insert_line(pos, "HISTORY " + " ".join(str(w) for w in words))
+        self.history.append(([str(w) for w in words], pos))
+
+    def remove_history(self) -> List[List[str]]:
+        removed = [list(t) for t, _ in self.history]
+        for _, ln in sorted(self.history, key=lambda x: x[1], reverse=True):
+            del self.lines[ln]
+            for b in self.buffers:
+                if b.line > ln:
+                    b.line -= 1
+            for p in self.passes:
+                if p.line > ln:
+                    p.line -= 1
+                for bind in p.binds:
+                    if bind.line > ln:
+                        bind.line -= 1
+                if p.push_line is not None and p.push_line > ln:
+                    p.push_line -= 1
+            self.outputs = [(i, f, n, l - 1 if l > ln else l) for (i, f, n, l) in self.outputs]
+            for pol in self.policies:
+                if pol.line > ln:
+                    pol.line -= 1
+        self.history = []
+        return removed
+
+    # ---------- serialization ----------
+    def to_text(self) -> str:
+        text = self.newline.join(self.lines)
+        if self.trailing_newline:
+            text += self.newline
+        return text
+
+    def write(self, path: Path | str, *, check: bool = True) -> Path:
+        if check:
+            self.assert_valid()
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Write bytes so the original CRLF/LF identity survives byte-for-byte.
+        path.write_bytes(self.to_text().encode("utf-8"))
+        return path
+
+    def sha256(self) -> str:
+        return hashlib.sha256(self.to_text().encode("utf-8")).hexdigest()
+
+    # ---------- comparison ----------
+    def summary(self) -> Dict[str, object]:
+        return {
+            "path": str(self.path),
+            "sha256": self.sha256(),
+            "header": list(self.header),
+            "buffers": len(self.buffers),
+            "dispatches": len(self.passes),
+            "outputs": [list(o[:3]) for o in self.outputs],
+            "buffer_names": [b.name for b in self.buffers],
+            "dispatch_ids": [{"ordinal": p.ordinal, "name": p.name, "spv": p.spv, "spv_sha256": sha256_file(p.spv) if Path(p.spv).is_file() else None} for p in self.passes],
+        }
+
+
+def diff_plans(a: Plan, b: Plan) -> Dict[str, object]:
+    """Resource-level diff, keyed by buffer name and dispatch identity."""
+    ab = {x.name: x for x in a.buffers}
+    bb = {x.name: x for x in b.buffers}
+    buf_added = sorted(set(bb) - set(ab))
+    buf_removed = sorted(set(ab) - set(bb))
+    buf_changed = []
+    for name in sorted(set(ab) & set(bb)):
+        x, y = ab[name], bb[name]
+        if (x.bytes, x.file) != (y.bytes, y.file):
+            buf_changed.append({"name": name, "old": {"bytes": x.bytes, "file": x.file}, "new": {"bytes": y.bytes, "file": y.file}})
+    disp_added = [p.ordinal for p in b.passes[len(a.passes):]]
+    disp_removed = [p.ordinal for p in a.passes[len(b.passes):]]
+    spv_changed = []
+    for k in range(min(len(a.passes), len(b.passes))):
+        x, y = a.passes[k], b.passes[k]
+        if x.name != y.name:
+            spv_changed.append({"ordinal": k, "kind": "name", "old": x.name, "new": y.name})
+        elif x.spv != y.spv:
+            spv_changed.append({"ordinal": k, "kind": "spv", "name": x.name, "old": x.spv, "new": y.spv,
+                                "old_sha256": sha256_file(x.spv) if Path(x.spv).is_file() else None,
+                                "new_sha256": sha256_file(y.spv) if Path(y.spv).is_file() else None})
+        elif x.push != y.push:
+            spv_changed.append({"ordinal": k, "kind": "push", "name": x.name,
+                                "old": x.push, "new": y.push})
+    return {
+        "a": {"path": str(a.path), "sha256": a.sha256()},
+        "b": {"path": str(b.path), "sha256": b.sha256()},
+        "buffers_added": buf_added,
+        "buffers_removed": buf_removed,
+        "buffers_changed": buf_changed,
+        "dispatches_added": disp_added,
+        "dispatches_removed": disp_removed,
+        "dispatch_changes": spv_changed,
+    }
+
+
+def apply_patch(base_plan: Path | str, patch: Dict[str, object], out_plan: Path | str) -> Dict[str, object]:
+    """Apply a JSON patch description to a base plan.
+
+    patch = {
+      "base_sha256": "...",                  # required, checked
+      "replace_buffers": {"name": {"file": "...", "bytes": 123}},
+      "replace_spv": [{"ordinal": 1, "name": "...", "spv": "...", "expected_sha256": "..."}],
+      "set_push": [{"ordinal": 1, "word": 17, "value": 123}],
+      "output": "replayed-network.bin",
+      "notes": "..."
+    }
+    """
+    base = Plan(base_plan)
+    got = base.sha256()
+    want = patch.get("base_sha256")
+    if want and got != want:
+        raise PlanError(f"base plan hash mismatch: got {got}, want {want}")
+    log: List[Dict[str, object]] = []
+    for name, spec in (patch.get("add_buffers") or {}).items():
+        b = base.add_buffer(name, int(spec["bytes"]), spec.get("file", "-"))
+        log.append({"op": "add_buffer", "name": name, "index": b.index, "bytes": b.bytes, "file": b.file})
+    for name, spec in sorted((patch.get("replace_buffers") or {}).items()):
+        log.append({"op": "replace_buffer", **base.set_buffer(name, file=spec.get("file"), bytes_=spec.get("bytes"))})
+    for item in patch.get("replace_spv") or []:
+        spv = item["spv"]
+        if item.get("expected_sha256") and sha256_file(spv) != item["expected_sha256"]:
+            raise PlanError(f"SPV hash mismatch for {spv}")
+        log.append({"op": "replace_spv", **base.set_spv(int(item["ordinal"]), spv, name=item.get("name"))})
+    for item in patch.get("set_binds") or []:
+        log.append({"op": "set_bind", **base.set_bind(int(item["ordinal"]), int(item["binding"]),
+                                                       buffer_name=item.get("buffer"),
+                                                       offset=item.get("offset"), bytes_=item.get("bytes"))})
+    for item in patch.get("add_binds") or []:
+        log.append({"op": "add_bind", **base.add_bind(int(item["ordinal"]), int(item["binding"]), item["buffer"],
+                                                      int(item.get("offset", 0)), item.get("bytes"))})
+    for item in patch.get("set_push") or []:
+        log.append({"op": "set_push", **base.set_push_word(int(item["ordinal"]), int(item["word"]), int(item["value"]))})
+    for item in patch.get("set_policies") or []:
+        log.append({"op": "set_policy", **base.set_policy(item["buffer"],
+                                                         resident=item.get("resident"),
+                                                         first=item.get("first"),
+                                                         last=item.get("last"),
+                                                         clear_first=item.get("clear"))})
+    if patch.get("remove_history"):
+        removed = base.remove_history()
+        log.append({"op": "remove_history", "removed": removed})
+    for words in patch.get("add_history") or []:
+        base.add_history(words)
+        log.append({"op": "add_history", "words": words})
+    if patch.get("output"):
+        base.set_output(patch["output"])
+        log.append({"op": "set_output", "file": patch["output"]})
+    base.assert_valid()
+    base.write(out_plan, check=False)
+    out_sha = sha256_file(out_plan)
+    expected_out = patch.get("expected_out_sha256")
+    if expected_out and out_sha != expected_out:
+        raise PlanError(f"output plan hash mismatch: got {out_sha}, want {expected_out}")
+    result = {
+        "base_plan": str(base_plan),
+        "base_sha256": got,
+        "out_plan": str(out_plan),
+        "out_sha256": out_sha,
+        "changes": log,
+        "notes": patch.get("notes"),
+    }
+    return result
+
+
+def load_plan_set(pattern: str) -> List[Plan]:
+    return [Plan(p) for p in sorted(Path().glob(pattern))]
+
+
+if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("plan")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--diff")
+    args = ap.parse_args()
+    p = Plan(args.plan)
+    problems = p.validate()
+    if args.diff:
+        q = Plan(args.diff)
+        print(json.dumps(diff_plans(p, q), indent=2, ensure_ascii=False))
+    elif args.json:
+        print(json.dumps(p.summary(), indent=2, ensure_ascii=False))
+    else:
+        print(f"{p.path}: sha={p.sha256()} header={p.header} buffers={len(p.buffers)} dispatches={len(p.passes)} outputs={len(p.outputs)}")
+        print("problems:", problems if problems else "none")

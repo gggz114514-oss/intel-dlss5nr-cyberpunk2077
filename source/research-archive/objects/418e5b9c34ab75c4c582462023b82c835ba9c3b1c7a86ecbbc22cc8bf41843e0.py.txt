@@ -1,0 +1,84 @@
+"""S01 step B: prove the CPU body4 model against the existing GPU local-b4 arms.
+
+Arms
+  A  c32-minmax/local-b4          parent body1.spv, 1168 B scales, original w8
+  B  c32-equalized-b4/local-b4    X-equalized SPV, 1296 B scales, equalized w8
+Both arms replay the same FP16 teacher input dump_block3_out.bin and write skip4,
+so the CPU model can be compared element by element in the same flat layout.
+"""
+import sys, json, argparse
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--tiles", type=int, default=256, help="number of swin tiles to sample (0 = all)")
+ap.add_argument("--stride", type=int, default=337, help="tile sampling stride")
+args = ap.parse_args()
+
+OUT = {}
+teacher = np.fromfile(L.D / "dump-fp16/dump_skip4.bin", dtype="<f2")
+print("teacher dump_skip4 fp16 elements", teacher.size, "expected", 168 * 96 * 512)
+
+tix_all, tx_all, ty_all = L.tile_set(168, 96)
+if args.tiles:
+    sel = np.unique(np.linspace(0, tix_all.size - 1, args.tiles).astype(np.int64))
+else:
+    sel = np.arange(tix_all.size)
+tiles = tix_all[sel]
+cols = np.arange(16)
+TT, CC = np.meshgrid(tiles, cols, indexing="ij")
+TT = TT.ravel(); CC = CC.ravel()
+print("sampled tiles", tiles.size, "columns", TT.size)
+
+arms = {
+    "A_minmax": dict(plan=L.D / "c32-minmax/local-b4.txt",
+                     gpu=L.D / "c32-minmax/local-b4/replayed-network.bin"),
+    "B_equalx": dict(plan=L.D / "c32-equalized-b4/local-b4.txt",
+                     gpu=L.D / "c32-equalized-b4/local-b4/replayed-network.bin"),
+}
+for key, arm in arms.items():
+    info = L.block_bindings(arm["plan"])
+    x_flat = np.fromfile(info["input"], dtype="<f2")
+    gpu = np.fromfile(arm["gpu"], dtype="<f2")
+    we, wc = L.load_w8(info["w8"])
+    fsc = L.load_fsc(info["fsc"])
+    rs = L.load_rs(info["wb"], info["rs_base"])
+    invx = fsc[L.FSC_INVX:L.FSC_INVX + 32].copy() if fsc.size >= L.FSC_INVX + 32 else np.full(32, fsc[L.FSC_INV_X], np.float32)
+    inve = fsc[L.FSC_INVE:L.FSC_INVE + 128].copy() if fsc.size >= L.FSC_INVE + 128 else np.full(128, fsc[L.FSC_INV_E], np.float32)
+    x = L.gather(x_flat, TT, CC)
+    got = L.forward(x, we, wc, rs, invx, inve, fsc[L.FSC_TAP_E:L.FSC_TAP_E + 128], fsc[L.FSC_TAP_C:L.FSC_TAP_C + 32])
+    # GPU values at the same addresses
+    ref = np.empty((32, TT.size), np.float16)
+    base = TT * 512 + CC * 16
+    for c in range(32):
+        off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+        ref[c] = gpu[base + off]
+    te = np.empty((32, TT.size), np.float16)
+    for c in range(32):
+        off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+        te[c] = teacher[base + off]
+
+    cpu_vs_gpu = L.rel_l2(got["y_half"], ref)
+    cpu_vs_teacher = L.rel_l2(got["y_f32"], te)
+    gpu_vs_teacher = L.rel_l2(ref, te)
+    exact = float(np.mean(got["y_half"] == ref))
+    print(f"{key:10s} spv_sha={info['spv_sha256'][:12]} fsc={fsc.size} "
+          f"cpu/gpu relL2={cpu_vs_gpu:.6e} bitexact_frac={exact:.6f} "
+          f"cpu/teacher={cpu_vs_teacher:.6f} gpu/teacher={gpu_vs_teacher:.6f}")
+    OUT[key] = dict(plan=info["plan"], plan_sha256=info["plan_sha256"],
+                    spv_sha256=info["spv_sha256"], w8_sha256=info["w8_sha256"],
+                    fsc_sha256=info["fsc_sha256"], fsc_entries=int(fsc.size),
+                    gpu_out=str(arm["gpu"]).replace("\\", "/"),
+                    cpu_vs_gpu_rel_l2=cpu_vs_gpu, bit_exact_fraction=exact,
+                    cpu_vs_teacher_rel_l2=cpu_vs_teacher,
+                    gpu_vs_teacher_rel_l2=gpu_vs_teacher,
+                    tiles=int(TT.size // 16), columns=int(TT.size))
+
+OUT["teacher"] = "@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24/dump-fp16/dump_skip4.bin"
+OUT["input"] = "@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24/dump-fp16/dump_block3_out.bin"
+OUT["note"] = "flat-layout comparison: no pixel geometry assumed, only the shader address formula"
+print(json.dumps(OUT, indent=2)[:400])
+(Path(__file__).resolve().parent / "alignment.json").write_text(json.dumps(OUT, indent=2))

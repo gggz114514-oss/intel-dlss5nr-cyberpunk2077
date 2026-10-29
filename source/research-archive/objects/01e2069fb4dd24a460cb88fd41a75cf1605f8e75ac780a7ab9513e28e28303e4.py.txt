@@ -1,0 +1,168 @@
+"""Motion-frame re-check of D1/D2, the 0.729-vs-0.273 gap, and the teacher-x65 artifact.
+
+Per frame (34189 / 41444 / 43654) the FP16 teacher boundary triple is available:
+  dump_block65_out.bin, dump_skip4.bin, dump_block66_out.bin
+so the A-class arm (F2's own error under one common input) can be run on all three frames
+even though the INT8 chain dump exists only for 34189.
+
+Also:
+  T1  inter-block correlation inside each 1024-element workgroup run
+      (channel-group vs tile-neighbour discriminator for block65_out's layout)
+  T2  per-element correlation between the FP16 teacher and the INT8 chain block65_out
+  T3  block67's static input scale (buffer 874) and the clip fraction it implies for
+      each F2 arm -> the downstream-calibration test
+  A1  the teacher->F2-layout artifact (identity under H1) + SHA256
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import f2model as M  # noqa: E402
+import planbits  # noqa: E402
+
+TD = M.D / "teacher-diagnostics"
+FRAMES = {
+    "34189": {"dir": M.D / "dump-fp16"},
+    "41444": {"dir": TD / "teacher-41444"},
+    "43654": {"dir": TD / "teacher-43654"},
+}
+EV = HERE / "EVIDENCE"
+
+
+def sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for c in iter(lambda: f.read(1 << 20), b""):
+            h.update(c)
+    return h.hexdigest()
+
+
+def load_f16(p):
+    return np.fromfile(p, dtype="<f2")
+
+
+def arm(x65, skip, weights, quant, proj, sdim, seed="channel"):
+    ws = dict(M.SETS[weights])
+    main, sA = M.project(x65, ws, quant, proj, sdim)
+    X = M.blend(main, skip, True)
+    st = M.body(X, ws, quant, seed, "qk")
+    return st, main
+
+
+def stats(a):
+    a = np.asarray(a, np.float32)
+    return {"rms": float(np.sqrt((a ** 2).mean())), "maxabs": float(np.abs(a).max()),
+            "p999": float(np.quantile(np.abs(a), 0.999))}
+
+
+def clip_frac(t, inv):
+    """fraction of elements that hit the +-127 rail when block67's static invX is applied"""
+    v = np.abs(np.asarray(t, np.float32) * np.float32(inv))
+    return float((v > 126.5).mean())
+
+
+def t1_layout(path):
+    reg = np.load if False else np.fromfile(path, dtype="<f2").astype(np.float32).reshape(M.NWG, 1024)
+    blk = reg.reshape(M.NWG, 4, 16, 16)
+    # correlation between consecutive 256-element sub-blocks, all WGs pooled
+    cs = []
+    for i in range(3):
+        a = blk[:, i].ravel()
+        b = blk[:, i + 1].ravel()
+        cs.append(float(np.corrcoef(a, b)[0, 1]))
+    # within-subblock spatial correlation of the 4x4 slot field (sanity)
+    f = blk[:, 0, :, 0]
+    sp = float(np.corrcoef(f[:, :-1].ravel(), f[:, 1:].ravel())[0, 1])
+    return {"inter_subblock_corr": cs, "slot_neighbour_corr": sp}
+
+
+def main():
+    out = {"frames": {}, "tests": {}}
+
+    # ---- block67 static input scale (buffer 874 of ord 282)
+    pl = planbits.parse(planbits.PLANS["int8_corrected"])
+    b67 = [p for p in pl["passes"] if p["ordinal"] == 282][0]
+    b874 = [bd for bd in b67["bind"] if bd["binding"] == 6][0]["buffer"]
+    f874 = pl["buffers"][b874]
+    sc = np.fromfile(f874["file"], dtype="<f4").astype(np.float32)
+    out["block67_pack"] = {"buffer": b874, "file": f874["file"], "floats": int(len(sc)),
+                           "sX": float(sc[0]), "invX": float(sc[1]), "sE": float(sc[2]), "invE": float(sc[3])}
+    invX67 = float(sc[1])
+    out["block67_pack"]["amax_implied"] = 127.0 / invX67
+    print("block67 pack %s  sX=%.5f invX=%.5f -> amax %.3f" % (Path(f874["file"]).name, sc[0], sc[1], 127.0 / sc[1]))
+
+    # ---- layout tests
+    out["tests"]["T1_teacher"] = t1_layout(M.RES["t_x65"])
+    out["tests"]["T1_chain"] = t1_layout(M.RES["c_x65"])
+    a = load_f16(M.RES["t_x65"]).astype(np.float32)
+    b = load_f16(M.RES["c_x65"]).astype(np.float32)
+    out["tests"]["T2_teacher_vs_chain_same_offset_corr"] = float(np.corrcoef(a, b)[0, 1])
+    out["tests"]["T2_note"] = "same semantic boundary, two chains; a wrong layout pairing would give ~0"
+    print("T1 teacher inter-subblock %s slot-neighbour %.3f" % (
+        ["%.3f" % x for x in out["tests"]["T1_teacher"]["inter_subblock_corr"]],
+        out["tests"]["T1_teacher"]["slot_neighbour_corr"]))
+    print("T1 chain   inter-subblock %s slot-neighbour %.3f" % (
+        ["%.3f" % x for x in out["tests"]["T1_chain"]["inter_subblock_corr"]],
+        out["tests"]["T1_chain"]["slot_neighbour_corr"]))
+    print("T2 corr(teacher block65, chain block65) at identical offsets = %.4f" %
+          out["tests"]["T2_teacher_vs_chain_same_offset_corr"])
+
+    # ---- per-frame arms
+    for fr, cfg in FRAMES.items():
+        d = cfg["dir"]
+        x65 = load_f16(d / "dump_block65_out.bin")
+        skip = load_f16(d / "dump_skip4.bin")
+        tout = load_f16(d / "dump_block66_out.bin").astype(np.float32)
+        row = {"input_rms": float(np.sqrt((x65.astype(np.float32) ** 2).mean())),
+               "teacher_out_rms": float(np.sqrt((tout ** 2).mean()))}
+        for tag, proj, sdim in (("as_written", "source", "row"), ("fixed_D1D2", "parent", "col")):
+            st, main = arm(x65, skip, "i8", True, proj, sdim)
+            got = M.to_io(st["O"])
+            row[tag] = {"relL2_vs_teacher": float(M.rel(got, tout)),
+                        "corr_vs_teacher": float(np.corrcoef(got, tout)[0, 1]),
+                        "out": stats(got),
+                        "X": stats(st["X"]),
+                        "clip_frac_block67": clip_frac(got, invX67)}
+        # cross-chain number: fixed arm, INT8 chain input, compared to the FP16 teacher output
+        if fr == "34189":
+            stc, _ = arm(M.R["c_x65"], M.R["t_skip"], "i8", True, "parent", "col")
+            row["cross_chain_fixed_relL2_vs_teacher"] = float(M.rel(M.to_io(stc["O"]), tout))
+            sts, _ = arm(M.R["c_x65"], M.R["t_skip"], "i8", True, "source", "row")
+            row["cross_chain_aswritten_relL2_vs_teacher"] = float(M.rel(M.to_io(sts["O"]), tout))
+            row["same_chain_aswritten_relL2_vs_gpu"] = float(M.rel(M.to_io(sts["O"]), M.R["c_out"].astype(np.float32)))
+        out["frames"][fr] = row
+        print("frame %s in_rms=%.2f  as-written relL2=%.4f corr=%.3f clip=%.4f | fixed relL2=%.4f corr=%.3f clip=%.4f" % (
+            fr, row["input_rms"], row["as_written"]["relL2_vs_teacher"], row["as_written"]["corr_vs_teacher"],
+            row["as_written"]["clip_frac_block67"], row["fixed_D1D2"]["relL2_vs_teacher"],
+            row["fixed_D1D2"]["corr_vs_teacher"], row["fixed_D1D2"]["clip_frac_block67"]))
+        if fr == "34189":
+            print("   34189 cross-chain: as-written %.4f  fixed %.4f (vs FP16 teacher output)" % (
+                row["cross_chain_aswritten_relL2_vs_teacher"], row["cross_chain_fixed_relL2_vs_teacher"]))
+
+    # ---- teacher -> F2 layout artifact
+    src = M.RES["t_x65"]
+    dst = HERE / "teacher-block65-f2layout.bin"
+    raw = src.read_bytes()
+    dst.write_bytes(raw)
+    out["artifact"] = {"src": str(src).replace("\\", "/"), "src_sha256": sha(src),
+                       "dst": "C00-integer-ref/teacher-block65-f2layout.bin", "dst_sha256": sha(dst),
+                       "bytes": len(raw), "mapping": "identity ([wg][chgrp4][slot16][ch16] already)",
+                       "evidence": "fixed F2 on this tensor reproduces dump_block66_out at relL2 %.4f corr %.4f"
+                                   % (out["frames"]["34189"]["fixed_D1D2"]["relL2_vs_teacher"],
+                                      out["frames"]["34189"]["fixed_D1D2"]["corr_vs_teacher"])}
+    print("artifact", out["artifact"]["dst_sha256"], out["artifact"]["bytes"])
+
+    (EV / "motion-frames.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
+    print("wrote EVIDENCE/motion-frames.json")
+
+
+if __name__ == "__main__":
+    main()
+

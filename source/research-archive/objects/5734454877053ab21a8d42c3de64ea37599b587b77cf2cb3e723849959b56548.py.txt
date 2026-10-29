@@ -1,0 +1,136 @@
+"""Static activation quantization headroom analysis on FP16 teacher dumps.
+
+For each block input X [tokens, K] this reports:
+  static      : one per-tensor scale, max|X|/127
+  channel     : power-of-two per-input-channel balancing D, X/D, one scale
+  token       : per-token scale (upper bound, NOT allowed in the static task)
+  weights     : quantization error of the weight matrix at per-output-channel scales
+
+The point is to separate *channel imbalance* (fixable offline) from *token
+variance* (irreducible without runtime token scales).  All numbers are CPU
+estimates on captured FP16 teacher inputs, not GPU results.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+
+D = Path(r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24")
+TEACHERS = [D / "dump-fp16", D / "teacher-diagnostics/teacher-41444", D / "teacher-diagnostics/teacher-43654"]
+
+
+def load_half(path: Path) -> np.ndarray:
+    return np.fromfile(path, dtype="<f2").astype(np.float32)
+
+
+def reshape_c32(raw: np.ndarray) -> np.ndarray:
+    # (tokens/16, 2, 16, 16) -> (tokens, 32), matching calibrate_c32_real.py
+    x = raw.reshape(-1, 2, 16, 16).transpose(0, 2, 1, 3).reshape(-1, 32)
+    return x
+
+
+def reshape_c64(raw: np.ndarray) -> np.ndarray:
+    # (tokens/16, 4, 16, 16) -> (tokens, 64), matching calibrate_c64_* scripts
+    x = raw.reshape(-1, 4, 16, 16).transpose(0, 2, 1, 3).reshape(-1, 64)
+    return x
+
+
+def quant_error(x: np.ndarray, s: np.ndarray | float) -> float:
+    q = np.clip(np.rint(x / s), -127, 127)
+    rec = q * s
+    return float(np.linalg.norm(x - rec) / np.linalg.norm(x))
+
+
+def analyze(x: np.ndarray, max_tokens: int = 262144) -> dict:
+    if len(x) > max_tokens:
+        idx = np.linspace(0, len(x) - 1, max_tokens).astype(np.int64)
+        x = x[idx]
+    x = x.astype(np.float64)
+    amax = np.max(np.abs(x))
+    static = quant_error(x, amax / 127.0)
+
+    # Channel balancing: power-of-two diagonal, equalise channel ranges.
+    ch_amax = np.max(np.abs(x), axis=0)
+    pos = ch_amax[ch_amax > 0]
+    target = float(np.exp(np.mean(np.log(pos)))) if len(pos) else 1.0
+    d = np.exp2(np.rint(np.log2(np.maximum(ch_amax, 1e-30) / target)))
+    d[ch_amax == 0] = 1.0
+    xd = x / d
+    channel = quant_error(xd, np.max(np.abs(xd)) / 127.0)
+    # Same but with a single continuous (non power-of-two) diagonal, as a bound.
+    d_cont = np.maximum(ch_amax, 1e-30) / target
+    xdc = x / d_cont
+    channel_cont = quant_error(xdc, np.max(np.abs(xdc)) / 127.0)
+
+    # Per-token scale (not permitted in the static candidate; upper bound).
+    row_amax = np.max(np.abs(x), axis=1)
+    row_amax = np.maximum(row_amax, 1e-30)
+    q = np.clip(np.rint(x / (row_amax[:, None] / 127.0)), -127, 127)
+    token = float(np.linalg.norm(x - q * (row_amax[:, None] / 127.0)) / np.linalg.norm(x))
+
+    return {
+        "tokens": int(x.shape[0]),
+        "k": int(x.shape[1]),
+        "absmax": float(amax),
+        "rms": float(np.sqrt(np.mean(x * x))),
+        "max_over_rms": float(amax / max(np.sqrt(np.mean(x * x)), 1e-30)),
+        "static_rel_l2": static,
+        "channel_pow2_rel_l2": channel,
+        "channel_cont_rel_l2": channel_cont,
+        "token_rel_l2": token,
+        "channel_gain_fraction": float((static - channel) / max(static, 1e-30)),
+        "token_gain_fraction": float((channel - token) / max(channel, 1e-30)),
+        "channel_absmax_min": float(ch_amax.min()),
+        "channel_absmax_max": float(ch_amax.max()),
+        "channel_absmax_ratio": float(ch_amax.max() / max(ch_amax.min(), 1e-30)),
+        "diagonal_pow2": [float(v) for v in d],
+    }
+
+
+def gather(block: int, kind: str) -> tuple[np.ndarray, list[str]]:
+    """Load the teacher input for a block, three frames concatenated."""
+    xs, used = [], []
+    for td in TEACHERS:
+        if kind == "c32":
+            p = td / f"dump_block{block-1}_out.bin"
+            if not p.exists():
+                continue
+            xs.append(reshape_c32(load_half(p)))
+        elif kind == "c64":
+            p = td / f"dump_block{block-1}_out.bin"
+            if not p.exists():
+                continue
+            xs.append(reshape_c64(load_half(p)))
+        else:
+            raise SystemExit(f"unknown kind {kind}")
+        used.append(str(p))
+    if not xs:
+        raise SystemExit(f"no teacher input for {kind} block {block}")
+    return np.concatenate(xs, axis=0), used
+
+
+def main() -> None:
+    out = {"scope": "CPU estimate on captured FP16 teacher inputs; per-token scale is an upper bound, not a candidate",
+           "teachers": [str(t) for t in TEACHERS], "rows": []}
+    todo = [("c32", b) for b in (1, 2, 3, 4, 67, 68, 69)] + [("c64", b) for b in (5, 6, 7, 8, 62, 63, 64, 65)]
+    for kind, block in todo:
+        try:
+            x, files = gather(block, kind)
+        except SystemExit as e:
+            print("skip", kind, block, e)
+            continue
+        r = analyze(x)
+        r.update({"family": kind, "block": block, "inputs": files})
+        out["rows"].append(r)
+        print(f"{kind} b{block}: static={r['static_rel_l2']:.4f} ch={r['channel_pow2_rel_l2']:.4f} "
+              f"token={r['token_rel_l2']:.4f} ch_gain={r['channel_gain_fraction']:.2f} "
+              f"token_gain={r['token_gain_fraction']:.2f} ratio={r['channel_absmax_ratio']:.1f}")
+    (Path(__file__).resolve().parent / "QUANT-HEADROOM.json").write_text(json.dumps(out, indent=2), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,110 @@
+from common import *
+import copy, struct, sys, subprocess
+sys.path.insert(0,str(A/'fullnet-continuous-20261027'))
+import COMMON as K
+assert sha(HEAD)=='bc34404c00a52a02b5be77cbb167e71cb3965536f634ecd1bed663c002e45df6'
+assert sha(PARENT)=='75dadb8a180cceeb1f98647e4d536eeabd5cef385a2d468566cb0e2d67af43a6'
+h,s,v=map(parse,[HEAD,PARENT,VK]);sv={b['name']:b for b in s['buffers']};vv={b['name']:b for b in v['buffers']}
+shifts={x['name']:x['candidate'] for x in read(D/'SHIFT-BUILD.json')}
+packs={};proof=[];passproof=[];out=[];buffers={}
+def halves(raw):return list(struct.unpack('<'+'H'*(len(raw)//2),raw))
+def blob(vals):return struct.pack('<'+'H'*len(vals),*vals)
+def tiletranspose(vals):
+ out=[]
+ for i in range(0,len(vals),256):out.extend(vals[i+c*16+r] for r in range(16) for c in range(16))
+ return out
+def tile256(vals):
+ return [vals[(nt*16+n)*256+kt*16+k] for nt in range(16) for kt in range(16) for n in range(16) for k in range(16)]
+def getbuffer(fb,p):
+ name=fb['name'];sn=rename(name);base=sn.removesuffix('_finaltile');sb=sv[base]
+ if sn in buffers:return sn
+ result=copy.deepcopy(sb);result['name']=sn
+ old=vv[name.removesuffix('_finaltile')]
+ if fb['path']!='-' and old['path']!='-' and sha(fb['path'])!=sha(old['path']):
+  full0=halves(Path(old['path']).read_bytes());full1=halves(Path(fb['path']).read_bytes());small0=halves(Path(sb['path']).read_bytes());small1=small0[:];made=full0[:];regions=[]
+  if name.endswith('_finaltile'):
+   regions=[(0,65536,'tile256')]
+  else:
+   assert name=='ioport_0_ioport_pack' or name in ('swin_1_weights','swin_4_weights','swin_66_weights','swin_69_weights'),name
+   regions=[(off,n,'transpose16') for off,n in zip(p['push'][4:8],[4096,4096,3072,1024])]
+   if name=='ioport_0_ioport_pack':regions.append((p['push'][28],512,'transpose16'))
+  applied=[]
+  for off,n,kind in regions:
+   if full0[off:off+n]==full1[off:off+n]:continue
+   fn=tile256 if kind=='tile256' else tiletranspose
+   assert fn(full0[off:off+n])==full1[off:off+n],(name,off,n,'not known transform')
+   made[off:off+n]=fn(full0[off:off+n]);small1[off:off+n]=fn(small0[off:off+n]);applied.append((off,n,kind))
+  assert made==full1,(name,'unexplained full pack difference')
+  assert len(small0)==len(full0),(name,len(small0),len(full0))
+  # Inverse coordinate proof with unique indices, independent of repeated values.
+  for off,n,kind in applied:
+   fn=tile256 if kind=='tile256' else tiletranspose;perm=fn(list(range(n)));assert sorted(perm)==list(range(n))
+   assert all(small1[off+i]==small0[off+perm[i]] for i in range(n))
+  dst=D/'weights'/f'{sn}.bin';dst.parent.mkdir(exist_ok=True);dst.write_bytes(blob(small1));result['path']=dst.as_posix()
+  proof.append(dict(name=sn,parent=sb['path'],parent_sha=sha(sb['path']),candidate=str(dst),sha256=sha(dst),regions=applied,full_parent_sha=sha(old['path']),full_head_sha=sha(fb['path']),full_transform_exact=True))
+ elif fb['path']=='-':
+  result['path']='-'
+  # Adopt changed representation capacity (not arbitrary old declaration).
+  if fb['size']!=old['size']:result['size']=fb['size']
+ buffers[sn]=result
+ return sn
+for sr,vr in TEMPLATE.items():
+ old=[p for p in v['passes'] if p['row']==vr];small=[p for p in s['passes'] if p['row']==sr]
+ assert len(old)==len(small)
+ oldmap={p['name']:(p,q) for p,q in zip(old,small)}
+ for p in [p for p in h['passes'] if p['row']==vr]:
+  q=copy.deepcopy(p);q['row']=sr;q['name']=f'r{sr:02d}_'+re.sub(r'(block|split16_b)(\d+)',lambda m:m[1]+str(BLOCK_MAP[int(m[2])]),p['name']);q['binds']=[]
+  delta=[]
+  if p['name'] in oldmap:
+   po,ps=oldmap[p['name']]
+   for i,(a,b) in enumerate(zip(po['push'],ps['push'])):
+    if a!=b:
+     assert q['push'][i]==a,(sr,i,'ABI conflict');q['push'][i]=b;delta.append((i,a,b))
+   for i,(a,b) in enumerate(zip(po['grid'],ps['grid'])):
+    if a!=b:
+     assert q['grid'][i]==a,(sr,i,'grid conflict');q['grid'][i]=b
+  else:assert sr==75 and p['name']=='s37_fold_body_r1a_v1'
+  if sr==4 and p['name']=='f3c64_body_ds':q['spv']=shifts['f3c64']
+  if sr==8 and p['name']=='f3c256_body_ds':q['spv']=shifts['f3c256']
+  if sr==73:q['spv']=shifts['f2']
+  if sr in (67,71) and p['name'].startswith('c3x_pre_'):
+   po,ps=oldmap[p['name']]
+   assert sha(po['spv'])==sha(p['spv']),'pre kernel changed; needs fresh port'
+   q['spv']=ps['spv']
+  for slot,r,off,size in p['binds']:
+   fb=h['buffers'][r];sn=getbuffer(fb,p);sb=sv[sn.removesuffix('_finaltile')]
+   # All transient windows cover actual shifted grid; never retain a short descriptor.
+   if re.fullmatch(r'swin_(4|26)_[MYT]',sn):
+    size=sb['size']-off
+   elif fb['path']!='-':size=min(size,buffers[sn]['size']-off)
+   buffers[sn]['size']=max(buffers[sn]['size'],off+size)
+   q['binds'].append([slot,sn,off,size])
+  q['shared']=K.ST.Module(Path(q['spv'])).storage_bytes().get('Workgroup',{}).get('bytes',0) or 0
+  out.append(q);passproof.append(dict(small_row=sr,full_row=vr,full_ordinal=p['ordinal'],name=q['name'],push_delta=delta,spv=q['spv'],sha256=sha(q['spv']),grid=q['grid']))
+assert len(out)==108
+# Derive all lifetime intervals in the new sequence. Preserve parent clear/resident semantics.
+pol={s['buffers'][int(t[1])]['name']:t for t in s['tail'] if t[0]=='POLICY'}
+ids={name:i for i,name in enumerate(buffers)}
+lines=[f'PORT_NETWORK_1 76 {len(buffers)} {len(out)} 1']
+for name,b in buffers.items():lines.append(f'BUFFER "{name}" {b["size"]} "{b["path"]}"')
+for q in out:
+ lines.append(f'PASS {q["row"]} "{q["name"]}" "{Path(q["spv"]).as_posix()}" {q["sg"]} {q["shared"]} {len(q["binds"])} {len(q["push"])} '+ ' '.join(map(str,q['grid'])))
+ for slot,name,off,size in q['binds']:lines.append(f'BIND {slot} {ids[name]} {off} {size}')
+ lines.append('PUSH '+' '.join(map(str,q['push'])))
+for t in s['tail']:
+ if t[0]=='OUTPUT':lines.append(f'OUTPUT {ids[s["buffers"][int(t[1])]["name"]]} {t[2]} "{t[3]}"')
+for name,b in buffers.items():
+ indices=[i for i,p in enumerate(out) if any(x[1]==name for x in p['binds'])];assert indices
+ pp=pol[name.removesuffix('_finaltile')]
+ resident=int(pp[2]) or int(b['path']!='-')
+ lines.append(f'POLICY {ids[name]} {resident} {min(indices)} {max(indices)} {pp[5]}')
+for t in s['tail']:
+ if t[0]=='HISTORY':lines.append('HISTORY '+str(ids[s['buffers'][int(t[1])]['name']])+' '+str(ids[s['buffers'][int(t[2])]['name']])+' '+' '.join(t[3:]))
+plan=D/'plan.txt';plan.write_text('\n'.join(lines)+'\n',encoding='utf8')
+save(D/'PACK-PROOF.json',proof);save(D/'PASS-MAP.json',passproof)
+save(D/'BUILD.json',dict(head=str(HEAD),head_sha=sha(HEAD),small_parent=str(PARENT),small_parent_sha=sha(PARENT),plan=str(plan),plan_sha=sha(plan),passes=len(out),buffers=len(buffers),gpu_executed=False))
+print('built',len(out),len(buffers),sha(plan))
+runner=A/'small-current-paired-20261026/runner-build/Release/clock_runner.exe'
+r=subprocess.run([str(runner),'--plan',str(plan),'--cpu-check'],capture_output=True,text=True)
+(D/'CPU-CHECK.txt').write_text(r.stdout+r.stderr);assert r.returncode==0,r.stdout+r.stderr
+print(r.stdout)

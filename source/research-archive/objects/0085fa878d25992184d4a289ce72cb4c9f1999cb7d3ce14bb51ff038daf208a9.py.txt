@@ -1,0 +1,51 @@
+from pathlib import Path
+import json,hashlib,re,sys,subprocess,copy,difflib
+B=Path('@NR_WORKSPACE@');A=B/'work/codex-astra-fp16-int8-audit-20261024';D=A/'fullnet-mechanism-transfer-20261026';T=D/'f10-weight-return-separation-20261027';S=D/'f05-four-weight-window-20261027'/'wait-diagnosis'/'vlate-control';S.mkdir(exist_ok=True)
+read=lambda p:json.loads(p.read_text(encoding='utf-8-sig'));sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest();ident=lambda p:dict(path=str(p),sha256=sha(p))
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True,encoding='utf-8',errors='replace');assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+rows=[r for r in read(D/'remaining-amd-production-audit-20261027/INTEL-ROWS.json') if r['family']=='F05'];modules={r['source']:r for r in rows};plan=(T/'plan.txt').read_text(encoding='utf-8-sig');build=[]
+proof="""DIAGNOSTIC CONTROL, not adopted optimization. Keep accepted F10 and rolling F05 unchanged.
+Compare to rolling C128952f7545: source delta only moves two V weight loads after K0/K1 consumption, leaving four Q/K initial loads, A layout/loadcount and each accumulator K order unchanged. No new work, barriers or rounding points. Peak four B source operands remains; V not live across K consumes, A still live until V. No cross-K prefetch.
+Hypothesis: earlyV creates combined ready groups in native that gate K on V return/previousVacc. DelayingV intentionally sacrifices its overlap; if native preserves A/QK and isolates K fromV, comparison can test whether readiness coupling negates early supply. No expectation of improvement built into test.
+Native gate BEFORE timing: check QK loads, A row bank parallelism, K/V grouping and wait producers, scratch0/shared unchanged. If codegen changes non-target scheduling/material footprint, classify non-isolating compiler response and do not run causal timing. First inspect both row phases; prior48-DPAS audit was row_phase0 only (wholeQKV96).
+This control does not impose ISA constraints: source ordering can be undone by JIT. No direction conclusion from failure to realize control.
+"""
+(S/'PROOF.txt').write_text(proof,encoding='utf-8')
+for srcname,row in modules.items():
+ src=Path(srcname);parent=Path(row['spv']);width=next(x for x in ['c64','c128','c256'] if x in src.parts)
+ if width!='c128':continue
+ out=S/width;out.mkdir(exist_ok=True);original=src.read_text(encoding='utf-8-sig');pm=ST.Module(parent)
+ blocks=list(re.finditer(r'            \{\n\s+MAT_B b0[\s\S]*?acc(?:Q|K|V)1 = coopMatMulAdd\(a, b1, acc(?:Q|K|V)1\);\n            \}',original));needed=2 if width=='c256' else 3;assert len(blocks)>=needed
+ blocks=blocks[:needed];old=original[blocks[0].start():blocks[-1].end()];loads=[];mmas=[]
+ for i,m in enumerate(blocks):
+  text=m.group();ls=re.findall(r'coopMatLoad\(b[01], pack,[^;]+;',text);ms=re.findall(r'acc\w+ = coopMatMulAdd\(a, b[01], acc\w+\);',text);assert len(ls)==len(ms)==2
+  for j in range(2):loads.append(re.sub(r'\bb'+str(j)+r'\b','wb'+str(i*2+j),ls[j]));mmas.append(re.sub(r'\bb'+str(j)+r'\b','wb'+str(i*2+j),ms[j]))
+ # Q slots wb0/wb1 are retired before V overwrites them; K keeps wb2/wb3.
+ vloads=[x.replace('wb4','wb0').replace('wb5','wb1') for x in loads[4:]]
+ vmmas=[x.replace('wb4','wb0').replace('wb5','wb1') for x in mmas[4:]]
+ schedule=loads[:4]+mmas[:4]+vloads+vmmas
+ new='            MAT_B wb0,wb1,wb2,wb3;\n'+'\n'.join('            '+x for x in schedule);changed=original.replace(old,new,1)
+ def comp(label,text):
+  inc=B/'work/zcode-fp16-fullnet-handoff-20261024/candidates/f01-f02-f05-f21'/('f05-'+width+'-join-t3-v1')/'source'
+  f=out/(label+'.comp');o=out/(label+'.spv');f.write_text(text,encoding='utf-8');run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(src.parent),'-I'+str(inc),f,'-o',o]);return o
+ rb=comp('parent-rebuild',original);rm=ST.Module(rb);keep,_=ST.transfer_decoration_pattern_aligned(pm,rm,set());ST.set_no_contraction(rm,keep,rb);assert sha(rb)==sha(parent),(width,'parent mismatch')
+ o=comp('candidate',changed);cm=ST.Module(o);ints={128,130,132,134,135,137,138,139};nc=set(ST.no_contraction_ids(pm));ncf={ST.result_id_of(op,a) for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in nc and op not in ints};ops={op for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in ncf};keep=[];checked=0
+ for pr,cr in zip(ST.function_regions(pm),ST.function_regions(cm)):
+  ps=[pm.instructions[i] for i in pr if pm.instructions[i][0] in ops];cs=[cm.instructions[i] for i in cr if cm.instructions[i][0] in ops];assert len(ps)==len(cs)
+  for x,y in zip(ps,cs):
+   assert (x[0],x[3])==(y[0],y[3]);xi=ST.result_id_of(x[0],x[1]);yi=ST.result_id_of(y[0],y[1]);assert pm.operand_signature(xi,3)==cm.operand_signature(yi,3);checked+=1
+   if xi in ncf:keep.append(yi)
+ assert len(keep)==len(ncf);raw=set(ST.no_contraction_ids(cm));keep += [ST.result_id_of(op,a) for op,a,_,_ in cm.instructions if op in ints and ST.result_id_of(op,a) in raw];ST.set_no_contraction(cm,keep,o)
+ run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',o]);n=plan.count(parent.as_posix());assert n>0;plan=plan.replace(parent.as_posix(),o.as_posix());build.append(dict(width=width,passes=n,parent=ident(parent),parent_rebuild=ident(rb),candidate=ident(o),source=ident(o.with_suffix('.comp')),NC_checked=checked))
+ (out/'DIFF.patch').write_text(''.join(difflib.unified_diff(original.splitlines(True),changed.splitlines(True))),encoding='utf-8')
+(S/'plan.txt').write_text(plan,encoding='utf-8');cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',S/'plan.txt','--cpu-check']);(S/'BUILD.json').write_text(json.dumps(dict(parent=ident(T/'plan.txt'),plan=ident(S/'plan.txt'),modules=build,CPU=cpu),indent=2),encoding='utf-8')
+(S/'run').mkdir(exist_ok=True);(S/'captures').mkdir(exist_ok=True)
+for kind in ['GATES','RESOURCES','NATIVE','ORDINARY']:
+ t=read(T/f'LUNA-{kind}.json');t['output_root']=str(S/(kind.lower()+'-execution'));t['identities']=[x for x in t['identities'] if not x['path'].endswith('.spv')]+[x['candidate'] for x in build]
+ for j in t['jobs']:
+  jp=T/'plan.txt' if j.get('candidate')=='parent' else S/'plan.txt';j['plan']=ident(jp);j['runner_output']=str(S/'run'/j['id']);ar=j['argv'];ar[ar.index('--plan')+1]=str(jp);ar[ar.index('--out')+1]=j['runner_output']
+  if kind=='NATIVE':ar[ar.index('--output_dir')+1]=str(S/'captures');ar[ar.index('--msg_file')+1]=str(S/'native.log');j['capture_output']=str(S/'captures'/ar[ar.index('--profile_dir')+1])
+ (S/f'LUNA-{kind}.json').write_text(json.dumps(t,indent=2),encoding='utf-8')
+(S/'execute.ps1').write_text((T/'execute.ps1').read_text(encoding='utf-8-sig').replace('LUNA-F10-WEIGHT-SEPARATION','LUNA-F05-VLATE-CONTROL').replace('F10 QKV A consumer layout','F05 four-weight rolling window'),encoding='utf-8');print(cpu);print([(m['width'],m['passes']) for m in build])

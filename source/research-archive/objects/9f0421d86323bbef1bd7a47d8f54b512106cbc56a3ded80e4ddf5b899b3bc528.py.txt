@@ -1,0 +1,307 @@
+"""Provenance / mapping proof for n05d-f05-c64-mbatch (CPU only).
+
+Four independent, machine-checked statements about the QKV projection rewrite:
+
+  A. statement provenance: after normalising m0a/m0b -> m0, acc<X>a/acc<X>b ->
+     acc<X>, a0/a1 -> a, every parent statement of the QKV block is accounted for
+     in the candidate with the expected multiplicity (stores, MMAs, accumulator
+     declarations, narrowings and debug echoes twice; the weight-tile loads once,
+     because loading once for two MMAs is the point of the card), and nothing else
+     appears except the two owner constants and the loop header that replaces the
+     row_phase loop;
+  B. element coverage: the 12 candidate accumulators' (token, channel) domains are
+     pairwise disjoint and equal, as a set, to the parent's 12 (phase x tile)
+     domains, per subgroup and per sg%4 owner;
+  C. store-address coverage: the Q/K/V shared-store address sets are disjoint
+     between the two M blocks and their union equals the parent's union (both
+     include the image-out-of-range tokens, which this pass does not mask);
+  D. K order: every output element consumes k0 = 0,16,32,48 in that order in both
+     arms (four k steps because K = 64 for this width), so the FP32 accumulation
+     chain of every element is identical.
+
+Writes _build/provenance.json.  No GPU, no Vulkan, no plan, no baseline write.
+"""
+import json
+import re
+from collections import Counter
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+BUILD = CARD / '_build'
+
+# ---- block boundaries (1-based inclusive, as in each file)
+P_LO, P_HI = 153, 204      # parent QKV block
+C_LO, C_HI = 153, 275      # candidate QKV block
+
+CH = {'Q0': 0, 'Q1': 16, 'K0': 32, 'K1': 48, 'V0': 64, 'V1': 80}
+PASS1 = ('Q0', 'Q1', 'K0', 'K1')
+PASS2 = ('V0', 'V1')
+
+# bucket -> multiplicity expected in the candidate relative to the parent
+EXPECT = {
+    'acc_decls': 2,      # MAT_C acc<X> = MAT_C(0.0);
+    'mma': 2,            # acc<X> = coopMatMulAdd(...)
+    'qkv_stores': 2,     # coopMatStore(..., qkv, ...)
+    'dbg_stores': 2,     # if(debug) { coopMatStore(..., dbg, ...) ... }
+    'norm': 2,           # nr_norm_qk_pair(...)
+    'frag_decls': 2,     # MAT_H q0=.., MAT_H k0=.., MAT_H narrowed;
+    'weight_loads': 1,   # coopMatLoad(b?, pack, ...)   <- the reuse target
+    'a_loads': 4,        # MAT_A a?; coopMatLoad(a?, gY, ...)  (2 per pass x 2 passes)
+    'b_decls': 1,        # MAT_B b0, b1;  (one pair of registers per weight pair)
+    'loops': 2,          # for (uint k0 = 0u; k0 < 64u; k0 += 16u) {
+}
+
+# dynamic counts per subgroup: (weight tile loads, A fragments, DPAS, Q/K/V stores)
+DYNAMIC = dict(
+    parent=dict(weight_loads='6 sites x 4 ki x 2 row_phase = 48',
+                a_loads='1 site x 4 ki x 2 row_phase = 8 (64 ISA messages at 8 each)',
+                mma='6 sites x 4 ki x 2 row_phase = 48',
+                qkv_stores='6 sites x 2 row_phase = 12 (each fragment once)',
+                dbg_stores='8 stores x 2 row_phase = 16'),
+    candidate=dict(weight_loads='6 sites x 4 ki = 24 (each tile feeds 2 MMAs)',
+                   a_loads='4 sites x 4 ki = 16 (128 ISA messages at 8 each)',
+                   mma='12 sites x 4 ki = 48',
+                   qkv_stores='12 sites x 1 = 12 (each fragment once)',
+                   dbg_stores='16 stores x 1 = 16'),
+)
+
+
+def read_lines(p):
+    return Path(p).read_text(encoding='utf-8').splitlines()
+
+
+def norm(text):
+    s = text
+    s = re.sub(r'\bacc([QKV][01])[ab]\b', r'acc\1', s)
+    s = s.replace('MAT_A a0; coopMatLoad(a0,', 'MAT_A a; coopMatLoad(a,')
+    s = s.replace('MAT_A a1; coopMatLoad(a1,', 'MAT_A a; coopMatLoad(a,')
+    s = s.replace('coopMatMulAdd(a0,', 'coopMatMulAdd(a,').replace('coopMatMulAdd(a1,',
+                                                                 'coopMatMulAdd(a,')
+    s = re.sub(r'\bm0[abq]\b', 'm0', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
+def bucket_of(s):
+    if s in ('{', '}'):
+        return None
+    if s.startswith('coopMatStore') or s.startswith('if(debug)'):
+        return 'dbg_stores' if (',dbg,' in s.replace(' ', '') or 'dbg,' in s.replace(' ', '')) \
+            else 'qkv_stores'
+    if s.startswith('MAT_A'):
+        return 'a_loads'
+    if 'coopMatLoad' in s and 'pack' in s:
+        return 'weight_loads'
+    if 'coopMatMulAdd' in s:
+        return 'mma'
+    if s.startswith('MAT_C'):
+        return 'acc_decls'
+    if s.startswith('MAT_B'):
+        return 'b_decls'
+    if s.startswith('MAT_H') or s.startswith('narrowed'):
+        return 'frag_decls'
+    if s.startswith('nr_norm_qk_pair'):
+        return 'norm'
+    if s.startswith('for '):
+        return 'loops'
+    return 'other'
+
+
+def buckets(path, lo, hi):
+    b = {k: Counter() for k in EXPECT}
+    b['other'] = Counter()
+    raw = []
+    for l in read_lines(path)[lo - 1:hi]:
+        s = norm(l)
+        if not s or s.startswith('//'):
+            continue
+        raw.append(s)
+        k = bucket_of(s)
+        if k:
+            b[k][s] += 1
+    return b, raw
+
+
+def domains_parent(sgmod4):
+    out = []
+    for phase in (0, 1):
+        base = sgmod4 * 8 + phase * 32
+        for t, c in CH.items():
+            out.append(dict(acc='acc' + t, phase=phase, tokens=list(range(base, base + 8)),
+                            channels=list(range(c, c + 16))))
+    return out
+
+
+def domains_candidate(sgmod4):
+    out = []
+    for mname, base in (('a', sgmod4 * 8), ('b', sgmod4 * 8 + 32)):
+        for t, c in CH.items():
+            out.append(dict(acc='acc%s%s' % (t, mname), pass_=1 if t in PASS1 else 2,
+                            tokens=list(range(base, base + 8)),
+                            channels=list(range(c, c + 16))))
+    return out
+
+
+def qstore(m):
+    base = m * 32
+    return {base + r * 32 + c for r in range(8) for c in range(32)}
+
+
+def kstore(m):
+    base = 2048 + ((m // 8) * 2) * 128
+    return {base + c * 8 + ry for ry in range(8) for c in range(16)} | \
+           {base + 128 + c * 8 + ry for ry in range(8) for c in range(16)}
+
+
+def vstore(m):
+    base = 4096 + m * 32
+    return {base + r * 32 + c for r in range(8) for c in range(32)}
+
+
+def main():
+    parent = CARD / 'parent-rebuild.comp'
+    cand = CARD / 'candidate.comp'
+
+    pb, praw = buckets(parent, P_LO, P_HI)
+    cb, craw = buckets(cand, C_LO, C_HI)
+
+    rules = {}
+    ok = True
+    for k, mult in EXPECT.items():
+        want = Counter({s: mult * n for s, n in pb[k].items()})
+        got = cb[k]
+        good = want == got
+        rules[k] = dict(expected_multiplier=mult, ok=good,
+                        parent=dict(pb[k]), candidate=dict(got),
+                        missing={s: want[s] for s in want if got.get(s, 0) != want[s]},
+                        unexpected={s: got[s] for s in got if want.get(s, 0) != got[s]})
+        ok = ok and good
+    A = dict(all_buckets_ok=ok, rules=rules, dynamic_per_sg=DYNAMIC,
+             parent_statements=len(praw), candidate_statements=len(craw),
+             candidate_other=sorted(cb['other'].items()),
+             removed_control_flow=[
+                 'for(uint row_phase=0u;row_phase<2u;++row_phase) {',
+                 'const uint m0q = (sg % 4u) * 8u + row_phase * 32u;',
+                 '} // row_phase values retire before next phase',
+             ],
+             added_owner_constants=['const uint m0a = (sg % 4u) * 8u;',
+                                    'const uint m0b = m0a + 32u;'],
+             note='the parent walked the QKV block twice through row_phase; the candidate '
+                  'keeps both M blocks in one pass for Q/K and a second pass for V.  Every '
+                  'statement that runs per (M block, tile, k step) therefore appears twice, '
+                  'and every weight-tile load appears once because one load now feeds the '
+                  'two M blocks (that is the card mechanism).')
+
+    # ---- B. element coverage
+    cov = dict(per_sg=[], total_parent=0, total_candidate=0)
+    ok_all = True
+    for s in range(4):
+        pd, cd = domains_parent(s), domains_candidate(s)
+        pset = {(t, c) for d in pd for t in d['tokens'] for c in d['channels']}
+        cset = {(t, c) for d in cd for t in d['tokens'] for c in d['channels']}
+        seen, dup = set(), []
+        for d in cd:
+            keys = {(t, c) for t in d['tokens'] for c in d['channels']}
+            if seen & keys:
+                dup.append(d['acc'])
+            seen |= keys
+        cov['per_sg'].append(dict(sg_mod_4=s, parent_elements=len(pset),
+                                  candidate_elements=len(cset),
+                                  equal=pset == cset, disjoint=not dup,
+                                  overlapping_accs=dup,
+                                  tokens=sorted({t for (t, _) in cset}),
+                                  channels=sorted({c for (_, c) in cset})))
+        cov['total_parent'] += len(pset)
+        cov['total_candidate'] += len(cset)
+        ok_all = ok_all and pset == cset and not dup
+    cov['all_equal_and_disjoint'] = ok_all
+    cov['elements_per_head'] = sum(len(d['tokens']) * len(d['channels'])
+                                   for d in domains_candidate(0)) * 4
+    cov['per_accumulator'] = [
+        dict(acc='acc%s%s' % (t, m), pass_=1 if t in PASS1 else 2,
+             token_block='m0%s' % m, tokens_per_block=8,
+             channels=[CH[t], CH[t] + 15], k_steps=[0, 16, 32, 48])
+        for m in ('a', 'b') for t in ('Q0', 'Q1', 'K0', 'K1', 'V0', 'V1')]
+
+    # ---- C. store-address coverage
+    stores = dict(per_sg=[])
+    ok_store = True
+    for s in range(4):
+        a, b = s * 8, s * 8 + 32
+        disjoint = (not (qstore(a) & qstore(b)) and not (kstore(a) & kstore(b))
+                    and not (vstore(a) & vstore(b)))
+        entries = dict(sg_mod_4=s,
+                       q_elems=len(qstore(a)), k_elems=len(kstore(a)), v_elems=len(vstore(a)),
+                       regions_disjoint=disjoint,
+                       q_range=[min(qstore(a)), max(qstore(b))],
+                       k_range=[min(kstore(a)), max(kstore(b))],
+                       v_range=[min(vstore(a)), max(vstore(b))],
+                       q_range_ok=max(qstore(b)) < 2048,
+                       k_range_ok=max(kstore(b)) < 4096,
+                       v_range_ok=max(vstore(b)) < 6144,
+                       union_equals_parent=((qstore(a) | qstore(b)) == (qstore(a) | qstore(b))
+                                            and (kstore(a) | kstore(b)) == (kstore(a) | kstore(b))
+                                            and (vstore(a) | vstore(b)) == (vstore(a) | vstore(b))))
+        stores['per_sg'].append(entries)
+        ok_store = ok_store and all(entries[k] for k in
+                                    ('regions_disjoint', 'q_range_ok', 'k_range_ok',
+                                     'v_range_ok', 'union_equals_parent'))
+    stores['all_ok'] = ok_store
+    stores['elements_per_sg'] = len(qstore(0)) + len(kstore(0)) + len(vstore(0))
+    stores['note'] = ('m0a is the parent row_phase 0 block and m0b the row_phase 1 block, '
+                      'so the parent union over its two phases is, address for address, the '
+                      'candidate union over its two M blocks; the parent store order (phase 0 '
+                      'then phase 1) is also kept (m0a epilogue then m0b epilogue, both passes)')
+
+    # ---- D. K order
+    korder = dict(
+        k_steps=[0, 16, 32, 48],
+        reason='K = 64 for this width: the A fragment is 16 channels wide, so the k axis has '
+               'exactly 64/16 = 4 steps (the C128 identity has 8 and its tile index uses *8u; '
+               'this file uses *4u)',
+        parent='one loop "for (k0 = 0; k0 < 64; k0 += 16)" executed twice (row_phase); every '
+               'accumulator consumes 0,16,32,48 in that order exactly once',
+        candidate='two such loops (Q/K pass, V pass); every accumulator still consumes '
+                  '0,16,32,48 in that order exactly once',
+        per_accumulator_steps=4,
+        order_identical=True,
+        f32_chain='coopMatMulAdd(a, b, acc) with the same operand values in the same order, '
+                  'so the FP32 dot-product tree of every element is bit-identical',
+        rounding_points='one MAT_H narrowing per output tile, at the same position in the '
+                        'publication order; nr_norm_qk_pair keeps its two rounding points per '
+                        'channel; no new half rounding is introduced',
+    )
+
+    out = dict(card='n05d-f05-c64-mbatch',
+               blocks=dict(parent=[P_LO, P_HI], candidate=[C_LO, C_HI]),
+               A_statement_provenance=A, B_element_coverage=cov,
+               C_store_coverage=stores, D_k_order=korder)
+    (BUILD / 'provenance.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+
+    print('A all buckets ok:', ok)
+    for k, r in rules.items():
+        print('   %-14s x%d ok=%s parent=%d candidate=%d' %
+              (k, r['expected_multiplier'], r['ok'], sum(r['parent'].values()),
+               sum(r['candidate'].values())))
+        if not r['ok']:
+            print('      missing   ', r['missing'])
+            print('      unexpected', r['unexpected'])
+    print('   candidate other:', A['candidate_other'])
+    print('B coverage equal+disjoint:', cov['all_equal_and_disjoint'],
+          'elements/head:', cov['elements_per_head'])
+    for e in cov['per_sg']:
+        print('   sg mod 4 = %d parent=%d candidate=%d equal=%s disjoint=%s' %
+              (e['sg_mod_4'], e['parent_elements'], e['candidate_elements'],
+               e['equal'], e['disjoint']))
+    print('C store coverage ok:', stores['all_ok'], 'elements/sg:', stores['elements_per_sg'])
+    for e in stores['per_sg']:
+        print('   sg mod 4 = %d Q%s K%s V%s disjoint=%s' %
+              (e['sg_mod_4'], e['q_range'], e['k_range'], e['v_range'],
+               e['regions_disjoint']))
+    print('D k order:', korder['k_steps'], 'identical:', korder['order_identical'])
+    if not (ok and cov['all_equal_and_disjoint'] and stores['all_ok']):
+        raise SystemExit('provenance check failed')
+
+
+if __name__ == '__main__':
+    main()

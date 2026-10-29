@@ -1,0 +1,126 @@
+"""Region-wise cost table for the F01 baseline ISA (read-only).
+
+Prints, for each named index range, the hot/debug instruction split, class
+histogram, message histogram and mov type-pair histogram.
+"""
+import re, sys, json, collections
+
+INSN = re.compile(r'^/\* \[(?P<addr>[0-9A-F]+)\]\s+\*/\s*(?P<pre>\([^)]*\))?\s*(?P<op>[a-z][a-z0-9.]*)\s*(?P<rest>.*)$')
+LABEL = re.compile(r'^(L\d+):$')
+
+CLASS = [
+    ('send', lambda o: o.startswith('send')),
+    ('dpas', lambda o: o.startswith('dpas')),
+    ('mov', lambda o: o == 'mov'),
+    ('math', lambda o: o.startswith('math')),
+    ('sync', lambda o: o.startswith('sync') or o in ('fence',) or o.startswith('signal')),
+    ('ctrl', lambda o: o in ('jmpi', 'goto', 'join', 'brc', 'illegal') or o.startswith('send.gtwy')),
+    ('sel', lambda o: o == 'sel'),
+    ('add', lambda o: o in ('add', 'add3', 'addc', 'subb')),
+    ('mul', lambda o: o in ('mul', 'macl', 'mach', 'mad', 'madm')),
+    ('bit', lambda o: o in ('and', 'or', 'xor', 'shl', 'shr', 'asr', 'bfn', 'fbl', 'not', 'bswap')),
+    ('cmp', lambda o: o in ('cmp', 'cmpn')),
+]
+
+
+def cls(op):
+    for name, f in CLASS:
+        if f(op):
+            return name
+    return 'other'
+
+
+def load(path):
+    ins, labels = [], {}
+    for line in open(path, encoding='utf-8', errors='replace'):
+        s = line.strip()
+        m = LABEL.match(s)
+        if m:
+            labels[m.group(1)] = len(ins)
+            continue
+        m = INSN.match(s)
+        if not m:
+            continue
+        ins.append(dict(addr=m.group('addr'), pre=(m.group('pre') or ''), op=m.group('op'),
+                        rest=m.group('rest').strip(), text=s))
+    for i, r in enumerate(ins):
+        r['i'] = i
+        r['cls'] = cls(r['op'])
+    return ins, labels
+
+
+MOVDST = re.compile(r'\S+\s+(-?[a-z][a-z0-9]*\d+\.\d+|null)<[\d;:]*>:([a-z0-9]+)')
+MOVSRC = re.compile(r'\s(-?[a-z][a-z0-9]*\d+\.\d+|<[\d;:]*>:)(?:<[\d;:]*>)?:([a-z0-9]+)')
+
+
+def mov_pair(rest):
+    d = re.search(r'>:([a-z0-9]+)', rest)
+    # source type is the last type token on the line
+    toks = re.findall(r'>:([a-z0-9]+)', rest)
+    return (toks[0] if toks else '?', toks[-1] if len(toks) > 1 else '?')
+
+
+def stats(ins, idx, spans):
+    cov = set()
+    for a, b, *_ in spans:
+        cov.update(range(a, b + 1))
+    hot = [i for i in idx if i not in cov]
+    dbg = [i for i in idx if i in cov]
+    out = dict(n=len(idx), hot=len(hot), debug=len(dbg),
+               hot_classes=dict(collections.Counter(ins[i]['cls'] for i in hot).most_common()),
+               hot_ops=dict(collections.Counter(ins[i]['op'] for i in hot).most_common(18)))
+    m = collections.Counter()
+    for i in hot:
+        mm = re.search(r'//\s*wr:\S+,\s*rd:\S+;\s*(.*)$', ins[i]['text'])
+        if mm:
+            m[mm.group(1).strip()] += 1
+    out['hot_msgs'] = dict(m.most_common())
+    pairs = collections.Counter()
+    hf_from_f = hf_from_hf = 0
+    for i in hot:
+        if ins[i]['op'] == 'mov':
+            p = mov_pair(ins[i]['rest'])
+            pairs['%s<-%s' % p] += 1
+            if p[0] == 'hf' and p[1] == 'f':
+                hf_from_f += 1
+            if p[0] == 'hf' and p[1] == 'hf':
+                hf_from_hf += 1
+    out['mov_pairs'] = dict(pairs.most_common(12))
+    out['mov_hf_from_f'] = hf_from_f
+    out['mov_hf_from_hf'] = hf_from_hf
+    return out
+
+
+def main(path, boundaries, out_path=None):
+    ins, labels = load(path)
+    spans = []
+    for r in ins:
+        if r['op'] == 'jmpi' and 'f1.0' in r['pre'] and 'W' in r['pre']:
+            m = re.search(r'L(\d+)', r['rest'])
+            if m and 'L' + m.group(1) in labels:
+                t = labels['L' + m.group(1)]
+                if t > r['i']:
+                    spans.append((r['i'] + 1, t - 1))
+    outer = []
+    for s in sorted(spans, key=lambda x: (x[0], -x[1])):
+        if any(o[0] <= s[0] and s[1] <= o[1] for o in outer):
+            continue
+        outer.append(s)
+    res = dict(file=path, total=len(ins), debug_spans=len(outer),
+               debug_instructions=len(set(i for a, b in outer for i in range(a, b + 1))))
+    regions = {}
+    for name, (a, b) in boundaries.items():
+        regions[name] = stats(ins, list(range(a, b + 1)), outer)
+    res['regions'] = regions
+    res['whole_hot'] = stats(ins, list(range(len(ins))), outer)
+    if out_path:
+        open(out_path, 'w', encoding='utf-8').write(json.dumps(res, indent=1))
+        print('wrote', out_path)
+    else:
+        print(json.dumps(res, indent=1))
+
+
+if __name__ == '__main__':
+    arg = sys.argv[2]
+    cfg = json.loads(open(arg, encoding='utf-8').read()) if arg.endswith('.json') else json.loads(arg)
+    main(sys.argv[1], {k: tuple(v) for k, v in cfg.items()}, sys.argv[3] if len(sys.argv) > 3 else None)

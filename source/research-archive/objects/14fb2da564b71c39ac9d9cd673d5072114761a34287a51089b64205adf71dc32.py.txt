@@ -1,0 +1,59 @@
+from pathlib import Path
+import json,shlex,subprocess,numpy as np
+Q=Path(__file__).resolve().parent;B=Q.parents[2];D=Q/'real-int8-24';O=D/'c64-residual';O.mkdir(exist_ok=False)
+src=B/'candidates/int8-coverage-v2-20261020/B/source';compiler=B/'src/project/tools/glslang-16.5.0/bin/glslang.exe'
+common=(src/'c64_int8_common.glsl').read_text();(O/'c64_int8_common.glsl').write_text(common)
+s=(src/'c64_d2.comp').read_text()
+def compile(name,text):
+ p=O/f'{name}.comp';p.write_text(text);out=O/f'{name}.spv';r=subprocess.run([str(compiler),'-V','--target-env','vulkan1.3','-I'+str(O),'-o',str(out),str(p)],capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return out
+parent=compile('parent',s);assert parent.read_bytes()==(B/'candidates/int8-coverage-v2-20261020/B/spv/c64_d2.spv').read_bytes(),'parent identity mismatch'
+s=s.replace('#include "c64_int8_common.glsl"','#include "c64_int8_common.glsl"\nlayout(set=0,binding=8) readonly buffer OriginalInput {float16_t originalX[];};')
+old='''    MQ seed;
+    if (oob) seed = MQ(QT(0));
+    else coopMatLoad(seed, gx, base + n, 64u, ROW);
+    MF seedf = MF(seed);'''
+new='''    MH seed;
+    if (oob) seed = MH(float16_t(0));
+    else {
+        uint tile=base/1024u, slot=(base%1024u)/64u;
+        coopMatLoad(seed, originalX, tile*1024u+(n/16u)*256u+slot*16u, 16u, ROW);
+    }
+    MF seedf = MF(seed);'''
+assert old in s;s=s.replace(old,new).replace('SC_RESID +','464u +')
+compile('original-f32',s)
+half=s.replace('    MF seedf = MF(seed);','    MH seedScale = MH(rs);\n    MH roundedSeed = seed * seedScale;\n    MF seedf = MF(roundedSeed);').replace('precise float residual = seedf[i] * rs[i];','precise float residual = seedf[i];')
+compile('original-half',half)
+data=json.loads((Q/'ACTIVE-ROWS.json').read_text());buffers=data['buffers'];mods={};ranges={};mapping=[]
+for r in data['rows']:
+ if not r['name'].endswith('_swin_body_2') or not r['spv'].endswith('/B/spv/c64_d2.spv'):continue
+ block=int(r['name'].split('_')[0][5:]);peer=next(p for p in data['rows'] if p['name']==f'block{block}_swin_body_3');bb={int(k):v for k,v in peer['bindings'].items()};pb=list(map(int,peer['push']));bind={int(k):v for k,v in r['bindings'].items()};sid=bind[1][0]
+ original=np.fromfile(buffers[bb[0][0]]['file'],dtype='<f2');rs=original[pb[17]:pb[17]+64].astype(np.float32);oldpath=Path(buffers[sid]['file']);sc=np.fromfile(oldpath,dtype='<f4');assert len(sc)==464
+ newsc=np.concatenate([sc,rs]);p=O/f'b{block}-scales.bin';newsc.tofile(p);mods[oldpath.as_posix()]=p.as_posix();ranges[sid]=newsc.nbytes;mapping.append({'block':block,'input_resource':bb[2][0],'scales':sid,'rs_half_offset':pb[17],'old_residual_fold_error':float(abs(sc[400:464]/sc[0]-rs).max())})
+def transform(text,arm):
+ for old,new in mods.items():text=text.replace(old,new)
+ ls=text.splitlines();bi=-1;current=None;inserts=[]
+ # input binding must follow the teacher-injected original input when isolating a block.
+ original_inputs={};name=None
+ for l in ls:
+  t=shlex.split(l)
+  if t and t[0]=='PASS':name=t[2]
+  if t and t[0]=='BIND' and t[1]=='2' and name and name.endswith('_swin_body_3'):original_inputs[name.replace('_3','_2')]=t[2:]
+ for i,l in enumerate(ls):
+  t=shlex.split(l)
+  if not t:continue
+  if t[0]=='BUFFER':
+   bi+=1
+   if bi in ranges:ls[i]=f'BUFFER "{t[1]}" {ranges[bi]} "{t[3]}"'
+  if t[0]=='PASS':
+   current=t[2] if t[3].endswith('/B/spv/c64_d2.spv') else None
+   if current:t[3]=(O/f'{arm}.spv').as_posix();t[6]='9';ls[i]=' '.join(t[:2])+f' "{t[2]}" "{t[3]}" '+' '.join(t[4:])
+  if t[0]=='BIND' and int(t[2]) in ranges:t[4]=str(ranges[int(t[2])]);ls[i]=' '.join(t)
+  if t[0]=='PUSH' and current:inserts.append((i,'BIND 8 '+' '.join(original_inputs[current])))
+ for i,l in reversed(inserts):ls.insert(i,l)
+ return '\n'.join(ls)+'\n'
+jobs=[]
+for arm in ['original-f32','original-half']:
+ source=D/'family-isolation/block6.txt';p=O/f'local-b6-{arm}.txt';p.write_text(transform(source.read_text(),arm));ref=json.loads((D/'family-isolation/JOBS.json').read_text());ref=next(j['reference'] for j in ref if j['sequence']=='block6');jobs.append(dict(sequence=f'local-b6-{arm}',frame=34189,plan=str(p),out=str(O/f'local-b6-{arm}'),reference=ref,expected_output_sha256=None,dump=False))
+ for frame in [34189,41444,43654]:
+  p=O/f'{arm}-{frame}.txt';p.write_text(transform((D/f'c32-equalized/combo-{frame}.txt').read_text(),arm));jobs.append(dict(sequence=arm,frame=frame,plan=str(p),out=str(O/f'{arm}-{frame}'),expected_output_sha256=None,dump=False))
+(O/'JOBS.json').write_text(json.dumps(jobs,indent=2));(O/'MAPPING.json').write_text(json.dumps({'changes':mapping,'mapping':'qx base tile*1024+slot*64 maps original half tile*1024+(n//16)*256+slot*16, row stride16; m8 never crosses slot16 tile','lifetime':'original half already consumed by later attention and output; new reader d2 falls within existing lifetime','arms':'f32 original input isolates loss of qX residual; half additionally preserves parent half multiplication boundary'},indent=2));print('Built',len(jobs),'jobs for',len(mapping),'C64 blocks')

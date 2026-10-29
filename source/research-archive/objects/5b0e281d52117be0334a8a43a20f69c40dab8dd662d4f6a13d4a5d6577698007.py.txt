@@ -1,0 +1,227 @@
+"""n34-f19-latency, build step 1: emit candidate.comp (pure statement reorder),
+compile it with the sealed F19 recipe (glslang 16.5.0 + NoContraction transfer
+from the F2 parent with the full_norm drop_region branch), and validate.
+
+The two reordered regions
+-------------------------
+R1  norm + head-scale (source lines 736-792)
+    current:  for c in 0..3: { nn = full_norm(...); scale q00/q01/k00/k01 with nn }
+              <K/V stores>
+              for c in 0..3: { nn = full_norm(...); scale q10/q11/k10/k11 with nn }
+    candidate: nn0..nn3 (all four roots) -> four consumer blocks
+              <same K/V stores, same order>
+              nn4..nn7 -> four consumer blocks
+    effect: each of the 16 math.rsqt is separated from its first consumer by the
+    remaining norm computations (about 70 live instructions each) instead of 0-4.
+
+R2  softmax denominator (source lines 928-1083)
+    current:  for g in A,B,C,D: { reduce p.. with 4 shuffle-xor steps; inv = 1/max;
+                                  8 multiplies of p by inv }
+    candidate: four reductions -> four inv statements -> four consumer blocks
+    effect: the 8 math.inv become consecutive and are separated from their first
+    consumer by ~3 consumer blocks.  The four debug store blocks keep their
+    relative place (after the consumers of the p array they dump).
+
+Nothing else moves.  Every FP expression keeps its operands, its order of
+operations and its `precise` qualifier; no accumulation order, no rounding point
+and no memory operation changes.
+"""
+import hashlib
+import json
+import re
+import shutil
+import sys
+from collections import Counter
+from pathlib import Path
+
+HERE = Path(__file__).parent
+CAMP = HERE.parent.parent
+sys.path.insert(0, str(CAMP))
+sys.path.insert(0, str(CAMP / 'cards/idt-identity-recipe'))
+import identity_kit as IK  # noqa: E402
+import COMMON as K        # noqa: E402
+
+SRC = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+           'c32-rest-20261026/root-f2/candidate.comp')
+SRC_SHA = 'd82eb7dd23e4a38a9547a4f23f82cf1e990a57036c148953d115560bdbe299e3'
+PARENT_SPV_SHA = '7f1ad115cb46d710336c536dd8009b8f3af93206202f96cb8b262617b42796a2'
+RECIPES = CAMP / 'cards/idt-identity-recipe/RECIPES.json'
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+# ------------------------------------------------------------------ R1
+def reorder_r1(lines):
+    """lines is 0-based list; R1 = source lines 736..792 (1-based)."""
+    head = lines[735]                                     # headscale
+    assert head.startswith('float16_t headscale='), head
+    blocks_a = [(737, 741), (742, 746), (747, 751), (752, 756)]   # 1-based inclusive
+    blocks_b = [(765, 769), (770, 774), (775, 779), (780, 784)]
+    stores_a = lines[756:764]
+    stores_b = lines[784:792]
+    out = [head]
+    for half, blocks, names in ((0, blocks_a, ('nn0', 'nn1', 'nn2', 'nn3')),
+                                (1, blocks_b, ('nn4', 'nn5', 'nn6', 'nn7'))):
+        for (a, b), nm in zip(blocks, names):
+            blk = lines[a - 1:b]
+            assert blk[0] == '{' and blk[-1] == '}', blk
+            norm = blk[1]
+            assert norm.startswith('f16vec2 n=full_norm('), norm
+            out.append(norm.replace('f16vec2 n=', 'f16vec2 %s=' % nm))
+            out.append('{')
+            for cons in blk[2:4]:
+                assert cons.startswith('precise float16_t qr'), cons
+                out.append(cons.replace('*n.x', '*%s.x' % nm).replace('*n.y', '*%s.y' % nm))
+            out.append('}')
+        out.extend(stores_a if half == 0 else stores_b)
+    return out
+
+
+# ------------------------------------------------------------------ R2
+def reorder_r2(lines):
+    """R2 = source lines 928..1083 (1-based).
+
+    Each of the four groups is `{ precise f16vec2 d=0; 4 shuffle-xor blocks;
+    3 tree blocks; f16vec2 inv=...; 4 consumer lines }`.  The accumulator is
+    renamed to a function-scope variable (`ddA..ddD`) so the four reductions can
+    run first; the four `inv` statements are then consecutive, and the four
+    consumer blocks follow.  Renaming a scope-local accumulator to an outer-scope
+    one adds no operation: the same 4 stores/loads exist in both versions.
+    """
+    region = lines[927:1083]
+    assert region[0] == '{' and region[-1].endswith('LROW);'), (region[0], region[-1])
+    groups, debug, i = [], [], 0
+    while i < len(region):
+        if region[i] == '{' and i + 1 < len(region) and \
+                region[i + 1].startswith('precise f16vec2 d='):
+            j = next(k for k in range(i + 1, len(region))
+                     if region[k].startswith('f16vec2 inv='))
+            g = region[i:j + 6]                       # '{' .. inv, 4 consumers, '}'
+            assert g[-1] == '}', g[-1]
+            assert all(l.startswith('p') and '*inv.' in l
+                       for l in g[j + 1 - i:j + 5 - i]), g[-6:]
+            groups.append(g)
+            i = j + 6
+        else:
+            k = i
+            while k < len(region) and not (region[k] == '{' and
+                                           k + 1 < len(region) and
+                                           region[k + 1].startswith('precise f16vec2 d=')):
+                k += 1
+            debug.append(region[i:k])
+            i = k
+    assert len(groups) == 4 and len(debug) == 2, (len(groups), len(debug))
+    names = ('ddA', 'ddB', 'ddC', 'ddD')
+    ivs = ('ivA', 'ivB', 'ivC', 'ivD')
+    out = []
+    # (a) four reductions, accumulator renamed, in producer order
+    for g, nm in zip(groups, names):
+        j = next(k for k in range(len(g)) if g[k].startswith('precise f16vec2 d='))
+        assert g[j] == 'precise f16vec2 d=f16vec2(float16_t(0));'
+        out.append(('precise f16vec2 %s=f16vec2(float16_t(0));' % nm))
+        for l in g[j + 1:]:
+            if l.startswith('f16vec2 inv=') or (l.startswith('p') and '*inv.' in l):
+                break
+            out.append(re.sub(r'\bd\b', nm, l))
+        # (the group's own '{' / '}' are not reproduced: with the accumulator
+        #  hoisted the block would only scope the seven shuffle sub-blocks, and
+        #  each of those already has its own braces)
+    # (b) four inverses, consecutive
+    for g, nm, iv in zip(groups, names, ivs):
+        inv = [l for l in g if l.startswith('f16vec2 inv=')]
+        assert len(inv) == 1, inv
+        out.append(re.sub(r'\bd\b', nm, inv[0]).replace('inv=', '%s=' % iv))
+    # (c) four consumer blocks in producer order, then the debug dumps in their
+    #     original relative place (P00..P03 after consumer B, P10..P13 after D)
+    cons = []
+    for g, iv in zip(groups, ivs):
+        blk = ['{'] + [l.replace('*inv.', '*%s.' % iv) for l in g
+                       if l.startswith('p') and '*inv.' in l] + ['}']
+        assert len(blk) == 6, blk
+        cons.append(blk)
+    out.extend(cons[0])
+    out.extend(cons[1])
+    out.extend(debug[0])
+    out.extend(cons[2])
+    out.extend(cons[3])
+    out.extend(debug[1])
+    return out
+
+
+def main():
+    text = SRC.read_text(encoding='utf-8-sig')
+    assert sha(SRC) == SRC_SHA, sha(SRC)
+    lines = text.splitlines()
+
+    r1 = reorder_r1(lines)
+    r2 = reorder_r2(lines)
+    new = lines[:735] + r1 + lines[792:927] + r2 + lines[1083:]
+    out_src = HERE / 'candidate.comp'
+    out_src.write_text('\n'.join(new) + '\n', encoding='utf-8')
+
+    # ---- invariant: no source statement was added or dropped (only braces,
+    # scope-local declarations and identifier renames differ)
+    def canon(s):
+        s = s.strip()
+        s = re.sub(r'\b(nn[0-7]|iv[ABCD]|dd[ABCD])\b', 'Q', s)
+        s = re.sub(r'\b(n|n0|inv|d)\b', 'Q', s)
+        return s
+    old_body = [canon(l) for l in lines[735:792]]
+    new_body = [canon(l) for l in r1]
+    old_soft = [canon(l) for l in lines[927:1083]]
+    new_soft = [canon(l) for l in r2]
+    for tag, old, newi in (('R1', old_body, new_body), ('R2', old_soft, new_soft)):
+        co, cn = Counter(x for x in old if x not in ('{', '}')), \
+            Counter(x for x in newi if x not in ('{', '}'))
+        diff = (co - cn) + (cn - co)
+        assert not diff, (tag, diff)
+        print('%s: %d non-brace lines preserved (exact multiset)' %
+              (tag, sum(co.values())))
+
+    # ---- compile + seal with the recorded F19 recipe
+    rec = IK.read_json(RECIPES)[PARENT_SPV_SHA]
+    build = HERE / 'build'
+    build.mkdir(parents=True, exist_ok=True)
+    recipe = dict(source=str(out_src), target=rec['target'], defines=[],
+                  include_dirs=[rec['compile']['pinned_include_dir']],
+                  nc=dict(mode='parent', parent=rec['nc_recipe']['parent'],
+                          drop_region=rec['nc_recipe']['drop_region']))
+    res = IK.rebuild(recipe, build / 'candidate')
+    res['candidate_source'] = str(out_src)
+    res['candidate_source_sha256'] = sha(out_src)
+    res['candidate_spv'] = str(HERE / 'candidate.spv')
+    shutil.copyfile(build / 'candidate/rebuild.spv', HERE / 'candidate.spv')
+    res['candidate_spv_sha256'] = sha(HERE / 'candidate.spv')
+    print(json.dumps({k: res[k] for k in ('raw_sha256', 'raw_match', 'nc',
+                                          'rebuilt_sha256', 'candidate_spv_sha256')},
+                     indent=1)[:1200])
+
+    # ---- validate
+    K.validate_spv(HERE / 'candidate.spv')
+    res['spv_validate_cpu'] = 'ok'
+
+    # ---- parent rebuild (identity) for the record
+    parent_dir = build / 'parent-repro'
+    if not (parent_dir / 'rebuild.spv').exists():
+        pr = IK.rebuild(dict(source=rec['source'], target=rec['target'], defines=[],
+                             include_dirs=[rec['compile']['pinned_include_dir']],
+                             nc=dict(mode='parent', parent=rec['nc_recipe']['parent'],
+                                     drop_region=rec['nc_recipe']['drop_region'])),
+                        parent_dir)
+    else:
+        pr = dict(verified=sha(parent_dir / 'rebuild.spv') == PARENT_SPV_SHA)
+    shutil.copyfile(parent_dir / 'rebuild.spv', HERE / 'parent-rebuild.spv')
+    res['parent_rebuild'] = dict(sha256=sha(HERE / 'parent-rebuild.spv'),
+                                 verified=res.get('target_sha256') == PARENT_SPV_SHA,
+                                 matches_target=sha(HERE / 'parent-rebuild.spv') == PARENT_SPV_SHA)
+    (HERE / 'BUILD-RECORD.json').write_text(json.dumps(res, indent=1, default=str),
+                                            encoding='utf-8')
+    print('parent-rebuild.spv sha', res['parent_rebuild']['sha256'])
+    print('candidate.comp sha', res['candidate_source_sha256'])
+    print('candidate.spv  sha', res['candidate_spv_sha256'])
+
+
+if __name__ == '__main__':
+    main()

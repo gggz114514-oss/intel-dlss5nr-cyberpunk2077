@@ -1,0 +1,240 @@
+"""Read-only F20 (ord 230) ISA accounting.  No GPU, no writes outside this card.
+
+Parses the capture asm of kernel hash 76902ef344609c8a (pipe 38, ord 230) and
+produces the cost decomposition used by COST-BREAKDOWN.md:
+
+  * instruction mix (opcode histogram)
+  * send message taxonomy (class / shape / count / rd-regs / wr-regs)
+  * stage segmentation (barriers + dpas clusters)
+  * mov sub-taxonomy (uniform vs vector, type-changing vs same-type, imm-zero)
+  * lane-efficiency model from grid (169,97,1) / local 256 / tiles_x 336
+"""
+import re, json, sys, hashlib
+from pathlib import Path
+
+ISA = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+           r'fullnet-mechanism-transfer-20261026/f10-weight-return-separation-20261027/'
+           r'captures/native-f20-pixel-owner/ISA/'
+           r'CS_asm76902ef344609c8a_simd32_0000000000000027_38_orig.asm')
+OUT = Path(__file__).parent / 'build'
+
+INSTR = re.compile(r'^/\* \[([0-9A-Fa-f]+)\]\s*\*/\s*(.*)$')
+PRED = re.compile(r'^(\([^)]*\))\s*')
+LABEL = re.compile(r'^(L\d+):')
+MSG = re.compile(r'//\s*([^;]*);\s*([^;]*)$')
+
+
+def parse():
+    ins = []
+    hist = {}
+    lines = ISA.read_text(encoding='utf-8', errors='replace').splitlines()
+    for ln in lines:
+        m = LABEL.match(ln.strip())
+        if m:
+            ins.append(dict(kind='label', label=m.group(1), addr=None, index=len(ins)))
+            continue
+        m = INSTR.match(ln)
+        if not m:
+            continue
+        addr, body = m.group(1), m.group(2)
+        pred = None
+        mp = PRED.match(body)
+        if mp:
+            pred = mp.group(1)
+            body = body[mp.end():]
+        body = body.strip()
+        # split off trailing {flags} and // comment
+        comment = None
+        if '//' in body:
+            body, comment = body.split('//', 1)
+            comment = comment.strip()
+        flags = None
+        mf = re.search(r'\{([^}]*)\}\s*$', body)
+        if mf:
+            flags = mf.group(1)
+            body = body[:mf.start()].strip()
+        tok = body.split()
+        if not tok:
+            continue
+        op = tok[0]
+        # normalise opcode: keep sub-op for send/dpas/sync/mov width
+        rec = dict(kind='ins', index=len(ins), addr=int(addr, 16), addr_s=addr,
+                   pred=pred, op=op, body=body, flags=flags, comment=comment,
+                   unit=(re.match(r'\((\d+)\|', body) or [None, None])[1] if re.match(r'\(\d+\|', body) else None)
+        # message class for sends
+        if op.startswith('send.'):
+            cls = op.split('.')[1]
+            msg = ''
+            rd = wr = None
+            if comment:
+                mm = re.match(r'wr:(\d+)\+(\d+),\s*rd:(\d+);\s*(.+)$', comment)
+                if mm:
+                    wr = (int(mm.group(1)), int(mm.group(2)))
+                    rd = int(mm.group(3))
+                    msg = mm.group(4).strip()
+            rec.update(send_class=cls, msg=msg, rd=rd, wr=wr)
+            # message shape e.g. load.ugm.d32x8t.a32.bss  -> shape token
+            shape = None
+            if msg:
+                parts = msg.replace(',', ' ').split()
+                for p in parts:
+                    if re.match(r'^(load|store)\.(slm|ugm|d32|d16)', p) or re.match(r'^d\d+x\d+', p):
+                        shape = p
+                        break
+            rec['shape'] = shape
+        ins.append(rec)
+    return ins
+
+
+def main():
+    OUT.mkdir(parents=True, exist_ok=True)
+    ins = parse()
+    real = [r for r in ins if r['kind'] == 'ins']
+    labels = [r for r in ins if r['kind'] == 'label']
+    hist = {}
+    for r in real:
+        op = r['op']
+        if op.startswith('send.'):
+            key = op
+        elif op.startswith('dpas'):
+            key = op
+        elif op.startswith('sync'):
+            key = op
+        else:
+            key = op
+        hist[key] = hist.get(key, 0) + 1
+
+    # ---- sends
+    sends = [r for r in real if r['op'].startswith('send.')]
+    by_msg = {}
+    for r in sends:
+        k = r['msg'] or (r['op'] + ' :no-comment')
+        by_msg.setdefault(k, dict(n=0, rd=r['rd'], wr=r['wr'], cls=r['send_class'],
+                                  first=r['addr_s'], idx=[], preds=set()))
+        e = by_msg[k]
+        e['n'] += 1
+        e['idx'].append(r['index'])
+        if r['pred']:
+            e['preds'].add(r['pred'])
+
+    # contiguous runs (same message) = "sites"
+    runs = []
+    for k, e in by_msg.items():
+        idxs = e['idx']
+        start = prev = idxs[0]
+        n = 1
+        for i in idxs[1:]:
+            if i == prev + 1:
+                n += 1
+            else:
+                runs.append(dict(msg=k, start=start, len=n))
+                start, n = i, 1
+            prev = i
+        runs.append(dict(msg=k, start=start, len=n))
+
+    # ---- mov taxonomy
+    movs = [r for r in real if r['op'] == 'mov']
+    mdef = dict(n=len(movs), uniform1=0, imm_zero=0, hf=0, f32=0, same_type_d=0,
+                type_change=0, other=0)
+    dst_re = re.compile(r'\s(\S+?):(\w+)\s')
+    for r in movs:
+        b = r['body']
+        is_uniform = r['unit'] in ('1', '8', '16') or (r['unit'] or '').isdigit() and int(r['unit']) <= 16
+        # destination type
+        m = re.search(r'(\w+\.\d+<[^>]*>):(\w+)', b)
+        dt = m.group(2) if m else None
+        # source token after dst (+ optional region/stride)
+        src = None
+        if m:
+            rest = b[m.end():].strip()
+            if rest:
+                src = rest.split()[0]
+        st = None
+        if src:
+            ms = re.search(r':(\w+)', src)
+            st = ms.group(1) if ms else None
+        if '0x0' in b or ' 0:' in b or '0.0:' in b:
+            if re.search(r'(0x0|0:w|0\.0:hf|0\.0:f)\s*$', b) or re.search(r'\s(0x0|0:w|0\.0:hf|0\.0:f)\s*($|\{)', b):
+                mdef['imm_zero'] += 1
+        if is_uniform:
+            mdef['uniform1'] += 1
+        if dt == 'hf':
+            mdef['hf'] += 1
+        elif dt == 'f':
+            mdef['f32'] += 1
+        if dt and st and dt == st:
+            mdef['same_type_d'] += 1
+        elif dt and st and dt != st:
+            mdef['type_change'] += 1
+        else:
+            mdef['other'] += 1
+
+    # ---- barriers / dpas / sync
+    bars = [r['index'] for r in real if r['op'] == 'sync.bar']
+    dpas = [r['index'] for r in real if r['op'].startswith('dpas')]
+    syncs = {}
+    for r in real:
+        if r['op'].startswith('sync'):
+            syncs[r['op']] = syncs.get(r['op'], 0) + 1
+
+    # ---- segment boundaries: barrier indices
+    seg_bounds = [0] + bars + [len(real)]
+    segments = []
+    for a, b in zip(seg_bounds, seg_bounds[1:]):
+        part = real[a:b]
+        if not part:
+            continue
+        pc = part[0]['addr_s']; pcl = part[-1]['addr_s']
+        seg = dict(first_addr=pc, last_addr=pcl, n_instr=len(part),
+                   sends=sum(1 for r in part if r['op'].startswith('send.')),
+                   slm=sum(1 for r in part if r['op'] == 'send.slm'),
+                   ugm=sum(1 for r in part if r['op'] == 'send.ugm'),
+                   gtwy=sum(1 for r in part if r['op'] == 'send.gtwy'),
+                   dpas=sum(1 for r in part if r['op'].startswith('dpas')),
+                   mov=sum(1 for r in part if r['op'] == 'mov'),
+                   msgs={})
+        for r in part:
+            if r['op'].startswith('send.'):
+                seg['msgs'][r['msg']] = seg['msgs'].get(r['msg'], 0) + 1
+        segments.append(seg)
+
+    out = dict(
+        isa=dict(path=str(ISA), sha256=hashlib.sha256(ISA.read_bytes()).hexdigest(),
+                 lines=len(ISA.read_text(encoding='utf-8', errors='replace').splitlines())),
+        n_instructions=len(real), n_labels=len(labels),
+        histogram=dict(sorted(hist.items(), key=lambda kv: -kv[1])),
+        sends=dict(total=len(sends),
+                   by_class={c: sum(1 for r in sends if r['send_class'] == c)
+                             for c in sorted({r['send_class'] for r in sends})},
+                   by_message={k: dict(n=v['n'], cls=v['cls'], rd=v['rd'], wr=v['wr'],
+                                       first_addr=v['first'], preds=sorted(v['preds']))
+                               for k, v in sorted(by_msg.items(), key=lambda kv: -kv[1]['n'])},
+                   n_sites=len(runs),
+                   sites=sorted(runs, key=lambda r: r['start'])),
+        mov=dict(mdef),
+        sync=syncs,
+        barriers=bars, dpas=dpas,
+        segments=segments,
+    )
+    (OUT / 'isa.json').write_text(json.dumps(out, indent=1), encoding='utf-8')
+
+    print('instructions', out['n_instructions'], 'labels', out['n_labels'])
+    print('histogram top 25:')
+    for k, v in list(out['histogram'].items())[:25]:
+        print('  %-14s %5d' % (k, v))
+    print('sends by class', out['sends']['by_class'])
+    print('send sites', out['sends']['n_sites'])
+    print('mov', json.dumps(mdef))
+    print('sync', syncs, 'bars', len(bars), 'dpas', len(dpas))
+    print('\nsegments (by sync.bar):')
+    for i, s in enumerate(segments):
+        print(' %2d %s..%s instr=%4d send=%3d (slm %3d ugm %3d) dpas=%2d mov=%4d' % (
+            i, s['first_addr'], s['last_addr'], s['n_instr'], s['sends'],
+            s['slm'], s['ugm'], s['dpas'], s['mov']))
+    print('\nmessage taxonomy:')
+    for k, v in out['sends']['by_message'].items():
+        print('  %-70s n=%3d cls=%s rd=%s wr=%s preds=%s' % (k[:70], v['n'], v['cls'], v['rd'], v['wr'], v['preds']))
+
+
+if __name__ == '__main__':
+    main()

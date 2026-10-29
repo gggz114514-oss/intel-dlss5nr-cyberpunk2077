@@ -1,0 +1,100 @@
+"""GPU stage runner: build a LUNA manifest + supervisor, run it under the unique lock, verify receipts.
+
+Usage:
+  python STAGE.py --spec <spec.json> [--dry]
+
+spec.json:
+{
+  "stage": "gates" | "native" | "resources" | "ordinary",
+  "owner": "LUNA-...",
+  "authorization": "text written into the lock",
+  "output_root": "<abs dir>",
+  "identities": ["<abs path>", ...],           # hashed before the run
+  "jobs": [ {<job dict as produced by COMMON.*_job>}, ... ]
+}
+
+Only one stage runs at a time; the supervisor itself takes the exclusive lock and
+refuses to start unless the previous holder wrote state=FINISHED.
+"""
+import json, subprocess, sys, shutil
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+
+TEMPLATE = K.C / 'templates' / 'execute.ps1'
+TEMPLATE_OWNER = 'LUNA-F10-WEIGHT-SEPARATION'
+TEMPLATE_AUTH = 'Main authorized only the explicitly approved F10 QKV A consumer layout manifest stage'
+
+
+def prepare(spec):
+    out_root = Path(spec['output_root'])
+    out_root.mkdir(parents=True, exist_ok=True)
+    stage = spec['stage']
+    manifest = out_root / ('LUNA-%s.json' % stage.upper())
+    ids = [K.ident(p) for p in spec['identities']]
+    jobs = spec['jobs']
+    for j in jobs:
+        p = Path(j['plan']['path'])
+        assert K.sha(p) == j['plan']['sha256'], 'plan sha mismatch ' + str(p)
+        out = Path(j['runner_output'])
+        assert not out.exists(), 'runner output not fresh: %s' % out
+        out.parent.mkdir(parents=True, exist_ok=True)
+    K.write_json(manifest, dict(working_directory=str(K.GPU_WS), output_root=str(out_root),
+                                identities=ids, jobs=jobs, rules=[spec.get('rules', '')]))
+    ps1 = out_root / ('execute-%s.ps1' % stage)
+    text = TEMPLATE.read_text(encoding='utf-8')
+    assert text.count(TEMPLATE_OWNER) >= 1 and text.count(TEMPLATE_AUTH) >= 1
+    text = text.replace(TEMPLATE_OWNER, spec['owner']).replace(TEMPLATE_AUTH, spec['authorization'])
+    ps1.write_text(text, encoding='utf-8')
+    return manifest, ps1
+
+
+PS5 = 'C:/windows/System32/WindowsPowerShell/v1.0/powershell.exe'
+
+
+def run(manifest, ps1):
+    r = subprocess.run([PS5, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(ps1),
+                        '-ManifestPath', str(manifest)],
+                       capture_output=True, text=True, encoding='utf-8', errors='replace')
+    return r
+
+
+def summarize(out_root, slim=True):
+    res = Path(out_root) / 'LUNA-DIRECT-CLOCK-RESULTS.json'
+    if not res.exists():
+        return dict(status='NO_RESULTS')
+    d = K.read_json(res)
+    rows = []
+    for j in d.get('jobs', []):
+        rows.append(dict(id=j.get('id'), status=j.get('status'), exit=j.get('exit_code'),
+                         frame=j.get('frame_present'), frame_sha=j.get('frame_out_sha256'),
+                         samples=j.get('receipt_sample_count'), normal_close=j.get('normal_close'),
+                         nan=j.get('nan'), inf=j.get('inf')))
+        if slim:
+            # keep the frame hash, drop the 28 MB binary: the run is reproducible from the plan
+            ro = j.get('runner_output')
+            if ro:
+                p = Path(ro)
+                hashes = {}
+                for f in list(p.glob('frame_*.bin')):
+                    hashes[f.name] = dict(sha256=K.sha(f), bytes=f.stat().st_size)
+                    f.unlink()
+                if hashes:
+                    K.write_json(p / 'FRAME-HASHES.json', hashes)
+    return dict(status=d.get('status'), stop_reason=d.get('stop_reason'),
+                executed=d.get('executed_jobs'), skipped=d.get('skipped_jobs'), jobs=rows)
+
+
+if __name__ == '__main__':
+    spec = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8-sig'))
+    manifest, ps1 = prepare(spec)
+    print('manifest', manifest)
+    if '--dry' in sys.argv:
+        sys.exit(0)
+    r = run(manifest, ps1)
+    print(r.stdout[-4000:])
+    if r.returncode != 0:
+        print(r.stderr[-6000:])
+    s = summarize(spec['output_root'])
+    print(json.dumps(s, indent=2))
+    K.write_json(Path(spec['output_root']) / 'STAGE-SUMMARY.json', s)

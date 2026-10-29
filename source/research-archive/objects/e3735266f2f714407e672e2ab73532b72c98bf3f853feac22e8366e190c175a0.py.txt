@@ -1,0 +1,134 @@
+"""Build the S02 F01 packs (scales-only and optional lift-D variant).
+
+Writes only inside S02-f01/PACK and S02-f01/SOURCE.
+"""
+import json
+import hashlib
+import shutil
+import subprocess
+import numpy as np
+import f01_model as M
+
+B = M.B
+S02 = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S02-f01"
+LIFT = M.D24 + "/lift-equalized"
+BASE = M.BASE
+OUT = S02 + "/PACK"
+SRC = S02 + "/SOURCE"
+
+SX = np.float32(0.0135)
+SE = np.float32(0.0052)
+
+We = M.WEXP_AS_F32
+Wc = M.WCON_AS_F32
+SWE = np.array([np.float32(a / np.float64(127.0)) if a else np.float32(1.0)
+                for a in np.abs(We).max(1)], np.float32)
+SWC = np.array([np.float32(a / np.float64(127.0)) if a else np.float32(1.0)
+                for a in np.abs(Wc).max(1)], np.float32)
+
+
+def scale_file(sx, se):
+    vals = np.empty(164, np.float32)
+    vals[0] = np.float32(sx)
+    vals[1] = np.float32(np.float32(1.0) / np.float32(sx))
+    vals[2] = np.float32(se)
+    vals[3] = np.float32(np.float32(1.0) / np.float32(se))
+    vals[4:132] = (np.float32(sx) * SWE).astype(np.float32)
+    vals[132:164] = (np.float32(se) * SWC).astype(np.float32)
+    return vals
+
+
+def sha(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest()
+
+
+def main():
+    import os
+    os.makedirs(OUT, exist_ok=True)
+    os.makedirs(SRC, exist_ok=True)
+    rep = {"scales": {}, "lift_d": None}
+    # --- primary: X/E scales only (656 B replaces f1-ffn-scales.bin) -----------
+    v = scale_file(SX, SE)
+    p = OUT + "/f1-ffn-scales.bin"
+    v.astype("<f4").tofile(p)
+    rep["scales"] = {"file": p, "bytes": int(v.size * 4), "sha256": sha(p),
+                     "sx": float(SX), "se": float(SE),
+                     "invx": float(v[1]), "inve": float(v[3]),
+                     "replaces": BASE + "/f1-ffn-scales.bin",
+                     "replaces_sha256": sha(BASE + "/f1-ffn-scales.bin"),
+                     "format": "164 x float32: [sX,1/sX,sE,1/sE, sX*sWe[128], sE*sWc[32]]"}
+    # verify byte-identity of the old file when rebuilt from the old constants
+    old = np.fromfile(BASE + "/f1-ffn-scales.bin", dtype="<f4")
+    assert np.array_equal(scale_file(old[0], old[2]), old), "canonical rebuild mismatch"
+
+    # --- optional: lift D -----------------------------------------------------
+    d = np.array([2.7, 4.05, 3.6, 1.5, 0.09, 0.084375, 0.135, 0.28125,
+                  0.1512, 0.2025, 0.672, 2.0, 2.0, 2.0, 2.7, 1.0], np.float32)
+    invd_txt = [f"{float(1.0 / np.float64(x)):.9f}" for x in d]
+    invd = np.array([np.float32(float(t)) for t in invd_txt], np.float32)
+    d_eff = (np.float64(1.0) / invd.astype(np.float64)).astype(np.float32)
+    Wl = M.WLIFT_AS_F32
+    wt = (Wl * d_eff[None, :]).astype(np.float32)
+    sw = np.maximum(np.abs(wt).max(axis=1) / np.float32(127.0), np.float32(1e-12)).astype(np.float32)
+    qw = np.clip(np.rint(wt / sw[:, None]), -127, 127).astype(np.int32)
+    base_w = np.fromfile(BASE + "/f1-weights.bin", dtype=np.int8).copy()
+    base_s = np.fromfile(BASE + "/f1-body-scales.bin", dtype="<f4").copy()
+    w = base_w.copy(); s = base_s.copy()
+    w[49152:] = 0
+    for c in range(32):
+        for k in range(16):
+            w[49152 + (c // 8) * 1024 + k * 32 + c % 8] = np.int8(qw[c, k])
+    s[128:160] = sw
+    wp = OUT + "/f1-body-weights-dopt.bin"
+    sp = OUT + "/f1-body-scales-dopt.bin"
+    w.tofile(wp); s.astype("<f4").tofile(sp)
+    assert np.array_equal(w[:49152], base_w[:49152])
+    assert np.array_equal(s[:128], base_s[:128])
+    # k>=16 stays zero
+    assert all(w[49152 + (c // 8) * 1024 + k * 32 + c % 8] == 0
+               for c in range(32) for k in range(16, 32))
+    rep["lift_d"] = {
+        "d": [float(x) for x in d_eff], "invd_text": invd_txt,
+        "sf": float(np.float32(np.load(M.D24 + "/lift-equalized/CALIBRATION.npz")["activation_scale"])),
+        "weights": wp, "weights_bytes": int(w.size), "weights_sha256": sha(wp),
+        "scales": sp, "scales_bytes": int(s.size * 4), "scales_sha256": sha(sp),
+        "weight_scale_offset": "scales.bin bytes 512..639 (float32 x32, lift output channels)",
+        "weight_codes_offset": "weights.bin bytes 49152..53247",
+        "replaces_weights_sha256": sha(BASE + "/f1-weights.bin"),
+        "lift_equalized_weights_sha256": sha(LIFT + "/weights.bin"),
+        "lift_equalized_scales_sha256": sha(LIFT + "/scales.bin"),
+        "weight_codes_zero_k16_31": True,
+    }
+    # --- shader for the D variant --------------------------------------------
+    src = open(LIFT + "/candidate.comp", encoding="utf-8").read()
+    old_line = [ln for ln in src.splitlines() if ln.startswith("const float NRF_INV_D[16]")]
+    assert len(old_line) == 1, old_line
+    new_line = ("const float NRF_INV_D[16] = float[16](" + ",".join(t + "f" for t in invd_txt) + ");")
+    src2 = src.replace(old_line[0], new_line)
+    assert src2 != src
+    cp = SRC + "/candidate-dopt.comp"
+    open(cp, "w", encoding="utf-8").write(src2)
+    inc = B + "/candidates/int8-coverage-v2-20261020/C/c32-i8-debug-eact-v1/source"
+    glsl = B + "/src/project/tools/glslang-16.5.0/bin/glslang.exe"
+    spv = SRC + "/candidate-dopt.spv"
+    import os
+    argv = [os.path.normpath(glsl), "-V", "--target-env", "vulkan1.3",
+            "-I" + os.path.normpath(inc), "-o", "SOURCE\\candidate-dopt.spv",
+            "SOURCE\\candidate-dopt.comp"]
+    print("COMPILE_ARGV", argv, "cwd", S02, "incdir", os.path.isdir(inc))
+    r = subprocess.run(argv, capture_output=True, text=True, cwd=S02)
+    assert r.returncode == 0, r.stdout + r.stderr
+    rep["lift_d"]["spv"] = spv
+    rep["lift_d"]["spv_sha256"] = sha(spv)
+    rep["lift_d"]["spv_bytes"] = int(__import__("os").path.getsize(spv))
+    rep["lift_d"]["shader_change"] = {
+        "line_replaced": old_line[0],
+        "line_new": new_line,
+        "unchanged": "sF/invF, K16..K31 zero pad, two-float-multiply code path, half casts",
+    }
+    open(OUT + "/PACK.json", "w", encoding="utf-8").write(json.dumps(rep, indent=2))
+    print(json.dumps(rep, indent=2))
+
+
+if __name__ == "__main__":
+    main()

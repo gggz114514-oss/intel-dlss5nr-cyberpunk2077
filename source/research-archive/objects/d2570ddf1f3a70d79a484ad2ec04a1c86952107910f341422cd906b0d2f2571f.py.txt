@@ -1,0 +1,110 @@
+"""n33 A-step addendum: the expensive op's *first arithmetic consumer*.
+
+For this kernel every expensive op's first consumer is the rounding conversion
+that is part of the same source expression (`float16_t(inversesqrt(...))`), so the
+card's "distance to first consumer" can never grow: the conversion sits 1
+instruction after the op in the parent, in SPIR-V and in any reordering.
+
+The measurable quantity that a reorder *can* move is the distance to the first
+instruction that does arithmetic on the result (the multiply / select / add that
+uses the narrowed value).  This script reports both, for all 24 sites.
+"""
+import sys, json
+from pathlib import Path
+from collections import defaultdict
+
+HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE))
+import _isa  # noqa: E402
+from _t02_live import reachable  # noqa: E402
+from _t01_identity import classify, reg_base, reaching  # noqa: E402
+
+MOVISH = {"mov", "movi", "sync.nop", "nop"}
+
+
+def build():
+    ins, labels = _isa.parse()
+    seen = reachable(ins, labels)
+    for i, it in enumerate(ins):
+        it["live"] = seen[i]
+        it["w"], it["r"] = classify(it)
+    by_dw = defaultdict(list)
+    for it in ins:
+        for f, no, dw, n in it["w"]:
+            for d in range(dw, dw + n):
+                by_dw[(f, no, d)].append(it["idx"])
+    for v in by_dw.values():
+        v.sort()
+    return ins, by_dw
+
+
+def readers(ins, by_dw, live, k):
+    key = reg_base(ins[k]["ops"][0])
+    nxt = None
+    for w in by_dw.get(key, []):
+        if w > k:
+            nxt = w
+            break
+    out = []
+    for j in live:
+        if j <= k or (nxt is not None and j >= nxt):
+            continue
+        for f, no, dw, cnt in ins[j]["r"]:
+            if any((f, no, d) == tuple(key) for d in range(dw, dw + cnt)):
+                out.append(j)
+                break
+    return out
+
+
+def chain_to_arith(ins, by_dw, live, k, maxdepth=6):
+    """walk through mov-only consumers until an arithmetic consumer is found."""
+    cur, seen = [k], {k}
+    for depth in range(maxdepth):
+        nxt = []
+        for c in cur:
+            for u in readers(ins, by_dw, live, c):
+                if u in seen:
+                    continue
+                seen.add(u)
+                if ins[u]["op"] not in MOVISH:
+                    return u
+                nxt.append(u)
+        cur = nxt
+        if not cur:
+            break
+    return None
+
+
+def main():
+    ins, by_dw = build()
+    live = [i for i in range(len(ins)) if ins[i]["live"]]
+    sites = [k for k in live if ins[k]["op"] in ("math.rsqt", "math.inv")]
+    rows = []
+    for k in sites:
+        first = readers(ins, by_dw, live, k)
+        first = first[0] if first else None
+        arith = chain_to_arith(ins, by_dw, live, k)
+        rows.append(dict(idx=k, addr=hex(ins[k]["addr"]), op=ins[k]["op"],
+                         first_consumer=first, first_op=ins[first]["op"] if first else None,
+                         d_first=(first - k) if first else None,
+                         arith_consumer=arith, arith_op=ins[arith]["op"] if arith else None,
+                         d_arith=(arith - k) if arith else None))
+    print("%-6s %-9s %-6s %-8s %-6s %-14s" % ("idx", "op", "1st", "op", "d_1st", "1st arith (d)"))
+    for r in rows:
+        print("%-6d %-9s %-6s %-8s %-6s %s(%s) @%s"
+              % (r["idx"], r["op"], r["first_consumer"], r["first_op"], r["d_first"],
+                 r["arith_op"], r["d_arith"],
+                 hex(ins[r["arith_consumer"]]["addr"]) if r["arith_consumer"] else "-"))
+    import statistics
+    rs = [r for r in rows if r["op"] == "math.rsqt"]
+    iv = [r for r in rows if r["op"] == "math.inv"]
+    print("\nmath.rsqt  d_first %s   d_arith %s"
+          % ([r["d_first"] for r in rs], [r["d_arith"] for r in rs]))
+    print("math.inv   d_first %s   d_arith %s"
+          % ([r["d_first"] for r in iv], [r["d_arith"] for r in iv]))
+    json.dump(rows, open(HERE / "A-ARITH.json", "w"), indent=1)
+    print("\nwrote A-ARITH.json")
+
+
+if __name__ == "__main__":
+    main()

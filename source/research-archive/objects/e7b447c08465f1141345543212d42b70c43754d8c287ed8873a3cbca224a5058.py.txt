@@ -1,0 +1,195 @@
+"""n34-f19-latency: run n33-f02-latency's value-identity method on F19 (f3942341c6275bc3).
+
+n33 (`cards/n33-f02-latency/_c1_redundancy.py`) decides "is a copy a duplicate
+value?" with three checks that are independent of n34's own `_d_redundancy.py`:
+
+  1. dword-granular reaching definition of the source operand at every site;
+  2. every instruction between two same-text sites that writes that dword
+     (a rewrite proves the value changed);
+  3. *leaf signature* of each site's backward slice: the set of (register,dword)
+     reads whose definition lies outside the slice -- i.e. the fragment/buffer
+     inputs the value is actually computed from.  Different leaf sets => the two
+     slices cannot be the same value.
+
+This script re-uses n33's own functions (`_isa.parse`, `_t02_live.reachable`,
+`_t01_identity.{classify,reg_base,reaching}`, and the c1 pipeline) with the F19
+kernel substituted, and writes the result into *this* card only.
+
+CPU only, read-only on the ISA.  Output: N33-CROSSCHECK.json.
+"""
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+HERE = Path(__file__).parent
+N33 = HERE.parent / 'n33-f02-latency'
+sys.path.insert(0, str(N33))
+
+import _isa                      # noqa: E402
+import _t02_live as LIVE          # noqa: E402
+import _t01_identity as ID        # noqa: E402
+
+F19_CAP = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+               'fullnet-continuous-20261027/queue/n29-f01-alu-chain/native/captures/'
+               'native-native-base/ISA')
+F19_FILE = 'CS_asmf3942341c6275bc3_simd32_0000000000000026_37_orig.asm'
+OUT = HERE / 'N33-CROSSCHECK.json'
+
+
+def main():
+    # ---- point n33's reader at F19 (module-level constants; nothing written there)
+    _isa.CAP = F19_CAP
+    _isa.FILES = [F19_FILE]
+    _isa.KERN = 'f3942341c6275bc3'
+
+    ins, labels = _isa.parse()
+    # n33's own reachability model assumes the debug islands are entered through
+    # an always-taken predicated jump; F19's layout is different and that model
+    # keeps only 58 of 5384 instructions, so the executed-path mask used here is
+    # n34's (n19's uniform-guarded rule: 4181 live / 1203 guarded).  The
+    # value-identity logic below is n33's, unchanged.
+    seen_n33 = LIVE.reachable(ins, labels)
+    # n34's own audit module: load by path, because n33 also ships an _a_audit.py
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('n34_a_audit', HERE / '_a_audit.py')
+    A = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(A)
+    rows_a = A.load()
+    guarded, spans = A.guarded_spans(rows_a)
+    seen = [i not in guarded for i in range(len(ins))]
+    n33_reachable = sum(1 for s in seen_n33 if s)
+    for i, it in enumerate(ins):
+        it['live'] = seen[i]
+        it['w'], it['r'] = ID.classify(it)
+    live_idx = {i for i in range(len(ins)) if ins[i]['live']}
+
+    by_dw = defaultdict(list)
+    for it in ins:
+        for f, no, dw, n in it['w']:
+            for d in range(dw, dw + n):
+                by_dw[(f, no, d)].append(it['idx'])
+    for v in by_dw.values():
+        v.sort()
+
+    def src_dw(k):
+        for o in ins[k]['ops']:
+            b = ID.reg_base(o)
+            if b:
+                return (b[0], b[1], b[2])
+        return None
+
+    def defs_between(key, lo, hi):
+        return [i for i in by_dw.get(key, []) if lo < i < hi]
+
+    def slice_leaf(k, limit=400):
+        body, leaves, stack = set(), set(), [k]
+        while stack:
+            j = stack.pop()
+            if j in body:
+                continue
+            body.add(j)
+            for f, no, dw, n in ins[j]['r']:
+                for d in range(dw, dw + n):
+                    p = ID.reaching(by_dw, (f, no, d), j)
+                    if p is None or p not in live_idx:
+                        leaves.add((f, no, d, j))
+                    else:
+                        stack.append(p)
+            if len(body) > limit:
+                break
+        return body, leaves
+
+    exp = [k for k in sorted(live_idx) if ins[k]['op'] in ('math.rsqt', 'math.inv')]
+    rows = []
+    for k in exp:
+        key = src_dw(k)
+        prod = ID.reaching(by_dw, key, k)
+        body, leaves = slice_leaf(k)
+        leaf_sig = sorted({(f, no, d) for f, no, d, _ in leaves})
+        rows.append(dict(idx=k, addr=hex(ins[k]['addr']), op=ins[k]['op'],
+                         src_text=';'.join(ins[k]['ops'][:2]), src_key=list(key),
+                         producer=prod,
+                         producer_addr=hex(ins[prod]['addr']) if prod is not None else None,
+                         producer_text=ins[prod]['text'][:90] if prod is not None else None,
+                         slice_len=len(body), leaf_n=len(leaf_sig), leaf_sig=leaf_sig))
+
+    groups = defaultdict(list)
+    for r in rows:
+        groups[(r['op'], r['src_text'])].append(r)
+
+    verdicts = []
+    for (op, txt), rs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        rs.sort(key=lambda r: r['idx'])
+        same, rewrites = [], []
+        for i in range(len(rs)):
+            for j in range(i + 1, len(rs)):
+                a, b = rs[i], rs[j]
+                if a['producer'] is not None and a['producer'] == b['producer']:
+                    same.append((a['idx'], b['idx']))
+                    continue
+                w = defs_between(tuple(a['src_key']), a['idx'], b['idx'])
+                rewrites.append(dict(a=a['idx'], b=b['idx'],
+                                     a_addr=a['addr'], b_addr=b['addr'],
+                                     rewrites=w,
+                                     rewrite_addrs=[hex(ins[x]['addr']) for x in w],
+                                     rewrite_text=[ins[x]['text'][:70] for x in w],
+                                     leaf_diff=a['leaf_sig'] != b['leaf_sig']))
+        verdicts.append(dict(op=op, src_text=txt.split(';')[0], copies=len(rs),
+                             distinct_producers=len({r['producer'] for r in rs}),
+                             sites=[dict(addr=r['addr'], producer=r['producer_addr'],
+                                         producer_text=r['producer_text'],
+                                         slice_len=r['slice_len'], leaf_n=r['leaf_n'])
+                                    for r in rs],
+                             same_value_pairs=same, rewrites=rewrites,
+                             distinct_leaf_signatures=len({tuple(r['leaf_sig']) for r in rs})))
+
+    tot = len(rows)
+    census_redundant = sum(v['copies'] - v['distinct_producers'] for v in verdicts)
+    truly_same = sum(len(v['same_value_pairs']) for v in verdicts)
+    out = dict(
+        method='n33-f02-latency _c1_redundancy.py (re-run on the F19 kernel)',
+        kernel='f3942341c6275bc3', isa=str(F19_CAP / F19_FILE),
+        instructions=len(ins), reachable=len(live_idx), unreachable=len(ins) - len(live_idx),
+        n33_reachability_model_inapplicable=dict(
+            reachable_by_n33_cfg=n33_reachable, total=len(ins),
+            reason='n33 reachable() follows only the first target of a (W&fN) predicated '
+                   'jmpi and therefore keeps 58 of 5384 F19 instructions; the executed-path '
+                   'mask used here is n34/n19 uniform-guarded spans'),
+        n_sites=tot,
+        n_distinct_producers=len({r['producer'] for r in rows}),
+        census_redundant=census_redundant,
+        actual_same_value_pairs=truly_same,
+        sites=rows, groups=verdicts,
+        verdict=dict(census_would_delete=census_redundant,
+                     actually_share_one_definition=truly_same,
+                     keep=len({r['producer'] for r in rows}),
+                     same_value_groups=sum(1 for v in verdicts if v['same_value_pairs'])),
+    )
+    OUT.write_text(json.dumps(out, indent=1), encoding='utf-8')
+
+    print('F19 kernel %s: %d instructions, reachable %d, unreachable %d'
+          % (out['kernel'], out['instructions'], out['reachable'], out['unreachable']))
+    print('%-6s %-9s %-22s %-10s %6s %5s' %
+          ('idx', 'op', 'source text', 'producer', 'slice', 'leaf'))
+    for r in rows:
+        print('%-6d %-9s %-22s %-10s %6d %5d'
+              % (r['idx'], r['op'], r['src_text'][:22], r['producer_addr'],
+                 r['slice_len'], r['leaf_n']))
+    print('\ngroups by identical source-operand text (census criterion):')
+    for v in verdicts:
+        print('  %-9s %-18s x%d  distinct_producers %d  same_value_pairs %d  distinct_leaf_sigs %d'
+              % (v['op'], v['src_text'], v['copies'], v['distinct_producers'],
+                 len(v['same_value_pairs']), v['distinct_leaf_signatures']))
+        for w in v['rewrites']:
+            print('       %s -> %s : %d write(s) of the source dword in between %s ; leaves differ=%s'
+                  % (w['a_addr'], w['b_addr'], len(w['rewrites']),
+                     w['rewrite_addrs'][:4], w['leaf_diff']))
+    print('\nsummary: sites %d, distinct reaching definitions %d, '
+          'census would delete %d, actually same value %d'
+          % (tot, out['n_distinct_producers'], census_redundant, truly_same))
+    print('wrote', OUT)
+
+
+if __name__ == '__main__':
+    main()

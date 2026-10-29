@@ -1,0 +1,89 @@
+// c64_d1.comp — C64 body1 INT8: expand (K=64,N=256) -> act -> mid (K=128,N=64).
+//
+// Private family copy for VK-INT8-ZCODE-COVERAGE-FIRST-EXECUTION-V2 工单 B2.
+// Structure inherited from c128-diffusion-v1/source/pilot_d1.comp (native INT8
+// A/B, int32 acc, float dequant, one half act, int8 requant) with the C64
+// geometry of the FP16 parent dispatch c64-full.spv
+// (s1-tail-layout/c64-complete/full/source/nb05_swin_c64_m_pair_fp16.comp):
+//   grid = window grid (42x24 for block5), z = head group g in {0,1}
+//   expand N = 2*128 = 256, K = 64 (2 x KS=32, no K tail)
+//   mid    N = 2*32  = 64,  K = 128 (4 x KS=32, no K tail)
+//   M      int8 window-major (w*64+m)*64+c
+//
+// Weight layout is declared here (row-major [N][K]); the pack builder writes
+// exactly this order.  The parent FP16 pack layouts are only read offline.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 256) in;
+#include "c64_int8_common.glsl"
+
+shared QT sa[8192];   // [64 tokens][128 channels] int8
+
+void main() {
+    uint tid = gl_LocalInvocationID.x, sg = tid / 32u;
+    uint wx = gl_WorkGroupID.x, wy = gl_WorkGroupID.y, g = gl_WorkGroupID.z;
+    uint w = wy * uint(pc.p1.x) + wx;
+    const uint n0 = (sg % 4u) * 32u;
+    const float invA = sc[2], invM = sc[3];
+
+    MF eScale0, eScale1, invA0, invA1;
+    coopMatLoad(invA0, sc, 464u+g*128u+n0, 0u, ROW);
+    coopMatLoad(invA1, sc, 464u+g*128u+n0+16u, 0u, ROW);
+    coopMatLoad(eScale0, sc, SC_EXPAND + g * 128u + n0, 0u, ROW);
+    coopMatLoad(eScale1, sc, SC_EXPAND + g * 128u + n0 + 16u, 0u, ROW);
+
+    // ---- expand 64 x 256 x 64: per group 64 x 128 x 64 ----
+    for (uint r = 0u; r < 2u; ++r) {
+        uint m0 = (sg / 4u + 4u * r) * 8u, m1 = m0 + 16u;
+        bool oob0, oob1;
+        uint base0 = qx_addr(m0, 0u, wx, wy, oob0);
+        uint base1 = qx_addr(m1, 0u, wx, wy, oob1);
+        ACC a0 = ACC(ZERO), a1 = ACC(ZERO), b0 = ACC(ZERO), b1 = ACC(ZERO);
+        for (uint k = 0u; k < 64u; k += KS) {
+            MA x; MB v0, v1;
+            coopMatLoad(v0, qw, (g * 128u + n0) * 64u + k, 64u, COL);
+            coopMatLoad(v1, qw, (g * 128u + n0 + 16u) * 64u + k, 64u, COL);
+            x = load_entry_A(base0, k, oob0);
+            a0 = coopMatMulAdd(x, v0, a0); a1 = coopMatMulAdd(x, v1, a1);
+            x = load_entry_A(base1, k, oob1);
+            b0 = coopMatMulAdd(x, v0, b0); b1 = coopMatMulAdd(x, v1, b1);
+        }
+        dumpdot(a0, 0u, m0, g * 128u + n0, 512u);
+        dumpdot(a1, 0u, m0, g * 128u + n0 + 16u, 512u);
+        dumpdot(b0, 0u, m1, g * 128u + n0, 512u);
+        dumpdot(b1, 0u, m1, g * 128u + n0 + 16u, 512u);
+        MQ q = requant_act(a0, eScale0, invA0);
+        coopMatStore(q, sa, m0 * 128u + n0, 128u, ROW);
+        q = requant_act(a1, eScale1, invA1);
+        coopMatStore(q, sa, m0 * 128u + n0 + 16u, 128u, ROW);
+        q = requant_act(b0, eScale0, invA0);
+        coopMatStore(q, sa, m1 * 128u + n0, 128u, ROW);
+        q = requant_act(b1, eScale1, invA1);
+        coopMatStore(q, sa, m1 * 128u + n0 + 16u, 128u, ROW);
+    }
+    barrier();
+
+    // ---- mid 64 x 32 x 128 (one 32-column shard per head group) ----
+    uint m = sg * 8u;
+    MF mScale0, mScale1;
+    coopMatLoad(mScale0, sc, SC_MID + g * 32u, 0u, ROW);
+    coopMatLoad(mScale1, sc, SC_MID + g * 32u + 16u, 0u, ROW);
+    ACC c0 = ACC(ZERO), c1 = ACC(ZERO);
+    for (uint k = 0u; k < 128u; k += KS) {
+        MA x; MB w0, w1;
+        coopMatLoad(x, sa, m * 128u + k, 128u, ROW);
+        coopMatLoad(w0, qw, 16384u + (32u * g) * 128u + k, 128u, COL);
+        coopMatLoad(w1, qw, 16384u + (32u * g + 16u) * 128u + k, 128u, COL);
+        c0 = coopMatMulAdd(x, w0, c0); c1 = coopMatMulAdd(x, w1, c1);
+    }
+    dumpdot(c0, 32768u, m, g * 32u, 128u);
+    dumpdot(c1, 32768u, m, g * 32u + 16u, 128u);
+    MQ q0 = requant_linear(c0, mScale0, invM);
+    coopMatStore(q0, gm, (w * 64u + m) * 64u + g * 32u, 64u, ROW);
+    q0 = requant_linear(c1, mScale1, invM);
+    coopMatStore(q0, gm, (w * 64u + m) * 64u + g * 32u + 16u, 64u, ROW);
+}

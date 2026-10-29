@@ -1,0 +1,269 @@
+"""ISA reader for the F18 body-pre kernel (ord 166, kernel a606bc5d667e43fa).
+
+Read-only on the existing gtpin capture; no GPU, no plan, no deploy.
+Produces: the 16 math.inv sites with their def -> first-use distance, the op
+census, the highest register touched, and the n32-style "independent chains per
+lane" number (greedy def-use path cover, max simultaneously live chains).
+
+Operand model (deliberately small, dword granularity):
+  * rN.S<W;H,V> -> dwords {S + i*H, i in 0..W-1}; W==0 -> broadcast {S}
+  * rN.S<W>     -> H defaults to 1
+  * :hf/:h/:bf  -> two halves per dword: dwords S/2 .. (S+(W-1)*H)/2
+  * send        -> block widths from the trailing "wr:a+b, rd:c" comment
+  * only rN / accN are tracked; cr/f/a0/ce/sN are control, not data
+"""
+import re, json
+from pathlib import Path
+from collections import Counter, OrderedDict
+
+ROOT = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+CAP = ROOT / 'queue/n01b-f02-load-side/native/captures'
+BASE_ISA = CAP / 'native-native-base/ISA/CS_asma606bc5d667e43fa_simd32_000000000000001d_28_orig.asm'
+CAND_ISA = CAP / 'native-native-cand/ISA/CS_asma606bc5d667e43fa_simd32_000000000000001d_28_orig.asm'
+
+LINE = re.compile(r'^/\*\s*\[([0-9A-Fa-f]+)\]\s*\*/\s*(.*)$')
+LABEL = re.compile(r'^(L\d+):$')
+MASK = re.compile(r'^\(([^)]+)\)\s*')
+REG = re.compile(r'(r|acc)(\d+)\.(\d+)(?:<(\d+)(?:;(\d+),(\d+))?>)?(?::(\w+))?')
+SENDW = re.compile(r'wr:(\d+)\+(\d+)')
+SENDR = re.compile(r'rd:(\d+)')
+REGS = ('r', 'acc')
+
+
+def parse(path):
+    ins = []
+    for raw in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        m = LABEL.match(s)
+        if m:
+            ins.append(dict(kind='label', label=m.group(1)))
+            continue
+        m = LINE.match(s)
+        if not m:
+            continue
+        off, body = int(m.group(1), 16), m.group(2)
+        comment = ''
+        if '//' in body:
+            body, comment = body.split('//', 1)
+        b = body.strip()
+        emask = ''
+        mm = MASK.match(b)
+        if mm:
+            emask = mm.group(1)
+            b = b[mm.end():].strip()
+        # a leading (~fl) / (W&fl) predicate column may still be present
+        mp = re.match(r'^(\([~W&|fl0-9.]*\))\s+', b)
+        if mp:
+            b = b[mp.end():].strip()
+        toks = b.split()
+        if not toks:
+            continue
+        ins.append(dict(kind='ins', off=off, off_s='%04X' % off, emask=emask,
+                        op=toks[0], args=toks[1:], comment=comment.strip(),
+                        text=(s.split('*/', 1)[1].strip() if '*/' in s else b)))
+    n = 0
+    for i in ins:
+        if i['kind'] == 'ins':
+            i['idx'] = n
+            n += 1
+    return ins
+
+
+def dwords(a):
+    a = a.strip().rstrip(',')
+    if not a or a in ('null',):
+        return None
+    a = a.lstrip('-~')
+    m = REG.match(a)
+    if not m:
+        return None
+    pre, num, sub, W, H, V, ty = m.groups()
+    if pre not in REGS:
+        return None
+    s, w = int(sub), int(W) if W is not None else 1
+    h = int(H) if H is not None else 1
+    if ty in ('hf', 'h', 'bf'):
+        n_el = max(w, 1)
+        lo = s // 2
+        hi = (s + (n_el - 1) * max(h, 1)) // 2
+        return ('%s%s' % (pre, num), set(range(lo, hi + 1)))
+    if w == 0:
+        return ('%s%s' % (pre, num), {s})
+    return ('%s%s' % (pre, num), set(range(s, s + (w - 1) * max(h, 1) + 1)))
+
+
+def operands(i):
+    args = list(i['args'])
+    if i['op'].startswith('send'):
+        dst, src = [], []
+        mw, mr = SENDW.search(i['comment']), SENDR.search(i['comment'])
+        if mw and args:
+            r = re.match(r'^(r|acc)(\d+)', args[0].lstrip('-'))
+            if r:
+                dst.append((r.group(1) + r.group(2), set(range(int(mw.group(1)) + int(mw.group(2))))))
+        if mr and len(args) > 1:
+            r = re.match(r'^(r|acc)(\d+)', args[1].lstrip('-'))
+            if r:
+                src.append((r.group(1) + r.group(2), set(range(int(mr.group(1))))))
+        for a in args:
+            if re.match(r'^(null|\S+:0)$', a):
+                continue
+            r = dwords(a)
+            if r and r[0] not in {x[0] for x in src}:
+                src.append(r)
+        return dst, src
+    di = None
+    for k, a in enumerate(args):
+        if dwords(a):
+            di = k
+            break
+    if di is None:
+        return [], []
+    dst = [dwords(args[di])]
+    src = [dwords(a) for k, a in enumerate(args) if k != di and dwords(a)]
+    return dst, src
+
+
+def build(code):
+    ddef, duse = {}, {}
+    for i in code:
+        dst, src = operands(i)
+        ddef[i['idx']] = OrderedDict((r, ds) for r, ds in dst)
+        duse[i['idx']] = [(r, d) for r, ds in src for d in sorted(ds)]
+    return ddef, duse
+
+
+def gaps(code, ddef, duse, want):
+    """[(site_idx, consumer_idx, distance, dword)] for instructions whose op is in `want`."""
+    pend = {}
+    out = []
+    for i in code:
+        k = i['idx']
+        for rd in duse[k]:
+            for w in pend.pop(rd, []):
+                out.append((w, k, k - w, rd, i['op']))
+        for r, ds in ddef[k].items():
+            if i['op'] in want:
+                for d in ds:
+                    pend.setdefault((r, d), []).append(k)
+    return out
+
+
+def use_def_edges(code, ddef, duse):
+    """use -> nearest preceding def of the same dword."""
+    last = {}
+    edges = []
+    for i in code:
+        k = i['idx']
+        for rd in duse[k]:
+            if rd in last:
+                edges.append((last[rd], k, rd))
+        for r, ds in ddef[k].items():
+            for d in ds:
+                last[(r, d)] = k
+    return edges
+
+
+def chains_and_concurrency(code, ddef, duse):
+    """n32 method: back-slice every live memory-writing send, cover with greedy
+    def-use paths, then max number of chains alive at one program point."""
+    ins_by = {i['idx']: i for i in code}
+    n = len(code)
+    # predecessors per instruction on the same dword
+    pred = [[] for _ in range(n)]
+    for a, b, rd in use_def_edges(code, ddef, duse):
+        pred[b].append(a)
+    sinks = [i['idx'] for i in code if i['op'].startswith('send') and
+             (i['op'] == 'send.ugm' or i['op'] == 'send.slm') and
+             ('store' in i['comment'] or 'wr:' in i['comment'])]
+    # keep only stores (write to memory): "wr:" width > 0 and no "load." in the message
+    sinks = [i['idx'] for i in code if i['op'].startswith('send') and
+             'wr:' in i['comment'] and 'load.' not in i['comment']]
+    onchain = set()
+    for s in sinks:
+        stack, seen = [s], set()
+        while stack:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            onchain.add(x)
+            stack.extend(pred[x])
+    # greedy path cover over the chain subgraph (longest remaining path first)
+    order = sorted(onchain)
+    indeg_w = {x: len([p for p in pred[x] if p in onchain]) for x in order}
+    used = set()
+    paths = []
+    starts = [x for x in order if indeg_w[x] == 0]
+    pool = starts + [x for x in order if x not in starts]
+    for s in pool:
+        if s in used:
+            continue
+        path, cur = [], s
+        while cur is not None and cur not in used:
+            used.add(cur)
+            path.append(cur)
+            nxt = [y for y in range(cur + 1, min(n, cur + 400))
+                   if y in onchain and any(p == cur for p in pred[y]) and y not in used]
+            cur = min(nxt) if nxt else None
+        if path:
+            paths.append(path)
+    events = []
+    for p in paths:
+        events.append((min(p), 1))
+        events.append((max(p) + 1, -1))
+    events.sort()
+    cur = best = 0
+    best_at = 0
+    for pos, d in events:
+        cur += d
+        if cur > best:
+            best, best_at = cur, pos
+    return dict(sinks=len(sinks), chain=len(onchain), chains=len(paths),
+                max_concurrent=best, at='0x%04X' % ins_by[best_at]['off'] if best_at in ins_by else str(best_at))
+
+
+def census(code):
+    c = Counter(i['op'] for i in code)
+    maxr = 0
+    for i in code:
+        for a in i['args']:
+            for m in re.finditer(r'(?:^|[ ,\-])(r|acc)(\d+)', a):
+                maxr = max(maxr, int(m.group(2)))
+    return c, maxr
+
+
+def main():
+    a = parse(BASE_ISA)
+    b = parse(CAND_ISA)
+    ca = [i for i in a if i['kind'] == 'ins']
+    cb = [i for i in b if i['kind'] == 'ins']
+    res = dict(n_instructions=len(ca), n_instructions_cand=len(cb),
+               identical_bytes=(Path(BASE_ISA).read_bytes() == Path(CAND_ISA).read_bytes()))
+    ddef, duse = build(ca)
+    g = gaps(ca, ddef, duse, {'math.inv', 'math.rsqt'})
+    invs = [x for x in g if ca[x[0]]['op'] == 'math.inv']
+    res['inv_sites'] = [dict(idx=s, off=ca[s]['off_s'], consumer=ca[c]['off_s'],
+                             distance=d, dword='%s.%d' % rd, consumer_op=ca[c]['op'],
+                             dst=ca[s]['args'][0] if ca[s]['args'] else '')
+                        for s, c, d, rd, _ in invs]
+    res['inv_count'] = len(invs)
+    hist = Counter(x[2] for x in invs)
+    res['distance_histogram'] = {str(k): v for k, v in sorted(hist.items())}
+    res['spacing'] = [invs[i + 1][0] - invs[i][0] for i in range(len(invs) - 1)]
+    c, maxr = census(ca)
+    res['ops'] = dict(c.most_common())
+    res['max_register'] = maxr
+    res['registers_used'] = len({m.group(0) for i in ca for a_ in i['args']
+                                 for m in [re.match(r'^(r|acc)(\d+)', a_.lstrip('-'))] if m})
+    res['chains'] = chains_and_concurrency(ca, ddef, duse)
+    # where the 16 inv sit relative to the region boundaries
+    res['inv_offsets'] = [ca[s]['off_s'] for s, *_ in invs]
+    print(json.dumps(res, indent=1))
+    return res
+
+
+if __name__ == '__main__':
+    main()

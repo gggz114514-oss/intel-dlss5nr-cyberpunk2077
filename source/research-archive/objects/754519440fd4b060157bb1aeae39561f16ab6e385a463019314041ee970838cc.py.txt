@@ -1,0 +1,182 @@
+"""n21 ISA scan (read only): register footprint of the gated debug store path.
+
+Source: the authoritative gtpin capture of the *parent* module (SPV sha ffde3c3d…,
+identity CURRENT per n20).  No GPU is used: this only parses an existing .asm.
+
+Outputs (build/isa-scan.json):
+  * per-block instruction/register facts,
+  * the 8 blocks that are skipped when debug == 0 (the `if (debug)` store path),
+  * max register inside vs outside those blocks,
+  * which blocks touch the highest registers,
+  * store-message census (Y vs dbg).
+"""
+import sys, re, json, collections
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent
+C = CARD.parent.parent
+sys.path.insert(0, str(C))
+import COMMON as K
+
+ISA = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+           'fullnet-mechanism-transfer-20261026/f05-a-return-phase1-20261027/captures/'
+           'boundary/ISA/CS_asm4e6ba3ddc1931535_simd32_0000000000000022_33_orig.asm')
+
+LINE = re.compile(r'^/\* \[([0-9A-F]+)\]\s+\*/\s+(?:\(([^)]*)\)\s+)?([a-z0-9_.]+)\s*(.*)$')
+LABEL = re.compile(r'^(L\d+):')
+REG = re.compile(r'\b(r|acc)(\d+)(?:\.(\d+))?')
+FLAG = re.compile(r'\bf(\d+)\.(\d+)\b')
+
+
+def parse(path):
+    ins, labels = [], {}
+    for raw in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+        m = LABEL.match(raw.strip())
+        if m:
+            labels[m.group(1)] = len(ins)
+            continue
+        m = LINE.match(raw.rstrip())
+        if not m:
+            continue
+        addr, mask, op, rest = m.groups()
+        pred = None
+        if mask:
+            pred = mask
+        ins.append(dict(addr=int(addr, 16), mask=mask or '', op=op, rest=rest.strip(),
+                        pred=pred, text=raw.strip()))
+    return ins, labels
+
+
+def regs(rest):
+    out = set()
+    for kind, num, sub in REG.findall(rest):
+        if kind == 'r':
+            out.add(int(num))
+    return out
+
+
+ins, labels = parse(ISA)
+lab_at = {v: k for k, v in labels.items()}
+
+# block boundaries by label index
+bounds = sorted(labels.items(), key=lambda kv: kv[1])
+blocks = []
+for i, (name, start) in enumerate(bounds):
+    end = bounds[i + 1][1] if i + 1 < len(bounds) else len(ins)
+    blocks.append(dict(label=name, start=start, end=end, n=end - start))
+
+
+def block_of(idx):
+    lo, hi = 0, len(blocks) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if blocks[mid]['start'] <= idx < blocks[mid]['end']:
+            return blocks[mid]
+        if idx < blocks[mid]['start']:
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    return None
+
+
+# ---------------------------------------------------------------- census
+maxr = max((max(regs(i['rest'])) for i in ins if regs(i['rest'])), default=-1)
+allregs = collections.Counter()
+for i in ins:
+    for r in regs(i['rest']):
+        allregs[r] += 1
+
+# ---------------------------------------------------------------- debug-skipped blocks
+# pattern: `(W&fX.Y) jmpi TARGET` where TARGET == the label of the block that starts the
+# skipped region's *end*; every instruction between the jmpi and TARGET belongs to the
+# skipped region.  We classify a skipped region as the debug store path when it contains
+# store.ugm and no dpas / ugm load of A rows.
+skipped = []
+for k, i in enumerate(ins):
+    if i['op'] == 'jmpi' and 'f' in i['mask'] and '&' in i['mask'] and i['rest'].strip().startswith('L'):
+        target = i['rest'].strip()
+        start_blk = block_of(k)
+        tgt_idx = labels.get(target)
+        if start_blk is None or tgt_idx is None:
+            continue
+        body = ins[start_blk['end']:tgt_idx]
+        skipped.append(dict(pred=i['mask'], at=i['addr'], target=target,
+                            body_start=start_blk['end'], body_end=tgt_idx, body=body))
+
+dbg_regions = []
+for s in skipped:
+    body = s['body']
+    ops = collections.Counter(b['op'] for b in body)
+    if ops.get('send.ugm') and not ops.get('dpas') and not any('load.ugm' in b['rest'] for b in body):
+        dbg_regions.append(dict(pred=s['pred'], at=s['at'], target=s['target'],
+                                body_start=s['body_start'], body_end=s['body_end'],
+                                body=body, ops=dict(ops)))
+
+dbg_idx = set()
+for r in dbg_regions:
+    for j in range(r['body_start'], r['body_end']):
+        dbg_idx.add(j)
+
+dbg_regs = collections.Counter()
+for r in dbg_regions:
+    for b in r['body']:
+        for x in regs(b['rest']):
+            dbg_regs[x] += 1
+out_regs = collections.Counter()
+for j, i in enumerate(ins):
+    if j in dbg_idx:
+        continue
+    for x in regs(i['rest']):
+        out_regs[x] += 1
+
+upper_out = sorted([r for r in out_regs if r >= 96])
+upper_dbg = sorted([r for r in dbg_regs if r >= 96])
+
+# registers that appear ONLY inside the debug regions
+only_dbg = sorted(set(dbg_regs) - set(out_regs))
+
+# messages
+msg = collections.Counter()
+for i in ins:
+    m = re.search(r'//\s*(?:wr:[^;]*;\s*)?([a-z0-9_.]+)\s*$', i['text'])
+    if '// ' in i['text']:
+        msg[i['text'].split('//')[1].strip()] += 1
+
+store_y = sum(1 for j, i in enumerate(ins) if 'store.ugm' in i['rest'] and j not in dbg_idx)
+store_dbg = sum(1 for j in dbg_idx if 'store.ugm' in ins[j]['rest'])
+
+top_touch = collections.defaultdict(list)
+for j, i in enumerate(ins):
+    for x in regs(i['rest']):
+        if x >= 120:
+            top_touch[x].append((j, i['addr'], i['op'], 'dbg' if j in dbg_idx else 'prod'))
+
+res = dict(
+    isa=str(ISA), isa_sha256=K.sha(ISA), instructions=len(ins), blocks=len(blocks),
+    max_r=maxr, distinct_r=len(allregs), registers_ge_96_outside=sorted(set(out_regs) & set(range(96, 128))),
+    registers_ge_96_inside_dbg=upper_dbg,
+    registers_only_in_dbg=only_dbg,
+    dbg_regions=dict(count=len(dbg_regions),
+                     preds=sorted({r['pred'] for r in dbg_regions}),
+                     n_instructions=sum(len(r['body']) for r in dbg_regions),
+                     per_region=[dict(pred=r['pred'], at=hex(r['at']), target=r['target'],
+                                      n=len(r['body']), ops=r['ops'],
+                                      regs=sorted({x for b in r['body'] for x in regs(b['rest'])}),
+                                      text=[b['text'] for b in r['body']]) for r in dbg_regions]),
+    store_messages=dict(production=store_y, debug=store_dbg),
+    top_register_uses={str(k): v for k, v in sorted(top_touch.items())},
+    message_census=dict(msg.most_common(20)),
+)
+K.write_json(CARD / 'build' / 'isa-scan.json', res)
+print('instructions', len(ins), 'blocks', len(blocks), 'max_r', maxr, 'distinct r', len(allregs))
+print('dbg regions', len(dbg_regions), 'sites', sorted({r["pred"] for r in dbg_regions}),
+      'instr', sum(len(r['body']) for r in dbg_regions))
+print('dbg regs', sorted(set(dbg_regs)))
+print('regs >=96 outside dbg', sorted(set(out_regs) & set(range(96, 128))))
+print('regs >=96 inside dbg', upper_dbg, 'only-in-dbg', only_dbg)
+print('stores: production', store_y, 'debug', store_dbg)
+print('top registers:', {k: len(v) for k, v in sorted(top_touch.items())})
+for r in dbg_regions[:2]:
+    print('--- region', hex(r['at']), r['pred'], 'n=', len(r['body']), r['ops'])
+    for b in r['body'][:20]:
+        print('   ', b['text'][:150])

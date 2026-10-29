@@ -1,0 +1,46 @@
+from pathlib import Path
+import json,sys,subprocess,hashlib,struct,re,copy
+B=Path('@NR_WORKSPACE@'); A=B/'work/codex-astra-fp16-int8-audit-20261024'; D=A/'fullnet-mechanism-transfer-20261026'; P=D/'f05-four-weight-window-20261027'; S=D/'f05-a-return-phase1-20261027'
+S.mkdir(exist_ok=True); (S/'run').mkdir(exist_ok=True); (S/'captures').mkdir(exist_ok=True)
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts')); import spv_tools_local as ST
+ident=lambda p:dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+read=lambda p:json.loads(p.read_text(encoding='utf-8-sig'))
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True); assert r.returncode==0,r.stdout+r.stderr; return r.stdout
+src=(P/'c128/candidate.comp').read_text(); old='            accK0 = coopMatMulAdd(a, wb2, accK0);\n            accK1 = coopMatMulAdd(a, wb3, accK1);'; assert src.count(old)==1
+oldloop='''        for (uint ki = 0u; ki < 8u; ++ki) {
+            uint k0 = ki * 16u;
+            MAT_A a; coopMatLoad(a, gY, (w * 64u + m0) * 128u + k0, 128u, LROW);'''
+newloop='''        MAT_A a;
+        if (row_phase == 1u) coopMatLoad(a, gY, (w * 64u + m0) * 128u, 128u, LROW);
+        for (uint ki = 0u; ki < 8u; ++ki) {
+            if (row_phase == 0u) coopMatLoad(a, gY, (w * 64u + m0) * 128u + ki * 16u, 128u, LROW);
+            MAT_A nextA;
+            if (row_phase == 1u && ki < 7u) coopMatLoad(nextA, gY, (w * 64u + m0) * 128u + (ki + 1u) * 16u, 128u, LROW);'''
+assert src.count(oldloop)==1
+changed=src.replace(oldloop,newloop)
+last='            accV1 = coopMatMulAdd(a, wb1, accV1);';assert changed.count(last)==1
+changed=changed.replace(last,last+'\n            if (row_phase == 1u && ki < 7u) a = nextA;')
+inc=B/'work/zcode-fp16-fullnet-handoff-20261024/candidates/f01-f02-f05-f21/f05-c128-join-t3-v1/source'
+def comp(name,text):
+ f=S/(name+'.comp'); o=S/(name+'.spv'); f.write_text(text,encoding='utf-8');run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(inc),f,'-o',o]);return o
+pm=ST.Module(P/'c128/candidate.spv'); rb=comp('parent-rebuild',src); rm=ST.Module(rb); keep,_=ST.transfer_decoration_pattern_aligned(pm,rm,set()); ST.set_no_contraction(rm,keep,rb); assert ident(rb)['sha256']==ident(P/'c128/candidate.spv')['sha256']
+o=comp('candidate',changed); cm=ST.Module(o)
+# The added function contains only MMA. Match all decorated noninteger arithmetic
+# by opcode, wordcount and recursively resolved operand expression before restoring NC.
+ints={128,130,132,134,135,137,138,139}; nc=set(ST.no_contraction_ids(pm)); ops={op for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in nc and op not in ints}; keep=[]; checked=0
+for op in ops:
+ ps=[i for i in pm.instructions if i[0]==op]; cs=[i for i in cm.instructions if i[0]==op]; assert len(ps)==len(cs),(op,len(ps),len(cs))
+ for x,y in zip(ps,cs):
+  xi=ST.result_id_of(x[0],x[1]); yi=ST.result_id_of(y[0],y[1]); assert pm.operand_signature(xi,3)==cm.operand_signature(yi,3),(op,xi,yi); checked+=1
+  if xi in nc:keep.append(yi)
+raw=set(ST.no_contraction_ids(cm));keep += [ST.result_id_of(op,a) for op,a,_,_ in cm.instructions if op in ints and ST.result_id_of(op,a) in raw];ST.set_no_contraction(cm,keep,o)
+cm=ST.Module(o); barriers=[a for op,a,_,_ in cm.instructions if op==224]; fid=None
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',o])
+plan=(P/'c128-isolated/plan.txt').read_text(); assert plan.count((P/'c128/candidate.spv').as_posix())==12;plan=plan.replace((P/'c128/candidate.spv').as_posix(),o.as_posix());(S/'plan.txt').write_text(plan)
+cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',S/'plan.txt','--cpu-check'])
+(S/'BUILD.json').write_text(json.dumps(dict(parent=ident(P/'c128/candidate.spv'),rebuild=ident(rb),candidate=ident(o),plan=ident(S/'plan.txt'),NC_checked=checked,helper_id=fid,CPU=cpu),indent=2))
+(S/'PROOF.txt').write_text('Targeted lifetime change, not QKV statement permutation: current A at row0 seed is native r46..49, last read V pair0DC0/0DD0 grouped token7. 0DE0 overwrites r46 address under token7.src,0E00/20/40/50 return nextA rows to46/49/48/47. Separate nextA permits next tile read before currentA retires, subject to compiler allocation. Source seedA outside8step loop, nextA loaded for ki<7; all six consumers use currentA, then a=nextA. Enumerated tiles0..7 exactly once, same m0/window/stride/layout, no out-of-range load. No added barrier, weight reads or accumulator; per-acc ki and rounding unchanged. Logical extra A256B/SG, total A512+B2048+acc3072=5632B/SG versus5376, excludes addresses/backend shadows. Actual GRF unknown; require no scratch increase and native lifetime audit. Assignment may compile to copies; count them. Only row_phase1 applies doubleA; row_phase0 remains direct currentA load. This narrows treatment to phase with no earlyA in parent. Source condition is uniform and expected folded after unroll, check native. Actual register allocation may still affect phase0; no unchanged-native assertion before audit. No timing until native/gold/resources reviewed.\n')
+t=read(D/'f05-compiler-kv-20261027/LUNA-PROBE.json'); j=copy.deepcopy(t['jobs'][0]);j['id']='native-boundary';j['process_environment']={};j['plan']=ident(S/'plan.txt');j['runner_output']=str(S/'run/native-boundary');ar=j['argv'];ar[ar.index('--plan')+1]=str(S/'plan.txt');ar[ar.index('--out')+1]=j['runner_output'];ar[ar.index('--output_dir')+1]=str(S/'captures');ar[ar.index('--profile_dir')+1]='boundary';ar[ar.index('--msg_file')+1]=str(S/'native.log');j['capture_output']=str(S/'captures/boundary');t['jobs']=[j];t['output_root']=str(S/'native-execution');t['identities']=[ident(S/'plan.txt'),ident(o)];t['rules']=['One original-native capture only. No timing. Stop on nongold. Main must audit A supply, grouping, copies, scratch before any further GPU.'];(S/'LUNA-NATIVE.json').write_text(json.dumps(t,indent=2));(S/'execute.ps1').write_text((D/'f05-compiler-kv-20261027/execute.ps1').read_text(encoding='utf-8-sig'))
+print(cpu);print(ident(o))
+

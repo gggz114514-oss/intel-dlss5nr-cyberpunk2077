@@ -1,0 +1,53 @@
+from pathlib import Path
+import json,hashlib
+R=Path('@NR_WORKSPACE@');O=R/'work/codex-astra-fp16-int8-audit-20261024'
+# Phase A: one SG per head, four rounds, 16 queries per WG.
+T={}
+for wave in range(4):
+ for sg in range(8):
+  h=wave*8+sg
+  for q in range(16):
+   for d in range(32):
+    at=q*1024+h*32+d
+    assert at not in T;T[at]=(q,h,d,wave,sg)
+assert set(T)==set(range(16384))
+# Phase B: each SG owns N32; four N sweeps; M16 uses two M8 tiles and four accumulators.
+Y={}
+for sweep in range(4):
+ for sg in range(8):
+  n0=sweep*256+sg*32
+  for mm in [0,8]:
+   for side in [0,16]:
+    for row in range(8):
+     for col in range(16):
+      at=(mm+row)*1024+n0+side+col
+      assert at not in Y;Y[at]=(sweep,sg,mm,side,row,col)
+assert set(Y)==set(T)
+# Every matrix A load is exactly row-major consumer context, both K16/K32.
+checks={}
+for kstep in [16,32]:
+ count=0
+ for mm in [0,8]:
+  for k in range(0,1024,kstep):
+   for r in range(8):
+    for c in range(kstep):
+     at=mm*1024+k+r*1024+c
+     assert T[at][:3]==(mm+r,(k+c)//32,(k+c)%32);count+=1
+ checks[str(kstep)]=count
+# Any projection output sees original ascending K, even in head-group streamed variant.
+assert [h*32+k for h in range(32) for k in range(32)]==list(range(1024))
+rows=[]
+for dtype,b,Nparent in [('FP16',2,16),('INT8',1,32)]:
+ oldkv=5*32*288*32*2*b;newkv=18*32*288*32*2*b
+ Twrite=288*1024*b;Tread=Twrite*(1024//Nparent)
+ rows.append(dict(dtype=dtype,context_shared=16*1024*b,WG_count=18,valid_attention_recompute_factor=1,KV_global_source_read_old=oldkv,KV_global_source_read_new=newkv,KV_source_read_factor=3.6,removed_context_global_write=Twrite,removed_context_global_projection_reads=Tread,new_projection_shared_reads=Twrite*32,delta_context_plus_KV_global_bytes=newkv-oldkv-Twrite-Tread,projection_accumulator_bytes_per_lane=64,attention_context_accumulator_bytes_per_lane=64,wide_accumulator_lifetimes_overlap=False,WG_publication_barriers_per_WG=1,WG_retire_barriers=0,scope='per ViT block; source-level logical traffic, not DRAM; INT8 row assumes completed R15 all-INT8 QK/PV and consumer-format QKV codes; excludes Q, weights, residual/debug and native transactions'))
+stream=[]
+for groups in [1,2,4]:
+ # Independent output-owner WGs each redo attention, retain complete M16xN-group output.
+ N=1024//groups
+ stream.append(dict(output_groups=groups,N_per_WG=N,attention_recompute_factor=groups,projection_accumulator_bytes_per_lane=16*N*4//256,attention_context_accumulator_bytes_per_lane=64,simultaneous_wide_payload_bytes_per_lane=16*N*4//256+64,context_tile_FP16=16*256*2,context_tile_INT8=16*256,head_waves=4,publication_and_retirement_barriers=7,WG_count=18*groups))
+paths=['candidates/codex-fp16-continuation-20261021/A/u03-f18-v2/source/vit_nb04_mpair.glsl','candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-qkv-v2/source/vit_nb04_mpair.glsl','candidates/zcode-fp16-compute-backend-20261021/b-t04-vit-chunk-split-v1/source/vit_attention_pden_register.comp']
+def ident(s):
+ p=R/s;b=p.read_bytes();return dict(path=p.as_posix(),sha256=hashlib.sha256(b).hexdigest(),bytes=len(b))
+res=dict(scope='CPU owner/address/K-order and analytical source cost model; no candidate compile, floating numerical gate, native or GPU result',T_unique_elements=16384,Y_unique_elements=16384,projection_A_address_checks=checks,coordinate_mismatches=0,staged_full_context=rows,streamed_head_group_alternatives=stream,split_warning='Existing split QKV is kernel-local: q16 query splitting repeats QKV four times unless separately produced; do not inherit ViT no-recompute claim.',sources=[ident(s) for s in paths])
+(O/'CROSS-HEAD-OWNER-PROOF.json').write_text(json.dumps(res,indent=2),encoding='utf-8');print(json.dumps({k:v for k,v in res.items() if k!='sources'}))

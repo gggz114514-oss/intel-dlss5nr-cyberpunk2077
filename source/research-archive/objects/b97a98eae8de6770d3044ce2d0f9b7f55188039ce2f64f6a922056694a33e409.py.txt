@@ -1,0 +1,142 @@
+"""Cross-file validator for the V2 ledger (read-only, writes nothing).
+
+Checks that the three V2 files agree with each other and with the patched rows, that the V1 files
+were not modified, and that no v1 field was dropped from a row.
+
+Run: python -X utf8 ledger/_work/validate_v2.py
+"""
+import hashlib
+import json
+from collections import Counter
+from pathlib import Path
+
+L = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/ledger"
+V1 = {"FULLNET-ROWS.json": "3e9281ea3d90fe4a6ab763057f2374b9b40417e0a03b5ca9cb989c173713e6af",
+      "DYNAMIC-SCALE-REMAINDERS.json": "31c95bfb09ed924317d77ab74357e06a3941abc6e0b54ca6cdd032c6e254995c",
+      "SCALE-CLASS-SUMMARY.json": "f7908f7ab7958a6722396bfd1a66648fa95adff81f9a43bfa18edd197c910ac0"}
+FAIL = []
+
+
+def check(cond, msg):
+    print(("  OK   " if cond else "  FAIL ") + msg)
+    if not cond:
+        FAIL.append(msg)
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+print("[1] V1 files untouched")
+for name, want in V1.items():
+    got = sha(L + "/" + name)
+    check(got == want, f"{name} sha256 {got[:12]}… (want {want[:12]}…)")
+
+print("[2] V2 files exist and parse")
+rows_d = json.load(open(L + r"/FULLNET-ROWS-V2.json", encoding="utf-8"))
+rem_d = json.load(open(L + r"/DYNAMIC-SCALE-REMAINDERS-V2.json", encoding="utf-8"))
+sum_d = json.load(open(L + r"/SCALE-CLASS-SUMMARY-V2.json", encoding="utf-8"))
+v1_d = json.load(open(L + r"/FULLNET-ROWS.json", encoding="utf-8"))
+rows, v1rows = rows_d["rows"], v1_d["rows"]
+check(len(rows) == 288 and len(v1rows) == 288, f"288 rows in both (v2={len(rows)})")
+check(rows_d["schema"] == "fullnet-rows-v2", "schema = fullnet-rows-v2")
+check(rem_d["schema"] == "dynamic-scale-remainders-v2", "remainders schema")
+check(sum_d["schema"] == "fullnet-scale-class-summary-v2", "summary schema")
+
+print("[3] no v1 row key was dropped; every changed row is documented")
+v1k = set(v1rows[0])
+for a, b in zip(v1rows, rows):
+    if set(a) - set(b):
+        FAIL.append(f"row {a['ordinal']} dropped {set(a) - set(b)}")
+check(not FAIL, "all v1 row keys still present")
+changed = [r for r in rows if "reclassification" in r]
+check(len(changed) == 32, f"32 rows carry a reclassification block (got {len(changed)})")
+check(all(r["status"] == ("CLOSED" if r["ordinal"] == 5 else "OPEN") for r in changed),
+      "changed rows: ord5 CLOSED, the other 31 OPEN")
+
+print("[4] every promoted edge carries source text + a probe record and kept its v1 text")
+probe = json.load(open(L + r"/evidence/reclassification-probe.json", encoding="utf-8"))
+probe_ords = {t["ordinal"]: t for t in probe["targets"]}
+promoted = [(r["ordinal"], e) for r in rows for e in r["quant_edges"] if "reclassified" in e]
+check(len(promoted) == 35, f"35 promoted edges (33 dynamic + 2 static), got {len(promoted)}")
+for o, e in promoted:
+    ok = (e["reclassified"]["to"] == e["scale_A_source"] and len(e["evidence"]) > 120
+          and "evidence_v1" in e and o in probe_ords
+          and probe_ords[o]["sha256"] == next(r for r in rows if r["ordinal"] == o)["spv"]["sha256"])
+    if not ok:
+        FAIL.append(f"ordinal {o} promotion incomplete")
+check(not [f for f in FAIL if "promotion incomplete" in f], "35/35 promotions: class+evidence+v1 text+probe sha")
+
+print("[5] class census and entries")
+c = Counter(e["scale_A_source"] for r in rows for e in r["quant_edges"])
+check(dict(c) == {"STATIC_REFINED": 32, "STATIC_COARSE": 170, "DYNAMIC_RUNTIME": 223},
+      f"classes {dict(c)}")
+check(sum(c.values()) == 425, f"entries {sum(c.values())}")
+check(sum(1 for r in rows for e in r["quant_edges"] if not e["edge"].startswith("QX")) == 403,
+      "matrix edges 403")
+
+print("[6] remainders agree with rows")
+dyn_edges = [(r["ordinal"], e["edge"]) for r in rows for e in r["quant_edges"]
+             if e["scale_A_source"] == "DYNAMIC_RUNTIME"]
+pos_keys = [(p["ordinal"], p["edge"]) for p in rem_d["positions"]]
+check(len(rem_d["positions"]) == len(dyn_edges) == 223, f"{len(rem_d['positions'])} positions == 223 dynamic edges")
+check(sorted(pos_keys) == sorted(dyn_edges), "position (ordinal, edge) pairs == dynamic edges")
+v1rem = json.load(open(L + r"/DYNAMIC-SCALE-REMAINDERS.json", encoding="utf-8"))
+v1_pos = {(p["ordinal"], p["edge"]): p for p in v1rem["positions"]}
+same = sum(1 for p in rem_d["positions"] if v1_pos.get((p["ordinal"], p["edge"])) == p)
+check(same == 190, f"190 v1 position records reused verbatim (got {same})")
+check(all("new_in_v2" in p for p in rem_d["positions"] if (p["ordinal"], p["edge"]) not in v1_pos),
+      "every new position carries new_in_v2")
+check(rem_d["summary"]["positions"] == 223 and rem_d["summary"]["dispatches"] == 109,
+      "summary positions 223 / dispatches 109")
+check(len({p["ordinal"] for p in rem_d["positions"]}) == 109, "109 distinct dispatches in positions")
+check(rem_d["unknown_positions"] == [], "unknown_positions empty")
+check(len(rem_d["retracted_positions"]) == 1 and rem_d["retracted_positions"][0]["ordinal"] == 5,
+      "1 retraction, ordinal 5")
+check(sum(rem_d["summary"]["by_family"].values()) == 223, "by_family sums to 223")
+check(sum(rem_d["summary"]["by_role"].values()) == 223, "by_role sums to 223")
+
+print("[7] S09 instance crosswalk")
+cw = rem_d["crosswalk_s09_instances"]
+check(cw["recomputed_from_this_file"] == cw["published_total"] == 276, "276 == 276")
+qkv = sum(1 for p in rem_d["positions"] if p["edge"].startswith("QKV projection"))
+qk = sum(1 for p in rem_d["positions"] if p["edge"].endswith("QK score"))
+pv = sum(1 for p in rem_d["positions"] if p["edge"].endswith("PV context"))
+check(qkv + 2 * qk + 2 * pv == 276, f"1x{qkv} + 2x{qk} + 2x{pv} = 276")
+
+print("[8] summary agrees with rows")
+t = sum_d["totals"]
+check(t["edges_total"] == 425 and t["matrix_edges"] == 403 and t["quantiser_epilogue_positions"] == 22,
+      "summary entries/matrix/epilogue")
+check(t["edges_by_activation_scale_class"] == {"STATIC_REFINED": 32, "STATIC_COARSE": 170,
+                                               "DYNAMIC_RUNTIME": 223}, "summary class counts")
+check(t["dynamic_positions"] == 223 and t["fp16_mma_positions"] == 0, "dynamic 223 / fp16 0")
+check(t["dispatches_by_worst_class"] == {"STATIC_COARSE": 153, "DYNAMIC_RUNTIME": 109,
+                                         "STATIC_REFINED": 24, "NO_MATRIX": 2},
+      f"dispatch worst class {t['dispatches_by_worst_class']}")
+check(sum(t["dispatches_by_worst_class"].values()) == 288, "worst-class sums to 288")
+check(t["dispatches_closed"] == 179 and t["dispatches_open"] == 109, "closed 179 / open 109")
+pf = sum_d["per_family"]
+check(sum(v["edges_total"] for v in pf.values()) == 425, "per_family edges sum 425")
+check(sum(v["dispatches"] for v in pf.values()) == 288, "per_family dispatches sum 288")
+check(sum_d["recompute_check"]["matches"] is True, "recompute_check.matches")
+check(sum_d["recompute_check"]["recount"] == {"DYNAMIC_RUNTIME": 223, "STATIC_COARSE": 170,
+                                              "STATIC_REFINED": 32}, "recount")
+check(sum_d["delta_vs_v1"]["entries_total_before"] == 426
+      and sum_d["delta_vs_v1"]["entries_total_after"] == 425, "delta 426 -> 425")
+check(len(sum_d["delta_vs_v1"]["retractions"]) == 1
+      and sum_d["delta_vs_v1"]["removed_from_dynamic"] == [], "1 retraction, 0 removed from dynamic")
+check(sum_d["delta_vs_v1"]["status_before"] == {"CLOSED": 178, "OPEN": 110}
+      and sum_d["delta_vs_v1"]["status_after"] == {"CLOSED": 179, "OPEN": 109}, "status delta")
+
+print("[9] conflicts / deferred are consistent across the three files")
+ids = [c["id"] for c in rem_d["conflicts"]]
+check(ids == ["C1", "C2"], f"conflict ids {ids}")
+check([c["id"] for c in sum_d["conflicts"]] == ids, "same conflicts in summary")
+check(rows_d["lineage"]["conflicts_open"] == ids, "same conflicts in rows lineage")
+check(rem_d["deferred"][0]["id"] == "D1", "D1 deferred (S03 R3 scalar float MAC)")
+
+print()
+print("RESULT:", "PASS" if not FAIL else f"FAIL ({len(FAIL)} problems)")
+for f in FAIL:
+    print("  -", f)

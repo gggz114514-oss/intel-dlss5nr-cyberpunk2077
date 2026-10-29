@@ -1,0 +1,93 @@
+"""S07 equalisation arms: does a per-input-channel power-of-two diagonal on X or F
+beat the scalar-only arm?  Measured on the same three teachers, objective = Y."""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029"
+sys.path.insert(0, str(W / "tools"))
+sys.path.insert(0, str(W / "S07-split16/tools"))
+from calibrate import Chain  # noqa: E402
+import model as M  # noqa: E402
+
+OUT = W / "S07-split16"
+
+
+def requant(Wt, D):
+    """Wt[n,c] * D[c], per-output-channel symmetric int8 with RNE."""
+    wt = Wt * D[None, :]
+    s = np.maximum(np.abs(wt).max(1) / 127.0, 1e-12)
+    q = np.clip(np.rint(wt / s[:, None]), -127, 127)
+    return q, s
+
+
+def diag_from(amax, floor=1e-6):
+    a = np.maximum(amax, floor)
+    g = np.exp(np.log(a).mean())
+    return np.exp2(np.rint(np.log2(a / g))).astype(np.float32)
+
+
+def main():
+    ch = Chain()
+    cal = json.loads((OUT / "CALIBRATION.json").read_text())
+    s_scalar = dict(cal["new"]["scales"])
+    # gather statistics over the three frames
+    Xa = np.zeros(512, np.float32)
+    Fa = np.zeros(512, np.float32)
+    for fr in ch.frames:
+        Xa = np.maximum(Xa, np.abs(fr["X"][:1056]).max(0))
+        F16, _ = M.fp16_forward(ch.pk, fr["X"])
+        Fa = np.maximum(Fa, np.abs(F16[:1056]).max(0))
+    out = {"scalar_only": {"Y": ch.score(s_scalar, detail=True)}, "variants": {}}
+
+    # equalised X: W1' = W1 * D1, D1 per input channel
+    D1 = diag_from(Xa)
+    q1, s1 = requant(ch.pk.W1, D1)
+    out["D1_summary"] = {"D1": D1.tolist(), "X_amax": Xa.tolist(),
+                         "requant_rel_l2": float(np.linalg.norm(q1 * s1[:, None] - ch.pk.W1) / np.linalg.norm(ch.pk.W1)),
+                         "clipped": int((np.abs(q1) >= 127).sum())}
+    inv1 = (1.0 / s_scalar["sX"]) / D1
+    # version A: X equalised, scalar sX still tuned afterwards
+    for tag, s in [("scalar_scales", s_scalar)]:
+        r = []
+        for fr in ch.frames:
+            F, A, Y, *_ = ch.forward(fr, s, dx=D1, w={"W1": q1, "sW1": s1}, invq={"qx": inv1})
+            r.append({"frame": fr["tag"], "Y_rel_l2": M.rel_l2(Y, fr["Y"]),
+                      "F_rel_l2": M.rel_l2(F, fr["F"])})
+        out["variants"]["X_equalised"] = r
+        print("X_equalised", json.dumps(r), flush=True)
+
+    # equalised F: Wc' = Wc * D2, D2 per input channel of the contract
+    D2 = diag_from(Fa)
+    q2, s2 = requant(ch.pk.Wc, D2)
+    out["D2_summary"] = {"D2": D2.tolist(), "F_amax": Fa.tolist(),
+                         "requant_rel_l2": float(np.linalg.norm(q2 * s2[:, None] - ch.pk.Wc) / np.linalg.norm(ch.pk.Wc)),
+                         "clipped": int((np.abs(q2) >= 127).sum())}
+    inv2 = (1.0 / s_scalar["sF"]) / D2
+    r = []
+    for fr in ch.frames:
+        F, A, Y, *_ = ch.forward(fr, s_scalar, dx=None, w={"Wc": q2, "sWc": s2}, invq={"qf": inv2})
+        r.append({"frame": fr["tag"], "Y_rel_l2": M.rel_l2(Y, fr["Y"]), "F_rel_l2": M.rel_l2(F, fr["F"])})
+    out["variants"]["F_equalised"] = r
+    print("F_equalised", json.dumps(r), flush=True)
+
+    r = []
+    for fr in ch.frames:
+        F, A, Y, *_ = ch.forward(fr, s_scalar, dx=D1, w={"W1": q1, "sW1": s1, "Wc": q2, "sWc": s2}, invq={"qx": inv1, "qf": inv2})
+        r.append({"frame": fr["tag"], "Y_rel_l2": M.rel_l2(Y, fr["Y"]), "F_rel_l2": M.rel_l2(F, fr["F"])})
+    out["variants"]["both_equalised"] = r
+    print("both_equalised", json.dumps(r), flush=True)
+
+    for k, v in out["variants"].items():
+        print(k, "meanY=%.6e meanF=%.6e" % (np.mean([x["Y_rel_l2"] for x in v]), np.mean([x["F_rel_l2"] for x in v])))
+    out["scalar_only_mean"] = {"Y": float(np.mean([x["Y_rel_l2"] for x in out["scalar_only"]["Y"]["per_frame"]])),
+                               "F": float(np.mean([x["F_rel_l2"] for x in out["scalar_only"]["Y"]["per_frame"]]))}
+    (OUT / "EQUALISE.json").write_text(json.dumps(out, indent=1))
+    print("wrote EQUALISE.json")
+
+
+if __name__ == "__main__":
+    main()

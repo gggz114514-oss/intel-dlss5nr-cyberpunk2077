@@ -1,0 +1,30 @@
+from pathlib import Path
+import numpy as np,json,subprocess,shlex,hashlib
+Q=Path(__file__).resolve().parent;B=Q.parents[2];D=Q/'real-int8-24';O=D/'lift-equalized';a=np.load(O/'CALIBRATION.npz')
+d=a['d'];sa=float(a['activation_scale']);qw=a['weight_codes'];sw=a['weight_scale']
+src=D/'feature-diagnostics/reproduced.comp';s=src.read_text()
+start=s.index('    float m = 0.0;',s.index('void nrf_lift_stage(uint q,out float sF,out float invF) {'))
+end=s.index('    for (uint i = lane; i < 512u;',start)
+s=s[:start]+f'    sF = {sa:.9g};\n    invF = {float(np.float32(1/sa)):.9g};\n'+s[end:]
+needle='int8_t(nr_i8_code(nrf_feat[q * 256u + tk * 16u + kk], invF))';assert s.count(needle)==1
+s=s.replace(needle,'int8_t(nrf_equalized_code(nrf_feat[q * 256u + tk * 16u + kk], kk, invF))')
+helper='const float NRF_INV_D[16] = float[16]('+','.join(f'{float(1/v):.9f}' for v in d)+');\nfloat nrf_equalized_code(float16_t value,uint channel,float inv){\n precise float scaled=float(value)*NRF_INV_D[channel];\n precise float code=scaled*inv;\n return clamp(roundEven(code),-127.0,127.0);\n}\n'
+at=s.index('void nrf_lift_stage(uint q,out float sF,out float invF) {');s=s[:at]+helper+s[at:]
+(O/'candidate.comp').write_text(s)
+inc=B/'candidates/int8-coverage-v2-20261020/C/c32-i8-debug-eact-v1/source';compiler=B/'src/project/tools/glslang-16.5.0/bin/glslang.exe'
+r=subprocess.run([str(compiler),'-V','--target-env','vulkan1.3','-I'+str(inc),'-o',str(O/'candidate.spv'),str(O/'candidate.comp')],capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+base=Q.parent/'int8-v15-offline-20261028/corrected-20261029/assets'
+weights=np.fromfile(base/'f1-weights.bin',dtype=np.int8).copy();scales=np.fromfile(base/'f1-body-scales.bin',dtype='<f4').copy();weights[49152:]=0
+for c in range(32):
+ for k in range(16):weights[49152+(c//8)*1024+k*32+c%8]=qw[k,c]
+scales[128:160]=sw;weights.tofile(O/'weights.bin');scales.tofile(O/'scales.bin')
+assert (O/'weights.bin').read_bytes()[:49152]==(base/'f1-weights.bin').read_bytes()[:49152]
+assert (O/'scales.bin').read_bytes()[:512]==(base/'f1-body-scales.bin').read_bytes()[:512]
+jobs=[]
+for arm in ['lift-only','lift-c32']:
+ for frame in [34189,41444,43654]:
+  p=D/(f'int8-{frame}.txt' if arm=='lift-only' else f'c32-minmax/candidate-{frame}.txt');s=p.read_text()
+  s=s.replace((base/'f1.spv').as_posix(),(O/'candidate.spv').as_posix()).replace((base/'f1-weights.bin').as_posix(),(O/'weights.bin').as_posix()).replace((base/'f1-body-scales.bin').as_posix(),(O/'scales.bin').as_posix())
+  target=O/f'{arm}-{frame}.txt';target.write_text(s);jobs.append(dict(sequence=arm,frame=frame,plan=str(target),out=str(O/f'{arm}-{frame}'),expected_output_sha256=None,dump=False))
+(O/'JOBS.json').write_text(json.dumps(jobs,indent=2))
+(O/'BUILD.json').write_text(json.dumps({'spv_sha256':hashlib.sha256((O/'candidate.spv').read_bytes()).hexdigest(),'method':'Offline power-of-two X/D and D*W; static narrow symmetric activation scale; per-output-channel weights','unchanged':'original half features, FFN/QKV/attention, all non-lift pack bytes','runtime_changes':'replace lift SG max-reduction with static scale; add per-feature exact power-of-two multiply before RNE; no new shared storage','scope':'candidate only, not accepted'},indent=2));print('Built 6 measurement plans')

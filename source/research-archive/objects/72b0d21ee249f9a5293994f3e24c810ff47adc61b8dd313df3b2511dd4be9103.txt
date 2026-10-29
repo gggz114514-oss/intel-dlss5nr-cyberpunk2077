@@ -1,0 +1,157 @@
+================================================================================
+n07n14-arena — RESUME（2026-10-27）
+================================================================================
+
+状态：BUILT_AWAITING_GPU
+  - 父字节复现：PASS（raw 配方，逐字节 c8531484…）
+  - candidate.spv：PASS（spv_validate_cpu result=0）
+  - plan.txt：PASS（cpu_check: CPU_PLAN_OK 152 rows, 232 passes, 502 buffers）
+  - GPU：本卡一次都没有运行（无 clock_runner / gtpin / zprof，未取锁）
+  - 部署：无
+
+------------------------------------------------------------------ 1. 身份
+父 plan      @NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/
+             fullnet-mechanism-transfer-20261026/f10-weight-return-separation-20261027/plan.txt
+             sha256 a024c3c5aa1d1432ab3f0591bf03a897880d86be2c99d6de1e1492a2a7b2befe
+父源         candidates/amd-netorg-full-scope-workbuddy-20261017/c2-layout/layout0-unify-l2-v4/
+             source/f3-c256-fused/fused_c256_body_ds.comp
+             sha256 0bbaa7f62b348098b10529ce8ece9dad245713bf11799e8ed1bea3aa78d2f2ef
+父 SPV       …/layout0-unify-l2-v4/spv/c2_S19_fused_c256_body_ds.spv
+             sha256 c853148407be055e7e2fc71ef87614f7ec003468baeb8954ed2e998ff89047fd
+父重建       cards/n07n14-arena/parent-rebuild.spv   sha256 = 父（逐字节相同）
+候选源       cards/n07n14-arena/candidate.comp
+             sha256 b343581d03e24b4ff64ca5af75ae4df8253c137d0b87359c46d8dd18d3541ba3
+候选 SPV     cards/n07n14-arena/candidate.spv
+             sha256 9ad41edca218526f5626b486af8c93184f674fe54670e9866a7b400a758fffb8
+plan         cards/n07n14-arena/plan.txt
+             sha256 ab62b56a32b05c92dd5a87bb8882c8c603568600e2ac85a616f1ee4a898e3ece
+             只替换 PASS 行 1086 的 SPV 路径（替换数 1 = 该 SPV 的 PASS 数），
+             其余 BUFFER/BIND/PUSH/shared 字段全部逐字节保留。
+站点         ordinal 59 / PASS label 22 / f3c256_body_ds / grid 11x7x1 / local 256 /
+             shared 45056 / 10 bindings。
+构建配方     glslang 16.5.0 `-V --target-env vulkan1.3`，
+             `-I cards/idt-identity-recipe/evidence/headers/c853148407be`
+             （c256_common.glsl pin 315e7c34），无 decorate 移植。
+             NoContraction 4 = 4（3×OpFAdd + 1×OpFMul，池化树，未动）；
+             OpExtInst Fma 0 = 0。float_NC_checked=4。
+
+------------------------------------------------------------------ 2. 做了什么
+F07 C256（44 KiB 的 shader）的 DS 输出片段原来走
+    coopMatStore(→nrf_pair[sg*256+128]) → publish subgroupBarrier →
+    每元素标量读 nrf_pair → 每元素 nrf_ds_at → 16-bit global 存 → retire subgroupBarrier
+共 8 次（2 轮 × 4 个 16 通道组）。本卡把这条往返删掉，改成一次 8×16 的
+coopMatStore 直落消费者 io_at layout 0：
+
+    if (!half_ok) return;
+    coopMatStore(h, nrf_o,
+                 obase + nrf_ds_at(uint(px0i), uint(py0i), group*16u, OW, OH, N, 0u),
+                 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+能这么做的**唯一**理由是 C256 这个形状的 tile 对齐（不是普通手法）：
+px0 = 4*wx（恒 %4==0）、py0 = 4*wy-2+2*sy（%4 ∈ {0,2}）→ 片段的 8 个行光栅
+token 是 t = tbase+m，tbase%16 ∈ {0,8}，即**同一个 16-token supertile 内连续
+8 个 token**；io_at layout 0 对固定 16 通道组正是行距 16 halves 的连续 256-half
+块 = 行主 8×16 累加器存储。基址直接用 io_at 自己（c=group*16，c%16==0），
+不是第二套地址代数。C64/C128 的 F07-D 之所以只能逐元素 scatter，是因为
+它们的 px0 = 4*wx-2 不对齐——这一点在 SOURCE-DIFF.patch 与 ANALYSIS §0 里写明。
+
+------------------------------------------------------------------ 3. 已证（可复核）
+P1 映射一一覆盖：穷举 11×7 WG × {sy} × 32 组 × 8 行 × 16 列
+   → 期望 1056×512 = 540,672 元素，实写 540,672，
+     地址不一致 0 / 行连续违例 0 / 重复写 0 / 漏写 0 / 越界 0。
+   → PROOF.json → ds_output_address_identity（含 22 个被 mask 站点逐条）。
+P2 掩码集合相等（不是基数相等）：候选沿用父的 half_ok 判据原文，
+   domain 是 set-equal；px=42,43 两列（OW=44 > valid_W=42）两侧都写。
+P3 生命周期/退休：候选 DS 段**没有**任何指向 Workgroup 指针的写。
+   机器可核：OpCooperativeMatrixStoreKHR 回溯到 OpVariable(sc=Workgroup)
+   的条数 6 → 2（删掉的 4 条正是 main 的 DS 暂存），新增的 1 条落在
+   StorageBuffer(binding 9 = nrf_o)。PROOF.json → store_storage_audit。
+P4 屏障覆盖有账：删的 8 个静态 OpControlBarrier（128 次执行/WG）只覆盖
+   已消失的 RAW+WAR；仍然有活读者/写者的屏障一个都没削弱
+   （F18 pre 的 WAR barrier、nrf_mean 的 WG barrier、nrf_pair A 相的两个
+   SG barrier、填 shT 的 WG barrier 全部保留）。PROOF.json → barrier_ledger。
+P5 数值/指令身份：Workgroup 45056 = 45056；PushConstant 128 = 128；
+   声明绑定集合同；dpas/coopMatMulAdd 6 = 6；控制流只少 1 个标量循环
+   （OpLoopMerge 8→7）；NoContraction 4 = 4 且序型一致；
+   指令 1965→1884、代码区 1540→1462、OpLoad 407→386、
+   IAdd 145→132、IMul 102→94、ShiftRightLogical 11→9、BitwiseAnd 12→10。
+P6 cpu_check 与父逐字相同（152 rows / 232 passes / 502 buffers）。
+
+------------------------------------------------------------------ 4. 未证（本卡不能回答）
+U1 native 是否形成处理（send.slm 暂存/读取与 fence 是否真的消失）。
+   → 见 NATIVE-PREDICTION.md 的 B1/B2/B3 判据。
+U2 输出 store 的宽度是否变大（每片段 4×16-bit 还是 1×8B）：允许不变。
+U3 GRF 峰值、scratch 实占、真实 DRAM/L1 字节：无设备证据，只有 unknown。
+U4 整体计时与 CI：本卡没有 GPU。
+U5 帧字节：按 P1/P2 预测与父逐字节相同，但**未测**。
+
+------------------------------------------------------------------ 5. CARD 首个候选（互斥阶段共址）结论 = 无对象，缺的证明如下
+三条身份分别缺的证明（不是"读域/写域不明"，而是"没有第二个 arena 可共址"）：
+  (a) F07 C256：nrf_mean→shT 需要**每 j 的 WG 级退休保证**才成立；现有
+      WG 级屏障只有 3 个（填 shT 后、debug 后、body 结束后），j 循环内只有
+      SG 级。要共址就得每 j 加 1 个 WG barrier（+8/派发）= 新增同步，且
+      收益只是声明 45056→36864，占用率收益本卡无法测 → 本轮不做。
+      另两条共址按地址范围直接不可能（j=0 的 stage 写 [0,2048) 就是 j=0
+      正在读的 shT 行；nrf_mean 4096 > nrf_pair 2048 且同寿命）。
+  (b) F18 pre（166/192/212）：单 arena，声明 = max(相位) = 峰值，已最小；
+      acc 写域 [0,2048) 落在 gather 读域 [0,4096) 内 → 第 82 行 WAR barrier
+      **必需，不能删**（CARD 的禁止项正好命中）。
+  (c) F18 body/contract：单相位，没有第二种用途可共址。
+因此本卡执行同方向里可证的一半（退休），并把下一条写清楚（见 §6）。
+
+------------------------------------------------------------------ 6. 下一条具体改动（按优先级，均可直接开工）
+N1（最像"arena 退休"的一步，F18 contract C256，ordinal 168）：
+   把 block48_swin_body_2 的 shM[16384]（32768 B）整个退休，A 直接读 global gM
+   （`coopMatLoad(a, gM, w*16384u + mA*256u + k0, 256u, LROW)`），删掉 16384 half
+   的拷贝循环与其 WG barrier。
+   - 族内先例：C128/C64 的 contract（194/214）**已经**是这条路（声明 0 B，
+     基线字节，coefficient-reuse-combined 采纳）——不是新方向。
+   - 必须先入账的成本：C256 的 A 复用倍数是 8（mA=16r 与 sg 无关），删 arena
+     后每 WG 的 A 逻辑全局请求 32 KiB → 256 KiB；C128 只有 4×。N06 的警告
+     （"删 32 KiB 一次读可能变成多 owner 合计 256 KiB 逻辑请求"）必须写进臂说明。
+   - plan 侧必要变化：该 PASS 的 shared 字段 32768 → 0（cpu_check 不校验该字段
+     与 SPV 一致，所以**必须手工改**，否则保留 32 KiB 声明会把收益吃掉；
+     参照 §7 未决项 1 里 ord 35 既有的 plan/SPV 不一致）。
+   - 判据：`send.ugm` A 读取消息数应升到约 8×，`send.slm` 归零，WG barrier 少 1。
+N2（退休 nrf_pair 本身，F07 C256）：把 C64/C128 已采纳的 F07-P（池化直读寄存器
+   片段：先 pack 后选边的 packed XOR16 shuffle，实测 CH 映射
+   row=2*ci+(lane>>4), col=lane&15）移植到 C256 的 nr_body_stage，退休
+   nrf_pair[2048] → 声明 45056→40960，再少 2 个 SG barrier/j。
+   注意：C256 的 ly 公式是 `2*(1-sy1)+dy`（与 C128 的 `2*sy1+R` 不同），
+   不能互换；F07-P 与 F07-D 是两个独立数值改动，单卡先过门再组合。
+N3（被 (a) 挡住的共址变体，需要先有占用率数据）：nrf_mean 落到 shT 的
+   已死行 + 每 j 一个 WG barrier。只有在 N1/N2 之后仍想压 SLM 时再开卡，
+   且必须把 +8 barrier 与新地址映射一起证明。
+N4（登记，不动）：ord 35 的 plan shared 32768 与 SPV 16384 的既有不一致。
+
+------------------------------------------------------------------ 7. 分诊（本卡给判据，不预设结论）
+A 实现未落地：若 native 里 DS 段的 `send.slm` 暂存写/逐元素 `load.slm`/`fence`
+   计数不变，或仍是"暂存→屏障→标量读"的形态 → 记 A，**不是方向无效**。
+   注意：Xe 上 subgroup=1 warp，`subgroupBarrier()` 可能本来就近乎免费，
+   所以 A 的**主判据是 send.slm**，不是屏障计数。
+B 实现有副作用：若 DS 段 send.slm 消失但出现新的 GRF 峰值/溢出（scratch 上升）
+   或地址运算没降反升 → 列增量账，针对最大副作用修一版（多半是
+   MAT_H 传参被物化；可改成在 main 内联 3 行）。
+C 当前身份无净收益：实现完整、门过、整体仍慢/不显著 → 归因到"1/232 派发、
+   该 shader 自身 -4.1% 指令（代码区 -5.1%）"，不推广成方向禁令。
+D INDISTINCT：单点作用域小（本卡就是单点），按 D 处理：与 N1/N2 分别成臂，
+   禁止挑显著样本，禁止跨批相加毫秒。
+E 数值失败：本卡被 P1/P2/P5 排除到"极不可能"；若发生，先查
+   ① tbase 对齐（py0%4）② group 编号（cb*8+rnd*4+j）③ half_ok 域
+   ④ MAT_H 传参是否被错误物化。错都在实现，不是方法。
+
+------------------------------------------------------------------ 8. 恢复点 / 如何重跑（全 CPU）
+  cd cards/n07n14-arena
+  @NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe build.py
+    → 重编译父（断言 == c8531484…）→ 编译候选 → spv_validate_cpu →
+      穷举地址/生命周期证明 → make_plan（1 PASS）→ cpu_check →
+      BUILD.json / PROOF.json / COST-LEDGER.json / SPV-DIFF.json
+  …/tools/make_patch.py → SOURCE-DIFF.patch
+  产物：candidate.comp / candidate.spv / parent-rebuild.spv / plan.txt
+  只写 cards/n07n14-arena/；未改 COMMON.py、基线 plan、任何指针或其他卡。
+
+------------------------------------------------------------------ 9. 未决项
+- 帧字节同一性只有静态证明（P1/P2），等 fixed/fb2/ordinary 门实测。
+- native 的 store 宽度（U2）只能由捕获回答。
+- N1 的 plan shared 字段必须手工改 32768→0；这是"path 替换之外的必要变化"，
+  必须在本卡后续（或新卡）的 BUILD 里单独写清。

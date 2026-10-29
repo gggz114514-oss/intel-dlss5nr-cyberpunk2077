@@ -1,0 +1,141 @@
+"""Residual FP16 MMA inventory after the change, per card, by module type.
+
+Not "old count minus removed".  Each module that a card's PASS actually binds
+*after* this card is re-read from its own raw words, its cooperative-matrix
+MulAdd sites are enumerated in that module's own word-offset space, and every
+other float multiply in the module is enumerated too so the report can state
+that no scalar float multiply was used to bypass the count.
+
+  R09  -> spv/r09_f3c64_body_ds_wo_i8.spv   (new module, 0 FP16 / 6 INT8)
+  R10  -> the module G3 binds (unchanged, not implemented by this card)
+  R11  -> the module G3 binds (unchanged, not implemented by this card)
+
+usage: python tools/residual_after.py
+"""
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+CARD = HERE.parent
+sys.path.insert(0, str(HERE))
+import spvlib  # noqa: E402
+
+for _op, _name in ((3, "OpSource"), (4, "OpSourceExtension"),
+                   (185, "OpFOrdLessThan"), (186, "OpFOrdGreaterThan"),
+                   (42, "OpConstantFalse")):
+    spvlib.OP.setdefault(_op, _name)
+
+R = Path("@NR_WORKSPACE@")
+
+MODULES = [
+    ("R09", "f3c64_body_ds",
+     CARD / "spv/r09_f3c64_body_ds_wo_i8.spv",
+     "implemented by this card (WO -> INT8, DS already INT8)"),
+    ("R10", "f3c128_body_ds",
+     R / "candidates/amd-netorg-acceleration-workbuddy-20261016/"
+         "f3-c128-fused-half-patch-v1/fused_c128_body_ds.spv",
+     "NOT implemented by this card: module unchanged (named gap)"),
+    ("R11", "f3c256_body_ds",
+     R / "candidates/amd-netorg-full-scope-workbuddy-20261017/"
+         "c2-layout/layout0-unify-l2-v4/spv/c2_S19_fused_c256_body_ds.spv",
+     "NOT implemented by this card: module unchanged (named gap)"),
+]
+
+
+def dtype_of(m, vid):
+    it = m.byid.get(vid)
+    if it is None or not it.a:
+        return None
+    if it.name == "OpCooperativeMatrixLoadKHR":
+        c = m.cm_type(it.a[0])
+    elif it.name in ("OpCooperativeMatrixMulAddKHR", "OpCooperativeMatrixConvertKHR"):
+        c = m.cm_type(it.a[0])
+    elif it.name == "OpLoad":
+        # walk to the store that defined the value through a coopmat variable
+        return "loaded"
+    else:
+        t = m.types.get(it.a[0])
+        return m.ctype(it.a[0]) if t else None
+    return None if not c else "cmat:%s" % c.get("component")
+
+
+def main():
+    out = {"scope": "residual FP16 matrix multiplies after this card, per module type",
+           "note": "counts are static instruction counts in each module's own "
+                   "word-offset space; they are not dynamic matrix work and not time",
+           "cards": {}}
+    for card, pname, path, note in MODULES:
+        m = spvlib.Mod(path)
+        sites = []
+        for it in m.insts:
+            if it.name != "OpCooperativeMatrixMulAddKHR":
+                continue
+            rc = m.cm_type(it.a[0]) or {}
+            ac = m.cm_type(m.byid[it.a[2]].a[0]) if it.a[2] in m.byid else {}
+            bc = m.cm_type(m.byid[it.a[3]].a[0]) if it.a[3] in m.byid else {}
+            sites.append({"word_offset": it.woff, "result_id": it.a[1],
+                          "function": m.funcs.get(it.func, "?"),
+                          "accumulator": rc.get("component"),
+                          "A": "%sx%s %s" % (ac.get("rows"), ac.get("cols"),
+                                             ac.get("component")),
+                          "B": "K%sxN%s %s" % (bc.get("rows"), bc.get("cols"),
+                                               bc.get("component"))})
+        fp16 = [s for s in sites if s["accumulator"] == "f32"]
+        i32 = [s for s in sites if s["accumulator"] == "i32"]
+        # every other float multiply, so a scalar bypass cannot hide
+        fmul = []
+        for it in m.insts:
+            if it.name not in ("OpFMul", "OpFDiv", "OpExtInst"):
+                continue
+            if it.name == "OpExtInst":
+                # glsl.std.450: report which builtin (roundEven=26, Fma=50, ...)
+                fmul.append({"word_offset": it.woff, "op": "OpExtInst",
+                             "function": m.funcs.get(it.func, "?"),
+                             "builtin": it.a[3] if len(it.a) > 3 else None})
+                continue
+            rt = m.types.get(it.a[0])
+            fmul.append({"word_offset": it.woff, "op": it.name,
+                         "function": m.funcs.get(it.func, "?"),
+                         "result_type": ("cmat:%s %sx%s" % (
+                             (m.cm_type(it.a[0]) or {}).get("component"),
+                             (m.cm_type(it.a[0]) or {}).get("rows"),
+                             (m.cm_type(it.a[0]) or {}).get("cols"))
+                             if rt and rt[0] == "cmat" else (m.ctype(it.a[0]) if rt else None))})
+        kinds = Counter((f["op"], str(f.get("result_type", f.get("builtin")))) for f in fmul)
+        out["cards"][card] = {
+            "pass": pname, "module": path.as_posix(),
+            "bytes": path.stat().st_size,
+            "sha256": __import__("hashlib").sha256(path.read_bytes()).hexdigest(),
+            "status": note,
+            "fp16_matrix_multiply_count": len(fp16),
+            "int8_matrix_multiply_count": len(i32),
+            "fp16_sites": fp16, "int8_sites": i32,
+            "no_fp16_matrix_multiply": len(fp16) == 0,
+            "float_mul_inventory": {"total_OpFMul": sum(1 for f in fmul if f["op"] == "OpFMul"),
+                                    "total_OpFDiv": sum(1 for f in fmul if f["op"] == "OpFDiv"),
+                                    "OpExtInst": [f for f in fmul if f["op"] == "OpExtInst"],
+                                    "kinds": {"%s %s" % k: v for k, v in kinds.items()},
+                                    "operations": fmul},
+        }
+    out["summary"] = {c: {"fp16": v["fp16_matrix_multiply_count"],
+                          "int8": v["int8_matrix_multiply_count"]}
+                      for c, v in out["cards"].items()}
+    out["verdict"] = ("R09_CLEAN" if out["cards"]["R09"]["no_fp16_matrix_multiply"]
+                      else "R09_RESIDUAL_PRESENT")
+    (CARD / "evidence").mkdir(parents=True, exist_ok=True)
+    (CARD / "evidence/RESIDUAL-MMA-AFTER.json").write_text(
+        json.dumps(out, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(json.dumps({"summary": out["summary"], "verdict": out["verdict"],
+                      "R09_fp16_sites": out["cards"]["R09"]["fp16_sites"],
+                      "R09_float_mul_kinds": out["cards"]["R09"]["float_mul_inventory"]["kinds"],
+                      "R09_extinst": [(f["function"], f["builtin"]) for f in
+                                      out["cards"]["R09"]["float_mul_inventory"]["OpExtInst"]]},
+                     indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

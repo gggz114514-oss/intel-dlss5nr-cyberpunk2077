@@ -1,0 +1,145 @@
+// C256 D4 cooperative seed/output; original A/B layout: original seed-before-K math and
+// two-accumulator ownership.
+//
+// n06c-f06-c256-sht: shT is KEPT (same 32 KiB shared array, same row-major layout, same
+// stride-256 A read path, same 8 owner subgroups). The single "publish the whole 64x256
+// tile, then read it eight times" phase is replaced by per-consumer-window publishing:
+// the tile is published in 4 segments of 16 tokens (8 KiB each), and the segment of the
+// next pair of output windows is published while the current pair is still being
+// consumed, so compute starts after 1/4 of the copy and the other 3/4 of the copy
+// overlaps the DPAS stream instead of preceding it. No cross-head reduction, no partial
+// output re-association, no weight-reuse change.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256) in;
+// diagnostics: NR_D4_SEED_ONLY / NR_D4_MMA_ONLY isolate the two O components
+#ifndef NR_D4_MODE
+#define NR_D4_MODE 0   // 0 = full, 1 = seed only, 2 = mma only
+#endif
+#include "c256_common.glsl"
+
+layout(set = 0, binding = 6) buffer YBuf { float16_t gY[]; };
+layout(set = 0, binding = 7) buffer TBuf { float16_t gT[]; };
+
+shared float16_t shT[16384];
+#define MAT_H coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+
+// ---- segmented publish of shT (n06c) --------------------------------------
+// One segment is one publish/consume window: 16 tokens x 256 K = 4096 halves = 8 KiB,
+// i.e. exactly the A rows of the output windows j = 2*seg and j = 2*seg + 1.
+// 256 threads x 16 halves (32 B) per segment: each thread owns one contiguous 32 B chunk
+// that is contiguous in gT *and* in shT, so the segment write keeps the parent's
+// row-major layout byte for byte and only changes which thread writes which element.
+#define C256_SEG_HALVES 4096u
+#define C256_SEG_THREAD 16u
+#define C256_SEGS       4u
+
+#define C256_PUBLISH(seg) do {                                                   \
+    const uint seg_ = (seg);                                                     \
+    const uint e_ = seg_ * C256_SEG_HALVES + t_local * C256_SEG_THREAD;          \
+    const uint g_ = w * 16384u + e_;                                             \
+    shT[e_ +  0u] = gT[g_ +  0u]; shT[e_ +  1u] = gT[g_ +  1u];                 \
+    shT[e_ +  2u] = gT[g_ +  2u]; shT[e_ +  3u] = gT[g_ +  3u];                 \
+    shT[e_ +  4u] = gT[g_ +  4u]; shT[e_ +  5u] = gT[g_ +  5u];                 \
+    shT[e_ +  6u] = gT[g_ +  6u]; shT[e_ +  7u] = gT[g_ +  7u];                 \
+    shT[e_ +  8u] = gT[g_ +  8u]; shT[e_ +  9u] = gT[g_ +  9u];                 \
+    shT[e_ + 10u] = gT[g_ + 10u]; shT[e_ + 11u] = gT[g_ + 11u];                 \
+    shT[e_ + 12u] = gT[g_ + 12u]; shT[e_ + 13u] = gT[g_ + 13u];                 \
+    shT[e_ + 14u] = gT[g_ + 14u]; shT[e_ + 15u] = gT[g_ + 15u];                 \
+} while (false)
+
+void main() {
+    const uint t_local = gl_LocalInvocationID.x;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint wx = (pc.p1.z != 0) ? uint(pc.p2.x) : gl_WorkGroupID.x;
+    const uint wy = (pc.p1.z != 0) ? uint(pc.p2.y) : gl_WorkGroupID.y;
+    const uint w = wy * uint(pc.p1.x) + wx;
+    const bool debug = pc.p1.w != 0;
+    const uint wo = uint(pc.p4.x);
+    const uint ars = uint(pc.p4.z);   // p4.y is rs (used by D2) — ars is p4.z
+
+    C256_PUBLISH(0u);                 // only the first consumer window has to wait
+    barrier();
+    const uint n0 = (sg % 8u) * 32u;
+    MAT_H scale0, scale1;
+    float16_t gain_scale0=pack[(ars + n0)+(lane & 15u)];
+    for(int component=0;component<scale0.length();++component) scale0[component]=gain_scale0;
+    float16_t gain_scale1=pack[(ars + (n0 + 16u))+(lane & 15u)];
+    for(int component=0;component<scale1.length();++component) scale1[component]=gain_scale1;
+    for (uint j = 0u; j < 8u; ++j) {
+        // publish the next segment's rows before consuming this one: its write domain is
+        // disjoint from every row this rotation still reads, so no barrier is needed
+        // between the compute of a segment and the publish of the next one.
+        if ((j & 1u) == 0u && j < 6u)
+            C256_PUBLISH((j >> 1u) + 1u);
+        uint m0 = (sg / 8u + 1u * j) * 8u;
+        MAT_C acc0;
+        {
+            MAT_H seed;
+            coopMatLoad(seed, gY, (w * 64u + m0) * 256u + n0, 256u, LROW);
+            seed = seed * scale0;
+#if NR_D4_MODE == 2
+            acc0 = MAT_C(0.0);
+#else
+            acc0 = MAT_C(seed);
+#endif
+        }
+        MAT_C acc1;
+        {
+            MAT_H seed;
+            coopMatLoad(seed, gY, (w * 64u + m0) * 256u + (n0 + 16u), 256u, LROW);
+            seed = seed * scale1;
+#if NR_D4_MODE == 2
+            acc1 = MAT_C(0.0);
+#else
+            acc1 = MAT_C(seed);
+#endif
+        }
+        for (uint ki = 0u; ki < 16u; ++ki) {
+            uint k0 = ki * 16u;
+            MAT_A a;  coopMatLoad(a, shT, m0 * 256u + k0, 256u, LROW);
+            MAT_B b0; coopMatLoad(b0, pack, wo + (n0 / 16u) * 4096u + (k0 / 16u) * 256u, 16u, LCOL);
+            MAT_B b1; coopMatLoad(b1, pack, wo + ((n0 + 16u) / 16u) * 4096u + (k0 / 16u) * 256u,
+                                  16u, LCOL);
+#if NR_D4_MODE != 1
+            acc0 = coopMatMulAdd(a, b0, acc0);
+            acc1 = coopMatMulAdd(a, b1, acc1);
+#endif
+        }
+        {
+            MAT_H narrowed = MAT_H(acc0);
+            if (debug)
+                coopMatStore(narrowed, dbg, 442368u + m0 * 256u + n0, 256u, LROW);
+            bool oob;
+            uint addr = c256_img_half_index(m0, n0, wx, wy, oob);
+            if (!oob)
+                coopMatStore(narrowed, imgout, addr, 16u, LROW);
+        }
+        {
+            MAT_H narrowed = MAT_H(acc1);
+            if (debug)
+                coopMatStore(narrowed, dbg, 442368u + m0 * 256u + (n0 + 16u), 256u, LROW);
+            bool oob;
+            uint addr = c256_img_half_index(m0, (n0 + 16u), wx, wy, oob);
+            if (!oob)
+                coopMatStore(narrowed, imgout, addr, 16u, LROW);
+        }
+        // publish barrier: every thread's segment write is visible before the readers of
+        // the next consumer window run (covers the WAR-free publish issued above)
+        if ((j & 1u) == 1u && j < 6u)
+            barrier();
+    }
+    // debug view of the staged tile: after the last publish, so the final publish barrier
+    // already orders every segment and the debug path needs no barrier of its own
+    if (debug) {
+        for (uint e = t_local; e < 16384u; e += 256u) {
+            dbg[425984u + e] = shT[e];
+        }
+    }
+}

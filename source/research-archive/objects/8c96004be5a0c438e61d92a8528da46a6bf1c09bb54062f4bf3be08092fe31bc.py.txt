@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Build the F2 body INT8 pack from the deployed FP16 packs.
+
+Reads (read-only):
+  swin_66_weights.fp16.bin   -- QKV weights (LROW stride 16) and the output
+                                projection weights
+  ioport_66_ioport_pack.fp16.bin -- the projection B weights (LCOL stride 16)
+Writes (card):
+  pack/f2_body_weights.i8.bin   51200 B  = [We8|Wc8]*  + Wq8 + Wk8 + Wv8 + Wo8 + Wproj8
+                                            (* the deployed FFN tiles, copied
+                                             verbatim so the shipped 32768-byte
+                                             prefix stays byte-identical)
+  pack/f2_body_scales.f32.bin   640 B    = sWq[32] sWk[32] sWv[32] sWo[32] sProj[32]
+  evidence/PACK-F2.json
+"""
+import json
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path("@NR_WORKSPACE@")
+WB = ROOT / "candidates/amd-map-20261015/s1-integrated/candidate/packs/swin_66_weights.fp16.bin"
+PW = ROOT / "candidates/amd-map-20261015/round4-integrated/candidate/packs/ioport_66_ioport_pack.fp16.bin"
+FFN = ROOT / "candidates/int8-coverage-v2-20261020/C/pack/c32_b66_weights.i8.bin"
+CARD = ROOT / "work/dsh-int8-fullnet-impl-20261024/candidates/c32-f1-f2"
+# G3 PASS 147 ABI words used by the source (p1.z QKV base, p1.w Wo base, p4.y
+# projection weight base, p5.x projection K); these are the module's own diag
+# values, see evidence/ABI-PROBE.json.
+P1_Z, P1_W = 13440, 0
+P4_Y, P5_X = 8192, 64
+
+
+def bits(x):
+    return np.asarray(x, np.float32).view(np.uint32) if isinstance(x, np.ndarray) else np.uint32(x)
+
+
+def main():
+    wb = np.fromfile(WB, dtype=np.float16)
+    pw = np.fromfile(PW, dtype=np.float16)
+    ffn = np.fromfile(FFN, dtype=np.uint8)
+    assert wb.size == 16648, wb.size
+    assert pw.size == 18976, pw.size
+    assert ffn.size == 32768, ffn.size
+
+    def mat(base, nout, K):
+        W = np.zeros((nout, K), np.float64)
+        for ch in range(nout):
+            for k in range(K):
+                ofs = base + 128 * (2 * (ch // 8) + k // 16) + (ch % 8) * 16 + k % 16
+                W[ch, k] = float(wb[ofs])
+        return W
+
+    mats = {"Wq": mat(P1_Z, 32, 32), "Wk": mat(P1_Z + 1024, 32, 32),
+            "Wv": mat(P1_Z + 2048, 32, 32), "Wo": mat(P1_W, 32, 32)}
+
+    def quant(W):
+        amax = np.abs(W).max(axis=1)
+        s = np.maximum(amax / 127.0, 1e-12)
+        q = np.clip(np.rint(W / s[:, None]), -127, 127).astype(np.int8)
+        return q, s
+
+    body = bytearray(ffn.tobytes())
+    assert len(body) == 32768
+    report = {"source": {"weights": str(WB), "projection_pack": str(PW),
+                         "ffn_prefix": str(FFN)},
+              "abi": {"p1_z": P1_Z, "p1_w": P1_W, "p4_y": P4_Y, "p5_x": P5_X},
+              "matrices": {}}
+    scales = np.zeros(160, np.float32)
+    order = ["Wq", "Wk", "Wv", "Wo"]
+    for mi, name in enumerate(order):
+        W = mats[name]
+        q, s = quant(W)
+        scales[32 * mi:32 * mi + 32] = s
+        tile = bytearray(4096)   # 4 tiles x 1024 B address space, 256 live codes
+        for ch in range(32):
+            t = ch // 8
+            for k in range(32):
+                tile[t * 1024 + k * 32 + (ch % 8)] = int(q[ch, k]) & 0xFF
+        body += tile
+        deq = (np.float64(q) * s[:, None])
+        rel = float(np.linalg.norm(deq - W) / np.linalg.norm(W))
+        report["matrices"][name] = {
+            "shape": [32, 32], "byte_offset": 32768 + 4096 * mi, "bytes": 4096,
+            "codes": int(q.size), "saturated": int(np.sum(np.abs(q) >= 127)),
+            "rel_L2_vs_fp16": rel,
+            "snr_dB": float(-20 * np.log10(max(rel, 1e-30))),
+            "absmax": float(np.abs(W).max()),
+            "scale_min": float(s.min()), "scale_max": float(s.max())}
+
+    # projection B tiles: 4 tiles (cg 0..1, kc32 0..1) of 512 B
+    proj = bytearray(2048)
+    amaxn = np.zeros(32)
+    for cg in range(2):
+        for k in range(64):
+            for n in range(16):
+                v = float(pw[P4_Y + cg * (P5_X // 16) * 256 + (k // 16) * 256 + n * 16 + (k % 16)])
+                amaxn[cg * 16 + n] = max(amaxn[cg * 16 + n], abs(v))
+    sproj = np.maximum(amaxn / 127.0, 1e-12)
+    scales[128:160] = sproj
+    for cg in range(2):
+        for kc32 in range(2):
+            for k in range(32):
+                kg = kc32 * 32 + k
+                for n in range(16):
+                    v = float(pw[P4_Y + cg * (P5_X // 16) * 256 + (kg // 16) * 256 + n * 16 + (kg % 16)])
+                    c = int(np.clip(np.rint(v / sproj[cg * 16 + n]), -127, 127))
+                    proj[cg * 1024 + kc32 * 512 + n * 32 + k] = c & 0xFF
+    body += proj
+    # round-trip check of the projection tiles
+    err = 0.0; nrm = 0.0
+    for cg in range(2):
+        for k in range(64):
+            for n in range(16):
+                v = float(pw[P4_Y + cg * (P5_X // 16) * 256 + (k // 16) * 256 + n * 16 + (k % 16)])
+                c = int(np.frombuffer(bytes([proj[cg * 1024 + (k // 32) * 512 + n * 32 + (k % 32)]]),
+                                      dtype=np.int8)[0])
+                err += (c * sproj[cg * 16 + n] - v) ** 2
+                nrm += v * v
+    report["matrices"]["Wproj"] = {
+        "shape": [64, 32], "byte_offset": 49152, "bytes": 2048,
+        "rel_L2_vs_fp16": float(np.sqrt(err / nrm)),
+        "absmax": float(amaxn.max()),
+        "scale_min": float(sproj.min()), "scale_max": float(sproj.max())}
+
+    assert len(body) == 51200, len(body)
+    (CARD / "pack").mkdir(parents=True, exist_ok=True)
+    (CARD / "pack/f2_body_weights.i8.bin").write_bytes(bytes(body))
+    scales.astype("<f4").tofile(CARD / "pack/f2_body_scales.f32.bin")
+    report["files"] = {"pack/f2_body_weights.i8.bin": len(body),
+                       "pack/f2_body_scales.f32.bin": int(scales.size * 4)}
+    report["ffn_prefix_identical"] = bool(
+        bytes(body[:32768]) == ffn.tobytes())
+    (CARD / "evidence").mkdir(parents=True, exist_ok=True)
+    (CARD / "evidence/PACK-F2.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
+    print(json.dumps(report, indent=1))
+
+
+if __name__ == "__main__":
+    main()

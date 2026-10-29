@@ -1,0 +1,206 @@
+# -*- coding: utf-8 -*-
+"""Assemble COLOR-BASELINE.json + COLOR-TILES.csv from the evidence files."""
+import datetime as dt
+import json
+from pathlib import Path
+
+import numpy as np
+
+OUT = Path(__file__).resolve().parent.parent
+EV = OUT / "evidence"
+ident = json.loads((EV / "identity.json").read_text(encoding="utf-8"))
+raw = json.loads((EV / "metrics-raw.json").read_text(encoding="utf-8"))
+layout = json.loads((EV / "layout.json").read_text(encoding="utf-8"))
+imgs = json.loads((OUT / "PNG/image-manifest.json").read_text(encoding="utf-8"))
+LUMA = np.array([0.2126, 0.7152, 0.0722])
+
+CH = ("R", "G", "B")
+frames_out = []
+tile_rows = ["frame,arm,tile,x,y,w,h,npx,ref_Y_mean,signed_mean_R,signed_mean_G,signed_mean_B,"
+             "mae_R,mae_G,mae_B,signed_mean_Y,mae_Y,rmse_Y,max_abs"]
+
+for f in raw["frames"]:
+    frame = f["frame"]
+    fo = {"frame": frame, "sequence": f["sequence"],
+          "bucket_pixels": f["bucket_pixels"], "bucket_fraction": f["bucket_fraction"],
+          "arms": {}}
+    for arm in ("xe", "c64"):
+        a = f["arms"][arm]
+        sc = a["scopes"]
+        entry = {"replayed": a["replayed"],
+                 "global": sc["global"],
+                 "buckets": sc["buckets"],
+                 "clip": sc["clip"],
+                 "roi": sc["roi"],
+                 "roi_meta": a["roi_meta"]}
+        # luma-vs-chroma decomposition of the bright bucket
+        b = sc["buckets"]["bright"]
+        dy = float(sum(LUMA[i] * b[c]["signed_mean"] for i, c in enumerate(CH)))
+        chroma = {c: round(b[c]["signed_mean"] - dy, 6) for c in CH}
+        entry["bright_decomposition"] = {
+            "signed_mean_Y_recomputed": round(dy, 6),
+            "signed_mean_Y_row": b["Y"]["signed_mean"],
+            "chroma_residual_RGB": chroma,
+            "note": "luma proxy uses 0.2126/0.7152/0.0722 on the raw buffer; colour space unverified, "
+                    "so this is a display-scale proxy, not CIE luminance",
+        }
+        # tile rankings
+        tiles = a["tiles"]
+        def top(key, n=5, absolute=True):
+            keyfn = (lambda r: abs(r[key])) if absolute else (lambda r: r[key])
+            return sorted(tiles, key=keyfn, reverse=True)[:n]
+        entry["tile_rankings"] = {
+            "worst_by_mae_Y": [{"tile": r["tile"], "x": r["x"], "y": r["y"], "mae_Y": r["mae_Y"],
+                                "signed_mean_B": r["signed_mean_B"], "ref_Y_mean": r["ref_Y_mean"]}
+                               for r in top("mae_Y", 5, False)],
+            "worst_abs_signed_R": [{"tile": r["tile"], "x": r["x"], "y": r["y"],
+                                    "signed_mean_R": r["signed_mean_R"]} for r in top("signed_mean_R")],
+            "worst_abs_signed_G": [{"tile": r["tile"], "x": r["x"], "y": r["y"],
+                                    "signed_mean_G": r["signed_mean_G"]} for r in top("signed_mean_G")],
+            "worst_abs_signed_B": [{"tile": r["tile"], "x": r["x"], "y": r["y"],
+                                    "signed_mean_B": r["signed_mean_B"]} for r in top("signed_mean_B")],
+        }
+        entry["worst_tile_summary"] = {
+            "channel_by_signed_mean": max(CH, key=lambda c: max(abs(r[f"signed_mean_{c}"]) for r in tiles)),
+            "max_abs_signed_mean": max(max(abs(r[f"signed_mean_{c}"]) for c in CH) for r in tiles),
+            "max_mae_Y": max(r["mae_Y"] for r in tiles),
+            "max_abs_pixel_error": max(r["max_abs"] for r in tiles),
+        }
+        fo["arms"][arm] = entry
+        for r in tiles:
+            tile_rows.append(",".join([
+                str(frame), arm, r["tile"], str(r["x"]), str(r["y"]), str(r["w"]), str(r["h"]),
+                str(r["npx"]), f"{r['ref_Y_mean']:.6f}",
+                f"{r['signed_mean_R']:.6f}", f"{r['signed_mean_G']:.6f}", f"{r['signed_mean_B']:.6f}",
+                f"{r['mae_R']:.6f}", f"{r['mae_G']:.6f}", f"{r['mae_B']:.6f}",
+                f"{r['signed_mean_Y']:.6f}", f"{r['mae_Y']:.6f}", f"{r['rmse_Y']:.6f}",
+                f"{r['max_abs']:.6f}"]))
+    frames_out.append(fo)
+
+(OUT / "COLOR-TILES.csv").write_text("\n".join(tile_rows) + "\n", encoding="utf-8")
+print("tiles rows", len(tile_rows) - 1)
+
+# ---- cross-arm comparison (xe - c64), same masks/frames
+cross = {"note": "xe and c64 differ only in one 656-byte scale pack (c32_f1_i8_scales); "
+                 "all other resources and every SPV/PUSH are identical",
+         "per_frame": []}
+for f, fo in zip(raw["frames"], frames_out):
+    row = {"frame": f["frame"], "global": {}, "bright": {}, "roi": {}}
+    xe, c64 = fo["arms"]["xe"], fo["arms"]["c64"]
+    for scope in ("global",):
+        for c in CH:
+            row[scope][c] = round(xe[scope][c]["signed_mean"] - c64[scope][c]["signed_mean"], 6)
+    for c in CH:
+        row["bright"][c] = round(xe["buckets"]["bright"][c]["signed_mean"]
+                                 - c64["buckets"]["bright"][c]["signed_mean"], 6)
+    for name in xe["roi"]:
+        row["roi"][name] = {c: round(xe["roi"][name][c]["signed_mean"]
+                                     - c64["roi"][name][c]["signed_mean"], 6) for c in CH}
+    cross["per_frame"].append(row)
+
+# ---- core bright-region table (the parent-requested highlight view)
+bright_core = {"definition": "bright = FP16 plane0 luma >= 0.70 (fixed mask). "
+                             "clip_frac = fraction of bright pixels whose channel is >= 1.0. "
+                             "'not_clipped' = bright pixels where the FP16 reference has no channel "
+                             "at the clamp; 'clipped' = bright pixels where the reference is clamped.",
+               "per_frame": []}
+for f, fo in zip(raw["frames"], frames_out):
+    row = {"frame": f["frame"], "arms": {}}
+    for arm in ("xe", "c64"):
+        e = fo["arms"][arm]
+        b = e["buckets"]["bright"]
+        nc = e["clip"]["bright_not_clipped"]
+        cl = e["clip"]["bright_clipped"]
+        row["arms"][arm] = {
+            "bright_npx": b["R"]["npx"],
+            "bright_fraction": round(b["R"]["npx"] / 921600.0, 6),
+            "signed_mean": {c: b[c]["signed_mean"] for c in CH},
+            "signed_mean_Y": round(float(sum(LUMA[i] * b[c]["signed_mean"] for i, c in enumerate(CH))), 6),
+            "abs_p99": {c: b[c]["abs_p99"] for c in "RGBY"},
+            "abs_p95": {c: b[c]["abs_p95"] for c in "RGBY"},
+            "clip_frac_ref": {c: b[c]["ref_clip_frac"] for c in CH},
+            "clip_frac_cand": {c: b[c]["cand_clip_frac"] for c in CH},
+            "clipped_any_px": int(e["clip"]["clipped_any"]["R"]["npx"]),
+            "bright_not_clipped": {"npx": nc["R"]["npx"],
+                                   "signed_mean": {c: nc[c]["signed_mean"] for c in CH},
+                                   "abs_p99_B": nc["B"]["abs_p99"]},
+            "bright_clipped": {"npx": cl["R"]["npx"],
+                               "signed_mean": {c: cl[c]["signed_mean"] for c in CH},
+                               "abs_p99_B": cl["B"]["abs_p99"]},
+        }
+    bright_core["per_frame"].append(row)
+
+
+doc = {
+    "card": "C00 color-bias baseline (observation only; no correction, no tone mapping, no LUT)",
+    "generated": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+    "workspace": "@NR_WORKSPACE@",
+    "status": {
+        "quality_accepted": False,
+        "color_accepted": False,
+        "gpu_used": False,
+        "corrections_applied": "none",
+        "note": "these are fixed-identity observations, not a root-cause verdict; "
+                "see COLOR-FIRST-DIVERGENCE.json / COLOR-ROOT-CAUSE.txt (other cards)",
+    },
+    "identity": ident,
+    "observation_protocol": raw["definitions"] | {
+        "roi": {k: {"box": v} for k, v in {
+            "sky-bright": [646, 155, 700, 205],
+            "building-bright": [706, 150, 762, 232],
+            "ncpd-sign": [455, 255, 620, 305],
+            "blue-ground": [100, 600, 300, 672],
+            "blue-wall": [640, 368, 720, 430],
+            "neutral-wall": [1090, 192, 1130, 230]}.items()},
+        "roi_source": "determined once on frame 34189 at 1280x720 (see ROI-SOURCE.md); "
+                      "identical mask on both arms and all frames",
+        "same_mask_both_arms": True,
+        "display_mapping": "v8 = round(clip(v,0,1)*255); identical for A and B; "
+                           "displacement/diff images use fixed gain 4 (0.5+4*d), no auto-stretch",
+        "colour_space": "UNVERIFIED - no Lab/DeltaE claimed; RGB channel differences only",
+        "near_black_note": "normalised chroma is not used anywhere; dark-bucket values are raw "
+                           "signed RGB differences with no division by small RGB sums",
+    },
+    "plane_verification": layout,
+    "bright_core_metrics": bright_core,
+    "frames": frames_out,
+    "cross_arm_xe_minus_c64": cross,
+    "images": imgs,
+    "limitations": [
+        "Captured FP16 history: every frame replays the recorded FP16 pre/post; autonomous INT8 "
+        "temporal feedback is NOT tested here.",
+        "plane1 channel 3 differs strongly (MAE ~0.15) but is not the delivered alpha (plane0 alpha "
+        "is exactly 1.0 in both arms); its semantics are unverified and it is excluded from RGB metrics.",
+        "ROI boxes were placed once on frame 34189; on the two motion frames the same physical features "
+        "shift by roughly 50-100 px, so ROI numbers there sample the same screen coordinates rather than "
+        "the same surface (per-ROI ref luma/bucket fractions are reported so drift is visible).",
+        "Output colour space / transfer function of frame_out is unverified, so luma proxy and any "
+        "PSNR-like number are not perceptual evidence.",
+        "Single scene family (day-street), 3 of 24 frames; no holdout scene.",
+    ],
+}
+(OUT / "COLOR-BASELINE.json").write_text(json.dumps(doc, indent=1), encoding="utf-8")
+print("wrote COLOR-BASELINE.json", (OUT / "COLOR-BASELINE.json").stat().st_size, "bytes")
+
+# ---- console summary for the hand-off message
+print("\nframe arm  global R/G/B            bright R/G/B (n)         brightRp99 Bp99 clipR%/clipB% (ref->cand)")
+for fo in frames_out:
+    for arm in ("xe", "c64"):
+        e = fo["arms"][arm]
+        g = e["global"]
+        b = e["buckets"]["bright"]
+        print(f"{fo['frame']} {arm:4s} "
+              f"{g['R']['signed_mean']:+.5f}/{g['G']['signed_mean']:+.5f}/{g['B']['signed_mean']:+.5f}  "
+              f"{b['R']['signed_mean']:+.5f}/{b['G']['signed_mean']:+.5f}/{b['B']['signed_mean']:+.5f} "
+              f"({b['R']['npx']:5d})  {b['R']['abs_p99']:.3f}/{b['B']['abs_p99']:.3f}  "
+              f"{b['R']['ref_clip_frac']*100:.3f}->{b['R']['cand_clip_frac']*100:.3f} / "
+              f"{b['B']['ref_clip_frac']*100:.3f}->{b['B']['cand_clip_frac']*100:.3f}")
+
+print("\nworst ROI by |d(R-G)| per frame/arm:")
+for fo in frames_out:
+    for arm in ("xe", "c64"):
+        r = fo["arms"][arm]["roi"]
+        w = max(r, key=lambda k: abs(r[k]["RG"]["signed_mean"]))
+        print(f"{fo['frame']} {arm:4s} {w:16s} dRG={r[w]['RG']['signed_mean']:+.5f} "
+              f"dRGB=({r[w]['R']['signed_mean']:+.4f},{r[w]['G']['signed_mean']:+.4f},"
+              f"{r[w]['B']['signed_mean']:+.4f})")

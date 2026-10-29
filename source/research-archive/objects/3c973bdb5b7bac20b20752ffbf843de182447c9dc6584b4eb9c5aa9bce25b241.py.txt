@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Strict plan checks that the shared tool does not do (TOOL-DEFECTS.md D1).
+
+  * every BIND line is parsed as 5 fields (binding, resource, offset, bytes) and
+    checked as `offset + bytes <= declared BUFFER size`;
+  * every appended BUFFER's file exists and its byte length equals the declared
+    size, and its sha256 is recorded;
+  * exactly the expected 7 PASS lines changed, and the 14 new BIND lines point at
+    the 14 new resources;
+  * every other PASS/BIND/PUSH/OUTPUT/POLICY/HISTORY line is byte-identical to
+    the parent plan.
+
+usage: python strict_plan_check.py
+"""
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+R = Path("@NR_WORKSPACE@")
+CARD = R / "work/dsh-xmx-handoff-validation-20261024/candidates/r07-output-proj"
+PARENT = R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt"
+CHILD = CARD / "plan-r07-c64-output-i8.txt"
+BLOCKS = [5, 6, 7, 62, 63, 64, 65]
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def main():
+    pl = PARENT.read_text(encoding="utf-8").splitlines()
+    cl = CHILD.read_text(encoding="utf-8").splitlines()
+    ph, ch = pl[0].split(), cl[0].split()
+    nb_p, npass, nout = int(ph[2]), int(ph[3]), int(ph[4])
+    nb_c = int(ch[2])
+    rec = {"parent_buffers": nb_p, "child_buffers": nb_c,
+           "passes": npass, "outputs": nout,
+           "header_ok": (ph[0] == ch[0] == "PORT_NETWORK_1" and int(ch[3]) == npass
+                         and int(ch[4]) == nout and int(ch[1]) == int(ph[1])),
+           "appended": nb_c - nb_p}
+
+    def bufs(lines, n):
+        out = []
+        for ln in lines[1:1 + n]:
+            m = re.match(r'BUFFER "([^"]+)" (\d+) "([^"]*)"', ln)
+            out.append({"name": m.group(1), "bytes": int(m.group(2)),
+                        "path": m.group(3), "line": ln})
+        return out
+    bp, bc = bufs(pl, nb_p), bufs(cl, nb_c)
+    rec["parent_buffer_lines_identical"] = [x["line"] for x in bp] == \
+                                          [x["line"] for x in bc[:nb_p]]
+    new = bc[nb_p:]
+    rec["new_buffers"] = []
+    for k, b in enumerate(new):
+        p = Path(b["path"])
+        rec["new_buffers"].append({
+            "index": nb_p + k, "name": b["name"], "declared_bytes": b["bytes"],
+            "file": b["path"], "exists": p.exists(),
+            "file_bytes": p.stat().st_size if p.exists() else None,
+            "size_matches": p.exists() and p.stat().st_size == b["bytes"],
+            "sha256": sha(p) if p.exists() else None})
+    rec["new_buffers_ok"] = all(x["size_matches"] for x in rec["new_buffers"])
+
+    # ---- strict BIND bounds over the whole child plan -----------------------
+    rest = cl[1 + nb_c:]
+    size = [b["bytes"] for b in bc]
+    i, problems, binds = 0, [], 0
+    for pi in range(npass):
+        t = re.findall(r'"[^"]*"|\S+', rest[i])
+        nbind = int(t[6])
+        for b in range(nbind):
+            w = rest[i + 1 + b].split()
+            assert w[0] == "BIND"
+            binding, res, off, length = int(w[1]), int(w[2]), int(w[3]), int(w[4])
+            binds += 1
+            if res >= nb_c:
+                problems.append("pass %d bind %d: resource %d >= %d" % (pi, binding, res, nb_c))
+            elif off + length > size[res]:
+                problems.append("pass %d bind %d: %d+%d > %d (%s)" %
+                                (pi, binding, off, length, size[res], bc[res]["name"]))
+        i += 1 + nbind + 1
+    rec["strict_bind"] = {"checked": binds, "problems": problems, "ok": not problems}
+
+    # ---- exactly 7 PASS lines changed, and which ----------------------------
+    rest_p = pl[1 + nb_p:]
+    def pass_blocks(lines, rest0, nbuf):
+        out, i = [], 0
+        for pi in range(npass):
+            t = re.findall(r'"[^"]*"|\S+', rest0[i])
+            nbind = int(t[6])
+            out.append({"pass": pi, "row": int(t[1]), "name": t[2].strip('"'),
+                        "spv": t[3].strip('"'), "shared": int(t[5]),
+                        "nbind": nbind,
+                        "binds": rest0[i + 1:i + 1 + nbind],
+                        "push": rest0[i + 1 + nbind]})
+            i += 1 + nbind + 1
+        out.append({"tail": rest0[i:]})
+        return out
+    P = pass_blocks(pl, rest_p, nb_p)
+    C = pass_blocks(cl, rest, nb_c)
+    changed = []
+    for a, b in zip(P[:-1], C[:-1]):
+        if a["name"] != b["name"] or a["row"] != b["row"]:
+            problems.append("pass order changed at %d" % a["pass"])
+        if a["spv"] != b["spv"] or a["shared"] != b["shared"] or a["binds"] != b["binds"]:
+            changed.append({"pass": a["pass"], "row": a["row"], "name": a["name"],
+                            "spv_before": a["spv"], "spv_after": b["spv"],
+                            "shared_before": a["shared"], "shared_after": b["shared"],
+                            "nbind_before": a["nbind"], "nbind_after": b["nbind"],
+                            "binds_added": [x for x in b["binds"] if x not in a["binds"]],
+                            "binds_removed": [x for x in a["binds"] if x not in b["binds"]],
+                            "push_identical": a["push"] == b["push"]})
+    rec["changed_passes"] = changed
+    rec["changed_count"] = len(changed)
+    rec["tail_identical"] = P[-1]["tail"] == C[-1]["tail"]
+    rec["only_c64_output_passes"] = all(
+        c["name"] == "block%d_swin_body_4" % b for c, b in
+        zip(sorted(changed, key=lambda x: x["pass"]), BLOCKS)) and len(changed) == 7
+    ok = (rec["header_ok"] and rec["parent_buffer_lines_identical"]
+          and rec["new_buffers_ok"] and rec["strict_bind"]["ok"]
+          and rec["changed_count"] == 7 and rec["tail_identical"]
+          and rec["only_c64_output_passes"] and not problems)
+    rec["problems"] = problems
+    rec["verdict"] = "PASS" if ok else "FAIL"
+    (CARD / "evidence/PLAN-VALIDATION.json").write_text(json.dumps(rec, indent=1) + "\n",
+                                                        encoding="utf-8")
+    print(json.dumps({"verdict": rec["verdict"], "strict_bind": rec["strict_bind"],
+                      "changed_count": rec["changed_count"],
+                      "tail_identical": rec["tail_identical"],
+                      "new_buffers_ok": rec["new_buffers_ok"],
+                      "problems": problems}, indent=1))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

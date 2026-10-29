@@ -1,0 +1,109 @@
+"""S06 block15 probe-2: exact decoder match + FP16 forward vs teacher Y.
+
+Findings so far force two corrections over probe-1:
+  * build_packs_early.quantize_segment divides by the float64 scale (the f32
+    scale is only what gets stored), so the match test must do the same.
+  * dump_swin_15_M.bin is an all-zero (dead) dump -> not usable as an oracle;
+    M must be recomputed from X and the FP16 weights.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+import c256b15 as L
+
+OUT = L.W / "evidence/02-probe.json"
+ev = {}
+
+We, Wm, Wc, rs = L.decode_weights()
+
+
+def quant_exact(W, K):
+    """Byte-exact replay of build_packs_early.quantize_segment."""
+    N = W.shape[0]
+    Wd = W.astype(np.float64)
+    ch = np.max(np.abs(Wd), axis=1)
+    s64 = ch / 127.0
+    s64 = np.where(s64 > 0.0, s64, 1.0)
+    q = np.clip(np.rint(Wd / s64[:, None]), -127.0, 127.0).astype(np.int8)
+    s32 = s64.astype(np.float32)
+    k = np.arange(K)[None, :]; n = np.arange(N)[:, None]
+    buf = np.zeros(N * K, dtype=np.int8)
+    buf[L.w8_idx(n, k, K).ravel()] = q.ravel()
+    return buf, s32, q
+
+
+old = np.fromfile(L.PACK_OLD, dtype=np.uint8)
+old_wc = old[L.WC_OFF:L.WE_OFF].view(np.int8)
+old_we = old[L.WE_OFF:L.WM_OFF].view(np.int8)
+old_wm = old[L.WM_OFF:L.SC_OFF].view(np.int8)
+dp = {}
+for tag, W, K, ref in (("contract", Wc, 256, old_wc), ("expand", We, 256, old_we), ("mid", Wm, 128, old_wm)):
+    buf, s32, q = quant_exact(W, K)
+    dp[tag] = dict(bytes=int(buf.size), equal=int((buf == ref).sum()),
+                   bitexact=bool((buf == ref).all()))
+    if tag == "contract":
+        ev_sWc = s32
+    elif tag == "expand":
+        ev_sWe = s32
+    else:
+        ev_sWm = s32
+ev["decoder_proof_exact"] = dp
+
+# ------------------------------------------------------------- dump semantics
+XDUMP = L.D / "dump-fp16/dump_block14_out.bin"
+YDUMP = L.D / "dump-fp16/dump_swin_15_Y.bin"
+MDUMP = L.D / "dump-fp16/dump_swin_15_M.bin"
+Xall = np.fromfile(XDUMP, dtype="<f2")
+Xc = L.load_x_canonical(XDUMP)
+Y = L.load_window_major(YDUMP, 256).astype(np.float32)
+Mraw = np.fromfile(MDUMP, dtype="<f2")
+ev["dumps"] = dict(
+    x_bytes=int(Xall.size * 2), x_absmax_valid=float(np.abs(Xc).max()),
+    x_absmax_whole_file=float(np.abs(Xall).max()),
+    x_nonzero_whole=int(np.count_nonzero(Xall)),
+    y_absmax=float(np.abs(Y).max()),
+    m_absmax=float(np.abs(Mraw).max()), m_nonzero=int(np.count_nonzero(Mraw)),
+    y_sha256=L.sha256(YDUMP), x_sha256=L.sha256(XDUMP), m_sha256=L.sha256(MDUMP),
+    pack_receipt_sX_absmax=46.8125, pack_receipt_sA_absmax=117.75,
+    pack_receipt_sM_absmax=64.8125,
+)
+
+idx, oob = L.window_to_canonical()
+valid = idx >= 0
+Xw = np.zeros((L.N_TOK, L.C_IN), dtype=np.float32)
+Xw[valid] = Xc[idx[valid]]
+
+# ----------------------------------------------------------- FP16 forward test
+Araw = (Xw.astype(np.float64) @ We.astype(np.float64).T).astype(np.float32)
+Aact = L.act_half32(L.narrow_half(Araw))
+M = np.zeros((L.N_TOK, 256), dtype=np.float32)
+for g in range(L.MID_GROUPS):
+    sl = slice(32 * g, 32 * g + 32)
+    M[:, sl] = (Aact[:, 128 * g:128 * g + 128].astype(np.float64)
+                @ Wm[sl].astype(np.float64).T).astype(np.float32)
+Mh = L.narrow_half(M)
+base = (Mh.astype(np.float64) @ Wc.astype(np.float64)).astype(np.float32)
+ev["fp16_forward"] = dict(A_absmax=float(np.abs(Aact).max()),
+                          M_absmax=float(np.abs(Mh).max()),
+                          contract_absmax=float(np.abs(base).max()))
+tests = {}
+for k, seed in (("seed=0", np.zeros_like(base)),
+                ("seed=X", Xw),
+                ("seed=X*rs", L.narrow_half(Xw * rs[None, :])),
+                ("seed=half(X)*half(rs)", L.narrow_half(L.narrow_half(Xw) * rs[None, :]))):
+    for tag, y in (("half_out", L.narrow_half(base + seed)), ("f32_out", base + seed)):
+        tests[f"{k}|{tag}"] = L.stats(y, Y, valid, f"cpu fp16 ref vs teacher Y, {k}, {tag}")
+ev["fp16_forward_vs_teacher_Y"] = tests
+# also: does the teacher Y contain a large DC/scale relation to X?
+ev["teacher_Y_shape"] = dict(
+    y_mean=float(Y[valid].mean()), y_std=float(Y[valid].std()),
+    x_mean=float(Xw[valid].mean()), x_std=float(Xw[valid].std()),
+    corr_X_Y=float(np.corrcoef(Xw[valid].ravel(), Y[valid].ravel())[0, 1]),
+)
+
+Path(OUT).write_text(json.dumps(ev, indent=1), encoding="utf-8")
+print(json.dumps(ev, indent=1)[:7000])

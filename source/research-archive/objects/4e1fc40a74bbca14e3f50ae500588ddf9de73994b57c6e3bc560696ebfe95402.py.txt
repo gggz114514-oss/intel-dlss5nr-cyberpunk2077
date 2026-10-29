@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+"""R04 evidence: the 184 static FP16 MMA sites of the c64 attention module, split
+into QKV / QK / PV, plus the int8 M8N16K32 ABI map for PV.
+
+CPU only.  Inputs (read-only):
+  FULLNET-RESIDUAL-MMA-SITES.json   (audit)
+  FULLNET-INT8-IMPLEMENTATION-LEDGER.json (audit)
+  abi-probe/evidence/I8-ABI-MEASURED.json (measured B580 fragment maps)
+  abi-probe/generated/generated_i8_adapter.glsl (tables generated from the maps)
+Outputs: candidates/r04-c64-attn/evidence/*.json
+"""
+import hashlib
+import json
+import os
+import re
+import sys
+
+ROOT = r"@NR_WORKSPACE@"
+AUDIT = ROOT + "/work/codex-astra-fp16-int8-audit-20261024"
+CARD = ROOT + "/work/dsh-xmx-handoff-validation-20261024/candidates/r04-c64-attn"
+PROBE = ROOT + "/candidates/dsh-int8-same-family-20261023/abi-probe"
+sys.path.insert(0, ROOT + "/work/dsh-xmx-handoff-validation-20261024/build/r04-c64-attn")
+import spv_r04 as S  # noqa: E402
+
+PASSES = ["block5_swin_body_3", "block6_swin_body_3", "block7_swin_body_3",
+          "block8_swin_body_3", "block62_swin_body_3", "block63_swin_body_3",
+          "block64_swin_body_3", "block65_swin_body_3"]
+GRID = [42, 24, 2]
+BLOCKS = [5, 6, 7, 8, 62, 63, 64, 65]
+PARENT_SPV = ROOT + "/candidates/amd-netorg-t2-20261018/c64-ownership-v1/attention-c64-ownership.spv"
+PARENT_SRC = ROOT + "/candidates/amd-netorg-t2-20261018/c64-ownership-v1/source/b3_20_c64_ownership_fp16.comp"
+CAND_SPV = CARD + "/spv/r04_c64_pv_i8.spv"
+
+# Per-site static facts, from the parent source (line numbers of b3_20_c64_ownership_fp16.comp).
+# One entry per static MMA in source order == ascending word offset (verified below).
+QKV_SITE = [
+    # (accumulator, output channel group, source line)
+    ("accQ0", "96h+0..15", 134), ("accQ1", "96h+16..31", 135),
+    ("accK0", "96h+32..47", 141), ("accK1", "96h+48..63", 142),
+    ("accV0", "96h+64..79", 148), ("accV1", "96h+80..95", 149),
+]
+PV_SITE = [("c%d" % t, "j%d" % j) for j in range(4) for t in range(4)]
+PV_LINE = {}
+for j in range(4):
+    for t in range(4):
+        PV_LINE[(t, j)] = [280, 282, 284, 286, 292, 294, 296, 298,
+                           304, 306, 308, 310, 316, 318, 320, 322][j * 4 + t]
+QK_LINE = 83
+
+
+def sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+def load_measured():
+    d = json.load(open(PROBE + "/evidence/I8-ABI-MEASURED.json", encoding="utf-8"))
+    maps = d["maps"]
+    out = {}
+    for name in ("A", "B", "CH", "CI"):
+        per = maps[name]["per_lane"]
+        m = {}
+        for e in maps[name]["lane_comp"]:
+            (lane, comp), (row, col) = e
+            m[(lane, comp)] = (row, col)
+        out[name] = {"per_lane": per, "dim": maps[name]["dim"], "coord": m}
+    return d, out
+
+
+def adapter_tables():
+    txt = open(PROBE + "/generated/generated_i8_adapter.glsl", encoding="utf-8").read()
+
+    def arr(name):
+        m = re.search(r"const uint " + name + r"\[(\d+)\]\[32\] = \{(.*?)\n\};", txt, re.S)
+        rows = []
+        for line in m.group(2).strip().split("\n"):
+            vals = [int(x) for x in re.findall(r"(\d+)u", line)]
+            assert len(vals) == 32
+            rows.append(vals)
+        return rows
+    return {"A_FRAG": arr("I8A_FRAG"), "A_LANE": arr("I8A_LANE"), "A_BYTE": arr("I8A_BYTE"),
+            "B_FRAG": arr("I8B_FRAG"), "B_LANE": arr("I8B_LANE"), "B_BYTE": arr("I8B_BYTE")}
+
+
+def abi_map(measured_raw, maps):
+    """Closed forms, each verified against the measured map for every lane/component."""
+    A, B, CH = maps["A"]["coord"], maps["B"]["coord"], maps["CH"]["coord"]
+    v = {"CH_coord": 0, "A_coord": 0, "B_coord": 0, "A_source": 0, "B_source": 0}
+    rowsl = []
+    for lane in range(32):
+        for comp in range(4):
+            row, col = 2 * comp + (lane >> 4), lane & 15
+            if CH[(lane, comp)] != (row, col):
+                v["CH_coord"] += 1
+            rowsl.append({"lane": lane, "component": comp, "row": row, "col": col})
+    arows, brows = [], []
+    for lane in range(32):
+        for comp in range(8):
+            if A[(lane, comp)] != (comp, lane):
+                v["A_coord"] += 1
+            row, col = A[(lane, comp)]
+            src = {"frag": (0 if col < 16 else 1),
+                   "lane": (col & 15) | (16 * (row & 1)),
+                   "byte": row >> 1}
+            arows.append({"lane": lane, "component": comp, "row": row, "col": col,
+                          "source_fragment_in_k16_pair": src["frag"],
+                          "source_lane": src["lane"], "source_byte": src["byte"]})
+        for comp in range(16):
+            row_cf = (lane & 3) | (4 * ((comp >> 1) & 1)) | (8 * ((comp >> 2) & 1)) \
+                     | (16 * ((comp >> 3) & 1))
+            col_cf = ((lane >> 2) & 3) | (4 * ((lane >> 4) & 1)) | (8 * (comp & 1))
+            if B[(lane, comp)] != (row_cf, col_cf):
+                v["B_coord"] += 1
+            row, col = B[(lane, comp)]
+            frag_cf = ((comp >> 2) & 1) | (2 * ((comp >> 3) & 1))
+            slane_cf = (((lane >> 2) & 3) | (4 * ((lane >> 4) & 1)) | (8 * (comp & 1))
+                        | (16 * (lane & 1)))
+            byte_cf = ((lane >> 1) & 1) | (2 * ((comp >> 1) & 1))
+            src = {"frag": row >> 3, "lane": col + 16 * ((row & 7) & 1),
+                   "byte": (row & 7) >> 1}
+            if (src["frag"], src["lane"], src["byte"]) != (frag_cf, slane_cf, byte_cf):
+                v["B_source"] += 1
+            brows.append({"lane": lane, "component": comp, "row": row, "col": col,
+                          "source_8key_block": src["frag"], "source_lane": src["lane"],
+                          "source_byte": src["byte"]})
+    # the generated tables must equal the same derivation
+    tab = adapter_tables()
+    tv = {"A_tables": 0, "B_tables": 0}
+    for lane in range(32):
+        for comp in range(8):
+            row, col = A[(lane, comp)]
+            exp = (0 if col < 16 else 1, (col & 15) | (16 * (row & 1)), row >> 1)
+            if (tab["A_FRAG"][comp][lane], tab["A_LANE"][comp][lane],
+                    tab["A_BYTE"][comp][lane]) != exp:
+                tv["A_tables"] += 1
+        for comp in range(16):
+            row, col = B[(lane, comp)]
+            exp = (row >> 3, col + 16 * ((row & 7) & 1), (row & 7) >> 1)
+            if (tab["B_FRAG"][comp][lane], tab["B_LANE"][comp][lane],
+                    tab["B_BYTE"][comp][lane]) != exp:
+                tv["B_tables"] += 1
+    return {
+        "label": "R04-INT8-ABI-MAP",
+        "measured": {
+            "file": PROBE + "/evidence/I8-ABI-MEASURED.json",
+            "sha256": sha(PROBE + "/evidence/I8-ABI-MEASURED.json"),
+            "device": measured_raw.get("device"), "verdict": measured_raw.get("verdict"),
+            "status": measured_raw.get("status"),
+            "tuple": "OpCooperativeMatrixMulAddKHR, ScopeSubgroup(32), "
+                     "A int8 8x32 MatrixA, B int8 32x16 MatrixB, C int32 8x16 Accumulator",
+            "provenance_note": "measured by an earlier GPU probe card; this card did not "
+                               "run a GPU and re-derives the maps only on CPU",
+        },
+        "generated_adapter": {
+            "file": PROBE + "/generated/generated_i8_adapter.glsl",
+            "sha256": sha(PROBE + "/generated/generated_i8_adapter.glsl"),
+        },
+        "closed_forms": {
+            "P": "one row = (row, col) of the logical tile",
+            "CH": "FP16 8x16 accumulator owner: (row,col) -> lane = col + 16*(row&1), "
+                  "component = row>>1; equivalently CH(lane,comp) = (2*comp+(lane>>4), lane&15)",
+            "A_int8": "A(lane,comp) = (row=comp, col=lane): one K column per lane, 8 rows",
+            "B_int8": "B(lane,comp) = (row=(lane&3)|4((comp>>1)&1)|8((comp>>2)&1)|16((comp>>3)&1), "
+                      "col=((lane>>2)&3)|4((lane>>4)&1)|8(comp&1))",
+            "B_int8_source": "byte ((lane>>1)&1)|2((comp>>1)&1) of the code word "
+                             "((comp>>2)&1)|2((comp>>3)&1), owned by lane "
+                             "((lane>>2)&3)|4((lane>>4)&1)|8(comp&1)|16(lane&1)",
+            "A_int8_source": "byte (row>>1) of the code word (col>=16), owned by lane "
+                             "(col&15)|16(row&1)",
+        },
+        "verification_against_measured": v,
+        "verification_generated_tables": tv,
+        "k16_to_k32_pairing": {
+            "rule": "an M8N16K32 int8 MMA consumes exactly two M8N16K16 FP16 operand "
+                    "slices; the paired halves of the A and B operands carry the two "
+                    "16-wide halves of the same K32 reduction, in ascending K order",
+            "A": "8x16+8x16 -> 8x32. Columns 0..15 come from K16 slice 0, 16..31 from "
+                 "slice 1 (source_fragment_in_k16_pair). The FP16 slices' lane map is "
+                 "the CH map, so an A operand held in registers needs one lane exchange "
+                 "(lane (col&15)|16(row&1)); an A operand in shared memory needs none, "
+                 "because the int8 A map is exactly LROW with 32-element rows.",
+            "B": "16x16+16x16 -> 32x16. Rows 0..7, 8..15, 16..23, 24..31 come from four "
+                 "8-key FP16 halves (two K16 slices); each 8-key half contributes one "
+                 "code word after a single quantisation, and the int8 B value is a byte "
+                 "of that word fetched from a named lane.",
+            "PV": "K = 64 keys = 2 x K32 = 4 x K16; slice 0 = keys 0..31 (j=0,1), "
+                  "slice 1 = keys 32..63 (j=2,3)",
+            "QK": "K = 32 head dims = 1 x K32 = 2 x K16 (ki=0 is dims 0..15, ki=1 is 16..31)",
+            "QKV": "K = 64 input channels = 2 x K32 = 4 x K16 (k0=0,16,32,48)",
+        },
+        "lane_component_map": {
+            "note": "computed from the measured maps; rows are [lane, component, row, col]. "
+                    "The *_source_* columns say which FP16 code word supplies the value.",
+            "CH": rowsl, "A_int8": arows, "B_int8": brows,
+        },
+        "candidate_int8_sites": [],
+    }
+
+
+def site_table():
+    mod = S.Module(PARENT_SPV)
+    sites = mod.mma_sites()
+    assert len(sites) == 23, len(sites)
+    audit = json.load(open(AUDIT + "/FULLNET-RESIDUAL-MMA-SITES.json", encoding="utf-8"))
+    mod3 = [m for m in audit if m["path"].endswith("attention-c64-ownership.spv")][0]
+    audited = sorted((s["word_offset"], s["result_id"], s["function"]) for s in mod3["fp16_mma_sites"])
+    parsed = sorted((s["word_offset"], s["result_id"], s["function"]) for s in sites)
+    crosscheck = {"audited_sites": len(audited), "parsed_sites": len(parsed),
+                  "identical": audited == parsed}
+    assert crosscheck["identical"], (audited[:3], parsed[:3])
+
+    # QKV = first six in main, PV = the next sixteen in main, QK = the one in the score helper
+    seg = []
+    main_idx = 0
+    for s in sites:
+        if s["function"] == "main":
+            if main_idx < 6:
+                seg.append("QKV")
+            else:
+                seg.append("PV")
+            main_idx += 1
+        else:
+            seg.append("QK")
+    assert [s["function"] for s in sites].count("main") == 22
+
+    loads = {l["result_id"]: l for l in mod.coop_loads()}
+    rows = []
+    for i, (s, g) in enumerate(zip(sites, seg)):
+        rec = {
+            "site_index_in_module": i, "segment": g,
+            "function": s["function"], "function_id": s["function_id"],
+            "word_offset": s["word_offset"], "result_id": s["result_id"],
+            "instruction_index": s["instruction_index"],
+            "A_id": s["A_id"], "B_id": s["B_id"], "C_id": s["C_id"],
+            "dtype_class": s["dtype_class"],
+            "A_shape": [s["A"]["rows"], s["A"]["cols"]], "A_use": s["A"]["use_name"],
+            "B_shape": [s["B"]["rows"], s["B"]["cols"]], "B_use": s["B"]["use_name"],
+            "C_shape": [s["C"]["rows"], s["C"]["cols"]], "C_use": s["C"]["use_name"],
+            "A_component": s["A"]["component"], "B_component": s["B"]["component"],
+            "C_component": s["C"]["component"],
+        }
+        if g == "QKV":
+            acc, chans, line = QKV_SITE[i]
+            rec.update({
+                "accumulator": acc, "output_channels": chans, "source_line": line,
+                "A_pointer": "gY (binding 6, global)", "A_load": "coopMatLoad(gY, "
+                             "(w*64+m0q)*64 + k0, stride 64, LROW)",
+                "B_pointer": "pack (binding 0, global)", "B_load": "coopMatLoad(pack, "
+                             "wq + (((96h+N)/16)*4 + k0/16)*256, stride 16, LCOL)",
+                "layout_A": "LROW", "layout_B": "LCOL",
+                "K_total": 64, "K_chunks": [0, 16, 32, 48], "K_chunk_of_site": "loop k0",
+                "owner": "all 8 SGs; sg owns window tokens m0q=sg*8 .. +7 "
+                         "(one head h = WorkGroupID.z) and 16 output channels per "
+                         "accumulator",
+                "token_scope": "64 window tokens, 8 per SG",
+            })
+        elif g == "QK":
+            rec.update({
+                "accumulator": "score accumulator of c64_score_block(kb, qg, h)",
+                "source_line": QK_LINE,
+                "A_pointer": "qkv[2048..] (shared, K rows)", "A_load": "coopMatLoad(qkv, "
+                             "2048 + (kb*32 + ki*16), stride 32, LROW)",
+                "B_pointer": "qkv[0..] (shared, Q^T)", "B_load": "coopMatLoad(qkv, "
+                             "0 + (qg*32 + ki*16), stride 32, LCOL)",
+                "layout_A": "LROW", "layout_B": "LCOL",
+                "K_total": 32, "K_chunks": [0, 16], "K_chunk_of_site": "loop ki",
+                "owner": "SG qg/16 for qg in {0,16,32,48}: SG 0..3 only (SG 4..7 idle "
+                         "during score and PV); the owner holds 16 queries x all 64 keys, "
+                         "8 keys per block",
+                "token_scope": "16 queries x 8 keys (block kb)",
+                "k_organisation": "S^T = K*Q^T (rows are keys, columns are queries)",
+            })
+        else:
+            t, jn = PV_SITE[i - 6]
+            rec.update({
+                "accumulator": "ctx^T tile %s" % t,
+                "source_line": PV_LINE[(int(t[1]), int(jn[1]))],
+                "A_pointer": "qkv[4096..] (shared, V^T ch-major)", "A_load":
+                    "coopMatLoad(qkv, 4096 + %d*64 + %d, stride 64, LROW)" %
+                    (8 * int(t[1]), 16 * int(jn[1])),
+                "B_pointer": "registers (P), nrh_join_rows_to_B(p_j0, p_j1)",
+                "B_load": "no memory: register handoff",
+                "layout_A": "LROW", "layout_B": "register fragment",
+                "K_total": 64, "K_chunks": [0, 16, 32, 48], "K_chunk_of_site": jn,
+                "owner": "same four query-block owners as QK; accumulator = 8 dims x 16 "
+                         "owner queries",
+                "token_scope": "8 dims x 16 queries, K = 16 keys per site",
+                "k_organisation": "ctx^T = V^T * P^T, K order keys 0..15,16..31,32..47,48..63",
+            })
+        rows.append(rec)
+
+    by_seg = {}
+    for r in rows:
+        by_seg.setdefault(r["segment"], []).append(r)
+
+    # 184 = 23 static sites x 8 PASSes of the same dispatch module
+    ledger = json.load(open(AUDIT + "/FULLNET-INT8-IMPLEMENTATION-LEDGER.json", encoding="utf-8"))
+    led = [p for p in ledger["positions"] if p["card"] == "R04"]
+    assert len(led) == 8, len(led)
+    for p in led:
+        assert p["spv"].endswith("attention-c64-ownership.spv"), p["spv"]
+        assert p["sha256"] == sha(PARENT_SPV)
+        assert p["fp16_static_mma_count"] == 23, p["fp16_static_mma_count"]
+    assert sorted(p["pass_name"] for p in led) == sorted(PASSES)
+    grid_of = {p["pass_name"]: p["grid"] for p in led}
+    plan_order_of = {p["pass_name"]: p["plan_order"] for p in led}
+
+    per_pass = []
+    for block in BLOCKS:
+        name = "block%d_swin_body_3" % block
+        for site in rows:
+            per_pass.append({
+                "pass_name": name, "block": block,
+                "plan_order": plan_order_of[name],
+                "grid": grid_of[name],
+                "site_index_in_pass": site["site_index_in_module"],
+                "segment": site["segment"], "function": site["function"],
+                "word_offset": site["word_offset"], "result_id": site["result_id"],
+                "A_id": site["A_id"], "B_id": site["B_id"], "C_id": site["C_id"],
+            })
+    assert len(per_pass) == 184 == 8 * 23
+
+    return {
+        "label": "R04-SITES-184",
+        "module": {"path": PARENT_SPV, "sha256": sha(PARENT_SPV),
+                   "bytes": os.path.getsize(PARENT_SPV), "words": os.path.getsize(PARENT_SPV) // 4,
+                   "source": PARENT_SRC, "source_sha256": sha(PARENT_SRC),
+                   "functions": mod.census()["functions"],
+                   "total_instructions": len(mod.insts)},
+        "audit_crosscheck": crosscheck,
+        "site_evidence_reference": AUDIT + "/FULLNET-RESIDUAL-MMA-SITES.json",
+        "static_sites_per_module": 23,
+        "passes": PASSES,
+        "grids": {"block5_swin_body_3": [42, 24, 2], "block6_swin_body_3": [43, 25, 2],
+                  "block7_swin_body_3": [43, 24, 2], "block8_swin_body_3": [42, 25, 2],
+                  "block62_swin_body_3": [42, 24, 2], "block63_swin_body_3": [43, 25, 2],
+                  "block64_swin_body_3": [43, 24, 2], "block65_swin_body_3": [42, 25, 2]},
+        "counts": {"static_sites": 23, "passes": 8, "total": 184,
+                   "QKV": len(by_seg["QKV"]), "QK": len(by_seg["QK"]),
+                   "PV": len(by_seg["PV"]),
+                   "per_pass": {"QKV": 6, "QK": 1, "PV": 16}},
+        "sites": rows,
+        "enumeration_184": per_pass,
+        "method": "parsed from the parent SPV binary (OpCooperativeMatrixMulAddKHR with "
+                  "A/B/C resolved through OpTypeCooperativeMatrixKHR); word offset = word "
+                  "index of the MMA instruction in the module; the 8 PASSes share one "
+                  "module identity, so 184 = 23 static sites x 8 dispatches",
+    }
+
+
+def pv_scheme(mod_cand):
+    m = S.Module(CAND_SPV)
+    mma = m.mma_sites()
+    int8 = [s for s in mma if s["A"]["component"] == "i8"]
+    assert len(int8) == 8, len(int8)
+    loads = [l for l in m.coop_loads() if l["component"] == "i8"]
+    return {
+        "label": "R04-PV-INT8-SCHEME",
+        "scope": "PV segment of block5..8/62..65 swin_body_3 (c64 attention)",
+        "k16_two_slice_to_k32": {
+            "parent": "4 sites of K16 per dim tile (j = 0..3, keys 16j..16j+15), "
+                      "16 static MMAs per module",
+            "candidate": "2 sites of K32 per dim tile (keys 0..31 and 32..63), "
+                         "8 static MMAs per module",
+            "slice_0": "keys 0..31 = p00,p01,p10,p11 (4 eight-key FP16 halves, K order j=0,1)",
+            "slice_1": "keys 32..63 = p20,p21,p30,p31 (K order j=2,3)",
+            "why_two_slices_are_composable": "P is a normalised probability with a single "
+                                             "per-query scale, so both K32 slices share the "
+                                             "same sP and the INT32 accumulators sum the "
+                                             "same mathematical quantity the FP32 path summed",
+        },
+        "probability_requantisation": {
+            "input": "the identical half P the parent's PV consumes: P := half(P*inv) with "
+                     "the parent's tree, reciprocal and rounding unchanged",
+            "scale_granularity": "per query (output column), one value for all 64 keys",
+            "scale_derivation": "pmx = max over the owner's 64 keys of the half P of that "
+                                "query; closed with one subgroupShuffleXor(pmx,16) because a "
+                                "lane owns 4 of the 8 rows of each 8-key block and its "
+                                "partner lane owns the other 4",
+            "scale": "sP = pmx * (1/127); quantise inverse = 127/pmx; both are lane-local, no "
+                     "shared memory and no broadcast in the new path",
+            "rounding": "roundEven then clamp to [-127,127] (i8code, the same helper as the "
+                        "measured adapter); P>=0 so the reachable range is [0,127]",
+            "packing": "one quantisation per P element, 4 elements of one 8-key FP16 half "
+                       "packed as bytes 0..3 of a 32-bit code word (i8pack4)",
+            "dequant": "FP32 C tile *= sV * sP(query) once, before the single MC->MH "
+                       "narrowing; sP is constant inside a lane because the FP32 "
+                       "accumulator's lane owns exactly one query column",
+            "overflow_proof": "max_k P <= 1 always: exp(x) <= sum(exp) = s and inv = "
+                              "1/max(s, 2^-14), so P = exp*inv <= s/max(s,2^-14) <= 1; "
+                              "therefore pmx <= 1 and pmx*(127/pmx) = 127 never saturates",
+            "degenerate_case": "pmx == 0 -> quantise inverse 0 and dequant 0, so the whole "
+                              "row contribution is exactly zero instead of 0*inf",
+            "zero_point": 0,
+        },
+        "v_requantisation": {
+            "input": "the half V the QKV projection already produced and stored to shared; "
+                     "V is never scaled by the head scalar (only Q is), so it is final at "
+                     "the norm pass",
+            "scale_granularity": "one absmax per workgroup = per head per window",
+            "placement": "atomicMax of |V| bit patterns in the existing norm pass "
+                         "(64 owner threads x 32 channels cover all 2048 values), published "
+                         "by the existing post-norm barrier; the quantisation itself is a "
+                         "stride-1 copy in the existing scale pass published by the existing "
+                         "post-scale barrier",
+            "barriers_added": 0,
+            "dequant": "sV = absmax/127, applied together with sP in the same FP32 multiply",
+        },
+        "p_register_handoff_kept": {
+            "answer": True,
+            "parent": "nrh_join_rows_to_B(p_lo,p_hi) per 16-key block: 8 components x "
+                      "(1 shuffle + 2 shuffles inside nrh_unpack2) = 24 shuffles per B, "
+                      "4 B per owner = 96",
+            "candidate": "i8_join_B(w0..w3) per 32-key slice: 16 components x 1 shuffle = 16 "
+                         "per B, 2 B per owner = 32; each operand is a byte of a packed code "
+                         "word, so no unpack network",
+            "shuffle_delta_per_owner": -64,
+            "fragment_lifetime": "P never leaves registers; no shared or global P buffer is "
+                                 "introduced",
+        },
+        "k_order": "unchanged: keys ascend, slice 0 = keys 0..31, slice 1 = keys 32..63; "
+                   "the parent's j = 0,1,2,3 order is exactly the 2x2 grouping of the two "
+                   "K32 slices",
+        "owner": "unchanged: SG 0..3 own queries 16sg..16sg+15 x all 64 keys; SG 4..7 stay "
+                 "idle in score and PV (no owner was widened to fill them)",
+        "store": "unchanged canonical T address (w*64+query)*64 + 32*h + dim, LCOL, one "
+                 "MC->MH narrowing per 8-dim tile",
+        "int8_mma_sites": int8,
+        "int8_loads": loads,
+        "cost_per_owner_sg": {
+            "mma": {"parent": 16, "candidate": 8},
+            "coopmat_loads": {"parent": 16, "candidate": 8},
+            "group_shuffles": {"parent": 96, "candidate": 32},
+            "new_scalar_quantisations": 32,
+            "new_fp32_max_ops": 32,
+            "new_shuffle_xor": 1,
+            "barriers": {"parent": 4, "candidate": 4},
+        },
+        "not_converted_here": {
+            "QKV": "6 static FP16 MMA remain: needs an offline int8 weight pack "
+                   "(N/32 x K/32 x 32x32 tiles + per-channel scale) that has no verified "
+                   "identity for this plan; see REPORT.md named gap 1",
+            "QK": "1 static FP16 MMA remains: needs int8 q/k in shared with per-head "
+                  "scales; see REPORT.md named gap 2",
+        },
+    }
+
+
+def main():
+    raw, maps = load_measured()
+    sites = site_table()
+    abi = abi_map(raw, maps)
+    abi["candidate_int8_sites"] = [
+        {k: s[k] for k in ("word_offset", "result_id", "function", "A_id", "B_id", "C_id",
+                           "dtype_class", "A", "B", "C")}
+        for s in S.Module(CAND_SPV).mma_sites() if s["A"]["component"] == "i8"]
+    for k, path in (("SITES-184.json", sites), ("ABI-MAP.json", abi),
+                    ("PV-INT8-SCHEME.json", pv_scheme(None))):
+        json.dump(path, open(CARD + "/evidence/" + k, "w", encoding="utf-8"), indent=1)
+        print("wrote", k)
+    print("sites", sites["counts"], "abi verification", abi["verification_against_measured"],
+          "tables", abi["verification_generated_tables"])
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,240 @@
+"""Host-side reader for the n23 8x32 accumulator lane-map probe (CPU only).
+
+Input is what the GPU arm produces with
+
+    clock_runner.exe --plan plan.txt --out <fresh> --pool --warm 0 --reps 1 --dump-intermediates
+
+i.e. `dump_<dbg buffer name>.bin` -- the raw bytes of the `dbg` storage buffer (binding 4),
+which candidate.comp also views as `float dbgf[]`. The weights pack `swin_9_weights.fp16.bin`
+(binding 0 of the replaced pass) supplies the pattern: half window 28624 has 237 distinct fp16
+values out of the 256 it feeds the 8x32 tile with, so a wrong hypothesis cannot match all lanes.
+
+Blocks written by candidate.comp (float indices into dbgf; same byte offsets in the dump):
+    DUMP+0     H16   (8x16 half acc, pack[28624 + r*16 + c], LROW stride 16)   4 comps/lane
+    DUMP+128   C16   (fp32 8x16 acc, converted from H16)                      4 comps/lane
+    DUMP+256   H32   (8x32 half acc, pack[28624 + r*32 + c], LROW stride 32)   8 comps/lane
+    DUMP+512   C32   (fp32 8x32 acc, converted from H32)                       8 comps/lane
+    DUMP+768   MMA32 (A 8x16 x B 16x32, both read from the same window)        8 comps/lane
+    DUMP+1024  MMA16 (A 8x16 x B 16x16, control)                               4 comps/lane
+
+Method: score each candidate lane law by exact fp16 equality over all 32 lanes x ncomp
+components; then re-derive the table cell by cell with a duplicate-aware naming pass (a cell
+whose value repeats inside the tile is reported as unnamed, never guessed).
+
+Verdicts
+    NESTED     comps 0..3 = cols 0..15, comps 4..7 = cols 16..31, rows from the documented
+               8x16 law -> the merge keeps nr_norm_qk_pair term for term and 3 merged fp32
+               accumulators cost the parent's 48 GRF.
+    LANE-COL   lane = column, comp = row -> 3 merged accumulators cost 24 GRF and the norm
+               must become a pure lane reduction (different tree code, same 32 terms).
+    PERM/OTHER the measured table is printed; the norm and the GRF budget must be re-derived.
+    BAD-BASE   the dump does not line up with the pack; nothing is concluded.
+"""
+import argparse
+import json
+import struct
+import sys
+from pathlib import Path
+
+DUMP = 100352
+BASE = 28624
+N16, N32 = 4, 8
+
+
+def read_pack(path):
+    b = Path(path).read_bytes()
+    return list(struct.unpack('<%de' % (len(b) // 2), b))
+
+
+def read_dump_f32(path, offset_floats, count):
+    b = Path(path).read_bytes()
+    return list(struct.unpack_from('<%df' % count, b, offset_floats * 4))
+
+
+def h(x):
+    return struct.unpack('<e', struct.pack('<e', float(x)))[0]
+
+
+def tile(pack, base, width, rows=8):
+    return [[pack[base + r * width + c] for c in range(width)] for r in range(rows)]
+
+
+def law_nested(lane, comp):
+    """8x16 law on each 16-column half (the merge nests)."""
+    return (2 * (comp & 3) + (lane >> 4), (comp >> 2) * 16 + (lane & 15))
+
+
+def law_lanecol(lane, comp):
+    """32 lanes = 32 columns, 8 comps = 8 rows."""
+    return (comp, lane)
+
+
+def law_8x16(lane, comp):
+    return (2 * comp + (lane >> 4), lane & 15)
+
+
+def law_swap_halves(lane, comp):
+    """cols 0..15 from comps 4..7, cols 16..31 from comps 0..3 (half order reversed)."""
+    return (2 * (comp & 3) + (lane >> 4), ((comp >> 2) ^ 1) * 16 + (lane & 15))
+
+
+def law_rowmajor_lane(lane, comp):
+    """lane = row pair, comp = column block: deliberately exotic control."""
+    return (lane >> 2, (lane & 3) * 8 + comp)
+
+
+def score_hyp(dump, t, ncomp, law):
+    ok = 0
+    tot = 0
+    for lane in range(32):
+        for comp in range(ncomp):
+            r, c = law(lane, comp)
+            if 0 <= r < len(t) and 0 <= c < len(t[0]):
+                tot += 1
+                if h(dump[lane * ncomp + comp]) == t[r][c]:
+                    ok += 1
+    return ok, tot
+
+
+def name_cells(dump, t, ncomp):
+    """Duplicate-aware naming: unique value -> (r,c); repeated value -> None."""
+    flat = [(t[r][c], (r, c)) for r in range(len(t)) for c in range(len(t[0]))]
+    out, amb = {}, 0
+    for lane in range(32):
+        for comp in range(ncomp):
+            v = h(dump[lane * ncomp + comp])
+            hits = [rc for val, rc in flat if val == v]
+            if len(hits) == 1:
+                out[(lane, comp)] = hits[0]
+            else:
+                out[(lane, comp)] = None
+                amb += 1
+    return out, amb
+
+
+def report(path, lines):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    print('\n'.join(lines))
+
+
+def synthetic(hypothesis, dump_path, pack_path):
+    pack = read_pack(pack_path)
+    t16 = tile(pack, BASE, 16)
+    t32 = tile(pack, BASE, 32)
+    vals = {}
+    for lane in range(32):
+        for comp in range(N16):
+            r, c = law_8x16(lane, comp)
+            v = float(t16[r][c])
+            vals[DUMP + lane * N16 + comp] = v
+            vals[DUMP + 128 + lane * N16 + comp] = v
+            vals[DUMP + 1024 + lane * N16 + comp] = v
+        for comp in range(N32):
+            r, c = (law_nested if hypothesis == 'NESTED' else law_lanecol)(lane, comp)
+            v = float(t32[r][c])
+            vals[DUMP + 256 + lane * N32 + comp] = v
+            vals[DUMP + 512 + lane * N32 + comp] = v
+            vals[DUMP + 768 + lane * N32 + comp] = v
+    n = DUMP + 1152 + 8
+    buf = bytearray(b'\x00' * (n * 4))
+    for i, v in vals.items():
+        struct.pack_into('<f', buf, i * 4, v)
+    Path(dump_path).write_bytes(bytes(buf))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--dump')
+    ap.add_argument('--pack')
+    ap.add_argument('--synthetic', choices=['NESTED', 'LANE-COL'])
+    ap.add_argument('--out', default='build/probe-map.json')
+    a = ap.parse_args()
+    if a.synthetic:
+        synthetic(a.synthetic, a.dump, a.pack)
+
+    pack = read_pack(a.pack)
+    d16 = read_dump_f32(a.dump, DUMP, 128)
+    dc16 = read_dump_f32(a.dump, DUMP + 128, 128)
+    d32 = read_dump_f32(a.dump, DUMP + 256, 256)
+    dc32 = read_dump_f32(a.dump, DUMP + 512, 256)
+    mma32 = read_dump_f32(a.dump, DUMP + 768, 256)
+    mma16 = read_dump_f32(a.dump, DUMP + 1024, 128)
+
+    t16 = tile(pack, BASE, 16)
+    t32 = tile(pack, BASE, 32)
+    res = {'card': 'n23-f05-shape', 'dump': str(a.dump), 'pack': str(a.pack),
+           'pattern_base_half': BASE, 'synthetic': a.synthetic or None}
+    lines = ['# n23-f05-shape: 8x32 accumulator lane-map probe (measured table)', '']
+    lines.append('pattern window: pack half offset %d (237/256 distinct fp16 values)' % BASE)
+
+    # control 1/2: the documented 8x16 law must reproduce on this capture
+    c16, _ = score_hyp(d16, t16, N16, law_8x16)
+    c16f, _ = score_hyp(dc16, t16, N16, law_8x16)
+    lines.append('control 8x16 half acc : %d/128 match nrh_coord_CH' % c16)
+    lines.append('control 8x16 fp32 acc : %d/128 match the same law' % c16f)
+    res['control_8x16_half'] = c16
+    res['control_8x16_f32'] = c16f
+
+    # the shape under test: score every hypothesis exactly
+    hyps = dict(NESTED=law_nested, LANE_COL=law_lanecol,
+                SWAP_HALVES=law_swap_halves, EXOTIC=law_rowmajor_lane)
+    for tag, dump in (('H32', d32), ('C32', dc32)):
+        s = {k: score_hyp(dump, t32, N32, f) for k, f in hyps.items()}
+        tab, amb = name_cells(dump, t32, N32)
+        lines.append('%s: %s | unique-named %d/256 (ambiguous %d)'
+                     % (tag, ' '.join('%s=%d/%d' % (k, v[0], v[1]) for k, v in s.items()),
+                        256 - amb, amb))
+        res[tag] = {k: v[0] for k, v in s.items()}
+        res[tag + '_named'] = 256 - amb
+        res[tag + '_ambiguous'] = amb
+        if tag == 'C32':
+            best = max(s, key=lambda k: s[k][0])
+            if (c16 >= 120 and s[best][0] == s[best][1] and
+                    s[best][0] > max(v[0] for k, v in s.items() if k != best) + 32):
+                verdict = {'NESTED': 'NESTED', 'LANE_COL': 'LANE-COL'}.get(best, 'PERM/OTHER')
+            elif c16 < 120:
+                verdict = 'BAD-BASE'
+            else:
+                verdict = 'PERM/OTHER'
+            res['best_hypothesis'] = best
+            table = tab
+
+    lines += ['', 'VERDICT: %s' % verdict]
+    res['verdict'] = verdict
+    if verdict in ('PERM/OTHER', 'BAD-BASE'):
+        for lane in (0, 1, 15, 16, 17, 31):
+            row = ['lane %2d:' % lane]
+            for comp in range(N32):
+                v = table[(lane, comp)]
+                row.append('c%d=%s' % (comp, '?' if v is None else '%d,%d' % v))
+            lines.append('  ' + '  '.join(row))
+
+    okm = sum(1 for lane in range(32) for comp in range(N32)
+              if abs(mma32[lane * N32 + comp] - dc32[lane * N32 + comp]) < 1e-3)
+    lines.append('MMA32 vs converted acc: %d/256 components bit-near' % okm)
+    res['mma32_map_consistency'] = okm
+
+    # consequences
+    lines += ['', '## what the verdict decides', '']
+    if verdict == 'NESTED':
+        lines += ['- 3 merged fp32 accumulators = 3 x 16 GRF = 48 GRF, equal to the parent six x 8.',
+                  '- nr_norm_qk_pair keeps its term-for-term tree: pair component i with i+4.',
+                  '- B1 may be built (still needs the weight-pack re-block of the 32-channel pair).']
+    elif verdict == 'LANE-COL':
+        lines += ['- 3 merged fp32 accumulators = 3 x 8 GRF = 24 GRF, HALF the parent: the',
+                  '  12-accumulator variant n05e measured at -0.349 ms becomes affordable.',
+                  '- the norm becomes a pure lane reduction (xor16 first), same 32 terms.',
+                  '- B1 may be built and the acc-GRF gate is satisfied with margin.']
+    else:
+        lines += ['- the map is neither nested nor lane-per-column: print the table and re-derive',
+                  '  the norm and the GRF budget before any source change.']
+    res['consequences'] = lines[lines.index('## what the verdict decides') + 2:]
+
+    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(a.out).write_text(json.dumps(res, indent=2), encoding='utf-8')
+    report(Path(a.out).with_suffix('.md'), lines)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

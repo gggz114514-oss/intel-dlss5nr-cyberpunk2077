@@ -1,0 +1,144 @@
+"""Verification, SPV diff, validation, plan and CPU check for card n04a-f05-c64-feed."""
+import difflib
+import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+import COMMON as K
+import spv_tools_local as ST
+
+CARD = K.C / 'cards' / 'n04a-f05-c64-feed'
+BUILD = CARD / 'build'
+ORD = 7
+GROUP = [7, 10, 13, 16, 215, 218, 221, 224]
+
+INT_CF = {128, 130, 132, 134, 135, 137, 138, 139}
+NAMES = {5: 'OpName', 6: 'OpMemberName', 43: 'OpConstant', 59: 'OpVariable', 71: 'OpDecorate', 72: 'OpMemberDecorate', 128: 'OpIAdd', 130: 'OpISub', 132: 'OpIMul', 134: 'OpUDiv', 135: 'OpSDiv',
+         137: 'OpUMod', 138: 'OpSRem', 139: 'OpSMod', 191: 'OpShiftRightLogical',
+         194: 'OpShiftLeftLogical', 195: 'OpBitwiseOr', 184: 'OpBitwiseOr',
+         186: 'OpBitwiseAnd', 12: 'OpExtInst', 133: 'OpFMul', 129: 'OpFAdd',
+         61: 'OpLoad', 62: 'OpStore', 65: 'OpAccessChain', 66: 'OpInBoundsAccessChain',
+         4422: 'OpCooperativeMatrixLoadKHR', 4423: 'OpCooperativeMatrixStoreKHR',
+         4458: 'OpCooperativeMatrixMulAddKHR', 113: 'OpUConvert', 114: 'OpSConvert',
+         124: 'OpBitcast', 169: 'OpSelect', 126: 'OpSNegate'}
+
+
+def result_id(op, ops):
+    if op in (19, 20, 21, 22, 26, 27, 28, 30, 32, 33, 17, 4456, 4457, 4458, 9):
+        return ops[0] if ops else None
+    return ops[1] if len(ops) > 1 else None
+
+
+def nc_pairs(pm, cm):
+    """Same alignment as ST.transfer_decoration_pattern_aligned, but keeps pairs."""
+    pregions = ST.function_regions(pm)
+    cregions = ST.function_regions(cm)
+    pskel = ST._skeleton_of(pm, pregions)
+    cskel = ST._skeleton_of(cm, cregions)
+    pairs = []
+    used = set()
+    for pi, pregion in enumerate(pregions):
+        pattern = ST.decoration_pattern(pm, pregion)
+        if not pattern:
+            continue
+        want = pskel[pi]
+        best = None
+        for ci, have in cskel.items():
+            if ci in used or len(have) < 1:
+                continue
+            blocks = difflib.SequenceMatcher(None, want, have, autojunk=False).get_matching_blocks()
+            matched = sum(b.size for b in blocks)
+            pos = {}
+            ok = True
+            for b in blocks:
+                for k in range(b.size):
+                    pos[b.a + k] = b.b + k
+            for p in pattern:
+                if p not in pos:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            if best is None or matched > best[0]:
+                best = (matched, ci, pos)
+        assert best is not None, ('no aligned function', pi)
+        matched, target, pos = best
+        used.add(target)
+        cregion = cregions[target]
+        for p in sorted(pattern):
+            pidx = pregion[p]
+            cidx = cregion[pos[p]]
+            pop, pops = pm.instructions[pidx][0], pm.instructions[pidx][1]
+            cop, cops = cm.instructions[cidx][0], cm.instructions[cidx][1]
+            prid, crid = result_id(pop, pops), result_id(cop, cops)
+            psig = pm.operand_signature(prid, 3)
+            csig = cm.operand_signature(crid, 3)
+            pairs.append(dict(parent_id=prid, candidate_id=crid,
+                              parent_op=pop, candidate_op=cop,
+                              parent_op_name=NAMES.get(pop, 'Op%d' % pop),
+                              cls='integer_NC' if pop in INT_CF else 'float_NC',
+                              signature=str(psig), candidate_signature=str(csig),
+                              opcode_equal=pop == cop, signature_equal=psig == csig))
+    return pairs
+
+
+def opcode_delta(pm, cm):
+    def census(m):
+        c = {}
+        for op, ops, _, _ in m.instructions:
+            c[op] = c.get(op, 0) + 1
+        return c
+    a, b = census(pm), census(cm)
+    out = {}
+    for op in set(a) | set(b):
+        d = b.get(op, 0) - a.get(op, 0)
+        if d:
+            out[NAMES.get(op, 'Op%d' % op)] = d
+    return dict(sorted(out.items(), key=lambda kv: kv[1]))
+
+
+def main():
+    row = K.row_by_ordinal(ORD)
+    parent_spv = Path(row['spv'])
+    pm = ST.Module(parent_spv)
+    cm = ST.Module(BUILD / 'candidate-raw.spv')
+
+    pairs = nc_pairs(pm, cm)
+    bad = [p for p in pairs if not (p['opcode_equal'] and p['signature_equal'])]
+    print('NC pairs:', len(pairs), 'float:', sum(1 for p in pairs if p['cls'] == 'float_NC'),
+          'integer:', sum(1 for p in pairs if p['cls'] == 'integer_NC'), 'mismatched:', len(bad))
+
+    dp = opcode_delta(pm, cm)
+    print('opcode delta parent->candidate:', json.dumps(dp))
+
+    # validation
+    shutil.copyfile(BUILD / 'candidate-raw.spv', CARD / 'candidate.spv')
+    r = subprocess.run([str(K.VALIDATE), str(CARD / 'candidate.spv')],
+                       capture_output=True, text=True, encoding='utf-8', errors='replace')
+    print('spv_validate_cpu rc=%d out=%r' % (r.returncode, (r.stdout or '').strip()))
+    assert r.returncode == 0
+
+    # plan: replace exactly this group's 8 PASS
+    n = K.make_plan(CARD / 'candidate.spv', CARD / 'plan.txt', spv_shas={row['spv_sha256']})
+    print('plan passes replaced:', n)
+    print('plan sha:', K.sha(CARD / 'plan.txt'))
+
+    base_cpu = K.cpu_check(K.BASELINE)
+    cand_cpu = K.cpu_check(CARD / 'plan.txt')
+    print('baseline cpu-check:', (base_cpu or '').strip())
+    print('candidate cpu-check:', (cand_cpu or '').strip())
+    K.write_json(BUILD / 'cpu-check.json', dict(
+        baseline=dict(plan=str(K.BASELINE), sha256=K.sha(K.BASELINE), stdout=base_cpu),
+        candidate=dict(plan=str(CARD / 'plan.txt'), sha256=K.sha(CARD / 'plan.txt'), stdout=cand_cpu)))
+
+    K.write_json(BUILD / 'nc-pairs.json', pairs)
+    K.write_json(BUILD / 'spv-opcode-delta.json', dp)
+
+
+if __name__ == '__main__':
+    main()
+

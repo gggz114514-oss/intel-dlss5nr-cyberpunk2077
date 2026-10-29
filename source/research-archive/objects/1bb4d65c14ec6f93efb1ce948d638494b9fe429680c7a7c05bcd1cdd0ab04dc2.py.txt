@@ -1,0 +1,965 @@
+#!/usr/bin/env python3
+"""Autonomous-feedback sequence plans for the DSH full-net static-INT8 replay.
+
+Why this tool exists (book 9E, CAPTURE-CONTRACT.txt "连续反馈评估另做"):
+  * the 24 current quality frames were replayed with the *captured FP16 history*;
+    that is an independent-frame measurement, not a continuous-feedback run;
+  * a real feedback run must inject the *candidate's own* previous history, and must
+    not be faked by repeating one input image with --feedback.
+
+What this tool builds
+  A per-frame chain for a captured sequence.  Frame 0 of the chain keeps the
+  captured input bundles (the FP16 history that frame actually saw).  Every later
+  frame gets a *composite* input bundle: the frame's own captured pre/post bytes with
+  only the history plane replaced by the previous frame's candidate output history
+  plane.  Everything else (colour, depth, motion, controls, weights bindings) stays
+  byte-identical to that frame's capture.
+
+  The history geometry is not hard-coded: it is derived from the HISTORY directives of
+  a plan that still carries them (the corrected INT8 base plan) with the shared
+  planlib parser, then cross-checked against the candidate plan's buffer indices/sizes
+  and (best effort) against the live FP16 plan text.
+
+Plan edits are done through planlib only (Plan.set_buffer / set_output / validate /
+diff_plans).  No string replacement of the plan text is performed here.
+
+Explicitly refused
+  * --feedback style single-image repetition: each frame must have its own capture and
+    the adjacent captures must differ (same-image reuse is rejected);
+  * re-injecting the captured FP16 history for frames > 0 (detected by hashing the
+    predecessor output against that frame's captured network-output.bin; only the
+    reference-chain self-test may allow it via --allow-reference-history);
+  * non-consecutive frames, wrong frame ids, stale captures (sha mismatch).
+
+Self test:  python feedback_plan.py selftest --frames 34189-34196
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029"
+SELF_DIR = Path(__file__).resolve().parent
+TOOLS = W / "tools"
+sys.path.insert(0, str(TOOLS))
+
+from planlib import Plan, PlanError, diff_plans, sha256_file  # noqa: E402
+
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+DATASET = Q / "dataset"
+CANDIDATE_DIR = D / "c64-family-static"
+# Identity anchors from CONTRACT.md section 1.
+PLAN_WITH_HISTORY = B / "work/codex-astra-fp16-int8-audit-20261024/int8-v15-offline-20261028/corrected-20261029/plan.txt"
+PLAN_WITH_HISTORY_SHA = "48262262fb173dc28957464311e6c8b8a16a0073e054a800604278686cd6096b"
+FP16_LIVE_PLAN = B / "work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/backend-merged/plan.txt"
+FP16_LIVE_PLAN_SHA = "bc34404c00a52a02b5be77cbb167e71cb3965536f634ecd1bed663c002e45df6"
+
+FORMAL_SEQUENCES = (
+    "day-street-static-formal-01",
+    "day-street-motion-formal-01",
+    "day-street-motion-formal-02",
+)
+RUNNER = B / "work/codex-astra-fp16-int8-audit-20261024/phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe"
+OUTPUT_NAME = "feedback-network.bin"
+BASE_OUTPUT_NAME = "replayed-network.bin"
+
+
+class FeedbackError(RuntimeError):
+    """Raised when a guard refuses to build a feedback plan."""
+
+
+# --------------------------------------------------------------------------- utils
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def frame_dir(sequence: str, frame: int) -> Path:
+    return DATASET / sequence / f"0-{int(frame)}"
+
+
+def list_frames(sequence: str) -> List[int]:
+    root = DATASET / sequence
+    frames = []
+    for p in root.iterdir():
+        if p.is_dir() and p.name.startswith("0-") and p.name.split("-")[-1].isdigit():
+            frames.append(int(p.name.split("-")[-1]))
+    return sorted(frames)
+
+
+def parse_frames(spec: str) -> List[int]:
+    """"34189-34196" or "34189,34190" -> [34189, ..., 34196]."""
+    out: List[int] = []
+    for token in spec.replace(" ", "").split(","):
+        if not token:
+            continue
+        if "-" in token[1:]:
+            head, tail = token.split("-", 1)
+            out.extend(range(int(head), int(tail) + 1))
+        else:
+            out.append(int(token))
+    return out
+
+
+def rel(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(B).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+# --------------------------------------------------------------- history geometry
+@dataclass(frozen=True)
+class HistoryGeometry:
+    """Byte geometry of the one history plane carried by the image bundles."""
+
+    source_buffer: int          # output buffer that produces the next history
+    source_offset: int          # history plane offset inside that output
+    source_bytes: int           # output buffer size (application plane + history plane)
+    plane_bytes: int            # history plane size
+    destinations: Dict[int, int]  # input buffer index -> history plane offset
+    controls_offset: int        # input controls block offset
+    controls_word: int          # u32 word inside the controls block that flags history
+
+    def to_json(self) -> dict:
+        return {
+            "source_buffer": self.source_buffer,
+            "source_offset": self.source_offset,
+            "source_bytes": self.source_bytes,
+            "plane_bytes": self.plane_bytes,
+            "destinations": {str(k): v for k, v in sorted(self.destinations.items())},
+            "controls_offset": self.controls_offset,
+            "controls_word": self.controls_word,
+            "controls_word_offset": self.controls_offset + 4 * self.controls_word,
+        }
+
+
+def _fp16_plan_history(plan_path: Path) -> List[Tuple[int, int, int, int, int, int]]:
+    """Read HISTORY lines textually; the live FP16 plan uses unquoted SPV paths and
+    is therefore not accepted by planlib (recorded, not worked around silently)."""
+    rows: List[Tuple[int, int, int, int, int, int]] = []
+    for line in plan_path.read_text(encoding="utf-8-sig").splitlines():
+        m = re.match(r"^HISTORY\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$", line)
+        if m:
+            rows.append(tuple(int(x) for x in m.groups()))  # type: ignore[arg-type]
+    return rows
+
+
+def derive_geometry(candidate: Plan, plan_with_history: Path = PLAN_WITH_HISTORY) -> Tuple[HistoryGeometry, dict]:
+    if not plan_with_history.is_file():
+        raise FeedbackError(f"plan with HISTORY directives missing: {plan_with_history}")
+    base_sha = sha256_file(plan_with_history)
+    if plan_with_history == PLAN_WITH_HISTORY and base_sha != PLAN_WITH_HISTORY_SHA:
+        raise FeedbackError(
+            f"corrected INT8 base plan identity changed: {base_sha} != {PLAN_WITH_HISTORY_SHA}"
+        )
+    carrier = Plan(plan_with_history)
+    if len(carrier.history) != 2:
+        raise FeedbackError(f"expected 2 HISTORY directives in {plan_with_history}, got {len(carrier.history)}")
+    parsed = []
+    for words, _line in carrier.history:
+        if len(words) != 6:
+            raise FeedbackError(f"HISTORY directive with {len(words)} fields: {words}")
+        parsed.append(tuple(int(w) for w in words))
+    sources = {p[0] for p in parsed}
+    src_offsets = {p[2] for p in parsed}
+    sizes = {p[4] for p in parsed}
+    ctrl = {p[5] for p in parsed}
+    if len(sources) != 1 or len(src_offsets) != 1 or len(sizes) != 1 or len(ctrl) != 1:
+        raise FeedbackError(f"HISTORY directives disagree: {parsed}")
+    source_buffer = sources.pop()
+    source_offset = src_offsets.pop()
+    plane_bytes = sizes.pop()
+    controls_offset = ctrl.pop()
+    destinations = {p[1]: p[3] for p in parsed}
+    if len(destinations) != 2:
+        raise FeedbackError(f"expected two distinct history destinations, got {destinations}")
+
+    src_bytes = candidate.buffers[source_buffer].bytes
+    if src_bytes != carrier.buffers[source_buffer].bytes:
+        raise FeedbackError(
+            f"output buffer {source_buffer} size differs between carrier ({carrier.buffers[source_buffer].bytes}) "
+            f"and candidate ({src_bytes})"
+        )
+    if source_offset + plane_bytes != src_bytes or source_offset != src_bytes // 2:
+        raise FeedbackError(
+            f"output layout is not [application plane][history plane]: {source_offset}+{plane_bytes} != {src_bytes}"
+        )
+    for dest, offset in destinations.items():
+        if candidate.buffers[dest].bytes != carrier.buffers[dest].bytes:
+            raise FeedbackError(f"input buffer {dest} size differs between carrier and candidate plan")
+        if offset + plane_bytes > candidate.buffers[dest].bytes:
+            raise FeedbackError(f"history plane {offset}+{plane_bytes} outside input buffer {dest}")
+    ctrl_word = 8  # reader: controlsOffset + 8*4 is the float history-enabled flag
+    geometry = HistoryGeometry(
+        source_buffer=source_buffer,
+        source_offset=source_offset,
+        source_bytes=src_bytes,
+        plane_bytes=plane_bytes,
+        destinations=destinations,
+        controls_offset=controls_offset,
+        controls_word=ctrl_word,
+    )
+
+    evidence = {
+        "carrier_plan": rel(plan_with_history),
+        "carrier_plan_sha256": base_sha,
+        "planlib_history_directives": [list(p) for p in parsed],
+        "history_value_units": "float32 RGBA 720x1280 (3 colour channels + alpha)",
+        "candidate_output_buffer": {"index": source_buffer, "name": candidate.buffers[source_buffer].name,
+                                    "bytes": src_bytes},
+        "candidate_input_buffers": [
+            {"index": d, "name": candidate.buffers[d].name, "bytes": candidate.buffers[d].bytes,
+             "history_offset": o} for d, o in sorted(destinations.items())
+        ],
+        "geometry": geometry.to_json(),
+    }
+    # Best-effort cross-check against the live FP16 plan (unquoted PASS lines: textual read only).
+    if FP16_LIVE_PLAN.is_file():
+        rows = _fp16_plan_history(FP16_LIVE_PLAN)
+        evidence["fp16_live_plan"] = {
+            "path": rel(FP16_LIVE_PLAN),
+            "sha256": sha256_file(FP16_LIVE_PLAN),
+            "sha256_matches_contract": sha256_file(FP16_LIVE_PLAN) == FP16_LIVE_PLAN_SHA,
+            "history_directives_textual": [list(r) for r in rows],
+            "agrees_with_carrier": [list(r) for r in rows] == [list(p) for p in parsed],
+            "note": "parsed textually because the live plan has unquoted SPV paths that planlib rejects",
+        }
+        if rows and [list(r) for r in rows] != [list(p) for p in parsed]:
+            raise FeedbackError("live FP16 plan HISTORY geometry disagrees with the corrected base plan")
+    return geometry, evidence
+
+
+# ------------------------------------------------------------------- capture frames
+def load_capture(sequence: str, frame: int) -> dict:
+    path = frame_dir(sequence, frame) / "capture.json"
+    if not path.is_file():
+        raise FeedbackError(f"missing capture metadata: {path}")
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    if meta.get("schema") != 1:
+        raise FeedbackError(f"{path}: unsupported capture schema {meta.get('schema')!r}")
+    if int(meta.get("frame_id", -1)) != int(frame):
+        raise FeedbackError(f"{path}: capture frame_id {meta.get('frame_id')} != requested {frame}")
+    if not meta.get("history_active", False):
+        raise FeedbackError(f"{path}: capture was taken with history disabled; not a feedback sequence")
+    snaps = {int(b["resource"]): b for b in meta["buffers"]}
+    if len(snaps) != 2:
+        raise FeedbackError(f"{path}: expected two input snapshots, got {len(snaps)}")
+    files = {}
+    for resource, item in snaps.items():
+        f = path.parent / item["file"]
+        if f.stat().st_size != int(item["bytes"]):
+            raise FeedbackError(f"{f}: size {f.stat().st_size} != captured {item['bytes']}")
+        if sha256_file(f) != item["sha256"]:
+            raise FeedbackError(f"{f}: content no longer matches capture.json")
+        files[resource] = {"path": f, "bytes": int(item["bytes"]), "sha256": item["sha256"],
+                           "file": item["file"]}
+    out = meta["output"]
+    return {
+        "json_path": path,
+        "json_sha256": sha256_file(path),
+        "sequence": sequence,
+        "frame": int(frame),
+        "control_epoch": int(meta.get("control_epoch", -1)),
+        "noise_seed": int(meta.get("noise_seed", 0)),
+        "history_active": True,
+        "inputs": files,
+        "output": {"file": out["file"], "bytes": int(out["bytes"]), "sha256": out["sha256"],
+                   "path": path.parent / out["file"]},
+        "meta": meta,
+    }
+
+
+# ------------------------------------------------------------------------ composite
+def _plane_from_output(prev_output: Path, geom: HistoryGeometry) -> bytes:
+    if prev_output.stat().st_size != geom.source_bytes:
+        raise FeedbackError(
+            f"predecessor output {prev_output} has {prev_output.stat().st_size} bytes, expected {geom.source_bytes}"
+        )
+    with prev_output.open("rb") as f:
+        f.seek(geom.source_offset)
+        plane = f.read(geom.plane_bytes)
+    if len(plane) != geom.plane_bytes:
+        raise FeedbackError(f"{prev_output}: truncated history plane")
+    import numpy as np  # local import: plan-only modes need no numpy
+
+    values = np.frombuffer(plane, dtype="<f4")
+    if not np.isfinite(values).all():
+        raise FeedbackError(f"{prev_output}: non-finite values in the history plane")
+    return plane
+
+
+def composite_bytes(capture_file: Path, capture_bytes: int, geom: HistoryGeometry, plane: bytes) -> Tuple[bytes, dict]:
+    raw = capture_file.read_bytes()
+    if len(raw) != capture_bytes:
+        raise FeedbackError(f"{capture_file}: size {len(raw)} != {capture_bytes}")
+    dest_offset = next(iter(geom.destinations.values()))
+    if len({o for o in geom.destinations.values()}) != 1:
+        # Different offsets per destination would need per-destination composites.
+        raise FeedbackError(f"history destinations use different offsets: {geom.destinations}")
+    if dest_offset + geom.plane_bytes > len(raw):
+        raise FeedbackError(f"{capture_file}: history plane outside the captured buffer")
+    if len(plane) != geom.plane_bytes:
+        raise FeedbackError("history plane length mismatch")
+    patched = bytearray(raw)
+    patched[dest_offset:dest_offset + geom.plane_bytes] = plane
+    before, after = raw[:dest_offset], raw[dest_offset + geom.plane_bytes:]
+    if patched[:dest_offset] != before or patched[dest_offset + geom.plane_bytes:] != after:
+        raise FeedbackError("composite changed bytes outside the history plane")
+    import numpy as np
+
+    a = np.frombuffer(raw[dest_offset:dest_offset + geom.plane_bytes], dtype="<u1")
+    b = np.frombuffer(bytes(patched[dest_offset:dest_offset + geom.plane_bytes]), dtype="<u1")
+    changed = np.flatnonzero(a != b)
+    stats = {
+        "capture_bytes": len(raw),
+        "plane_offset": dest_offset,
+        "plane_bytes": geom.plane_bytes,
+        "changed_bytes": int(changed.size),
+        "changed_span_in_plane": (None if changed.size == 0 else
+                                  [int(changed[0]), int(changed[-1]) + 1]),
+        "bytes_outside_plane_changed": 0,
+    }
+    if changed.size == 0:
+        stats["note"] = "history plane identical to the capture (no drift for this link)"
+    return bytes(patched), stats
+
+
+def stage_composite(capture_file: Path, capture_bytes: int, prev_output: Path, geom: HistoryGeometry,
+                    destination: Path, reuse: bool = True) -> dict:
+    plane = _plane_from_output(prev_output, geom)
+    payload, stats = composite_bytes(capture_file, capture_bytes, geom, plane)
+    if destination.exists():
+        if not reuse:
+            raise FeedbackError(f"composite already exists and --no-reuse forbids overwriting: {destination}")
+        if destination.stat().st_size != len(payload) or destination.read_bytes() != payload:
+            raise FeedbackError(f"existing composite is not identical to the requested one: {destination}")
+        action = "REUSED_IDENTICAL"
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        tmp = destination.with_suffix(destination.suffix + ".tmp")
+        tmp.write_bytes(payload)
+        tmp.replace(destination)
+        action = "WRITTEN"
+    stats.update({
+        "composite": str(destination),
+        "composite_sha256": sha256_bytes(payload),
+        "action": action,
+        "history_source": str(prev_output),
+        "history_source_offset": geom.source_offset,
+        "history_source_sha256": sha256_file(prev_output),
+    })
+    return stats
+
+
+# ------------------------------------------------------------------------ plan build
+def _policy_table(plan: Plan) -> List[Tuple[int, int, int, int, int]]:
+    return [(p.buffer, p.resident, p.first, p.last, p.clear_first) for p in plan.policies]
+
+
+def build_frame(sequence: str, frame: int, candidate_plan: Path, stage_dir: Path,
+                plan_out: Path, receipt_out: Path, out_run_dir: Path,
+                output_name: str = OUTPUT_NAME, predecessor: Optional[dict] = None,
+                allow_reference_history: bool = False, reuse: bool = True,
+                geometry: Optional[HistoryGeometry] = None,
+                geometry_evidence: Optional[dict] = None) -> dict:
+    """Build one frame of the chain. `predecessor` = {frame, run_dir, output_file?}."""
+    base = Plan(candidate_plan)
+    base_sha = sha256_file(candidate_plan)
+    problems = base.validate()
+    if problems:
+        raise FeedbackError(f"candidate plan {candidate_plan} does not validate: {problems}")
+    if geometry is None:
+        geometry, geometry_evidence = derive_geometry(base)
+    dests = sorted(geometry.destinations)
+    if base.buffers[geometry.source_buffer].bytes != geometry.source_bytes:
+        raise FeedbackError("candidate output buffer size differs from the derived geometry")
+    if base.outputs[0][0] != geometry.source_buffer:
+        raise FeedbackError(f"candidate OUTPUT targets buffer {base.outputs[0][0]}, expected {geometry.source_buffer}")
+
+    capture = load_capture(sequence, frame)
+    if predecessor is not None and int(predecessor["frame"]) + 1 != int(frame):
+        raise FeedbackError(
+            f"predecessor frame {predecessor['frame']} is not the immediately preceding frame of {frame}; "
+            "a chain may only consume the previous frame's output"
+        )
+    for dest in dests:
+        item = capture["inputs"].get(dest)
+        if item is None:
+            raise FeedbackError(f"capture has no snapshot for input buffer {dest}")
+        if item["bytes"] != base.buffers[dest].bytes:
+            raise FeedbackError(
+                f"capture input {dest} is {item['bytes']} bytes but plan buffer is {base.buffers[dest].bytes}"
+            )
+    # Guard: the capture must be its own image, not a duplicate of a neighbour.
+    neighbour = frame - 1 if predecessor is not None else frame + 1
+    if (DATASET / sequence / f"0-{neighbour}").is_dir():
+        try:
+            other = load_capture(sequence, neighbour)
+        except FeedbackError:
+            other = None
+        if other is not None:
+            same = [str(r) for r in dests if other["inputs"][r]["sha256"] == capture["inputs"][r]["sha256"]]
+            if same:
+                raise FeedbackError(
+                    f"captures {frame} and {neighbour} share identical input buffers {same}; "
+                    "this is not a motion sequence (single-image repetition is forbidden)"
+                )
+
+    inputs = {}
+    for dest in dests:
+        item = capture["inputs"][dest]
+        if predecessor is None:
+            inputs[str(dest)] = {
+                "buffer": dest, "buffer_name": base.buffers[dest].name,
+                "file": item["path"].as_posix(), "bytes": item["bytes"], "sha256": item["sha256"],
+                "provenance": "CAPTURED_FP16_HISTORY",
+                "history_plane_offset": geometry.destinations[dest],
+                "note": "frame 0 of the sequence: the history the capture actually consumed",
+                "bytes_outside_plane_changed": 0,
+            }
+        else:
+            prev_out = Path(predecessor["run_dir"]) / predecessor.get("output_file", output_name)
+            prev_capture = load_capture(sequence, int(predecessor["frame"]))
+            if prev_out.stat().st_size != geometry.source_bytes:
+                raise FeedbackError(f"predecessor output {prev_out} is not a {geometry.source_bytes}-byte network output")
+            fp16_reinjection = sha256_file(prev_out) == prev_capture["output"]["sha256"]
+            if fp16_reinjection and not allow_reference_history:
+                raise FeedbackError(
+                    f"predecessor output {prev_out} is byte-identical to the captured FP16 output of frame "
+                    f"{predecessor['frame']}: injecting it would feed FP16 history every frame (forbidden). "
+                    "Use --allow-reference-history only for the reference-chain self test."
+                )
+            composite = stage_dir / f"{sequence}-{frame}" / f"{item['file']}"
+            stats = stage_composite(item["path"], item["bytes"], prev_out, geometry, composite, reuse=reuse)
+            inputs[str(dest)] = {
+                "buffer": dest, "buffer_name": base.buffers[dest].name,
+                "file": composite.as_posix(), "bytes": item["bytes"], "sha256": stats["composite_sha256"],
+                "provenance": "PREDECESSOR_CANDIDATE_OUTPUT",
+                "history_plane_offset": geometry.destinations[dest],
+                "history_source": {
+                    "run_dir": str(predecessor["run_dir"]),
+                    "frame": int(predecessor["frame"]),
+                    "file": stats["history_source"],
+                    "sha256": stats["history_source_sha256"],
+                    "offset": geometry.source_offset,
+                    "bytes": geometry.plane_bytes,
+                },
+                "changed_bytes": stats["changed_bytes"],
+                "changed_span_in_plane": stats["changed_span_in_plane"],
+                "bytes_outside_plane_changed": stats["bytes_outside_plane_changed"],
+                "fp16_history_reinjected": bool(fp16_reinjection),
+            }
+
+    history_before = [list(words) for words, _ in base.history]
+    if history_before:
+        raise FeedbackError(
+            "candidate plan still carries HISTORY directives; the chain must not rely on the runner's "
+            f"same-process feedback (--feedback): {history_before}"
+        )
+    policies_before = _policy_table(base)
+    dispatch_before = [(p.ordinal, p.name, p.spv, list(p.push or []), [(b.binding, b.buffer, b.offset, b.bytes) for b in p.binds])
+                       for p in base.passes]
+
+    for dest in dests:
+        base.set_buffer(base.buffers[dest].name, file=inputs[str(dest)]["file"], bytes_=inputs[str(dest)]["bytes"])
+    base.set_output(output_name)
+    problems = base.validate()
+    if problems:
+        raise FeedbackError(f"patched plan does not validate: {problems}")
+    plan_out.parent.mkdir(parents=True, exist_ok=True)
+    base.write(plan_out, check=False)
+
+    rebuilt = Plan(plan_out)
+    policies_after = _policy_table(rebuilt)
+    dispatch_after = [(p.ordinal, p.name, p.spv, list(p.push or []), [(b.binding, b.buffer, b.offset, b.bytes) for b in p.binds])
+                      for p in rebuilt.passes]
+    if rebuilt.history:
+        raise FeedbackError("patched plan unexpectedly carries HISTORY directives")
+    if policies_before != policies_after:
+        raise FeedbackError("POLICY table changed while patching the plan")
+    if dispatch_before != dispatch_after:
+        raise FeedbackError("PASS/PUSH/BIND identity changed while patching the plan")
+    if rebuilt.header != Plan(candidate_plan).header:
+        raise FeedbackError("plan header changed while patching the plan")
+    if rebuilt.outputs[0][2] != output_name:
+        raise FeedbackError("OUTPUT binding was not applied")
+    resource_diff = diff_plans(Plan(candidate_plan), rebuilt)
+    expected_buffer_changes = ([rebuilt.buffers[d].name for d in dests] if predecessor is not None else [])
+    changed_buffers = [c["name"] for c in resource_diff["buffers_changed"]]
+    if sorted(changed_buffers) != sorted(expected_buffer_changes):
+        raise FeedbackError(f"unexpected buffer-file changes in the patched plan: {changed_buffers}")
+    if resource_diff["dispatches_added"] or resource_diff["dispatches_removed"] or resource_diff["dispatch_changes"]:
+        raise FeedbackError("patch changed dispatch/SPV/PUSH identity")
+    if resource_diff["buffers_added"] or resource_diff["buffers_removed"]:
+        raise FeedbackError("patch added or removed buffers")
+
+    receipt = {
+        "schema": 1,
+        "kind": "AUTONOMOUS_FEEDBACK_FRAME" if predecessor is not None else "SEQUENCE_FIRST_FRAME_CAPTURED_HISTORY",
+        "sequence": sequence,
+        "frame": frame,
+        "predecessor": (None if predecessor is None else {
+            "frame": int(predecessor["frame"]),
+            "run_dir": str(predecessor["run_dir"]),
+            "output_file": predecessor.get("output_file", output_name),
+            "output_sha256": sha256_file(Path(predecessor["run_dir"]) / predecessor.get("output_file", output_name)),
+        }),
+        "candidate_plan": {"path": str(candidate_plan), "sha256": base_sha},
+        "capture": {"json": str(capture["json_path"]), "json_sha256": capture["json_sha256"],
+                    "frame_id": frame, "control_epoch": capture["control_epoch"],
+                    "noise_seed": capture["noise_seed"], "history_active": True},
+        "history_geometry": geometry.to_json(),
+        "history_geometry_evidence": geometry_evidence,
+        "inputs": inputs,
+        "plan": {
+            "path": str(plan_out),
+            "sha256": sha256_file(plan_out),
+            "output_file": output_name,
+            "output_buffer": geometry.source_buffer,
+            "header": list(rebuilt.header),
+            "validation_problems": [],
+            "history_directives_removed": history_before,
+            "policy_table_unchanged": True,
+            "bindings_unchanged": True,
+        },
+        "run": {
+            "out_dir": str(out_run_dir),
+            "output_path": str(Path(out_run_dir) / output_name),
+            "runner": str(RUNNER),
+            "runner_args": ["--plan", str(plan_out), "--out", str(out_run_dir), "--pool", "--warm", "0", "--reps", "1"],
+            "must_not_pass": ["--feedback"],
+            "reason_must_not_pass": ("--feedback copies this plan's own output into its own input and repeats one "
+                                     "image; the chain already injects the real predecessor history"),
+            "gpu_executed": False,
+        },
+        "integrity": {
+            "capture_history_reinjection": predecessor is None,
+            "fp16_history_reinjected": any(v.get("fp16_history_reinjected") for v in inputs.values() if isinstance(v, dict)),
+            "reference_chain_self_test": bool(allow_reference_history and predecessor is not None),
+            "single_image_repetition": False,
+            "adjacent_captures_are_distinct": True,
+        },
+        "claim_boundary": ("Plan generation only (CPU). No GPU execution, no timing, no quality verdict. "
+                          "Quality of this chain is NOT_RUN."),
+    }
+    receipt_out.parent.mkdir(parents=True, exist_ok=True)
+    receipt_out.write_text(json.dumps(receipt, indent=2, ensure_ascii=False), encoding="utf-8")
+    return receipt
+
+
+# --------------------------------------------------------------------------- chain
+def describe_chain(sequence: str, frames: List[int], candidate_dir: Path, out_root: Path,
+                   stage_dir: Path, output_name: str) -> dict:
+    links = []
+    for pos, frame in enumerate(frames):
+        capture = load_capture(sequence, frame)
+        plan = candidate_dir / f"combo-{frame}.txt"
+        entry = {
+            "index": pos,
+            "frame": frame,
+            "capture": str(capture["json_path"]),
+            "capture_pre_sha256": capture["inputs"][min(capture["inputs"])]["sha256"],
+            "candidate_plan": str(plan),
+            "candidate_plan_exists": plan.is_file(),
+            "out_dir": str(out_root / f"run-{frame}"),
+            "plan_out": str(out_root / f"plan-{frame}.txt"),
+            "receipt": str(out_root / f"receipt-{frame}.json"),
+        }
+        if pos == 0:
+            entry["history_source"] = {
+                "type": "CAPTURED_FP16_HISTORY",
+                "detail": "the history this captured frame actually consumed (injected once, at the sequence head)",
+                "buffers": {str(b): capture["inputs"][b]["path"].as_posix() for b in sorted(capture["inputs"])},
+            }
+        else:
+            prev = frames[pos - 1]
+            prev_out = out_root / f"run-{prev}" / output_name
+            entry["history_source"] = {
+                "type": "PREDECESSOR_CANDIDATE_OUTPUT",
+                "predecessor_frame": prev,
+                "predecessor_output": str(prev_out),
+                "predecessor_output_exists": prev_out.is_file(),
+                "offset": "derived from HISTORY directives of the corrected base plan",
+                "detail": "history plane of the previous frame's candidate output, injected into this frame's "
+                          "own captured pre/post bundles",
+            }
+            entry["depends_on"] = f"run-{prev}"
+        links.append(entry)
+    manifest = {
+        "schema": 1,
+        "kind": "AUTONOMOUS_FEEDBACK_SEQUENCE_PLAN",
+        "sequence": sequence,
+        "frames": frames,
+        "links": links,
+        "output_name": output_name,
+        "stage_dir": str(stage_dir),
+        "rules": [
+            "frame 0 consumes the captured FP16 history exactly once (legal sequence head)",
+            "frame k>0 consumes frame k-1's candidate output history plane; nothing else of frame k's capture is replaced",
+            "every frame uses its own captured pre/post bytes, so adjacent inputs differ (real motion)",
+            "the runner must not be given --feedback (single-image repetition would fake the chain)",
+            "each frame's plan is emitted only after the predecessor output exists; missing predecessors leave the tail PENDING",
+        ],
+    }
+    return manifest
+
+
+def chain(args: argparse.Namespace) -> dict:
+    frames = parse_frames(args.frames)
+    manifest = describe_chain(args.sequence, frames, args.candidate_dir, args.run_root, args.stage_dir, args.output_name)
+    geometry, evidence = derive_geometry(Plan(args.candidate_dir / f"combo-{frames[0]}.txt"))
+    statuses = []
+    built: List[int] = []
+    head_reuse = None
+    if args.head_run is not None:
+        head_out = args.head_run / args.head_output_name
+        if not head_out.is_file():
+            raise FeedbackError(f"--head-run output missing: {head_out}")
+        if head_out.stat().st_size != geometry.source_bytes:
+            raise FeedbackError(f"--head-run output is not a {geometry.source_bytes}-byte network output: {head_out}")
+        head_reuse = {
+            "run_dir": str(args.head_run),
+            "output_file": args.head_output_name,
+            "output_sha256": sha256_file(head_out),
+            "frame": frames[0],
+            "note": ("frame 0 result reused from an existing candidate run that used the captured FP16 history; "
+                     "its plan is byte-equal to the head plan emitted here (planlib diff empty) unless the candidate changed"),
+        }
+    for link in manifest["links"]:
+        frame = link["frame"]
+        pos = link["index"]
+        if not Path(link["candidate_plan"]).is_file():
+            link["status"] = "MISSING_CANDIDATE_PLAN"
+            statuses.append((frame, "MISSING_CANDIDATE_PLAN"))
+            continue
+        if pos == 0 and head_reuse is not None:
+            link["status"] = "HEAD_RESULT_REUSED"
+            link["reused"] = head_reuse
+            statuses.append((frame, "HEAD_RESULT_REUSED"))
+            continue
+        if pos == 0:
+            predecessor = None
+        else:
+            prev = frames[pos - 1]
+            if pos == 1 and head_reuse is not None:
+                predecessor = {"frame": prev, "run_dir": args.head_run, "output_file": args.head_output_name}
+                prev_out = args.head_run / args.head_output_name
+            else:
+                predecessor = {"frame": prev, "run_dir": args.run_root / f"run-{prev}",
+                               "output_file": args.output_name}
+                prev_out = args.run_root / f"run-{prev}" / args.output_name
+            if not prev_out.is_file():
+                link["status"] = f"PENDING_PREDECESSOR run-{prev}"
+                statuses.append((frame, link["status"]))
+                break
+        receipt = build_frame(
+            args.sequence, frame, Path(link["candidate_plan"]), args.stage_dir,
+            Path(link["plan_out"]), Path(link["receipt"]), Path(link["out_dir"]),
+            output_name=args.output_name, predecessor=predecessor,
+            allow_reference_history=args.allow_reference_history, reuse=args.reuse,
+            geometry=geometry, geometry_evidence=evidence,
+        )
+        link["status"] = "BUILT"
+        link["plan_sha256"] = receipt["plan"]["sha256"]
+        link["receipt_sha256"] = sha256_file(Path(link["receipt"]))
+        built.append(frame)
+    manifest["built_frames"] = built
+    if head_reuse is not None:
+        manifest["head_result_reused"] = head_reuse
+    manifest["statuses"] = [{"frame": f, "status": s} for f, s in statuses]
+    # The next executable job: the earliest built plan whose run directory has no output yet.
+    next_job = None
+    for link in manifest["links"]:
+        if link.get("status") != "BUILT":
+            continue
+        out_dir = Path(link["out_dir"])
+        output = out_dir / args.output_name
+        if output.is_file():
+            continue
+        next_job = {
+            "frame": link["frame"],
+            "plan": link["plan_out"],
+            "plan_sha256": link.get("plan_sha256"),
+            "out_dir": link["out_dir"],
+            "output_file": args.output_name,
+            "argv": [str(RUNNER), "--plan", link["plan_out"], "--out", link["out_dir"],
+                     "--pool", "--warm", "0", "--reps", "1"],
+            "must_not_pass": ["--feedback"],
+        }
+        break
+    manifest["next_job"] = next_job
+    manifest["history_geometry"] = geometry.to_json()
+    manifest["history_geometry_evidence"] = evidence
+    manifest["all_frames_built"] = len(built) == len(frames)
+    manifest_path = args.run_root / f"SEQUENCE-{args.sequence}-FEEDBACK.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    return manifest
+
+
+# ------------------------------------------------------------------------- self test
+def selftest(args: argparse.Namespace) -> dict:
+    """Eight-frame chain wiring test plus byte-level proof of the history geometry."""
+    import numpy as np
+
+    sequence = args.sequence
+    frames = parse_frames(args.frames)
+    out_dir = args.out or (SELF_DIR / "selftest")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    plans_dir = out_dir / "plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    staged_dir = out_dir / "staged"
+    candidate_dir = args.candidate_dir
+
+    report: dict = {
+        "schema": 1,
+        "kind": "FEEDBACK_PLAN_SELF_TEST",
+        "sequence": sequence,
+        "frames": frames,
+        "checks": [],
+        "gpu_executed": False,
+        "claim_boundary": "Wiring/geometry self test only; no GPU run, no quality verdict.",
+    }
+
+    def check(name: str, ok: bool, detail) -> None:
+        report["checks"].append({"check": name, "ok": bool(ok), "detail": detail})
+        if not ok:
+            raise AssertionError(f"self test failed: {name}: {detail}")
+
+    # 1. geometry derivation and cross checks
+    candidate = Plan(candidate_dir / f"combo-{frames[0]}.txt")
+    geometry, evidence = derive_geometry(candidate)
+    check("history geometry derived from planlib HISTORY directives",
+          geometry.source_offset + geometry.plane_bytes == geometry.source_bytes and len(geometry.destinations) == 2,
+          {"geometry": geometry.to_json(), "evidence": evidence})
+    check("candidate plans have no HISTORY directives (runner feedback disabled)",
+          all(not Plan(candidate_dir / f"combo-{f}.txt").history for f in frames), None)
+    check("live FP16 plan HISTORY geometry agrees",
+          bool(evidence.get("fp16_live_plan", {}).get("agrees_with_carrier", False)),
+          evidence.get("fp16_live_plan"))
+
+    # 2. byte-level proof: replacing frame k's history plane with frame k-1's FP16 output
+    #    plane reproduces frame k's captured bundle byte for byte.
+    equiv = []
+    for prev, cur in zip(frames, frames[1:]):
+        prev_out = frame_dir(sequence, prev) / "network-output.bin"
+        plane = _plane_from_output(prev_out, geometry)
+        row = {"prev_frame": prev, "frame": cur, "links": {}}
+        for dest in sorted(geometry.destinations):
+            cap = load_capture(sequence, cur)["inputs"][dest]
+            payload, stats = composite_bytes(cap["path"], cap["bytes"], geometry, plane)
+            identical = payload == cap["path"].read_bytes()
+            row["links"][str(dest)] = {
+                "capture": cap["file"], "composite_equals_capture": identical,
+                "changed_bytes": stats["changed_bytes"], "outside_plane_changed": stats["bytes_outside_plane_changed"],
+            }
+            check(f"history plane geometry reproduces capture {cur} (buffer {dest})", identical,
+                  {"changed_bytes": stats["changed_bytes"], "plane": [stats["plane_offset"], stats["plane_bytes"]]})
+        equiv.append(row)
+    report["capture_equivalence"] = equiv
+    check("all transitions reproduce the captured bundles exactly", True,
+          {"transitions": len(equiv), "note": "proves the plane offset/length and that each capture already saw the "
+                                             "previous frame's FP16 history"})
+
+    # 3. perturbation localisation: a single modified history pixel may only move the plane.
+    perturbed = bytearray(_plane_from_output(frame_dir(sequence, frames[0]) / "network-output.bin", geometry))
+    pixel = 4096  # float index inside the plane
+    perturbed[4 * pixel:4 * pixel + 4] = np.float32(0.25).tobytes()
+    cap = load_capture(sequence, frames[1])["inputs"][sorted(geometry.destinations)[0]]
+    payload, stats = composite_bytes(cap["path"], cap["bytes"], geometry, bytes(perturbed))
+    check("perturbing one history pixel changes only that pixel's bytes",
+          stats["changed_bytes"] == 4 and stats["bytes_outside_plane_changed"] == 0,
+          {"changed_bytes": stats["changed_bytes"], "span": stats["changed_span_in_plane"]})
+
+    # 4. provenance table for the whole chain (frame 0 = capture, k>0 = predecessor output)
+    provenance = []
+    for pos, frame in enumerate(frames):
+        capture = load_capture(sequence, frame)
+        if pos == 0:
+            provenance.append({"frame": frame, "history_source": "CAPTURED_FP16_HISTORY",
+                               "evidence": {str(d): rel(capture["inputs"][d]["path"]) for d in sorted(capture["inputs"])}})
+        else:
+            prev = frames[pos - 1]
+            prev_out = Path(out_dir) / "reference-chain" / f"run-{prev}" / BASE_OUTPUT_NAME
+            provenance.append({
+                "frame": frame,
+                "history_source": "PREDECESSOR_CANDIDATE_OUTPUT",
+                "predecessor": prev,
+                "expected_predecessor_output": rel(prev_out),
+                "not_the_capture_of_this_frame": rel(capture["inputs"][sorted(capture["inputs"])[0]]["path"]),
+            })
+    check("frame 0 points at the captured bundles and frames 1..7 point at predecessors",
+          provenance[0]["history_source"] == "CAPTURED_FP16_HISTORY" and
+          all(p["history_source"] == "PREDECESSOR_CANDIDATE_OUTPUT" for p in provenance[1:]),
+          provenance)
+
+    # 5. build a real frame-0 plan and one reference-chain plan (predecessor = captured FP16 output)
+    ref_chain = out_dir / "reference-chain"
+    prev_frame = frames[0]
+    # The reference chain deliberately uses the captured FP16 output as the predecessor
+    # output so the wiring can be tested without a GPU run; this is *not* a feedback result.
+    import shutil
+
+    pred_dir = ref_chain / f"run-{prev_frame}"
+    pred_dir.mkdir(parents=True, exist_ok=True)
+    pred_output = pred_dir / BASE_OUTPUT_NAME
+    captured_output = frame_dir(sequence, prev_frame) / "network-output.bin"
+    if not pred_output.is_file() or sha256_file(pred_output) != sha256_file(captured_output):
+        shutil.copy2(captured_output, pred_output)
+    head = build_frame(sequence, frames[0], candidate_dir / f"combo-{frames[0]}.txt", staged_dir,
+                       plans_dir / f"plan-{frames[0]}-head.txt", out_dir / f"receipt-{frames[0]}-head.json",
+                       ref_chain / f"run-{frames[0]}", output_name=BASE_OUTPUT_NAME,
+                       geometry=geometry, geometry_evidence=evidence)
+    check("sequence head plan keeps the captured inputs and only renames OUTPUT",
+          head["kind"] == "SEQUENCE_FIRST_FRAME_CAPTURED_HISTORY" and
+          all(v["provenance"] == "CAPTURED_FP16_HISTORY" for v in head["inputs"].values()) and
+          head["plan"]["output_file"] == BASE_OUTPUT_NAME, head["plan"])
+
+    chained = build_frame(sequence, frames[1], candidate_dir / f"combo-{frames[1]}.txt", staged_dir,
+                          plans_dir / f"plan-{frames[1]}-chained.txt", out_dir / f"receipt-{frames[1]}-chained.json",
+                          ref_chain / f"run-{frames[1]}", output_name=BASE_OUTPUT_NAME,
+                          predecessor={"frame": frames[0], "run_dir": ref_chain / f"run-{frames[0]}",
+                                       "output_file": BASE_OUTPUT_NAME},
+                          allow_reference_history=True, geometry=geometry, geometry_evidence=evidence)
+    check("chained plan consumes the predecessor history plane from the named run",
+          all(v["provenance"] == "PREDECESSOR_CANDIDATE_OUTPUT" and
+              v["history_source"]["offset"] == geometry.source_offset and
+              v["history_source"]["bytes"] == geometry.plane_bytes for v in chained["inputs"].values()),
+          {k: v["history_source"] for k, v in chained["inputs"].items()})
+    check("reference-chain build is marked as a self test, not a feedback result",
+          chained["integrity"]["reference_chain_self_test"] is True and
+          chained["integrity"]["fp16_history_reinjected"] is True, chained["integrity"])
+
+    # 6. negative tests: the guards must refuse the forbidden constructions.
+    negatives = []
+    try:
+        build_frame(sequence, frames[1], candidate_dir / f"combo-{frames[1]}.txt", staged_dir / "negative",
+                    plans_dir / f"plan-{frames[1]}-negative.txt", out_dir / "receipt-negative.json",
+                    ref_chain / f"run-{frames[1]}", output_name=BASE_OUTPUT_NAME,
+                    predecessor={"frame": frames[0], "run_dir": ref_chain / f"run-{frames[0]}",
+                                 "output_file": BASE_OUTPUT_NAME},
+                    allow_reference_history=False, geometry=geometry, geometry_evidence=evidence)
+        negatives.append({"case": "fp16 history reinjection without the self-test flag", "refused": False})
+    except FeedbackError as exc:
+        negatives.append({"case": "fp16 history reinjection without the self-test flag", "refused": True,
+                          "message": str(exc)})
+    try:
+        build_frame(sequence, frames[2], candidate_dir / f"combo-{frames[2]}.txt", staged_dir / "negative",
+                    plans_dir / f"plan-{frames[2]}-negative.txt", out_dir / "receipt-negative-adjacency.json",
+                    ref_chain / f"run-{frames[2]}", output_name=BASE_OUTPUT_NAME,
+                    predecessor={"frame": frames[0], "run_dir": ref_chain / f"run-{frames[0]}",
+                                 "output_file": BASE_OUTPUT_NAME},
+                    allow_reference_history=True, geometry=geometry, geometry_evidence=evidence)
+        negatives.append({"case": "non-adjacent predecessor", "refused": False})
+    except FeedbackError as exc:
+        negatives.append({"case": "non-adjacent predecessor", "refused": True, "message": str(exc)})
+    check("forbidden constructions are refused", all(n["refused"] for n in negatives), negatives)
+    report["negative_tests"] = negatives
+    report["staged_composites"] = {
+        str(p): {"bytes": p.stat().st_size, "sha256": sha256_file(p)}
+        for p in sorted(staged_dir.glob("*/*.bin"))
+    }
+    report["reference_chain_predecessor"] = {
+        "path": str(pred_output),
+        "sha256": sha256_file(pred_output),
+        "equals_captured_fp16_output": sha256_file(pred_output) == sha256_file(captured_output),
+        "purpose": "wiring-only predecessor for the self test; a real chain must use a candidate run output",
+    }
+    report["plans"] = {str(p.name): {"sha256": sha256_file(p), "bytes": p.stat().st_size}
+                       for p in sorted(plans_dir.glob("*.txt"))}
+    report["ok"] = all(c["ok"] for c in report["checks"])
+    report_path = out_dir / "SELFTEST-FEEDBACK-PLAN.json"
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    report["report_path"] = str(report_path)
+    return report
+
+
+# ----------------------------------------------------------------------------- CLI
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    g = sub.add_parser("geometry", help="derive and print the history plane geometry")
+    g.add_argument("--candidate", type=Path, default=CANDIDATE_DIR / "combo-34189.txt")
+
+    b = sub.add_parser("build", help="build one frame of the chain")
+    b.add_argument("--sequence", required=True, choices=FORMAL_SEQUENCES)
+    b.add_argument("--frame", type=int, required=True)
+    b.add_argument("--candidate", type=Path)
+    b.add_argument("--stage-dir", type=Path, required=True)
+    b.add_argument("--plan-out", type=Path, required=True)
+    b.add_argument("--receipt", type=Path, required=True)
+    b.add_argument("--out-run", type=Path, required=True)
+    b.add_argument("--prev-run", type=Path, help="run directory of the previous frame (chained frames only)")
+    b.add_argument("--prev-frame", type=int)
+    b.add_argument("--prev-output-name", default=None,
+                   help="output file name inside --prev-run (defaults to --output-name)")
+    b.add_argument("--output-name", default=OUTPUT_NAME)
+    b.add_argument("--allow-reference-history", action="store_true")
+    b.add_argument("--no-reuse", dest="reuse", action="store_false", default=True)
+
+    c = sub.add_parser("chain", help="build as many frames of the chain as their predecessors allow")
+    c.add_argument("--sequence", required=True, choices=FORMAL_SEQUENCES)
+    c.add_argument("--frames", default="")
+    c.add_argument("--candidate-dir", type=Path, default=CANDIDATE_DIR)
+    c.add_argument("--run-root", type=Path, required=True)
+    c.add_argument("--stage-dir", type=Path, required=True)
+    c.add_argument("--output-name", default=OUTPUT_NAME)
+    c.add_argument("--head-run", type=Path, default=None,
+                   help="existing candidate run to reuse as the frame-0 result (captured FP16 history)")
+    c.add_argument("--head-output-name", default=BASE_OUTPUT_NAME)
+    c.add_argument("--allow-reference-history", action="store_true")
+    c.add_argument("--no-reuse", dest="reuse", action="store_false", default=True)
+    c.add_argument("--emit-next", action="store_true",
+                   help="print the next runnable (plan, out, argv) after building what predecessors allow")
+
+    s = sub.add_parser("selftest", help="eight-frame chain wiring and byte-level geometry test")
+    s.add_argument("--sequence", default="day-street-static-formal-01", choices=FORMAL_SEQUENCES)
+    s.add_argument("--frames", default="34189-34196")
+    s.add_argument("--candidate-dir", type=Path, default=CANDIDATE_DIR)
+    s.add_argument("--out", type=Path)
+
+    args = ap.parse_args(argv)
+    if args.cmd == "geometry":
+        candidate = Plan(args.candidate)
+        geometry, evidence = derive_geometry(candidate)
+        print(json.dumps({"geometry": geometry.to_json(), "evidence": evidence}, indent=2, ensure_ascii=False))
+        return 0
+    if args.cmd == "build":
+        candidate = args.candidate or (CANDIDATE_DIR / f"combo-{args.frame}.txt")
+        predecessor = None
+        if args.prev_run is not None:
+            if args.prev_frame is None:
+                raise SystemExit("--prev-run requires --prev-frame")
+            if int(args.prev_frame) + 1 != int(args.frame):
+                raise SystemExit(f"predecessor frame {args.prev_frame} is not {args.frame} - 1")
+            predecessor = {"frame": int(args.prev_frame), "run_dir": args.prev_run,
+                           "output_file": args.prev_output_name or args.output_name}
+        receipt = build_frame(args.sequence, args.frame, candidate, args.stage_dir, args.plan_out,
+                              args.receipt, args.out_run, output_name=args.output_name,
+                              predecessor=predecessor, allow_reference_history=args.allow_reference_history,
+                              reuse=args.reuse)
+        print(json.dumps({k: receipt[k] for k in ("kind", "sequence", "frame", "plan", "integrity")},
+                         indent=2, ensure_ascii=False))
+        return 0
+    if args.cmd == "chain":
+        manifest = chain(args)
+        print(json.dumps({k: manifest[k] for k in ("sequence", "built_frames", "statuses", "all_frames_built")},
+                         indent=2, ensure_ascii=False))
+        return 0
+    report = selftest(args)
+    print(json.dumps({"ok": report["ok"], "checks": len(report["checks"]),
+                      "report": report["report_path"]}, indent=2, ensure_ascii=False))
+    return 0 if report["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

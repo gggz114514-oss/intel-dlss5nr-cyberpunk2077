@@ -1,0 +1,152 @@
+<#
+DSH full-network static INT8 GPU queue runner.
+
+DO NOT RUN until the coordinator grants a GPU slot and the user confirms.
+This script implements the existing exclusive-lock protocol; it never creates a
+second lock, never kills a running game/runner, and stops on the first failure.
+
+Usage:
+  pwsh -File run-queue.ps1 -Queue <JOBS-QUEUE.json> [-Owner <name>]
+#>
+param(
+  [Parameter(Mandatory = $true)][string]$Queue,
+  [string]$Owner = 'DSH-FULLNET-STATIC-20261029'
+)
+$ErrorActionPreference = 'Stop'
+$runner = '@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe'
+$ws = '@NR_WORKSPACE@'
+$lock = '@NR_GPU_WORKSPACE@/artifacts/parallel-port-20261013/GPU.lock'
+$queueDir = Split-Path -Parent (Resolve-Path $Queue)
+$raw = Join-Path $queueDir 'raw-logs'
+New-Item -ItemType Directory -Force -Path $raw | Out-Null
+$q = Get-Content $Queue -Raw | ConvertFrom-Json
+if ($q.status -ne 'NOT_RUN') { throw "Queue status is $($q.status); refusing to run" }
+if ($q.authorization -match 'NOT_ALLOCATED') { throw 'No GPU allocation is recorded in the queue; update authorization first' }
+$jobs = @($q.jobs | Where-Object { $_.ready })
+if ($jobs.Count -eq 0) { throw 'No ready jobs' }
+foreach ($j in $jobs) {
+  if (!(Test-Path $j.plan)) { throw "Missing plan: $($j.plan)" }
+  if (Test-Path $j.out) { throw "Output directory not fresh: $($j.out)" }
+  if ($null -ne $j.expected_output_sha256 -and $j.expected_output_sha256 -notmatch '^[0-9a-f]{64}$') { throw "bad expected hash for $($j.sequence)" }
+}
+$active = @(Get-Process | Where-Object { $_.ProcessName -match 'Cyberpunk|REDlauncher|port_network|profile_zprof|gtpin|clock_runner|clock_query|capture_gpu' })
+if ($active.Count) { throw ('Active game/GPU process: ' + (($active | ForEach-Object { $_.ProcessName + ' PID ' + $_.Id }) -join ', ')) }
+$before = Get-Content $lock -Raw | ConvertFrom-Json
+if ($before.state -ne 'FINISHED') { throw ('GPU lock not FINISHED: ' + $before.owner) }
+$beforeHash = (Get-FileHash $lock -Algorithm SHA256).Hash.ToLowerInvariant()
+[IO.File]::WriteAllBytes((Join-Path $raw 'GPU.lock.before.json'), [IO.File]::ReadAllBytes($lock))
+
+$results = [Collections.ArrayList]::new()
+$stream = $null
+$state = $null
+$failure = $null
+function SaveJson($path, $value) {
+  [IO.File]::WriteAllText($path, ($value | ConvertTo-Json -Depth 30), [Text.UTF8Encoding]::new($false))
+}
+function SaveLock($value) {
+  $b = [Text.Encoding]::UTF8.GetBytes(($value | ConvertTo-Json -Depth 20))
+  $script:stream.Position = 0
+  $script:stream.SetLength(0)
+  $script:stream.Write($b, 0, $b.Length)
+  $script:stream.Flush()
+}
+try {
+  $deadline = (Get-Date).AddSeconds(30)
+  while ($true) {
+    try {
+      $stream = [IO.File]::Open($lock, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+      break
+    } catch {
+      if ((Get-Date) -gt $deadline) { throw }
+      Start-Sleep -Milliseconds 500
+    }
+  }
+  $state = [ordered]@{
+    owner = $Owner; holder_pid = $PID; gpu_pid = $null; cwd = $ws; argv = @()
+    started_utc = [DateTime]::UtcNow.ToString('o'); state = 'RUNNING'
+    authorization = $q.authorization
+    previous_owner = $before.owner; previous_state = $before.state; previous_lock_sha256 = $beforeHash
+    queue = (Resolve-Path $Queue).Path
+  }
+  SaveLock $state
+  foreach ($j in $jobs) {
+    if ($failure) { break }
+    $argv = [Collections.Generic.List[string]]::new()
+    foreach ($a in @('--plan', [string]$j.plan, '--out', [string]$j.out, '--pool', '--warm', '0', '--reps', '1')) { [void]$argv.Add($a) }
+    if ($j.dump) { [void]$argv.Add('--dump-intermediates') }
+    $id = "$($j.sequence)-$($j.frame)"
+    $state.current_job = $id
+    $state.argv = @($runner) + @($argv)
+    $state.started_utc = [DateTime]::UtcNow.ToString('o')
+    SaveLock $state
+    $stem = ('{0}-{1}' -f $j.sequence, $j.frame)
+    $so = Join-Path $raw "$stem.stdout.txt"
+    $se = Join-Path $raw "$stem.stderr.txt"
+    # Windows PowerShell 5.1: run the native runner synchronously and let the
+    # shell capture stdout/stderr and $LASTEXITCODE.  This is more reliable than
+    # Start-Process -PassThru for short native runs.
+    & $runner @argv 1> $so 2> $se
+    $exit = $LASTEXITCODE
+    $pidRun = $null
+    $state.gpu_pid = $null
+    SaveLock $state
+    $outName = if ($j.output_name) { [string]$j.output_name } else { 'replayed-network.bin' }
+    $file = Join-Path $j.out $outName
+    $actual = $null
+    if (Test-Path $file) { $actual = (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant() }
+    $status = 'MEASURED'
+    $reason = $null
+    if ($exit -ne 0) { $status = 'FAIL'; $reason = 'runner exit nonzero' }
+    elseif (!$actual) { $status = 'FAIL'; $reason = "$outName missing" }
+    elseif ($null -ne $j.expected_output_sha256 -and $actual -ne $j.expected_output_sha256) { $status = 'FAIL'; $reason = 'expected output SHA-256 mismatch' }
+    [void]$results.Add([ordered]@{
+      card = $j.card; sequence = $j.sequence; frame = $j.frame; plan = $j.plan; plan_sha256 = $j.plan_sha256
+      out = $j.out; argv = @($runner) + @($argv); dump = [bool]$j.dump; exit_code = $exit
+      expected_output_sha256 = $j.expected_output_sha256; actual_output_sha256 = $actual
+      measurement_status = $status; failure_reason = $reason; stdout_path = $so; stderr_path = $se; pid = $pidRun
+    })
+    $state.gpu_pid = $null
+    $state.last_job = $id
+    $state.last_job_status = $status
+    SaveLock $state
+    SaveJson (Join-Path $queueDir 'RESULTS.json') ([ordered]@{
+      status = if ($status -eq 'FAIL') { 'STOPPED_ON_FIRST_FAILURE' } else { 'RUNNING' }
+      completed_jobs = @($results); total_jobs = $jobs.Count; failure = $reason
+      lock_owner = $state.owner; updated_utc = [DateTime]::UtcNow.ToString('o')
+    })
+    if ($status -eq 'FAIL') { $failure = "$id`: $reason (actual $actual)" }
+  }
+  $state.state = 'FINISHED'
+  $state.gpu_pid = $null
+  $state.finished_utc = [DateTime]::UtcNow.ToString('o')
+  $state.exit_code = if ($failure) { 1 } else { 0 }
+  if ($failure) { $state.failure = $failure }
+  SaveLock $state
+  SaveJson (Join-Path $queueDir 'RESULTS.json') ([ordered]@{
+    status = if ($failure) { 'FAILED' } else { 'COMPLETED' }
+    completed_jobs = @($results); total_jobs = $jobs.Count
+    measured = (@($results | Where-Object measurement_status -eq 'MEASURED').Count)
+    failed = (@($results | Where-Object measurement_status -eq 'FAIL').Count)
+    failure = $failure; lock_owner = $state.owner; updated_utc = [DateTime]::UtcNow.ToString('o')
+  })
+}
+catch {
+  $failure = $_.Exception.Message
+  if ($stream) {
+    $state.state = 'FINISHED'; $state.gpu_pid = $null
+    $state.finished_utc = [DateTime]::UtcNow.ToString('o'); $state.exit_code = 1; $state.failure = $failure
+    try { SaveLock $state } catch {}
+  }
+  SaveJson (Join-Path $queueDir 'RESULTS.json') ([ordered]@{
+    status = 'FAILED'; completed_jobs = @($results); total_jobs = $jobs.Count
+    failure = $failure; lock_owner = if ($state) { $state.owner } else { $null }
+  })
+  throw
+}
+finally {
+  if ($stream) {
+    $stream.Dispose(); $stream = $null
+    [IO.File]::WriteAllBytes((Join-Path $raw 'GPU.lock.released.json'), [IO.File]::ReadAllBytes($lock))
+  }
+}
+if ($failure) { throw $failure }

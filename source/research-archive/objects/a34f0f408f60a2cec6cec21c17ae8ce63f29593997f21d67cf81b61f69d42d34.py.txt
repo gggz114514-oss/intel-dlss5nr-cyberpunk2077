@@ -1,0 +1,132 @@
+"""S07 audit: prove the weight/scale decode against the FP16 teacher dumps, then measure
+the shipped INT8 pipeline error on the same inputs.
+
+Outputs AUDIT.json. Every number is CPU-only; GPU is NOT_RUN.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029"
+sys.path.insert(0, str(W / "tools"))
+sys.path.insert(0, str(W / "S07-split16/tools"))
+from planlib import Plan  # noqa: E402
+import model as M  # noqa: E402
+
+D = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+PLAN = D / "c64-family-static/combo-34189.txt"
+TEACHERS = [("34189", D / "dump-fp16"),
+            ("41444", D / "teacher-diagnostics/teacher-41444"),
+            ("43654", D / "teacher-diagnostics/teacher-43654")]
+OUT = W / "S07-split16"
+
+
+def fit_scale(w8, wt):
+    """Per-output-channel least-squares scale sW (row-wise) plus decode error."""
+    num = (w8 * wt).sum(1)
+    den = (w8 * w8).sum(1)
+    s = num / np.maximum(den, 1)
+    deq = w8 * s[:, None]
+    return s, float(np.linalg.norm(deq - wt) / np.linalg.norm(wt)), float(np.abs(deq - wt).max())
+
+
+def main():
+    p = Plan(PLAN)
+    d0 = p.dispatch_by_name("split16_b23_l0")
+    d1 = p.dispatch_by_name("split16_b23_l1")
+    dqx = p.dispatch_by_name("split16_b23_l0_qx_producer")
+    push0 = [int(x) for x in d0.push]
+    p2, p3 = push0[8:12], push0[12:16]
+    l0pack = Path(p.buffers[d0.binds[10].buffer].file)
+    l1pack = Path(p.buffers[d1.binds[10].buffer].file)
+    f16w = Path(p.buffers[d0.binds[0].buffer].file)
+    invX = np.float32(np.frombuffer(np.uint32(int(dqx.push[1])).tobytes(), "<f4")[0])
+    invF = np.fromfile(p.buffer("split16_b23_l1qxinv").file, dtype="<f4")[0]
+    pk = M.Pack(l0pack.read_bytes(), l1pack.read_bytes(), f16w, p2, p3)
+
+    rep = {
+        "scope": "split16 block23 l0 (expand) + l1 (contract); CPU only; GPU_VERIFICATION=NOT_RUN",
+        "plan": str(PLAN), "plan_sha256": p.sha256(),
+        "ordinals": {"split16_b23_l0_qx_producer": dqx.ordinal, "split16_b23_l0": d0.ordinal,
+                     "split16_b23_l1": d1.ordinal},
+        "push_p2_W1_W2_W3_Wc": p2, "push_p3_rs_QKV_Wo_oscale": p3,
+        "packs": {"l0": [str(l0pack), l0pack.stat().st_size],
+                  "l1": [str(l1pack), l1pack.stat().st_size],
+                  "fp16_weights": [str(f16w), f16w.stat().st_size]},
+        "static_scales_old": {"sX_l0": float(1 / invX), "invX_l0": float(invX),
+                              "sR": float(1 / pk.invs[0]), "invR": float(pk.invs[0]),
+                              "sA": float(1 / pk.invs[1]), "invA": float(pk.invs[1]),
+                              "sF": float(1 / invF), "invF": float(invF)},
+    }
+
+    # ---- weight decode check (least-squares scale recovers the baked sW exactly)
+    checks = {}
+    plan_rows = [("W1", pk.W1q_m, pk.W1, 512), ("W2", pk.W2q_m, pk.W2, 2048),
+                 ("W3", pk.W3q_m, pk.W3, 512), ("Wc", pk.Wcq_m, pk.Wc, 512)]
+    for name, Wq, Wt, N in plan_rows:
+        w8 = Wq.astype(np.float32)
+        s, rel, mx = fit_scale(w8, Wt)
+        checks[name] = {"N": N, "K": int(Wt.shape[1]), "W_absmax": float(np.abs(Wt).max()),
+                        "fitted_sW_min": float(s.min()), "fitted_sW_max": float(s.max()),
+                        "rel_l2_deq": rel, "max_abs_deq": mx,
+                        "clip_frac_127": float(np.mean(np.abs(Wq) >= 127)),
+                        "zero_frac": float(np.mean(Wq == 0))}
+    # baked input step implied by wsc / fitted sW
+    f1 = np.array(checks["W1"]["fitted_sW_min"]), checks["W1"]["fitted_sW_max"]
+    s1, _, _ = fit_scale(pk.W1q_m, pk.W1)
+    s2, _, _ = fit_scale(pk.W2q_m, pk.W2)
+    s3, _, _ = fit_scale(pk.W3q_m, pk.W3)
+    sc, _, _ = fit_scale(pk.Wcq_m, pk.Wc)
+    rep["baked_input_step"] = {
+        "l0_stage1_wsc_over_sW": [float(np.median(pk.wsc1 / s1)), float(np.std(pk.wsc1 / s1))],
+        "l0_stage2_wsc_over_sW": [float(np.median(pk.wsc2 / s2)), float(np.std(pk.wsc2 / s2))],
+        "l0_stage3_wsc_over_sW": [float(np.median(pk.wsc3 / s3)), float(np.std(pk.wsc3 / s3))],
+        "l1_wsc_over_sW": [float(np.median(pk.wscL / sc)), float(np.std(pk.wscL / sc))],
+        "note": "median of wsc[n]/sW[n] equals the scalar input step baked into the pack",
+    }
+    rep["weight_decode"] = checks
+
+    # ---- per-frame forward
+    frames = []
+    for tag, td in TEACHERS:
+        X = M.load_half(td / "dump_block22_out.bin")
+        Ft = M.load_half(td / "dump_split16_b23_F.bin")
+        Yt = M.load_half(td / "dump_split16_b23_Y.bin")
+        F16, Y16 = M.fp16_forward(pk, X)
+        Fi, Yi, qx, qr, qa, qf = M.int8_forward(
+            pk, X, 1.0 / float(invX), 1.0 / float(pk.invs[0]), 1.0 / float(pk.invs[1]), 1.0 / float(invF))
+        seed = M.f16(X * pk.rs)
+        A16 = F16 @ pk.Wc.T
+        Ai = Fi @ pk.Wcq_m.T * pk.wscL
+        frames.append({
+            "frame": tag, "teacher_dir": str(td),
+            "X_absmax": float(np.abs(X[:1056]).max()), "X_rms": float(np.sqrt((X[:1056] ** 2).mean())),
+            "fp16_ref": {"F_rel_l2_vs_dump": M.rel_l2(F16, Ft), "Y_rel_l2_vs_dump": M.rel_l2(Y16, Yt),
+                         "F_equal_frac": float(np.mean(F16[:1056] == Ft[:1056])),
+                         "Y_equal_frac": float(np.mean(Y16[:1056] == Yt[:1056])),
+                         "F_max_abs": float(np.abs(F16[:1056] - Ft[:1056]).max()),
+                         "Y_max_abs": float(np.abs(Y16[:1056] - Yt[:1056]).max())},
+            "int8_old": {"F_rel_l2_vs_dump": M.rel_l2(Fi, Ft), "Y_rel_l2_vs_dump": M.rel_l2(Yi, Yt),
+                         "F_rel_l2_vs_fp16": M.rel_l2(Fi, F16), "Y_rel_l2_vs_fp16": M.rel_l2(Yi, Y16),
+                         "contract_term_ratio_A_over_Y": float(np.linalg.norm(A16) / np.linalg.norm(seed)),
+                         "contract_term_rel_change": float(np.linalg.norm(Ai - A16) / np.linalg.norm(A16)),
+                         "Y_abs_err_rms": float(np.sqrt(np.mean((Yi[:1056] - Yt[:1056]) ** 2)))},
+            "saturation": {"qx_pm127": int(np.sum(np.abs(qx) >= 127)), "qr_pm127": int(np.sum(np.abs(qr) >= 127)),
+                           "qa_pm127": int(np.sum(np.abs(qa) >= 127)), "qf_pm127": int(np.sum(np.abs(qf) >= 127)),
+                           "qx_absmax_used": float(np.abs(qx).max()), "qr_absmax_used": float(np.abs(qr).max()),
+                           "qa_absmax_used": float(np.abs(qa).max()), "qf_absmax_used": float(np.abs(qf).max())},
+        })
+        print(tag, json.dumps(frames[-1]["fp16_ref"]), flush=True)
+        print(tag, json.dumps(frames[-1]["int8_old"]), flush=True)
+    rep["frames"] = frames
+    (OUT / "AUDIT.json").write_text(json.dumps(rep, indent=1))
+    print("wrote", OUT / "AUDIT.json")
+    print(json.dumps(rep["baked_input_step"], indent=1))
+    print(json.dumps(rep["weight_decode"], indent=1))
+
+
+if __name__ == "__main__":
+    main()

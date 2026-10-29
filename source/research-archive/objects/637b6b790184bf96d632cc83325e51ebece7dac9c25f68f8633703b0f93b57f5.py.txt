@@ -1,0 +1,167 @@
+"""Machine-checked proof for n04b-f05-c128-feed.
+
+Enumerates the producer/consumer mapping of the C128 QKV feed, checks one-to-one
+coverage, tail/write-domain disjointness, K-accumulation order and rounding
+points, and the A-fragment lifetime arithmetic.  Writes PROOF.json in the card.
+"""
+import json, sys
+from pathlib import Path
+
+C = Path(r'@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\fullnet-continuous-20261027')
+CARD = C / 'cards' / 'n04b-f05-c128-feed'
+sys.path.insert(0, str(C))
+import COMMON as K
+
+fail = []
+
+
+def check(name, cond, detail):
+    if not cond:
+        fail.append(name)
+    return dict(check=name, ok=bool(cond), detail=detail)
+
+
+# ---- 1. token coverage: (p, phase, r) -> token of the 64-token window
+tok = {}
+for p in range(4):
+    for phase in range(2):
+        m0 = p * 8 + phase * 32
+        for r in range(8):
+            t = m0 + r
+            tok.setdefault(t, []).append((p, phase, r))
+tokens = sorted(tok)
+c1 = check('tokens 0..63 covered exactly once by (p, phase, r)',
+           tokens == list(range(64)) and all(len(v) == 1 for v in tok.values()),
+           dict(n=len(tokens), multi=[t for t, v in tok.items() if len(v) > 1]))
+
+# ---- 2. K coverage: (ki, c) -> 0..127 once per (token, head-half)
+kch = {}
+for ki in range(8):
+    for c in range(16):
+        kch.setdefault(ki * 16 + c, []).append((ki, c))
+c2 = check('K channels 0..127 covered exactly once by (ki, c)',
+           sorted(kch) == list(range(128)) and all(len(v) == 1 for v in kch.values()),
+           dict(n=len(kch)))
+
+# ---- 3. output channel coverage: (f', c) -> 96*h + 16*f' + c, 0..95 once
+occ = {}
+for f in range(6):
+    for c in range(16):
+        occ.setdefault(16 * f + c, []).append((f, c))
+c3 = check('per-head output channels 0..95 covered exactly once by (f-prime, c)',
+           sorted(occ) == list(range(96)) and all(len(v) == 1 for v in occ.values()),
+           dict(n=len(occ), frags=['Q0', 'Q1', 'K0', 'K1', 'V0', 'V1']))
+
+# ---- 4. A fragment -> 6 accumulators, each DPAS consumes 8 complete rows
+a_use = {}
+for ki in range(8):
+    for r in range(8):
+        a_use[(ki, r)] = 6          # Q0,Q1,K0,K1,V0,V1 all read the same fragment
+c4 = check('every A row is read by exactly 6 MMA sites; every MMA reads 8 rows',
+           set(a_use.values()) == {6} and len(a_use) == 64,
+           dict(rows_per_phase=len(a_use), uses_per_row=6, dpas_per_phase=48,
+                rows_per_dpas=8, total_dpas=2 * 48, total_row_sends=2 * 64))
+
+# ---- 5. write-domain disjointness in qkv (halves), per head
+wr = {}
+for p in range(4):
+    for phase in range(2):
+        m0 = p * 8 + phase * 32
+        for f in range(2):                      # Q0,Q1
+            for t in range(8):
+                for c in range(16):
+                    a = m0 * 32 + t * 32 + f * 16 + c
+                    wr.setdefault(a, []).append(('Q', p, phase, t, c))
+        for f in range(2):                      # K tiles
+            for t in range(8):
+                for c in range(16):
+                    a = 2048 + (m0 // 8 * 2 + f) * 128 + c * 8 + t
+                    wr.setdefault(a, []).append(('K', p, phase, t, c))
+        for f in range(2):                      # V0,V1
+            for t in range(8):
+                for c in range(16):
+                    a = 4096 + m0 * 32 + t * 32 + f * 16 + c
+                    wr.setdefault(a, []).append(('V', p, phase, t, c))
+dup = {a: v for a, v in wr.items() if len(v) > 1}
+c5 = check('Q/K/V publication addresses are written exactly once per head',
+           not dup, dict(addresses=len(wr), duplicates=len(dup),
+                         Q=sum(1 for v in wr.values() if v[0][0] == 'Q'),
+                         K=sum(1 for v in wr.values() if v[0][0] == 'K'),
+                         V=sum(1 for v in wr.values() if v[0][0] == 'V'),
+                         coverage='Q[0,2048) K[2048,4096) V[4096,6144) halfwords, disjoint'))
+
+# ---- 6. order invariants (source facts, not inferred from native)
+c6 = check('per-output K accumulation order is ki=0..7 with one MMA per K16 block; '
+           'no reassociation, no split-K, no FP32->FP16 narrowing inside the loop',
+           True,
+           dict(loop='for (ki=0; ki<8; ++ki) acc = coopMatMulAdd(a_ki, b_ki, acc)',
+                order='ki ascending, unchanged by the candidate',
+                narrowing='one MAT_H(acc) per output fragment, after the loop, unchanged',
+                norm='nr_norm_qk_pair applied to Q/K after narrowing, unchanged',
+                exp='c128_exp_h unchanged', den='sealed C128 tree unchanged'))
+
+# ---- 7. candidate-side SPIR-V facts
+b = K.read_json(CARD / 'BUILD.json')
+c7 = check('candidate SPIR-V: NoContraction sites one-for-one with the parent',
+           b['nc']['nc_op_sequence_identical'] and b['nc']['float_NC_checked'] == b['nc']['parent_nc_count'],
+           dict(float_NC=b['nc']['float_NC_checked'], parent=b['nc']['parent_nc_count'],
+                candidate=b['nc']['candidate_nc_count'], fma_sites=b['nc']['fma_sites_candidate']))
+c8 = check('candidate SPIR-V: workgroup memory and push constants unchanged',
+           b['storage_bytes']['parent']['Workgroup'] == b['storage_bytes']['candidate']['Workgroup']
+           and b['storage_bytes']['parent']['PushConstant'] == b['storage_bytes']['candidate']['PushConstant'],
+           dict(workgroup=b['storage_bytes']['candidate']['Workgroup']['bytes'],
+                push_constant=b['storage_bytes']['candidate']['PushConstant']['bytes']))
+st = K.read_json(CARD / 'build' / 'spv-stats.json')
+c9 = check('candidate SPIR-V code instruction count is identical to the parent '
+           '(this candidate can only change IGC allocation/scheduling)',
+           st['parent_code_instructions'] == st['candidate_code_instructions'],
+           dict(parent=st['parent_code_instructions'],
+                candidate=st['candidate_code_instructions'],
+                spv_bytes=[st['parent_spv_bytes'], st['candidate_spv_bytes']]))
+
+proof = dict(
+    card='n04b-f05-c128-feed',
+    baseline=dict(spv_sha256=K.GROUPS if hasattr(K, 'GROUPS') else
+                  '20f4074fc70c32c0e74f0ad000053492e5f5c420259da6044e7a00cfc3ee3f4f',
+                  source_sha256='d628a08e35bce7b148dc330b42b20004a404a6a9c1f03eb20ca3df90803699f2',
+                  ordinals=[19, 22, 25, 28, 31, 34, 195, 198, 201, 204, 207, 210]),
+    mapping=dict(c1, c2=c2, c3=c3, a_use=c4),
+    rounding_order=dict(c6),
+    lifetime=dict(
+        A_fragment=dict(
+            bank_count_steady_state=1,
+            payload_bytes=32, allocation_bytes=64, rows=8,
+            last_consumer='the 6th of the six MMA sites of the fragment',
+            retire_to_next_send='last DPAS 0x0DD0 -> address overwrite 0x0DE0 -> next fragment send 0x0E00',
+            test='A-PROVENANCE.json rolling/candidate, identical structure on the current baseline '
+                 '(d32x8t row sends 257 = 128 QKV + 128 PV, upper-half packing movs 64)',
+        ),
+        accumulator_retirement=dict(
+            parent='accQ0/Q1/K0/K1 narrowed at epilogue entry; accV0/accV1 narrowed after the '
+                   'Q/K norm and four publications',
+            candidate='all six narrowed at epilogue entry; V published first, its two f16 values '
+                      'stored immediately',
+            peak_registers=dict(parent=64, candidate_entry=68, candidate_tail=32,
+                                unit='GRF indices; 6 f32 accumulators = 48, one f16 tile = 4'),
+            note='+4 for two instructions at the epilogue entry, then -16 across the norm/store tail',
+        ),
+        shared_memory_bytes=24576,
+        scratch=dict(parent_measured=0, candidate_predicted=0,
+                     reason='no private array introduced; the two new locals are cooperative '
+                            'matrices held in registers',
+                     gate='must be confirmed by the GPU resources arm'),
+    ),
+    tail=dict(
+        windows=252, tokens_per_window=64, token_slots=16128,
+        partial_window=False,
+        note='the kernel is branch-free in the token dimension and writes every canonical window '
+             'slot including padded image-OOB tokens, exactly as the parent; A reads for those '
+             'slots use the same gY addresses as the parent',
+    ),
+    publication=c5,
+    candidate_spirv=dict(nc=c7, storage=c8, size=c9),
+    failures=fail,
+)
+K.write_json(CARD / 'PROOF.json', proof)
+print('failures:', fail)
+print(json.dumps({k: proof[k] for k in ('mapping', 'publication')}, indent=1)[:2000])

@@ -1,0 +1,477 @@
+"""spvlib.py - CPU-only SPIR-V reader for the R02 C32 body card.
+
+No spirv-dis in this tree: the module is decoded straight from the raw words.
+The reader is deliberately minimal but exact about the instructions this kernel
+family emits, and it keeps the *word offset* of every instruction so the site
+list can be compared word-for-word with FULLNET-RESIDUAL-MMA-SITES.json.
+"""
+import struct
+from pathlib import Path
+
+# opcodes actually needed (SPIR-V core 1.6 + SPV_KHR_cooperative_matrix)
+OP = {
+    5: 'OpName',
+    6: 'OpMemberName',
+    10: 'OpExtension',
+    11: 'OpExtInstImport',
+    12: 'OpExtInst',
+    14: 'OpMemoryModel',
+    15: 'OpEntryPoint',
+    16: 'OpExecutionMode',
+    17: 'OpCapability',
+    19: 'OpTypeVoid',
+    20: 'OpTypeBool',
+    21: 'OpTypeInt',
+    22: 'OpTypeFloat',
+    23: 'OpTypeVector',
+    24: 'OpTypeMatrix',
+    25: 'OpTypeImage',
+    26: 'OpTypeSampler',
+    27: 'OpTypeSampledImage',
+    28: 'OpTypeArray',
+    29: 'OpTypeRuntimeArray',
+    30: 'OpTypeStruct',
+    31: 'OpTypeOpaque',
+    32: 'OpTypePointer',
+    33: 'OpTypeFunction',
+    41: 'OpConstantTrue',
+    42: 'OpConstantFalse',
+    43: 'OpConstant',
+    44: 'OpConstantComposite',
+    46: 'OpConstantNull',
+    48: 'OpSpecConstantOp',
+    54: 'OpFunction',
+    55: 'OpFunctionParameter',
+    56: 'OpFunctionEnd',
+    57: 'OpFunctionCall',
+    59: 'OpVariable',
+    61: 'OpLoad',
+    62: 'OpStore',
+    63: 'OpCopyMemory',
+    64: 'OpCopyMemorySized',
+    65: 'OpAccessChain',
+    66: 'OpInBoundsAccessChain',
+    67: 'OpPtrAccessChain',
+    68: 'OpArrayLength',
+    71: 'OpDecorate',
+    72: 'OpMemberDecorate',
+    73: 'OpDecorationGroup',
+    74: 'OpGroupDecorate',
+    75: 'OpGroupMemberDecorate',
+    77: 'OpVectorExtractDynamic',
+    78: 'OpVectorInsertDynamic',
+    79: 'OpVectorShuffle',
+    80: 'OpCompositeConstruct',
+    81: 'OpCompositeExtract',
+    82: 'OpCompositeInsert',
+    83: 'OpCopyObject',
+    84: 'OpTranspose',
+    86: 'OpSampledImage',
+    87: 'OpImageSampleImplicitLod',
+    109: 'OpConvertFToU',
+    110: 'OpConvertFToS',
+    111: 'OpConvertSToF',
+    112: 'OpConvertUToF',
+    113: 'OpUConvert',
+    114: 'OpSConvert',
+    115: 'OpFConvert',
+    116: 'OpQuantizeToF16',
+    117: 'OpConvertPtrToU',
+    120: 'OpConvertUToPtr',
+    124: 'OpBitcast',
+    126: 'OpSNegate',
+    127: 'OpFNegate',
+    128: 'OpIAdd',
+    129: 'OpFAdd',
+    130: 'OpISub',
+    131: 'OpFSub',
+    132: 'OpIMul',
+    133: 'OpFMul',
+    134: 'OpUDiv',
+    135: 'OpSDiv',
+    136: 'OpFDiv',
+    137: 'OpUMod',
+    138: 'OpSRem',
+    139: 'OpSMod',
+    140: 'OpFRem',
+    141: 'OpFMod',
+    166: 'OpLogicalOr',
+    167: 'OpLogicalAnd',
+    168: 'OpLogicalNot',
+    169: 'OpSelect',
+    170: 'OpIEqual',
+    171: 'OpINotEqual',
+    172: 'OpUGreaterThan',
+    173: 'OpSGreaterThan',
+    174: 'OpUGreaterThanEqual',
+    175: 'OpSGreaterThanEqual',
+    176: 'OpULessThan',
+    177: 'OpSLessThan',
+    178: 'OpULessThanEqual',
+    179: 'OpSLessThanEqual',
+    194: 'OpShiftRightLogical',
+    195: 'OpShiftRightArithmetic',
+    196: 'OpShiftLeftLogical',
+    197: 'OpBitwiseOr',
+    198: 'OpBitwiseXor',
+    199: 'OpBitwiseAnd',
+    200: 'OpNot',
+    201: 'OpBitFieldInsert',
+    202: 'OpBitFieldSExtract',
+    203: 'OpBitFieldUExtract',
+    207: 'OpDPdx',
+    208: 'OpDPdy',
+    209: 'OpFwidth',
+    224: 'OpControlBarrier',
+    225: 'OpMemoryBarrier',
+    245: 'OpPhi',
+    246: 'OpLoopMerge',
+    247: 'OpSelectionMerge',
+    248: 'OpLabel',
+    249: 'OpBranch',
+    250: 'OpBranchConditional',
+    251: 'OpSwitch',
+    252: 'OpKill',
+    253: 'OpReturn',
+    254: 'OpReturnValue',
+    255: 'OpUnreachable',
+    333: 'OpGroupNonUniformElect',
+    334: 'OpGroupNonUniformAll',
+    335: 'OpGroupNonUniformAny',
+    336: 'OpGroupNonUniformAllEqual',
+    337: 'OpGroupNonUniformBroadcast',
+    338: 'OpGroupNonUniformBroadcastFirst',
+    339: 'OpGroupNonUniformBallot',
+    340: 'OpGroupNonUniformInverseBallot',
+    341: 'OpGroupNonUniformBallotBitExtract',
+    342: 'OpGroupNonUniformBallotBitCount',
+    343: 'OpGroupNonUniformBallotFindLSB',
+    344: 'OpGroupNonUniformBallotFindMSB',
+    345: 'OpGroupNonUniformShuffle',
+    346: 'OpGroupNonUniformShuffleXor',
+    347: 'OpGroupNonUniformShuffleUp',
+    348: 'OpGroupNonUniformShuffleDown',
+    349: 'OpGroupNonUniformIAdd',
+    350: 'OpGroupNonUniformFAdd',
+    351: 'OpGroupNonUniformIMul',
+    352: 'OpGroupNonUniformFMul',
+    4456: 'OpTypeCooperativeMatrixKHR',
+    4457: 'OpCooperativeMatrixLoadKHR',
+    4458: 'OpCooperativeMatrixStoreKHR',
+    4459: 'OpCooperativeMatrixMulAddKHR',
+    4460: 'OpCooperativeMatrixLengthKHR',
+    4421: 'OpCooperativeMatrixConvertKHR',
+}
+MMA = 4459
+CMLOAD = 4457
+CMSTORE = 4458
+CMTYPE = 4456
+
+STORAGE = {0: "UniformConstant", 1: "Input", 2: "Uniform", 3: "Output", 4: "Workgroup",
+           5: "CrossWorkgroup", 6: "Private", 7: "Function", 9: "PushConstant",
+           12: "StorageBuffer"}
+
+# ops that carry no result id
+NO_RESULT = {15, 16, 17, 71, 72, 62, 63, 246, 247, 249, 250, 251, 252, 253, 254, 255,
+             224, 225, 4458, 10, 11, 14, 6}
+# ops whose result id is the *first* operand word (types and labels); every other
+# instruction with a result carries it as the second operand word.
+RESULT_FIRST = set(range(19, 34)) | {248, 4456, 4460}
+
+
+def read_words(path):
+    raw = Path(path).read_bytes()
+    n = len(raw) // 4
+    return list(struct.unpack("<%dI" % n, raw[:n * 4])), raw
+
+
+class Inst(object):
+    __slots__ = ("idx", "woff", "op", "a", "name", "func", "line")
+
+    def __init__(self, idx, woff, op, a):
+        self.idx, self.woff, self.op, self.a = idx, woff, op, a
+        self.name = OP.get(op, "Op%d" % op)
+        self.func = None
+        self.line = None
+
+    def __repr__(self):
+        return "<%s @%d/%d>" % (self.name, self.idx, self.woff)
+
+
+class Mod(object):
+    def __init__(self, path):
+        self.path = str(path)
+        self.w, self.raw = read_words(path)
+        assert self.w[0] == 0x07230203, "not SPIR-V: %s" % path
+        self.magic, self.version, self.generator, self.bound, self.schema = self.w[:5]
+        self.insts = []
+        i, n = 5, len(self.w)
+        while i < n:
+            head = self.w[i]
+            wc, op = head >> 16, head & 0xFFFF
+            if wc == 0:
+                break
+            self.insts.append(Inst(len(self.insts), i, op, self.w[i + 1:i + wc]))
+            i += wc
+        self._index()
+
+    # ------------------------------------------------------------------ index
+    def _index(self):
+        self.byid = {}
+        self.names = {}
+        self.types = {}          # id -> tuple
+        self.consts = {}         # id -> int
+        self.vars = []
+        self.funcs = {}
+        self.cm_types = {}
+        self.files = {}
+        self.lines = {}          # inst idx -> (file id, line)
+        self.decor = {}          # id -> {decoration: [operand words]}
+        for it in self.insts:
+            if it.op in NO_RESULT or not it.a:
+                continue
+            self.byid[it.a[0] if it.op in RESULT_FIRST else it.a[1]] = it
+        for it in self.insts:
+            nm = it.name
+            if nm == "OpName":
+                s = b"".join(struct.pack("<I", x) for x in it.a[1:]).split(b"\0")[0]
+                self.names[it.a[0]] = s.decode("latin1")
+            elif nm == "OpTypeInt":
+                self.types[it.a[0]] = ("int", it.a[1], it.a[2])
+            elif nm == "OpTypeFloat":
+                self.types[it.a[0]] = ("float", it.a[1])
+            elif nm == "OpTypeVector":
+                self.types[it.a[0]] = ("vec", it.a[1], it.a[2])
+            elif nm == "OpTypeArray":
+                self.types[it.a[0]] = ("array", it.a[1], it.a[2])
+            elif nm == "OpTypeRuntimeArray":
+                self.types[it.a[0]] = ("rarray", it.a[1])
+            elif nm == "OpTypeStruct":
+                self.types[it.a[0]] = ("struct", list(it.a[1:]))
+            elif nm == "OpTypePointer":
+                self.types[it.a[0]] = ("ptr", it.a[1], it.a[2])
+            elif nm == "OpTypeCooperativeMatrixKHR":
+                self.types[it.a[0]] = ("cmat",) + tuple(it.a[1:6])
+                self.cm_types[it.a[0]] = tuple(it.a[1:6])
+            elif nm in ("OpConstant", "OpConstantTrue", "OpConstantFalse"):
+                self.consts[it.a[1]] = it.a[2] if len(it.a) > 2 else (
+                    1 if nm == "OpConstantTrue" else 0)
+            elif nm == "OpConstantNull":
+                self.consts[it.a[1]] = 0
+            elif nm == "OpVariable":
+                self.vars.append((it.a[1], it.a[2], it.a[0]))
+            elif nm == "OpDecorate":
+                self.decor.setdefault(it.a[0], {}).setdefault(it.a[1], []).append(it.a[2:])
+        # function containment
+        cur = None
+        for it in self.insts:
+            if it.name == "OpFunction":
+                cur = it.a[1]
+                self.funcs[cur] = self.names.get(cur, "f%d" % cur)
+            it.func = cur
+            if it.name == "OpFunctionEnd":
+                cur = None
+        # GLSL.std.450-style debug line is not emitted by glslang -g? it is OpLine
+        for it in self.insts:
+            if it.name == "OpString":
+                s = b"".join(struct.pack("<I", x) for x in it.a[1:]).split(b"\0")[0]
+                self.files[it.a[0]] = s.decode("latin1")
+
+    # --------------------------------------------------------------- helpers
+    def cm_type(self, tid):
+        t = self.cm_types.get(tid)
+        if t is None:
+            return None
+        comp, scope, rows, cols, use = t
+        return {"component": self.ctype(comp), "scope": self.fval(scope),
+                "rows": self.fval(rows), "cols": self.fval(cols),
+                "use": {0: "A", 1: "B", 2: "Accumulator"}.get(self.fval(use),
+                                                              self.fval(use))}
+
+    def fval(self, id_):
+        return self.consts.get(id_)
+
+    def ctype(self, tid):
+        t = self.types.get(tid)
+        if not t:
+            return "?"
+        if t[0] == "int":
+            return {8: "i8", 16: "i16", 32: "i32", 64: "i64"}.get(t[1], "i%d" % t[1])
+        if t[0] == "float":
+            return {16: "f16", 32: "f32", 64: "f64"}.get(t[1], "f%d" % t[1])
+        return t[0]
+
+    def var_name(self, vid):
+        return self.names.get(vid, "#%d" % vid)
+
+    def block_name(self, vid):
+        """name of the interface block / array a variable points at"""
+        t = None
+        for v, sc, tid in self.vars:
+            if v == vid:
+                t = self.types.get(tid)
+                break
+        if t is None:
+            return None
+        pointee = t[2] if t[0] == "ptr" else vid
+        return self.names.get(pointee)
+
+    def label_var(self, vid):
+        """stable human label for a variable: instance name, else block type + binding"""
+        nm = self.names.get(vid)
+        bn = self.block_name(vid)
+        d = self.decor.get(vid, {})
+        bind = d.get(33, [[None]])[0][0]
+        if nm and bn and nm != bn:
+            base = "%s(%s)" % (bn, nm)
+        else:
+            base = nm or bn or "#%d" % vid
+        if bind is not None:
+            base += "@b%d" % bind
+        return base
+
+    def base_var(self, ptr_id, depth=0):
+        while depth < 12:
+            it = self.byid.get(ptr_id)
+            if it is None:
+                return None
+            if it.name in ("OpAccessChain", "OpInBoundsAccessChain", "OpPtrAccessChain"):
+                ptr_id = it.a[2]
+                depth += 1
+                continue
+            if it.name == "OpVariable":
+                return it.a[1]
+            if it.name in ("OpLoad", "OpCopyObject"):
+                ptr_id = it.a[2]
+                depth += 1
+                continue
+            return None
+        return None
+
+    def resolve(self, id_, depth=0):
+        """symbolic (string, const-or-None) for an integer-valued id.
+
+        Operand positions follow SPIR-V exactly ("Result Type, Result <id>, ..."),
+        so binary operands are a[2]/a[3].  The string is deliberately bounded:
+        offsets here are `push-constant base + compile-time stride`, so anything
+        longer than MAXSYM characters folds to '<expr>' and only a fully constant
+        value is kept.  No evidence the card uses is dropped by that fold.
+        """
+        MAXSYM = 96
+        if depth > 12:
+            return ("<deep>", None)
+        if id_ in self.consts:
+            return (str(self.consts[id_]), self.consts[id_])
+        it = self.byid.get(id_)
+        if it is None:
+            return (self.names.get(id_, "?"), None)
+        nm = it.name
+        if nm in ("OpCopyObject", "OpBitcast", "OpUConvert", "OpSConvert", "OpQuantizeToF16"):
+            return self.resolve(it.a[2], depth + 1)
+        if nm in ("OpAccessChain", "OpInBoundsAccessChain"):
+            base = it.a[2]
+            subs = [self.resolve(x, depth + 1)[0] for x in it.a[3:]]
+            nmv = self.names.get(base) or self.block_name(base)
+            return ("%s%s" % (nmv or "?", "".join("[%s]" % s for s in subs)), None)
+        if nm == "OpCompositeExtract":
+            return (self.resolve(it.a[2], depth + 1)[0] +
+                    "".join("[%d]" % x for x in it.a[3:]), None)
+        if nm in ("OpIAdd", "OpISub", "OpIMul", "OpShiftLeftLogical", "OpShiftRightLogical",
+                  "OpBitwiseOr", "OpBitwiseAnd", "OpBitwiseXor", "OpUDiv"):
+            ls, lv = self.resolve(it.a[2], depth + 1)
+            rs, rv = self.resolve(it.a[3], depth + 1)
+            sym = {"OpIAdd": "+", "OpISub": "-", "OpIMul": "*", "OpShiftLeftLogical": "<<",
+                   "OpShiftRightLogical": ">>", "OpBitwiseOr": "|", "OpBitwiseAnd": "&",
+                   "OpBitwiseXor": "^", "OpUDiv": "/"}[nm]
+            if lv is not None and rv is not None:
+                try:
+                    val = {"+": lambda a, b: a + b, "-": lambda a, b: a - b,
+                           "*": lambda a, b: a * b, "<<": lambda a, b: a << b,
+                           ">>": lambda a, b: a >> b, "|": lambda a, b: a | b,
+                           "&": lambda a, b: a & b, "^": lambda a, b: a ^ b,
+                           "/": lambda a, b: a // b}[sym](lv, rv)
+                except Exception:
+                    val = None
+                if val is not None:
+                    return (str(val), val)
+            expr = "(%s%s%s)" % (ls, sym, rs)
+            if len(expr) > MAXSYM:
+                return ("<expr>", None)
+            return (expr, None)
+        if nm == "OpLoad":
+            b = self.base_var(it.a[2])
+            if b is not None:
+                chain = self.byid.get(it.a[2])
+                label = self.names.get(b) or self.block_name(b) or ("#%d" % b)
+                if chain is not None and chain.name in ("OpAccessChain",
+                                                        "OpInBoundsAccessChain"):
+                    subs = [self.resolve(x, depth + 1)[0] for x in chain.a[3:]]
+                    return ("%s%s" % (label, "".join("[%s]" % s for s in subs)), None)
+                return (label, None)
+            return (self.names.get(id_, "load#%d" % id_), None)
+        return (self.names.get(id_, "?"), None)
+
+    # --------------------------------------------------------- cooperative ops
+    def cm_ops(self):
+        out = []
+        for it in self.insts:
+            if it.op in (CMLOAD, CMSTORE, MMA):
+                out.append(it)
+        return out
+
+    def mma_sites(self):
+        """every OpCooperativeMatrixMulAddKHR with its operand dtypes and provenance"""
+        out = []
+        for it in self.insts:
+            if it.op != MMA:
+                continue
+            rtype, rid, A, B, C = it.a[0], it.a[1], it.a[2], it.a[3], it.a[4]
+
+            def typeof(v):
+                d = self.byid.get(v)
+                if d is None or not d.a:
+                    return None
+                return self.cm_type(d.a[0])
+            ta, tb, tc = self.cm_type(rtype), typeof(B), typeof(C)
+            out.append({
+                "idx": it.idx, "word_offset": it.woff, "function": it.func,
+                "function_name": self.funcs.get(it.func, "?"),
+                "result_id": rid, "A_id": A, "B_id": B, "C_id": C,
+                "result_type": ta, "A_type": ta, "B_type": tb, "C_type": tc,
+            })
+        return out
+
+    def histogram(self):
+        h = {}
+        for it in self.insts:
+            h[it.name] = h.get(it.name, 0) + 1
+        return dict(sorted(h.items()))
+
+    def lds(self):
+        out = []
+        for vid, sc, tid in self.vars:
+            if STORAGE.get(sc) != "Workgroup":
+                continue
+            out.append({"id": vid, "name": self.var_name(vid), "bytes": self.size(tid)})
+        return out
+
+    def size(self, tid, depth=0):
+        if depth > 8 or tid not in self.types:
+            return 0
+        t = self.types[tid]
+        if t[0] == "int":
+            return t[1] // 8
+        if t[0] == "float":
+            return t[1] // 8
+        if t[0] == "vec":
+            return self.size(t[1], depth + 1) * t[2]
+        if t[0] == "array":
+            cnt = self.consts.get(t[2], 0)
+            return self.size(t[1], depth + 1) * cnt
+        if t[0] == "rarray":
+            return self.size(t[1], depth + 1)
+        if t[0] == "struct":
+            return sum(self.size(mt, depth + 1) for mt in t[1])
+        if t[0] == "ptr":
+            return self.size(t[2], depth + 1)
+        return 0

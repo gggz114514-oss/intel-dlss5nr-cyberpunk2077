@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""s37fn3/s37fn4: fragment-norm rewrite with EXPLICIT fma contraction.
+
+Evidence chain (2026-10-24 GPU diagnostics):
+- WG0 staged dumps: raw Q/K and everything downstream identical between the
+  sealed candidate cfa357ac and the parent EXCEPT 5/128 rows' half total
+  (1-2 ULP) -> 52 normalized-K halfs at 1 ULP.
+- CPU re-simulation on the dumped WG0 rows: the parent's total is reproduced
+  128/128 by 'first' FMA fusion (v[c]^2 fused into the pair add, v[c+16]^2
+  rounded first), and the candidate's by exact two-rounding ('none').
+  => the driver contracts the parent's mul+add; `precise` in the candidate
+     forbade it. Root cause of the cfa357ac gate FAIL.
+- Removing `precise` (s37fn2) did NOT transfer to the full gate: the JIT's
+  fusion choice depends on the surrounding compiled form (the debug-write
+  diag SPVs matched at WG0, the gate SPVs did not — s37fn2 frame 7.96% off
+  vs cfa's 2.31%).
+=> contract the fusion EXPLICITLY in GLSL so no JIT choice can alter it:
+     pair sum = fma(v_first, v_first, H(v_second*v_second))
+   with 'first' = fragment0 columns (s37fn3) or 'second' = fragment1 (s37fn4).
+All other norm ops keep `precise` (no contraction anywhere else; every other
+site is pure add/mul without mul+add pairs).
+"""
+import hashlib
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+WS = Path(r"@NR_WORKSPACE@")
+CAND_SRC = WS / "work/zcode-fp16-fullnet-handoff-20261024/candidates/s37-fnorm/source/s37_fold_body_r1a.comp"
+OUT = WS / "work/zcode-fp16-hotspot-r2-20261024/s37fn34"
+INC = CAND_SRC.parent
+COMPILER = WS / "src/project/tools/glslang-16.5.0/bin/glslang.exe"
+VALIDATOR = WS / "candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe"
+
+OLD_SQUARES = """            precise float16_t z0[4], z1[4];
+            for (uint ci = 0u; ci < 4u; ++ci) {
+                z0[ci] = half0[ci] * half0[ci];
+                z1[ci] = half1[ci] * half1[ci];
+            }
+            // per-component pair = sq[c] + sq[c+16] (local: same lane, same
+            // row, both fragments). Packed 2 uint32 for XOR shuffle chain.
+            uint p01 = packFloat2x16(f16vec2(z0[0] + z1[0], z0[1] + z1[1]));
+            uint p23 = packFloat2x16(f16vec2(z0[2] + z1[2], z0[3] + z1[3]));"""
+
+NEW_SQUARES_FIRST = """            precise float16_t z1[4];
+            for (uint ci = 0u; ci < 4u; ++ci) z1[ci] = half1[ci] * half1[ci];
+            // pair = fma(v_first, v_first, H(v_second^2)): the parent's
+            // driver-contracted 'first' form, made explicit (1-ULP-exact).
+            uint p01 = packFloat2x16(f16vec2(fma(half0[0], half0[0], z1[0]),
+                                             fma(half0[1], half0[1], z1[1])));
+            uint p23 = packFloat2x16(f16vec2(fma(half0[2], half0[2], z1[2]),
+                                             fma(half0[3], half0[3], z1[3])));"""
+
+NEW_SQUARES_SECOND = """            precise float16_t z0[4];
+            for (uint ci = 0u; ci < 4u; ++ci) z0[ci] = half0[ci] * half0[ci];
+            // pair = fma(v_second, v_second, H(v_first^2)): 'second' fusion.
+            uint p01 = packFloat2x16(f16vec2(fma(half1[0], half1[0], z0[0]),
+                                             fma(half1[1], half1[1], z0[1])));
+            uint p23 = packFloat2x16(f16vec2(fma(half1[2], half1[2], z0[2]),
+                                             fma(half1[3], half1[3], z0[3])));"""
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def compile_one(src, out_spv, label):
+    r = subprocess.run([str(COMPILER), "-V", "--target-env", "vulkan1.3",
+                        "-I" + str(INC), "-o", str(out_spv), str(src)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(label, "COMPILE FAIL:\n", r.stderr[-2000:])
+        sys.exit(1)
+    v = subprocess.run([str(VALIDATOR), str(out_spv)], capture_output=True, text=True)
+    ok = "result=0" in (v.stdout + v.stderr)
+    print(label, sha(out_spv)[:16], "validate", "OK" if ok else "FAIL")
+
+
+def main():
+    (OUT / "source").mkdir(parents=True, exist_ok=True)
+    (OUT / "spv").mkdir(exist_ok=True)
+    for f in INC.iterdir():
+        if f.suffix in (".comp", ".glsl"):
+            shutil.copy2(f, OUT / "source" / f.name)
+    base = CAND_SRC.read_text(encoding="utf-8")
+    assert base.count(OLD_SQUARES) == 1
+
+    D01 = WS / "candidates/dsh-fp16-same-family-20261023/combo-d01-d034-s32k11-v1/plan-combo-d01-d034-s32k11-v1.txt"
+    base_plan = Path(D01).read_text(encoding="utf-8").replace("\r\n", "\n").split("\n")
+
+    for name, repl in (("s37fn3", NEW_SQUARES_FIRST), ("s37fn4", NEW_SQUARES_SECOND)):
+        txt = base.replace(OLD_SQUARES, repl)
+        p = OUT / "source" / f"{name}.comp"
+        p.write_text(txt, encoding="utf-8")
+        spv = OUT / "spv" / f"{name}.spv"
+        compile_one(p, spv, name + ":")
+        lines = list(base_plan)
+        done = 0
+        for i, ln in enumerate(lines):
+            if ln.startswith('PASS 151 "s37_fold_body_r1a_v1"'):
+                w = ln.split()
+                w[3] = str(spv).replace("\\", "/")
+                lines[i] = " ".join(w)
+                done += 1
+        assert done == 1
+        plan = OUT / f"plan-{name}-232.txt"
+        Path(plan).write_text("\n".join(lines), encoding="utf-8")
+        print(plan.name, hashlib.sha256(plan.read_bytes()).hexdigest()[:16])
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,843 @@
+"""n10b-f10-pipeline build: F10 software pipeline over the n10 double window.
+
+Writes only into this card directory.  No GPU, no deployment, no shared edits.
+
+Pipeline
+  1. parent byte reproduction: the chain-head F10 source (n10-f10-next/candidate.comp)
+     must recompile byte for byte to the chain-head F10 SPV (228dee8a...).
+  2. candidate source: the kc loop becomes a nine-step producer/consumer ring; the
+     publish barrier moves to the loop head, staging slice i precedes consuming
+     slice i-1, so the next sixteen global reads are issued before the twenty-four
+     DPAS and the barrier that waits for them sits after the DPAS.
+  3. structural proof: NoContraction sites pair 1:1 with the parent, every float
+     instruction keeps its opcode and operand signature, the mapping and the
+     hazard schedule are re-derived from scratch.
+  4. candidate.spv must pass spv_validate_cpu.
+  5. plan.txt: exactly the sixteen F10 PASS lines of the chain head are swapped.
+  6. plan must pass clock_runner --cpu-check.
+"""
+from pathlib import Path
+import hashlib, json, subprocess, sys, difflib
+
+W = Path('@NR_WORKSPACE@')
+A = W / 'work/codex-astra-fp16-int8-audit-20261024'
+D = A / 'fullnet-mechanism-transfer-20261026'
+C = A / 'fullnet-continuous-20261027'
+S = Path(__file__).resolve().parent
+PARENT_CARD = C / 'cards/n10-f10-next'
+CHAIN = C / 'accepted/n10-f10-next-20261027'
+SITE = W / 'work/zcode-fp16-fullnet-handoff-20261024/candidates/f10p-s22-pblock/source'
+GLSLANG = W / 'src/project/tools/glslang-16.5.0/bin/glslang.exe'
+VALIDATE = W / 'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'
+RUNNER = A / 'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe'
+
+sys.path.insert(0, str(W / 'build/zcode-fp16-compute-backend-20261021/scripts'))
+import spv_tools_local as ST
+
+PASS_ORDINALS = [62, 66, 70, 74, 78, 82, 86, 90, 136, 140, 144, 148, 152, 156, 160, 164]
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def ident(p):
+    return dict(path=str(Path(p)), sha256=sha(p))
+
+
+def run(argv, allow_fail=False):
+    r = subprocess.run(list(map(str, argv)), capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    if r.returncode != 0 and not allow_fail:
+        raise RuntimeError('FAILED %s\n%s\n%s' % (argv, r.stdout, r.stderr))
+    return r.returncode, (r.stdout or '') + (r.stderr or '')
+
+
+def compile_glsl(comp, out):
+    return run([GLSLANG, '-V', '--target-env', 'vulkan1.3', '-I' + str(SITE), comp, '-o', out])
+
+
+# ------------------------------------------------------------------ 1. parent
+PARENT_SRC = PARENT_CARD / 'candidate.comp'
+PARENT_SPV = PARENT_CARD / 'candidate.spv'
+PARENT_PLAN = CHAIN / 'plan.txt'
+PARENT_SRC_SHA = 'ff2ffde62e44e11c3a5e4eff16e45160695b602b7c19a6e86f91757241b39c71'
+PARENT_SPV_SHA = '228dee8a437dd0827c4c7bc770707e645c753d493252fdda0907283889a9eb0e'
+PARENT_PLAN_SHA = '719f100b5210249f315094b24160ecfd5b2fb707afb9a3543e1beec61d3f3f49'
+BASE_OF_BASELINE = dict(
+    plan=dict(path=str(D / 'f10-weight-return-separation-20261027/plan.txt'),
+              sha256='a024c3c5aa1d1432ab3f0591bf03a897880d86be2c99d6de1e1492a2a7b2befe'))
+assert sha(PARENT_SRC) == PARENT_SRC_SHA, 'parent source identity moved'
+assert sha(PARENT_SPV) == PARENT_SPV_SHA, 'parent SPV identity moved'
+assert sha(PARENT_PLAN) == PARENT_PLAN_SHA, 'chain-head plan identity moved'
+
+parent_src = PARENT_SRC.read_text(encoding='utf-8-sig')
+(S / 'parent-rebuild.comp').write_text(parent_src, encoding='utf-8')
+rc, log = compile_glsl(S / 'parent-rebuild.comp', S / 'parent-rebuild.spv')
+assert rc == 0, log
+parent_raw_sha = sha(S / 'parent-rebuild.spv')
+PARENT_REPRO = parent_raw_sha == PARENT_SPV_SHA
+assert PARENT_REPRO, 'parent did not reproduce: %s' % parent_raw_sha
+
+# --------------------------------------------------------------- 2. candidate
+cand = parent_src
+edits = []
+
+
+def sub(old, new, count=1):
+    global cand
+    n = cand.count(old)
+    assert n == count, 'expected %d occurrence(s), found %d for %r' % (count, n, old[:90])
+    cand = cand.replace(old, new)
+    edits.append(dict(kind='replace', count=count, before=old, after=new))
+
+
+def sub_region(start_marker, end_marker, new, must_contain=(), must_not_contain=()):
+    """Replace the inclusive region [start_marker .. end_marker] exactly once."""
+    global cand
+    assert cand.count(start_marker) == 1, 'start marker count %d' % cand.count(start_marker)
+    assert cand.count(end_marker) == 1, 'end marker count %d' % cand.count(end_marker)
+    i0 = cand.index(start_marker)
+    i1 = cand.index(end_marker) + len(end_marker)
+    old = cand[i0:i1]
+    for m in must_contain:
+        assert m in old, 'region does not contain %r' % m
+    for m in must_not_contain:
+        assert m not in old, 'region unexpectedly contains %r' % m
+    cand = cand[:i0] + new + cand[i1:]
+    edits.append(dict(kind='region', count=1, before=old, after=new))
+
+
+# 2a. header note
+sub('// NOT CHANGED: bindings, push constants, local_size 256, phase/qkv shared\n'
+    '// allocation (20480 B), QKV/norm debug echoes, necessary T clear (runner-side).',
+    '// NOT CHANGED: bindings, push constants, local_size 256, phase/qkv shared\n'
+    '// allocation (20480 B), QKV/norm debug echoes, necessary T clear (runner-side).\n'
+    '//\n'
+    '// N10B-F10 (2026-10-27) software pipeline of the kc A feed.  One hunk, in the QKV\n'
+    '// kc loop, integer/control only:\n'
+    '//   the two windows n10 built are now a producer/consumer ring.  The loop runs\n'
+    '//   nine times; iteration i publishes (one workgroup barrier), stages slice i into\n'
+    '//   the window of parity i, and consumes slice i-1 from the other window.  So the\n'
+    '//   sixteen global reads of the next slice are issued before the twenty-four DPAS\n'
+    '//   of the current one, and the barrier that has to wait for them is after the\n'
+    '//   DPAS instead of before it.  Barrier count, staged bytes, load/store counts,\n'
+    '//   weight read count/order, the three independent weight return regions, DPAS\n'
+    '//   order, every floating expression, shared 20480 B, grid and lane activity are\n'
+    '//   unchanged.  The guards are uniform: i is the loop counter, identical in every\n'
+    '//   invocation of the workgroup.')
+
+# 2b. the kc loop -> the nine-step ring
+NEW_LOOP = '''        // N10B-F10 software pipeline.  The two staging windows n10 built are used as a
+        // producer/consumer ring instead of one window per slice:
+        //   iteration i : publish barrier (i>0) -> stage slice i (i<8) -> consume slice i-1 (i>0)
+        // so the sixteen global reads of the next slice are issued before the twenty-four
+        // DPAS of the current one, and the barrier that has to wait for those reads comes
+        // after the DPAS.  The window of slice i is [4096,8192) for even i and [0,4096) for
+        // odd i, so the two live windows of an iteration are the two halves of smem[0,8192)
+        // and the last staged slice (i=7, odd) is in [0,4096): the QKV handoff stores in
+        // [4096,10240) are still ordered only by the existing post-store barrier.  The
+        // number of barriers executed per workgroup is eight, as in n10.
+        // The guards are uniform (i is the loop counter, the same for every invocation).
+        uint abase=QKV_OFF;   // staging window of the slice this iteration produces
+        uint kc=0u;           // channel base of the slice this iteration consumes
+        for(uint i=0u;i<9u;i++) {
+            // publish slice i-1 (staged in the previous iteration) and retire its readers
+            if(i>0u) barrier();
+            if(i<8u) {
+#define STAGE(A,V,O) smem[abase+qkv_a_offset(lid+(O))]=(V)?gy[(A)]:float16_t(0.0)
+                STAGE(a00,v00,0u);      STAGE(a00+64u,v00,256u);
+                STAGE(a00+128u,v00,512u);STAGE(a00+192u,v00,768u);
+                STAGE(a10,v10,1024u);   STAGE(a10+64u,v10,1280u);
+                STAGE(a10+128u,v10,1536u);STAGE(a10+192u,v10,1792u);
+                STAGE(a01,v01,2048u);   STAGE(a01+64u,v01,2304u);
+                STAGE(a01+128u,v01,2560u);STAGE(a01+192u,v01,2816u);
+                STAGE(a11,v11,3072u);   STAGE(a11+64u,v11,3328u);
+                STAGE(a11+128u,v11,3584u);STAGE(a11+192u,v11,3840u);
+#undef STAGE
+                // the next slice starts 64 channels further into the same tiles
+                a00+=1024u;a10+=1024u;a01+=1024u;a11+=1024u;
+            }
+            if(i>0u) {
+                // the slice published by the barrier above lives in the other window
+                uint acons=QKV_OFF-abase;
+                for(uint k=0u;k<64u;k+=16u) {
+                    MA a0,a1;
+                    coopMatLoad(a0,smem,acons+((mA/8u)*4u+k/16u)*128u,8u,COL);
+                    coopMatLoad(a1,smem,acons+((mB/8u)*4u+k/16u)*128u,8u,COL);
+                    MB b0,b1,b2;
+                    coopMatLoad(b0,weights,wq_tile(h*96u+n0+0u,kc+k),16u,COL);
+                    coopMatLoad(b1,weights,wq_tile(h*96u+n0+16u,kc+k),16u,COL);
+                    coopMatLoad(b2,weights,wq_tile(h*96u+n0+32u,kc+k),16u,COL);
+                    acc00=coopMatMulAdd(a0,b0,acc00);
+                    acc10=coopMatMulAdd(a1,b0,acc10);
+                    acc01=coopMatMulAdd(a0,b1,acc01);
+                    acc11=coopMatMulAdd(a1,b1,acc11);
+                    acc02=coopMatMulAdd(a0,b2,acc02);
+                    acc12=coopMatMulAdd(a1,b2,acc12);
+                }
+                kc+=64u;
+            }
+            // ring step: the window staged by this iteration is the one consumed next
+            abase=QKV_OFF-abase;
+        }'''
+
+sub_region('        // N10-F10 slice lifetime: the staged 64x64 slice is consumed jointly by',
+           '            abase=QKV_OFF-abase;\n        }',
+           NEW_LOOP,
+           must_contain=['for(uint kc=0u;kc<512u;kc+=64u) {',
+                         'barrier();',
+                         '#define STAGE(A,V,O)',
+                         'acc12=coopMatMulAdd(a1,b2,acc12);',
+                         'coopMatLoad(b0,weights,wq_tile(h*96u+n0+0u,kc+k),16u,COL);',
+                         'abase=QKV_OFF-abase;'],
+           must_not_contain=['if(i>0u)'])
+
+code_only = '\n'.join(l for l in cand.splitlines() if not l.strip().startswith('//'))
+assert 'qkv[' not in code_only and 'sy[' not in code_only
+assert code_only.count('barrier();') == 5, code_only.count('barrier();')
+assert code_only.count('for(uint i=0u;i<9u;i++)') == 1, 'ring loop shape'
+assert code_only.count('uint i=') == 1 and code_only.count('uint pi') == 0
+(S / 'candidate.comp').write_text(cand, encoding='utf-8')
+rc, log = compile_glsl(S / 'candidate.comp', S / 'candidate.spv')
+assert rc == 0, log
+
+# ------------------------------------------------------------ 3. float identity
+pm = ST.Module(S / 'parent-rebuild.spv')
+cm = ST.Module(S / 'candidate.spv')
+INTS = {128, 130, 132, 134, 135, 137, 138, 139}
+FLOAT_OPS = {129, 131, 133, 139, 140}          # OpFAdd/FSub/FMul/FRem/FMod
+float_NC_checked = 0
+mismatch = []
+pr_all = ST.function_regions(pm)
+cr_all = ST.function_regions(cm)
+assert len(pr_all) == len(cr_all), 'function count changed: %d -> %d' % (len(pr_all), len(cr_all))
+for fi, (pr, cr) in enumerate(zip(pr_all, cr_all)):
+    ps = [pm.instructions[i] for i in pr if pm.instructions[i][0] in FLOAT_OPS]
+    cs = [cm.instructions[i] for i in cr if cm.instructions[i][0] in FLOAT_OPS]
+    assert len(ps) == len(cs), 'function %d float-op count %d -> %d' % (fi, len(ps), len(cs))
+    for x, y in zip(ps, cs):
+        assert (x[0], x[3]) == (y[0], y[3]), 'float op shape changed in function %d' % fi
+        xi = ST.result_id_of(x[0], x[1])
+        yi = ST.result_id_of(y[0], y[1])
+        if pm.operand_signature(xi, 3) != cm.operand_signature(yi, 3):
+            mismatch.append(dict(function=fi, opcode=x[0]))
+        float_NC_checked += 1
+assert not mismatch, 'floating operand signatures changed: %r' % mismatch[:3]
+
+# NoContraction: pair the parent's NC set to the candidate by instruction position
+# over the parent's NC opcode set, prove the candidate already carries exactly it.
+parent_nc = set(ST.no_contraction_ids(pm))
+cand_nc = set(ST.no_contraction_ids(cm))
+
+
+def classify(m, ids):
+    out = {}
+    for op, a, _, _ in m.instructions:
+        if ST.result_id_of(op, a) in ids:
+            out[op] = out.get(op, 0) + 1
+    return dict(sorted(out.items()))
+
+
+def op_seq(m, opcodes):
+    out = []
+    for fi, reg in enumerate(ST.function_regions(m)):
+        for i in reg:
+            op = m.instructions[i][0]
+            if op in opcodes:
+                out.append((fi, op, ST.result_id_of(op, m.instructions[i][1])))
+    return out
+
+
+nc_hist_parent = classify(pm, parent_nc)
+nc_hist_cand = classify(cm, cand_nc)
+assert nc_hist_parent == nc_hist_cand, 'NC opcode histogram differs'
+pair_ops = sorted(nc_hist_parent)
+ps_all, cs_all = op_seq(pm, pair_ops), op_seq(cm, pair_ops)
+assert len(ps_all) == len(cs_all), 'NC-capable opcode sequence length %d -> %d' % (
+    len(ps_all), len(cs_all))
+keep = set()
+for (fi, op, xi), (fj, op2, yi) in zip(ps_all, cs_all):
+    assert (fi, op) == (fj, op2), 'NC-capable sequence shape changed'
+    if xi in parent_nc:
+        keep.add(yi)
+assert len(keep) == len(parent_nc)
+nc_self_consistent = (keep == cand_nc)
+assert nc_self_consistent, 'candidate NC decorations are not the paired parent set'
+
+
+def nc_multiset(m, ids):
+    seen, out = {}, []
+    for op, a, _, _ in m.instructions:
+        rid = ST.result_id_of(op, a)
+        if rid in ids:
+            key = (op, str(m.operand_signature(rid, 3)))
+            seen[key] = seen.get(key, 0) + 1
+            out.append((key, seen[key]))
+    return sorted(out)
+
+
+nc_multiset_equal = nc_multiset(pm, parent_nc) == nc_multiset(cm, cand_nc)
+assert nc_multiset_equal, 'NC (opcode, signature) multiset differs'
+ST.set_no_contraction(cm, list(keep), S / 'candidate-nc-check.spv')
+nc_reemit_identical = sha(S / 'candidate-nc-check.spv') == sha(S / 'candidate.spv')
+cm = ST.Module(S / 'candidate.spv')
+
+# -------------------------------------------------- 4. static SPIR-V accounting
+INT_CTRL = {248, 249, 250, 251, 252, 253}      # labels/branches/switch/return: motion only
+
+
+def opcount(m, opcodes=None):
+    c = {}
+    for op, a, _, _ in m.instructions:
+        if opcodes is None or op in opcodes:
+            c[op] = c.get(op, 0) + 1
+    return c
+
+
+pc_counts, cc_counts = opcount(pm), opcount(cm)
+MULADD = 4459
+print('coopMatMulAdd', pc_counts.get(MULADD, 0), cc_counts.get(MULADD, 0))
+spirv_delta = dict(
+    parent_instructions=len(pm.instructions), candidate_instructions=len(cm.instructions),
+    parent_words=len(pm.words), candidate_words=len(cm.words),
+    control_barriers=dict(parent=pc_counts.get(224, 0), candidate=cc_counts.get(224, 0)),
+    memory_barriers=dict(parent=pc_counts.get(225, 0), candidate=cc_counts.get(225, 0)),
+    coopmat_muladd=dict(parent=pc_counts.get(MULADD, 0), candidate=cc_counts.get(MULADD, 0)),
+    coopmat_load=dict(parent=pc_counts.get(4457, 0), candidate=cc_counts.get(4457, 0)),
+    coopmat_store=dict(parent=pc_counts.get(4458, 0), candidate=cc_counts.get(4458, 0)),
+    integer_add=dict(parent=pc_counts.get(128, 0), candidate=cc_counts.get(128, 0)),
+    integer_sub=dict(parent=pc_counts.get(130, 0), candidate=cc_counts.get(130, 0)),
+    iadd_ops_total=dict(parent=sum(pc_counts.get(o, 0) for o in INTS),
+                        candidate=sum(cc_counts.get(o, 0) for o in INTS)),
+    branch_ops=dict(parent=sum(pc_counts.get(o, 0) for o in INT_CTRL),
+                    candidate=sum(cc_counts.get(o, 0) for o in INT_CTRL)),
+    loads=dict(parent=pc_counts.get(61, 0), candidate=cc_counts.get(61, 0)),
+    stores=dict(parent=pc_counts.get(62, 0), candidate=cc_counts.get(62, 0)),
+)
+
+# ------------------------------------------------------ 5. loop / barrier shape
+OP_LABEL, OP_LOOP_MERGE, OP_BARRIER, OP_STORE, OP_LOAD = 248, 246, 224, 62, 61
+
+
+def loops_of(m):
+    ins = m.instructions
+    out = []
+
+    def label_index(lbl):
+        for j, (o2, a2, _, _) in enumerate(ins):
+            if o2 == OP_LABEL and a2 and a2[0] == lbl:
+                return j
+        return None
+
+    for i, (op, a, _, _) in enumerate(ins):
+        if op != OP_LOOP_MERGE:
+            continue
+        head_i = None
+        for j in range(i - 1, -1, -1):
+            if ins[j][0] == OP_LABEL:
+                head_i = j
+                break
+        mg = label_index(a[0])
+        out.append(dict(head_i=head_i, merge_i=mg))
+    return out
+
+
+def loop_report(m):
+    ins = m.instructions
+    loops = loops_of(m)
+    recs = []
+    for lp in loops:
+        h, mg = lp['head_i'], lp['merge_i']
+        inner = [x for x in loops if x is not lp and x['head_i'] > h and x['merge_i'] <= mg]
+        own = [j for j in range(h, mg)
+               if not any(x['head_i'] <= j < x['merge_i'] for x in inner)]
+        body = mg - h
+        bar = [j for j in range(h, mg) if ins[j][0] == OP_BARRIER]
+        rec = dict(head_word='0x%X' % (ins[h][2] * 4), body_instructions=body,
+                   barriers_in_loop=len(bar),
+                   barrier_words=['0x%X' % (ins[j][2] * 4) for j in bar])
+        if inner:
+            rec['nested_loops'] = [dict(head_word='0x%X' % (ins[x['head_i']][2] * 4),
+                                        body_instructions=x['merge_i'] - x['head_i'])
+                                   for x in inner]
+            rec['own_body_instructions'] = len(own)
+            rec['own_histogram'] = {str(k): v for k, v in sorted(opcount_idx(ins, own).items())}
+            rec['own_barrier_offsets'] = [j - h for j in own if ins[j][0] == OP_BARRIER]
+            rec['own_store_offsets'] = [j - h for j in own if ins[j][0] == OP_STORE]
+            rec['own_first_load_offset'] = next((j - h for j in own if ins[j][0] == OP_LOAD), None)
+            rec['barrier_offsets'] = [j - h for j in bar]
+            rec['first_muladd_offset'] = next(
+                (j - h for j in range(h, mg) if ins[j][0] == MULADD), None)
+        recs.append(rec)
+    recs.sort(key=lambda d: -d['body_instructions'])
+    return dict(total_barriers=sum(1 for op, _, _, _ in ins if op == OP_BARRIER),
+                loops=recs[:4])
+
+
+def opcount_idx(ins, idxs):
+    c = {}
+    for j in idxs:
+        c[ins[j][0]] = c.get(ins[j][0], 0) + 1
+    return c
+
+
+loop_parent = loop_report(pm)
+loop_cand = loop_report(cm)
+(S / 'LOOP-BARRIERS.json').write_text(json.dumps(
+    {'parent-rebuild.spv': loop_parent, 'candidate.spv': loop_cand}, indent=2), encoding='utf-8')
+
+# -------------------------------------------------------------- 6. spv validate
+rc, vlog = run([VALIDATE, S / 'candidate.spv'], allow_fail=True)
+spv_valid = rc == 0
+
+# ------------------------------------------------------------------- 7. plan
+parent_plan_text = PARENT_PLAN.read_text(encoding='utf-8-sig')
+parent_path = PARENT_SPV.as_posix()
+cand_path = (S / 'candidate.spv').as_posix()
+n_base = parent_plan_text.count(parent_path)
+assert n_base == 16, 'chain-head F10 SPV path occurs %d times in the plan' % n_base
+plan_text = parent_plan_text.replace(parent_path, cand_path)
+assert plan_text.count(cand_path) == 16
+assert plan_text.count('PASS ') == 232
+(S / 'plan.txt').write_text(plan_text, encoding='utf-8')
+plan_sha = sha(S / 'plan.txt')
+
+rc, cpu_log = run([RUNNER, '--plan', S / 'plan.txt', '--cpu-check'], allow_fail=True)
+cpu_ok = rc == 0 and 'CPU_PLAN_OK' in cpu_log
+
+p_lines = parent_plan_text.splitlines()
+c_lines = plan_text.splitlines()
+assert len(p_lines) == len(c_lines), 'plan line count changed'
+diff_lines = [i for i, (a, b) in enumerate(zip(p_lines, c_lines)) if a != b]
+only_f10 = all(parent_path in p_lines[i] and cand_path in c_lines[i] for i in diff_lines)
+# the differing lines must be exactly the sixteen F10 PASS ordinals
+pass_idx = [i for i, l in enumerate(p_lines) if l.startswith('PASS ')]
+diff_pass_ordinals = [pass_idx.index(i) for i in diff_lines]
+assert diff_pass_ordinals == PASS_ORDINALS, diff_pass_ordinals
+
+# ------------------------------------------------- 8. mapping / hazard schedule
+def a_off(e):
+    r, k = e // 64, e % 64
+    return ((r // 8) * 4 + k // 16) * 128 + (k % 16) * 8 + r % 8
+
+
+cells = {}
+for r in range(64):
+    for k in range(64):
+        addr = a_off(r * 64 + k)
+        assert addr not in cells
+        cells[addr] = (r, k)
+assert set(cells) == set(range(4096)), 'staged slice is not a bijection'
+fragment_ok = 0
+for sg in range(8):
+    for abase in (0, 4096):
+        for m in ((sg // 2) * 16, (sg // 2) * 16 + 8):
+            for k0 in range(0, 64, 16):
+                base = abase + ((m // 8) * 4 + k0 // 16) * 128
+                for r in range(8):
+                    for c in range(16):
+                        assert cells[base - abase + c * 8 + r] == (m + r, k0 + c)
+                        fragment_ok += 1
+
+
+def tiled(token, c, C=512):
+    return ((token // 16) * (C // 16) + c // 16) * 256 + (token % 16) * 16 + c % 16
+
+
+hoist_checks = 0
+for token in range(1024):
+    base_c0 = [tiled(token, c0) for c0 in range(64)]
+    for i in range(8):
+        for c0 in range(64):
+            assert base_c0[c0] + 1024 * i == tiled(token, 64 * i + c0)
+            hoist_checks += 1
+
+
+def schedule(kind):
+    """Program-order event list per thread, with the barrier sequence number of each
+    event (the number of barriers that have completed before it in that thread)."""
+    events = []
+    bseq = 0
+    if kind == 'parent':                       # n10: stage i, barrier, consume i
+        stage_win, cons_win = [], []
+        for i in range(8):
+            w = 4096 if i % 2 == 0 else 0
+            stage_win.append(w)
+            stage_cons = 0
+            events.append(dict(iter=i, ev='stage', slice=i, window=w, bseq=bseq))
+            bseq += 1
+            events.append(dict(iter=i, ev='barrier', slice=None, window=None, bseq=bseq))
+            events.append(dict(iter=i, ev='consume', slice=i, window=w, bseq=bseq))
+    else:                                      # candidate: nine-step ring
+        stage_win = []
+        for i in range(9):
+            w = 4096 if i % 2 == 0 else 0
+            if i > 0:
+                bseq += 1
+                events.append(dict(iter=i, ev='barrier', slice=None, window=None, bseq=bseq))
+            if i < 8:
+                stage_win.append(w)
+                events.append(dict(iter=i, ev='stage', slice=i, window=w, bseq=bseq))
+            if i > 0:
+                acons = 4096 - w
+                events.append(dict(iter=i, ev='consume', slice=i - 1, window=acons, bseq=bseq))
+    return events
+
+
+hazard = {}
+for kind in ('parent', 'candidate'):
+    ev = schedule(kind)
+    stage_w = {e['slice']: e['window'] for e in ev if e['ev'] == 'stage'}
+    cons_w = {e['slice']: e['window'] for e in ev if e['ev'] == 'consume'}
+    assert set(stage_w) == set(range(8)) and set(cons_w) == set(range(8))
+    assert all(stage_w[s] == cons_w[s] for s in range(8)), (stage_w, cons_w)
+    first = {}
+    for e in ev:
+        first.setdefault((e['ev'], e['slice']), e)
+    checks = []
+    for s in range(8):
+        w = stage_w[s]
+        a, b = first[('stage', s)], first[('consume', s)]
+        checks.append(dict(kind='RAW', item='staging write -> A fragment read', slice=s,
+                           window=w, stage_bseq=a['bseq'], consume_bseq=b['bseq'],
+                           barriers_between=b['bseq'] - a['bseq']))
+        if s + 2 <= 7:
+            nxt = first[('stage', s + 2)]
+            checks.append(dict(kind='WAR', item='A fragment read -> next staging write',
+                               slice=s, window=w, consume_bseq=b['bseq'],
+                               next_stage_bseq=nxt['bseq'],
+                               barriers_between=nxt['bseq'] - b['bseq']))
+            checks.append(dict(kind='WAW', item='staging write -> next staging write',
+                               slice=s, window=w, stage_bseq=a['bseq'],
+                               next_stage_bseq=nxt['bseq'],
+                               barriers_between=nxt['bseq'] - a['bseq']))
+    handoff = None
+    if kind == 'candidate':
+        last_stage = first[('stage', 7)]
+        handoff = dict(
+            last_staged_slice=7, last_staged_window=stage_w[7],
+            handoff_region=[4096, 10240],
+            overlap=(stage_w[7] == 4096),
+            store_qkv_bseq=8,
+            last_read_of_handoff_window=first[('consume', 6)]['bseq'],
+            barriers_between=8 - first[('consume', 6)]['bseq'])
+        assert not handoff['overlap'], 'last staged slice shares the handoff window'
+        assert handoff['barriers_between'] >= 1
+    bad = [c for c in checks if c['barriers_between'] < 1]
+    assert not bad, bad
+    hazard[kind] = dict(events=ev, checks=checks, handoff=handoff,
+                        barriers_executed=sum(1 for e in ev if e['ev'] == 'barrier'))
+
+# stage/consume counts must be identical between the two schedules
+for k in ('parent', 'candidate'):
+    ev = hazard[k]['events']
+    assert sum(1 for e in ev if e['ev'] == 'stage') == 8
+    assert sum(1 for e in ev if e['ev'] == 'consume') == 8
+assert hazard['parent']['barriers_executed'] == hazard['candidate']['barriers_executed'] == 8
+
+# ------------------------------------------- 8b. ring index algebra (S1)
+# There are exactly two statements in the source that touch abase or kc:
+#   abase=QKV_OFF;  ...  abase=QKV_OFF-abase;   and   uint kc=0u; ... kc+=64u;
+# So the table below is a transliteration of the source, not a second model.
+QKV_OFF = 4096
+ring_table = []
+abase, kc = QKV_OFF, 0
+for i in range(9):
+    row = dict(iteration=i, abase_at_entry=abase)
+    if i < 8:
+        row['staged_slice'] = i
+        row['stage_window'] = abase
+    if i > 0:
+        acons = QKV_OFF - abase
+        row['consumed_slice'] = i - 1
+        row['consume_window'] = acons
+        row['kc'] = kc
+        assert kc == 64 * (i - 1), (kc, i)
+        kc += 64
+    abase = QKV_OFF - abase
+    ring_table.append(row)
+stage_win_of = {r['staged_slice']: r['stage_window'] for r in ring_table if 'staged_slice' in r}
+cons_win_of = {r['consumed_slice']: r['consume_window'] for r in ring_table if 'consumed_slice' in r}
+assert stage_win_of == cons_win_of, (stage_win_of, cons_win_of)
+assert sorted(stage_win_of) == list(range(8))
+assert [r['consumed_slice'] for r in ring_table if 'consumed_slice' in r] == list(range(8))
+
+# ----------------------------------------------- 9. source-level counter parity
+code_lines = [l for l in cand.splitlines() if not l.strip().startswith('//')]
+code_src = '\n'.join(code_lines)
+parent_lines = [l for l in parent_src.splitlines() if not l.strip().startswith('//')]
+parent_code = '\n'.join(parent_lines)
+
+
+def counters(text):
+    return dict(
+        stage_invocations=text.count('STAGE(a'),
+        global_half_loads=text.count('STAGE(a'),
+        slm_stores=text.count('STAGE(a'),
+        weight_fragment_loads=(text.count('coopMatLoad(b0,weights')
+                               + text.count('coopMatLoad(b1,weights')
+                               + text.count('coopMatLoad(b2,weights')),
+        a_fragment_loads=(text.count('coopMatLoad(a0,smem,')
+                          + text.count('coopMatLoad(a1,smem,')),
+        dpas_statements=text.count('coopMatMulAdd('),
+        barrier_calls=text.count('barrier();'),
+        acc_statements=len([l for l in text.splitlines() if 'acc' in l and '=coopMatMulAdd' in l]),
+    )
+
+
+counts = {k: dict(parent=v, candidate=counters(code_src)[k])
+          for k, v in counters(parent_code).items()}
+assert counts['stage_invocations']['parent'] == counts['stage_invocations']['candidate'] == 16
+assert counts['weight_fragment_loads']['parent'] == counts['weight_fragment_loads']['candidate'] == 3
+assert counts['a_fragment_loads']['parent'] == counts['a_fragment_loads']['candidate'] == 2
+assert counts['dpas_statements']['parent'] == counts['dpas_statements']['candidate'] == 24
+
+
+# the accepted asset: the three weight loads and the six accumulator statements must be
+# byte-identical to the parent and in the same order (only their surroundings changed).
+def b_asset_lines(text):
+    out = []
+    for l in text.splitlines():
+        s = l.strip()
+        if (s.startswith('coopMatLoad(b0,weights') or s.startswith('coopMatLoad(b1,weights')
+                or s.startswith('coopMatLoad(b2,weights')):
+            out.append(s)
+        elif (s.startswith(('acc00=', 'acc10=', 'acc01=', 'acc11=', 'acc02=', 'acc12='))
+              and '=coopMatMulAdd' in s):
+            out.append(s)
+    return out
+
+
+parent_b_lines = b_asset_lines(parent_code)
+cand_b_lines = b_asset_lines(code_src)
+assert parent_b_lines == cand_b_lines, 'the three weight loads / six DPAS changed'
+assert len(parent_b_lines) == 9, len(parent_b_lines)
+b_asset = dict(
+    lines=parent_b_lines,
+    identical=True,
+    weight_loads=3,
+    accumulator_statements=6,
+    per_b_dpas={b: sum(1 for l in parent_b_lines if ',%s,' % b in l) for b in ('b0', 'b1', 'b2')},
+    note='source-level identity only; physical three-region separation is a native question (P1)',
+)
+
+# the ring body must have exactly this statement order (publish, stage, consume, step)
+ring = code_src[code_src.index('for(uint i=0u;i<9u;i++) {'):]
+ring = ring[:ring.index('\n        STORE_QKV')]
+order = ['if(i>0u) barrier();', '#define STAGE(A,V,O)',
+         'a00+=1024u;a10+=1024u;a01+=1024u;a11+=1024u;',
+         'if(i>0u) {', 'uint acons=QKV_OFF-abase;', 'for(uint k=0u;k<64u;k+=16u) {',
+         'kc+=64u;', 'abase=QKV_OFF-abase;']
+pos = [ring.index(s) for s in order]
+assert pos == sorted(pos), 'ring statement order changed: %r' % list(zip(order, pos))
+assert ring.count('barrier();') == 1 and ring.count('if(i>0u) barrier();') == 1
+assert ring.count('if(i<8u)') == 1
+# no second barrier, and the only barrier precedes the staging block
+assert ring.index('barrier();') < ring.index('#define STAGE(A,V,O)')
+ring_order = dict(order=order, char_offsets=pos,
+                  barrier_before_stage=True, single_barrier_in_ring=True,
+                  guards_uniform='i is the loop counter, identical for every invocation')
+
+# ------------------------------------------------------------ 10. artifacts
+patch = list(difflib.unified_diff(
+    parent_src.splitlines(keepends=True), cand.splitlines(keepends=True),
+    fromfile='A-parent/candidate.comp  (n10-f10-next, sha %s)' % PARENT_SRC_SHA[:8],
+    tofile='B-n10b/candidate.comp', n=6))
+(S / 'SOURCE-DIFF.patch').write_text(''.join(patch), encoding='utf-8')
+
+# the four required proofs, as claim records
+max_invalid_addr = 1024 * 7 + 192
+input_halves = 1179648 // 2
+claims = [
+    dict(id='M1-map-one-to-one',
+         statement='Every staged element is written exactly once; the 4096 (token,channel) '
+                   'cells of a slice are covered and qkv_a_offset is a bijection over 0..4095.',
+         method='exhaustive (r,k) -> qkv_a_offset(r*64+k)', checked=len(cells), result='PASS'),
+    dict(id='M2-fragment-addresses',
+         statement='For every SG, both M blocks, all four K16 blocks and both window bases, '
+                   'the COL8 coopMatLoad element (m+r,16j+c) lands on the staged cell of the '
+                   'same (token,channel).',
+         method='exhaustive 8 SG x 2 windows x 2 M8 x 4 K16 x 8 x 16', checked=fragment_ok,
+         result='PASS'),
+    dict(id='R1-float-ops-identical',
+         statement='Every floating SPIR-V instruction keeps its parent opcode and operand '
+                   'signature in the same function position: no float expression was added, '
+                   'removed, reordered or re-associated.',
+         method='sequence pairing over OpFAdd/OpFSub/OpFMul/OpFRem/OpFMod per function',
+         checked=float_NC_checked, mismatches=0, result='PASS'),
+    dict(id='R2-nocontraction-identical',
+         statement='The NoContraction decoration set pairs one-to-one with the parent by '
+                   'instruction position, the (opcode, signature, occurrence) multiset is '
+                   'equal and re-emitting the paired set is byte-neutral.',
+         method='spv_tools_local NC pairing + multiset + set_no_contraction re-emit',
+         parent_ids=len(parent_nc), paired_ids=len(keep), candidate_ids=len(cand_nc),
+         histogram={str(k): v for k, v in nc_hist_parent.items()},
+         multiset_equal=nc_multiset_equal, self_consistent=nc_self_consistent,
+         reemit_identical=nc_reemit_identical, result='PASS'),
+    dict(id='R3-k-order-and-rounding-points',
+         statement='Per-output K order (slice 0..7, k=0,16,32,48 inside each), the six FP32 '
+                   'accumulators, every half narrowing point and every residual/seed order are '
+                   'untouched: the ring visits the slices in the same order (consume s happens '
+                   'in iteration s+1 for s=0..7) and R1 proves no arithmetic changed.',
+         method='SOURCE-DIFF review + consume-order table + R1 sequence proof',
+         consume_order=[dict(iteration=i, slice=i - 1, kc=64 * (i - 1)) for i in range(1, 9)],
+         result='PASS'),
+    dict(id='L1-raw-covered',
+         statement='Each slice is published by exactly one workgroup barrier between its '
+                   'sixteen staging stores and its first A fragment read.',
+         method='program-order event model with barrier sequence numbers',
+         per_slice=[[c for c in hazard['candidate']['checks']
+                     if c['kind'] == 'RAW' and c['slice'] == s][0] for s in range(8)],
+         min_barriers_between=min(c['barriers_between'] for c in hazard['candidate']['checks']
+                                  if c['kind'] == 'RAW'),
+         result='PASS'),
+    dict(id='L2-war-waw-still-closed',
+         statement='Two uses of the same window are still separated by at least one barrier, '
+                   'exactly as in the parent: no new WAR or WAW was introduced.',
+         method='same model, parent vs candidate',
+         candidate_checks=[c for c in hazard['candidate']['checks'] if c['kind'] != 'RAW'],
+         parent_checks=[c for c in hazard['parent']['checks'] if c['kind'] != 'RAW'],
+         min_barriers_candidate=min(c['barriers_between']
+                                    for c in hazard['candidate']['checks']
+                                    if c['kind'] != 'RAW'),
+         min_barriers_parent=min(c['barriers_between']
+                                 for c in hazard['parent']['checks']
+                                 if c['kind'] != 'RAW'),
+         identical_separation=all(
+             a['barriers_between'] == b['barriers_between']
+             for a, b in zip([c for c in hazard['candidate']['checks'] if c['kind'] != 'RAW'],
+                             [c for c in hazard['parent']['checks'] if c['kind'] != 'RAW'])),
+         result='PASS'),
+    dict(id='L3-handoff-not-raced',
+         statement='The QKV handoff [4096,10240) is used as a staging window only by the even '
+                   'slices; the last one (slice 6) is retired by the barrier of iteration 8, so '
+                   'STORE_QKV still needs no extra barrier.',
+         method='window schedule + barrier sequence numbers', detail=hazard['candidate']['handoff'],
+         result='PASS'),
+    dict(id='L4-barrier-count-unchanged',
+         statement='Eight workgroup barriers per QKV phase, one in the kc loop body, four in '
+                   'the module: the same as the parent.',
+         method='schedule model + OpControlBarrier count',
+         dynamic=dict(parent=hazard['parent']['barriers_executed'],
+                      candidate=hazard['candidate']['barriers_executed']),
+         static=spirv_delta['control_barriers'], result='PASS'),
+    dict(id='S1-ring-index-algebra',
+         statement='Transliterating only the two assignments the ring adds (abase flips once '
+                   'per iteration, kc advances inside the consume guard), the window a slice is '
+                   'staged into equals the window it is consumed from, and the channel base used '
+                   'for the weights equals 64*slice. The consume therefore reads the slice that '
+                   'was staged in the previous iteration, in slice order 0..7.',
+         method='exact integer evaluation of the source recurrences',
+         table=ring_table, result='PASS'),
+    dict(id='T2-address-hoist-identity',
+         statement='tiled(token,64i+c0,512) == tiled(token,c0,512) + 1024*i for every token, '
+                   'slice and c0 (inherited from n10, re-verified here).',
+         method='exhaustive 1024 x 8 x 64', checked=hoist_checks,
+         max_invalid_address=max_invalid_addr, input_buffer_halves=input_halves, result='PASS'),
+    dict(id='B1-parent-byte-reproduction',
+         statement='The chain-head F10 source recompiles byte for byte to the chain-head F10 '
+                   'SPV with glslang 16.5.0.',
+         method='raw sha256 compare', sha256=parent_raw_sha, expected=PARENT_SPV_SHA, result='PASS'),
+    dict(id='B2-candidate-valid',
+         statement='candidate.spv passes spv_validate_cpu.',
+         output=vlog.strip()[:400], ok=spv_valid, result='PASS' if spv_valid else 'FAIL'),
+    dict(id='B3-plan-scope',
+         statement='plan.txt swaps exactly the sixteen F10 PASS lines of the chain head, keeps '
+                   '232 PASS blocks, and every differing line is one of those sixteen.',
+         passes_replaced=16, passes_in_plan=232, differing_lines=len(diff_lines),
+         only_f10_lines_changed=only_f10, differing_pass_ordinals=diff_pass_ordinals,
+         cpu_check=cpu_log.strip(), result='PASS' if cpu_ok else 'FAIL'),
+    dict(id='A1-three-b-regions-unchanged',
+         statement='The accepted asset is untouched at source level: the three weight fragment '
+                   'loads (b0,b1,b2) and the six accumulator statements are byte-identical to the '
+                   'parent and in the same order, each B fragment still feeds exactly two DPAS, '
+                   'and the weight read count per k-step per SG is still 3. Physical separation '
+                   'of the three return regions stays a native question (P1).',
+         method='line-level comparison of the weight-load and DPAS statements',
+         detail=b_asset, result='PASS'),
+    dict(id='B4-counter-parity',
+         statement='No read/write/DPAS counter changed: residual loads, SLM stores, weight '
+                   'fragment loads, A fragment loads, DPAS and barrier statements are identical '
+                   'in count between parent and candidate source (the barrier is only moved).',
+         counts=counts, ring_order=ring_order, result='PASS'),
+]
+
+build = dict(
+    card='n10b-f10-pipeline',
+    family='F10',
+    shader_group='s22_register_p (16 PASS)',
+    pass_ordinals=PASS_ORDINALS,
+    parent=dict(plan=ident(PARENT_PLAN), spv=ident(PARENT_SPV), source=ident(PARENT_SRC)),
+    baseline_of_parent=BASE_OF_BASELINE,
+    parent_reproduction=dict(raw_sha256=parent_raw_sha, expected_sha256=PARENT_SPV_SHA,
+                             exact=PARENT_REPRO,
+                             note='glslang 16.5.0 -V --target-env vulkan1.3 with the site '
+                                  'include dir; no decoration transfer needed'),
+    candidate=dict(spv=ident(S / 'candidate.spv'), source=ident(S / 'candidate.comp')),
+    plan=dict(path=str(S / 'plan.txt'), sha256=plan_sha, parent_sha256=PARENT_PLAN_SHA,
+              passes_replaced=16, passes_in_plan=232, differing_lines=len(diff_lines),
+              only_f10_lines_changed=only_f10,
+              differing_pass_ordinals=diff_pass_ordinals),
+    float_NC_checked=float_NC_checked,
+    nc_parent_ids=len(parent_nc),
+    nc_paired_ids=len(keep),
+    nc_candidate_raw_ids=len(cand_nc),
+    nc_histogram={str(k): v for k, v in nc_hist_parent.items()},
+    nc_self_consistent=nc_self_consistent,
+    nc_multiset_equal=nc_multiset_equal,
+    nc_reemit_identical=nc_reemit_identical,
+    nc_operand_signature_mismatches=mismatch,
+    spirv_static=spirv_delta,
+    loops=dict(parent=loop_parent, candidate=loop_cand),
+    spv_validate_cpu=dict(ok=spv_valid, output=vlog.strip()[:400]),
+    cpu_check=dict(ok=cpu_ok, output=cpu_log.strip()),
+    proofs=dict(staged_slice_bijection=len(cells), fragment_addresses_checked=fragment_ok,
+                address_hoist_identity_checks=hoist_checks,
+                address_hoist_max_invalid_address=max_invalid_addr,
+                input_buffer_halves=input_halves,
+                hazard=hazard),
+    counts=counts,
+    ring_order=ring_order,
+    b_asset=b_asset,
+    edits=[dict(count=e['count'], before=e['before'][:600], after=e['after'][:600])
+           for e in edits],
+)
+(S / 'BUILD.json').write_text(json.dumps(build, indent=2), encoding='utf-8')
+(S / 'PROOF.json').write_text(json.dumps(dict(
+    card='n10b-f10-pipeline', family='F10', status='BUILT_AWAITING_GPU',
+    identity=dict(
+        parent_plan=ident(PARENT_PLAN), parent_spv=ident(PARENT_SPV),
+        parent_source=ident(PARENT_SRC),
+        candidate_plan=dict(path=str(S / 'plan.txt'), sha256=plan_sha),
+        candidate_spv=ident(S / 'candidate.spv'),
+        candidate_source=ident(S / 'candidate.comp')),
+    claims=claims,
+    hazard_model=dict(
+        model='Each thread executes a fixed program order; a workgroup barrier is the only '
+              'cross-thread ordering point and every event carries the number of barriers '
+              'completed before it in that thread. A hazard is closed when at least one '
+              'barrier lies between the two accesses.',
+        parent=hazard['parent'], candidate=hazard['candidate']),
+    unproven=[
+        'actual GRF allocation / spill (scratch must be 0 in native: hard gate, revert if > 0)',
+        'whether IGC issues the sixteen staging UGM sends before the DPAS block (P2a) and, '
+        'more strongly, whether it sinks the sixteen SLM stores below the DPAS (P2b)',
+        'whether the three weight sends still return three disjoint 8-GRF regions before the '
+        'first DPAS (P1) after the ring moved two staging blocks ahead of them',
+        'any timing effect (no GPU work in this card)']), indent=2), encoding='utf-8')
+
+print(json.dumps(dict(
+    parent_repro=PARENT_REPRO,
+    parent_spv_sha=parent_raw_sha,
+    cand_spv_sha=sha(S / 'candidate.spv'),
+    cand_src_sha=sha(S / 'candidate.comp'),
+    plan_sha=plan_sha,
+    float_NC_checked=float_NC_checked,
+    nc_parent=len(parent_nc), nc_cand_raw=len(cand_nc),
+    nc_self_consistent=nc_self_consistent, nc_reemit_identical=nc_reemit_identical,
+    spv_valid=spv_valid, cpu_ok=cpu_ok, cpu_log=cpu_log.strip(),
+    diff_lines=len(diff_lines), only_f10=only_f10, diff_pass_ordinals=diff_pass_ordinals,
+    spirv_static=spirv_delta,
+    parent_loops=loop_parent['loops'][0], cand_loops=loop_cand['loops'][0],
+    counts=counts), indent=2))

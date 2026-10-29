@@ -1,0 +1,161 @@
+"""Build identity + candidate for card n04a-f05-c64-feed (F05 C64 QKV feed).
+
+Everything here is CPU only.  Steps
+  1. byte-reproduce the parent SPV (the current baseline group identity) from the
+     baseline source with the campaign toolchain,
+  2. produce candidate.comp by re-associating only the *integer* B-feed address
+     expression (one shared scalar per K step, six constant offsets),
+  3. compile it, verify the NoContraction set site by site against the parent,
+  4. validate the SPV, derive plan.txt (8 PASS) and run the CPU plan check.
+
+Writes only inside cards/n04a-f05-c64-feed/.
+"""
+import difflib
+import json
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+import COMMON as K
+import spv_tools_local as ST
+
+CARD = K.C / 'cards' / 'n04a-f05-c64-feed'
+BUILD = CARD / 'build'
+ORD = 7
+GROUP = [7, 10, 13, 16, 215, 218, 221, 224]
+
+IDENT_RE = re.compile(r'^(\s*)')
+
+
+def patch_source(text):
+    """Return (candidate_text, [(lineno, old, new), ...])."""
+    subs = []
+
+    # 1. row-phase invariant weight base, right after the QKV comment line.
+    anchor = ("    // ---- QKV projection: unchanged (one A fragment feeds all six accumulators) ----\n"
+              "    for(uint row_phase=0u;row_phase<2u;++row_phase) {\n")
+    new_anchor = (
+        "    // ---- QKV projection: one A fragment feeds all six accumulators ----\n"
+        "    // B-feed address base.  96*h is a multiple of 16 for every h and the six\n"
+        "    // fragment offsets are multiples of 16, so (96h+n)/16 == 6h + n/16 exactly:\n"
+        "    // this is the parent's element index, re-associated, not a new address.\n"
+        "    const uint wq_row = wq + ((96u * h) / 16u) * 1024u;\n"
+        "    for(uint row_phase=0u;row_phase<2u;++row_phase) {\n")
+    subs.append((anchor, new_anchor))
+
+    # 2. one shared address value per K step.
+    old_k = "        for (uint k0 = 0u; k0 < 64u; k0 += 16u) {\n            MAT_A a;"
+    new_k = ("        for (uint k0 = 0u; k0 < 64u; k0 += 16u) {\n"
+             "            // One address value spans all six weight sends of this K step.\n"
+             "            // The parent evaluated wq + ((96h+n)/16*4 + k0/16)*256 at every\n"
+             "            // load site, so each address temporary died at its own send and\n"
+             "            // could be allocated inside that send's weight return region.\n"
+             "            const uint wk = wq_row + (k0 / 16u) * 256u;\n"
+             "            MAT_A a;")
+    subs.append((old_k, new_k))
+
+    # 3. the six B loads: identical element indices, constant offsets from wk.
+    for n, off in ((0, 0), (16, 1024), (32, 2048), (48, 3072), (64, 4096), (80, 5120)):
+        old = ("coopMatLoad(b%d, pack, wq + (((96u * h + %du) / 16u) * 4u + k0 / 16u) * 256u, 16u, LCOL);"
+               % (0 if off % 2048 == 0 else 1, n))
+        new = "coopMatLoad(b%d, pack, wk + %uu, 16u, LCOL);" % (0 if off % 2048 == 0 else 1, off)
+        subs.append((old, new))
+
+    out = text
+    applied = []
+    for old, new in subs:
+        cnt = out.count(old)
+        assert cnt == 1, ('anchor not unique', cnt, old[:70])
+        applied.append((old, new))
+        out = out.replace(old, new)
+    return out, applied
+
+
+def opcode_class(op):
+    INT_CF = {128, 130, 132, 134, 135, 137, 138, 139}
+    return 'integer_NC' if op in INT_CF else 'float_NC'
+
+
+def nc_sites(module):
+    """[(result_id, opcode, class)] for every NoContraction decoration."""
+    ids = set(ST.no_contraction_ids(module))
+    out = []
+    for op, ops, _, _ in module.instructions:
+        rid = None
+        try:
+            rid = ops[1] if op not in (19, 20, 21, 22, 26, 27, 28, 30, 32, 33, 17, 4456, 4457, 4458) else ops[0]
+        except IndexError:
+            continue
+        if rid in ids:
+            out.append((rid, op, opcode_class(op)))
+    seen = set()
+    uniq = []
+    for r in out:
+        if r[0] in seen:
+            continue
+        seen.add(r[0])
+        uniq.append(r)
+    return uniq
+
+
+def main():
+    BUILD.mkdir(parents=True, exist_ok=True)
+    row = K.row_by_ordinal(ORD)
+    parent_spv = Path(row['spv'])
+    parent_src = Path(row['source'])
+    parent_text = parent_src.read_text(encoding='utf-8-sig')
+
+    (CARD / 'parent-rebuild.comp').write_text(parent_text, encoding='utf-8')
+    inc = K.include_dirs_for(ORD, parent_src)
+    K.compile_glsl(parent_src, BUILD / 'parent-raw.spv', inc)
+    parent_sha = K.sha(BUILD / 'parent-raw.spv')
+    print('parent rebuild sha :', parent_sha)
+    print('baseline group sha :', row['spv_sha256'])
+    print('byte identical     :', parent_sha == row['spv_sha256'])
+    assert parent_sha == row['spv_sha256'], 'parent does not reproduce'
+
+    cand_text, applied = patch_source(parent_text)
+    (CARD / 'candidate.comp').write_text(cand_text, encoding='utf-8')
+    K.compile_glsl(CARD / 'candidate.comp', BUILD / 'candidate-raw.spv', inc)
+    cand_sha = K.sha(BUILD / 'candidate-raw.spv')
+    print('candidate sha      :', cand_sha)
+    print('candidate != parent:', cand_sha != parent_sha)
+
+    # NoContraction site-by-site comparison
+    pm = ST.Module(parent_spv)
+    cm = ST.Module(BUILD / 'candidate-raw.spv')
+    ps = nc_sites(pm)
+    cs = nc_sites(cm)
+    print('parent NC sites    :', len(ps), {k: sum(1 for s in ps if s[2] == k) for k in ('float_NC', 'integer_NC')})
+    print('candidate NC sites :', len(cs), {k: sum(1 for s in cs if s[2] == k) for k in ('float_NC', 'integer_NC')})
+
+    # alignment check: transfer the parent pattern onto the candidate and see
+    # whether the resulting set is exactly the candidate's own set.
+    keep, info = ST.transfer_decoration_pattern_aligned(pm, cm, set())
+    same = sorted(keep) == sorted(x[0] for x in cs)
+    print('aligned pattern == candidate own NC set:', same)
+    print('alignment mapped functions:', info['functions_mapped'])
+
+    # exact per-site table: parent site -> candidate site, via the alignment
+    table = []
+    same_sig = 0
+    same_op = 0
+    keep_set = set(keep)
+    for pid, pop, pcls in ps:
+        table.append(dict(parent_id=pid, parent_op=pop, cls=pcls,
+                          mapped_into_candidate=(pid in keep_set)))
+    for cid, cop, ccls in cs:
+        table.append(dict(candidate_id=cid, candidate_op=cop, cls=ccls))
+    K.write_json(BUILD / 'nc-sites.json', dict(
+        parent=[dict(id=i, op=o, cls=c) for i, o, c in ps],
+        candidate=[dict(id=i, op=o, cls=c) for i, o, c in cs],
+        aligned_equals_candidate=same,
+        functions_mapped=info['functions_mapped'],
+        parent_decorations_total=info['parent_decorations_total']))
+
+    print(json.dumps(dict(applied=len(applied)), indent=1))
+
+
+if __name__ == '__main__':
+    main()

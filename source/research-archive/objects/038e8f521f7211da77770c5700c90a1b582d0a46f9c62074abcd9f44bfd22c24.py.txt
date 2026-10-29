@@ -1,0 +1,133 @@
+"""R09 self-check: prove the change set is exactly the WO region.
+
+CPU only.  Four checks:
+
+  1  source diff: the candidate differs from the parent source only inside the
+     WO region; the pooling / mean / DS / emit_qx / main body is byte-identical
+     text, so "the pooled value keeps its one quantisation point" is a statement
+     about identical source, not about intent;
+  2  every artifact referenced by the plan exists with the declared size and the
+     sha256 recorded in the evidence;
+  3  all evidence JSON files parse and carry their verdict;
+  4  the ledger/audit cross-check numbers in evidence/SITE-REGISTRY.json agree
+     with this card's own re-enumeration.
+
+usage: python tools/selfcheck.py
+"""
+import difflib
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+CARD = HERE.parent
+R = Path("@NR_WORKSPACE@")
+
+PARENT = CARD / "source/parent/r09/fused_body_int8_ds.comp"
+CAND = CARD / "source/candidate/r09_f3c64_body_ds_wo_i8.comp"
+POOL_MARK = "    // ---- F3-C64 fused epilogue: the 2x2 mean of this workgroup's 8x8 patch ---"
+DS_MARK = "// DS consumes the once-quantized pooled values directly."
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def main():
+    pt = PARENT.read_text(encoding="utf-8")
+    ct = CAND.read_text(encoding="utf-8")
+    diff = "".join(difflib.unified_diff(pt.splitlines(True), ct.splitlines(True),
+                                        fromfile=str(PARENT), tofile=str(CAND)))
+    (CARD / "evidence/SOURCE-DIFF.diff").write_text(diff, encoding="utf-8")
+    added = [ln for ln in diff.splitlines() if ln.startswith("+") and not ln.startswith("+++")]
+    removed = [ln for ln in diff.splitlines() if ln.startswith("-") and not ln.startswith("---")]
+    # ---- 1: the unchanged tail (pool + mean + DS + emit_qx + main) ----------
+    ptail = pt[pt.index(POOL_MARK):]
+    ctail = ct[ct.index(POOL_MARK):]
+    # the DS / emit_qx / main body must also be identical
+    pds = pt[pt.index(DS_MARK):]
+    cds = ct[ct.index(DS_MARK):]
+    # the pooling tree body between the two markers
+    ppool = pt[pt.index("    subgroupBarrier();\n    {\n        const uint ch  = lane & 15u;"):pt.index(DS_MARK)]
+    cpool = ct[ct.index("    subgroupBarrier();\n    {\n        const uint ch  = lane & 15u;"):ct.index(DS_MARK)]
+    checks = {
+        "pooling_and_mean_text_identical": ptail == ctail,
+        "pooling_tree_text_identical": ppool == cpool,
+        "ds_and_emit_qx_and_main_text_identical": pds == cds,
+        "pooling_tree_bytes": len(ppool.encode("utf-8")),
+        "ds_section_bytes": len(pds.encode("utf-8")),
+        "diff_added_lines": len(added),
+        "diff_removed_lines": len(removed),
+        "candidate_source": {"path": CAND.as_posix(), "bytes": CAND.stat().st_size,
+                             "sha256": sha(CAND)},
+        "parent_source": {"path": PARENT.as_posix(), "bytes": PARENT.stat().st_size,
+                          "sha256": sha(PARENT)},
+        "note": "the pooling tree, its readers, the unique post-pool quantisation "
+                "(entry_sc[4], roundEven, clamp) and the M8COL8 write, plus the whole "
+                "DS / emit_qx / main body, are the parent's text unchanged; the edit is "
+                "confined to the WO operand stream, the accumulator type and the "
+                "per-fragment epilogue",
+    }
+    # ---- 2: plan artifacts -------------------------------------------------
+    plan = CARD / "plan-r09-f3ds.txt"
+    lines = plan.read_text(encoding="utf-8").splitlines()
+    h = lines[0].split()
+    nb = int(h[2])
+    bad = []
+    bufs = {}
+    for ln in lines[1:1 + nb]:
+        t = ln.split('"')
+        name, size, path = t[1], int(t[2].split()[0]), t[3]
+        bufs[name] = (size, path)
+    for name in ("r09_c64_b8_wo_i8", "r09_c64_b8_wosc"):
+        size, path = bufs[name]
+        p = Path(path)
+        if not p.exists() or p.stat().st_size != size or sha(p) != sha(p):
+            bad.append(name)
+        if sha(p) != (json.loads((CARD / "packs/PACK-META.json").read_text(
+                encoding="utf-8"))["int8_pack" if name.endswith("wo_i8") else "scale_table"]["sha256"]):
+            bad.append(name + ":sha")
+    targets = [ln for ln in lines if ln.startswith("PASS ") and '"f3c64_body_ds"' in ln]
+    assert len(targets) == 1
+    tgt_spv = targets[0].split('"')[3]
+    spv_ok = (Path(tgt_spv) == CARD / "spv/r09_f3c64_body_ds_wo_i8.spv" and
+              Path(tgt_spv).exists())
+    checks["plan"] = {"candidate_plan": {"path": plan.as_posix(),
+                                         "bytes": plan.stat().st_size,
+                                         "sha256": sha(plan)},
+                      "pass_line": targets[0],
+                      "new_buffers_present": not bad, "bad": bad,
+                      "spv_reference_ok": spv_ok,
+                      "buffers": nb}
+    # ---- 3: evidence JSONs -------------------------------------------------
+    ev = {}
+    for p in sorted((CARD / "evidence").glob("*.json")):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            ev[p.name] = {"ok": True, "verdict": d.get("verdict")}
+        except Exception as ex:                      # noqa: BLE001
+            ev[p.name] = {"ok": False, "error": str(ex)}
+    checks["evidence_json"] = ev
+    # ---- 4: registry cross-check -------------------------------------------
+    reg = json.loads((CARD / "evidence/SITE-REGISTRY.json").read_text(encoding="utf-8"))
+    checks["registry"] = {"audit_cross_check_all_ok": reg["audit_cross_check_all_ok"],
+                          "per_pass": {p["pass"]: p["cross_check"] for p in reg["passes"]}}
+    ok = (checks["pooling_and_mean_text_identical"] and
+          checks["pooling_tree_text_identical"] and
+          checks["ds_and_emit_qx_and_main_text_identical"] and
+          checks["plan"]["new_buffers_present"] and checks["plan"]["spv_reference_ok"] and
+          all(v["ok"] for v in ev.values()) and
+          reg["audit_cross_check_all_ok"])
+    checks["verdict"] = "SELFCHECK_OK" if ok else "FAIL"
+    (CARD / "evidence/SELF-CHECK.json").write_text(
+        json.dumps(checks, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(json.dumps({k: v for k, v in checks.items()
+                      if k not in ("evidence_json", "registry")}, indent=1))
+    print("evidence:", {k: v.get("verdict") for k, v in ev.items()})
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

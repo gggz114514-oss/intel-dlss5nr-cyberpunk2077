@@ -1,0 +1,163 @@
+"""n36-f05-arena-shrink: compile + validate the three candidates, collect SPIR-V facts.
+
+CPU only.  Writes build/build.json.
+"""
+import collections
+import hashlib
+import json
+import pathlib
+import subprocess
+import sys
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST          # noqa: E402
+
+W = pathlib.Path('@NR_WORKSPACE@')
+A = W / 'work/codex-astra-fp16-int8-audit-20261024'
+C = A / 'fullnet-continuous-20261027'
+CARD = C / 'cards/n36-f05-arena-shrink'
+GLSLANG = W / 'src/project/tools/glslang-16.5.0/bin/glslang.exe'
+VALIDATE = W / 'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'
+JOIN = W / 'work/zcode-fp16-fullnet-handoff-20261024/candidates/f01-f02-f05-f21'
+
+INCLUDES = {
+    'c64': [JOIN / 'f05-c64-join-t3-v1/source'],
+    'c128': [JOIN / 'f05-c128-join-t3-v1/source'],
+    'c256': [JOIN / 'f05-c256-join-t3-v1/source', C / 'cards/n05a-f05-c256-mreuse'],
+}
+
+OPNAME = {
+    12: 'OpExtInst', 43: 'OpConstant', 59: 'OpVariable', 61: 'OpLoad', 62: 'OpStore',
+    65: 'OpAccessChain', 224: 'OpControlBarrier', 225: 'OpMemoryBarrier',
+    246: 'OpLoopMerge', 247: 'OpSelectionMerge', 4456: 'OpTypeCooperativeMatrixKHR',
+    4457: 'OpCooperativeMatrixLoadKHR', 4458: 'OpCooperativeMatrixStoreKHR',
+    4459: 'OpCooperativeMatrixMulAddKHR',
+}
+SCOPE = {0: 'CrossDevice', 1: 'Device', 2: 'Workgroup', 3: 'Subgroup', 4: 'Invocation'}
+CM_LOAD, CM_STORE, CM_MULADD, BARRIER = 4457, 4458, 4459, 224
+FP_OPS = {127, 129, 131, 133, 135, 140, 141, 142}
+FP_EXT = {4, 8, 10, 26, 27, 28, 31, 32, 37, 40, 43, 46, 49, 50}
+
+
+def sha(p):
+    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+
+
+def run(argv):
+    r = subprocess.run([str(x) for x in argv], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    return r.returncode, (r.stdout or '') + (r.stderr or '')
+
+
+def barriers(m):
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+    out = []
+    for i, (op, ops, _, _) in enumerate(m.instructions):
+        if op != BARRIER:
+            continue
+        ex, me, sem = (const.get(ops[0], ops[0]), const.get(ops[1], ops[1]),
+                       const.get(ops[2], ops[2]))
+        out.append(dict(index=i, execution_scope=SCOPE.get(ex, ex),
+                        memory_scope=SCOPE.get(me, me), semantics=sem,
+                        raw=[ex, me, sem]))
+    return out
+
+
+def movement(m):
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+    loads, stores = [], []
+    for op, ops, _, _ in m.instructions:
+        if op not in (CM_LOAD, CM_STORE):
+            continue
+        rec = dict(layout=const.get(ops[3], ops[3]), stride=const.get(ops[4], ops[4]),
+                   coll=const.get(ops[5], ops[5]) if len(ops) > 5 else None)
+        (loads if op == CM_LOAD else stores).append(rec)
+    return loads, stores
+
+
+def fp_multiset(m):
+    bag = collections.Counter()
+    for op, ops, _, _ in m.instructions:
+        rid = ST.result_id_of(op, ops)
+        if rid is None:
+            continue
+        if op in FP_OPS:
+            bag[('op', op, ST.Module.operand_signature(m, rid, 3))] += 1
+        elif op == 12 and len(ops) > 3 and ops[3] in FP_EXT:
+            bag[('ext', ops[3], tuple(ST.Module.operand_signature(m, x, 2)
+                                      for x in ops[4:7]))] += 1
+    return bag
+
+
+def main():
+    out = {}
+    for g in ('c64', 'c128', 'c256'):
+        rec = {}
+        comp = CARD / ('candidate-%s.comp' % g)
+        spv = CARD / ('candidate-%s.spv' % g)
+        rec['source'] = dict(path=str(comp), sha256=sha(comp))
+        argv = [GLSLANG, '-V', '--target-env', 'vulkan1.3']
+        for d in INCLUDES[g]:
+            argv.append('-I' + str(d))
+        argv += [comp, '-o', spv]
+        rc, log = run(argv)
+        assert rc == 0, (g, log)
+        rec['compile_argv'] = [str(x) for x in argv]
+        rec['spv'] = dict(path=str(spv), sha256=sha(spv), bytes=spv.stat().st_size)
+        rc, log = run([VALIDATE, spv])
+        rec['validate'] = dict(exit=rc, log=log.strip()[:400])
+        assert rc == 0, (g, 'validation failed', log)
+        parent = ST.Module(CARD / ('parent-rebuild-%s.spv' % g))
+        cand = ST.Module(spv)
+        rec['instructions'] = dict(parent=len(parent.instructions),
+                                   candidate=len(cand.instructions))
+        rec['words'] = dict(parent=len(parent.words), candidate=len(cand.words))
+        sp, sc = parent.storage_bytes(), cand.storage_bytes()
+        rec['storage_bytes'] = dict(parent=sp, candidate=sc,
+                                    identical=sp == sc)
+        bp, bc = barriers(parent), barriers(cand)
+        rec['barriers'] = dict(
+            parent=len(bp), candidate=len(bc), delta=len(bc) - len(bp),
+            parent_signature=sorted({(b['execution_scope'], b['memory_scope'],
+                                      b['semantics']) for b in bp}),
+            candidate_signature=sorted({(b['execution_scope'], b['memory_scope'],
+                                         b['semantics']) for b in bc}),
+            candidate_sites=bc)
+        lp, sp_ = movement(parent)
+        lc, sc_ = movement(cand)
+        rec['coopmat'] = {
+            'parent': dict(loads=len(lp), stores=len(sp_)),
+            'candidate': dict(loads=len(lc), stores=len(sc_)),
+            'parent_stride_hist': dict(collections.Counter(x['stride'] for x in lp + sp_)),
+            'candidate_stride_hist': dict(collections.Counter(x['stride'] for x in lc + sc_)),
+            'parent_load_stride_hist': dict(collections.Counter(x['stride'] for x in lp)),
+            'candidate_load_stride_hist': dict(collections.Counter(x['stride'] for x in lc)),
+            'identical_loads': len(lp) == len(lc),
+            'identical_stores': len(sp_) == len(sc_),
+        }
+        fp, fc = fp_multiset(parent), fp_multiset(cand)
+        rec['fp_multiset'] = dict(parent=sum(fp.values()), candidate=sum(fc.values()),
+                                  identical=fp == fc,
+                                  parent_only=[str(k) for k in (fp - fc)][:20],
+                                  candidate_only=[str(k) for k in (fc - fp)][:20])
+        ncp = len(ST.no_contraction_ids(parent))
+        ncc = len(ST.no_contraction_ids(cand))
+        rec['no_contraction'] = dict(parent=ncp, candidate=ncc)
+        hp = collections.Counter(op for op, _, _, _ in parent.instructions)
+        hc = collections.Counter(op for op, _, _, _ in cand.instructions)
+        rec['opcode_delta'] = {OPNAME.get(k, 'op%d' % k): [hp.get(k, 0), hc.get(k, 0)]
+                               for k in sorted(set(hp) | set(hc))
+                               if hp.get(k, 0) != hc.get(k, 0)}
+        rec['dpas'] = dict(parent=hp.get(CM_MULADD, 0), candidate=hc.get(CM_MULADD, 0))
+        out[g] = rec
+        print('%-5s spv=%s bytes=%d insn %d->%d barriers %d->%d wg %s->%s nc %d->%d dpas %d->%d'
+              % (g, rec['spv']['sha256'][:16], rec['spv']['bytes'],
+                 rec['instructions']['parent'], rec['instructions']['candidate'],
+                 len(bp), len(bc), sp['Workgroup']['bytes'], sc['Workgroup']['bytes'],
+                 ncp, ncc, rec['dpas']['parent'], rec['dpas']['candidate']))
+    (CARD / 'build/build.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

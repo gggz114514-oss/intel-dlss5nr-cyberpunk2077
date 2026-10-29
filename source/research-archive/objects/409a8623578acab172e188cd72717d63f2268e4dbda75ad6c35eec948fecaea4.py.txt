@@ -1,0 +1,167 @@
+"""S07 split16 b23 l0/l1 CPU model: FP16 reference and INT8 pipeline.
+
+Layout facts (audited against the FP16 parent shaders):
+  weights.fp16.bin half offsets from push p2/p3:
+    W1  = p2.x (0)        stage1 [512 out][512 in], 16x16 blocked
+    W2  = p2.y (262144)   stage2 [2048 out][64 in], 16x16 blocked
+    W3  = p2.z (393216)   stage3 [512 out][256 in], 16x16 blocked
+    Wc  = p2.w (524288)   contract [512 out][512 in], row-major [n][k]
+    rs  = p3.x (786432)   residual diagonal [512]
+  l0 int8 pack (536584 B): w8(262144) wsc(512 f32) w2(131072) wsc2(2048 f32)
+                           w3(131072) wsc3(512 f32) invs(2 f32)
+  l1 int8 pack (264192 B): w8(262144) wsc(512 f32)
+  int8 weight layout: 32x32 tiles, tile(n,k) = ((n/32)*(K/32)+(k/32))*1024 + (n%32)*32 + (k%32)
+"""
+from __future__ import annotations
+
+import numpy as np
+
+TOKENS = 1152
+
+
+def f16(x):
+    return np.asarray(x, dtype=np.float16).astype(np.float32)
+
+
+def code(x):
+    """S8 symmetric RNE clamp [-127,127] (numpy rint is round-half-to-even)."""
+    return np.clip(np.rint(np.asarray(x, np.float32)), -127.0, 127.0)
+
+
+def tiled(t, c, C=512):
+    return ((t // 16) * (C // 16) + c // 16) * 256 + (t % 16) * 16 + c % 16
+
+
+def unload(raw_half, tokens=TOKENS, C=512):
+    idx = np.fromiter((tiled(t, c, C) for t in range(tokens) for c in range(C)),
+                      dtype=np.int64, count=tokens * C)
+    return raw_half[idx].reshape(tokens, C)
+
+
+def load_half(path, tokens=TOKENS, C=512):
+    return unload(np.fromfile(path, dtype="<f2").astype(np.float32), tokens, C)
+
+
+# ---------- weight decoders ----------
+def dec16(wp, off, N, K):
+    """FP16 16x16-blocked [n][k] matrix -> [N,K] float32."""
+    n = np.arange(N)[:, None]
+    k = np.arange(K)[None, :]
+    idx = off + (n // 16) * ((K // 16) * 256) + (k // 16) * 256 + (n % 16) * 16 + (k % 16)
+    return wp[idx]
+
+
+def enc16(w, off, N, K):
+    raise NotImplementedError
+
+
+def dec32(w8, N, K):
+    """int8 32x32-tile [n][k] -> [N,K] int32."""
+    n = np.arange(N)[:, None]
+    k = np.arange(K)[None, :]
+    idx = ((n // 32) * (K // 32) + (k // 32)) * 1024 + (n % 32) * 32 + (k % 32)
+    return w8[idx]
+
+
+def enc32(w8):
+    """[N,K] int8 values -> flat 32x32-tile pack."""
+    N, K = w8.shape
+    out = np.zeros((N // 32, K // 32, 32, 32), np.int8)
+    for nb in range(N // 32):
+        for kb in range(K // 32):
+            out[nb, kb] = w8[nb * 32:(nb + 1) * 32, kb * 32:(kb + 1) * 32]
+    return out.ravel()
+
+
+def activation(x):
+    """split16_common.glsl activation(): half math, fma fused, one cast per step."""
+    x = f16(x)
+    t = np.clip(x, np.float32(-4.0), np.float32(4.0)).astype(np.float16)
+    u = (np.float32(-0.055908203125) * np.abs(t.astype(np.float32))
+         + np.float32(0.447265625))
+    u = u.astype(np.float16)
+    v = (t.astype(np.float32) * u.astype(np.float32) + np.float32(0.89453125)).astype(np.float16)
+    return (x * v.astype(np.float32)).astype(np.float16).astype(np.float32)
+
+
+class Pack:
+    """Decoded l0 / l1 int8 packs plus the FP16 reference weights."""
+
+    def __init__(self, l0_bytes: bytes, l1_bytes: bytes, fp16_path, p2, p3):
+        a = np.frombuffer(l0_bytes, np.uint8)
+        self.w1q = a[:262144].view(np.int8).astype(np.int32)
+        self.wsc1 = a[262144:264192].view("<f4").copy()
+        self.w2q = a[264192:395264].view(np.int8).astype(np.int32)
+        self.wsc2 = a[395264:403456].view("<f4").copy()
+        self.w3q = a[403456:534528].view(np.int8).astype(np.int32)
+        self.wsc3 = a[534528:536576].view("<f4").copy()
+        self.invs = a[536576:536584].view("<f4").copy()
+        b = np.frombuffer(l1_bytes, np.uint8)
+        self.wcq = b[:262144].view(np.int8).astype(np.int32)
+        self.wscL = b[262144:264192].view("<f4").copy()
+        wp = np.fromfile(fp16_path, dtype="<f2").astype(np.float32)
+        self.W1 = dec16(wp, p2[0], 512, 512)
+        self.W2 = dec16(wp, p2[1], 2048, 64)
+        self.W3 = dec16(wp, p2[2], 512, 256)
+        # contract weight is plain row-major [N][K]: the l1 B fragment is loaded
+        # COL with stride 512, i.e. element (k,n) at wb + n*512 + k.
+        self.Wc = wp[p2[3]:p2[3] + 512 * 512].reshape(512, 512).copy()
+        self.rs = wp[p3[0]:p3[0] + 512].copy()
+        del wp
+        # dequantised int8 weights (needs the X scale of each pack)
+        self.W1q_m = dec32(self.w1q, 512, 512).astype(np.float32)
+        self.W2q_m = dec32(self.w2q, 2048, 64).astype(np.float32)
+        self.W3q_m = dec32(self.w3q, 512, 256).astype(np.float32)
+        self.Wcq_m = dec32(self.wcq, 512, 512).astype(np.float32)
+
+
+def fp16_forward(pk: Pack, X):
+    """FP16 parent semantics: stage1 -> sr(half) -> stage2 -> act(half) -> stage3 -> F(half)
+    then contract + seed in fp32, narrowed once to half."""
+    sr = f16(X @ pk.W1.T)
+    sa = np.empty((X.shape[0], 2048), np.float32)
+    for g in range(8):
+        sa[:, g * 256:(g + 1) * 256] = f16(sr[:, g * 64:(g + 1) * 64] @ pk.W2[g * 256:(g + 1) * 256].T)
+    sa = activation(sa)
+    F = np.empty((X.shape[0], 512), np.float32)
+    for g in range(8):
+        F[:, g * 64:(g + 1) * 64] = f16(sa[:, g * 256:(g + 1) * 256] @ pk.W3[g * 64:(g + 1) * 64].T)
+    seed = f16(X * pk.rs)
+    Y = f16(F @ pk.Wc.T + seed)
+    return F, Y
+
+
+def int8_forward(pk: Pack, X, sx, sr_scale, sa_scale, sf_scale,
+                 dx=None, df=None, invR=None, invA=None, invF=None):
+    """Current INT8 pipeline.
+
+    dx / df : per-input-channel power-of-two divisors (X / dx, F / df), folded in W.
+    sx ...  : scalar static quant steps (X, stage1-out, activation, contract input).
+    invR/A/F: optional per-channel inverse arrays overriding 1/scale.
+    """
+    n = X.shape[0]
+    invx = (1.0 / sx) / dx if dx is not None else np.float32(1.0 / sx)
+    qx = code(X * invx)
+    sr = f16((qx @ pk.W1q_m.T) * pk.wsc1)
+    qr = code(f16(sr) * (invR if invR is not None else np.float32(1.0 / sr_scale)))
+    sa = np.empty((n, 2048), np.float32)
+    for g in range(8):
+        sa[:, g * 256:(g + 1) * 256] = f16(
+            (qr[:, g * 64:(g + 1) * 64] @ pk.W2q_m[g * 256:(g + 1) * 256].T) * pk.wsc2[g * 256:(g + 1) * 256])
+    act = activation(sa)
+    qa = code(act * (invA if invA is not None else np.float32(1.0 / sa_scale)))
+    F = np.empty((n, 512), np.float32)
+    for g in range(8):
+        F[:, g * 64:(g + 1) * 64] = f16(
+            (qa[:, g * 256:(g + 1) * 256] @ pk.W3q_m[g * 64:(g + 1) * 64].T) * pk.wsc3[g * 64:(g + 1) * 64])
+    qf = code(F * (invF if invF is not None else np.float32(1.0 / sf_scale)))
+    acc = (qf @ pk.Wcq_m.T) * pk.wscL
+    seed = f16(X * pk.rs)
+    Y = f16(acc + seed)
+    return F, Y, qx, qr, qa, qf
+
+
+def rel_l2(a, b, tokens=slice(0, 1056)):
+    a = a[tokens].astype(np.float64)
+    b = b[tokens].astype(np.float64)
+    return float(np.linalg.norm(a - b) / np.linalg.norm(b))

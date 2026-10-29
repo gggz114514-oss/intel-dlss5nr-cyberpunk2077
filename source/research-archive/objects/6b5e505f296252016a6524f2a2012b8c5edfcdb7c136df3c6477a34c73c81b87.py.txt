@@ -1,0 +1,192 @@
+"""Identity kit: rebuild a baseline SPV from source bytes with a declarative recipe.
+
+Recipe fields
+-------------
+  source        : Path to the .comp that produced the SPV
+  include_dirs  : ordered -I list appended after the source's own directory
+  defines       : list of "NAME=VALUE" / "NAME" strings passed as -D
+  nc            : NoContraction restoration strategy (see apply_nc)
+
+Strategies for `nc` (all CPU-only, glslang + local SPIR-V word surgery):
+  {"mode": "raw"}                                    -- compiler output as-is
+  {"mode": "parent", "parent": <spv>}                -- whole pattern transferred
+  {"mode": "parent", "parent": <spv>,
+     "own_region": "<fn>"}                            -- pattern + child's own FP nodes in <fn>
+  {"mode": "parent", "parent": <spv>,
+     "drop_region": "<fn>"}                           -- parent's <fn> pattern excluded,
+                                                         child's FP nodes in <fn> kept
+  {"mode": "parent", "parent": <spv>, "drop_vmul": true} -- parent's FP16 vector *FMul*
+                                                         decorations excluded, child's kept
+
+Everything is read-only except the caller's output directory.
+"""
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+W = Path('@NR_WORKSPACE@')
+GLSLANG = W / 'src/project/tools/glslang-16.5.0/bin/glslang.exe'
+SPV_TOOLS = W / 'build/zcode-fp16-compute-backend-20261021/scripts'
+sys.path.insert(0, str(SPV_TOOLS))
+import spv_tools_local as ST  # noqa: E402
+
+FP_NODES = (129, 133)          # OpFAdd, OpFMul
+FMA_EXTINST = ('OpExtInst', 50)
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def read_json(p):
+    return json.loads(Path(p).read_text(encoding='utf-8-sig'))
+
+
+def write_json(p, obj):
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(obj, indent=2, default=str), encoding='utf-8')
+
+
+# ------------------------------------------------------------------ compiler
+def compile_glsl(src, out, include_dirs=(), defines=()):
+    argv = [str(GLSLANG), '-V', '--target-env', 'vulkan1.3']
+    for d in defines:
+        argv.append('-D' + str(d))
+    for d in include_dirs:
+        argv.append('-I' + str(d))
+    argv += [str(src), '-o', str(out)]
+    out = Path(out)
+    if out.exists():
+        out.unlink()
+    r = subprocess.run(argv, capture_output=True, text=True, encoding='utf-8', errors='replace')
+    if r.returncode != 0:
+        raise RuntimeError('glslang failed (rc=%d)\nARGV: %s\n%s\n%s'
+                           % (r.returncode, ' '.join(argv), r.stdout, r.stderr))
+    return argv
+
+
+# ------------------------------------------------------------- NoContraction
+def _region(module, name):
+    names = {}
+    for op, ops, _, _ in module.instructions:
+        if op == 5:                                     # OpName
+            names[ops[0]] = b''.join(int(w).to_bytes(4, 'little')
+                                     for w in ops[1:]).split(b'\0')[0].decode()
+    fid = next(k for k, v in names.items() if v.startswith(name + '('))
+    return next(r for r in ST.function_regions(module)
+                if module.instructions[r[0]][1][1] == fid)
+
+
+def _result_ids(module, region):
+    return {ST.result_id_of(module.instructions[i][0], module.instructions[i][1])
+            for i in region}
+
+
+def _fp_nodes(module, region):
+    """Result ids in `region` that are FP add/mul or OpExtInst Fma."""
+    out = set()
+    for i in region:
+        op, ops = module.instructions[i][0], module.instructions[i][1]
+        if op in FP_NODES or (op == 12 and len(ops) > 3 and ops[3] == 50):
+            out.add(ST.result_id_of(op, ops))
+    return out
+
+
+def _vmul_ids(module):
+    """Decorated OpFMul whose result type is a vector (the FP16 vector-scale mul)."""
+    by_id = module.id_to_instruction()
+    out = set()
+    for rid in ST.no_contraction_ids(module):
+        op, ops = by_id[rid]
+        if op != 133:
+            continue
+        trec = by_id.get(ops[0])
+        if trec and trec[0] == 23:                      # OpTypeVector
+            out.add(rid)
+    return out
+
+
+def apply_nc(raw_spv, target_sha, recipe_nc, out_spv):
+    """Rewrite `raw_spv` into `out_spv` with the recipe's NoContraction map.
+
+    Returns a record of what was done (counts + parent identity).
+    """
+    nc = recipe_nc or {'mode': 'raw'}
+    mode = nc.get('mode', 'raw')
+    rec = {'mode': mode, 'parent': nc.get('parent')}
+    if mode == 'raw':
+        Path(out_spv).write_bytes(Path(raw_spv).read_bytes())
+        rec['nc_count'] = len(ST.no_contraction_ids(ST.Module(Path(out_spv))))
+        return rec
+    parent = Path(nc['parent'])
+    pm = ST.Module(parent)
+    cm = ST.Module(Path(raw_spv))
+    rec['parent_sha256'] = sha(parent)
+    rec['parent_nc'] = len(ST.no_contraction_ids(pm))
+    extra = set()
+    ref = pm
+    if nc.get('drop_region'):
+        pn = _result_ids(pm, _region(pm, nc['drop_region'])) & set(ST.no_contraction_ids(pm))
+        cn = _fp_nodes(cm, _region(cm, nc['drop_region']))
+        rec['dropped_region'] = nc['drop_region']
+        rec['dropped_ids'] = len(pn)
+        rec['own_region_ids'] = len(cn)
+        extra |= cn
+        filtered = Path(out_spv).with_suffix('.filtered.spv')
+        ST.set_no_contraction(pm, set(ST.no_contraction_ids(pm)) - pn, filtered)
+        ref = ST.Module(filtered)
+    elif nc.get('drop_vmul'):
+        pn = _vmul_ids(pm)
+        cn = _vmul_ids(cm)
+        rec['dropped_vmul'] = len(pn)
+        rec['own_vmul'] = len(cn)
+        extra |= cn
+        filtered = Path(out_spv).with_suffix('.filtered.spv')
+        ST.set_no_contraction(pm, set(ST.no_contraction_ids(pm)) - pn, filtered)
+        ref = ST.Module(filtered)
+    if nc.get('own_region'):
+        cn = (_result_ids(cm, _region(cm, nc['own_region']))
+              & set(ST.no_contraction_ids(cm)))
+        rec['own_region'] = nc['own_region']
+        rec['own_region_ids'] = len(cn)
+        extra |= cn
+    keep, info = ST.transfer_decoration_pattern_aligned(ref, cm, extra)
+    rec['functions_mapped'] = info['functions_mapped']
+    rec['child_functions_without_parent_counterpart'] = \
+        info['child_functions_without_parent_counterpart']
+    rec['nc_count'] = len(keep)
+    ST.set_no_contraction(cm, keep, out_spv)
+    rec['written'] = True
+    return rec
+
+
+# ------------------------------------------------------------------- rebuild
+def rebuild(recipe, outdir, target=None):
+    """Compile + decorate `recipe`, verify against `target`; returns a record."""
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    src = Path(recipe['source'])
+    target = Path(target or recipe['target'])
+    raw = outdir / 'raw.spv'
+    final = outdir / 'rebuild.spv'
+    rec = {'source': str(src), 'source_sha256': sha(src),
+           'target': str(target), 'target_sha256': sha(target),
+           'defines': list(recipe.get('defines') or []),
+           'include_dirs': [str(x) for x in (recipe.get('include_dirs') or [])]}
+    argv = compile_glsl(src, raw, rec['include_dirs'], rec['defines'])
+    rec['argv'] = argv
+    rec['raw_sha256'] = sha(raw)
+    rec['raw_match'] = rec['raw_sha256'] == rec['target_sha256']
+    rec['nc'] = apply_nc(raw, rec['target_sha256'], recipe.get('nc'), final)
+    rec['rebuilt_sha256'] = sha(final)
+    rec['verified'] = rec['rebuilt_sha256'] == rec['target_sha256']
+    if not rec['raw_match'] and rec['nc']['mode'] == 'raw':
+        rec['verified'] = False
+    return rec
+
+
+def spv_nc_count(p):
+    return len(ST.no_contraction_ids(ST.Module(Path(p))))

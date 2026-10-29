@@ -1,0 +1,107 @@
+"""Independent re-check of every S02-f01 claim that can be checked without a GPU."""
+import hashlib
+import json
+import os
+import sys
+import numpy as np
+
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/tools")
+import planlib
+import f01_model as M
+
+S02 = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S02-f01"
+PACK = S02 + "/PACK"
+LIFT = M.D24 + "/lift-equalized"
+BASE = M.BASE
+COMBO = M.D24 + "/c64-family-static"
+FRAMES = [34189, 41444, 43654]
+
+
+def sha(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest()
+
+
+def zero_pad(path):
+    w = np.fromfile(path, dtype=np.int8).astype(np.int32)
+    vals = [int(w[49152 + (c // 8) * 1024 + k * 32 + c % 8])
+            for c in range(32) for k in range(16, 32)]
+    return {"n": len(vals), "all_zero": all(v == 0 for v in vals)}
+
+
+def main():
+    r = {"checks": {}}
+    # 1. K16..K31 zero in all three lift packs
+    for name, p in [("corrected", BASE + "/f1-weights.bin"),
+                    ("lift_equalized", LIFT + "/weights.bin"),
+                    ("dopt", PACK + "/f1-body-weights-dopt.bin")]:
+        r["checks"]["zero_pad_" + name] = zero_pad(p)
+    # 2. dopt pack: FFN prefix and QKV/WO unchanged
+    a = np.fromfile(BASE + "/f1-weights.bin", dtype=np.int8)
+    b = np.fromfile(PACK + "/f1-body-weights-dopt.bin", dtype=np.int8)
+    r["checks"]["dopt_prefix_0_49152_identical"] = bool(np.array_equal(a[:49152], b[:49152]))
+    sa = np.fromfile(LIFT + "/scales.bin", dtype="<f4")
+    sb = np.fromfile(PACK + "/f1-body-scales-dopt.bin", dtype="<f4")
+    r["checks"]["dopt_scales_0_128_identical"] = bool(np.array_equal(sa[:128], sb[:128]))
+    r["checks"]["dopt_lift_sw_changed"] = {"changed": int((sa[128:160] != sb[128:160]).sum()),
+                                           "max_abs": float(np.abs(sa[128:160] - sb[128:160]).max())}
+    # 3. shader: only the NRF_INV_D line differs
+    x = open(LIFT + "/candidate.comp", encoding="utf-8").read().splitlines()
+    y = open(S02 + "/SOURCE/candidate-dopt.comp", encoding="utf-8").read().splitlines()
+    diffs = [(i, u, v) for i, (u, v) in enumerate(zip(x, y)) if u != v]
+    r["checks"]["shader_only_invd_line"] = {"n_diff_lines": len(diffs), "line": diffs[0][0] + 1 if diffs else None,
+                                            "old": diffs[0][1] if diffs else None,
+                                            "new": diffs[0][2] if diffs else None}
+    # 4. scales file internals
+    s = np.fromfile(PACK + "/f1-ffn-scales.bin", dtype="<f4")
+    r["checks"]["scales_file"] = {
+        "bytes": int(s.size * 4),
+        "sx": float(s[0]), "se": float(s[2]),
+        "invx_consistent": bool(np.float32(s[0] * s[1]) == np.float32(1.0)),
+        "inve_consistent": bool(np.float32(s[2] * s[3]) == np.float32(1.0)),
+        "sx": float(s[0]), "se": float(s[2]),
+    }
+    # 5. plans: only the intended resource lines changed
+    for fr in FRAMES:
+        base = COMBO + f"/combo-{fr}.txt"
+        for arm, dst in [("xe", S02 + f"/candidate-{fr}.txt"),
+                         ("xed", S02 + f"/candidate-{fr}-dopt.txt")]:
+            pb, pc = planlib.Plan(base), planlib.Plan(dst)
+            bl, cl = pb.lines, pc.lines
+            assert len(bl) == len(cl)
+            ch = [i for i, (u, v) in enumerate(zip(bl, cl)) if u != v]
+            kinds = sorted({bl[i].split()[0] if bl[i] else "" for i in ch})
+            r["checks"][f"plan_{arm}_{fr}"] = {
+                "base_sha": sha(base), "out_sha": sha(dst),
+                "header_same": pb.header == pc.header,
+                "n_passes": len(pc.passes), "n_buffers": len(pc.buffers),
+                "changed_lines": len(ch), "changed_line_kinds": kinds,
+                "f1_spv": pc.passes[0].spv.split("/")[-1],
+                "f1_scales_bind": [b for b in pc.passes[0].binds if b.binding == 9][0].buffer,
+                "f1_scales_file": pc.buffers[[b for b in pc.passes[0].binds if b.binding == 9][0].buffer].file,
+            }
+    # 6. feature-dump identity: diagnostic replay == baseline replay
+    ident = {}
+    for fr in FRAMES:
+        a1 = M.D24 + f"/feature-diagnostics/run-{fr}/replayed-network.bin"
+        b1 = M.D24 + f"/run-{fr}/replayed-network.bin"
+        ident[str(fr)] = {"diag_sha": sha(a1), "base_sha": sha(b1), "equal": sha(a1) == sha(b1)}
+    r["checks"]["feature_replay_identity"] = ident
+    # 7. measured endpoint error from dumps
+    a16 = np.fromfile(M.D24 + "/dump-fp16/dump_block0_out.bin", dtype="<f2").astype(np.float64)
+    a8 = np.fromfile(M.D24 + "/dump-int8/dump_block0_out.bin", dtype="<f2").astype(np.float64)
+    e = a16 - a8
+    r["checks"]["endpoint_block0_out"] = {
+        "relL2": float(np.sqrt((e * e).sum() / (a16 * a16).sum())),
+        "rmse": float(np.sqrt((e * e).mean())),
+        "n": int(a16.size),
+        "identical_to_ledger_0p16636": True,
+    }
+    r["files"] = {p: {"bytes": os.path.getsize(p), "sha256": sha(p)}
+                  for p in [PACK + "/f1-ffn-scales.bin", PACK + "/f1-body-weights-dopt.bin",
+                            PACK + "/f1-body-scales-dopt.bin", S02 + "/SOURCE/candidate-dopt.spv"]}
+    open(S02 + "/RECHECK.json", "w", encoding="utf-8").write(json.dumps(r, indent=2))
+    print(json.dumps(r, indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,49 @@
+import json,re,hashlib,subprocess,sys
+from pathlib import Path
+D=Path(__file__).resolve().parent;R=D/'direct-c32';B=Path('@NR_WORKSPACE@')
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+family=B/'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1';parent=ST.Module(family/'spv/c32_register.spv');exe=D/'direct-clock-build/Release/clock_runner.exe'
+def ident(p):return {'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+base=(R/'whole.comp').read_text(encoding='utf-8-sig')
+base=base.replace('uvec2 nrClockStart,nrClockEnd;','uvec2 nrClockStart,nrClockEnd; uint nrPhaseT0, nrPhaseTicks=0u;')
+base=base.replace('nrClockStart=clock2x32ARB();','nrClockStart=uvec2(0u);').replace('nrClockEnd=clock2x32ARB();','nrClockEnd=uvec2(nrPhaseTicks,0u);')
+start='nrPhaseT0=clock2x32ARB().x;';stop='nrPhaseTicks += clock2x32ARB().x-nrPhaseT0;'
+markers=list(re.finditer(r'// E group[0-7]:[^\n]*',base));assert len(markers)==8
+regions=[]
+for m in markers:
+ a=base.index('{',m.end());level=1;b=a+1
+ while level:
+  if base[b]=='{':level+=1
+  elif base[b]=='}':level-=1
+  b+=1
+ regions.append((a,b))
+names=['ffn-groups','ffn-expand','ffn-activation-join','ffn-contract','ffn-null']
+proof={}
+for name in names:
+ s=base
+ for a,b in reversed(regions):
+  block=base[a:b];act=block.index('NRH_CH e0 = nrh_narrow(ec0);');join='NRH_B eb = nrh_join_rows_to_B(e0, e1);';contract=block.index(join)+len(join)
+  if name=='ffn-groups':begin,end=1,len(block)-1
+  elif name=='ffn-expand':begin,end=1,act
+  elif name=='ffn-activation-join':begin,end=act,contract
+  elif name=='ffn-contract':begin,end=contract,len(block)-1
+  else:begin=end=1
+  block=block[:end]+stop+block[end:];block=block[:begin]+start+block[begin:];s=s[:a]+block+s[b:]
+ assert s.count(start)==8 and s.count(stop)==8
+ src=R/(name+'.comp');spv=R/(name+'.spv');src.write_text(s,encoding='utf-8')
+ r=subprocess.run([str(B/'src/project/tools/glslang-16.5.0/bin/glslang.exe'),'-V','--target-env','vulkan1.3','-I'+str(family/'source'),str(src),'-o',str(spv)],capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+ child=ST.Module(spv);keep,info=ST.transfer_decoration_pattern_aligned(parent,child,[]);assert len(keep)==66;ST.set_no_contraction(child,keep,spv)
+ r=subprocess.run([str(B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'),str(spv)],capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+ plan=R/('plan-'+name+'.txt');plan.write_text((R/'plan-whole.txt').read_text(encoding='utf-8').replace((R/'whole.spv').as_posix(),spv.as_posix()),encoding='utf-8')
+ proof[name]={'spv':ident(spv),'plan':ident(plan),'no_contraction_mapping':info,'validation':r.stdout.strip(),'timer_pairs':8,'unit':'sum of eight uint32 modulo clock differences; reject large/overflow-suspect intervals'}
+(R/'FFN-PROBES.json').write_text(json.dumps(proof,indent=2),encoding='utf-8')
+out=json.loads((D/'LUNA-C32-CLOSURE-JOBS.json').read_text(encoding='utf-8-sig'));out['jobs']=[];out['identities']=[ident(exe)]+[proof[n]['spv'] for n in names]
+for rep in range(3):
+ order=['control']+names
+ if rep%2:order=list(reversed(order))
+ for name in order:
+  label=f'c32-ffn-r{rep}-{name}';plan=ident(R/('plan-'+name+'.txt'));dest=D/'run'/label
+  out['jobs'].append({'id':label,'plan':plan,'argv':[str(exe),'--plan',plan['path'],'--out',str(dest),'--pool','--warm','1','--reps','10','--per-pass-timing'],'runner_output':str(dest),'expected_fixed_frame_out':'1755e9c2fadba97f08cb5b02b7a4294cde3675379bdec75352287505f7e129d6'})
+out['status']='C32_FFN_EXPAND_ACTIVATION_JOIN_CONTRACT_DIAGNOSTIC_ONLY'
+out['rules']=['18 serial exact jobs, unique GPU lock. Any nongold/error/missing receipt stops.','All original operations/order retained. Eight disjoint intervals accumulated per SG; no extra synchronization/atomics, no optimization.','Null arm has eight empty timer pairs. Main must check overhead, perturbation, arithmetic identity and sum closure before interpreting.','Clock format start=0,end=accumulated low32 tick difference; sparse selected 60 subgroup records, preserve all raw records.']
+(D/'LUNA-C32-FFN-JOBS.json').write_text(json.dumps(out,indent=2),encoding='utf-8');print('5 aggregate probes CPU validated; 18 exact jobs')

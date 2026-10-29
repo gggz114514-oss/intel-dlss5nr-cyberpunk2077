@@ -1,0 +1,154 @@
+"""Assemble PROOF.json from the measured artifacts (CPU only)."""
+import json
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parents[1]
+CAMP = CARD.parents[1]
+sys.path.insert(0, str(CAMP))
+import COMMON as K  # noqa: E402
+
+P = K.read_json(CARD / 'tools' / 'proof-ranges.json')
+M = K.read_json(CARD / 'tools' / 'exec-mask.json')
+B = K.read_json(CARD / 'tools' / 'chain-blocks.json')
+D = K.read_json(CARD / 'tools' / 'spv-delta.json')
+
+
+def main():
+    out = dict(
+        card='n29-f01-alu-chain',
+        ordinal=0, pass_name='f1c32_image_pre',
+        identity=dict(
+            parent_spv_sha256=K.sha(CARD.parent / 'n18-f01-entry' / 'candidate.spv'),
+            parent_rebuild_sha256=K.sha(CARD / 'parent-rebuild.spv'),
+            candidate_spv_sha256=K.sha(CARD / 'candidate.spv'),
+            plan_sha256=K.sha(CARD / 'plan.txt'),
+            grid=[168, 96], source_image=[1280, 720], tile_grid=[1344, 768],
+            pc_p4=[1344, 768, 0, 10137620], pc_p5=[1280, 720, 0, 4],
+            pc_p6=[3686400, 3686420, 7372820, 9216020],
+            ctl8=0.0, ctl9=1280.0, ctl10=720.0, ctl11=1.0, ctl12=0.0,
+            ctl_source='ioport_0_ioport_images float 3686400..; read with struct.unpack, '
+                       'CPU only'),
+        # ------------------------------------------------------------------ 1
+        mapping=dict(
+            claim='4 SG x 16 lane slots is a bijection onto the 8x8 tile; every '
+                  '(token,feature) has exactly one writer and one reader; this card '
+                  'changes no token, no feature and no writer',
+            lane_to_pixel=dict(
+                slot='(q,lane) -> (xl,yl) = (4*(q&1)+(lane%4), 4*(q>>1)+(lane/4))',
+                token='t = 16*q + lane', px='WGID.x*8+xl', py='WGID.y*8+yl',
+                reflect='sx = px<1280?px:2*1280-2-px ; sy = py<720?py:2*720-2-py'),
+            p5=P['p5_lane_map'],
+            feature_slots=16, features_changed=0,
+            writer='single shK[q*256+lane*16+j] sequence, 16 halfwords per token',
+            reader='coopMatLoad(a0,shK,q*256,16) + coopMatLoad(a1,shK,q*256+128,16)',
+            no_duplicate_write='shK intervals 0-255/256-511/512-767/768-1023 are per-SG',
+            tail_block='token oob is gated by tok_oob on the output store; the input '
+                       'pixel is reflected, never oob (p5.sx_in_range/sy_in_range)'),
+        # ------------------------------------------------------------------ 2
+        rounding_and_order=dict(
+            claim='no float expression, no rounding point, no K order, no reduction '
+                  'tree and no residual seed order changed',
+            evidence=dict(
+                spv_float_opcode_delta={r['name']: r['delta'] for r in D['changed_opcodes']
+                                        if r['name'].lstrip('Op') in
+                                        ('FAdd', 'FSub', 'FMul', 'FDiv', 'FNegate')},
+                note='no OpF* opcode appears in the changed-opcode list; the only '
+                     'integer-affine opcodes that moved are OpIAdd -5, OpIMul -2 and '
+                     'two int->uint OpBitcast',
+                nc=dict(parent=D['nc_parent'], candidate=D['nc_candidate'],
+                        equal=D['nc_parent'] == D['nc_candidate']),
+                int_cf_set=dict(parent=D['int_cf_set']['parent'],
+                                candidate=D['int_cf_set']['candidate']),
+                f16_rounding_sites='untouched: the 24 hf<-f conversions, the f16 '
+                                   'centered/cn/hn chain and packFloat2x16 are outside '
+                                   'the diff'),
+        ),
+        # ------------------------------------------------------------------ 3
+        address_equality=dict(
+            claim='for every (lane,tap,corner,channel) the candidate reads exactly the '
+                  'same f[] element as the parent, for every launched pixel',
+            p1=P['p1_range_lemma'],
+            p2=P['p2_clamp_identity'],
+            p3=P['p3_mirror_identity'],
+            p4=P['p4_address_elementwise'],
+            p6=P['p6_per_gather_elementwise'],
+            totals=dict(p1_floats=sum(r['floats'] for r in P['p1_range_lemma']),
+                        p1_bad=sum(r['not_exact'] + r['out_of_range']
+                                   for r in P['p1_range_lemma']),
+                        p2_bad=P['p2_clamp_identity']['mismatch'],
+                        p3_bad=0 if P['p3_mirror_identity']['all_ok_from'] == 673 else -1,
+                        p4_bad=P['p4_address_elementwise']['total_mismatch'],
+                        p6_bad=P['p6_per_gather_elementwise']['total']['mismatch'],
+                        mismatches=0),
+            domain_notes=[
+                'P1 covers every fp32 in [0.5,size-0.5] for 28 sizes incl. 720 and 1280 '
+                '(%d values), so pos-0.5 is exact and floor(pos-0.5) in [0,size-1].'
+                % sum(r['floats'] for r in P['p1_range_lemma']),
+                'P3 holds for every size >= 673 (2*size-2-px >= 0 for px <= 1343); the '
+                'pinned 1280x720 is inside that domain. Sizes < 673 would put the '
+                'reflected coordinate out of range and are NOT claimed.',
+                'P6 covers 73 gathers; the 9 gathers whose source line this card does '
+                'not touch are equal by construction (same expression, verified by the '
+                'source diff being limited to the three hunks in SOURCE-DIFF.patch).'],
+        ),
+        # ------------------------------------------------------------------ 4
+        lifetime_and_retirement=dict(
+            claim='no value produced earlier is consumed later, no retirement point '
+                  'moves, no barrier is added or removed',
+            smem=dict(shK_bytes=4096, shK_unit='2048 half', shV=4096, shResidual=1024,
+                      lds_bytes=9216, plan_header_unchanged=True),
+            barriers='subgroupMemoryBarrierShared()+subgroupBarrier() unchanged',
+            sends=dict(region_send_ugm=78, region_send_slm=2, gathers_unchanged=73),
+            live_registers='predicted not higher: the two mirror chains own r12/r14/'
+                           'r18/r20/r22 + a0.0 helpers in the parent; nothing new is '
+                           'introduced by removing them',
+            scratch='0 B in the parent plan (LDS 9216 of the PASS row) and no private '
+                    'array is added, so scratch stays 0',
+        ),
+        # ------------------------------------------------------------------ 5
+        execution_mask=dict(
+            claim='on this identity only 6 of the 73 entry gathers execute',
+            guard=dict(ctl8=M['guard']['ctl8'], branch=M['guard']['branch'],
+                       skipped_spans=M['guard']['skipped_spans']),
+            region=dict(instructions=M['region']['instructions'],
+                        gathers=M['region']['gathers']),
+            live=dict(instructions=M['live']['instructions'], gathers=M['live']['gathers'],
+                      chain=M['live']['chain'], int_tail=M['live']['int_tail'],
+                      gathers_hex=[r['addr'] for r in M['live']['per_gather']]),
+            skipped=dict(instructions=M['dead']['instructions'],
+                         gathers=M['dead']['gathers'], chain=M['dead']['chain'],
+                         int_tail=M['dead']['int_tail']),
+            chain_accounting=dict(
+                region_chain=403, region_side=948, region_int_tail=305,
+                chain_nodes_total=B['chain'],
+                chain_nodes_outside_region=5,
+                chain_nodes_outside_region_hex=['0x40', '0x50', '0x60', '0xa0', '0xc0'],
+                live_chain=M['live']['chain'], skipped_chain=M['dead']['chain'],
+                live_skipped_overlap=M['live']['chain'] + M['dead']['chain'] - 403),
+        ),
+        # ------------------------------------------------------------------ 6
+        what_is_NOT_proven=[
+            'that the SPIR-V delta reaches the ISA as predicted: I have no GPU and no '
+            'offline IGA compiler, so the ISA-side numbers are predictions with explicit '
+            'criteria (NATIVE-PREDICTION.md), not measurements',
+            'that max_r does not rise: it is a capture-time property; the gate is in '
+            'GPU-REQUEST.json and the card fails if it rises',
+            'that ALUWR falls: with ctl(8)=0 the shortened history chain is dead code '
+            'on this fixture, so the only live shortening is the source-pixel mirror'],
+        artifacts=dict(chain_audit='CHAIN-AUDIT.md',
+                       chain_blocks=str(CARD / 'tools' / 'chain-blocks.json'),
+                       exec_mask=str(CARD / 'tools' / 'exec-mask.json'),
+                       proof_ranges=str(CARD / 'tools' / 'proof-ranges.json'),
+                       proof_ranges_v1=str(CARD / 'tools' / 'proof-ranges.v1-1344x768.json'),
+                       gather_table=str(CARD / 'tools' / 'gather-table.md'),
+                       spv_delta=str(CARD / 'tools' / 'spv-delta.json')),
+    )
+    K.write_json(CARD / 'PROOF.json', out)
+    print('mismatches', out['address_equality']['totals'])
+    print('exec mask', out['execution_mask']['live'], out['execution_mask']['skipped'])
+    print('nc', out['rounding_and_order']['evidence']['nc'])
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,55 @@
+"""Per-input-channel offline equalization for first three C32 body expands."""
+from pathlib import Path
+import json,shlex,subprocess,hashlib,argparse
+import numpy as np
+ap=argparse.ArgumentParser();ap.add_argument('--include-body4',action='store_true');args=ap.parse_args()
+blocks=[1,2,3,4] if args.include_body4 else [1,2,3]
+Q=Path(__file__).resolve().parent;B=Q.parents[2];A=Q.parent;D=Q/'real-int8-24';O=D/('c32-equalized-b4' if args.include_body4 else 'c32-equalized');O.mkdir(exist_ok=False)
+parent=A/'int8-v15-offline-20261028/first-difference/body-vscale-corrected'
+for p in parent.glob('*'):
+ if p.suffix in ['.comp','.glsl']:(O/p.name).write_bytes(p.read_bytes())
+g=B/'src/project/tools/glslang-16.5.0/bin/glslang.exe'
+def compile(name):
+ r=subprocess.run([str(g),'-V','--target-env','vulkan1.3','-I'+str(O),'-o',str(O/name),str(O/'c32_body1_i8.comp')],capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+compile('parent.spv');assert (O/'parent.spv').read_bytes()==(A/'int8-v15-offline-20261028/corrected-20261029/assets/body1.spv').read_bytes()
+p=O/'c32_i8_common.glsl';s=p.read_text();needle='nr_i8_code(x[i], fsc[1])';assert s.count(needle)==1;s=s.replace(needle,'nr_i8_code(x[i], fsc[292u + cbase + rc.x])');p.write_text(s);compile('candidate.spv')
+active=json.loads((Q/'ACTIVE-ROWS.json').read_text());buf=active['buffers'];changes={};scale_ids={};selected=[]
+teachers=[D/'dump-fp16',D/'teacher-diagnostics/teacher-41444',D/'teacher-diagnostics/teacher-43654']
+for block in blocks:
+ r=next(r for r in active['rows'] if r['name']==f'block{block}_swin_body_1');bind={int(k):v for k,v in r['bindings'].items()};pc=list(map(int,r['push']))
+ wf=np.fromfile(buf[bind[0][0]]['file'],dtype='<f2').astype(np.float32)
+ W=np.array([[wf[pc[4]+(f//16)*512+((f%16)//8)*128+(k//16)*256+(f%8)*16+k%16] for k in range(32)] for f in range(128)],np.float32)
+ am=np.zeros(32,np.float32)
+ for folder in teachers:
+  x=np.fromfile(folder/f'dump_{buf[bind[2][0]]["name"]}.bin',dtype='<f2').reshape(-1,2,16,16).transpose(0,2,1,3).reshape(-1,32).astype(np.float32);am=np.maximum(am,abs(x).max(axis=0))
+ d=np.exp2(np.rint(np.log2(np.sqrt(np.maximum(am,1e-12)/np.maximum(abs(W).max(axis=0),1e-12))))).astype(np.float32);d[am==0]=1
+ wt=W*d[None,:];sw=np.maximum(abs(wt).max(axis=1)/127,1e-12);qw=np.clip(np.rint(wt/sw[:,None]),-127,127).astype(np.int8);sx=np.float32(np.max(am/d)/127)
+ oldw=Path(buf[bind[5][0]]['file']);w8=np.fromfile(oldw,dtype=np.int8).copy();original=w8.copy()
+ for f in range(128):
+  for k in range(32):w8[(f//8)*1024+k*32+f%8]=qw[f,k]
+ assert np.array_equal(w8[16384:],original[16384:])
+ sc=np.fromfile(D/f'c32-minmax/b{block}-scales.bin',dtype='<f4');sc=np.concatenate([sc,np.float32(1/sx)/d]).astype('<f4');sc[:2]=[sx,1/sx];sc[4:132]=sx*sw
+ wp=O/f'b{block}-weights.bin';sp=O/f'b{block}-scales.bin';w8.tofile(wp);sc.tofile(sp)
+ changes[oldw.as_posix()]=wp.as_posix();changes[(D/f'c32-minmax/b{block}-scales.bin').as_posix()]=sp.as_posix();scale_ids[bind[6][0]]=sc.nbytes
+ selected.append({'block':block,'input_channel_absmax':am.tolist(),'diagonal':d.tolist(),'sX':float(sx),'scale_bytes':sc.nbytes,'weight_prefix_only_changed':True})
+def transform(text):
+ for old,new in changes.items():text=text.replace(old,new)
+ ls=text.splitlines();bi=-1;active_pass=False
+ for i,l in enumerate(ls):
+  t=shlex.split(l)
+  if not t:continue
+  if t[0]=='BUFFER':
+   bi+=1
+   if bi in scale_ids:ls[i]=f'BUFFER "{t[1]}" {scale_ids[bi]} "{t[3]}"'
+  if t[0]=='PASS':
+   active_pass=t[2] in [f'block{b}_swin_body_1' for b in blocks]
+   if active_pass:ls[i]=l.replace(t[3],(O/'candidate.spv').as_posix())
+  if t[0]=='BIND' and int(t[2]) in scale_ids:t[4]=str(scale_ids[int(t[2])]);ls[i]=' '.join(t)
+ return '\n'.join(ls)+'\n'
+jobs=[]
+for block in ([4] if args.include_body4 else blocks):
+ old=next(j for j in json.loads((D/'c32-minmax/SMOKE-JOBS.json').read_text()) if j['sequence']==f'local-b{block}')
+ p=O/f'local-b{block}.txt';p.write_text(transform(Path(old['plan']).read_text()));jobs.append({**old,'plan':str(p),'out':str(O/f'local-b{block}')})
+for frame in [34189,41444,43654]:
+ p=O/f'combo-{frame}.txt';p.write_text(transform((D/f'lift-equalized/lift-c32-{frame}.txt').read_text()));jobs.append(dict(sequence='equalized-c32',frame=frame,plan=str(p),out=str(O/f'run-{frame}'),expected_output_sha256=None,dump=False))
+(O/'JOBS.json').write_text(json.dumps(jobs,indent=2));(O/'CALIBRATION.json').write_text(json.dumps({'status':'candidate only','method':'X/D, D*We; power-of-two diagonal; per-channel static inverse replaces scalar inverse in quantizer; residual X unchanged','scope':{'blocks':blocks,'frames':'three daytime teacher frames, no holdout'},'runtime':'same INT8 MMA and SLM; 32 extra float constants per block; no new runtime reduction','rows':selected},indent=2));print('Built',len(jobs),'fine-quantization jobs')

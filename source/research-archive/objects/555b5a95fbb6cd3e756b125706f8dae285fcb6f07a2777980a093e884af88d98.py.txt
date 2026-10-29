@@ -1,0 +1,181 @@
+"""S01 turn 2: fold the GPU outcomes and the follow-up diagnostics into the docs.
+
+Edits the existing documents in place (adds sections, keeps the round-1 content).
+"""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/tools")
+from planlib import sha256_file  # noqa: E402
+
+B = Path(r"@NR_WORKSPACE@")
+D = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+HERE = Path(__file__).resolve().parent
+C = HERE / "CPU"
+
+
+def j(name):
+    return json.loads((C / name).read_text())
+
+
+oracle = j("oracle_crossmatch.json")
+prereg = j("ablation_preregistration.json")
+
+GPU = dict(
+    executed_by="main executor under the exclusive GPU lock (this card prepared the jobs only)",
+    oracle=dict(plan="oracle-local-b4-debug.txt",
+                replayed_network_sha256="926b206f... (receipt; equal to c32-minmax/local-b4)",
+                debug_equals_base_arm=True,
+                note="debug=1 did not change the output, so the dbg dump is a faithful side channel"),
+    local=dict(plan="candidate-local-b4.txt",
+               out_sha256=sha256_file(HERE / "runs/S01-B4-LOCAL/replayed-network.bin"),
+               block_exit_rel_l2_vs_teacher=0.065358,
+               reference_arms=dict(frozen_minmax=0.126992, x_equalised=0.113969),
+               improvement_ratio=1.943),
+    combo=dict(plans={f: sha256_file(HERE / f"candidate-{f}.txt") for f in (34189, 41444, 43654)},
+               psnr_candidate={34189: 29.0474, 41444: 29.2765, 43654: 29.6522},
+               psnr_frozen={34189: 29.2956, 41444: 29.5277, 43654: 29.7877},
+               delta_db={34189: -0.2482, 41444: -0.2512, 43654: -0.1355},
+               x_only_block4_delta_db={34189: -0.0432, 41444: -0.0341, 43654: 0.0032},
+               verdict="REJECTED: 3/3 frames degrade in the same direction"),
+)
+
+cal = json.loads((HERE / "CALIBRATION.json").read_text())
+cal["status"] = ("candidate built, GPU-measured, REJECTED for accumulation: the block-4 exit is "
+                 "1.94x better but the network loses 0.136-0.251 dB on 3/3 frames")
+cal["gpu_results"] = GPU
+cal["cpu_gpu_audit"] = dict(
+    status="CPU FFN model PROVED bit-exact on real GPU data, but only on 2 columns",
+    oracle_dump=str(HERE / "runs/S01-B4-ORACLE/swin_4_debug.bin").replace("\\", "/"),
+    how="the debug buffer is written by EVERY workgroup at the same offsets, so it is a race mix. "
+        "Pairing every dumped Y column against every dumped X column found 2 columns where X and Y "
+        "come from the same workgroup",
+    bitexact_y_pairs=oracle["y_pairs"],
+    bitexact_e_pairs=oracle["e_pairs"],
+    best_match_rel_l2_median=sorted(b["rel_l2"] for b in oracle["best_y"])[16],
+    consequence="on those two columns the whole FFN chain (per-channel X code, int32 expand, half "
+                "SiLU, E codes, int32 contract, per-output tap, original half residual) reproduces "
+                "the GPU Y on 32/32 channels bit-exactly. The E dump is never coherent (0 matches) "
+                "because its 128-half spans are won by other workgroups.",
+    lesson="a future debug oracle for this dispatch must guard the dbg store with a workgroup id or "
+           "run a 1x1 grid; an unguarded dump cannot serve as an oracle",
+)
+cal["network_regression_forensics"] = dict(
+    conclusion="not a mechanical bug: every mechanism that could be checked was excluded",
+    ruled_out=dict(
+        tap_reuse="fsc[132..163] is read only by the 4 contract dequant calls; QKV/WO read "
+                  "164/196/228/260; fsc[3] is only the E quantiser and fsc[2] is unused "
+                  "(the shader body has exactly one literal fsc[] use, line 290)",
+        shared_bytes="expand 0..16383 and QKV/WO 32768..49151 are byte-identical to the "
+                     "X-equalised pack; only 3728 of 16384 contract bytes changed; fsc[0], "
+                     "fsc[4:132], fsc[164:324] identical; the combo plan differs from the frozen "
+                     "combo in exactly 4 lines (2 BUFFER, 1 PASS, 1 BIND)",
+        downstream_saturation="block-4 exit absmax 184.0/183.0/184.9 (teacher 184.1); static code "
+                              "saturation 5.00e-5 / 5.09e-5 / 5.17e-5 (teacher 5.08e-5)",
+        int8_fed_E_saturation="feeding the INT8 block-3 exit: E absmax 145.25 vs 144.50, zero "
+                              "saturated codes, per-channel headroom min 1.05",
+        tail_only_gain="median |exit error| 0.161 -> 0.059, RMS 0.404 -> 0.208; the |teacher|>32 "
+                       "tail carries 0.6% of the error energy, so the gain is in the bulk",
+        systematic_bias="per-channel signed bias RMS 0.157 -> 0.059 (4.9% -> 1.8% of the teacher "
+                        "RMS), so no DC offset is introduced",
+        runner_allocation="receipts differ in exactly one buffer (c32_block4_unified_scales "
+                          "1168->1808 B, allocated 1216->1856, pool +640 B); no aliasing change",
+    ),
+    remaining_hypothesis="cumulative error cancellation: the frozen candidate is fitted to the old "
+                         "block-4 error pattern. X-only on block 4 was network-neutral "
+                         "(-0.043/-0.034/+0.003 dB) while X+E is -0.248/-0.251/-0.136 dB, i.e. the "
+                         "network response is not monotone in the local metric. The construction "
+                         "book already records the same phenomenon; it cannot be localised without "
+                         "per-stage dumps of the INT8 chain after block 4.",
+)
+cal["ablation_preregistration"] = prereg
+(HERE / "CALIBRATION.json").write_text(json.dumps(cal, indent=2))
+print("CALIBRATION.json updated; sections:", len(cal))
+
+q = json.loads((HERE / "QUALITY.json").read_text())
+q["GPU_VERIFICATION"] = "RUN (by the main executor under the exclusive lock)"
+q["quality_accepted"] = False
+q["verdict"] = ("REJECTED for accumulation (3/3 frames, -0.136..-0.251 dB) even though the block "
+                "exit is 1.94x better and no mechanical cause was found. Direction kept, pack not "
+                "adopted.")
+q["gpu_metrics"] = dict(
+    block_exit=dict(arm="candidate-local-b4.txt", frame=34189,
+                    input="dump_block3_out.bin (FP16 feed)",
+                    teacher="dump-fp16/dump_skip4.bin",
+                    old_rel_l2=0.126992, new_rel_l2=0.065358, improvement_ratio=1.943,
+                    note="includes the already published 12.699% -> 11.397% X-only step"),
+    network=dict(frames=[34189, 41444, 43654],
+                 psnr_frozen=[29.2956, 29.5277, 29.7877],
+                 psnr_candidate=[29.0474, 29.2765, 29.6522],
+                 delta_db=[-0.2482, -0.2512, -0.1355],
+                 direction="3/3 frames worse",
+                 x_only_block4_delta_db=[-0.0432, -0.0341, 0.0032]),
+    twentyfour_frames="NOT_RUN by design: the 3-frame screen already rejected the pack",
+)
+(HERE / "QUALITY.json").write_text(json.dumps(q, indent=2))
+
+RUNNER = "@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe"
+jobs = json.loads((HERE / "JOBS.json").read_text())
+jobs["executed"] = [
+    dict(id="S01-B4-ORACLE", plan="oracle-local-b4-debug.txt",
+         result="OK; output identical to the base arm; dbg dump is a workgroup race and only 2 columns are coherent"),
+    dict(id="S01-B4-LOCAL", plan="candidate-local-b4.txt", result="block exit 12.699% -> 6.536%"),
+    dict(id="S01-B4-COMBO-34189", plan="candidate-34189.txt", result="29.2956 -> 29.0474 dB"),
+    dict(id="S01-B4-COMBO-41444", plan="candidate-41444.txt", result="29.5277 -> 29.2765 dB"),
+    dict(id="S01-B4-COMBO-43654", plan="candidate-43654.txt", result="29.7877 -> 29.6522 dB"),
+]
+jobs["round2"] = [
+    dict(id="S01-B4-ABL-EONLY", priority=1,
+         purpose="separate the E stage from the X-equalised expand path: minmax X path + the E "
+                 "diagonal, CPU FFN-Y metric 4.50% (rejected pack: 4.57%)",
+         plan=str(HERE / "candidate-34189-ablate-e-only.txt").replace("\\", "/"),
+         plan_sha256=prereg["plans"]["ablate_e_only"]["sha256"],
+         argv=[RUNNER, "--plan", str(HERE / "candidate-34189-ablate-e-only.txt"), "--out",
+               str(HERE / "runs/S01-B4-ABL-EONLY"), "--pool", "--warm", "0", "--reps", "1"],
+         expected_output_sha256=None,
+         decision_rule="within +-0.05 dB of 29.2956 -> the E stage is chain-neutral and the culprit "
+                       "is the interaction with the X-equalised expand path; ~-0.25 dB -> the E "
+                       "stage itself is the cause"),
+    dict(id="S01-B4-CHAIN-DUMP", priority=1,
+         purpose="localise where the regression enters: export the INT8 chain's block-4 exit, "
+                 "block-5 input and block-5 output from the frozen combo",
+         plan="main executor adds OUTPUT rows to D/c64-family-static/combo-34189.txt for buffers "
+              "15 (skip4), 19 (block4_out) and 23 (swin_5_Y); one frame, read-only, no parameter change",
+         expected_output_sha256=None),
+    dict(id="S01-B4-ABL-EHALF", priority=2,
+         purpose="is the network response monotone in how far the block-4 exit moves? half-strength "
+                 "diagonal, CPU FFN-Y metric 4.94%",
+         plan=str(HERE / "candidate-34189-ablate-e-half.txt").replace("\\", "/"),
+         plan_sha256=prereg["plans"]["ablate_e_half"]["sha256"],
+         argv=[RUNNER, "--plan", str(HERE / "candidate-34189-ablate-e-half.txt"), "--out",
+               str(HERE / "runs/S01-B4-ABL-EHALF"), "--pool", "--warm", "0", "--reps", "1"],
+         expected_output_sha256=None),
+]
+jobs["round2_note"] = ("ABL-EONLY is the only experiment that separates 'the E stage' from 'the "
+                       "X-equalised expand path' while keeping the local metric; CHAIN-DUMP is the "
+                       "only way to see where the regression enters, because block 4 itself "
+                       "measurably improves.")
+(HERE / "JOBS.json").write_text(json.dumps(jobs, indent=2))
+
+cpath = HERE / "CONTRACT.json"
+contract = json.loads(cpath.read_text())
+contract["cpu_gpu_validation"] = dict(
+    status="PROVED on 2 columns; candidate then REJECTED on the network",
+    proved=dict(
+        bit_exact_y="two GPU debug-dump columns reproduce the CPU FFN Y on 32/32 channels "
+                    "bit-exactly (CALIBRATION.json cpu_gpu_audit)",
+        spv_toolchain="the untouched c32-equalized-b4 sources recompile to candidate.spv byte for "
+                      "byte, so the E patch is the only delta",
+        pack_consistency="every expand and contract weight row of the new pack still has max|code| = 127",
+        plan_diff="the combo plan differs from the frozen combo in exactly 4 lines",
+    ),
+    oracle_defect=("the dbg store carries no workgroup index, so every workgroup overwrites the same "
+                   "offsets: the dump is a race mix and only 2 of 32 columns stayed coherent. A "
+                   "future oracle job must guard the store with a workgroup id or use a 1x1 grid."),
+    outcome=dict(block_exit="12.699% -> 6.536%",
+                 network="-0.248/-0.251/-0.136 dB on 3/3 frames",
+                 decision="REJECTED for accumulation; the E-channel direction is kept"),
+)
+cpath.write_text(json.dumps(contract, indent=2))
+print("docs updated")

@@ -1,0 +1,68 @@
+"""Least-squares identification of the *effective* contract matrix from the GPU arm.
+
+If  Y_gpu - seed  ==  A @ eq  has a tiny residual, then the CPU E codes are right and
+only the contract weight decode can be wrong; A can then be compared with
+diag(fsc[132..163]) @ Wc to expose a permutation.
+"""
+import sys
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+which = sys.argv[1] if len(sys.argv) > 1 else "A"
+plan = L.D / ("c32-minmax/local-b4.txt" if which == "A" else "c32-equalized-b4/local-b4.txt")
+gpu_path = L.D / ("c32-minmax/local-b4/replayed-network.bin" if which == "A"
+                  else "c32-equalized-b4/local-b4/replayed-network.bin")
+info = L.block_bindings(plan)
+x_flat = np.fromfile(info["input"], dtype="<f2")
+gpu = np.fromfile(gpu_path, dtype="<f2")
+we, wc = L.load_w8(info["w8"])
+fsc = L.load_fsc(info["fsc"])
+rs = L.load_rs(info["wb"], info["rs_base"])
+invx = fsc[L.FSC_INVX:L.FSC_INVX + 32] if fsc.size >= L.FSC_INVX + 32 else np.full(32, fsc[L.FSC_INV_X], np.float32)
+inve = fsc[L.FSC_INVE:L.FSC_INVE + 128] if fsc.size >= L.FSC_INVE + 128 else np.full(128, fsc[L.FSC_INV_E], np.float32)
+
+rng = np.random.default_rng(7)
+tiles = np.sort(rng.choice(168 * 96, size=1500, replace=False))
+cols = np.arange(16)
+TT, CC = np.meshgrid(tiles, cols, indexing="ij")
+TT = TT.ravel(); CC = CC.ravel()
+x = L.gather(x_flat, TT, CC)
+base = TT * 512 + CC * 16
+
+
+def take(flat):
+    out = np.empty((32, TT.size), np.float16)
+    for c in range(32):
+        off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+        out[c] = flat[base + off]
+    return out
+
+
+ref = take(gpu).astype(np.float64)
+got = L.forward(x, we, wc, rs, invx, inve, fsc[L.FSC_TAP_E:L.FSC_TAP_E + 128], fsc[L.FSC_TAP_C:L.FSC_TAP_C + 32])
+seed = got["seed"].astype(np.float64)
+eq = got["eq"].astype(np.float64)
+target = ref - seed
+
+# fit A: target (32,N) = A (32,128) @ eq (128,N)
+A_fit, *_ = np.linalg.lstsq(eq.T, target.T, rcond=None)
+resid = target.T - eq.T @ A_fit
+rel = float(np.linalg.norm(resid) / np.linalg.norm(target))
+print("arm", which, "N", TT.size)
+print("lstsq relative residual of (Y_gpu - seed) vs A@eq :", rel)
+A_expected = np.diag(np.asarray(fsc[132:164], np.float64)) @ wc.astype(np.float64)
+print("fit vs expected relL2:", float(np.linalg.norm(A_fit - A_expected) / np.linalg.norm(A_expected)))
+# and the pure CPU model
+print("cpu y relL2 vs gpu:", L.rel_l2(got["y_half"], ref))
+# Row correlation matrix to spot permutations
+An = A_fit / (np.linalg.norm(A_fit, axis=1, keepdims=True) + 1e-30)
+En = A_expected / (np.linalg.norm(A_expected, axis=1, keepdims=True) + 1e-30)
+C = An @ En.T
+best = np.argmax(np.abs(C), axis=1)
+print("expected-row -> best-fit-row (abs cos):")
+for r in range(32):
+    print(f"  {r:2d} -> {best[r]:2d}  cos={C[r, best[r]]:+.4f}")
+np.save(Path(__file__).resolve().parent / f"A_fit_{which}.npy", A_fit)

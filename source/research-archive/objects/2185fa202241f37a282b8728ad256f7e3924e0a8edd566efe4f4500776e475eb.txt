@@ -1,0 +1,106 @@
+n11-vit-ffn — RESUME（2026-10-27）
+================================================================
+
+状态：BUILT / AWAITING-GPU（未跑 GPU、未取锁、未部署、未改基线 plan/指针/COMMON.py/其他卡）
+选中组：F13 expand（VIT_STAGE 0），8 个 PASS：ordinal 93,98,103,108,113,118,123,128
+        PASS 行号 56,61,66,71,76,81,86,91，grid 9 32 1（未改）
+未动：F13 contract（94…129）、F16 projection（97…132）——下一处改动见 §5
+
+身份
+----
+父 SPV   candidates/dsh-fp16-same-family-20261023/s32-k11-v1/spv/K11_s32.spv
+         sha256 54029e6beb917f447e71add99a8b61c196d3e6428cc1df0113db82a00cb9c2a2  11144 B
+候选 SPV cards/n11-vit-ffn/candidate.spv
+         sha256 b68712e15bf6bf76eeb1db151d546195987aeec285fc0cc9bf79f805e6616fad  11516 B
+plan     cards/n11-vit-ffn/plan.txt
+         sha256 7c16fbf835f4e03bd0ae8d63dbffc56c126fc6c6ab339fe80ea134bff564e920
+父 plan  a024c3c5…（合同基线）→ 与父 plan 逐行比较：只差 8 行，全部是本组 PASS 的 SPV 路径
+cpu-check：CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded   （与父同）
+spv_validate_cpu：result=0 words=2879
+父字节复现：parent-rebuild.spv = 54029e6b…（glslang 16.5.0 -V --target-env vulkan1.3，
+            -I parent-src，raw recipe，无 NC 装饰迁移；与 RECIPES.json 的该 shader 配方一致）
+float_NC_checked：0（父 0、候选 0；recipe 为 raw，集合相等 ∅=∅）
+
+改了什么（一句话）
+------------------
+只把 K 循环里的两个 live 判定（`if(mA<live)` / `if(mB<live)`）提到循环外，用
+`rA=min(mA,last)` / `rB=min(mB,last)` 把行号夹进 live 范围，使循环体**没有分支、没有 join**。
+每输出 K 累加序、half 舍入点、B/A 读取条数、epilogue 守卫、grid、绑定、push 常量全部不变。
+
+六问最关键的三条
+----------------
+1) 映射：gr(9,32)×8 SG，每 SG 16 行 ×32 列（2×M8 × 2×N16）；枚举 1,179,648 = 288×4096 个
+   (token,channel) 恰好覆盖一次（0 重复 0 漏）。live=288 恰好 = 9×32 ⇒ 本 plan **没有尾块**，
+   clamp 一次都不触发，候选读集合与父逐字节相同；尾块规则单独枚举（live=0,7,8,16,255,257,288,289）。
+2) native 证据（本卡最硬的收获）：同族三份 CURRENT 捕获自算——expand mov32/dpas = 6.12、
+   projection = 6.23（两者判定都在循环内），contract = 2.27（判定已提到循环外）。
+   搬运量与累加器个数无关（4 个 vs 2 个都是 ~6.2），与“判定在不在循环里”强相关。
+   ⇒ 真实供料冲突是**循环内判定 join**，不是预取不足；本卡因此不加任何预取。
+3) 成本：删除目标是每 k0 步 24 条 mov(32)（8 存 + 8 存 + 8 取回，全核 1536/1568）与 2 条 jmpi；
+   新增只有循环外 1 个分支 + 4 个标量 + 部分 live 时的 clamp 读（live=288 为 0）。
+   权重读取量不变（4096·1024·18 half/派发），A 读取量 live=288 不变，SLM 0、scratch 0、无屏障。
+
+native 可观察点（无 GPU，只写预测 + 判据）
+------------------------------------------
+mov(32) 1568 → ≤600（理想 30–100；≥1400 判 A，300–600 记部分落地）、Instruction Count 7231 →
+5400–6400、dpas 256 不变、send.ugm 1216 = 128 宽 + 1088 narrow 不变、Scratch 0、Loop Count 0、
+Basic Block 250–290、jmpi 136 → ~8、每步 106 → ~78–82。详见 NATIVE-PREDICTION.md。
+
+分诊（本轮未测，给预案；落锤顺序按合同 §8.5 先判 A）
+--------------------------------------------------
+A 实现未落地：mov(32) 仍 ≈1568 ⇒ 说明 join 不是成因（或 IGC 在更上层就谓词化）。
+   下一条改动：把 `MA af` 拆成 `afA/afB` 两个独立变量并把 clamp 改成地址选择
+   （给 A 原始返回一个不与累加器同号的独立 bank）；同时核对 IGC 是否已把判定谓词化。
+B 实现有副作用：mov(32) 降了但 Scratch≠0 / narrow send 变多 / 指令数反涨 ⇒ 先修最大副作用。
+C 当前身份无净收益：门过、native 落地、整体不显著 ⇒ 归因到形状/候选身份，不推广为方向禁令。
+D INDISTINCT：单族 8 派发作用域小 ⇒ 把同一变换成包套到 F13 contract(8) + F16 projection(8) 再测，
+   不挑显著样本。
+E 数值失败：先查 rA/rB 是否在 [0,live-1]（已枚举），再查 epilogue 的 m>=live 守卫是否被误改。
+
+下一处具体改动（另一个组，本卡不动）
+------------------------------------
+F16 projection（ordinal 97,102,…,132；PASS 60,65,…,95；grid 3 64 1）：
+  源 = candidates/codex-fp16-continuation-20261021/A/u03-f18-v2/source/vit_nb04_mpair.glsl
+       sha256 22b39d5f234747363010a74f5ca0386f5bf4cb591353a64c8cc8b0277e982a67
+       （wrapper vit_nb04_projection_fp16.comp sha 706363cf…，VIT_STAGE 4）
+  该 include 的 `void main()` 与 expand 同形：`MC accA0=MC(0.0),accB0=MC(0.0);` +
+  `for(k0) { load b0; if(mA<live){load af; accA0+=af*b0;} if(mB<live){load af; accB0+=af*b0;} }`
+  ⇒ 与 expand 完全相同的 16 条第 2 类 join；它的 native 是 mov32/dpas = 6.23、5407 条指令、
+  128 dpas、1115 send、Loop Count 0、scratch 0
+  （capture: work/codex-astra-fp16-int8-audit-20261024/fullnet-mechanism-transfer-20261026/
+   f08-register-chain-20261027/captures/native-f20-pixel-owner/ISA/
+   CS_asm61c5144f4358fd6f_simd32_000000000000001b_26_orig.asm，sha 4e3ff2e6…）。
+  具体改法与本卡相同（一个外层 `if(mA<live)` + clamp 行号），**不要**同时改 tile 形状：
+  S32/K23 已测过（−0.0294 平局），重复无意义。
+  注意 projection 的 WG tile 仍是父几何 M128×N16（grid 3×64），本卡不动它。
+
+下一处具体改动（F13 contract，若要成族包）
+------------------------------------------
+contract 已经是“判定在循环外 + 双 B bank”，它的 2.27 mov32/dpas 残留在**回边**上；
+若做族包，先把 F16 与 expand 的变换套齐，再单独看 contract 是否需要把 K=4096 的两步展开
+（`k0+32`）保持而减少跨迭代存活。
+
+恢复点 / 未决项
+--------------
+* 复现父：glslang -V --target-env vulkan1.3 -I cards/n11-vit-ffn/parent-src \
+          parent-src/vit_nb04_expand_s32.comp -o parent-rebuild.spv
+* 复现候选：glslang -V --target-env vulkan1.3 -I cards/n11-vit-ffn/candidate-glsl \
+          cards/n11-vit-ffn/candidate.comp -o candidate.spv
+  ⚠ candidate.comp 与父 wrapper **逐字节相同**（sha 826a3d83…），差异全在
+  candidate-glsl/vit_nb04_mpair_s32.glsl（sha 1f185274…）。不带 -I candidate-glsl 会编出父 SPV。
+* 复现 plan：python _tools/build_plan.py（内部用 COMMON.make_plan + COMMON.cpu_check）
+* 未决 1：同族 contract 的反例（2.27 残留）是否也适用于完全展开的 expand —— 只能由候选 capture 回答。
+* 未决 2：F13 expand 的族和 1.2224 ms（fixed 首帧，含 contract 8 个派发）里 expand 占多少，
+  当前 atlas 只给族和；本卡不据此推算单派发值。
+* 未决 3：读放大只在 live 非 32 倍数时出现；本 plan 全 288，故本卡不测不同 M，
+  只在 PROOF 里枚举（合同要求“单独验证尾块与不同 M”，已用 CPU 枚举完成，未用 GPU）。
+
+本卡目录内容
+------------
+ANALYSIS.md / PROOF.json(+PROOF-RAW.json) / SOURCE-DIFF.patch / candidate.comp /
+candidate.spv / parent-rebuild.spv / plan.txt / BUILD.json / COST-LEDGER.json /
+NATIVE-PREDICTION.md / NATIVE-ANALYSIS.json / VIT-FFN-NATIVE-COMPARISON.json /
+GPU-REQUEST.json / RESUME.txt / CARD.txt
+工作件：parent-src/（父三件套字节副本）、candidate-glsl/（候选三件套）、
+_tools/（isa_scan.py, cfg_scan.py, step_budget.py, spv_census.py, spv_loops.py,
+proof_map.py, build_plan.py, finalize.py, counterexample.py, find_native*.py）

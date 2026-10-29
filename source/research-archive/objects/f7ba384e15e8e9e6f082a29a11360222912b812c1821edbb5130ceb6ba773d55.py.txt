@@ -1,0 +1,338 @@
+"""n38-f20-arena-shrink: static address audit of every shared-memory access (CPU only).
+
+The n36 lesson, transplanted to a card whose change is an ARRAY RETIREMENT rather than a
+stride change: the danger is that the identifier of a shared array is edited (or a
+declaration deleted) while a byte offset or a literal plane base is left behind, so the
+module still validates, the workgroup byte count still falls, the parent still reproduces
+byte-exactly and every multiset still matches -- and the gold frame fails, because one access
+reads a different plane.  Structural SPIR-V checks are blind to that; only an address-level
+audit sees it.
+
+Five rules, applied to both arms:
+
+  I1  array identity   every `shX`/`shXP`/`shY`/`shP`/`shArena` reference resolves to an
+                       array that is DECLARED in that same source.  (A deleted declaration
+                       with a surviving reference must fail here.)
+  I2  offset identity  the multiset of access lines with the array identifier normalised out
+                       must be IDENTICAL between the arms:  deleting a plane may not move a
+                       single offset, stride or literal.  Non-circular: it compares the two
+                       source texts, not my interpretation of them.
+  I3  literal bounds   every integer literal inside the offset/index/stride of a shared access
+                       must be < the declared size of that array (in halves), and the arena's
+                       plane literals must stay exactly {0, 2048, 4096, 6144}.
+  I4  footprint bounds the per-subgroup element footprints (the same model _lifetime.py uses)
+                       must stay inside the declaration in both arms, and for every value the
+                       writers' union must equal the readers' union (no uninitialised read,
+                       no partially covered plane).
+  I5  family coverage  the access families that make the module work must all still exist in
+                       both arms (X store, X stage-1 load, contract seed load, Y store, debug
+                       Y echo, O store, tail scalar load, arena M store/load, Q/K/V/CTX).
+
+`--selftest` proves the audit is not vacuous: it re-runs I1..I3 on two deliberately broken
+copies of the candidate (one surviving `shY` reference after the declaration was removed,
+and one offset literal pushed out of bounds) and requires both to FAIL.
+"""
+import collections
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(CARD))
+import _lifetime as LT                # noqa: E402  (footprint model, shared with the card)
+
+W = pathlib.Path(r'@NR_WORKSPACE@')
+PARENT = W / 'work/codex-astra-fp16-int8-audit-20261024/f20-coarse-owner-20261026/candidate.comp'
+CANDIDATE = CARD / 'candidate.comp'
+ARRAYS = ('shXP', 'shX', 'shY', 'shP', 'shArena')
+# shX and shP are #define aliases of the shXP array (the parent ships both aliases; shP is
+# dead code on the normal path).  Resolve them before any declaration/bounds lookup.
+ALIAS = {'shX': 'shXP', 'shP': 'shXP'}
+DECL = re.compile(r'shared\s+float16_t\s+(\w+)\s*\[\s*(\d+)\s*\]')
+INT = re.compile(r'(?<![\w.])(\d+)[uU]?(?![\w.])')
+ARENA_PLANE_LITERALS = {0, 2048, 4096, 6144}
+
+FAMILIES = {
+    'X-store': lambda l: 'shX[' in l and '=' in l and 'dbg' not in l,
+    'X-stage1-load': lambda l: 'coopMatLoad(a, shX' in l,
+    'contract-seed-load': lambda l: 'coopMatLoad(seed, shX' in l or 'coopMatLoad(seed, shY' in l,
+    'Y-store': lambda l: 'coopMatStore(half0, shY' in l or 'coopMatStore(half1, shY' in l
+                 or 'coopMatStore(half0, shX' in l or 'coopMatStore(half1, shX' in l,
+    'O-store': lambda l: 'coopMatStore(half0, shX' in l or 'coopMatStore(half1, shX' in l,
+    'debug-Y-echo': lambda l: 'dbg[8192u + e]' in l,
+    'debug-X-echo': lambda l: 'dbg[22528u + e]' in l,
+    'debug-O-echo': lambda l: 'dbg[20480u + e]' in l,
+    'tail-scalar-load': lambda l: 'shX[row*32u+c]' in l,
+    'arena-M-store': lambda l: 'coopMatStore(half_result, shArena' in l,
+    'arena-M-load': lambda l: 'coopMatLoad(a, shArena' in l,
+    'arena-QKV-store': lambda l: 'coopMatStore(half0, shArena, region' in l,
+    'arena-Q-load': lambda l: 'coopMatLoad(score_q' in l,
+    'arena-K-load': lambda l: 'coopMatLoad(b0, shArena, 2048u' in l,
+    'arena-V-load': lambda l: 'coopMatLoad(b0, shArena, 4096u' in l,
+    'arena-CTX-store': lambda l: 'coopMatStore(ctx_half' in l,
+}
+
+
+def sha(p):
+    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+
+
+def split_args(s):
+    depth, cur, out = 0, '', []
+    for ch in s:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            out.append(cur)
+            cur = ''
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur)
+    return out
+
+
+def access_args(line):
+    """All (kind, array, offset, stride, layout) of every coopMatLoad/Store on this line."""
+    out = []
+    for m in re.finditer(r'coopMat(Load|Store)\s*\(', line):
+        start = m.end()
+        depth, i = 1, start
+        while i < len(line) and depth:
+            if line[i] == '(':
+                depth += 1
+            elif line[i] == ')':
+                depth -= 1
+            i += 1
+        args = [a.strip() for a in split_args(line[start:i - 1])]
+        if len(args) < 3 or args[1] not in ARRAYS:
+            continue
+        out.append(dict(kind=m.group(1).lower(), array=args[1], offset=args[2],
+                        stride=(args[3] if len(args) > 3 else ''),
+                        layout=(args[4] if len(args) > 4 else '')))
+    return out
+
+
+def scalar_args(line):
+    """(array, index) of every scalar shared access `ARR[...]` on this line."""
+    out = []
+    for m in re.finditer(r'\b(shXP|shX|shY|shP|shArena)\s*\[([^\]]*)\]', line):
+        if 'shared ' in line[max(0, m.start() - 20):m.start()]:
+            continue                                  # the declaration itself
+        out.append((m.group(1), m.group(2)))
+    return out
+
+
+def norm(line):
+    """Access line with the array identifier removed, so the two arms are comparable."""
+    l = line.split('//')[0]
+    for a in ('shXP', 'shArena', 'shX', 'shY', 'shP'):
+        l = l.replace(a, 'ARR')
+    return ' '.join(l.split())
+
+
+def audit_source(path, arm):
+    text = pathlib.Path(path).read_text(encoding='utf-8-sig')
+    decl = {m.group(1): int(m.group(2)) for m in DECL.finditer(text)}
+    bad, rows, normed = [], [], collections.Counter()
+    for lineno, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if s.startswith('//') or s.startswith('#'):
+            continue
+        if 'shared float16_t' in line:
+            continue
+        if not any(a in line for a in ARRAYS):
+            continue
+        normed[norm(line)] += 1
+        for acc in access_args(line):
+            rows.append(dict(line=lineno, kind=acc['kind'], array=acc['array'],
+                             offset=' '.join(acc['offset'].split()),
+                             stride=acc['stride'], layout=acc['layout']))
+            # I1 (resolve the #define aliases first)
+            if ALIAS.get(acc['array'], acc['array']) not in decl:
+                bad.append(dict(line=lineno, rule='I1', why='array %r is not declared'
+                                % acc['array'], text=s[:120]))
+                continue
+            size = decl[ALIAS.get(acc['array'], acc['array'])]
+            # I3: literals of the offset and of the stride
+            for lit in INT.findall(acc['offset']) + INT.findall(acc['stride']):
+                v = int(lit)
+                if v >= size:
+                    bad.append(dict(line=lineno, rule='I3',
+                                    why='literal %d >= declared %d halves of %s'
+                                        % (v, size, acc['array']), text=s[:120]))
+            if acc['array'] == 'shArena':
+                planes = {int(x) for x in INT.findall(acc['offset']) if int(x) >= 1024}
+                if planes and not planes <= ARENA_PLANE_LITERALS:
+                    bad.append(dict(line=lineno, rule='I3',
+                                    why='arena plane literal %s outside %s'
+                                        % (sorted(planes), sorted(ARENA_PLANE_LITERALS)),
+                                    text=s[:120]))
+        for arr, idx in scalar_args(line):
+            rows.append(dict(line=lineno, kind='scalar', array=arr,
+                             offset=' '.join(idx.split()), stride='', layout=''))
+            if ALIAS.get(arr, arr) not in decl:       # I1
+                bad.append(dict(line=lineno, rule='I1', why='array %r is not declared' % arr,
+                                text=s[:120]))
+                continue
+            for lit in INT.findall(idx):              # I3
+                if int(lit) >= decl[ALIAS.get(arr, arr)]:
+                    bad.append(dict(line=lineno, rule='I3',
+                                    why='literal %s >= declared %d halves of %s'
+                                        % (lit, decl[arr], arr), text=s[:120]))
+    fams = {k: sum(1 for l in text.splitlines() if f(l)) for k, f in FAMILIES.items()}
+    return dict(source=dict(path=str(path), sha256=sha(path)), arm=arm, declarations=decl,
+                declared_bytes=sum(v * 2 for v in decl.values()),
+                access_lines=len(normed), sites=rows, families=fams,
+                violations=bad, _normed=normed)
+
+
+def check_footprints():
+    """I4: per-SG footprints inside the declaration; writers == readers per value."""
+    out, bad = {}, []
+    for arm in ('parent', 'candidate'):
+        sites = LT.arm_sites(arm)
+        decl = {'shX': 2048, 'shY': 2048, 'shArena': 8192}
+        per = {}
+        for s in sites:
+            size = decl[s['array']]
+            mx = max((max(f) if f else -1) for f in s['_fps'].values())
+            if mx >= size:
+                bad.append(dict(rule='I4', arm=arm, site=s['id'],
+                                why='max index %d >= %d halves of %s' % (mx, size, s['array'])))
+            per[s['id']] = dict(array=s['array'], max_index=mx, size=size,
+                                footprint=s['footprint_total'])
+        # writers' union must equal readers' union, per value
+        vals = {}
+        for s in sites:
+            v = (s['array'], 'vQKV' if s['value'] in ('vQ', 'vK', 'vV') else s['value'])
+            vals.setdefault(v, {'W': set(), 'R': set()})
+            union = set().union(*s['_fps'].values())
+            vals[v][s['kind']] |= union
+        cov = {}
+        for (arr, v), d in sorted(vals.items()):
+            if not d['W'] or not d['R']:
+                cov['%s/%s' % (arr, v)] = dict(writers_only=bool(d['W'] and not d['R']),
+                                               readers_only=bool(d['R'] and not d['W']))
+                continue
+            missing = d['R'] - d['W']
+            cov['%s/%s' % (arr, v)] = dict(written=len(d['W']), read=len(d['R']),
+                                           read_but_never_written=len(missing))
+            if missing and v != 'vC':
+                bad.append(dict(rule='I4', arm=arm, value='%s/%s' % (arr, v),
+                                why='%d elements read but never written' % len(missing)))
+        out[arm] = dict(sites=per, coverage=cov)
+    return out, bad
+
+
+def selftest(base_text):
+    """Prove the audit is not vacuous: two broken copies must FAIL."""
+    res = {}
+    broken = base_text.replace('        coopMatStore(half0, shX, m0 * 32u, 32u, LROW);',
+                               '        coopMatStore(half0, shY, m0 * 32u, 32u, LROW);', 1)
+    assert broken != base_text, 'selftest anchor 1 missing'
+    res['surviving_shY_reference'] = _audit_text(broken, 'broken-shY')
+    assert res['surviving_shY_reference']['violations'], 'audit did not catch the shY reference'
+    broken2 = base_text.replace('            coopMatLoad(seed, shX, m0 * 32u + 0u, 32u, LROW);',
+                                '            coopMatLoad(seed, shX, m0 * 32u + 4096u, 32u, LROW);', 1)
+    assert broken2 != base_text, 'selftest anchor 2 missing'
+    res['out_of_bounds_literal'] = _audit_text(broken2, 'broken-oob')
+    assert res['out_of_bounds_literal']['violations'], 'audit did not catch the oob literal'
+    for k, v in res.items():
+        print('selftest %-24s -> %d violation(s): %s' %
+              (k, len(v['violations']), v['violations'][0]['why'][:70]))
+    return {k: dict(violations=len(v['violations']),
+                    first=v['violations'][0] if v['violations'] else None) for k, v in res.items()}
+
+
+def _audit_text(text, arm):
+    """Audit a source held in memory (used by the self-test)."""
+    tmp = CARD / 'build/_selftest.comp'
+    tmp.parent.mkdir(exist_ok=True)
+    tmp.write_text(text, encoding='utf-8')
+    rec = audit_source(tmp, arm)
+    tmp.unlink()
+    return rec
+
+
+def main():
+    arms = {}
+    arms['parent'] = audit_source(PARENT, 'parent')
+    if not CANDIDATE.exists():
+        raise SystemExit('candidate.comp missing: run build.py first')
+    arms['candidate'] = audit_source(CANDIDATE, 'candidate')
+    bad = []
+    for arm, rec in arms.items():
+        for v in rec['violations']:
+            bad.append(dict(arm=arm, **v))
+
+    # I2: the normalised access-line multiset must be identical between the arms
+    pn, cn = arms['parent']['_normed'], arms['candidate']['_normed']
+    i2 = dict(identical=(pn == cn),
+              parent_only=[{'line': k, 'count': v} for k, v in (pn - cn).items()],
+              candidate_only=[{'line': k, 'count': v} for k, v in (cn - pn).items()])
+    if not i2['identical']:
+        bad.append(dict(rule='I2', why='normalised access lines differ', detail=i2))
+
+    # I5: family coverage
+    i5 = {}
+    for arm in arms:
+        fams = arms[arm]['families']
+        need = ('X-store', 'X-stage1-load', 'arena-M-store', 'arena-M-load', 'arena-QKV-store',
+                'arena-Q-load', 'arena-K-load', 'arena-V-load', 'arena-CTX-store',
+                'debug-X-echo', 'debug-O-echo', 'tail-scalar-load')
+        miss = [f for f in need if fams[f] < 1]
+        if arm == 'parent':
+            miss += [f for f in ('Y-store', 'contract-seed-load', 'debug-Y-echo') if fams[f] < 1]
+        else:
+            miss += [f for f in ('Y-store', 'contract-seed-load', 'debug-Y-echo') if fams[f] < 1]
+        i5[arm] = dict(families=fams, missing=miss)
+        for f in miss:
+            bad.append(dict(rule='I5', arm=arm, why='family %r missing' % f))
+
+    # the arm-specific declaration delta
+    pd = set(arms['parent']['declarations'])
+    cd = set(arms['candidate']['declarations'])
+    decl_delta = dict(removed=sorted(pd - cd), added=sorted(cd - pd))
+    if decl_delta['removed'] != ['shY'] or decl_delta['added']:
+        bad.append(dict(rule='I1', why='declaration delta is %s, expected shY removed only'
+                        % decl_delta))
+
+    # I4
+    foot, fbad = check_footprints()
+    bad += fbad
+
+    for rec in arms.values():
+        rec.pop('_normed', None)
+
+    out = {'card': 'n38-f20-arena-shrink', 'arms': arms,
+           'I2_offset_identity': i2, 'I4_footprints': foot, 'I5_families': i5,
+           'I1_declaration_delta': decl_delta,
+           'violations': bad, 'verdict': 'PASS' if not bad else 'FAIL'}
+    out['selftest'] = selftest(CANDIDATE.read_text(encoding='utf-8-sig'))
+
+    (CARD / 'build').mkdir(exist_ok=True)
+    (CARD / 'build/addr-audit.json').write_text(json.dumps(out, indent=1), encoding='utf-8')
+
+    for arm in arms:
+        r = arms[arm]
+        print('%-10s %s decls=%s bytes=%d access_sites=%d families=%s' %
+              (arm, 'PASS' if not [v for v in r['violations']] else 'FAIL',
+               r['declarations'], r['declared_bytes'], len(r['sites']),
+               {k: v for k, v in r['families'].items() if v}))
+    print('I2 offset identity identical:', i2['identical'],
+          '| parent_only', i2['parent_only'], '| candidate_only', i2['candidate_only'])
+    print('I1 declaration delta:', decl_delta)
+    print('I4 coverage:', json.dumps(foot['candidate']['coverage'], indent=1))
+    for v in bad[:12]:
+        print('  VIOLATION', json.dumps(v)[:200])
+    print('ADDRESS AUDIT', out['verdict'])
+    return 0 if out['verdict'] == 'PASS' else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,117 @@
+"""Coverage / mapping proof for n20-f18-ups-contract (ord 194 C128 UPS contract).
+
+Enumerates the (m,n) ownership of every accumulator fragment straight from the
+shader's index algebra and checks: exactly-once write, exactly-once seed read,
+K = 0..127 in increasing order, no tail block.  Pure Python, no GPU.
+
+Also enumerates the two rejected re-tilings so the cost ledger's duplication
+factors are reproducible from algebra instead of hand arithmetic:
+
+  per workgroup   A bytes = 131072 / n_frags_per_iter
+                  W bytes = 262144 / m_frags_per_iter
+  (each iteration loads m A-tiles and n W-tiles for 8 ki; 8 SG; 8 fragments/SG)
+"""
+import json
+from collections import Counter
+from pathlib import Path
+
+SG = 8                           # subgroups per workgroup
+M_ROWS, N_COLS, K = 64, 128, 128
+MF, NF = M_ROWS // 8, N_COLS // 16      # 8 x 8 fragments
+KI = 8                           # k tiles of 16
+A_MSG_B = 32                     # one A row message  (16 halves, ISA d32x8t)
+W_MSG_B = 512                    # one 16x16 f16 weight tile message
+SEED_MSG_B = 256                 # one 8x16 f16 seed tile
+STORE_MSG_B = 32                 # one Y row message
+
+
+def current():
+    """(sg,r,tag) -> (m_frag, n_frag); the shader as it stands: 2m x 2n per iter."""
+    own = {}
+    for sg in range(SG):
+        n0 = (sg % 4) * 32
+        for r in range(2):
+            mA = (sg // 4 + 4 * r) * 8
+            mB = mA + 16
+            for tag, m, dn in (('A0', mA, 0), ('A1', mA, 1), ('B0', mB, 0), ('B1', mB, 1)):
+                own[(sg, r, tag)] = (m // 8, n0 // 16 + dn)
+    return dict(own=own, m_per_iter=2, n_per_iter=2)
+
+
+def retile_m3():
+    """4 acc kept, 1 m-frag x 4 n-frag per iteration (message-oriented retile)."""
+    own = {}
+    for sg in range(SG):
+        q, c = sg // 2, sg % 2
+        for r in range(2):
+            m = (q * 2 + r) * 8
+            for i in range(4):
+                own[(sg, r, 'X%d' % i)] = (m // 8, c * 4 + i)
+    return dict(own=own, m_per_iter=1, n_per_iter=4)
+
+
+def retile_m4():
+    """8 acc: 4 m-frag x 2 n-frag in ONE iteration (r folded into the acc set)."""
+    own = {}
+    for sg in range(SG):
+        c, q = sg % 4, sg // 4
+        for i in range(4):
+            m = (q * 4 + i) * 8
+            for j in range(2):
+                own[(sg, 0, 'X%d%d' % (i, j))] = (m // 8, c * 2 + j)
+    return dict(own=own, m_per_iter=4, n_per_iter=2)
+
+
+def check(name, spec):
+    own = spec['own']
+    mn = Counter(own.values())
+    dup = {k: v for k, v in mn.items() if v != 1}
+    covered = set(mn) == {(m, n) for m in range(MF) for n in range(NF)}
+    iters = len(own) // SG // (spec['m_per_iter'] * spec['n_per_iter'])
+    a_tiles = SG * iters * spec['m_per_iter'] * KI
+    w_tiles = SG * iters * spec['n_per_iter'] * KI
+    a_b, w_b = a_tiles * 256, w_tiles * W_MSG_B
+    seed_b = len(own) * SEED_MSG_B
+    store_b = len(own) * SEED_MSG_B          # one 8x16 Y tile per accumulator
+    msgs = a_tiles * 8 + w_tiles + len(own) * 1 + len(own) * 8
+    print('== %s ==' % name)
+    print('  fragment assignments    : %d  (8 SG x %d iter x %d acc)'
+          % (len(own), iters, spec['m_per_iter'] * spec['n_per_iter']))
+    print('  (m,n) covered exactly 1 : %s   duplicates: %s' % (covered, dup or 'none'))
+    print('  A per WG                : %4d tile-loads = %3d KiB  (%4d msgs)' % (a_tiles, a_b // 1024, a_tiles * 8))
+    print('  W per WG                : %4d tile-loads = %3d KiB  (%4d msgs)' % (w_tiles, w_b // 1024, w_tiles))
+    print('  seed per WG             : %3d KiB  (%d msgs)' % (seed_b // 1024, len(own)))
+    print('  Y store per WG          : %3d KiB  (%d msgs)' % (store_b // 1024, len(own) * 8))
+    print('  production messages/WG  : %d   total load bytes %d KiB'
+          % (msgs, (a_b + w_b + seed_b) // 1024))
+    return dict(name=name, covered=covered, duplicates=dup or {},
+                iterations_per_sg=iters, m_per_iter=spec['m_per_iter'],
+                n_per_iter=spec['n_per_iter'], acc=spec['m_per_iter'] * spec['n_per_iter'],
+                a_tile_loads_per_wg=a_tiles, w_tile_loads_per_wg=w_tiles,
+                a_kib_per_wg=a_b // 1024, w_kib_per_wg=w_b // 1024,
+                seed_kib_per_wg=seed_b // 1024, store_kib_per_wg=store_b // 1024,
+                production_messages_per_wg=msgs,
+                load_kib_per_wg=(a_b + w_b + seed_b) // 1024)
+
+
+def main():
+    cur = check('current 2m x 2n, 4 acc, r loop over m', current())
+    m3 = check('M3 1m x 4n, 4 acc', retile_m3())
+    m4 = check('M4 4m x 2n, 8 acc, r folded', retile_m4())
+    out = dict(identity='ffde3c3d2379b4651274ceafd14251e9f1916c22c885f245802020ffb491cc64',
+               grid=[22, 12, 1], workgroups=22 * 12, subgroups_per_wg=SG,
+               tile=dict(m=M_ROWS, n=N_COLS, k=K),
+               k_order=dict(tiles=[ki * 16 for ki in range(KI)],
+                            increasing=True, covers_all=True),
+               message_bytes=dict(a_row=A_MSG_B, w_tile=W_MSG_B, seed_tile=SEED_MSG_B,
+                                  store_row=STORE_MSG_B),
+               tilings=[cur, m3, m4])
+    Path(__file__).with_name('proof-cover.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print()
+    print('per-frame output: %d halves (%.2f MiB)' % (264 * M_ROWS * N_COLS, 264 * M_ROWS * N_COLS * 2 / 2**20))
+    print('per-frame MACs  : %.3e' % (264 * M_ROWS * N_COLS * K))
+    print('written proof-cover.json')
+
+
+if __name__ == '__main__':
+    main()

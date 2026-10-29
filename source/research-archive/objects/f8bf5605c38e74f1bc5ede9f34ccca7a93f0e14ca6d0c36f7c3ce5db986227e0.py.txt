@@ -1,0 +1,62 @@
+from pathlib import Path
+import sys,json,hashlib,shutil,subprocess
+B=Path('@NR_WORKSPACE@'); A=B/'work/codex-astra-fp16-int8-audit-20261024'; D=Path(__file__).resolve().parent
+sys.path.insert(0,str(A/'small-latest-20261028'))
+from common import parse,tokenize
+SRC=B/'work/github-release-intel-dlss5nr-cyberpunk2077-20261023/repo/source'
+OLD=B/'work/github-experimental-game-install-20261024/package'
+cmake=Path('E:/VS2022BT/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe')
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+def write(p,t):p.parent.mkdir(parents=True,exist_ok=True);p.write_text(t,encoding='utf8')
+def js(p,x):write(p,json.dumps(x,indent=2)+'\n')
+reports=[]
+for key,plan,post in [('full',A/'fullnet-continuous-20261027/backend-merged/plan.txt',70),('small',A/'small-latest-20261028/plan.txt',30)]:
+ out=D/key;p=parse(plan);manifest=out/'manifest';gen=out/'generated'
+ manifest.mkdir(parents=True,exist_ok=True);gen.mkdir(exist_ok=True)
+ cold={};shaders={};bridge={};paths={};images=[]
+ def asset(src,kind):
+  src=Path(src);h=sha(src);dst=out/'assets'/kind/(h+src.suffix);dst.parent.mkdir(parents=True,exist_ok=True)
+  if not dst.exists():shutil.copy2(src,dst)
+  assert sha(dst)==h
+  return dict(path='../assets/'+kind+'/'+dst.name,bytes=dst.stat().st_size,sha256=h)
+ lines=[]
+ for line in plan.read_text(encoding='utf-8-sig').splitlines():
+  t=tokenize(line)
+  if not t:continue
+  if t[0]=='BUFFER':
+   if t[1] in ['ioport_0_ioport_images',f'ioport_{post}_ioport_images']:
+    images.append(t[1]);line=f'BUFFER "{t[1]}" {t[2]} "-"'
+   elif t[3]!='-':
+    rec=asset(t[3],'cold');cold[t[1]]=rec;line=f'BUFFER "{t[1]}" {t[2]} "{rec["path"]}"'
+  elif t[0]=='PASS':
+   if t[3] not in paths:
+    paths[t[3]]=asset(t[3],'spv');shaders[paths[t[3]]['path']]=paths[t[3]]
+   line='PASS '+t[1]+' '+json.dumps(t[2])+' '+json.dumps(paths[t[3]]['path'])+' '+' '.join(t[4:])
+  lines.append(line)
+ assert len(images)==2
+ runtime=manifest/'port_network_runtime.txt';write(runtime,'\n'.join(lines)+'\n')
+ for k in ['gather','scatter','scatter32']:bridge[k]=asset(OLD/'assets/spv'/f'port_network_bridge_{k}.spv','spv')
+ data=dict(schema='nr-optimized-game-20261028',model='310.8.0.0' if key=='full' else '310.9.16.0 Small',rows=int(p['header'][1]),buffers=len(p['buffers']),passes=len(p['passes']),outputs=1,history_links=2,input=[1280,720],network_shaders=shaders,bridge_shaders=bridge,cold=cold,image_inputs='game gather only; fixture paths removed',validation_scope='full: offline feedback verified; small: fixed input verified, long feedback unresolved',source_plan_sha256=sha(plan))
+ js(manifest/'port_network_manifest.json',data)
+ mh=sha(manifest/'port_network_manifest.json');rh=sha(runtime)
+ write(gen/'port_network_bridge_backend_model_identity.inc',f'static constexpr size_t kPlanRows={data["rows"]},kPlanBuffers={data["buffers"]},kPlanPasses={data["passes"]},kPlanOutputs=1,kPlanHistory=2;\nstatic constexpr const char* kPreImageName="ioport_0_ioport_images";\nstatic constexpr const char* kPostImageName="ioport_{post}_ioport_images";\n')
+ f=['struct FrozenFile { const char* path; const char* sha; };',f'static constexpr const char* frozen_manifest_sha="{mh}";',f'static constexpr const char* frozen_runtime_sha="{rh}";','static constexpr FrozenFile frozen_files[]={']
+ for r in list(cold.values())+list(shaders.values())+list(bridge.values()):f.append('{'+json.dumps(r['path'])+','+json.dumps(r['sha256'])+'},')
+ f.append('};')
+ for k,r in bridge.items():f.append(f'static constexpr const char* {k}_spv='+json.dumps(r['path'])+';')
+ write(gen/'port_network_bridge_backend_frozen.inc','\n'.join(f)+'\n')
+ write(gen/'nrvk_build_identity.inc',f'static constexpr const char* kFrozenBuildId="optimized-{key}-20261028";\nstatic constexpr const char* kFrozenManifestSha="{mh}";\nstatic constexpr const char* kFrozenRuntimeSha="{rh}";\n')
+ source=out/'source'
+ if not source.exists():
+  shutil.copytree(SRC/'vulkan',source/'vulkan');shutil.copytree(SRC/'bridge/include',source/'bridge/include')
+ cmd=[str(cmake),'-S',str(source/'vulkan'),'-B',str(out/'build'),'-G','Visual Studio 17 2022','-A','x64','-DNR_MODEL_DIR='+str(out),'-DVULKAN_INCLUDE_DIR='+str(B/'src/project/third_party/Vulkan-Headers/include')]
+ for name,args in [('configure',cmd),('build',[str(cmake),'--build',str(out/'build'),'--config','Release','--parallel','4']),('cpu-tests',[str(cmake.parent/'ctest.exe'),'--test-dir',str(out/'build'),'-C','Release','--output-on-failure'])]:
+  r=subprocess.run(args,capture_output=True,text=True,encoding="utf-8",errors="replace");write(out/(name+'.log'),r.stdout+r.stderr)
+  if r.returncode:raise RuntimeError(f'{key} {name} failed: '+r.stdout[-1500:]+r.stderr[-1500:])
+ (out/'bin').mkdir(exist_ok=True)
+ for name in ['nrvk_bridge.dll','port_network_bridge_backend.dll']:shutil.copy2(out/'build/Release'/name,out/'bin'/name)
+ reports.append(dict(key=key,source_plan=str(plan),source_plan_sha=sha(plan),runtime_sha=rh,manifest_sha=mh,passes=data['passes'],buffers=data['buffers'],component_sha=sha(out/'bin/nrvk_bridge.dll'),cpu_tests='PASS',game_test='NOT_RUN'))
+ js(D/'BUILD-RECEIPT.json',reports)
+print(json.dumps(reports,indent=2))
+
+

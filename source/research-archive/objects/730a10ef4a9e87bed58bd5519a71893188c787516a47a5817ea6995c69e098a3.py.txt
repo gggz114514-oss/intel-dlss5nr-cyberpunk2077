@@ -1,0 +1,58 @@
+from pathlib import Path
+import json,hashlib
+import numpy as np
+R=Path('@NR_WORKSPACE@');O=R/'work/codex-astra-fp16-int8-audit-20261024'
+m=json.loads((R/'candidates/dsh-int8-same-family-20261023/abi-probe/evidence/I8-ABI-MEASURED.json').read_text(encoding='utf-8'))
+ci={tuple(a):tuple(b) for a,b in m['maps']['CI']['lane_comp']}
+assert all(rc==(2*c+l//16,l%16) for (l,c),rc in ci.items())
+def pack(x):
+ a,b,c,d=[int(v)&0xffffff for v in x]
+ return [a|((b&255)<<24),(b>>8)|((c&65535)<<16),(c>>16)|(d<<8)]
+def unpack(w):
+ a,b,c=w;u=[a&0xffffff,(a>>24)|((b&65535)<<8),(b>>16)|((c&255)<<16),(c>>8)&0xffffff]
+ return [(v&0x7fffff)-(v&0x800000) for v in u]
+rng=np.random.default_rng(20261024);bounds={512:512*127*128,256:256*127*128};checks=0
+for bound in bounds.values():
+ values=[-bound,-bound+1,-1,0,1,bound-1,bound,-8388608,8388607]
+ for v in values:
+  x=[v,v,0,-1];assert unpack(pack(x))==x;checks+=4
+ for _ in range(10000):
+  x=rng.integers(-bound,bound+1,4).tolist();assert unpack(pack(x))==x;checks+=4
+# One 8x16 fragment, 3 planes of 32 uint words; each lane has one independent 96-bit payload.
+seen=set()
+for lane in range(32):
+ for plane in range(3):
+  addr=plane*32+lane;assert addr not in seen;seen.add(addr)
+assert seen==set(range(96))
+# Full vs grouped integer projection; even -128 weights are legal in this proof.
+A=rng.integers(-127,128,(32,1024),dtype=np.int32);W=rng.integers(-128,128,(1024,64),dtype=np.int32)
+ref=A.astype(np.int64)@W.astype(np.int64);results=[]
+for G in [2,4]:
+ K=1024//G;parts=[]
+ for g in range(G):
+  p=A[:,g*K:(g+1)*K].astype(np.int64)@W[g*K:(g+1)*K].astype(np.int64)
+  p2=np.array([unpack(pack(row)) for row in p.reshape(-1,4)],dtype=np.int64).reshape(p.shape)
+  assert np.array_equal(p,p2);parts.append(p2)
+ assert np.array_equal(sum(parts),ref)
+ # Last-group fusion consumes prior integer parts then original epilogue (no last partial store).
+ assert np.array_equal(sum(parts[:-1])+parts[-1],ref)
+ results.append(dict(groups=G,components=2048,mismatches=0,partial_bound=K*127*128,full_bound=1024*127*128,plain_partial_read_write_bytes=G*288*1024*8,packed_partial_read_write_bytes=G*288*1024*6,packed_last_owner_read_write_bytes=(G-1)*288*1024*6,all_group_WGs=9*G,first_wave_WGs=9*(G-1),last_wave_WGs=9))
+# FP16 N16 projection ownership, preserve both M8 accumulators and K16 instruction order per output.
+old=set();new=set()
+for wx in range(3):
+ for ny in range(64):
+  for sg in range(8):
+   for m in [wx*128+sg*8,wx*128+sg*8+64]:
+    if m<288:
+     for r in range(8):
+      for c in range(16):old.add((m+r,ny*16+c))
+for wx in range(18):
+ for ny in range(16):
+  for sg in range(4):
+   for m in [wx*16,wx*16+8]:
+    for r in range(8):
+     for c in range(16):
+      p=(m+r,ny*64+sg*16+c);assert p not in new;new.add(p)
+assert old==new and len(new)==288*1024
+r=dict(scope='CPU 24-bit integer transport, owner/address and analytical source counts only; no shader/native/GPU tests',signed24_checks=checks,signed24_bits=24,CI_slots=128,CI_map_matches_CH=True,packed_fragment_bytes=384,unpacked_fragment_bytes=512,partial_reduction=results,FP16_projection=dict(output_elements=len(new),mismatches=0,old_grid=[3,64,1],new_grid=[18,16,1],old_local=256,new_local=128,old_WGs=192,new_WGs=288,old_launched_SGs=1536,new_launched_SGs=1152,equivalent_M16_N16_work_units=1152,old_active_SGs=1280,new_active_SGs=1152,old_fully_idle_SGs=256,extra_B_load_units_from_unpaired_tail_M8=128,accumulator_bytes_per_lane=32,shared_bytes=0,new_barriers=0,old_source_weight_read_bytes=192*8*64*512,new_source_weight_read_bytes=288*4*64*512,source_context_read_bytes_both=288*1024*2*64,K_step=16,arithmetic='each output original ordered K16 MMA, then original residual FMA/half'))
+(O/'HOWN-PARTIAL-REDUCTION-PROOF.json').write_text(json.dumps(r,indent=2),encoding='utf-8');print(json.dumps(r))

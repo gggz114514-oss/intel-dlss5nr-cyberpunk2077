@@ -1,0 +1,273 @@
+"""n21 step-2: instruction-level SPIR-V diff parent -> candidate (read only).
+
+Decodes with the authoritative opcode table from glslang's spirv.hpp11, aligns the
+two modules with an LCS on (opcode, word count), and proves the candidate is the
+parent minus the debug-gated store path, operand for operand (id-shift checked).
+"""
+import sys, re, json, collections
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent
+C = CARD.parent.parent
+sys.path.insert(0, str(C))
+import COMMON as K
+ST = K.ST
+
+HPP = Path('@NR_WORKSPACE@/src/project/tools/glslang-16.5.0/include/glslang/SPIRV/spirv.hpp11')
+NAMES = {}
+for m in re.finditer(r'\b(Op[A-Za-z0-9_]+)\s*=\s*(\d+)', HPP.read_text(encoding='utf-8', errors='replace')):
+    NAMES.setdefault(int(m.group(2)), m.group(1))
+
+STORAGE = {0: 'UniformConstant', 1: 'Input', 2: 'Uniform', 3: 'Output', 4: 'Workgroup',
+           5: 'CrossWorkgroup', 6: 'Private', 7: 'Function', 8: 'Generic', 9: 'PushConstant',
+           10: 'AtomicCounter', 11: 'Image', 12: 'StorageBuffer', 5328: 'PhysicalStorageBuffer'}
+
+PARENT = Path(K.row_by_ordinal(194)['spv'])
+CAND = CARD / 'candidate.spv'
+
+
+class Mod:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.m = ST.Module(self.path)
+        self.words = self.m.words
+        self.ins = self.m.instructions          # (op, ops, idx, count)
+        self.names = {}
+        for i, (op, ops, _, _) in enumerate(self.ins):
+            if op == 5 and len(ops) >= 2:
+                b = b''.join(int(w).to_bytes(4, 'little') for w in ops[1:])
+                self.names.setdefault(ops[0], b.split(b'\0')[0].decode('utf-8', 'replace'))
+        self.idx_of = {id(self.ins[i]): i for i in range(len(self.ins))}
+        # result id -> global instruction index (first definition wins)
+        self.def_at = {}
+        for i, (op, ops, _, _) in enumerate(self.ins):
+            rid = ST.result_id_of(op, ops)
+            if rid is not None:
+                self.def_at.setdefault(rid, i)
+
+    def name(self, vid):
+        return self.names.get(vid, '%%%d' % vid)
+
+    def const(self, vid):
+        i = self.def_at.get(vid)
+        if i is None:
+            return None
+        op, ops, _, _ = self.ins[i]
+        if op == 43:
+            return ops[1]
+        return None
+
+
+def func_spans(mod):
+    """[(first_idx, last_idx)] per function, in order."""
+    spans, cur = [], None
+    for i, (op, ops, _, _) in enumerate(mod.ins):
+        if op == 54:
+            cur = i
+        if op == 56 and cur is not None:
+            spans.append((cur, i))
+            cur = None
+    return spans
+
+
+def block_label(mod, i):
+    """Label instruction index of the block containing global index i."""
+    j = i
+    while j >= 0:
+        op = mod.ins[j][0]
+        if op == 248:
+            return j
+        if op == 54:
+            return j
+        j -= 1
+    return None
+
+
+def describe(mod, i):
+    op, ops, _, count = mod.ins[i]
+    nm = NAMES.get(op, 'op%d' % op)
+    parts = []
+    for k, w in enumerate(ops):
+        c = mod.const(w)
+        if c is not None:
+            parts.append('%s=%d(0x%x)' % (mod.name(w), c, c))
+        else:
+            parts.append(mod.name(w) if w in mod.names else str(w))
+    return '%s  %s' % (nm, ' '.join(parts))
+
+
+def section(mod, wanted):
+    out = []
+    for i, (op, ops, _, _) in enumerate(mod.ins):
+        if op in wanted:
+            out.append(describe(mod, i))
+    return out
+
+
+pm, cm = Mod(PARENT), Mod(CAND)
+
+report = {}
+report['modules'] = dict(
+    parent=dict(path=str(PARENT), sha256=K.sha(PARENT), bytes=PARENT.stat().st_size, words=len(pm.words)),
+    candidate=dict(path=str(CAND), sha256=K.sha(CAND), bytes=CAND.stat().st_size, words=len(cm.words)),
+)
+
+# ---------------------------------------------------------------- header sections
+HEAD = {17: 'capability', 10: 'extension', 11: 'extinstimport', 14: 'memorymodel',
+        15: 'entrypoint', 16: 'executionmode'}
+for op, tag in HEAD.items():
+    report.setdefault('header', {})[tag] = dict(
+        parent=section(pm, {op}), candidate=section(cm, {op}),
+        equal=section(pm, {op}) == section(cm, {op}))
+
+# ---------------------------------------------------------------- structural counts
+def counts(mod, want):
+    c = collections.Counter()
+    for op, ops, _, _ in mod.ins:
+        if op in want:
+            c[NAMES.get(op, op)] += 1
+    return dict(c)
+
+KEY = {4456, 4457, 4458, 4459, 4460, 5358, 5359, 5360, 5361, 5362,
+       224, 225, 61, 62, 65, 128, 130, 132, 141, 180, 168, 248, 249, 250,
+       247, 246, 54, 56, 57, 59, 55, 5, 43, 71, 44, 46, 80, 79, 77, 81, 82}
+report['counts'] = dict(parent=counts(pm, KEY), candidate=counts(cm, KEY))
+
+# storage classes of all OpVariable
+def vars_by_class(mod):
+    c = collections.Counter()
+    for op, ops, _, _ in mod.ins:
+        if op == 59:
+            c[STORAGE.get(ops[2], ops[2])] += 1
+    return dict(c)
+report['storage_class'] = dict(parent=vars_by_class(pm), candidate=vars_by_class(cm))
+
+def buffers(mod):
+    dec = collections.defaultdict(dict)
+    for op, ops, _, _ in mod.ins:
+        if op == 71 and len(ops) >= 3:
+            if ops[1] == 33:
+                dec[ops[0]]['binding'] = ops[2]
+            elif ops[1] == 34:
+                dec[ops[0]]['descriptor_set'] = ops[2]
+    out = []
+    for op, ops, _, _ in mod.ins:
+        if op == 59 and ops[2] in (12, 0, 2):
+            out.append(dict(binding=dec[ops[0]].get('binding'), set=dec[ops[0]].get('descriptor_set'),
+                            storage=STORAGE.get(ops[2], ops[2])))
+    return sorted(out, key=lambda d: (d['set'] or 0, d['binding'] or 0))
+report['descriptors'] = dict(parent=buffers(pm), candidate=buffers(cm),
+                             equal=buffers(pm) == buffers(cm))
+
+report['no_contraction'] = dict(parent=len(ST.no_contraction_ids(pm.m)),
+                                candidate=len(ST.no_contraction_ids(cm.m)))
+
+# ---------------------------------------------------------------- LCS alignment
+def keyseq(mod):
+    return [(mod.ins[i][0], mod.ins[i][3]) for i in range(len(mod.ins))]
+
+A, B = keyseq(pm), keyseq(cm)
+n, mlt = len(A), len(B)
+# LCS table (small modules)
+prev = [[0] * (mlt + 1) for _ in range(2)]
+tbl = []
+for i in range(n + 1):
+    row = [0] * (mlt + 1)
+    tbl.append(row)
+for i in range(n - 1, -1, -1):
+    for j in range(mlt - 1, -1, -1):
+        tbl[i][j] = tbl[i + 1][j + 1] + 1 if A[i] == B[j] else max(tbl[i + 1][j], tbl[i][j + 1])
+
+pairs, i, j = [], 0, 0
+while i < n and j < mlt:
+    if A[i] == B[j]:
+        pairs.append((i, j)); i += 1; j += 1
+    elif tbl[i + 1][j] >= tbl[i][j + 1]:
+        i += 1
+    else:
+        j += 1
+matched_p = {p for p, _ in pairs}
+matched_c = {c for _, c in pairs}
+removed = [i for i in range(n) if i not in matched_p]
+added = [j for j in range(mlt) if j not in matched_c]
+report['align'] = dict(parent_n=n, candidate_n=mlt, matched=len(pairs),
+                       removed=len(removed), added=len(added), strictly_larger=None,
+                       monotone=all(pairs[k][0] < pairs[k + 1][0] and pairs[k][1] < pairs[k + 1][1]
+                                    for k in range(len(pairs) - 1)))
+
+# ---------------------------------------------------------------- removed / added listing
+def ctx(mod, i):
+    sp = func_spans(mod)
+    fn = next((k for k, (a, b) in enumerate(sp) if a <= i <= b), None)
+    bl = block_label(mod, i) if fn is not None else None
+    return fn, (mod.name(mod.ins[bl][1][0]) if bl is not None and mod.ins[bl][0] == 248 else ''), bl
+
+removed_rows = []
+for i in removed:
+    fn, blk, bl = ctx(pm, i)
+    removed_rows.append(dict(gi=i, function=fn, block=blk, text=describe(pm, i),
+                             opcode=NAMES.get(pm.ins[i][0], pm.ins[i][0]),
+                             result_id=ST.result_id_of(pm.ins[i][0], pm.ins[i][1])))
+added_rows = [dict(gi=j, text=describe(cm, j)) for j in added]
+report['removed'] = removed_rows
+report['added'] = added_rows
+report['removed_grouped'] = dict(collections.Counter(r['opcode'] for r in removed_rows))
+report['removed_by_function'] = dict(collections.Counter(str(r['function']) for r in removed_rows))
+
+# ---------------------------------------------------------------- id-shift operand proof
+# for a matched pair, parent ids must appear in the child as parent_id - shift(parent_idx),
+# where shift counts result ids produced by removed instructions before that index.
+removed_result_before = []
+cnt = 0
+rs = []
+for i in range(n):
+    rs.append(cnt)
+    if i in set(removed) and ST.result_id_of(pm.ins[i][0], pm.ins[i][1]) is not None:
+        cnt += 1
+shift_at = rs
+bad = []
+checked = 0
+pairs_set = dict()
+for (pi, ci) in pairs:
+    pop, pops, _, _ = pm.ins[pi]
+    cop, cops, _, _ = cm.ins[ci]
+    assert pop == cop
+    if len(pops) != len(cops):
+        bad.append((pi, 'operand length', pops, cops)); continue
+    s = shift_at[pi]
+    for k, (w1, w2) in enumerate(zip(pops, cops)):
+        if w1 in pm.def_at:                     # id operand
+            if w2 != w1 - s:
+                bad.append((pi, k, w1, w2, s, describe(pm, pi))); break
+        else:
+            if w1 != w2:
+                bad.append((pi, 'literal', k, w1, w2, describe(pm, pi))); break
+    else:
+        checked += 1
+report['operand_proof'] = dict(pairs_checked=checked, pairs_with_mismatch=len(bad),
+                               mismatch_sample=bad[:12], id_shift_model='child_id == parent_id - #removed_result_ids_before')
+
+# ---------------------------------------------------------------- coopmat sites
+def cm_detail(mod):
+    out = []
+    for i, (op, ops, _, _) in enumerate(mod.ins):
+        if op in (4457, 4458, 4459):
+            out.append(dict(op=NAMES.get(op), text=describe(mod, i)))
+    return out
+report['coopmat'] = dict(parent=cm_detail(pm), candidate=cm_detail(cm))
+
+K.write_json(CARD / 'build' / 'diff.json', report)
+print('parent ins', n, 'candidate ins', mlt, 'matched', len(pairs), 'removed', len(removed), 'added', len(added))
+print('removed grouped:', json.dumps(report['removed_grouped'], indent=1))
+print('removed by function:', report['removed_by_function'])
+print('operand proof:', report['operand_proof']['pairs_checked'], 'checked,',
+      report['operand_proof']['pairs_with_mismatch'], 'mismatch')
+print('storage_class parent:', report['storage_class']['parent'])
+print('storage_class cand  :', report['storage_class']['candidate'])
+print('descriptors equal:', report['descriptors']['equal'])
+print('nc:', report['no_contraction'])
+print('header equal:', {k: v['equal'] for k, v in report['header'].items()})
+print()
+print('--- removed instructions ---')
+for r in removed_rows:
+    print('%4d f%-2s %-22s %s' % (r['gi'], r['function'], r['block'], r['text']))

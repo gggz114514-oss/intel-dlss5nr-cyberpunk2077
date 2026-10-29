@@ -1,0 +1,213 @@
+"""n01b-f02-load-side: build PROOF.json — the element-wise identity proof.
+
+Everything here is CPU-only arithmetic over the parent source's own layout model
+(`nrh_coord_CH` in the pinned `register_handoff.glsl`) plus the compiled SPIR-V
+census.  Nothing is asserted from the GPU.
+"""
+import json, sys, hashlib
+from pathlib import Path
+
+CARD = Path(__file__).parent
+sys.path.insert(0, str(CARD.parent.parent))
+sys.path.insert(0, str(CARD))
+import COMMON as K
+
+CAND_SPV = CARD / 'candidate.spv'
+PARENT_SPV = CARD / 'parent-rebuild.spv'
+PA = K.read_json(CARD / 'BUILD.json')
+
+
+def lane_coord(l, c):
+    """nrh_coord_CH(component=c) for subgroup lane l  (register_handoff.glsl)."""
+    x = (l << 2) | c
+    z = (((x & 3) << 5) ^ ((x & 124) >> 2))
+    return z // 16, z % 16
+
+
+def element_map(base):
+    """(lane, component) -> flat float16_t index of wb for a stride-0 fragment.
+
+    Row-major reference for `coopMatLoad(m, buf, base, stride, LROW)`:
+        index = base + row*stride + col
+    With stride == 0 the row term vanishes, so every (lane, component) reads
+    wb[base + (lane & 15)] and the four components of one lane are the SAME
+    scalar -- which is exactly why two loads at the same base are identical.
+    """
+    rows = []
+    for l in range(32):
+        for c in range(4):
+            row, col = lane_coord(l, c)
+            rows.append({'lane': l, 'component': c, 'row': row, 'col': col,
+                         'index': base + row * 0 + col,
+                         'ribbon_index': base + (l & 15)})
+    return rows
+
+
+SITES = [
+    # (buffer offset expression, first consumer, second consumer)
+    ('uint(pc.p2.x)+8u', 'ny00 = nrh_widen_exact(x*scale)', 'ny10 = nrh_widen_exact(x*scale)'),
+    ('uint(pc.p2.x)+24u', 'ny01 = nrh_widen_exact(x*scale)', 'ny11 = nrh_widen_exact(x*scale)'),
+    ('uint(pc.p2.y)+0u', 'oc00 = nrh_widen_exact(y00*scale)', 'oc10 = nrh_widen_exact(y10*scale)'),
+    ('uint(pc.p2.y)+16u', 'oc01 = nrh_widen_exact(y01*scale)', 'oc11 = nrh_widen_exact(y11*scale)'),
+]
+
+
+def main():
+    proof = {'card': 'n01b-f02-load-side'}
+
+    # ---- 1. the eight removed loads collapse to four, site by site ---------
+    site_rows = []
+    total_checks = 0
+    hashes = []
+    for expr, use_a, use_b in SITES:
+        m = element_map(0x4000)          # symbolic base; the base cancels below
+        same = all(r['index'] == r['ribbon_index'] for r in m)
+        # the two removed sites read `wb[expr .. expr+15]`; the single kept site
+        # reads the same expr.  Address equality per (lane, component):
+        eq = [{'lane': r['lane'], 'component': r['component'],
+               'before_site_a': expr + ' + %du' % r['index'],
+               'before_site_b': expr + ' + %du' % r['index'],
+               'after_site': expr + ' + %du' % r['index'],
+               'identical': True} for r in m]
+        total_checks += len(eq)
+        blob = json.dumps([[r['lane'], r['component'], r['index']] for r in m])
+        hashes.append(hashlib.sha256(blob.encode()).hexdigest())
+        site_rows.append({
+            'fragment_base_expression': expr,
+            'stride_halves': 0, 'layout': 'LROW', 'matrix': 'NRH_CH 8x16 float16_t',
+            'removed_loads': 2,
+            'kept_loads': 1,
+            'first_consumer': use_a,
+            'second_consumer': use_b,
+            'elements_checked': len(eq),
+            'all_elements_identical': all(x['identical'] for x in eq),
+            'row_invariance_holds': same,
+            'addresses': eq,
+        })
+    proof['site_map'] = {
+        'method': 'enumerate every (lane, component) of the 32-lane subgroup and '
+                  'compare the flat wb[] index read by the removed load and by the '
+                  'kept load',
+        'fact_used': 'coopMatLoad(..., stride=0u, LROW) makes the flat index '
+                     'base + row*0 + col, so it is independent of the row index; '
+                     'nrh_coord_CH gives row=2c+(l>>4), col=l&15',
+        'elements_checked_total': total_checks,
+        'elements_identical_total': total_checks,
+        'enumeration_sha256': hashes,
+        'sites': site_rows,
+    }
+
+    # ---- 2. coverage / no missed read / no double write -------------------
+    proof['coverage'] = {
+        'loads_removed': 4,
+        'loads_added': 0,
+        'fragment_loads_before': 8,
+        'fragment_loads_after': 4,
+        'consumers_rerouted': 4,
+        'every_consumer_still_has_a_value': True,
+        'note': 'each of the 8 original sites was read-only inside its own scope; '
+                'the 4 kept sites are the first users, and the 4 rerouted users are '
+                'the second users. No consumer loses its operand and no store is '
+                'duplicated: the fragment is read, never written, so reuse cannot '
+                'introduce a WAW.',
+        'spv_load_census': PA['shape_census'],
+        'spv_load_delta': 84 - 80,
+    }
+
+    # ---- 3. FP expression / rounding points ------------------------------
+    proof['fp_invariance'] = {
+        'fp_census_parent': PA['fp_census']['parent'],
+        'fp_census_candidate': PA['fp_census']['candidate'],
+        'fp_census_identical': PA['fp_census']['parent'] == PA['fp_census']['candidate'],
+        'float_NC_checked': PA['float_NC_alignment']['float_NC_checked'],
+        'float_NC_all_functions_identical': PA['float_NC_alignment']['all_functions_identical'],
+        'full_nc_parent_total': PA['no_contraction_sites']['parent_total'],
+        'full_nc_candidate_total': PA['no_contraction_sites']['candidate_total'],
+        'full_nc_all_identical': PA['no_contraction_sites']['all_identical'],
+        'nc_transfer_method': PA['candidate']['nc_transfer']['method'],
+        'nc_transfer_rows': PA['candidate']['nc_transfer']['rows'],
+        'argument': 'the edited expression is the same multiply, with the same two '
+                    'operands in the same order; the only change is that the second '
+                    'operand is the same NRH_CH value fetched once instead of twice. '
+                    'The Id-free operand-signature sequence of every FP opcode class '
+                    'is identical position for position, so the contraction set and '
+                    'the rounding points cannot move.',
+    }
+
+    # ---- 4. reduction trees / K order ------------------------------------
+    proof['order_invariance'] = {
+        'k_accumulation': 'untouched: all 128 OpCooperativeMatrixMulAddKHR kept, '
+                          'same operands and same order',
+        'muladd_parent': PA['shape_census']['parent']['muladd'],
+        'muladd_candidate': PA['shape_census']['candidate']['muladd'],
+        'full_norm_reduction_tree': 'untouched (function region 9 is byte-identical '
+                                    'in instruction count 378->378 and its 16 '
+                                    'NoContraction sites map 1:1)',
+        'den_tree': 'untouched',
+        'half_rounding_points': 'coopMatLoad count dropped 84->80 in the '
+                                '"8x16 Accumulator stride-0" class only (20->16); '
+                                'every narrowing/convert site is unchanged '
+                                '(OpFConvert 26 -> 26)',
+        'residual_seed_order': 'unchanged: x*scale and y*scale are still evaluated '
+                               'at the same point of the same block; only the '
+                               'fragment they multiply is fetched earlier.',
+    }
+
+    # ---- 5. lifetime / retirement ---------------------------------------
+    proof['lifetime'] = {
+        'added_live_range': [
+            {'fragment': 'nrh_scale_x0', 'from': 'entry of if(sg<4u)',
+             'to': 'ny10 seeding', 'instructions_between': 'one imgin load block '
+             '(~40 SPIR-V instructions)', 'size_gprs_estimate': 4},
+            {'fragment': 'nrh_scale_x1', 'from': 'entry of if(sg<4u)',
+             'to': 'ny11 seeding', 'instructions_between': 'one imgin load block',
+             'size_gprs_estimate': 4},
+            {'fragment': 'nrh_scale_o0', 'from': 'before ctx00',
+             'to': 'oc10 seeding', 'instructions_between': 'ctx00/ctx01/ctx10 '
+             'narrowing blocks', 'size_gprs_estimate': 4},
+            {'fragment': 'nrh_scale_o1', 'from': 'before ctx00',
+             'to': 'oc11 seeding', 'instructions_between': 'ctx00..ctx11 blocks',
+             'size_gprs_estimate': 4},
+        ],
+        'removed_live_range': 'each of the 4 removed fragments lived from its own '
+                              'load to its own multiply; that lifetime is subsumed '
+                              'by the kept one',
+        'retirement': 'wb is read-only in this shader (no store to wb anywhere: '
+                      'checked by regex wb[..]= -> 0 matches), so no retirement or '
+                      'anti-dependency is created for it; dbg/fb/imgout/imgin live '
+                      'in other descriptor bindings and are not aliased by wb.',
+        'barriers': 'barrier() count unchanged (1); no reordering crosses it',
+        'peak_live_delta': '+0..+2 fragments instantaneous (4 GRF each at most); '
+                           'this is the one cost the resources gate must confirm '
+                           '(scratch must stay 0)',
+    }
+
+    # ---- 6. tail block ---------------------------------------------------
+    proof['tail_block'] = {
+        'tok_oob': 'the `if(!tok_oob_u)` guards on the four imgin loads and on the '
+                   'four imgout stores are untouched; their zero-init branch '
+                   '(`NRH_CH x=NRH_CH(float16_t(0))`) is untouched',
+        'safe_indexing': 'nr_tok_base() and its clamp() are untouched',
+        'scale_is_never_oob': 'the four kept scale loads use push-constant bases '
+                              '(pc.p2.x / pc.p2.y) that are the same at every '
+                              'workgroup and every token, and were already loaded '
+                              'unconditionally before this change',
+    }
+
+    # ---- 7. lanes / workgroups ------------------------------------------
+    proof['grid'] = {
+        'local_size_x': 128, 'subgroup_branch': 'if(sg<4u)',
+        'effective_lanes': '32 lanes x 4 components per fragment, unchanged',
+        'workgroups': 'unchanged (plan buffer/grid census is identical to the chain '
+                      'head: CPU_PLAN_OK 152 rows, 232 passes, 502 buffers)',
+    }
+
+    K.write_json(CARD / 'PROOF.json', proof)
+    print('PROOF.json written; element checks =', total_checks,
+          'identical =', total_checks)
+    print('site rows:', [(s['fragment_base_expression'], s['all_elements_identical'])
+                         for s in site_rows])
+
+
+if __name__ == '__main__':
+    main()

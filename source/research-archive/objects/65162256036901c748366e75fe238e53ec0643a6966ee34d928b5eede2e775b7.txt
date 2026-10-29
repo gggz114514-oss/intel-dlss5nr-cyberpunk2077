@@ -1,0 +1,75 @@
+n05a-f05-c256-mreuse — RESUME（2026-10-27）
+
+状态：BUILT / AWAITING-GPU（本卡未跑任何 Vulkan 任务、未取 GPU 锁、未部署、未改基线指针）
+
+一、这一版做了什么
+C256 F05（16 个 PASS：37,40,43,46,49,52,55,58,169,172,175,178,181,184,187,190）的 QKV 投影段，
+把父的两个 row_phase 合并成一次 M 批量翻倍的 pass：同一 SG 同时持有 m0a=(sg%4)*8 与 m0b=m0a+32
+两个 M8 A 片段，每块权重 tile 只加载一次、喂两条独立的 MMA。
+per SG：权重 tile 加载 192 → 96（−50%），A tile 加载 64 → 64（±0），DPAS 192 → 192（±0），
+QK 段同时活累加器 4 → 8，V 段 2 → 4。全部 token/通道/store 地址与父逐一相同，数值应为 bit-exact。
+
+二、已证（CPU，可复核）
+1. 父源 + 同一 glslang 配方**字节复现**父 SPV 9d61c4e3…66d8（raw_match=true，无需 NC 迁移）。
+2. candidate.spv = 7a9576d1…0af1（86,552 B），过 spv_validate_cpu（exit 0）。
+3. plan.txt = 6aad500e…a5db，只替换本组 16 行 PASS；与基线逐行 diff 恰好 16 行，且只有 SPV 路径变化；
+   cpu_check（--cpu-check）exit 0，输出与基线对照完全一致：CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded。
+4. 算术对齐：float_NC 8 对 8，父的 8 个 NoContraction 站点 1:1 传入候选，
+   候选自有多余装饰 0；`precise` 只在 8 个 score block 的 bias add（未动）；QKV 段沿用父的"无保护缩并"政策。
+5. 结构对齐（SPIR-V）：DPAS 静态 38→44（= QK 4→8、V 2→4，各执行 1 次而非 row_phase 2 次，动态 192 不变）、
+   coopmat load 静态 50→52（A 位点 2→4，B 位点 6→6）、store 静态 46→60（发布 6→12 + 其 debug 镜像）、
+   OpLoopMerge 28→27（去掉 row_phase 循环）、Workgroup 共享 24,576 B 与 7 个 binding 均不变。
+6. 源码改动范围：diff 只有两处 —— 头部注释插入 + 父 141–195 行（QKV 段）；
+   QKV 段里每条 coopMatLoad/coopMatStore 的地址表达式都能在父里逐条找到（missing=0，42 条语句核对）。
+7. 完整网格（未变）：11×6×4=264 WG 与 11×7×4=308 WG 各 8 个 PASS，合计 4,576 WG / 36,608 SG / 1,171,456 线程；
+   每个 SG = 1 head 的 16 token（2 个 M8 块），每个 WG = 2 head × 64 token。
+
+三、未证（必须在 GPU 侧闭环）
+1. 编译器是否真的把 QKV 段 `load.ugm.d32x8` 从 192 降到 96（落地主判据）。
+2. 8 个累加器是否同时活、是否 spill（父在 QKV 段已用到 r24…r72 共 8 个 DPAS 目标元组、payload 最高 r112/上限 127，
+   只剩约 15 个寄存器余量，+16 fp32 有 spill 风险）。
+3. 权重返回区活值翻倍后是否引入等待（父只有 9 个轮转 B 寄存器、1 载入 : 1 DPAS）。
+4. 整体 ordinary 收益；DRAM 是否变化（本卡只减 1.68 GiB 逻辑请求，几乎全是 cache 命中）。
+基准参照（同 SPV 字节的既有 native）：224 dpas（QKV 192 + attention 32）、1,014 send（750 load + 261 store，
+其中 QKV 段 192 条 load.ugm.d32x8 权重 + 512 条 load.ugm.d32x8t A 侧 + 2 条 auxf）、2,353 mov、1 条 fence.slm。
+
+四、分诊（当前没有 GPU 结果，按合同 §6 预登记判据，不预告结论）
+· 首选预登记：**若 N1 落地而整体不变快 → C（当前身份无净收益）**；若 N7 出现等待包/在途深度下降 →
+  B（实现有副作用，按增量账修一版）；若 N1 不成立（192 仍是 192）→ A（实现未落地），不是方法无效。
+· D（INDISTINCT）只有在本组 6 组均值差区间跨 0 且 native 已确认 N1/N2 成立时才用；
+  E（数值失败）先定位首差阶段，按 pack/索引/NoContraction/同步逐项查（本卡预期 bit-exact）。
+· 不把任何一次退化写成"权重跨 M 复用方向无效"。
+
+五、下一处具体代码改动（按 native 结果二选一，都已算清）
+A) 若 N1 成立但 N6/N7 显示两块被串行化或引入等待（B 类）→ 改 **S2 分三遍**：
+   把 QKV 段拆成 Q 对一遍 / K 对一遍 / V 对一遍，每遍仍 M 批量翻倍并保留"一对权重喂两个 M 块"，
+   每遍只有 4 个累加器：
+     · 权重 load：仍是 6/ki → 96/SG（与 S1 同）
+     · A load：3 遍 × 2/ki × 16 = 96/SG（父 64，**+32 = +50%**），native `d32x8t` 512 → 768
+     · acc 峰值回到父的 4 个（−16 fp32 reg/lane）
+   期望 native：`load.ugm.d32x8` 96、`dpas` 192、`d32x8t` 768、DPAS 目标元组 4/段。
+   这是"用 +32 条 A send 换 16 个寄存器"的具名对照，可与 S1 组成 3 臂同批测。
+B) 若 N1 成立且无副作用但整体不变快（C 类）→ 不在本 shader 继续堆权重预取，改攻 A 侧：
+   本 shader 的 send 主体是 A 的 **512 条 `load.ugm.d32x8t`**（64 tile × 8 条），且 QK 段与 V 段
+   **重复加载同一 A tile**（32 tile 重复 = 256 条 send）。具体改动：把 V 段并入同一 ki 循环
+   （需要 12 个累加器，须先解决 16 个寄存器的余量），或由 F04 生产侧直接发布 DPAS 友好的 A 片段布局
+   （跨派发，须另开卡，属 N03/N15 范围）。禁止把"矩阵融合"当免费收益，也禁止在没有 native 确认前
+   继续把它们串起来。
+
+六、恢复点 / 文件
+· 候选源：candidate.comp；候选 SPV：candidate.spv（7a9576d1…）；父重编译：parent-rebuild.spv（=9d61c4e3…）
+· plan：plan.txt（6aad500e…）；GPU 请求：GPU-REQUEST.json；构建身份与 cpu_check：BUILD.json
+· 六问：ANALYSIS.md；证明：PROOF.json；成本账：COST-LEDGER.json；native 判据：NATIVE-PREDICTION.md
+· 源码 diff：SOURCE-DIFF.patch；中间产物：_build/（repro/raw.spv、cpu_check*.txt、nc.json）
+· 可复跑脚本（本卡自留，均为 CPU 只读）：_repro.py(_build_candidate.py/_make_plan.py/_emit_json.py/
+  _emit_gpureq.py/_final_check.py/_compare.py/_grid.py/_isa_*.py)。_final_check.py 一键复核：
+  candidate.comp→spv 字节一致、parent-rebuild=父 SPV、validate、cpu_check、plan 16 行替换。
+· 本卡只写了 cards/n05a-f05-c256-mreuse/；基线 plan、指针 JSON、COMMON.py、其他卡目录均未动
+  （复核：父 SPV 9d61c4e3…、父源 b9478e88…、基线 plan a024c3c5… 哈希未变）。
+
+七、未决项（不阻塞，交主代理裁决）
+1. COMMON.FB2_LAST_GOLD = 2b63d4ba… 与 START-HERE 文本的 fb2 末帧 9c3e511e… 不一致；本卡未执行 GPU，
+   建议 manifest 使用 runner 的实际期望值，并在回执里注明用的是哪一个。
+2. 父 native 计数取自 native-f20-pixel-owner 批次（SPV 字节相同、批次/驱动可能不同）；新捕获才是权威。
+3. CARD.txt 里"第二候选（两 head 局部直交 / V 乘法朝向）"按卡要求本卡未做。
+4. 本卡没有把 shT/gT/跨派发部分纳入（不在本族本卡范围）。

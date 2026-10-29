@@ -1,0 +1,192 @@
+"""Read-only F20 (ord 230) ISA accounting, part 2: message taxonomy x staging tax.
+
+Builds on build/isa.json (from _isa.py) and adds the decomposition the card needs:
+
+  * one source-level cooperative-matrix fragment transfer == 8 SLM messages
+    (verified independently on 6 stage counts, see COST-BREAKDOWN.md)
+  * the staging tax per fragment: 8 messages + 8 register moves + ~8 uniform adds
+  * mov sub-taxonomy (uniform vs 32-lane, type-changing vs same-type, immediates)
+  * the dynamic per-dispatch totals (16393 WGs x 8 warps)
+  * lane efficiency of the dispatch and of the pixel tail
+"""
+import re, json, hashlib
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent
+ISA = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+           r'fullnet-mechanism-transfer-20261026/f10-weight-return-separation-20261027/'
+           r'captures/native-f20-pixel-owner/ISA/'
+           r'CS_asm76902ef344609c8a_simd32_0000000000000027_38_orig.asm')
+INSTR = re.compile(r'^/\* \[([0-9A-Fa-f]+)\]\s*\*/\s*(.*)$')
+PRED = re.compile(r'^(\([^)]*\))\s*')
+UNIT = re.compile(r'\((\d+)\|M0\)')
+
+
+def parse():
+    ins = []
+    for ln in ISA.read_text(encoding='utf-8', errors='replace').splitlines():
+        m = INSTR.match(ln)
+        if not m:
+            continue
+        addr, body = m.group(1), m.group(2)
+        pred = None
+        mp = PRED.match(body)
+        if mp:
+            pred = mp.group(1)
+            body = body[mp.end():].strip()
+        comment = None
+        if '//' in body:
+            body, comment = body.split('//', 1)
+            comment = comment.strip()
+        flags = None
+        mf = re.search(r'\{([^}]*)\}\s*$', body)
+        if mf:
+            flags = mf.group(1)
+            body = body[:mf.start()].strip()
+        tok = body.split()
+        if not tok:
+            continue
+        unit = UNIT.search(body)
+        rec = dict(index=len(ins), addr=int(addr, 16), addr_s=addr, pred=pred,
+                   op=tok[0], body=body, flags=flags, comment=comment,
+                   unit=int(unit.group(1)) if unit else None)
+        if rec['op'].startswith('send.') and comment:
+            mm = re.match(r'wr:(\d+)\+(\d+),\s*rd:(\d+);\s*(.+)$', comment)
+            if mm:
+                rec['wr'] = (int(mm.group(1)), int(mm.group(2)))
+                rec['rd'] = int(mm.group(3))
+                rec['msg'] = mm.group(4).strip()
+        ins.append(rec)
+    return ins
+
+
+def mov_class(r):
+    """(width, dst_type, src_type, is_imm, is_staging)"""
+    b = r['body']
+    m = re.search(r'(\w+\.\d+<[^>]*>):(\w+)', b)
+    dt = m.group(2) if m else None
+    st = None
+    imm = None
+    if m:
+        rest = b[m.end():].strip()
+        if rest:
+            src = rest.split()[0]
+            ms = re.search(r':(\w+)', src)
+            st = ms.group(1) if ms else None
+            if re.match(r'^(0x[0-9A-Fa-f]+|[-\d.]+):', src) or ':' not in src:
+                imm = src.split(':')[0]
+    staging = bool(re.search(r'\(\d+\|M0\)\s+r\d+\.\d+<1>:ud\s+r\d+\.\d+<[01];1,0>:ud', b))
+    return r['unit'], dt, st, imm, staging
+
+
+def main():
+    ins = parse()
+    real = ins
+    out = {}
+    # ---- mov taxonomy
+    movs = [r for r in ins if r['op'] == 'mov']
+    tax = dict(total=len(movs), by_width={}, staging=0, type_change=0, same_type=0,
+               imm_zero=0, imm_other=0)
+    for r in movs:
+        w, dt, st, imm, staging = mov_class(r)
+        tax['by_width'][str(w)] = tax['by_width'].get(str(w), 0) + 1
+        if staging:
+            tax['staging'] += 1
+        if dt and st and dt != st:
+            tax['type_change'] += 1
+        elif dt and st and dt == st:
+            tax['same_type'] += 1
+        if imm is not None:
+            if imm in ('0x0', '0', '0.0', '0:hf', '0:w'):
+                tax['imm_zero'] += 1
+            else:
+                tax['imm_other'] += 1
+    out['mov'] = tax
+
+    # ---- staging tax per fragment transfer
+    sends = [r for r in ins if r['op'].startswith('send.')]
+    slm_load = sum(1 for r in sends if r.get('msg', '').startswith('load.slm.d32x8t'))
+    slm_store = sum(1 for r in sends if r.get('msg', '').startswith('store.slm.d32x8t'))
+    frag_loads, frag_stores = 38, 20          # source-level coopMatLoad/Store of tiles
+    out['fragment_transfer'] = dict(
+        slm_load_messages=slm_load, slm_store_messages=slm_store,
+        source_fragment_loads=frag_loads, source_fragment_stores=frag_stores,
+        messages_per_fragment_load=slm_load / frag_loads,
+        messages_per_fragment_store=slm_store / frag_stores,
+        # uniform offset adds that address each message (add (1|M0) rX, rY, imm)
+        slm_offset_adds=sum(1 for r in ins if r['op'] == 'add' and r['unit'] == 1),
+    )
+    # staging movs that feed a send destination / follow a send
+    send_idx = [r['index'] for r in sends]
+    near = 0
+    for r in movs:
+        if any(abs(r['index'] - i) <= 2 for i in send_idx):
+            near += 1
+    out['fragment_transfer']['movs_within_2_of_a_send'] = near
+
+    # ---- message classes, normal path vs debug-only
+    def has(prefix):
+        return sum(1 for r in sends if r.get('msg', '').startswith(prefix))
+    classes = {
+        'slm_load_fragment': slm_load,
+        'slm_store_fragment': slm_store,
+        'slm_other_loads': has('load.slm.d32x8.a32') + has('load.slm.d32x4')
+                            + has('load.slm.d16u32'),
+        'slm_other_stores': has('store.slm.d32.'),
+        'slm_fence': has('fence.slm'),
+        'ugm_store_debug_tiles': has('store.ugm.d32x8t'),
+        'ugm_store_debug_elems': has('store.ugm.d16u32'),
+        'ugm_store_residual': has('store.ugm.d32.'),
+        'ugm_weight_loads': has('load.ugm.d32x8.a32'),
+        'ugm_bias_loads': has('load.ugm.d32x16t'),
+        'ugm_weight_loads_t': has('load.ugm.d32x8t'),
+        'ugm_scalar_loads': has('load.ugm.d16u32'),
+        'ugm_param_loads': has('load.ugm.d32x1t') + has('load.ugm.d32x2t')
+                           + has('load.ugm.d32x32t'),
+        'gateway': has('signal barrier') + has('end of thread'),
+    }
+    debug_only = classes['ugm_store_debug_tiles'] + classes['ugm_store_debug_elems']
+    total = len(sends)
+    out['message_classes'] = {
+        'counts': classes,
+        'total': total,
+        'share_pct': {k: round(100.0 * v / total, 2) for k, v in classes.items()},
+        'debug_only': debug_only,
+        'debug_share_pct': round(100.0 * debug_only / total, 2),
+        'normal_path': total - debug_only,
+    }
+
+    # ---- dispatch arithmetic (grid from the plan PASS row: 169 97 1, local 256)
+    # push constants (plan PUSH of ord 230): tiles_x=336, tiles_y=192, shift=-1,
+    # shift_y=-1, coarse 672x384; one WG covers 2x2 coarse tiles == 8x8 pixels.
+    grid = (169, 97, 1)
+    wgs = grid[0] * grid[1] * grid[2]
+    warps = wgs * 8
+    tiles = (336, 192)
+    real_wgs = (tiles[0] // 2) * (tiles[1] // 2)
+    out['dispatch'] = {
+        'grid': list(grid), 'local_size': 256, 'warps_per_dispatch': warps,
+        'tiles_x': tiles[0], 'tiles_y': tiles[1],
+        'workgroups_that_cover_the_image': real_wgs,
+        'workgroup_efficiency_pct': round(100.0 * real_wgs / wgs, 2),
+        'pixels_per_workgroup': 64,
+        'pixel_slots': real_wgs * 64,
+        'pixels_in_frame': 1280 * 720,
+        'pixel_slot_efficiency_pct': round(100.0 * 1280 * 720 / (real_wgs * 64), 2),
+        'slm_messages_per_dispatch': classes['slm_load_fragment'] + classes['slm_store_fragment'],
+        'slm_messages_per_dispatch_total': sum(v for k, v in classes.items() if k.startswith('slm')),
+        'all_messages_per_dispatch': total * warps,
+        'normal_path_messages_per_dispatch': (total - debug_only) * warps,
+        'fragment_transfer_messages_per_dispatch':
+            (classes['slm_load_fragment'] + classes['slm_store_fragment']) * warps,
+        'pixel_tail': {'subgroups_used': 2, 'subgroups_total': 8,
+                       'thread_efficiency_pct': 25.0,
+                       'note': 'stage 11 (pixel-owner projection) is the only 2-of-8 SG region'},
+    }
+    (CARD / 'build').mkdir(exist_ok=True)
+    (CARD / 'build/isa2.json').write_text(json.dumps(out, indent=1), encoding='utf-8')
+    print(json.dumps(out, indent=1)[:6000])
+
+
+if __name__ == '__main__':
+    main()

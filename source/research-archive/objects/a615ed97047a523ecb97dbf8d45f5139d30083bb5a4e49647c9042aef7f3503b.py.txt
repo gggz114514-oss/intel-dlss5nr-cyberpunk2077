@@ -1,0 +1,271 @@
+"""Assemble S08 CONTRACT.json from the live plan + files (every number is read, not typed)."""
+from pathlib import Path
+import hashlib
+import json
+import re
+
+import numpy as np
+
+R = Path(r"@NR_WORKSPACE@")
+S = R / "work/dsh-fullnet-static-20261029/S08-vit"
+Q = R / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+PLAN = D / "c64-family-static/combo-34189.txt"
+ROWS = Q / "dsh-static-handoff/CURRENT-ROWS.json"
+PACK = R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-v1/pack/vit_block31_weights.int8.bin"
+PACK_V2 = R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-qkv-v2/pack/vit_block31_weights.int8.bin"
+FP16W = R / "src/project/artifacts/parallel-port-20261013/vit/block31/vit_weights.fp16.bin"
+SCALES = R / "src/project/artifacts/parallel-port-20261013/vit/block31/vit_scales.fp32.bin"
+TEACH = [D / "dump-fp16", D / "teacher-diagnostics/teacher-41444", D / "teacher-diagnostics/teacher-43654"]
+ROWS_OF_INTEREST = list(range(119, 125))
+
+
+def shaf(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def main():
+    rows = json.loads(ROWS.read_text())
+    plan_lines = PLAN.read_text(encoding="utf-8").splitlines()
+    pack = PACK.read_bytes()
+    ws = np.frombuffer(pack[9437184:9437184 + 64], dtype="<f4")
+    ew = np.frombuffer(pack[9437248:9437248 + 16384], dtype="<f4")
+    ac = np.frombuffer(pack[9453632:9453632 + 4096], dtype="<f4")
+    ap = np.frombuffer(pack[9457728:9457728 + 4096], dtype="<f4")
+    aq = np.frombuffer(pack[12611648:12611648 + 12288], dtype="<f4")
+    wg = np.frombuffer(pack[9461824:9461824 + 4096], dtype="<f2")
+
+    dispatches = []
+    for i in ROWS_OF_INTEREST:
+        r = rows["rows"][i]
+        toks = r["pass_tokens"]
+        push = [int(x) for x in r["push"]]
+        pol = next(p for p in rows["policies"] if int(p[1]) == int(list(r["bindings"].values())[0][0]))
+        dispatches.append(dict(
+            ordinal=r["ordinal"], pass_number=r["pass_number"], name=r["name"],
+            spv=dict(path=r["spv"], sha256=shaf(r["spv"]) if Path(r["spv"]).is_file() else None,
+                     exists=Path(r["spv"]).is_file()),
+            pass_header=dict(tokens=toks[4:], local_or_wave=int(toks[4]), shared_bytes=int(toks[5]),
+                             bindings=int(toks[6]), subgroup=int(toks[7]),
+                             grid=[int(toks[8]), int(toks[9]), int(toks[10])]),
+            bindings={k: dict(buffer=int(v[0]), buffer_name=rows["buffers"][int(v[0])]["name"],
+                              offset=int(v[1]), bytes=int(v[2])) for k, v in r["bindings"].items()},
+            push=dict(raw=push,
+                      p0=dict(live_tokens=push[0], padded_keys=push[1], stage=push[2], debug=push[3]),
+                      p1=dict(WE_half=push[4], WC_half=push[5], WQKV_half=push[6], WO_half=push[7]),
+                      p2=dict(ff_skip_half=push[8], out_skip_half=push[9], scale_word_off=push[10], block=push[11]),
+                      p3=dict(debug_E_half=push[12], qkv0_half=push[13], logits_float=push[14], exp_half=push[15]),
+                      p4=dict(den_half=push[16], num_half=push[17], inv_half=push[18]),
+                      p5=dict(input_half=push[20], output_half=push[21], hidden_int8_base=push[22], Y_half=push[23]),
+                      p6=dict(qkv_base=push[24], context_base=push[25], debug_half=push[26])),
+        ))
+
+    sub = dict(
+        vit_block31_A=dict(resource=395, bytes=2359296, subregions=[
+            dict(name="qA (expand output, int8)", start=0, end=1179648, elements="288 rows x 4096",
+                 writer="ordinal 120 vit_block31_ffn_expand", readers=["ordinal 121 vit_block31_ffn_contract"],
+                 addr="pc.p5.z(0) + m*4096 + n0+side*16, stride 4096, RowMajor"),
+            dict(name="qX staging (int8)", start=1179648, end=1474560, elements="288 rows x 1024",
+                 writer="ordinal 119 vit_block31_ffn_qx_producer (UNIQUE writer)",
+                 readers=["ordinal 120 vit_block31_ffn_expand (A operand)"],
+                 addr="VIT_A_SCRATCH(1179648) + row*1024 + k, stride 1024, RowMajor"),
+            dict(name="qY (int8, Y edge for the next qkv GEMM)", start=1474560, end=1769472,
+                 elements="288 rows x 1024", writer="ordinal 121 vit_block31_ffn_contract (VIT_QY=1, UNIQUE writer)",
+                 readers=["ordinal 122 vit_block31_qkv"],
+                 addr="VIT_QY_OFF(1474560) + t*1024 + col, stride 1024"),
+            dict(name="unused tail", start=1769472, end=2359296, elements="-", writer=None, readers=[]),
+        ]),
+        note="The three sub-regions are disjoint and abut exactly; the single POLICY row is "
+             "POLICY 395 0 119 122 0 (first=119 because the qx producer writes the staging sub-region "
+             "before the expand reads it). Any plan that inserts a pass before ordinal 119 or moves the "
+             "qx producer after the expand silently reads stale/zero qX.",
+    )
+    scale_dir = dict(
+        ws_0_2="per-tensor weight STEP absmax/127 of WE/WC/WO (informational, unused by kernels)",
+        ws_3_5="sX/sA/sT per-tensor activation STEP (absmax/127)",
+        ws_8_10="invX/invA/invT = 127/absmax -> the quantiser MULTIPLIER (code=roundEven(v*inv))",
+        ws_11_12="sY / invY (Y edge, consumed by qY writer in contract and aq reader in qkv)",
+        ew="sX*sWE[n]   expand per-output-channel dequant (1 multiply)",
+        ac="sA*sWC[n]   contract per-output-channel dequant",
+        ap="sT*sWO[n]   projection per-output-channel dequant",
+        aq="sY*sWQKV[n] qkv per-output-channel dequant",
+        direction_check="expand reads codes*qW, multiplies once by ew; the producer multiplies by INV. "
+                        "Using ws[3..5] where ws[8..10] belongs is a silent 1/s^2 error (vit_common.glsl:40-42).",
+        numbers=dict(sX=float(ws[3]), sA=float(ws[4]), sT=float(ws[5]), sY=float(ws[11]),
+                     invX=float(ws[8]), invA=float(ws[9]), invT=float(ws[10]), invY=float(ws[12]),
+                     ws6_7=[float(ws[6]), float(ws[7])], ws13_15=[float(ws[13]), float(ws[14]), float(ws[15])]),
+        ew_range=[float(ew.min()), float(ew.max())], ac_range=[float(ac.min()), float(ac.max())],
+        ap_range=[float(ap.min()), float(ap.max())], aq_range=[float(aq.min()), float(aq.max())],
+    )
+
+    calib = json.loads((S / "CALIBRATION.json").read_text()) if (S / "CALIBRATION.json").is_file() else None
+    audit = json.loads((S / "AUDIT/audit-b31-ffn.json").read_text()) if (S / "AUDIT/audit-b31-ffn.json").is_file() else None
+
+    source_line_refs = {
+        "candidates/.../vit21-blocks31-38-qkv-v2/source/vit_common.glsl": {
+            "27-56": "VIT_W8 weights view: int8 w8[9437184] + ws[16]/ew[4096]/ac[1024]/ap[1024]/wg[2048] tail",
+            "40-42": "ws[8..10] are INVERSE steps (127/absmax); mixing them with ws[3..5] is a silent 1/s^2 error",
+            "43-45": "ew = sX*sWE[n] (expand), ac = sA*sWC[n] (contract), ap = sT*sWO[n] (projection)",
+            "111-122": "vit_wbase8: W[N/32][K/32][32][32] int8 tile, element (k,n) at n*32+k",
+            "144-147": "vit_code: precise float c=v*inv; clamp(roundEven(c),-127,127)"},
+        "candidates/.../vit21-blocks31-38-qkv-v2/source/vit_nb04_mpair.glsl": {
+            "30": "layout(local_size_x=256)",
+            "33-34": "VIT_A_SCRATCH=1179648 (qX staging), VIT_QY_OFF=1474560 (qY)",
+            "84-89": "K=1024 stage0 / K=4096 stage1 / K=1024 stage4",
+            "102-103": "stage0 A operand is loaded from the qX staging region (not quantised in-kernel)",
+            "139-144": "expand dequant: f[c]*ew[col], then narrow to half BEFORE vit_cubic",
+            "147": "result[c]=vit_cubic(result[c])",
+            "149-153": "invA=ws[9]; qA=vit_code(GELU); int8 store at p5.z+m*4096+n0+side*16",
+            "44": "alpha=ac[col] (contract per-output-channel dequant)",
+            "46": "invY=ws[12] (VIT_QY=1 only)",
+            "52-53": "res=fma(VIT_GAIN_C(col), float(x[p5.x+t*1024+col]), accf) - the FP16 residual",
+            "58": "qY int8 store at VIT_QY_OFF",
+            "61": "Y fp16 store at p5.w",
+            "68": "alpha=ap[col] (projection)",
+            "73-74": "projection residual reads y[p5.w+t*1024+col]"},
+        "candidates/.../vit21-blocks31-38-qkv-v2/source/vit_nb04_qx_producer.comp": {
+            "23": "Scale: invX = ws[8] = 127/absmax(block30_out)",
+            "30": "VIT_A_SCRATCH 1179648 - same constant as the expand A load",
+            "32-41": "one dispatch: row=WGID.x; aHidden[SCRATCH+row*1024+k]=vit_code(x[p5.x+row*1024+k],invX)"},
+        "candidates/.../vit21-blocks31-38-qkv-v2/source/vit_qkv_common.glsl": {
+            "13-25": "full pack view incl. wqkv8[3145728] and aq[3072]",
+            "14-17": "history: using the wqkv8 offset as the w8 size shifted the tail by 73,728 B and zeroed the B operand",
+            "26-27": "VIT_W8_WQKV=9465920, VIT_QY_OFF=1474560"},
+        "candidates/.../vit21-blocks31-38-v1/tools/pack_vit_block31.py": {
+            "3-18": "sealed byte map (WE/WC/WO/ws/ew/ac/ap/wg/wqkv8/aq + FP16 verbatim tail)",
+            "21": "SINGLE_FRAME_DIAGNOSTIC_NOT_CALIBRATION",
+            "86-95": "X absmax from one capture; asserts block30_out tail is zero and full==live absmax",
+            "97-105": "sA/sT/sY from that same capture; sX,sA,sT,sY = absmax/127",
+            "108-147": "per-output-channel absmax/127 weight quantisation + sAct*sW scale arrays",
+            "149-157": "ws[0..2] step, ws[3..5] sX/sA/sT, ws[8..10] inverse, ws[11] sY, ws[12] invY"},
+        "candidates/.../vit21-blocks31-38-v1/tools/derive_plans.py": {
+            "16-21": "POLICY first=111 for vit_block31_A because the qx producer writes the staging sub-region",
+            "111-117": "producer inserted before the expand block with identical 9 BIND rows and 32 PUSH words"},
+        "work/dsh-int8-fullnet-impl-20261024/candidates/r12-r15-split16-vit/source/vit21-cand/vit_attention_qk8_pv8.comp": {
+            "26-33": "sQ/sK/sV/sP are all in-kernel absmax - DYNAMIC, the S10/S11 remainder",
+            "132": "sQ = shQMax/127 per workgroup",
+            "161-162": "sK/sV per chunk",
+            "252-254": "sP per (query, chunk)",
+            "340": "invT = ws[10] - the only FFN-adjacent scale the attention kernel reads"},
+    }
+    contract = dict(
+        card="S08 ViT block31 FFN (expand+contract), vertical slice of blocks 31..38",
+        generated_from=dict(plan=str(PLAN), plan_sha256=shaf(PLAN), rows=str(ROWS), rows_sha256=shaf(ROWS)),
+        scope_note="block31 only. Blocks 32..38 FNN rows are structurally identical but each has its own "
+                   "pack/SPV identity; nothing here is extrapolated to them.",
+        identity_checks=dict(
+            plan_pack_sha256=shaf(PACK), plan_pack_bytes=len(pack),
+            plan_pack_is_fp16_source=bool(pack == FP16W.read_bytes()),
+            fp16_source_sha256=shaf(FP16W),
+            v2_pack_sha256=shaf(PACK_V2),
+            v2_pack_is_fp16_source=bool(PACK_V2.read_bytes() == FP16W.read_bytes()),
+            finding="vit21-blocks31-38-qkv-v2/pack/vit_block31_weights.int8.bin is byte-identical to the "
+                    "FP16 source weights (25169920 B, sha 174bf517...). The name says int8, the bytes are "
+                    "FP16. Plans that bind it (plan-full-*.txt in that candidate) are NOT genuine INT8 arms "
+                    "for the weight operand. combo-34189.txt binds the v1 pack (9166f9c8...), which is a real "
+                    "INT8 pack (14,269,526 changed bytes, tail regions verbatim).",
+        ),
+        dispatches=dispatches,
+        resource_subregions=sub,
+        scale_contract=scale_dir,
+        qx_producer=dict(
+            ordinal=119, name="vit_block31_ffn_qx_producer",
+            spv=shaf(R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-v1/spv/qx_producer.spv"),
+            spv_source_dir="vit21-blocks31-38-v1 (v1 SPV is what the plan binds; v2's producer SPV is a "
+                           "different file and is not in this plan)",
+            grid="288x1x1, local_size 256, shared 0, 9 bindings",
+            semantics="aHidden[1179648+row*1024+k] = clamp(roundEven(float(x[0+row*1024+k]) * ws[8]), -127,127)",
+            unique_writer="yes (the v2 expand template no longer re-quantises qX inside the gy loop)",
+            frame_bug_history="v1 staged qX inside the expand kernel, re-quantised once per gy workgroup "
+                              "(128x duplicated), +1.19 ms / +5.7M SEND on pass 116",
+            duplicated_work_risk="one dispatch per block per frame; block31 costs 1 extra dispatch",
+        ),
+        expand=dict(ordinal=120, name="vit_block31_ffn_expand",
+                    gemm="A(288x1024 int8) x B(1024x4096 int8) -> int32, K step 32, MA8 8x32 / MB8 32x16 / AC8 int32",
+                    weight_segment=dict(base=0, N=4096, K=1024, tile="W[N/32][K/32][32][32]", bytes=4194304),
+                    epilogue="half(f32(int32 acc) * ew[col]) -> vit_cubic -> code(*ws[9]) -> int8 qA store",
+                    activation=dict(kind="vit_cubic (cubic GELU approximation)",
+                                    constants=[-0.055908203125, 0.447265625, 0.89453125],
+                                    precision="half throughout: clamp to [-4,4], two half FMAs, half multiply",
+                                    narrowing="F32 accumulator is narrowed to half BEFORE the activation, "
+                                              "exactly like the FP16 parent"),
+                    int32_bound=dict(K=1024, worst=16516096, int32_max=2147483647, margin=130)),
+        contract_=dict(ordinal=121, name="vit_block31_ffn_contract",
+                       gemm="A(288x4096 int8 qA) x B(4096x1024 int8) -> int32, K step 32",
+                       weight_segment=dict(base=4194304, N=1024, K=4096, bytes=4194304),
+                       epilogue="res = half( fma(float(wg[col]), float(x[t*1024+col]), f32(int32 acc)*ac[col]) )",
+                       residual=dict(source="binding 2 Input = block30_out, FP16, read directly",
+                                     gain="wg[0..1024) = verbatim copy of the FP16 residual gain vectors at "
+                                          "byte 25165824 (pc.p2.x = 12582912 half offset)",
+                                     not_from_qx="the INT8 contract does NOT reconstruct X from qX; a change of "
+                                                 "invX/sX therefore cannot leak into the residual"),
+                       qy_write=dict(condition="VIT_QY=1 (SPV ac0b5c1a... is the only contract SPV in the plan)",
+                                     scale="ws[12]=invY", dest="vit_block31_A[1474560..1769472)"),
+                       int32_bound=dict(K=4096, worst=66064384, int32_max=2147483647, margin=32.5)),
+        projection_and_qkv=dict(
+            note="out of this card's numerical scope, registered for the consumer chain",
+            projection=dict(ordinal=124, spv=shaf(R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-qkv-v2/spv/vit_nb04_projection_int8.spv"),
+                            a_operand="qT int8 from vit_block31_T base (pc.p6.y=0)", weight_segment=dict(base=8388608, N=1024, K=1024),
+                            alpha="ap[col]=sT*sWO[col]", residual="wg[1024..2048) * y[...]",
+                            writes="block31_out FP16 (not qO: HC4/F2)"),
+            qkv=dict(ordinal=122, spv=shaf(R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-qkv-v2/spv/vit_nb04_qkv_int8.spv"),
+                     a_operand="qY int8 at VIT_QY_OFF", weight_segment=dict(base=9465920, N=3072, K=1024),
+                     alpha="aq[col]=sY*sWQKV[col]", extra="per-head Q scale from binding 1 scales[(n0%1024)/32], "
+                                                          "Q/K L2 normalisation and the 5.65625 factor are FP16 and unchanged"),
+        ),
+        head_scale_separation=dict(
+            head_scales=dict(resource=400, file=str(SCALES), sha256=shaf(SCALES), bytes=128, floats=32,
+                             semantics="per-head Q scale, read by vit_block31_qkv as scales[(n0%1024)/32], "
+                                       "applied to the Q columns only (n0<1024); pre-existing FP16-baseline asset"),
+            ffn_scales="live inside resource 399 (pack offsets 9437184/9437248/9453632/9457728/9461824)",
+            verdict="structurally disjoint: no FFN edge scale is shared with a head scale, and no head scale "
+                    "is written by this card",
+            attention_dynamic_remainder=dict(
+                spv=shaf(R / "work/dsh-int8-fullnet-impl-20261024/candidates/r12-r15-split16-vit/spv/r12r15_vit_attention_qk8_pv8.spv"),
+                sQ="per workgroup absmax over 64 queries x 32 dims / 127 (in-kernel)",
+                sK="per (workgroup, chunk) absmax",
+                sV="per (workgroup, chunk) absmax",
+                sP="per (query, chunk) absmax",
+                status="DYNAMIC - belongs to S10/S11, NOT closed by this card; the FFN slice shares nothing with it")),
+        teacher_and_dumps=dict(
+            teachers=[dict(dir=str(t), block30_out=shaf(t / "dump_block30_out.bin"),
+                           A=shaf(t / "dump_vit_block31_A.bin"), Y=shaf(t / "dump_vit_block31_Y.bin"),
+                           T=shaf(t / "dump_vit_block31_T.bin"), QKV=shaf(t / "dump_vit_block31_QKV.bin"))
+                      for t in TEACH],
+            dtype="little-endian fp16", live_rows=288,
+            sizes=dict(block30_out=786432, A=2359296, Y=589824, T=589824, QKV=1769472),
+            note="block30_out holds 384 rows in a 786432-byte buffer but only 288 are live (tail is all zero "
+                 "in the calibration capture; every dump consumer must slice [0:288*K])"),
+        source_line_refs=source_line_refs,
+        cpu_audit=audit,
+        calibration=dict(
+            file=str(S / 'CALIBRATION.json'), sha256=shaf(S / 'CALIBRATION.json'),
+            method=calib['method'] if calib else None,
+            data=calib['data'] if calib else None,
+            reproduction=calib['reproduction'] if calib else None,
+            parameters=calib['stage2']['parameters'] if calib else None,
+            chosen=calib['stage2']['chosen'] if calib else None,
+            per_frame=calib['stage2']['per_frame'] if calib else None,
+            pooled_new_rel_l2=calib['stage2']['pooled_new_rel_l2'] if calib else None,
+            pooled_old_rel_l2=calib['stage2']['pooled_old_rel_l2'] if calib else None,
+            improvement=calib['stage2']['improvement'] if calib else None,
+            saturation=calib['stage2']['saturation_final'] if calib else None,
+            headroom_tradeoff=calib['stage2']['headroom_tradeoff'] if calib else None,
+            leave_one_frame_out=calib['stage2']['leave_one_frame_out'] if calib else None,
+            in_fit_best=calib['stage2']['in_fit_best'] if calib else None,
+            variants={k: v for k, v in calib['stage1'].items()
+                      if k.startswith('V') and isinstance(v, dict)}
+            if calib and calib.get('stage1') else None,
+            ablations={k: v for k, v in calib['stage1'].items() if k.startswith('abl')}
+            if calib and calib.get('stage1') else None,
+            new_pack=calib['stage2']['pack'] if calib else None,
+        ),
+    )
+    (S / "CONTRACT.json").write_text(json.dumps(contract, indent=1, default=str) + "\n", encoding="utf-8")
+    print("wrote CONTRACT.json")
+    print(json.dumps(contract["identity_checks"], indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

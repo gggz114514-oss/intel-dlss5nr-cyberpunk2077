@@ -1,0 +1,176 @@
+"""S06 block15 step B: CPU forward of the native INT8 C256 FFN.
+
+1. VALIDATION on C256 block48 against the stored v4 CPU/GPU-exact reference
+   (evidence/v4-reference-block48/{qX,qA,qM,Y}.bin) -- this pins the
+   implementation before it is pointed at block15.
+2. block15 old arm: shipped pack + shipped scales -> Y_int8, vs the FP16
+   teacher Y (dump-fp16/dump_swin_15_Y.bin).
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+import c256b15 as L
+
+EV = L.W / "evidence/03-chain.json"
+V48REF = L.V48 / "evidence/v4-reference-block48"
+
+idx, oob = L.window_to_canonical()          # window slot -> canonical token (-1 oob)
+valid = idx >= 0
+NW, NV = L.N_TOK, L.N_VALID
+
+
+def pack_scalars(raw):
+    sc = np.frombuffer(raw[L.SCAL_OFF:L.SCAL_OFF + 128].tobytes(), dtype="<f4")
+    d = dict(invX=float(sc[0]), invA=float(sc[1]), invM=float(sc[2]),
+             sX=float(sc[3]), sA=float(sc[4]), sM=float(sc[5]),
+             absX=float(sc[6]), absA=float(sc[7]), absM=float(sc[8]))
+    d["ew"] = np.frombuffer(raw[L.EW_OFF:L.EW_OFF + 4096].tobytes(), dtype="<f4")
+    d["mw"] = np.frombuffer(raw[L.MW_OFF:L.MW_OFF + 1024].tobytes(), dtype="<f4")
+    d["alpha"] = np.frombuffer(raw[L.ALPHA_OFF:L.ALPHA_OFF + 1024].tobytes(), dtype="<f4")
+    return d
+
+
+def load_pack(path):
+    raw = np.fromfile(path, dtype=np.uint8)
+    codes = dict(
+        wc=L.from_pack_bytes(raw[L.WC_OFF:L.WE_OFF].view(np.int8), 256, 256),
+        we=L.from_pack_bytes(raw[L.WE_OFF:L.WM_OFF].view(np.int8), 1024, 256),
+        wm=L.from_pack_bytes(raw[L.WM_OFF:L.SC_OFF].view(np.int8), 256, 128),
+    )
+    rs = np.frombuffer(raw[L.RS_OFF:L.RS_OFF + 1024].tobytes(), dtype="<f4").astype(np.float16)
+    return raw, codes, pack_scalars(raw), rs
+
+
+def qx_codes(Xw, inv):
+    """producer: int8(clamp(roundEven(f32(v*inv)),-127,127)); zero for oob."""
+    x = np.where(valid[:, None], Xw, np.float32(0.0))
+    return L.code(x, inv)
+
+
+def canonical_qa_view(qa_win, mask):
+    """window-major qA[N_TOK,1024] -> canonical index array for comparison."""
+    return idx[mask]
+
+
+def expand_mid(qx, cod, sc):
+    """qX -> (qA codes [NW,1024], qM codes [NW,256])."""
+    acc = qx.astype(np.float64) @ cod["we"].astype(np.float64).T        # exact int32
+    f = acc.astype(np.float32)
+    v = np.float32(f * sc["ew"][None, :])
+    vh = L.narrow_half(v)
+    ha = L.act_half32(vh)
+    qa = L.code(ha, sc["invA"])
+    qm = np.zeros((NW, 256), dtype=np.int32)
+    qa32 = qa.astype(np.float64)
+    for g in range(L.MID_GROUPS):
+        sl = slice(32 * g, 32 * g + 32)
+        a2 = (qa32[:, 128 * g:128 * g + 128] @ cod["wm"][sl].astype(np.float64).T).astype(np.float32)
+        t = np.float32(a2 * sc["mw"][sl][None, :])
+        c = np.float32(t * np.float32(sc["invM"]))
+        qm[:, sl] = np.clip(np.rint(c.astype(np.float64)), -127.0, 127.0).astype(np.int32)
+    return qa, qm, dict(a_f32_max=float(np.abs(f).max()), a_half_max=float(np.abs(vh).max()))
+
+
+def contract(qm, seed_half, cod, sc, rs):
+    acc = qm.astype(np.float64) @ cod["wc"].astype(np.float64).T
+    f = acc.astype(np.float32)
+    real = np.float32(f * sc["alpha"][None, :])
+    s = (L.narrow_half(np.float16(seed_half) * rs[None, :])).astype(np.float32)
+    out = np.float32(real + s)
+    return out.astype(np.float16), real, s
+
+
+# =========================== 1. block48 validation ==========================
+ev = {"block48_validation": {}, "block15": {}}
+try:
+    raw48, cod48, sc48, rs48 = load_pack(L.V48 / "pack/c256_b48_int8.bin")
+    We48, Wm48, Wc48, rs48fp = L.decode_weights(
+        L.B / "candidates/amd-map-20261015/round4-integrated/candidate/packs/swin_48_weights.fp16.bin")
+    ev["block48_validation"]["rs_pack_equals_fp16"] = bool(np.array_equal(rs48, rs48fp.astype(np.float16)))
+    qx_ref = np.fromfile(V48REF / "qX.bin", dtype=np.int8)            # canonical, 1032192 B
+    qa_ref = np.fromfile(V48REF / "qA.bin", dtype=np.int8)            # canonical, 4128768 B
+    qm_ref = np.fromfile(V48REF / "qM.bin", dtype=np.int8)            # window-major
+    y_ref = np.fromfile(V48REF / "Y.bin", dtype="<f2")                # window-major
+    # (a) qA/qM/Y from the *stored qX*: pure stage test, no input ambiguity
+    qx_win = np.zeros((NW, 256), dtype=np.int8)
+    qx_win[valid] = qx_ref.reshape(NV, 256)[idx[valid]]
+    qa, qm, _ = expand_mid(qx_win, cod48, sc48)
+    # canonical view of qA: (tile*32 + c//32)*16*32 + s*32 + c%32
+    c = np.arange(1024)[None, :]
+    tile_of = (idx[valid] // 16)
+    s_of = (idx[valid] % 16)
+    qa_win_valid = qa[valid]
+    pos = ((tile_of[:, None] * 32 + c // 32) * 16 + s_of[:, None]) * 32 + (c % 32)
+    flat = np.zeros(4128768, dtype=np.int8)
+    flat[pos.ravel()] = qa_win_valid.ravel()
+    ev["block48_validation"]["qA_from_stored_qX"] = dict(
+        n=int(flat.size), equal=int((flat == qa_ref).sum()), pct=float((flat == qa_ref).mean() * 100))
+    ev["block48_validation"]["qM_from_stored_qA"] = dict(
+        n=int(qm.size), equal=int((qm.astype(np.int8) == qm_ref).sum()),
+        pct=float((qm.astype(np.int8) == qm_ref).mean() * 100))
+    # (b) Y from stored qM + teacher X seed (block48's ioport blend input)
+    X48 = L.load_x_canonical(L.D / "dump-fp16/dump_ioport_block48_blend.bin")
+    Xw48 = np.zeros((NW, 256), dtype=np.float32)
+    Xw48[valid] = X48[idx[valid]]
+    seed = np.where(valid[:, None], Xw48, np.float32(0)).astype(np.float16)
+    qmw = qm_ref.reshape(NW, 256).astype(np.int32)
+    Y48, _, _ = contract(qmw, seed, cod48, sc48, rs48)
+    ev["block48_validation"]["Y_from_stored_qM"] = dict(
+        n=int(Y48.size), bitexact=int((Y48.view(np.uint16) == y_ref.reshape(NW, 256).view(np.uint16)).sum()),
+        pct=float((Y48.view(np.uint16) == y_ref.reshape(NW, 256).view(np.uint16)).mean() * 100))
+    # (c) full chain from the teacher input
+    qx48 = qx_codes(Xw48, sc48["invX"])
+    ev["block48_validation"]["qX_from_teacher_input"] = dict(
+        n=int(qx48.size), equal=int((qx48.reshape(NW, 256)[valid] == qx_ref.reshape(NV, 256)[idx[valid]]).sum()),
+        pct=float((qx48.reshape(NW, 256)[valid] == qx_ref.reshape(NV, 256)[idx[valid]]).mean() * 100))
+    qa2, qm2, _ = expand_mid(qx48, cod48, sc48)
+    Y48b, _, _ = contract(qm2, seed, cod48, sc48, rs48)
+    Y48parent = np.fromfile(L.D / "dump-fp16/dump_swin_48_Y.bin", dtype="<f2").reshape(NW, 256).astype(np.float32)
+    M48 = np.fromfile(L.D / "dump-fp16/dump_swin_48_M.bin", dtype="<f2")
+    ev["block48_validation"]["dump_swin_48_M_nonzero"] = int(np.count_nonzero(M48))
+    ev["block48_validation"]["full_chain_Y_vs_fp16_parent"] = L.stats(
+        Y48b.astype(np.float32), Y48parent, valid, "block48 int8 chain Y vs parent fp16 Y")
+    ev["block48_validation"]["full_chain_Y_vs_v4ref_Y"] = dict(
+        pct=float((Y48b.view(np.uint16) == y_ref.reshape(NW, 256).view(np.uint16)).mean() * 100))
+except Exception as exc:  # keep the block15 path available even if 48 fails
+    ev["block48_validation"]["error"] = f"{type(exc).__name__}: {exc}"
+
+# ============================== 2. block15 =================================
+Xb15 = L.load_x_canonical(L.D / "dump-fp16/dump_block14_out.bin")
+Xw = np.zeros((NW, 256), dtype=np.float32)
+Xw[valid] = Xb15[idx[valid]]
+Yteach = np.fromfile(L.D / "dump-fp16/dump_swin_15_Y.bin", dtype="<f2").reshape(NW, 256).astype(np.float32)
+
+raw15, cod15, sc15, rs15 = load_pack(L.PACK_OLD)
+qx15 = qx_codes(Xw, sc15["invX"])
+qa15, qm15, info15 = expand_mid(qx15, cod15, sc15)
+seed15 = np.where(valid[:, None], Xw, np.float32(0)).astype(np.float16)
+Y15, real15, s15 = contract(qm15, seed15, cod15, sc15, rs15)
+Y15f = Y15.astype(np.float32)
+
+ev["block15"] = dict(
+    pack=str(L.PACK_OLD), pack_sha256=L.PACK_OLD_SHA,
+    scales={k: sc15[k] for k in ("invX", "invA", "invM", "sX", "sA", "sM", "absX", "absA", "absM")},
+    x_absmax=float(np.abs(Xw).max()),
+    stage_absmax=info15,
+    qX_stats=dict(zero=int((qx15 == 0).sum()), n=int(qx15.size),
+                  sat127=int((np.abs(qx15.astype(np.int32)) >= 127).sum())),
+    qA_stats=dict(zero=int((qa15 == 0).sum()), n=int(qa15.size),
+                  sat127=int((np.abs(qa15.astype(np.int32)) >= 127).sum())),
+    qM_stats=dict(zero=int((qm15 == 0).sum()), n=int(qm15.size),
+                  sat127=int((np.abs(qm15) >= 127).sum())),
+    Y_vs_teacher=L.stats(Y15f, Yteach, valid, "b15 int8 old arm Y vs FP16 teacher Y"),
+    Y_vs_teacher_f32=L.stats(np.float32(real15 + s15), Yteach, valid, "b15 int8 old arm Y (f32 out)"),
+    residual_norm_frac=float(np.sqrt(np.mean(s15[valid] ** 2)) / np.sqrt(np.mean(Yteach[valid] ** 2))),
+    contract_norm_frac=float(np.sqrt(np.mean(real15[valid] ** 2)) / np.sqrt(np.mean(Yteach[valid] ** 2))),
+)
+B15OUT = L.D / "dump-fp16/dump_block15_out.bin"
+if B15OUT.exists():
+    ev["block15"]["block15_out_dump"] = dict(bytes=B15OUT.stat().st_size)
+
+EV.write_text(json.dumps(ev, indent=1), encoding="utf-8")
+print(json.dumps(ev, indent=1)[:8000])

@@ -1,0 +1,119 @@
+"""Read-only ISA scanner for n11b-vit-projection-hoist (no GPU, no lock).
+
+Parses a GTPin medisa .asm dump into instructions:
+    /* [0FF0] */ (W)   mov (32|M0)  r58.0<1>:ud  r3.0<0;1,0>:ud
+      pred=(W)  op=mov  exec=(32|M0)  dst=r58.0<1>:ud  srcs=[...]
+
+Counts the categories this card is about (per-exec-width mov, dpas, sends split
+by exec width, jmpi, sync) and prints instruction windows for the per-k0 step.
+
+usage:
+  python isa_scan.py summary <asm> [<asm> ...]
+  python isa_scan.py step    <asm> <lo_hex> <hi_hex>
+  python isa_scan.py dpas    <asm>
+  python isa_scan.py sends   <asm>
+  python isa_scan.py mov32   <asm>
+"""
+import re, sys, json, collections
+
+LINE = re.compile(r'^/\* \[([0-9A-Fa-f]+)\]\s+\*/\s*(.*)$')
+LABEL = re.compile(r'^(L\d+):')
+PAREN0 = re.compile(r'^\(([^)]*)\)\s*')
+EXEC = re.compile(r'^\((\d+)\|([A-Za-z0-9]+)\)\s*')
+
+
+def parse(path):
+    out, label = [], None
+    for raw in open(path, encoding='utf-8', errors='replace'):
+        s = raw.rstrip('\n')
+        if s.strip().startswith('//'):
+            continue
+        m = LABEL.match(s.strip())
+        if m:
+            label = m.group(1)
+            continue
+        m = LINE.match(s)
+        if not m:
+            continue
+        off = int(m.group(1), 16)
+        body = m.group(2)
+        body2, _, com = body.partition('//')
+        body2 = body2.strip()
+        com = com.strip()
+        if not body2:
+            continue
+        pred = None
+        pm = PAREN0.match(body2)
+        if pm:
+            pred = pm.group(1)
+            body2 = body2[pm.end():].strip()
+        toks = body2.split()
+        if not toks:
+            continue
+        op = toks[0]
+        rest = body2[len(op):].strip()
+        exec_mask, width = None, None
+        em = EXEC.match(rest)
+        if em:
+            width = int(em.group(1))
+            exec_mask = em.group(0).strip()
+            rest = rest[em.end():].strip()
+        fields = [f for f in re.split(r'\s{2,}', rest) if f.strip()]
+        out.append(dict(label=label, off=off, pred=pred, op=op, exec=exec_mask,
+                        width=width, dst=(fields[0] if fields else ''),
+                        rest=rest, fields=fields, comment=com, text=body2))
+    return out
+
+
+def summary(ins):
+    sends = [i for i in ins if i['op'].startswith('send')]
+    dpas = [i for i in ins if i['op'].startswith('dpas')]
+    movs = collections.Counter()
+    for i in ins:
+        if i['op'] == 'mov':
+            movs['mov_%s' % (i['width'] if i['width'] else '?')] += 1
+    dstreg = collections.Counter()
+    for i in dpas:
+        m = re.match(r'^(r\d+)', i['dst'])
+        if m:
+            dstreg[m.group(1)] += 1
+    return dict(total=len(ins), sends=len(sends),
+                send_wide=len([i for i in sends if (i['width'] or 0) > 1]),
+                send_narrow=len([i for i in sends if i['width'] == 1]),
+                send_kinds=dict(collections.Counter(i['op'] for i in sends)),
+                dpas=len(dpas), dpas_dst=dict(dstreg.most_common(8)),
+                jmpi=len([i for i in ins if i['op'].startswith('jmpi')]),
+                sync=len([i for i in ins if i['op'].startswith('sync')]),
+                movs=dict(movs),
+                opcount=dict(collections.Counter(i['op'] for i in ins).most_common(20)))
+
+
+if __name__ == '__main__':
+    cmd = sys.argv[1]
+    if cmd == 'summary':
+        rows = []
+        for p in sys.argv[2:]:
+            ins = parse(p)
+            s = summary(ins)
+            s['file'] = p.split('/')[-1]
+            rows.append(s)
+        print(json.dumps(rows, indent=1))
+        sys.exit(0)
+    ins = parse(sys.argv[2])
+    if cmd == 'dpas':
+        for i in ins:
+            if i['op'].startswith('dpas'):
+                print('%05X %-4s %s' % (i['off'], i['label'] or '', i['text']))
+    elif cmd == 'sends':
+        for i in ins:
+            if i['op'].startswith('send'):
+                print('%05X %-4s %s' % (i['off'], i['label'] or '', i['text']))
+    elif cmd == 'mov32':
+        for i in ins:
+            if i['op'] == 'mov' and i['width'] == 32:
+                print('%05X %-4s %s' % (i['off'], i['label'] or '', i['text']))
+    elif cmd == 'step':
+        lo, hi = int(sys.argv[3], 16), int(sys.argv[4], 16)
+        for i in ins:
+            if lo <= i['off'] <= hi:
+                print('%05X %-4s %-4s %s' % (i['off'], i['label'] or '', i['exec'] or '', i['text']))

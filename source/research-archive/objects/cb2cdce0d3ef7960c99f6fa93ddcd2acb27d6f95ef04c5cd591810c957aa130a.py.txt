@@ -1,0 +1,268 @@
+"""C256 block15 FFN shared loader / CPU reference library (S06).
+
+Everything here is derived from verified files; no GPU, no writes outside
+W/S06-c256.  Formulas and layouts come from
+  candidates/codex-sol-int8-long-008-20261019/c256-int8-v1/source/*.comp
+  candidates/codex-sol-int8-long-008-20261019/c256-int8-v1/evidence/v4-gate-alignment.json
+and are re-derived here from the pack bytes themselves.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+import numpy as np
+
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029/S06-c256"
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+CAND = B / "candidates/codex-sol-int8-long-008-20261019"
+V15 = CAND / "c256-early-15-22-v1"
+V48 = CAND / "c256-int8-v1"
+
+FP16_PACK = B / "candidates/amd-map-20261015/round4-integrated/candidate/packs/swin_15_weights.fp16.bin"
+PF16_SHA = "df8100f65b1ee727b1a308ef873d24e0e29c14631d3b5b9d5a889ac68d0c334c"
+PACK_OLD = V15 / "pack/c256_b15_int8.bin"
+PACK_OLD_SHA = "60d58005ba8e64e7da3cae8be8d9ee7818ee88e32f1ef3bd5c6f2f3f291bb2f5"
+
+SPV_EXPAND = V48 / "spv/c256_expand_mid_int8.spv"
+SPV_CONTRACT = V48 / "spv/c256_contract_int8.spv"
+SPV_PRODUCER = V15 / "spv/c256_early_qx_producer.spv"
+SPV_WO = B / "work/dsh-int8-fullnet-impl-20261024/candidates/r07-c256-wo-merged/spv/r07m_c256_wo_qx_i8.spv"
+
+# ---- pack layout (bytes) : c256_int8_common.glsl + pack receipts -----------
+WC_OFF, WE_OFF, WM_OFF = 0, 65536, 327680
+SC_OFF = 360448
+EW_OFF, MW_OFF, ALPHA_OFF = SC_OFF + 0, SC_OFF + 4096, SC_OFF + 5120
+SWE_OFF, SWM_OFF, SWC_OFF = SC_OFF + 6144, SC_OFF + 10240, SC_OFF + 11264
+SCAL_OFF, RS_OFF = SC_OFF + 12288, SC_OFF + 12416
+RS_END = RS_OFF + 1024
+PAD_OFF = 373888          # 2944 B pad between rs and qx  (unused by every pass)
+PAD_BYTES = 2944
+QX_OFF, QX_BYTES = 376832, 1032192
+QA_OFF, QA_BYTES = 1409024, 4128768
+TOTAL = QA_OFF + QA_BYTES
+
+# SC scalars (c256_int8_common.glsl:39-47)
+SC_INV_X, SC_INV_A, SC_INV_M, SC_S_X, SC_S_A, SC_S_M = 0, 1, 2, 3, 4, 5
+SC_ABS_X, SC_ABS_A, SC_ABS_M = 6, 7, 8
+
+# ---- parent FP16 pack half offsets (identical push words in the plan) -----
+FP_WE, FP_WM, FP_WC = 164224, 426368, 98688
+RS_HALF = 655752
+
+TILES_X, TILES_Y = 21, 12
+GRID_X, GRID_Y = 11, 6
+SHIFT_X, SHIFT_Y = 0, 0
+N_WIN = GRID_X * GRID_Y              # 66
+N_TOK_WIN = 64
+N_TOK = N_WIN * N_TOK_WIN            # 4224 window-major slots
+N_VALID = TILES_X * TILES_Y * 16     # 4032 canonical tokens
+C_IN, C_A, C_M = 256, 1024, 256
+MID_GROUPS = 8                       # mid = 8 independent (N32 x K128) blocks
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ---- weight index maps (build_packs_early.py:56-68) ------------------------
+def fp16_idx(n, k):
+    """Parent FP16 weight order: [N/16][K/16][16][16], n inner then k inner."""
+    return (n // 16) * 4096 + (k // 16) * 256 + (n % 16) * 16 + (k % 16)
+
+
+def w8_idx(n, k, K):
+    """INT8 pack order: [N/32][K/32][32][32], n inner then k inner."""
+    return (n // 32) * (K // 32) * 1024 + (k // 32) * 1024 + (n % 32) * 32 + (k % 32)
+
+
+def decode_weights(fp16_pack: Path = FP16_PACK):
+    """Return (We[N=1024,K=256], Wm[N=256,K=128], Wc[N=256,K=256], rs[256]) fp32."""
+    flat = np.fromfile(fp16_pack, dtype="<f2")
+    n = np.arange(1024)[:, None]; k = np.arange(256)[None, :]
+    We = flat[FP_WE + fp16_idx(n, k)].astype(np.float32)
+    n = np.arange(256)[:, None]; k = np.arange(128)[None, :]
+    Wm = flat[FP_WM + (n * 128 + k)].astype(np.float32)   # mid is dense row-major
+    n = np.arange(256)[:, None]; k = np.arange(256)[None, :]
+    Wc = flat[FP_WC + fp16_idx(n, k)].astype(np.float32)
+    rs = flat[RS_HALF:RS_HALF + 256].astype(np.float32)
+    return We, Wm, Wc, rs
+
+
+def pack_codes(W, K):
+    """Per-output-channel symmetric absmax/127, RNE, clamp [-127,127] (same as
+    quantize_segment in build_packs_early.py)."""
+    N = W.shape[0]
+    ch = np.max(np.abs(W), axis=1)
+    s = np.where(ch > 0, ch / 127.0, 1.0).astype(np.float32)
+    q = np.clip(np.rint(W.astype(np.float64) / s[:, None].astype(np.float64)), -127.0, 127.0)
+    return q.astype(np.int8), s
+
+
+def to_pack_bytes(codes, K):
+    N = codes.shape[0]
+    n = np.arange(N)[:, None]; k = np.arange(K)[None, :]
+    buf = np.zeros(N * K, dtype=np.int8)
+    buf[w8_idx(n, k, K).ravel()] = codes.ravel()
+    return buf
+
+
+def from_pack_bytes(raw: np.ndarray, N, K):
+    n = np.arange(N)[:, None]; k = np.arange(K)[None, :]
+    return raw[w8_idx(n, k, K)].astype(np.int32)
+
+
+# ---- canonical <-> window-major token maps --------------------------------
+def canonical_row(tx, ty, s):
+    return (ty * TILES_X + tx) * 16 + s
+
+
+def window_to_canonical():
+    """idx[N_TOK] -> canonical token row (or -1 when out of bounds)."""
+    idx = np.full(N_TOK, -1, dtype=np.int64)
+    oob = 0
+    for w in range(N_WIN):
+        wy, wx = divmod(w, GRID_X)
+        for t in range(N_TOK_WIN):
+            q, s = t >> 4, t & 15
+            tx = 2 * wx + SHIFT_X + (q & 1)
+            ty = 2 * wy + SHIFT_Y + (q >> 1)
+            if 0 <= tx < TILES_X and 0 <= ty < TILES_Y:
+                idx[w * N_TOK_WIN + t] = canonical_row(tx, ty, s)
+            else:
+                oob += 1
+    return idx, oob
+
+
+def canonical_to_window():
+    """map[canonical token] -> window-major slot (asserts bijection)."""
+    idx, _ = window_to_canonical()
+    m = np.full(N_VALID, -1, dtype=np.int64)
+    v = idx >= 0
+    m[idx[v]] = np.nonzero(v)[0]
+    assert (m >= 0).all(), "canonical tokens not covered by the window grid"
+    return m
+
+
+def load_x_canonical(path: Path):
+    """dump_block14_out-style canonical FP16 tensor -> [N_VALID, 256] fp32."""
+    flat = np.fromfile(path, dtype="<f2", count=N_VALID * C_IN)
+    c = np.arange(C_IN); s = np.arange(16); tile = np.arange(TILES_X * TILES_Y)
+    idx = ((tile[:, None, None] * 16 + (c[None, None, :] // 16)) * 256
+           + s[None, :, None] * 16 + (c[None, None, :] % 16))
+    return flat[idx].astype(np.float32).reshape(N_VALID, C_IN)
+
+
+def load_window_major(path: Path, ch: int, np_dtype="<f2"):
+    flat = np.fromfile(path, dtype=np_dtype)
+    assert flat.size >= N_TOK * ch, (path.name, flat.size)
+    return flat[:N_TOK * ch].reshape(N_TOK, ch)
+
+
+# ---- half numerics --------------------------------------------------------
+H = np.float16
+
+
+def narrow_half(x):
+    return np.asarray(x, dtype=np.float32).astype(H).astype(np.float32)
+
+
+def act_half32(x):
+    """c256_act_h: MpCubicSilu evaluated entirely in half (fma = one rounding).
+
+    t = clamp(x,-4,4); u = fma(-0.055908203125,|t|,0.447265625);
+    return x * fma(t,u,0.89453125)   -- all operands/roundings in binary16.
+    """
+    xh = np.asarray(x, dtype=np.float32).astype(H)
+    t = np.clip(xh, H(-4.0), H(4.0))
+    u = (np.float64(-0.055908203125) * np.abs(t.astype(np.float64))
+         + np.float64(0.447265625)).astype(H)
+    v = (t.astype(np.float64) * u.astype(np.float64)
+         + np.float64(0.89453125)).astype(H)
+    return (xh.astype(np.float64) * v.astype(np.float64)).astype(H).astype(np.float32)
+
+
+def code(v, inv):
+    """c256_code: precise f32 multiply by the inverse step, RNE, clamp."""
+    c = np.float32(np.asarray(v, dtype=np.float32) * np.float32(inv))
+    return np.clip(np.rint(c.astype(np.float64)), -127.0, 127.0).astype(np.int8)
+
+
+def code_f32(v, inv):
+    """Same but keeps the pre-clamp f32 product (for audit)."""
+    return np.float32(np.asarray(v, dtype=np.float32) * np.float32(inv)).astype(np.float64)
+
+
+def rel_l2(a, b, mask=None):
+    a = np.asarray(a, dtype=np.float64); b = np.asarray(b, dtype=np.float64)
+    if mask is not None:
+        a = a[mask]; b = b[mask]
+    d = a - b
+    return float(np.sqrt(np.mean(d * d)) / max(np.sqrt(np.mean(b * b)), 1e-30))
+
+
+def stats(a, b, mask=None, label=""):
+    a = np.asarray(a, dtype=np.float64); b = np.asarray(b, dtype=np.float64)
+    if mask is not None:
+        a = a[mask]; b = b[mask]
+    d = a - b
+    return dict(label=label, n=int(a.size),
+                rel_l2=float(np.sqrt(np.mean(d * d)) / max(np.sqrt(np.mean(b * b)), 1e-30)),
+                corr=float(np.corrcoef(a.ravel(), b.ravel())[0, 1]),
+                max_abs_err=float(np.abs(d).max()),
+                rms=float(np.sqrt(np.mean(d * d))))
+
+
+# ---- verified pack -> Y chain (read the pack bytes, replay the shader math) --
+def decode_pack(raw):
+    """All taps of one c256_b15 pack, as floats/ints (see evidence/03 for the layout)."""
+    import numpy as _np
+    codes = dict(
+        wc=from_pack_bytes(raw[WC_OFF:WE_OFF].view(_np.int8), 256, 256),
+        we=from_pack_bytes(raw[WE_OFF:WM_OFF].view(_np.int8), 1024, 256),
+        wm=from_pack_bytes(raw[WM_OFF:SC_OFF].view(_np.int8), 256, 128))
+    s = _np.frombuffer(raw[SCAL_OFF:SCAL_OFF + 128].tobytes(), dtype="<f4")
+    d = dict(invX=float(s[0]), invA=float(s[1]), invM=float(s[2]),
+             sX=float(s[3]), sA=float(s[4]), sM=float(s[5]))
+    d["ew"] = _np.frombuffer(raw[EW_OFF:EW_OFF + 4096].tobytes(), dtype="<f4")
+    d["mw"] = _np.frombuffer(raw[MW_OFF:MW_OFF + 1024].tobytes(), dtype="<f4")
+    d["alpha"] = _np.frombuffer(raw[ALPHA_OFF:ALPHA_OFF + 1024].tobytes(), dtype="<f4")
+    d["rs"] = _np.frombuffer(raw[RS_OFF:RS_OFF + 1024].tobytes(), dtype="<f4").astype(_np.float16)
+    d["tab"] = _np.frombuffer(raw[PAD_OFF:PAD_OFF + 1024].tobytes(), dtype="<f4")
+    return codes, d
+
+
+def chain_from_pack(raw, Xw, use_tab=True, keep=False):
+    """X (window-major [N_TOK,256] fp32) -> Y (fp16->fp32), exact shader arithmetic."""
+    import numpy as _np
+    codes, d = decode_pack(raw)
+    inv = d["tab"].astype(_np.float64) if use_tab else _np.full(256, d["invX"], dtype=_np.float64)
+    qx = _np.clip(_np.rint(Xw.astype(_np.float64) * inv[None, :]), -127.0, 127.0)
+    acc = qx @ codes["we"].astype(_np.float64).T
+    ew = (d["sX"] * _np.frombuffer(raw[SWE_OFF:SWE_OFF + 4096].tobytes(), dtype="<f4").astype(_np.float64))
+    ha = act_half32(narrow_half(_np.float32(acc.astype(_np.float32) * ew.astype(_np.float32)[None, :])))
+    qa = _np.clip(_np.rint((ha * _np.float32(d["invA"])).astype(_np.float64)), -127.0, 127.0).astype(_np.int64)
+    qf = qa.astype(_np.float64)
+    mreal = _np.empty((N_TOK, 256), dtype=_np.float32)
+    for g in range(MID_GROUPS):
+        sl = slice(32 * g, 32 * g + 32)
+        r = qf[:, 128 * g:128 * g + 128] @ codes["wm"][sl].astype(_np.float64).T
+        mreal[:, sl] = r.astype(_np.float32) * d["mw"][sl][None, :]
+    qm = _np.clip(_np.rint((mreal * _np.float32(d["invM"])).astype(_np.float64)), -127.0, 127.0).astype(_np.int64)
+    acc3 = qm @ codes["wc"].astype(_np.float64).T
+    y = _np.float32(acc3.astype(_np.float32) * d["alpha"][None, :]
+                    + narrow_half(Xw * d["rs"][None, :]))
+    out = dict(y=y.astype(_np.float16).astype(_np.float32), qx=qx, ha=ha, mreal=mreal,
+               qa=qa, qm=qm,
+               sat=dict(qx=int((_np.abs(qx) >= 127).sum()),
+                        qa=int((_np.abs(qa) >= 127).sum()),
+                        qm=int((_np.abs(qm) >= 127).sum())),
+               qx_rms_code=float(_np.sqrt(_np.mean(qx.astype(_np.float64) ** 2))))
+    return out if keep else out["y"]

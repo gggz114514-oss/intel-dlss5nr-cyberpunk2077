@@ -1,0 +1,200 @@
+"""S03-tail: quality-sensitivity diagnostics computed from the existing 24 frame pairs.
+
+All numbers are IN-SAMPLE diagnostics on the same 24 frames that were used for
+calibration/measurement, derived only from files that already exist.  Nothing here is
+a GPU result, a new candidate, or a causal attribution.
+
+Questions answered:
+  1. How much of the tail output error is a global per-channel colour offset
+     (3-parameter) or a per-channel affine term (6-parameter)?
+  2. How much is frame-local global colour (per-frame affine, oracle upper bound)?
+  3. How does the error distribute against the history blend weight, and how wrong is
+     the blend weight itself (the value that only matters once feedback is autonomous)?
+  4. How much of the residual does the exit's 0.25 gain and the base anchor attenuate?
+"""
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+
+import numpy as np
+
+B = Path("@NR_WORKSPACE@")
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+OUT = D / "c64-family-static"
+FRAMES = {
+    "day-street-static-formal-01": list(range(34189, 34197)),
+    "day-street-motion-formal-01": list(range(41444, 41452)),
+    "day-street-motion-formal-02": list(range(43654, 43662)),
+}
+SHAPE = (2, 720, 1280, 4)
+
+
+def ref_path(seq: str, frame: int) -> Path:
+    for sub in (Q / "dataset" / seq).iterdir():
+        if sub.is_dir() and sub.name.endswith(f"-{frame}"):
+            return sub / "network-output.bin"
+    raise FileNotFoundError(frame)
+
+
+def psnr(mse: float) -> float:
+    return -10.0 * math.log10(mse) if mse > 0 else float("inf")
+
+
+def main() -> None:
+    # ---- pass 1: pooled moments for the 3/6-parameter fits --------------------
+    n = 0
+    s_cur = np.zeros(3)
+    s_ref = np.zeros(3)
+    s_cc = np.zeros(3)
+    s_rr = np.zeros(3)
+    s_cr = np.zeros(3)
+    sse_raw = 0.0
+    frames = []
+    for seq, fs in FRAMES.items():
+        for f in fs:
+            ref = np.fromfile(ref_path(seq, f), dtype="<f4").reshape(SHAPE)
+            cur = np.fromfile(OUT / f"run-{f}" / "replayed-network.bin", dtype="<f4").reshape(SHAPE)
+            r = ref[0, :, :, :3].astype(np.float64)
+            c = cur[0, :, :, :3].astype(np.float64)
+            frames.append((f, seq, r, c, ref, cur))
+            n += r[:, :, 0].size
+            s_cur += c.sum(axis=(0, 1))
+            s_ref += r.sum(axis=(0, 1))
+            s_cc += (c * c).sum(axis=(0, 1))
+            s_rr += (r * r).sum(axis=(0, 1))
+            s_cr += (c * r).sum(axis=(0, 1))
+            sse_raw += float(((c - r) ** 2).sum())
+
+    mse_raw = sse_raw / (n * 3)
+    # per-channel DC removal
+    bias = (s_cur - s_ref) / n
+    var_after_dc = (s_cc - 2 * bias * s_cur - 2 * s_cr + 2 * bias * s_ref + n * bias ** 2) / n
+    # E[(c-b-r)^2] = E[c^2] -2bE[c] + b^2 -2E[cr] +2bE[r] + E[r^2]
+    e_after_dc = (s_cc - 2 * bias * s_cur + n * bias ** 2 - 2 * s_cr + 2 * bias * s_ref + s_rr) / n
+    mse_dc = float(np.sum(e_after_dc) / 3)
+    # per-channel affine reference ~ alpha*current + beta (the *deployable* direction:
+    # a correction applied to the INT8 output, never touching the FP16 reference)
+    alpha = (s_cr - s_cur * s_ref / n) / (s_cc - s_cur ** 2 / n)
+    beta = (s_ref - alpha * s_cur) / n
+    # E[(r - (alpha c + beta))^2]
+    e_aff = (s_rr - 2 * alpha * s_cr - 2 * beta * s_ref + alpha ** 2 * s_cc
+             + 2 * alpha * beta * s_cur + n * beta ** 2) / n
+    mse_aff = float(np.sum(e_aff) / 3)
+
+    # ---- pass 2: per-frame oracle affine + blend conditioning ----------------
+    rows = []
+    sse_dimless = 0.0
+    for f, seq, r, c, ref, cur in frames:
+        # per-frame oracle affine reference ~ alpha*current + beta
+        # (NOT deployable: it is fitted on that frame's own FP16 output.  It only
+        #  bounds how much of the error could be "global colour" per frame.)
+        af = np.zeros(3)
+        bf = np.zeros(3)
+        nn = r[:, :, 0].size
+        for ch in range(3):
+            rc = r[:, :, ch].ravel()
+            cc = c[:, :, ch].ravel()
+            A = np.vstack([cc, np.ones_like(cc)]).T
+            sol, *_ = np.linalg.lstsq(A, rc, rcond=None)
+            af[ch], bf[ch] = sol
+        fixed = c * af + bf
+        mse_frame_aff = float(((fixed - r) ** 2).mean())
+
+        # blend deciles (reference blend, plane1 channel 3)
+        blend = ref[1, :, :, 3]
+        dblend_err = np.abs(cur[1, :, :, 3] - blend)
+        abs_err = np.abs(c - r).mean(axis=2)
+        qs = np.quantile(blend, np.linspace(0, 1, 11))
+        qs[0] -= 1e-9
+        bins = []
+        for k in range(10):
+            m = (blend > qs[k]) & (blend <= qs[k + 1])
+            if not m.any():
+                continue
+            bins.append({
+                "decile": k,
+                "blend_lo": float(qs[k]), "blend_hi": float(qs[k + 1]),
+                "pixel_frac": float(m.mean()),
+                "mean_abs_rgb_err": float(abs_err[m].mean()),
+                "mean_abs_blend_err": float(dblend_err[m].mean()),
+                "sse_share": float((((c - r) ** 2).mean(axis=2)[m]).sum() / (((c - r) ** 2).mean(axis=2)).sum()),
+            })
+        # correlation only: |rgb err| vs blend (subsampled for speed/noise)
+        sub = np.s_[::4, ::4]
+        xb = blend[sub].ravel()
+        ye = abs_err[sub].ravel()
+        corr = float(np.corrcoef(xb, ye)[0, 1])
+        # how much does the exit attenuate? rgb = base + 0.25*residual -> compare
+        # the observable delta of the *history plane* with the final plane
+        rows.append({
+            "frame": f, "sequence": seq,
+            "oracle_frame_affine_mse": mse_frame_aff,
+            "oracle_frame_affine_psnr": psnr(mse_frame_aff),
+            "affine_a": af.tolist(), "affine_b": bf.tolist(),
+            "corr_abs_err_vs_blend": corr,
+            "blend_deciles": bins,
+        })
+        sse_dimless += mse_frame_aff * nn * 3
+
+    summary = {
+        "frames": len(frames),
+        "baseline": {"mse": mse_raw, "psnr": psnr(mse_raw),
+                     "rmse": math.sqrt(mse_raw)},
+        "dc_removed_3param": {
+            "bias_per_channel": bias.tolist(),
+            "mse": mse_dc, "psnr": psnr(mse_dc),
+            "gain_db": psnr(mse_dc) - psnr(mse_raw),
+            "note": "in-sample; a static 3-value output offset is not a quantisation fix",
+        },
+        "affine_6param": {
+            "alpha_per_channel_ref_over_cur": alpha.tolist(),
+            "beta_per_channel": beta.tolist(),
+            "mse": mse_aff, "psnr": psnr(mse_aff),
+            "gain_db": psnr(mse_aff) - psnr(mse_raw),
+            "note": ("in-sample pooled over all 24 frames, applied as ref ~ alpha*cur + beta; "
+                     "upper bound for any static 6-number output calibration.  A channel-dependent "
+                     "gain is a hint of a static scale issue, not evidence that a calibration is a fix."),
+        },
+        "oracle_per_frame_affine": {
+            "mse": float(np.mean([r["oracle_frame_affine_mse"] for r in rows])),
+            "mean_psnr": float(np.mean([r["oracle_frame_affine_psnr"] for r in rows])),
+            "note": ("per-frame oracle (fitted on that frame's own FP16 output); NOT deployable, only "
+                     "a ceiling for 'the error is just global colour' explanations"),
+        },
+        "corr_abs_err_vs_blend_mean": float(np.mean([r["corr_abs_err_vs_blend"] for r in rows])),
+    }
+    # pooled deciles
+    dec = {}
+    for r in rows:
+        for b in r["blend_deciles"]:
+            acc = dec.setdefault(b["decile"], {"pf": 0.0, "e": 0.0, "be": 0.0, "s": 0.0})
+            acc["pf"] += b["pixel_frac"]
+            acc["e"] += b["mean_abs_rgb_err"] * b["pixel_frac"]
+            acc["be"] += b["mean_abs_blend_err"] * b["pixel_frac"]
+            acc["s"] += b["sse_share"]
+    summary["blend_deciles_pooled"] = {
+        str(k): {"pixel_frac": v["pf"] / len(rows),
+                 "mean_abs_rgb_err": v["e"] / max(v["pf"], 1e-30),
+                 "mean_abs_blend_err": v["be"] / max(v["pf"], 1e-30),
+                 "sse_share": v["s"] / len(rows)}
+        for k, v in dec.items()
+    }
+
+    dest = B / "work/dsh-fullnet-static-20261029/S03-tail/evidence/quality-sensitivity.json"
+    dest.write_text(json.dumps({
+        "scope": ("In-sample sensitivity diagnostics of the existing 24-frame INT8 replay vs the "
+                  "captured FP16 reference. Every number is derived from files that already exist; "
+                  "none is a GPU result, a candidate result, or a causal claim. The measured baseline "
+                  "is reproduced exactly (see tail-output-stats-24.json)."),
+        "summary": summary,
+        "rows": rows,
+    }, indent=1), encoding="utf-8")
+    print(json.dumps(summary, indent=1))
+    print(f"wrote {dest}")
+
+
+if __name__ == "__main__":
+    main()

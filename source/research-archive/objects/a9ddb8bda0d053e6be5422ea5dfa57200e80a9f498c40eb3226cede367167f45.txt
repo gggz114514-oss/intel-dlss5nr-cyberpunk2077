@@ -1,0 +1,106 @@
+n03b-f04-c256 / F04 C256 跨 owner middle 供料 —— RESUME（2026-10-27）
+
+状态：BUILT / AWAITING-GPU（CPU 全过门；未部署；未取 GPU 锁；未运行任何 Vulkan 任务）
+分诊（先验，须由 native/计时确认）：D（INDISTINCT）；A/B/E 的进入条件见 §5。
+
+## 1. 身份（全部可复算，逐字节）
+
+父源码   backend-uniform-owner/d034-family/c256/candidate.comp   sha256 725c590605eb0ff2b76f07040a5ca81811e8fd251437a5ceb5a6cb32f2d4e56e
+父 SPV   同目录 candidate.spv                                    sha256 dc5f1634de7e0a798dd38d64042a83bcc14ee0e8594b427c17f9923d8142e9e5（28772 B）
+父重编译 parent-rebuild.spv                                      sha256 dc5f1634…（**逐字节复现**，同一 glslang 16.5.0 + 钉住头 nb05_swin_c256_common.glsl 315e7c34…，两次运行同 sha）
+候选源码 candidate.comp                                          sha256 34a78c6ef0d7a212d14ff9c43574941d90003b87631632a31db1587ef14b15ff
+候选 SPV candidate.spv                                           sha256 19b5728bd351715ca03019c6088df49bfa43b02965dc5be05e289cd39db12ccb（34616 B，过 spv_validate_cpu，两次编译同 sha）
+plan 基底 当前接受链头 accepted/pkg-vit-16pass-20261027/plan.txt   sha256 584499081a6d773478fa5f97bc45aa80433323d74551056280d9362672b2b2a1
+候选 plan cards/n03b-f04-c256/plan.txt                           sha256 660e8c1077d9dbd05961f01a6f2ffaa396809b4e620ec2f8ac6681b2169c3962
+  → `K.make_plan(spv_shas={dc5f1634…}, parent_plan=链头)` 断言 **replaced == 15**；
+    PLAN-DIFF.json：3510 行中**只有 15 行**不同，逐行都是该 C256 PASS 的 SPV 路径（`every_changed_line_is_the_c256_spv=true`）；
+    `CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded` —— 与链头 cpu-check 输出**逐字相同**。
+
+## 2. 改的是什么（一句话）
+
+expand→act→middle 的 hidden 维从 **4 块 ×32** 改成 **2 块 ×64**：expand 的 A（输入）tile 地址只与
+(token 组, ki) 有关，父的嵌套让它每次 dispatch 被读 **4 次**（128 条 256 B UGM/SG + 每条 4 条半字散布 mov + 1 条 oob 分支），
+候选读 **2 次**（64 条消息 + 256 条 mov + 64 条分支）。
+DPAS 352、权重读 176（expand 128 + middle 16 + contract 32）、mLocal 发布 32、contract A 读 256、单 barrier、seed 4、
+每个 acc 的 K 序（expand ki 0..15、middle 0,16,…,112）全部不变。
+
+## 3. 预算结论（BUDGET.md；**与 CARD 的假设不同，请主代理复核**）
+
+- CARD 写“每 acc=8 GRF、C256 当前 6 acc=48”。**实测：现役基线 expand 段同时活 8 个 acc = 64 GRF**
+  （4 个 expand：DPAS 目的基址 r20/r28/r36/r44；4 个 middle：r52/r66/r80/r88，均 8 GRF）。
+  每 acc=8 GRF 这一点与 CARD 一致；“6 acc”少算了 2 个 middle 累加器。
+- 变换后 **12 个 acc = 96 GRF**（+32 GRF），占 128 GRF 的 75%；剩下 32 GRF 要装 2 个 A 片段（8）+ 2–4 个 B 片段（16–32）+ 地址。
+  文件已 `max_r=127`、`scratch=0`：**没有 spare，只会溢出或串行化**，这就是本卡唯一的真实风险。
+- 同族先例支持“放得下”：C128 同变换（同样 12 acc / 96 GRF）在 native 里确实落地（A 读 68→36、−620 指令）。
+- `+32 GRF` 不可压缩：hidden 每 SG 只有 128（8 个 16 宽 tile），A 复用只能靠“同一 A 服务多个 tile”，
+  每个 tile 需要一个独立 8×16 f32 累加器。不存在“少加 acc 还能减半 A 读”的写法 → 本卡只做这一版，用 scratch 判据裁决。
+
+## 4. 已证 / 未证
+
+已证（CPU，可复算）
+1. 父 SPV 逐字节复现；候选过 `spv_validate_cpu`；两者都是确定性构（重跑同 sha）。
+2. NoContraction：父 0 / 候选 0；浮点站点 `OpFMul 5 + Fma.ext 2` 两边**完全相同**，签名流相同，
+   `float_NC_checked = 14`；4 个函数中 3 个 opcode 流完全相同（act/index/ch_to_a），只有 main 因循环体变厚而不同。
+3. 映射：mLocal 4096 个元素恰好 1 个写者（`sg = c//32`）；每个元素恰好被 **8 个** 通道 owner 读（C256 的 K=256 全通道）；
+   expand A 的 32 个唯一地址在被访问集合上父与候选完全相同，只是重复次数 4→2（PROOF.json 穷举）。
+4. 源码推导与父 native 逐条对上：`load.ugm.d32x64t` barrier 前 **128** = 4 hb × 16 ki × 2 组；
+   barrier 后 4 = seed；`load.ugm.d32x8` 前 144 = expand 128 + middle 16，后 32 = contract；
+   `store.slm` 32、`load.slm` 256、`dpas` 352、`sync.bar` 1（采集 sha 2470b4cc…）。
+5. K 序、权重 tile 索引集合与顺序（8 tile ↔ 4 tile 两两分组，`(tile, ki)` 多重集 1024 项完全相同）、
+   mLocal 发布/contract 读/barrier/seed 文本逐字不变。
+6. plan 只 15 行变化，其余 3495 行逐字相同；232 passes / 502 buffers / 152 rows 与链头一致。
+
+未证（必须 GPU/native，交主代理；判据见 NATIVE-PREDICTION.md）
+1. A 读是否真的减半：预测 `load.ugm.d32x64t` 132→68（barrier 前 128→64）、`send.ugm` 844→780、
+   `jmpi` 134→70、`mov` 2571→1900–2000、`Instruction Count` 6549→5200–5450、`Basic Block` 429→≈365。
+2. 12 个同时驻留的 f32 acc 是否导致 `Scratch Memory Size > 0`（本候选最大风险，也是 B 的入口）。
+3. 端到端是否更快：按 C128 同变换的 −0.023 ms（32 条消息）线性外推约 −0.05 ms，**低于 6 对检出下限 ~0.10 ms**。
+4. L1/L2 命中与 DRAM 字节（不宣称）。
+
+## 5. 分诊与决定树（先 native，再数值，最后计时）
+
+- 主判：**D（INDISTINCT）** —— 15/232 PASS、844 条 send 里删 64 条、且都是 L1 命中读；D 不等于零收益，也不构成方向禁令。
+- `load.ugm.d32x64t` barrier 前仍 128 → **A（实现未落地）**：IGC 把两个 hidden 块串行化。
+  下一版换表达：显式 8 个命名 acc + 手工分离两个 hidden 块的 DPAS 顺序。
+- 前段 64 但 `Scratch > 0` → **B（副作用）**：按 CARD 立即回退，记增量账；下一步先做 C64（增量最便宜）再成包。
+- `dpas`/`Workgroup Memory`/写回计数变化 → 实现错误，回 §1 表。
+- fixed/fb2 首帧不符 → **E**，先查 act 窄化点与 middle 的 hidden 步配对。
+
+## 6. 下一处具体改动
+
+1. **C64（7 PASS，ordinal 6/9/12/15/217/220/223）**：`c64/candidate.comp:64-75` 同结构，`ki<4`（K=64），
+   A 读 32→16 条/SG；累加器 4→8 与 C256 相同，本卡的实现套路可直接复用（把 4096 换成 2048 的 tile 步长）。
+2. **成包**（CARD 已预告）：C128 −32 + C256 −64 + C64 −16 = **−112 条 A 读/SG**，是三宽度合计后唯一可能越过检出下限的形态；
+   成包时建议用本卡 `plan.txt` 作为新基底（它已在链头上）。
+3. 明确不建议再做的：mLocal 再换 tile 形状（两端都测过）、自有片段寄存器直交（已测）、
+   任何带新增独立权重 buffer 的包（ablation 已把 0.25 ms 级退化归因到分配本身）。
+
+## 7. 未决项（不阻塞，已按合同自行推断）
+
+1. **CARD 的 acc 计数与实测不符**（§3）：CARD 写 6 acc=48 GRF，实测 8 acc=64 GRF。本卡按实测继续，
+   若主代理有别的计数口径（例如把 middle 的 4 个算作 2 个），请以此处的寄存器基址证据为准：
+   expand r20/r28/r36/r44，middle r52/r66/r80/r88。
+2. **工程树正在被外部清理**：本卡开工后 `backend-uniform-owner/d034-family/captures/…/ISA` 的 10 份采集只剩 2 份，
+   d034 之前的 pre-d034 parent 采集（`CS_asmc6167173…`）已消失。本卡改引
+   `f10-weight-return-separation-20261027/captures/…/CS_asm95c51e16…`（sha 2470b4cc…，链头 C256 的 native 身份），
+   解析结果已冻结进 PROOF.json；GPU 侧复采时以 base 臂新采为权威。
+3. `gM`（binding 5）在父源码里已无任何写/读（死镜像），候选保持不动；本卡未新增/删除任何 binding。
+4. GPU-REQUEST 的 `plan` 已**直接给在链头上**（不需要主代理再做 `rebase_candidate_plan`）；
+   若主代理在测之前又接受了新卡，请按 `K.rebase_candidate_plan('n03b-f04-c256')` 重生成并核对 PLAN-DIFF 仍是 15 行。
+
+## 8. 恢复点
+
+```
+python.exe cards/n03b-f04-c256/build.py     # 父复现 + 候选编译 + SPV 校验 + NC/浮点审计 + plan(15) + cpu_check + BUILD.json
+python.exe cards/n03b-f04-c256/proof.py     # 穷举映射/K 序/权重 tile/寿命/尾块 + ISA 交叉核对 → PROOF.json
+python.exe cards/n03b-f04-c256/gen_docs.py  # SOURCE-DIFF.patch + PLAN-DIFF.json
+```
+Python：`@NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe`。
+全部只写 `cards/n03b-f04-c256/`；基线 plan、指针 JSON、COMMON.py、其他卡目录、GPU 锁均未改（已核 mtime）。
+
+## 9. 交付清单（本目录）
+
+CARD.txt（主代理原放）、BUDGET.md、ANALYSIS.md、PROOF.json、SOURCE-DIFF.patch、candidate.comp、candidate.spv、
+parent-rebuild.spv、BUILD.json、SPV-DIFF.json、plan.txt、PLAN-DIFF.json、COST-LEDGER.json、NATIVE-PREDICTION.md、
+GPU-REQUEST.json、RESUME.txt、build.py、proof.py、gen_docs.py。
+（目录里原有的 probe*.py 与 build/parent-*.spv 是前一阶段的探索产物，本卡未改动。）

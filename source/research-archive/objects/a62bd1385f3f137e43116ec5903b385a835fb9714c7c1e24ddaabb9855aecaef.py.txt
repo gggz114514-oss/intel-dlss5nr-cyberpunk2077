@@ -1,0 +1,297 @@
+"""n39-f06-c256-slack: SPIR-V facts for parent vs candidate (CPU only).
+
+Contract asks for (BUILD.json): Workgroup bytes from the module (L35), barrier sites, coopmat
+transfer counts/strides, the floating-point expression multiset with operand signatures,
+NoContraction ids/histogram/signature multiset, integer opcode deltas, the DPAS count and a
+static independent-chain root count (L25 proxy).
+
+It adds one check specific to this card: **where the DPAS A operand comes from**.  For every
+OpCooperativeMatrixLoadKHR we walk pointer -> OpAccessChain/OpCopyObject* -> OpVariable and
+report the variable's storage class.  Parent: Workgroup (the shT copy).  Candidate:
+StorageBuffer (the read-only gT/gM tile).  That is the SPIR-V-level proof that the operand
+changed source and the 32768 B Workgroup object is gone.
+
+Writes build/build.json.
+"""
+import collections
+import hashlib
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST          # noqa: E402
+
+CARD = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(CARD.parents[1]))
+import COMMON as K                      # noqa: E402
+
+PINNED_DIRS = {
+    'candidate': [r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                  r'fullnet-continuous-20261027/cards/idt-identity-recipe/evidence/headers/881dff8c5145'],
+    'candidate-padback': [r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                          r'fullnet-continuous-20261027/cards/idt-identity-recipe/evidence/headers/881dff8c5145'],
+    'candidate-f18': [r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                      r'fullnet-continuous-20261027/cards/idt-identity-recipe/evidence/headers/9057283fe0ac',
+                      r'@NR_WORKSPACE@/work/dsh-fp16-same-family-20261023/build/rebuild/K18'],
+}
+CANDIDATES = ['candidate', 'candidate-f18', 'candidate-padback']
+
+OPNAME = {12: 'OpExtInst', 43: 'OpConstant', 59: 'OpVariable', 61: 'OpLoad', 62: 'OpStore',
+          65: 'OpAccessChain', 83: 'OpCopyObject', 224: 'OpControlBarrier', 225: 'OpMemoryBarrier',
+          246: 'OpLoopMerge', 247: 'OpSelectionMerge', 4456: 'OpTypeCooperativeMatrixKHR',
+          4457: 'OpCooperativeMatrixLoadKHR', 4458: 'OpCooperativeMatrixStoreKHR',
+          4459: 'OpCooperativeMatrixMulAddKHR'}
+SCOPE = {0: 'CrossDevice', 1: 'Device', 2: 'Workgroup', 3: 'Subgroup', 4: 'Invocation'}
+STORAGE = {0: 'UniformConstant', 1: 'Input', 2: 'Uniform', 3: 'Output', 4: 'Workgroup',
+           5: 'CrossWorkgroup', 6: 'Private', 7: 'Function', 8: 'Generic', 9: 'PushConstant',
+           10: 'AtomicCounter', 11: 'Image', 12: 'StorageBuffer'}
+CM_LOAD, CM_STORE, CM_MULADD, BARRIER = 4457, 4458, 4459, 224
+FP_OPS = {127, 129, 131, 133, 135, 140, 141, 142}
+FP_EXT = {4, 8, 10, 26, 27, 28, 31, 32, 37, 40, 43, 46, 49, 50}
+INT_TRACKED = {128, 130, 132, 134, 137, 138, 139}
+ARITH = FP_OPS | INT_TRACKED
+
+
+def sha(p):
+    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+
+
+def barriers(m):
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+    out = []
+    for i, (op, ops, _, _) in enumerate(m.instructions):
+        if op != BARRIER:
+            continue
+        out.append(dict(index=i, execution_scope=SCOPE.get(const.get(ops[0], ops[0])),
+                        memory_scope=SCOPE.get(const.get(ops[1], ops[1])),
+                        semantics=const.get(ops[2], ops[2])))
+    return out
+
+
+def movement(m):
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+    loads, stores = [], []
+    for op, ops, _, _ in m.instructions:
+        if op not in (CM_LOAD, CM_STORE):
+            continue
+        rec = dict(layout=const.get(ops[3], ops[3]), stride=const.get(ops[4], ops[4]))
+        (loads if op == CM_LOAD else stores).append(rec)
+    return loads, stores
+
+
+def pointer_root(m, rid, depth=0):
+    """Walk a pointer id back to its OpVariable; return (storage_class, hops, var_id).
+
+    OpVariable encoding: Result Type, Result Id, Storage Class, [Initializer] -> ops[2].
+    """
+    d = m.defining_instruction(rid)
+    if d is None or depth > 12:
+        return None, depth, None
+    op, ops = d
+    if op == 59:                                  # OpVariable
+        return STORAGE.get(ops[2], str(ops[2])), depth, ops[1]
+    if op in (65, 83, 61):                        # AccessChain / CopyObject / Load
+        return pointer_root(m, ops[2], depth + 1)
+    return None, depth, None
+
+
+def cm_pointer_sources(m):
+    """For every cooperative-matrix load: the storage class its pointer resolves to."""
+    out = collections.Counter()
+    detail = []
+    for op, ops, _, _ in m.instructions:
+        if op != CM_LOAD:
+            continue
+        ptr = ops[2]
+        root, hops, var = pointer_root(m, ptr)
+        out[root] += 1
+        detail.append(dict(pointer=ptr, root_storage=root, hops=hops, variable=var,
+                           var_name=m.name_of(var) if var else None))
+    return out, detail
+
+
+def fp_multiset(m):
+    bag = collections.Counter()
+    for op, ops, _, _ in m.instructions:
+        rid = ST.result_id_of(op, ops)
+        if rid is None:
+            continue
+        if op in FP_OPS:
+            bag[('op', op, ST.Module.operand_signature(m, rid, 3))] += 1
+        elif op == 12 and len(ops) > 3 and ops[3] in FP_EXT:
+            bag[('ext', ops[3], tuple(ST.Module.operand_signature(m, x, 2)
+                                      for x in ops[4:7]))] += 1
+    return bag
+
+
+def nc_detail(m):
+    ids = ST.no_contraction_ids(m)
+    by_id = m.id_to_instruction()
+    hist = collections.Counter()
+    sigs = collections.Counter()
+    for rid in ids:
+        op, ops = by_id[rid]
+        hist[op] += 1
+        sigs[(op, ST.Module.operand_signature(m, rid, 2))] += 1
+    return dict(ids=len(ids), histogram={str(k): v for k, v in sorted(hist.items())},
+                signature_multiset_hash=hashlib.sha256(
+                    repr(sorted(sigs.items())).encode()).hexdigest())
+
+
+def chain_roots(m):
+    fp_roots = int_roots = 0
+    for op, ops, _, _ in m.instructions:
+        rid = ST.result_id_of(op, ops)
+        if rid is None or op not in ARITH:
+            continue
+        has_fp = has_int = False
+        for cid in ops:
+            if cid == rid:
+                continue
+            d = m.defining_instruction(cid)
+            if d is None:
+                continue
+            if d[0] in FP_OPS:
+                has_fp = True
+            elif d[0] in INT_TRACKED:
+                has_int = True
+        if op in FP_OPS and not has_fp:
+            fp_roots += 1
+        if op in INT_TRACKED and not has_int:
+            int_roots += 1
+    return dict(fp_chain_roots=fp_roots, int_chain_roots=int_roots,
+                note='root = an arithmetic instruction with no arithmetic operand')
+
+
+def facts(path):
+    m = ST.Module(pathlib.Path(path))
+    st = m.storage_bytes()
+    wg = st.get('Workgroup', {}) or {}
+    bp = barriers(m)
+    lp, sp = movement(m)
+    src_count, src_detail = cm_pointer_sources(m)
+    hp = collections.Counter(op for op, _, _, _ in m.instructions)
+    return dict(path=str(path), sha256=sha(path), instructions=len(m.instructions),
+                words=len(m.words),
+                workgroup_bytes=wg.get('bytes', 0) or 0,
+                workgroup_vars=wg.get('count', 0) or 0,
+                storage=st,
+                barriers=len(bp),
+                barrier_signature=sorted({(b['execution_scope'], b['memory_scope'],
+                                           b['semantics']) for b in bp}),
+                barrier_sites=bp,
+                memory_barriers=hp.get(225, 0),
+                coopmat=dict(loads=len(lp), stores=len(sp),
+                             load_stride_hist=dict(collections.Counter(x['stride'] for x in lp)),
+                             store_stride_hist=dict(collections.Counter(x['stride'] for x in sp)),
+                             load_layout_hist=dict(collections.Counter(x['layout'] for x in lp)),
+                             store_layout_hist=dict(collections.Counter(x['layout'] for x in sp))),
+                cm_load_pointer_roots={str(k): v for k, v in src_count.items()},
+                cm_load_pointer_detail=src_detail,
+                dpas=hp.get(CM_MULADD, 0),
+                fp_multiset_sum=sum(fp_multiset(m).values()),
+                nc=nc_detail(m),
+                chain_roots=chain_roots(m),
+                opcode_hist={OPNAME.get(k, 'op%d' % k): v for k, v in sorted(hp.items())})
+
+
+def pair(label, parent_rel, cand_rel):
+    par_p, cand_p = CARD / parent_rel, CARD / cand_rel
+    p, c = facts(par_p), facts(cand_p)
+    fp, fc = fp_multiset(ST.Module(par_p)), fp_multiset(ST.Module(cand_p))
+    rec = dict(label=label, parent=p, candidate=c,
+               workgroup_bytes=dict(parent=p['workgroup_bytes'],
+                                    candidate=c['workgroup_bytes'],
+                                    reduction=p['workgroup_bytes'] - c['workgroup_bytes']),
+               fp_multiset=dict(identical=fp == fc,
+                                parent=sum(fp.values()), candidate=sum(fc.values()),
+                                parent_only=[str(k) for k in (fp - fc)][:20],
+                                candidate_only=[str(k) for k in (fc - fp)][:20]),
+               opcode_delta={k: [p['opcode_hist'].get(k, 0), c['opcode_hist'].get(k, 0)]
+                             for k in sorted(set(p['opcode_hist']) | set(c['opcode_hist']))
+                             if p['opcode_hist'].get(k, 0) != c['opcode_hist'].get(k, 0)},
+               int_opcode_delta={OPNAME.get(k, 'op%d' % k): [p['opcode_hist'].get(OPNAME.get(k, 'op%d' % k), 0),
+                                                             c['opcode_hist'].get(OPNAME.get(k, 'op%d' % k), 0)]
+                                 for k in sorted(INT_TRACKED)})
+    rec['checks'] = dict(
+        workgroup_reduced=p['workgroup_bytes'] > c['workgroup_bytes'],
+        workgroup_candidate_zero=c['workgroup_bytes'] == 0,
+        no_workgroup_variables=c['workgroup_vars'] == 0,
+        fp_multiset_identical=fp == fc,
+        nc_identical=(p['nc']['ids'] == c['nc']['ids']
+                      and p['nc']['histogram'] == c['nc']['histogram']
+                      and p['nc']['signature_multiset_hash'] == c['nc']['signature_multiset_hash']),
+        dpas_identical=p['dpas'] == c['dpas'],
+        coopmat_loads_identical=p['coopmat']['loads'] == c['coopmat']['loads'],
+        coopmat_stores_identical=p['coopmat']['stores'] == c['coopmat']['stores'],
+        a_operand_moved_to_storagebuffer=(p['cm_load_pointer_roots'].get('Workgroup', 0) > 0
+                                         and c['cm_load_pointer_roots'].get('Workgroup', 0) == 0
+                                         and c['cm_load_pointer_roots'].get('StorageBuffer', 0) > 0),
+        barriers_not_increased=c['barriers'] <= p['barriers'],
+        fp_chain_roots_not_reduced=(c['chain_roots']['fp_chain_roots']
+                                    >= p['chain_roots']['fp_chain_roots']),
+    )
+    # integer chain roots are informational: deleting the copy deletes integer work, so a
+    # lower INT root count here is the expected consequence, not a lost independent chain
+    rec['informational'] = dict(
+        int_chain_roots=[p['chain_roots']['int_chain_roots'],
+                         c['chain_roots']['int_chain_roots']],
+        int_chain_roots_note='root count of tracked integer ops; the copy loop was the only '
+                             'integer-root producer that disappeared, FP roots unchanged')
+    rec['float_NC_checked'] = c['nc']['ids']
+    return rec
+
+
+def compile_candidates():
+    """Compile the three candidate sources and validate them; the SPVs land in the card root."""
+    out = {}
+    for name in CANDIDATES:
+        comp = CARD / ('%s.comp' % name)
+        spv = CARD / ('%s.spv' % name)
+        K.compile_glsl(comp, spv, [pathlib.Path(d) for d in PINNED_DIRS[name]])
+        K.validate_spv(spv)
+        out[name] = dict(source=comp.name, spv=spv.name, sha256=sha(spv),
+                         source_sha256=sha(comp), bytes=spv.stat().st_size)
+        print('%-20s -> %s  %s  validate OK' % (comp.name, spv.name, sha(spv)[:16]))
+    return out
+
+
+def main():
+    out = dict(card='n39-f06-c256-slack', family='F06 C256 (+F18 C256)',
+               compiled=compile_candidates(), pairs={}, controls={})
+    out['pairs']['f06-c256'] = pair('f06-c256', 'parent-rebuild.spv', 'candidate.spv')
+    out['pairs']['f18-c256'] = pair('f18-c256', 'parent-f18-rebuild.spv', 'candidate-f18.spv')
+    out['controls']['padback-vs-candidate'] = pair('padback-vs-candidate',
+                                                   'candidate.spv',
+                                                   'candidate-padback.spv')
+    base, base_sha, _ = None, None, None
+    for label, rec in list(out['pairs'].items()) + list(out['controls'].items()):
+        print('%-24s Workgroup %5d -> %5d B  insn %4d -> %4d  barriers %d -> %d  dpas %d -> %d'
+              % (label, rec['workgroup_bytes']['parent'], rec['workgroup_bytes']['candidate'],
+                 rec['parent']['instructions'], rec['candidate']['instructions'],
+                 rec['parent']['barriers'], rec['candidate']['barriers'],
+                 rec['parent']['dpas'], rec['candidate']['dpas']))
+        print('   A-operand pointer roots: parent %s -> candidate %s'
+              % (rec['parent']['cm_load_pointer_roots'],
+                 rec['candidate']['cm_load_pointer_roots']))
+        print('   fp identical=%s  NC %d -> %d  chain roots fp %d -> %d int %d -> %d'
+              % (rec['fp_multiset']['identical'], rec['parent']['nc']['ids'],
+                 rec['candidate']['nc']['ids'],
+                 rec['parent']['chain_roots']['fp_chain_roots'],
+                 rec['candidate']['chain_roots']['fp_chain_roots'],
+                 rec['parent']['chain_roots']['int_chain_roots'],
+                 rec['candidate']['chain_roots']['int_chain_roots']))
+        bad = [k for k, v in rec['checks'].items() if not v and k != 'workgroup_candidate_zero']
+        print('   checks failing: %s' % (bad or 'none'))
+        print('   opcode delta: %s' % rec['opcode_delta'])
+    K = ST
+    del K
+    (CARD / 'build' / 'build.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    ok = all(all(v for k, v in rec['checks'].items()) for rec in out['pairs'].values())
+    print('BUILD FACTS', 'PASS' if ok else 'FAIL')
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,259 @@
+"""n21 step-5: final SPIR-V difference proof (parent -> candidate).
+
+Claims proved mechanically here:
+  C1 the global/type section is identical position-by-position once the two debug-only
+     constants (81920 and its composite) are dropped  => type/global ids are stable;
+  C2 the annotation section differs only by the name "debug" (and one empty OpName),
+     i.e. the DbgBuf binding declaration is *still present* (descriptor sets unchanged);
+  C3 the code region is a strict in-order subset of the parent: 634/634 child code
+     instructions align, 85 parent instructions drop out, 0 are added;
+  C4 every operand of every aligned code instruction is either literally identical or
+     equals the parent's id through the id map derived from the alignment (dual
+     hypothesis; a "real" mismatch must satisfy neither);
+  C5 the dropped 85 instructions contain no arithmetic/matrix-multiply/epilogue
+     instruction: no OpCooperativeMatrixMulAddKHR, no OpFConvert/OpFAdd/OpFMul, and the
+     surviving cooperative-matrix stores are the 4 gY stores (dbg stores go 4 -> 0).
+"""
+import sys, re, json, collections
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent
+C = CARD.parent.parent
+sys.path.insert(0, str(C))
+import COMMON as K
+ST = K.ST
+
+HPP = Path('@NR_WORKSPACE@/src/project/tools/glslang-16.5.0/include/glslang/SPIRV/spirv.hpp11')
+NAMES = {}
+for m in re.finditer(r'\b(Op[A-Za-z0-9_]+)\s*=\s*(\d+)', HPP.read_text(encoding='utf-8', errors='replace')):
+    NAMES.setdefault(int(m.group(2)), m.group(1))
+
+RESULT_AT_ZERO = tuple(range(19, 40)) + (7, 11, 248, 4456, 5358)
+NO_RESULT = (0, 2, 3, 4, 5, 6, 8, 10, 14, 15, 16, 17, 62, 63, 64, 71, 72, 73, 74, 75, 77,
+             224, 225, 246, 247, 249, 250, 251, 252, 253, 254, 255, 4458, 5360)
+
+
+def result_id_of(op, ops):
+    if not ops or op in NO_RESULT:
+        return None
+    if op in RESULT_AT_ZERO:
+        return ops[0]
+    return ops[1] if len(ops) > 1 else None
+
+
+def result_pos(op):
+    return None if op in NO_RESULT else (0 if op in RESULT_AT_ZERO else 1)
+
+
+class Mod:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.m = ST.Module(self.path)
+        self.ins = self.m.instructions
+        self.names = {}
+        for op, ops, _, _ in self.ins:
+            if op == 5 and len(ops) >= 2:
+                b = b''.join(int(w).to_bytes(4, 'little') for w in ops[1:])
+                self.names.setdefault(ops[0], b.split(b'\0')[0].decode('utf-8', 'replace'))
+        self.def_at = {}
+        for i, (op, ops, _, _) in enumerate(self.ins):
+            rid = result_id_of(op, ops)
+            if rid is not None:
+                self.def_at.setdefault(rid, i)
+
+    def const(self, vid):
+        i = self.def_at.get(vid)
+        if i is None:
+            return None
+        op, ops, _, _ = self.ins[i]
+        return ops[1] if op == 43 else None
+
+    def word(self, w):
+        n = self.names.get(w)
+        c = self.const(w)
+        if c is not None:
+            return '%s=%d' % (n or '#%d' % w, c)
+        return n or '#%d' % w
+
+    def text(self, i):
+        op, ops, _, _ = self.ins[i]
+        return '%s %s' % (NAMES.get(op, 'op%d' % op), ' '.join(self.word(w) for w in ops))
+
+    def code_idx(self):
+        out, depth = [], 0
+        for i, (op, ops, _, _) in enumerate(self.ins):
+            if op == 54:
+                depth += 1
+            if depth:
+                out.append(i)
+            if op == 56:
+                depth -= 1
+        return out
+
+    def globals_idx(self):
+        code = set(self.code_idx())
+        return [i for i in range(len(self.ins)) if i not in code]
+
+    def strings(self):
+        out = collections.Counter()
+        for op, ops, _, _ in self.ins:
+            if op == 5 and len(ops) >= 2:
+                out[bytes(b for w in ops[1:] for b in int(w).to_bytes(4, 'little')).split(b'\0')[0]
+                    .decode('utf-8', 'replace')] += 1
+        return out
+
+
+pm = Mod(Path(K.row_by_ordinal(194)['spv']))
+cm = Mod(CARD / 'candidate.spv')
+out = {}
+P, Cc = pm.code_idx(), cm.code_idx()
+GP, GC = pm.globals_idx(), cm.globals_idx()
+
+# ---------------------------------------------------------------- C1 globals
+# which 2 global instructions carry the debug constants?
+dbg_const = [i for i in GP if pm.ins[i][0] == 43 and len(pm.ins[i][1]) > 2 and pm.ins[i][1][2] == 81920]
+assert len(dbg_const) == 1, dbg_const
+
+
+def name_of(mod, i):
+    op, ops = mod.ins[i][0], mod.ins[i][1]
+    if op != 5 or len(ops) < 2:
+        return None
+    return bytes(b for w in ops[1:] for b in int(w).to_bytes(4, 'little')).split(b'\0')[0].decode('utf-8', 'replace')
+
+
+dbg_name = [i for i in GP if name_of(pm, i) == 'debug']
+assert len(dbg_name) == 1, dbg_name
+drop = set(dbg_const + dbg_name)
+GP2 = [i for i in GP if i not in drop]
+same_len = len(GP2) == len(GC)
+pos_equal = same_len and all(
+    pm.ins[a][0] == cm.ins[b][0] and pm.ins[a][3] == cm.ins[b][3] for a, b in zip(GP2, GC))
+# identical instruction-for-instruction including operands?
+ops_equal = same_len and all(
+    pm.ins[a][1] == cm.ins[b][1] for a, b in zip(GP2, GC))
+out['C1_globals'] = dict(
+    parent_globals=len(GP), candidate_globals=len(GC),
+    dropped=[pm.text(i) for i in sorted(drop)],
+    same_length=same_len, opcode_position_equal=pos_equal, operands_position_equal=ops_equal,
+    identity_id_map_valid=pos_equal and ops_equal,
+)
+
+# ---------------------------------------------------------------- C2 annotations
+ps, cs = pm.strings(), cm.strings()
+out['C2_annotations'] = dict(
+    name_multiset_only_in_parent=dict((k, v) for k, v in (ps - cs).items()),
+    name_multiset_only_in_candidate=dict((k, v) for k, v in (cs - ps).items()),
+)
+
+# ---------------------------------------------------------------- C3 code alignment
+A = [(pm.ins[i][0], pm.ins[i][3]) for i in P]
+B = [(cm.ins[j][0], cm.ins[j][3]) for j in Cc]
+n, m = len(A), len(B)
+tbl = [[0] * (m + 1) for _ in range(n + 1)]
+for i in range(n - 1, -1, -1):
+    for j in range(m - 1, -1, -1):
+        tbl[i][j] = tbl[i + 1][j + 1] + 1 if A[i] == B[j] else max(tbl[i + 1][j], tbl[i][j + 1])
+pairs, i, j = [], 0, 0
+while i < n and j < m:
+    if A[i] == B[j]:
+        pairs.append((i, j)); i += 1; j += 1
+    elif tbl[i + 1][j] >= tbl[i][j + 1]:
+        i += 1
+    else:
+        j += 1
+mp, mc = {p for p, _ in pairs}, {c for _, c in pairs}
+removed = [k for k in range(n) if k not in mp]
+added = [k for k in range(m) if k not in mc]
+out['C3_alignment'] = dict(parent_code=n, candidate_code=m, matched=len(pairs),
+                           removed=len(removed), added=len(added),
+                           removed_grouped=dict(collections.Counter(
+                               NAMES.get(pm.ins[P[k]][0], pm.ins[P[k]][0]) for k in removed)))
+
+# ---------------------------------------------------------------- C4 operand check
+fwd = {}
+for (pi, ci) in pairs:
+    rp = result_id_of(*pm.ins[P[pi]][:2])
+    rc = result_id_of(*cm.ins[Cc[ci]][:2])
+    if rp is not None and rc is not None:
+        fwd.setdefault(rp, rc)
+# globals: identity for every id defined in the (equal) global section
+gpremoved_ids = {}
+for k, (a, b) in enumerate(zip(GP2, GC)):
+    rp = result_id_of(*pm.ins[a][:2])
+    rc = result_id_of(*cm.ins[b][:2])
+    if rp is not None and rc is not None:
+        if rp != rc:
+            gpremoved_ids[rp] = rc
+        fwd.setdefault(rp, rc)
+
+real, literal_coincidence, mapped_hits = [], 0, 0
+ops_checked = 0
+for (pi, ci) in pairs:
+    pgi, cgi = P[pi], Cc[ci]
+    pop, pops, _, _ = pm.ins[pgi]
+    cop, cops, _, _ = cm.ins[cgi]
+    rpos = result_pos(pop)
+    if len(pops) != len(cops):
+        real.append(dict(gi=pgi, why='operand-count', text=pm.text(pgi))); continue
+    for k, (w1, w2) in enumerate(zip(pops, cops)):
+        if k == rpos:
+            ops_checked += 1
+            continue
+        ops_checked += 1
+        if w1 == w2:
+            if w1 in fwd and fwd[w1] != w2:
+                literal_coincidence += 1
+            continue
+        if w1 in fwd and fwd[w1] == w2:
+            mapped_hits += 1
+            continue
+        real.append(dict(gi=pgi, why='operand', k=k, parent=w1, child=w2,
+                         mapped=fwd.get(w1), text=pm.text(pgi), child_text=cm.text(cgi)))
+out['C4_operands'] = dict(operands_checked=ops_checked, id_mapped_hits=mapped_hits,
+                          literal_form_only=literal_coincidence,
+                          id_map_size=len(fwd),
+                          global_id_shifts=dict(gpremoved_ids),
+                          real_mismatches=len(real), sample=real[:10])
+
+# ---------------------------------------------------------------- C5 no math dropped
+MATH = {4459: 'OpCooperativeMatrixMulAddKHR', 4461: 'OpFAdd', 4460: 'OpFMul',
+        4457: 'OpCooperativeMatrixLoadKHR', 4458: 'OpCooperativeMatrixStoreKHR',
+        168: 'OpFConvert', 180: 'OpFConvert', 128: 'OpIAdd', 132: 'OpIMul',
+        61: 'OpLoad', 65: 'OpAccessChain', 53: 'OpFunctionCall'}
+dropped_ops = collections.Counter(NAMES.get(pm.ins[P[k]][0], pm.ins[P[k]][0]) for k in removed)
+cm_all = collections.Counter(NAMES.get(op, op) for op, ops, _, _ in cm.ins)
+pm_all = collections.Counter(NAMES.get(op, op) for op, ops, _, _ in pm.ins)
+out['C5_no_math_dropped'] = dict(
+    dropped_ops=dict(dropped_ops),
+    mul_add=dict(parent=pm_all.get('OpCooperativeMatrixMulAddKHR', 0),
+                 candidate=cm_all.get('OpCooperativeMatrixMulAddKHR', 0)),
+    coop_load=dict(parent=pm_all.get('OpCooperativeMatrixLoadKHR', 0),
+                   candidate=cm_all.get('OpCooperativeMatrixLoadKHR', 0)),
+    coop_store=dict(parent=pm_all.get('OpCooperativeMatrixStoreKHR', 0),
+                    candidate=cm_all.get('OpCooperativeMatrixStoreKHR', 0)),
+    fconvert=dict(parent=pm_all.get('OpFConvert', 0), candidate=cm_all.get('OpFConvert', 0)),
+    fadd=dict(parent=pm_all.get('OpFAdd', 0), candidate=cm_all.get('OpFAdd', 0)),
+    fmul=dict(parent=pm_all.get('OpFMul', 0), candidate=cm_all.get('OpFMul', 0)),
+    function_calls=dict(parent=pm_all.get('OpFunctionCall', 0), candidate=cm_all.get('OpFunctionCall', 0)),
+    dropped_math_ops=[d for d in dropped_ops if d in ('OpCooperativeMatrixMulAddKHR', 'OpFAdd',
+                                                      'OpFMul', 'OpFConvert', 'OpFunctionCall',
+                                                      'OpCooperativeMatrixLoadKHR')],
+)
+
+# the surviving stores, decoded by name
+def stores(mod):
+    rows = []
+    for i, (op, ops, _, _) in enumerate(mod.ins):
+        if op == 4458:
+            rows.append(mod.text(i))
+    return rows
+out['stores'] = dict(parent=stores(pm), candidate=stores(cm))
+
+out['removed_rows'] = [dict(gi=P[k], text=pm.text(P[k])) for k in removed]
+K.write_json(CARD / 'build' / 'spv-diff-proof.json', out)
+print(json.dumps({k: v for k, v in out.items() if k != 'removed_rows'}, indent=1)[:5000])
+print('\nverdict C1', out['C1_globals']['identity_id_map_valid'],
+      '| C3 removed', out['C3_alignment']['removed'], 'added', out['C3_alignment']['added'],
+      '| C4 real', out['C4_operands']['real_mismatches'],
+      '| dropped math', out['C5_no_math_dropped']['dropped_math_ops'])

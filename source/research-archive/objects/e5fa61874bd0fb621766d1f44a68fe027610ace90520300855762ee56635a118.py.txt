@@ -1,0 +1,108 @@
+"""Residency map for the small network (vk102-derived, no campaign optimisations).
+
+small came from the vk102 backend, so none of the 12 adopted changes are in it. This reads its
+118-PASS plan, resolves each module, takes the TRUE workgroup memory from the SPIR-V (never the
+plan field, per L35), and applies the measured pool bracket P in [65536, 73728) to say how many
+workgroups fit and how many bytes short of the next threshold each shader is.
+"""
+import hashlib, json, re, struct, sys
+from collections import Counter, defaultdict
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+
+WG = 4
+PLAN = Path('@NR_WORKSPACE@/work/vk102-small-310-9-16-20261019/'
+            'package/manifest/port_network_runtime.txt')
+THRESH = [65536, 49152, 32768, 24576, 21845, 20480, 16384, 13107, 10922, 8192, 4096]
+POOL_LO, POOL_HI = 65536, 73728
+
+
+def wg_bytes(spv):
+    d = Path(spv).read_bytes()
+    w = struct.unpack('<%dI' % (len(d) // 4), d[:len(d) // 4 * 4])
+    i = 5
+    consts, types, arrays, ptr, vars_ = {}, {}, {}, {}, []
+    while i < len(w):
+        wc = w[i] >> 16
+        op = w[i] & 0xFFFF
+        if wc == 0:
+            break
+        a = list(w[i + 1:i + wc])
+        if op == 43 and len(a) >= 3:
+            consts[a[1]] = a[2]
+        elif op == 21:
+            types[a[0]] = ('int', a[1] // 8)
+        elif op == 22:
+            types[a[0]] = ('float', a[1] // 8)
+        elif op == 23:
+            types[a[0]] = ('vector', a[1], a[2])
+        elif op == 28:
+            arrays[a[0]] = (a[1], a[2])
+        elif op == 32 and len(a) >= 3:
+            ptr[a[0]] = (a[1], a[2])
+        elif op == 59 and a[0] in ptr and ptr[a[0]][0] == WG:
+            vars_.append(ptr[a[0]][1])
+        i += wc
+
+    def size(tid, dep=0):
+        if dep > 8:
+            return 0
+        if tid in arrays:
+            el, ln = arrays[tid]
+            return consts.get(ln, 0) * size(el, dep + 1)
+        if tid in types:
+            t = types[tid]
+            if t[0] in ('int', 'float'):
+                return t[1]
+            if t[0] == 'vector':
+                return t[1] * size(t[2], dep + 1)
+        return 0
+
+    return sum(size(v) for v in vars_), len(vars_)
+
+
+raw = PLAN.read_text(encoding='utf-8-sig', errors='replace')
+rows = []
+for line in raw.splitlines():
+    if line.startswith('PASS '):
+        parts = line.split('"')
+        if len(parts) >= 4:
+            row = int(line.split()[1])
+            spv = Path(re.sub(r'\\{2,}', r'\\', parts[3].strip()))
+            shared_field = line.split('"')[-1].split()[1]
+            rows.append(dict(row=row, name=parts[1].strip(), spv=spv,
+                             plan_shared=int(shared_field) if shared_field.isdigit() else None))
+print('small PASS:', len(rows))
+
+cache = {}
+for r in rows:
+    if r['spv'] not in cache:
+        cache[r['spv']] = wg_bytes(r['spv'])
+    true, nvars = cache[r['spv']]
+    r['true'] = true
+    r['nvars'] = nvars
+    lo = POOL_LO // max(true, 1) if true else 32
+    hi = POOL_HI // max(true, 1) if true else 32
+    r['res_lo'], r['res_hi'] = lo, hi
+    nxt = next((t for t in THRESH if t < true), None)
+    r['to_next'] = (true - nxt) if nxt else None
+    r['next_res'] = (POOL_LO // nxt) if nxt else None
+
+by_true = defaultdict(list)
+for r in rows:
+    by_true[r['true']].append(r)
+print('\n%-9s %4s %6s %6s %8s  %s' % ('trueB', 'n', 'res', 'next', 'need-cut', 'shaders'))
+for t in sorted(by_true, reverse=True):
+    sel = by_true[t]
+    res = POOL_LO // max(t, 1) if t else 32
+    nxt = next((x for x in THRESH if x < t), None)
+    print('%-9d %4d %6d %6s %8s  %s' % (t, len(sel), res,
+                                        (POOL_LO // nxt) if nxt else '-',
+                                        (t - nxt) if nxt else '-',
+                                        ', '.join(sorted({s['spv'].stem.split('__')[-1] for s in sel})[:3])))
+stale = [r for r in rows if r['plan_shared'] is not None and r['plan_shared'] != r['true']]
+print('\nplan field != true : %d of %d rows' % (len(stale), len(rows)))
+K.write_json(K.C / 'evidence' / 'SMALL-RESIDENCY.json', dict(rows=[
+    dict(row=r['row'], name=r['name'], spv=r['spv'].as_posix(), true=r['true'], plan=r['plan_shared'],
+         resid_lo=r['res_lo'], resid_hi=r['res_hi'], next_cut=r['to_next']) for r in rows]))

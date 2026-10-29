@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Operand-level audit of every cooperative-matrix multiply in a SPIR-V module.
+
+Why this exists: classifying a MulAdd by its *accumulator* type is not enough. The new
+task requires reading the actual A/B/C/Result dtypes **and their signedness / operand
+flags**, and forbids inferring "FP16 inputs" from an f32 result or "INT8 inputs" from an
+i32 result.  This tool follows each operand id back to its defining instruction, resolves
+its type through pointers and cooperative-matrix types, and reports the real scalar type
+of A, B, C and the result for every `OpCooperativeMatrixMulAddKHR` (4459).
+
+Opcode grammar used (calibrated against the audit's FULLNET-RESIDUAL-MMA-SITES.json):
+  4456 OpTypeCooperativeMatrixKHR   [result, component, scope, rows, cols, use]
+  4457 OpCooperativeMatrixLoadKHR   [type, result, pointer, layout, stride, memop]
+  4458 OpCooperativeMatrixStoreKHR  [pointer, object, layout, stride, memop]
+  4459 OpCooperativeMatrixMulAddKHR [type, result, A, B, C]
+
+Usage:
+  mma_operand_audit.py [--json out.json] <spv> [<spv> ...]
+"""
+import hashlib
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, r"@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts")
+import spv_tools_local as S  # noqa: E402
+
+INT_SIGNED = {0: "u", 1: "s"}          # OpTypeInt signedness operand
+
+
+def rid_of(op, ops):
+    if op == 4458:
+        return None
+    if op == 4456:
+        return ops[0]
+    if op in (4457, 4459, 4460, 5358):
+        return ops[1]
+    return S.result_id_of(op, ops)
+
+
+class Mod:
+    def __init__(self, path):
+        self.m = S.Module(Path(path))
+        self.by = {}
+        for idx, (op, ops, _, _) in enumerate(self.m.instructions):
+            r = rid_of(op, ops)
+            if r is not None:
+                self.by.setdefault(r, idx)
+
+    def instr(self, rid):
+        i = self.by.get(rid)
+        return None if i is None else self.m.instructions[i]
+
+    def type_of_value(self, rid, depth=0):
+        """Resolve a *value* id to the scalar type of its result, following
+        cooperative-matrix types and pointers."""
+        if depth > 8:
+            return ("?", 0, "?")
+        d = self.instr(rid)
+        if d is None:
+            return ("?", 0, "?")
+        op, ops = d[0], d[1]
+        if op in (4459, 4457, 4460, 5358) or op in (61, 65, 66, 67, 80, 81, 82, 83, 84, 109,
+                                                   110, 111, 112, 113, 114, 115, 116, 117,
+                                                   119, 120, 124, 126, 128, 129, 130, 132,
+                                                   133, 134, 135, 137, 141, 142, 143, 146,
+                                                   147, 148, 152, 154, 155, 156, 157, 158,
+                                                   159, 164, 165, 166, 169, 170, 171, 172):
+            return self.resolve_type(ops[0], depth + 1)
+        if op == 59:                                   # OpVariable
+            return self.resolve_type(ops[0], depth + 1)
+        if op in (43, 44, 46):                         # constants
+            return self.resolve_type(ops[0], depth + 1)
+        if op == 79:                                   # OpVectorInsertDynamic
+            return self.resolve_type(ops[0], depth + 1)
+        return self.resolve_type(ops[0], depth + 1) if ops else ("?", 0, "?")
+
+    def resolve_type(self, tid, depth=0):
+        if depth > 8:
+            return ("?", 0, "?")
+        d = self.instr(tid)
+        if d is None:
+            return ("?", 0, "?")
+        op, ops = d[0], d[1]
+        if op == 4456:                                  # cooperative matrix type
+            return self.resolve_type(ops[1], depth + 1)
+        if op == 32:                                    # OpTypePointer
+            return self.resolve_type(ops[2], depth + 1)
+        if op == 22:                                    # OpTypeFloat
+            return ("float", ops[1], "-")
+        if op == 21:                                    # OpTypeInt [result, width, signedness]
+            return ("int", ops[1], INT_SIGNED.get(ops[2], "?"))
+        if op == 23:                                    # vector
+            return self.resolve_type(ops[1], depth + 1)
+        if op == 28:                                    # array
+            return self.resolve_type(ops[1], depth + 1)
+        if op == 20:
+            return ("bool", 1, "-")
+        return ("op%d" % op, 0, "?")
+
+    def muladds(self):
+        out = []
+        for idx, (op, ops, word, _) in enumerate(self.m.instructions):
+            if op != 4459:
+                continue
+            out.append({
+                "word_offset": word,
+                "result_id": ops[1],
+                "A": self.type_of_value(ops[2]),
+                "B": self.type_of_value(ops[3]),
+                "C": self.type_of_value(ops[4]),
+                "Result": self.resolve_type(ops[0]),
+            })
+        return out
+
+
+def classify(entry):
+    a, b = entry["A"], entry["B"]
+    if a[0] == "float" and b[0] == "float":
+        if a[1] == 16 and b[1] == 16:
+            return "FP16_MATRIX"
+        return "FLOAT%d_MATRIX" % max(a[1], b[1])
+    if a[0] == "int" and b[0] == "int":
+        if a[1] == 8 and b[1] == 8:
+            return "INT8_MATRIX"
+        return "INT%d_MATRIX" % max(a[1], b[1])
+    return "MIXED_OR_UNKNOWN"
+
+
+def audit(path):
+    mod = Mod(path)
+    sites = mod.muladds()
+    for s in sites:
+        s["class"] = classify(s)
+    counts = Counter(s["class"] for s in sites)
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+        "bytes": Path(path).stat().st_size,
+        "muladd_total": len(sites),
+        "classes": dict(counts),
+        "fp16_matrix_multiplies": counts.get("FP16_MATRIX", 0),
+        "int8_matrix_multiplies": counts.get("INT8_MATRIX", 0),
+        "verdict": ("FP16_FREE" if counts.get("FP16_MATRIX", 0) == 0 and
+                    counts.get("INT8_MATRIX", 0) > 0 else
+                    ("NO_MATRIX" if not sites else "STILL_FP16")),
+        "sites": sites,
+    }
+
+
+def main(argv):
+    out = None
+    if argv and argv[0] == "--json":
+        out = Path(argv[1])
+        argv = argv[2:]
+    if not argv:
+        raise SystemExit(__doc__)
+    res = [audit(p) for p in argv]
+    for r in res:
+        print(f"{Path(r['path']).name:44} muladd={r['muladd_total']:3d} "
+              f"fp16={r['fp16_matrix_multiplies']:3d} int8={r['int8_matrix_multiplies']:3d} "
+              f"{r['classes']} {r['verdict']}")
+    if out:
+        out.write_text(json.dumps({"tool": "tools/mma_operand_audit.py",
+                                   "note": "A/B/C/Result resolved from each operand's defining "
+                                           "instruction, including signedness",
+                                   "modules": res}, indent=1) + "\n",
+                       encoding="utf-8", newline="\n")
+        print("wrote", out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

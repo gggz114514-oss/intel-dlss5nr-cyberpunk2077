@@ -1,0 +1,108 @@
+param()
+$ErrorActionPreference='Stop'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$cand = Join-Path $root 'c02-f20-merged-norm'
+$raw  = Join-Path $root 'GPU-EXECUTION\supervisor'
+New-Item -ItemType Directory -Force -Path $raw | Out-Null
+$resultsPath = Join-Path $root 'GPU-EXECUTION\LUNA-C02-RESULTS.json'
+$statusPath  = Join-Path $root 'GPU-EXECUTION\STATUS.json'
+$lockPath = '@NR_GPU_WORKSPACE@\artifacts\parallel-port-20261013\GPU.lock'
+$owner='LUNA-C02-MERGED-NORM-20261026'
+$authorization='C32 famprod task authorized exactly one candidate c02-f20-merged-norm (F20 merged producer-subgroup norm+scale): fixed/fb2 gates, native after both pass, driver resource receipt, then six ordinary jobs (three alternating parent/candidate pairs, warm1/reps30/feedback, all 180 samples retained). Parent arm is the fixed baseline f20-score-owner plan d655b6b1...; no source or plan changes during the batch; no deployment.'
+
+$jobs=[Collections.ArrayList]::new()
+$ls=$null;$state=$null;$stop=$null;$before=$null
+
+function SaveJson($p,$v){[IO.File]::WriteAllText($p,($v|ConvertTo-Json -Depth 60),[Text.UTF8Encoding]::new($false))}
+function HF([string]$p){(Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()}
+function HB([byte[]]$b){$h=[Security.Cryptography.SHA256]::Create();try{([BitConverter]::ToString($h.ComputeHash($b))).Replace('-','').ToLowerInvariant()}finally{$h.Dispose()}}
+function SaveLock($o){$b=[Text.Encoding]::UTF8.GetBytes(($o|ConvertTo-Json -Depth 30));$script:ls.Position=0;$script:ls.SetLength(0);$script:ls.Write($b,0,$b.Length);$script:ls.Flush()}
+function Quote([string]$a){if($a -eq ''){return '""'};if($a -notmatch '[ \t\n\v"]'){return $a};$sb=New-Object Text.StringBuilder;[void]$sb.Append('"');$bs=0;foreach($ch in $a.ToCharArray()){if($ch -eq '\'){$bs++;continue};if($ch -eq '"'){[void]$sb.Append(('\'*(2*$bs+1)));[void]$sb.Append('"');$bs=0;continue};if($bs){[void]$sb.Append(('\'*$bs));$bs=0};[void]$sb.Append($ch)};if($bs){[void]$sb.Append(('\'*(2*$bs)))};[void]$sb.Append('"');$sb.ToString()}
+function Active(){@(Get-Process|Where-Object{$_.ProcessName -match 'Cyberpunk|REDlauncher|port_network|profile_zprof|gtpin|clock_runner|clock_query|feedback_diag|feedback_snapshot|first_difference'})}
+function Progress($status,$next){
+  SaveJson $resultsPath ([ordered]@{status=$status;authorization=$authorization;jobs=@($jobs);executed_jobs=@($jobs).Count;stop_reason=$stop;lock_state=if($ls){'held exclusively'}else{'released/not held'};lock_evidence_path=(Join-Path $root 'GPU-EXECUTION\LOCK-EVIDENCE.json')})
+  SaveJson $statusPath ([ordered]@{status=$status;updated_at=[DateTime]::UtcNow.ToString('o');executed_jobs=@($jobs).Count;next_job=$next;stop_reason=$stop;lock_state=if($ls){'held exclusively'}else{'released/not held'};results_path=$resultsPath})
+}
+function InvokeJob($task,$kind){
+  if((Active).Count){throw ('Active game/GPU process before '+$task.id)}
+  $a=@($task.argv);$start=[DateTime]::UtcNow.ToString('o')
+  $state.current_job=$task.id;$state.argv=$a;$state.started_utc=$start;SaveLock $state
+  $psi=[Diagnostics.ProcessStartInfo]::new();$psi.FileName=$a[0];$psi.WorkingDirectory=$cand;$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true
+  $q=@();for($i=1;$i -lt $a.Length;$i++){$q+=(Quote ([string]$a[$i]))};$psi.Arguments=$q -join ' '
+  $child=[Diagnostics.Process]::new();$child.StartInfo=$psi;[void]$child.Start();$state.gpu_pid=$child.Id;SaveLock $state
+  $ot=$child.StandardOutput.ReadToEndAsync();$et=$child.StandardError.ReadToEndAsync();$child.WaitForExit();$exit=$child.ExitCode
+  $exitPath=Join-Path $raw ($task.id+'.exit.json');SaveJson $exitPath ([ordered]@{job_id=$task.id;exit_code=$exit;process_id=$child.Id;observed_utc=[DateTime]::UtcNow.ToString('o')})
+  $stdout=$ot.GetAwaiter().GetResult();$stderr=$et.GetAwaiter().GetResult();$child=$null;$end=[DateTime]::UtcNow.ToString('o')
+  [IO.File]::WriteAllText((Join-Path $raw ($task.id+'.stdout.txt')),$stdout,[Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText((Join-Path $raw ($task.id+'.stderr.txt')),$stderr,[Text.UTF8Encoding]::new($false))
+  $out=$task.runner_output;$recPath=Join-Path $out 'port_network_receipt.json';$rec=$null
+  if(Test-Path $recPath){$rec=Get-Content -Raw -LiteralPath $recPath|ConvertFrom-Json}
+  $frame=Join-Path $out 'frame_out.bin';$frameSha=if(Test-Path $frame){HF $frame}else{$null}
+  $frameBytes=if(Test-Path $frame){(Get-Item -LiteralPath $frame).Length}else{0}
+  $samples=@();if($rec -and $null -ne $rec.gpu_samples_ms){$samples=@($rec.gpu_samples_ms)}
+  $finite=$true;foreach($v in $samples){$x=0.0;if(-not [double]::TryParse([string]$v,[Globalization.NumberStyles]::Float,[Globalization.CultureInfo]::InvariantCulture,[ref]$x)-or [double]::IsNaN($x)-or [double]::IsInfinity($x)){$finite=$false}}
+  $device=(($stdout+[Environment]::NewLine+$stderr)-match '(?i)VkResult=-4|VK_ERROR_DEVICE_LOST|device lost|VK_TIMEOUT|timeout')
+  $reps=if($kind -eq 'native' -or $kind -eq 'resources'){1}elseif($task.id -like '*-fixed'){1}else{2}
+  $fb=($kind -eq 'gate' -and $task.id -like '*-fb2')
+  $receiptOK=($rec -and $rec.normal_close -eq $true -and $rec.gpu_passes -eq 232 -and $rec.warm -eq 0 -and $rec.reps -eq $reps -and $rec.feedback -eq $fb -and $rec.nan -eq 0 -and $rec.inf -eq 0 -and $finite -and $samples.Count -eq $reps)
+  if($kind -eq 'ordinary'){$reps=30;$fb=$true;$receiptOK=($rec -and $rec.normal_close -eq $true -and $rec.gpu_passes -eq 232 -and $rec.warm -eq 1 -and $rec.reps -eq 30 -and $rec.feedback -eq $true -and $rec.nan -eq 0 -and $rec.inf -eq 0 -and $finite -and $samples.Count -eq 30)}
+  $expected=$task.expected_frame_out
+  $technical=($exit -ne 0 -or $device -or -not $receiptOK -or $frameBytes -ne 29491200 -or $frameSha -ne $expected)
+  $status=if($technical){'EXECUTION_ERROR'}else{'PASSED'}
+  $entry=[ordered]@{id=$task.id;kind=$kind;status=$status;actual_argv=$a;tool_sha256=(HF $a[0]);started_utc=$start;ended_utc=$end;exit_code=$exit;exit_path=$exitPath;stdout_path=(Join-Path $raw ($task.id+'.stdout.txt'));stderr_path=(Join-Path $raw ($task.id+'.stderr.txt'));runner_output=$out;receipt_path=if(Test-Path $recPath){$recPath}else{$null};receipt_sha256=if(Test-Path $recPath){HF $recPath}else{$null};normal_close=if($rec){$rec.normal_close}else{$null};gpu_passes=if($rec){$rec.gpu_passes}else{$null};warm=if($rec){$rec.warm}else{$null};reps=if($rec){$rec.reps}else{$null};feedback=if($rec){$rec.feedback}else{$null};nan=if($rec){$rec.nan}else{$null};inf=if($rec){$rec.inf}else{$null};gpu_samples_ms=$samples;sample_count=$samples.Count;samples_finite=$finite;frame_out_sha256=$frameSha;expected_frame_out_sha256=$expected;device_error=$device;technical_error=$technical}
+  [void]$jobs.Add($entry);$state.gpu_pid=$null;$state.last_job=$task.id;$state.last_job_status=$status;$state.exit_code=$exit;SaveLock $state
+  Progress 'RUNNING' $task.id
+  Write-Output ('GPU_JOB '+$task.id+' '+$status+' exit='+$exit+' frame='+$frameSha)
+  if($technical){throw ('Technical/receipt failure '+$task.id)}
+  return $entry
+}
+try{
+  if((Active).Count){throw 'Game/GPU process active before batch'}
+  # Identity + freshness verification for every planned job.
+  $planDirs=@(@{f='LUNA-GATES.json';k='gate'},@{f='LUNA-NATIVE.json';k='native'},@{f='LUNA-RESOURCES.json';k='resources'},@{f='LUNA-ORDINARY.json';k='ordinary'})
+  foreach($pd in $planDirs){
+    $t=Get-Content -Raw -LiteralPath (Join-Path $cand $pd.f)|ConvertFrom-Json
+    foreach($i in $t.identities){if((HF $i.path) -ne $i.sha256.ToLowerInvariant()){throw ('Identity SHA mismatch '+$pd.f+' '+$i.path)}}
+    foreach($j in $t.jobs){
+      if((HF $j.plan.path) -ne $j.plan.sha256.ToLowerInvariant()){throw ('Plan SHA mismatch '+$j.id)}
+      if(Test-Path $j.runner_output){throw ('Output not fresh '+$j.id)}
+    }
+  }
+  $before=Get-Content -Raw -LiteralPath $lockPath|ConvertFrom-Json
+  if($before.state -ne 'FINISHED'){throw ('GPU lock not FINISHED: '+$before.owner)}
+  $bb=[IO.File]::ReadAllBytes($lockPath);$bh=HB $bb
+  $copy=Join-Path $root 'GPU-EXECUTION\GPU.lock.before.json';[IO.File]::WriteAllBytes($copy,$bb)
+  $ls=[IO.File]::Open($lockPath,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+  $ls.Position=0;$chk=New-Object byte[] $ls.Length;[void]$ls.Read($chk,0,$chk.Length)
+  if((HB $chk) -ne $bh){throw 'GPU lock changed during acquisition'}
+  $state=[ordered]@{owner=$owner;holder_pid=$PID;gpu_pid=$null;cwd='@NR_WORKSPACE@';argv=@();started_utc=[DateTime]::UtcNow.ToString('o');state='RUNNING';authorization=$authorization;previous_owner=$before.owner;previous_state=$before.state;previous_lock_copy=$copy;previous_lock_sha256=$bh};SaveLock $state
+  SaveJson (Join-Path $root 'GPU-EXECUTION\LOCK-EVIDENCE.json') ([ordered]@{path=$lockPath;owner=$owner;authorization=$authorization;acquired_utc=$state.started_utc;exclusive_acquired=$true;previous_owner=$before.owner;previous_state=$before.state;previous_lock_copy=$copy;previous_lock_sha256=$bh;release_pending=$true})
+  Progress 'RUNNING' $null
+
+  $gates=Get-Content -Raw -LiteralPath (Join-Path $cand 'LUNA-GATES.json')|ConvertFrom-Json
+  $gatePass=$true
+  foreach($j in $gates.jobs){$e=InvokeJob $j 'gate';if($e.status -ne 'PASSED'){$gatePass=$false;break}}
+  if($gatePass){
+    $nat=Get-Content -Raw -LiteralPath (Join-Path $cand 'LUNA-NATIVE.json')|ConvertFrom-Json
+    foreach($j in $nat.jobs){InvokeJob $j 'native'}
+    $res=Get-Content -Raw -LiteralPath (Join-Path $cand 'LUNA-RESOURCES.json')|ConvertFrom-Json
+    foreach($j in $res.jobs){InvokeJob $j 'resources'}
+    $ord=Get-Content -Raw -LiteralPath (Join-Path $cand 'LUNA-ORDINARY.json')|ConvertFrom-Json
+    foreach($j in $ord.jobs){InvokeJob $j 'ordinary'}
+  } else {
+    $skip=[ordered]@{id='skip-downstream-c02';kind='skip';status='SKIPPED_NUMERICAL_GATE';reason='gate failure isolates candidate; native/resources/ordinary not run'};[void]$jobs.Add($skip)
+  }
+  $state.state='FINISHED';$state.gpu_pid=$null;$state.finished_utc=[DateTime]::UtcNow.ToString('o');$state.exit_code=0;SaveLock $state
+  SaveJson (Join-Path $root 'GPU-EXECUTION\GPU.lock.released.json') $state
+  $ls.Dispose();$ls=$null
+  Progress 'COMPLETED' $null
+  SaveJson (Join-Path $root 'GPU-EXECUTION\LOCK-EVIDENCE.json') ([ordered]@{path=$lockPath;owner=$owner;authorization=$authorization;acquired_utc=$state.started_utc;exclusive_acquired=$true;previous_owner=$before.owner;previous_state=$before.state;previous_lock_copy=$copy;previous_lock_sha256=$bh;release_pending=$false;released_utc=$state.finished_utc;release_state='FINISHED';final_lock_owner=$owner;final_lock_state='FINISHED'})
+}catch{
+  $stop=$_.Exception.Message
+  if($ls -and $state){$state.state='FINISHED';$state.gpu_pid=$null;$state.finished_utc=[DateTime]::UtcNow.ToString('o');$state.exit_code=1;$state.failure=$stop;try{SaveLock $state}catch{}}
+  if($ls){$ls.Dispose();$ls=$null}
+  Progress 'FAILED_OR_STOPPED' 'none';throw
+}finally{
+  if($child -and -not $child.HasExited){$child.WaitForExit()}
+  if($ls){$ls.Dispose()}
+}

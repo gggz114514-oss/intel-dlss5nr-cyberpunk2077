@@ -1,0 +1,402 @@
+"""n36-f05-arena-shrink: generate the three candidate sources from the chain-head parents.
+
+Every edit is an explicitly asserted literal replacement, so the produced candidate is
+provably the parent plus exactly these edits (and SOURCE-DIFF.patch is generated from
+the parent/candidate pair, not hand-written).
+
+The single mechanism: the V plane stops being a third 4096 B plane per head.  The V
+projection is a pure function of gY and the V weight tiles, so it is relocated to after
+the last Q/K read of the workgroup and stores into the retired Q plane.  Token
+ownership of the V projection moves from {8t, 8t+32} to {16t, 16t+8} so this
+subgroup's V store footprint is exactly the 512 half of Q it read itself.
+"""
+import difflib
+import json
+import pathlib
+import sys
+
+D = pathlib.Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                 'fullnet-mechanism-transfer-20261026')
+C = D.parent / 'fullnet-continuous-20261027'
+CARD = C / 'cards/n36-f05-arena-shrink'
+
+DECL_OLD = 'shared float16_t qkv[12288]; // same Q/K/V half layout: +0/+2048/+4096'
+
+# ----------------------------------------------------------------- C64 / C128
+# Only the two kv-consumer-layout kernels share this shape: row_phase loop, one A
+# fragment feeding all six accumulators, V stored inside the same loop.
+CXX_DECL_NEW = """// N36-F05 arena shrink (2026-10-28): two 4096 B planes per head instead of three.
+//   per-head base = (sg/4)*4096 half:  Q at +0, K at +2048, V reuses Q at +0.
+//   Three 4096 B planes x two heads = 24576 B was the whole residency constraint;
+//   two planes x two heads = 16384 B is the measured 2 -> 4 resident step.
+//   V is a pure function of gY and the V weight tiles, so its projection moves to
+//   after the last Q read and stores into the retired Q plane.  Q/K/V values, the
+//   K accumulation order, every rounding point and every layout stride are unchanged.
+shared float16_t qkv[8192];"""
+
+C64_EDITS = [
+    # --- 1. drop the V accumulators from the QKV pass -----------------------
+    ("""        MAT_C accK0 = MAT_C(0.0);
+        MAT_C accK1 = MAT_C(0.0);
+        MAT_C accV0 = MAT_C(0.0);
+        MAT_C accV1 = MAT_C(0.0);
+""",
+     """        MAT_C accK0 = MAT_C(0.0);
+        MAT_C accK1 = MAT_C(0.0);
+"""),
+    # --- 2. drop the V weight tiles + DPAS from the QKV k loop --------------
+    ("""            {
+                MAT_B b0, b1;
+                coopMatLoad(b0, pack, wq + (((96u * h + 64u) / 16u) * 4u + k0 / 16u) * 256u, 16u, LCOL);
+                coopMatLoad(b1, pack, wq + (((96u * h + 80u) / 16u) * 4u + k0 / 16u) * 256u, 16u, LCOL);
+                accV0 = coopMatMulAdd(a, b0, accV0);
+                accV1 = coopMatMulAdd(a, b1, accV1);
+            }
+""", ''),
+    # --- 3. drop the V store from the QKV pass -----------------------------
+    ("""        MAT_H narrowed;
+        narrowed = MAT_H(accV0);
+        coopMatStore(narrowed, qkv, ((gl_SubgroupID / 4u) * 6144u) + 4096u + m0q * 32u, 32u, LROW);
+        narrowed = MAT_H(accV1);
+        coopMatStore(narrowed, qkv, ((gl_SubgroupID / 4u) * 6144u) + 4096u + m0q * 32u + 16u, 32u, LROW);
+""", ''),
+    # --- 4. the honest comment for the now four-accumulator QKV pass --------
+    ('    // ---- QKV projection: unchanged (one A fragment feeds all six accumulators) ----',
+     '    // ---- QKV projection: one A fragment feeds the four Q/K accumulators.\n'
+     '    // N36: the two V accumulators leave this pass and are rebuilt after the score\n'
+     '    // phase, where they can reuse the Q plane (see the V block below). ----'),
+    # --- 5. the debug V echo moves with V (removed here, re-inserted later) -
+    ("""    // Q/K are normalized by their original projection owners before publication.
+    // The existing barrier above publishes all Q/K/V to every score/PV subgroup.
+    if(debug) {
+        for(uint e=t_local;e<2048u;e+=256u) {
+            uint dst=(e/32u)*64u+32u*h+e%32u;
+            dbg[53248u+dst]=qkv[((gl_SubgroupID / 4u) * 6144u) + 4096u + e];
+        }
+    }
+""",
+     """    // Q/K are normalized by their original projection owners before publication.
+    // The existing barrier above publishes Q and K to every score/PV subgroup.
+    // N36: the raw V debug echo moves with V (it now runs after the V publication
+    // barrier below); same loop bounds, same destination, same values.
+"""),
+    # --- 6. the relocated V projection + its two barriers -------------------
+    ('        // ---- PV: ctx^T = V^T . P^T, K order j = 0,1,2,3 unchanged ----',
+     """        // ---- N36: V projection, relocated after the last Q/K read ----
+        // The V projection reads only gY and the V weight tiles: not Q, not K, not S,
+        // not P, not den.  Executing it here means every Q read of this workgroup has
+        // already been issued, so the Q plane is retired and V can be stored into it.
+        // Token ownership moves from {8t, 8t+32} to {16t, 16t+8}: this subgroup's V
+        // store footprint is then exactly the 512 half of Q it read itself
+        // (queries qg..qg+15 = 16t..16t+15), which is why the Q-read -> V-write WAR
+        // needs only the workgroup barrier below and not a cross-owner protocol.
+        // Unchanged: the 4 k-steps in the same order, the same A rows per token, the
+        // same V weight tiles, one MC->MH narrowing per output tile.
+        barrier();
+        {
+            const uint vt = (sg % 4u) * 16u;
+            MAT_C accV0a = MAT_C(0.0);
+            MAT_C accV1a = MAT_C(0.0);
+            MAT_C accV0b = MAT_C(0.0);
+            MAT_C accV1b = MAT_C(0.0);
+            for (uint k0 = 0u; k0 < 64u; k0 += 16u) {
+                MAT_A a0; coopMatLoad(a0, gY, (w * 64u + vt) * 64u + k0, 64u, LROW);
+                MAT_A a1; coopMatLoad(a1, gY, (w * 64u + vt + 8u) * 64u + k0, 64u, LROW);
+                MAT_B b0, b1;
+                coopMatLoad(b0, pack, wq + (((96u * h + 64u) / 16u) * 4u + k0 / 16u) * 256u, 16u, LCOL);
+                coopMatLoad(b1, pack, wq + (((96u * h + 80u) / 16u) * 4u + k0 / 16u) * 256u, 16u, LCOL);
+                accV0a = coopMatMulAdd(a0, b0, accV0a);
+                accV1a = coopMatMulAdd(a0, b1, accV1a);
+                accV0b = coopMatMulAdd(a1, b0, accV0b);
+                accV1b = coopMatMulAdd(a1, b1, accV1b);
+            }
+            MAT_H narrowed = MAT_H(accV0a);
+            coopMatStore(narrowed, qkv, ((gl_SubgroupID / 4u) * 4096u) + 0u + vt * 32u, 32u, LROW);
+            narrowed = MAT_H(accV1a);
+            coopMatStore(narrowed, qkv, ((gl_SubgroupID / 4u) * 4096u) + 0u + vt * 32u + 16u, 32u, LROW);
+            narrowed = MAT_H(accV0b);
+            coopMatStore(narrowed, qkv, ((gl_SubgroupID / 4u) * 4096u) + 0u + (vt + 8u) * 32u, 32u, LROW);
+            narrowed = MAT_H(accV1b);
+            coopMatStore(narrowed, qkv, ((gl_SubgroupID / 4u) * 4096u) + 0u + (vt + 8u) * 32u + 16u, 32u, LROW);
+        }
+        // V is published to the three other query-block owners here.
+        barrier();
+        if(debug) {
+            for(uint e=t_local;e<2048u;e+=256u) {
+                uint dst=(e/32u)*64u+32u*h+e%32u;
+                dbg[53248u+dst]=qkv[((gl_SubgroupID / 4u) * 4096u) + 0u + e];
+            }
+        }
+
+        // ---- PV: ctx^T = V^T . P^T, K order j = 0,1,2,3 unchanged ----"""),
+]
+
+C128_EDITS = [
+    ("""        MAT_C accK0 = MAT_C(float16_t(0.0));
+        MAT_C accK1 = MAT_C(float16_t(0.0));
+        MAT_C accV0 = MAT_C(float16_t(0.0));
+        MAT_C accV1 = MAT_C(float16_t(0.0));
+""",
+     """        MAT_C accK0 = MAT_C(float16_t(0.0));
+        MAT_C accK1 = MAT_C(float16_t(0.0));
+"""),
+    ("""            {
+                MAT_B b0, b1;
+                coopMatLoad(b0, pack, wq + (((96u * h + 64u) / 16u) * 8u + ki) * 256u, 16u, LCOL);
+                coopMatLoad(b1, pack, wq + (((96u * h + 80u) / 16u) * 8u + ki) * 256u, 16u, LCOL);
+                accV0 = coopMatMulAdd(a, b0, accV0);
+                accV1 = coopMatMulAdd(a, b1, accV1);
+            }
+""", ''),
+    ("""        MAT_H narrowed;
+        narrowed = MAT_H(accV0);
+        coopMatStore(narrowed, qkv, ((gl_SubgroupID / 4u) * 6144u) + 4096u + m0 * 32u, 32u, LROW);
+        narrowed = MAT_H(accV1);
+        coopMatStore(narrowed, qkv, ((gl_SubgroupID / 4u) * 6144u) + 4096u + m0 * 32u + 16u, 32u, LROW);
+""", ''),
+    ('    // AN6: one standard direct-Y A fragment feeds all six Q/K/V fragments.',
+     '    // AN6: one standard direct-Y A fragment feeds the four Q/K fragments.\n'
+     '    // N36: the two V fragments leave this loop and are rebuilt after the score\n'
+     '    // phase, where they can reuse the Q plane (see the V block below).'),
+    ("""    // Q/K are normalized by their original projection owners before publication.
+    // The existing barrier above publishes all Q/K/V to every score/PV subgroup.
+    if(debug) {
+        for(uint e=t_local;e<2048u;e+=256u) {
+            uint dst=(e/32u)*128u+32u*h+e%32u;
+            dbg[106496u+dst]=qkv[((gl_SubgroupID / 4u) * 6144u) + 4096u + e];
+        }
+    }
+""",
+     """    // Q/K are normalized by their original projection owners before publication.
+    // The existing barrier above publishes Q and K to every score/PV subgroup.
+    // N36: the raw V debug echo moves with V (it now runs after the V publication
+    // barrier below); same loop bounds, same destination, same values.
+"""),
+    ('        // ---- PV: (feature, query) = V^T . P^T, K order j = 0,1,2,3 unchanged ----',
+     """        // ---- N36: V projection, relocated after the last Q/K read ----
+        // The V projection reads only gY and the V weight tiles: not Q, not K, not S,
+        // not P, not den.  Executing it here means every Q read of this workgroup has
+        // already been issued, so the Q plane is retired and V can be stored into it.
+        // Token ownership moves from {8t, 8t+32} to {16t, 16t+8}: this subgroup's V
+        // store footprint is then exactly the 512 half of Q it read itself
+        // (queries qg..qg+15 = 16t..16t+15), which is why the Q-read -> V-write WAR
+        // needs only the workgroup barrier below and not a cross-owner protocol.
+        // Unchanged: the 8 k-steps in the same order, the same A rows per token, the
+        // same V weight tiles, one MC->MH narrowing per output tile.
+        barrier();
+        {
+            const uint vt = (sg % 4u) * 16u;
+            MAT_C accV0a = MAT_C(float16_t(0.0));
+            MAT_C accV1a = MAT_C(float16_t(0.0));
+            MAT_C accV0b = MAT_C(float16_t(0.0));
+            MAT_C accV1b = MAT_C(float16_t(0.0));
+            for (uint ki = 0u; ki < 8u; ++ki) {
+                uint k0 = ki * 16u;
+                MAT_A a0; coopMatLoad(a0, gY, (w * 64u + vt) * 128u + k0, 128u, LROW);
+                MAT_A a1; coopMatLoad(a1, gY, (w * 64u + vt + 8u) * 128u + k0, 128u, LROW);
+                MAT_B b0, b1;
+                coopMatLoad(b0, pack, wq + (((96u * h + 64u) / 16u) * 8u + ki) * 256u, 16u, LCOL);
+                coopMatLoad(b1, pack, wq + (((96u * h + 80u) / 16u) * 8u + ki) * 256u, 16u, LCOL);
+                accV0a = coopMatMulAdd(a0, b0, accV0a);
+                accV1a = coopMatMulAdd(a0, b1, accV1a);
+                accV0b = coopMatMulAdd(a1, b0, accV0b);
+                accV1b = coopMatMulAdd(a1, b1, accV1b);
+            }
+            MAT_H narrowed = MAT_H(accV0a);
+            coopMatStore(narrowed, qkv, ((gl_SubgroupID / 4u) * 4096u) + 0u + vt * 32u, 32u, LROW);
+            narrowed = MAT_H(accV1a);
+            coopMatStore(narrowed, qkv, ((gl_SubgroupID / 4u) * 4096u) + 0u + vt * 32u + 16u, 32u, LROW);
+            narrowed = MAT_H(accV0b);
+            coopMatStore(narrowed, qkv, ((gl_SubgroupID / 4u) * 4096u) + 0u + (vt + 8u) * 32u, 32u, LROW);
+            narrowed = MAT_H(accV1b);
+            coopMatStore(narrowed, qkv, ((gl_SubgroupID / 4u) * 4096u) + 0u + (vt + 8u) * 32u + 16u, 32u, LROW);
+        }
+        // V is published to the three other query-block owners here.
+        barrier();
+        if(debug) {
+            for(uint e=t_local;e<2048u;e+=256u) {
+                uint dst=(e/32u)*128u+32u*h+e%32u;
+                dbg[106496u+dst]=qkv[((gl_SubgroupID / 4u) * 4096u) + 0u + e];
+            }
+        }
+
+        // ---- PV: (feature, query) = V^T . P^T, K order j = 0,1,2,3 unchanged ----"""),
+]
+
+# ---------------------------------------------------------------------- C256
+C256_EDITS = [
+    ("""        // C256 V is physical [token][dim] at qkv+4096, written by the V
+        // projection above (ROW32); the A operand is therefore ColumnMajor
+        // stride 32, element (dim i, key k) = qkv[((gl_SubgroupID / 4u) * 6144u) + 4096 + key*32 + dim].""",
+     """        // C256 V is physical [token][dim] at qkv+0 (the retired Q plane, N36),
+        // written by the V projection just above (ROW32); the A operand is therefore
+        // ColumnMajor stride 32, element (dim i, key k) =
+        //   qkv[((gl_SubgroupID / 4u) * 4096u) + 0 + key*32 + dim]."""),
+    ("""    // Q/K MCs have left scope before the original two-acc V pass, now M-doubled.
+    {
+        MAT_C accV0a = MAT_C(float16_t(0.0));
+        MAT_C accV1a = MAT_C(float16_t(0.0));
+        MAT_C accV0b = MAT_C(float16_t(0.0));
+        MAT_C accV1b = MAT_C(float16_t(0.0));
+        for (uint ki = 0u; ki < 16u; ++ki) {
+            uint k0 = ki * 16u;
+            MAT_A a0; coopMatLoad(a0, gY, (w * 64u + m0a) * 256u + k0, 256u, LROW);
+            MAT_A a1; coopMatLoad(a1, gY, (w * 64u + m0b) * 256u + k0, 256u, LROW);
+            MAT_B b0; coopMatLoad(b0, pack, wq + (96u * h + 64u) * 256u + k0, 256u, LCOL);
+            MAT_B b1; coopMatLoad(b1, pack, wq + (96u * h + 80u) * 256u + k0, 256u, LCOL);
+            accV0a = coopMatMulAdd(a0, b0, accV0a);
+            accV0b = coopMatMulAdd(a1, b0, accV0b);
+            accV1a = coopMatMulAdd(a0, b1, accV1a);
+            accV1b = coopMatMulAdd(a1, b1, accV1b);
+        }
+        MAT_H narroweda = MAT_H(accV0a);
+        coopMatStore(narroweda, qkv, ((gl_SubgroupID / 4u) * 6144u) + 4096u + m0a * 32u, 32u, LROW);
+        narroweda = MAT_H(accV1a);
+        coopMatStore(narroweda, qkv, ((gl_SubgroupID / 4u) * 6144u) + 4096u + m0a * 32u + 16u, 32u, LROW);
+        MAT_H narrowedb = MAT_H(accV0b);
+        coopMatStore(narrowedb, qkv, ((gl_SubgroupID / 4u) * 6144u) + 4096u + m0b * 32u, 32u, LROW);
+        narrowedb = MAT_H(accV1b);
+        coopMatStore(narrowedb, qkv, ((gl_SubgroupID / 4u) * 6144u) + 4096u + m0b * 32u + 16u, 32u, LROW);
+    }
+    } // both M blocks retire before the publication barrier""",
+     """    // N36: the V pass leaves this scope and is rebuilt after the score phase, where
+    // it can reuse the Q plane (see the V block below).
+    } // both M blocks retire before the publication barrier"""),
+    ("""    // Q/K are normalized by their original projection owners before publication.
+    // The existing barrier above publishes all Q/K/V to every score/PV subgroup.
+    if(debug) {
+        for(uint e=t_local;e<2048u;e+=256u) {
+            uint dst=(e/32u)*256u+32u*h+e%32u;
+            dbg[212992u+dst]=qkv[((gl_SubgroupID / 4u) * 6144u) + 4096u + e];
+        }
+    }
+""",
+     """    // Q/K are normalized by their original projection owners before publication.
+    // The existing barrier above publishes Q and K to every score/PV subgroup.
+    // N36: the raw V debug echo moves with V (it now runs after the V publication
+    // barrier below); same loop bounds, same destination, same values.
+"""),
+    ('        // ---- PV: ctx^T = V^T . P^T, K order j = 0,1,2,3 unchanged ----',
+     """        // ---- N36: V projection, relocated after the last Q/K read ----
+        // The V projection reads only gY and the V weight tiles: not Q, not K, not S,
+        // not P, not den.  Executing it here means every Q read of this workgroup has
+        // already been issued, so the Q plane is retired and V can be stored into it.
+        // Token ownership moves from {8t, 8t+32} to {16t, 16t+8}: this subgroup's V
+        // store footprint is then exactly the 512 half of Q it read itself
+        // (queries qg..qg+15 = 16t..16t+15), which is why the Q-read -> V-write WAR
+        // needs only the workgroup barrier below and not a cross-owner protocol.
+        // Unchanged: the 16 k-steps in the same order, the same A rows per token, the
+        // same V weight tiles shared by both M blocks, one MC->MH narrowing per tile.
+        barrier();
+        {
+            const uint vt = (sg % 4u) * 16u;
+            MAT_C accV0a = MAT_C(float16_t(0.0));
+            MAT_C accV1a = MAT_C(float16_t(0.0));
+            MAT_C accV0b = MAT_C(float16_t(0.0));
+            MAT_C accV1b = MAT_C(float16_t(0.0));
+            for (uint ki = 0u; ki < 16u; ++ki) {
+                uint k0 = ki * 16u;
+                MAT_A a0; coopMatLoad(a0, gY, (w * 64u + vt) * 256u + k0, 256u, LROW);
+                MAT_A a1; coopMatLoad(a1, gY, (w * 64u + vt + 8u) * 256u + k0, 256u, LROW);
+                MAT_B b0; coopMatLoad(b0, pack, wq + (96u * h + 64u) * 256u + k0, 256u, LCOL);
+                MAT_B b1; coopMatLoad(b1, pack, wq + (96u * h + 80u) * 256u + k0, 256u, LCOL);
+                accV0a = coopMatMulAdd(a0, b0, accV0a);
+                accV0b = coopMatMulAdd(a1, b0, accV0b);
+                accV1a = coopMatMulAdd(a0, b1, accV1a);
+                accV1b = coopMatMulAdd(a1, b1, accV1b);
+            }
+            MAT_H narroweda = MAT_H(accV0a);
+            coopMatStore(narroweda, qkv, ((gl_SubgroupID / 4u) * 4096u) + 0u + vt * 32u, 32u, LROW);
+            narroweda = MAT_H(accV1a);
+            coopMatStore(narroweda, qkv, ((gl_SubgroupID / 4u) * 4096u) + 0u + vt * 32u + 16u, 32u, LROW);
+            MAT_H narrowedb = MAT_H(accV0b);
+            coopMatStore(narrowedb, qkv, ((gl_SubgroupID / 4u) * 4096u) + 0u + (vt + 8u) * 32u, 32u, LROW);
+            narrowedb = MAT_H(accV1b);
+            coopMatStore(narrowedb, qkv, ((gl_SubgroupID / 4u) * 4096u) + 0u + (vt + 8u) * 32u + 16u, 32u, LROW);
+        }
+        // V is published to the three other query-block owners here.
+        barrier();
+        if(debug) {
+            for(uint e=t_local;e<2048u;e+=256u) {
+                uint dst=(e/32u)*256u+32u*h+e%32u;
+                dbg[212992u+dst]=qkv[((gl_SubgroupID / 4u) * 4096u) + 0u + e];
+            }
+        }
+
+        // ---- PV: ctx^T = V^T . P^T, K order j = 0,1,2,3 unchanged ----"""),
+]
+
+GROUPS = {
+    'c64': dict(src=D / 'f05-kv-consumer-layout/family/c64/candidate.comp',
+                edits=C64_EDITS, old_decl=DECL_OLD, pv_loads=16),
+    'c128': dict(src=D / 'f05-kv-consumer-layout/family/c128/candidate.comp',
+                 edits=C128_EDITS, old_decl=DECL_OLD, pv_loads=16),
+    'c256': dict(src=C / 'cards/n05a-f05-c256-mreuse/candidate.comp',
+                 edits=C256_EDITS, old_decl=DECL_OLD, pv_loads=16),
+}
+
+OLD_BASE = '(gl_SubgroupID / 4u) * 6144u'
+NEW_BASE = '(gl_SubgroupID / 4u) * 4096u'
+# The PV A-operand reads address the V plane with the intra-section literal VBASE
+# (`... + 4096u + key*32u + dim`).  VBASE is NOT the section stride: when V moves into
+# the Q plane this literal must become 0u, or PV reads 4096 half past the head section
+# (and out of the 8192-half declaration for the second head).  This was the E-class bug
+# of the first build and is now an asserted edit with an exact count.
+PV_OLD = '(gl_SubgroupID / 4u) * 6144u) + 4096u + '
+PV_NEW = '(gl_SubgroupID / 4u) * 6144u) + 0u + '
+
+
+def main():
+    report = {}
+    patches = []
+    for g, spec in GROUPS.items():
+        text = pathlib.Path(spec['src']).read_text(encoding='utf-8')
+        edits = []
+        for old, new in spec['edits']:
+            n = text.count(old)
+            assert n == 1, (g, 'anchor count %d (expected 1)' % n, old[:90])
+            text = text.replace(old, new, 1)
+            edits.append(dict(anchor=old.splitlines()[0][:96], occurrences=n))
+        # declaration
+        n = text.count(spec['old_decl'])
+        assert n == 1, (g, 'declaration count', n)
+        text = text.replace(spec['old_decl'], CXX_DECL_NEW, 1)
+        edits.append(dict(anchor='shared float16_t qkv[12288]', occurrences=n))
+        # PV reads the V plane with an intra-section literal: VBASE 4096 -> 0
+        n_pv = text.count(PV_OLD)
+        assert n_pv == spec['pv_loads'], (g, 'PV base occurrences', n_pv, spec['pv_loads'])
+        text = text.replace(PV_OLD, PV_NEW)
+        edits.append(dict(anchor='PV A-load base  + 4096u -> + 0u',
+                          occurrences=n_pv,
+                          note='the V plane moved into the Q plane; this literal is the '
+                               'intra-section VBASE, not the section stride'))
+        # arena base: every per-head section stride 6144 -> 4096 half
+        n = text.count(OLD_BASE)
+        assert n >= 20, (g, 'base stride occurrences', n)
+        text = text.replace(OLD_BASE, NEW_BASE)
+        edits.append(dict(anchor=OLD_BASE, occurrences=n, replacement=NEW_BASE))
+        # residual V-plane offsets in the QKV pass must be gone
+        left = text.count('4096u + m0')
+        assert left == 0, (g, 'V store left in the QKV pass', left)
+        out = CARD / ('candidate-%s.comp' % g)
+        out.write_text(text, encoding='utf-8')
+        parent = pathlib.Path(spec['src']).read_text(encoding='utf-8').splitlines(True)
+        cand = text.splitlines(True)
+        diff = list(difflib.unified_diff(
+            parent, cand,
+            fromfile='A-parent/%s' % pathlib.Path(spec['src']).name,
+            tofile='B-n36/candidate-%s.comp' % g, n=4))
+        patches.append(''.join(diff))
+        report[g] = dict(parent=str(spec['src']), candidate=str(out),
+                         edits=edits, lines=len(cand), diff_lines=len(diff),
+                         barrier_calls=text.count('barrier();'))
+        print('%-5s lines=%4d diff=%4d barrier()=%d base_stride_edits=%d'
+              % (g, len(cand), len(diff), text.count('barrier();'), n))
+    (CARD / 'SOURCE-DIFF.patch').write_text('\n'.join(patches), encoding='utf-8')
+    (CARD / 'build/candidate-gen.json').write_text(json.dumps(report, indent=2),
+                                                   encoding='utf-8')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

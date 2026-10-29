@@ -1,0 +1,95 @@
+n03-f04-middle / F04 C128 跨通道 middle 供料 —— RESUME（2026-10-27）
+
+状态：BUILT / AWAITING-GPU（CPU 全过门；未部署；未取 GPU 锁；未运行任何 Vulkan 任务）
+宽度：只做 C128（11 PASS），C64/C256 的下一条改动写在 §5。
+
+## 1. 身份（全部可复算）
+
+父源码   backend-uniform-owner/d034-family/c128/candidate.comp   sha256 80253b625d643ea7360a85a8fd0e125a7d2720745930ecf6ad6b218245f2ff15
+父 SPV   同目录 candidate.spv                                     sha256 958c9719869c3eaa42391d0361d74b7d2fe55620f6db698944e36f1da850e527
+父重编译 parent-rebuild.spv                                       sha256 958c9719869c…（**逐字节复现**，同一 glslang 16.5.0 + 钉住头 nb05_swin_c128_common.glsl c8ecf148…）
+候选源码 candidate.comp                                           sha256 f53db96c49340180f85abd2e49465b722eed4867c3d6ff0b89bb0010b9ba4bb8
+候选 SPV candidate.spv                                            sha256 4ac5ecf8de5f458aefd3bb4f0dd46b1985cc91a74c3ac2120efb035ef0f93766（34424 B，过 spv_validate_cpu）
+基线 plan f10-weight-return-separation-20261027/plan.txt          sha256 a024c3c5…（与合同一致）
+候选 plan cards/n03-f04-middle/plan.txt                           sha256 f6ad8f00f332f438339b58214462bcf87291079db8028d5e728dfdce402b1b0f
+  → `K.make_plan(spv_shas={958c97…})` 断言替换数 = 11；PLAN-DIFF.json 证明 3510 行中**只有 11 行**不同（都是 SPV 路径），
+    `CPU_PLAN_OK 152 rows, 232 passes, 502 buffers`，与父 plan 的 cpu-check 输出逐字相同（缓冲数、池字节、grid 全不变）。
+
+## 2. 改的是什么（一句话）
+
+expand→act→middle 的 hidden 维从 **4 块 ×32** 改成 **2 块 ×64**：expand 的 A（输入）tile 地址只与 (token 组, ki) 有关，
+父的嵌套让它每次 dispatch 被读 **4 次**（64 条 256 B UGM/SG + 每条后面 4 条半字散布 mov + 1 条 oob 分支），候选读 **2 次**
+（32 条消息 + 128 条 mov + 32 条分支）。
+DPAS 192、权重读 96、mLocal 发布 4 次、contract A 读 16 次、单 barrier、seed 4 次、每个 acc 的 K 序全部不变。
+
+## 3. 为什么不是 CARD 的首个候选（冲突已解决，必须记录）
+
+CARD 首个候选“mLocal 生产者写布局按 contract 连续 A 读组织 token slab”**已被 `f04-middle-consumer-tile-20261027` 实现并测过**：
+COL8 tile 把发布 32 条 + 读 128 条 SLM 消息降到 4 + 16 条（每条 256 B），静态指令 −233（−5.6%），
+ordinary 结果 INDISTINCT（saving −0.0633 ms，CI95[−0.2840, +0.1575]）。
+`f04-own-middle-feed`（自有 2 个 K 片段寄存器直交）同样 INDISTINCT；
+`f04-family-package` 的变慢已被 `f04-package-ablation` 归因到**33 份独立权重副本的分配**（同 shader 换绑定 0.2486 ms），
+不是 shuffle 或依赖链。**这三个方向都在本卡被显式排除**，再抄一遍就是“重复相同成本搬家”。
+
+因此本卡的判断：middle→contract 的 SLM 手交已经做过“几乎全删”的上界实验（-140 条消息、-5.6% 静态指令）仍不可检出，
+再换写法不可能有可测收益；剩下唯一**没被碰过且量级更大**的重复工作，是 middle 的 A 输入在同一 SG 内被读 4 次。
+本卡就做这一条，并把它与“是否已落到 native”用可证伪的计数绑定。
+
+## 4. 已证 / 未证
+
+已证（CPU，可复算）
+1. 父 SPV 逐字节复现；候选 SPV 过 `spv_validate_cpu`。
+2. NoContraction：父 0 / 候选 0（raw 配方，同一工具链同一 flags），浮点站点签名流相同（OpFMul 5 + GLSL.std.450 Fma 2，两边一致），
+   `float_NC_checked = 14`；4 个函数中 3 个 opcode 流完全相同（act、index、ch_to_a），只有 main 因循环体变厚而不同。
+3. 映射：mLocal 4096 个元素**恰好一个写者**（`sg = 4*(r//16) + (c//32)`），每个元素**恰好被 4 个 g owner 读**；
+   expand A 的 16 个唯一 tile 在被访问集合上父与候选**完全相同**，只是重复次数 4→2（PROOF.json 穷举）。
+4. K 序：middle 的 hidden K 步序列两边都是 0,16,32,48,64,80,96,112；expand 每个 acc 仍是 ki 升序；DPAS 192/192。
+5. 权重 tile 索引集合与顺序逐条相同（8 个 tile/SG/owner 升序），条数 96 不变。
+6. plan 只有 11 行变化，其余 3499 行逐字相同；232 passes / 502 buffers 与父一致。
+
+未证（必须 GPU/native，交主代理）
+1. 候选是否真的少了 32 条 UGM：预测 `send.ugm` 409→377、`(1|M0) load.ugm.d32x64t` 68→36（barrier 前 64→32）、
+   mov 1529→≈1401、A 的 oob 分支 64→32、Instruction Count 4130→3900–3990、Basic Block 237→≈205。
+2. 8 个同时驻留的 f32 acc 是否导致 scratch>0 或占用率下降（这是本候选最大风险，也是分诊 B 的入口）。
+3. 端到端是否更快（预期幅度 0.02–0.05 ms，低于 6 对检出下限 ~0.10 ms，**大概率 D/INDISTINCT**）。
+4. L1/L2 命中与 DRAM 字节是否有变化（不宣称）。
+
+## 5. 分诊（先验，须由 native/计时确认）
+
+- 主判：**D（INDISTINCT）**——机制是“删重复读”，量级 32/409 UGM、11/232 PASS，落在检出下限以下；
+  与已测三次 F04 尝试同一量级。**D 不等于零收益，也不构成方向禁令**。
+- 若 native 显示 A 读仍 68（编译器把两个 hidden 块串行化）→ **A（实现未落地）**；下一版必须换表达（例如显式 8 个命名 acc + 手工分离两个 hidden 块的 DPAS 顺序，或改成 A 的寄存器显式复用到下一块）。
+- 若 native 显示 A 读 36 但 scratch>0 或 Basic Block/指令大涨 → **B（有副作用）**，先砍活值：
+  退回“只把第 2 个 hidden 块并入第一块的一半”（4+2 混合），或把 2 个 token 组拆成两次 64-hidden 块以减 4 个 acc。
+- 若 fixed/fb2 出现首差 → **E**，先查 act 的窄化点与 middle 的 K 步配对（本卡唯一的新增风险面）。
+
+## 6. 下一处具体改动
+
+1. **C256 先做**（15 PASS，ordinal 36/39/42/45/48/51/54/57/171/174/177/180/183/186/189）：
+   `c256/candidate.comp:67-78` 的 `for hb<4 (h0=hb*32) { for ki<16 { wh0, wh1, A } }` 做同一变换（2×64，8 acc），
+   A 读 128 条 → 64 条，收益面是 C128 的 2 倍；但 C256 已有 352 DPAS，寄存器风险更高 → 先确认 C128 scratch=0 再推。
+2. **C64 后做**（7 PASS，ordinal 6/9/12/15/217/220/223）：`c64/candidate.comp:64-75`，ki<4，A 读 32→16 条，收益面最小。
+3. **同族更值得开新卡的**：C128 F04 的权重读取有 2× 的 pair 冗余（middle 16 + contract 16 条 UGM 里各有一半是
+   `pair=0/1` 重复读同一批 tile）。这需要改 owner/WG 几何（每 SG 更多 token 或 pair 合并），会动权重读取总量与并行度，
+   不属于“供料布局”卡，必须独立成卡并先证明 token/group 全覆盖与占用率。
+4. 明确不建议再做的：mLocal 再换 tile 形状（两端都测过）、自有片段寄存器直交（已测）、直接系数供料（已测）、
+   任何带新增独立权重 buffer 的包（ablation 已证明分配本身就是 0.25 ms 级退化源）。
+
+## 7. 未决项（不阻塞，已按合同自行推断）
+
+1. CARD 的首个候选与既有卡冲突：按“不得重复相同成本搬家”优先，本卡改做 middle A 输入供料。若主代理认为必须复现 COL8，
+   请以 `f04-middle-consumer-tile-20261027/family/c128/` 的现成产物为准，不要重复构建。
+2. 父 ISA 普查用的是历史 native 采集（`f07-scale-fragments` 的 captures，被 `f04-own-middle-feed/NATIVE-REVIEW.json`
+   登记为 width128/ordinal18 的 parent）。若主代理要求本轮新采父 ISA，请按 GPU-REQUEST 的 base 臂执行后再对比。
+3. `gM`（binding 5）在父源码里已无任何写/读（死镜像已删），候选保持不动；本卡未新增/删除任何 binding。
+4. 候选的 `parent-rebuild.spv` 与 `candidate.spv` 都是确定性构建（两次运行同 sha），可直接复算。
+
+## 8. 恢复点
+
+```
+python.exe cards/n03-f04-middle/build.py     # 父复现 + 候选编译 + SPV 校验 + NC/浮点审计 + plan + cpu_check + BUILD.json
+python.exe cards/n03-f04-middle/proof.py     # 穷举映射/K 序/权重 tile/寿命/尾块 → PROOF.json
+python.exe cards/n03-f04-middle/gen_docs.py  # SOURCE-DIFF.patch + PLAN-DIFF.json
+```
+Python：`@NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe`。
+全部只写 `cards/n03-f04-middle/`；基线 plan、指针、COMMON.py、其他卡目录未改。

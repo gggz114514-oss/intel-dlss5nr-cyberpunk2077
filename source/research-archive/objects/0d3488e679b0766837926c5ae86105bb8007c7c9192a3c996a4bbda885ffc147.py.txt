@@ -1,0 +1,231 @@
+"""S07 build: materialise the calibrated split16 b23 l0/l1 arm.
+
+Deliverables written under S07-split16/:
+  PACK/split16_b23_l0s23.int8.bin      (536584 B, W1 equalised+requantised)
+  PACK/split16_b23_l1.int8.bin         (264192 B, rescaled contract scales)
+  PACK/split16_b23_l0qxinv.bin         (2048 B, per-input-channel X inverse)
+  PACK/split16_b23_l1qxinv.bin         (4 B, scalar contract-input inverse)
+  SOURCE/split16_qx_producer_xinv.comp + split16_b23_qx_producer_xinv.spv
+  candidate-34189.txt
+  PACK/MANIFEST.json
+"""
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029"
+S = W / "S07-split16"
+sys.path.insert(0, str(W / "tools"))
+sys.path.insert(0, str(S / "tools"))
+import planlib  # noqa: E402
+from planlib import Plan, sha256_file  # noqa: E402
+import model as M  # noqa: E402
+from calibrate import Chain  # noqa: E402
+from equalise import requant, diag_from  # noqa: E402
+
+GLSLANG = B / "src/project/tools/glslang-16.5.0/bin/glslang.exe"
+BASE_PLAN = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24/c64-family-static/combo-34189.txt"
+PRODUCER_SRC = B / "candidates/codex-sol-int8-long-008-20261019/split16-l2-qkv-int8-v1/source/split16_qx_producer.comp"
+
+PROD_SRC_XINV = """// split16 l2 qX producer (S07 variant): PER-INPUT-CHANNEL static inverse.
+//
+// Diff vs candidates/codex-sol-int8-long-008-20261019/split16-l2-qkv-int8-v1/
+// source/split16_qx_producer.comp:
+//   * new binding 2 = float inv[512], the offline per-input-channel inverse
+//     (1/(sX*D[c]) with D[c] a power of two).  The push-constant scalar is kept
+//     only so the ABI and every existing BIND line stay untouched; it is unused.
+//   * the channel of a linear qX index is decoded from the canonical tiled
+//     layout: i = ((t/16)*(C/16) + c/16)*256 + (t%16)*16 + c%16, so
+//     c = ((i/256) % (C/16))*16 + i%16 for C=512.
+// No runtime reduction, no amax, no per-frame value: the whole vector is static.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer In { float16_t gy[]; };
+layout(set = 0, binding = 1) buffer Out { int8_t qx[]; };
+layout(set = 0, binding = 2) readonly buffer QInv { float inv[]; };
+layout(push_constant) uniform PC {
+    uint n;      // elements
+    float unused;// scalar ABI slot, unused by this build
+    uint base;   // input element base
+    uint pad;
+} pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    uint c = ((i / 256u) % 32u) * 16u + (i % 16u);
+    float v = float(gy[pc.base + i]);
+    qx[i] = int8_t(clamp(roundEven(v * inv[c]), -127.0, 127.0));
+}
+"""
+
+SOURCE_XEQ = """// split16 l0 stage2/stage3 INT8, S07 X-equalised variant.
+// Body is byte-identical to candidates/int8-coverage-v2-20261020/A/source/l0/
+// split16_l0_s23_qx.comp; the S07 arm does NOT change this shader.  It is copied
+// here only so the SOURCE/ directory carries the full build set for the pack:
+//   * stage1 dequant uses wsc1 = sX*sW1'(n) with W1' = W1*D  (pack change)
+//   * qR/qA steps come from invs[0]/invs[1]                     (pack change)
+//   * the l1 contract-input qX keeps the scalar inv[0]          (inv file change)
+// Nothing else in l0 moves, so the shipped SPV
+// candidates/int8-coverage-v2-20261020/A/spv/split16_l0_s23_qx.spv stays valid.
+"""
+
+
+def sha256_bytes(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def build_packs(ch, scales, D1, q1, s1):
+    old0 = bytearray(ch.l0pack.read_bytes())
+    old1 = bytearray(ch.l1pack.read_bytes())
+    # --- l0 pack: w8 requantised with D1 folded, wsc1/wsc2/wsc3 rescaled, invs
+    w8 = M.enc32(q1.astype(np.int8))
+    wsc1 = (scales["sX"] * s1).astype("<f4")
+    wsc2 = (ch.pk.wsc2 * (scales["sR"] / ch.old["sR"])).astype("<f4")
+    wsc3 = (ch.pk.wsc3 * (scales["sA"] / ch.old["sA"])).astype("<f4")
+    invs = np.array([1.0 / scales["sR"], 1.0 / scales["sA"]], "<f4")
+    new0 = bytearray(old0)
+    new0[0:262144] = w8.tobytes()
+    new0[262144:264192] = wsc1.tobytes()
+    new0[395264:403456] = wsc2.tobytes()
+    new0[534528:536576] = wsc3.tobytes()
+    new0[536576:536584] = invs.tobytes()
+    # --- l1 pack: only the per-output-channel scale moves (Wc grid kept)
+    wscL = (ch.pk.wscL * (scales["sF"] / ch.old["sF"])).astype("<f4")
+    new1 = bytearray(old1)
+    new1[262144:264192] = wscL.tobytes()
+    # --- inv files
+    qxinv = ((1.0 / scales["sX"]) / D1).astype("<f4")
+    l1inv = np.array([1.0 / scales["sF"]], "<f4")
+    return bytes(new0), bytes(new1), qxinv.tobytes(), l1inv.tobytes()
+
+
+def main():
+    ch = Chain()
+    xeq = json.loads((S / "XEQ-RETUNE.json").read_text())
+    scales = dict(xeq["scales"])
+    D1 = np.array(xeq["D1"], np.float32)
+    Xa = np.zeros(512, np.float32)
+    for fr in ch.frames:
+        Xa = np.maximum(Xa, np.abs(fr["X"][:1056]).max(0))
+    D1b = diag_from(Xa)
+    assert np.array_equal(D1, D1b), "D1 differs from the measured diagonal"
+    q1, s1 = requant(ch.pk.W1, D1)
+    l0, l1, qxinv, l1inv = build_packs(ch, scales, D1, q1, s1)
+
+    pk_dir = S / "PACK"
+    src_dir = S / "SOURCE"
+    pk_dir.mkdir(exist_ok=True)
+    src_dir.mkdir(exist_ok=True)
+    files = {
+        "l0": pk_dir / "split16_b23_l0s23.int8.bin",
+        "l1": pk_dir / "split16_b23_l1.int8.bin",
+        "qxinv": pk_dir / "split16_b23_l0qxinv.bin",
+        "l1inv": pk_dir / "split16_b23_l1qxinv.bin",
+    }
+    files["l0"].write_bytes(l0)
+    files["l1"].write_bytes(l1)
+    files["qxinv"].write_bytes(qxinv)
+    files["l1inv"].write_bytes(l1inv)
+
+    # --- shader build (only the qX producer changes)
+    (src_dir / "split16_qx_producer_xinv.comp").write_text(PROD_SRC_XINV)
+    (src_dir / "split16_l0_s23_qx.unchanged.comp").write_text(SOURCE_XEQ)
+    spv = pk_dir / "split16_b23_qx_producer_xinv.spv"
+    cmd = [str(GLSLANG), "-V", "--target-env", "vulkan1.3", "-o", str(spv),
+           str(src_dir / "split16_qx_producer_xinv.comp")]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    (src_dir / "build.log").write_text(" ".join(cmd) + "\n" + (r.stdout or "") + (r.stderr or ""))
+    if r.returncode != 0 or not spv.exists():
+        raise SystemExit(f"glslang failed: {r.stdout} {r.stderr}")
+
+    # --- candidate plan
+    p = Plan(BASE_PLAN)
+    base_sha = p.sha256()
+    d_prod = p.dispatch_by_name("split16_b23_l0_qx_producer")
+    changes = []
+    changes.append(p.set_spv(d_prod.ordinal, str(spv), name="split16_b23_l0_qx_producer"))
+    for name, f in [("split16_b23_l0w8", files["l0"]), ("split16_b23_l1w8", files["l1"]),
+                    ("split16_b23_l1qxinv", files["l1inv"])]:
+        changes.append(p.set_buffer(name, file=str(f)))
+    # insert the new BUFFER line before the first PASS and bump the header count
+    first_pass = next(i for i, ln in enumerate(p.lines) if ln.startswith("PASS "))
+    p.lines.insert(first_pass, f'BUFFER "split16_b23_l0qxinv" 2048 "{files["qxinv"].as_posix()}"')
+    hdr = p.lines[p.header_line].split()
+    hdr[2] = str(int(hdr[2]) + 1)
+    p.lines[p.header_line] = " ".join(hdr)
+    # add BIND 2 to the producer and bump its nbind
+    new_index = int(hdr[2]) - 1
+    # the producer PASS line moved by one because of the inserted BUFFER line
+    pl = next(i for i, ln in enumerate(p.lines) if ln.startswith("PASS ") and '"split16_b23_l0_qx_producer"' in ln)
+    import shlex
+    toks = shlex.split(p.lines[pl])
+    # tail: subgroup shared nbind npush gx gy gz  -> toks[4], toks[5] ... toks[6] is nbind
+    toks[6] = "3"
+    p.lines[pl] = f'PASS {toks[1]} "{toks[2]}" "{toks[3]}" ' + " ".join(toks[4:])
+    last_bind = pl
+    for i in range(pl + 1, pl + 40):
+        if p.lines[i].startswith("BIND "):
+            last_bind = i
+        else:
+            break
+    p.lines.insert(last_bind + 1, f"BIND 2 {new_index} 0 2048")
+    out_plan = S / "candidate-34189.txt"
+    text = p.newline.join(p.lines) + (p.newline if p.trailing_newline else "")
+    out_plan.write_bytes(text.encode("utf-8"))
+    # re-parse and validate the written file
+    q = Plan(out_plan)
+    problems = q.validate()
+    d2 = q.dispatch_by_name("split16_b23_l0_qx_producer")
+    verify = {
+        "header": list(q.header), "problems": problems,
+        "producer_binds": [[b.binding, q.buffers[b.buffer].name, b.offset, b.bytes] for b in d2.binds],
+        "l0_w8": q.buffer("split16_b23_l0w8").file,
+        "l1_w8": q.buffer("split16_b23_l1w8").file,
+        "l1inv": q.buffer("split16_b23_l1qxinv").file,
+        "qxinv_bytes": q.buffer("split16_b23_l0qxinv").bytes,
+    }
+    if problems:
+        raise SystemExit(f"candidate plan invalid: {problems}")
+
+    man = {
+        "card": "S07 split16 C512 l0/l1 vertical slice, block 23",
+        "base_plan": str(BASE_PLAN), "base_plan_sha256": base_sha,
+        "candidate_plan": str(out_plan), "candidate_plan_sha256": sha256_file(out_plan),
+        "scales_old": {k: float(v) for k, v in ch.old.items()},
+        "scales_new": {k: float(v) for k, v in scales.items()},
+        "D1_nonunit": int(np.sum(D1 != 1.0)),
+        "D1_values": {float(k): int(v) for k, v in zip(*np.unique(D1, return_counts=True))},
+        "files": [],
+        "verify": verify,
+        "layout": {
+            "l0_pack": [["w8", 0, 262144, "int8 32x32 tiles: ((n/32)*16+(k/32))*1024+(n%32)*32+(k%32), N=512 K=512, W1*D1"],
+                        ["wsc", 262144, 2048, "512 f32 = sX*sW1'(n)"],
+                        ["w2", 264192, 131072, "int8 32x32 tiles, N=2048 K=64 (unchanged)"],
+                        ["wsc2", 395264, 8192, "2048 f32 = sR*sW2(n)"],
+                        ["w3", 403456, 131072, "int8 32x32 tiles, N=512 K=256 (unchanged)"],
+                        ["wsc3", 534528, 2048, "512 f32 = sA*sW3(n)"],
+                        ["invs", 536576, 8, "f32[0]=1/sR f32[1]=1/sA"]],
+            "l1_pack": [["w8", 0, 262144, "int8 row-major [N][K], N=512 K=512, unchanged"],
+                        ["wsc", 262144, 2048, "512 f32 = sF*sWc(n)"]],
+            "l0qxinv": [["inv", 0, 2048, "512 f32 = 1/(sX*D[c])"]],
+            "l1qxinv": [["inv", 0, 4, "f32 = 1/sF"]],
+        },
+    }
+    for k, f in list(files.items()) + [("spv", spv)]:
+        man["files"].append({"role": k, "path": str(f), "bytes": f.stat().st_size,
+                             "sha256": sha256_file(f)})
+    (pk_dir / "MANIFEST.json").write_text(json.dumps(man, indent=1))
+    print(json.dumps(man, indent=1))
+
+
+if __name__ == "__main__":
+    main()

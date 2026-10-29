@@ -1,0 +1,131 @@
+"""Build a resource access graph for a PORT_NETWORK plan using SPIR-V reflection."""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+from planlib import Plan, sha256_file  # noqa: E402
+import spvlib  # noqa: E402
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("plan")
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+
+    plan = Plan(args.plan)
+    plan.assert_valid()
+
+    refl_cache = {}
+    dispatch_access = []
+    buf_writers = defaultdict(list)
+    buf_readers = defaultdict(list)
+    unknown_spv = []
+
+    for p in plan.passes:
+        try:
+            if p.spv not in refl_cache:
+                refl_cache[p.spv] = spvlib.reflect(p.spv)
+            refl = refl_cache[p.spv]
+        except Exception as e:  # noqa: BLE001
+            unknown_spv.append({"ordinal": p.ordinal, "name": p.name, "spv": p.spv, "error": str(e)})
+            dispatch_access.append({"ordinal": p.ordinal, "name": p.name, "bindings": [], "error": str(e)})
+            continue
+        by_binding = {d["binding"]: d for d in refl["descriptors"]}
+        rows = []
+        for b in p.binds:
+            buf = plan.buffers[b.buffer]
+            d = by_binding.get(b.binding)
+            access = d["access"] if d else "UNKNOWN"
+            kind = d["kind"] if d else "UNKNOWN"
+            rows.append({
+                "binding": b.binding,
+                "buffer": buf.name,
+                "buffer_index": b.buffer,
+                "offset": b.offset,
+                "bytes": b.bytes,
+                "buffer_bytes": buf.bytes,
+                "kind": kind,
+                "access": access,
+                "declared_binding": d is not None,
+            })
+            if access in ("WRITE", "READ_WRITE"):
+                buf_writers[buf.name].append(p.ordinal)
+            if access in ("READ", "READ_WRITE", "SAMPLED"):
+                buf_readers[buf.name].append(p.ordinal)
+        dispatch_access.append({
+            "ordinal": p.ordinal,
+            "name": p.name,
+            "spv": p.spv,
+            "spv_sha256": sha256_file(p.spv) if Path(p.spv).is_file() else None,
+            "bindings": rows,
+        })
+
+    buffers = []
+    for b in plan.buffers:
+        w = sorted(set(buf_writers.get(b.name, [])))
+        r = sorted(set(buf_readers.get(b.name, [])))
+        buffers.append({
+            "index": b.index,
+            "name": b.name,
+            "bytes": b.bytes,
+            "file": b.file,
+            "external": b.file != "-",
+            "writers": w,
+            "readers": r,
+            "writer_count": len(w),
+            "reader_count": len(r),
+            "policy": next(({"resident": pol.resident, "first": pol.first, "last": pol.last, "clear": pol.clear_first}
+                            for pol in plan.policies if pol.buffer == b.index), None),
+        })
+
+    # Small runtime buffers written in-graph are scale/counter candidates.
+    candidates = []
+    for b in buffers:
+        if b["external"] or b["bytes"] > 262144 or not b["writers"]:
+            continue
+        name = b["name"].lower()
+        score = 0
+        if any(k in name for k in ("sc", "scale", "ws", "alpha", "amax", "deq", "inv")):
+            score += 2
+        if b["bytes"] % 4 == 0:
+            score += 1
+        if 64 <= b["bytes"] <= 65536:
+            score += 1
+        if score >= 2:
+            candidates.append({"name": b["name"], "bytes": b["bytes"], "writers": b["writers"],
+                               "readers": b["readers"], "score": score})
+
+    out = {
+        "plan": str(plan.path),
+        "plan_sha256": plan.sha256(),
+        "dispatches": len(plan.passes),
+        "buffers": len(plan.buffers),
+        "unknown_spv": unknown_spv,
+        "dispatch_access": dispatch_access,
+        "buffers": buffers,
+        "runtime_scale_candidates": sorted(candidates, key=lambda x: (-x["score"], x["bytes"])),
+        "buffers_without_writer": [b["name"] for b in buffers if not b["writers"]],
+        "buffers_multi_writer": [{"name": b["name"], "writers": b["writers"]} for b in buffers if b["writer_count"] > 1],
+        "buffers_without_reader": [b["name"] for b in buffers if not b["readers"]],
+    }
+    Path(args.out).write_text(json.dumps(out, indent=2), encoding="utf-8")
+    print(json.dumps({
+        "plan": str(plan.path),
+        "dispatches": len(plan.passes),
+        "buffers": len(plan.buffers),
+        "unknown_spv": len(unknown_spv),
+        "runtime_scale_candidates": len(candidates),
+        "buffers_without_writer": len(out["buffers_without_writer"]),
+        "buffers_multi_writer": len(out["buffers_multi_writer"]),
+        "buffers_without_reader": len(out["buffers_without_reader"]),
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()

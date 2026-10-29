@@ -1,0 +1,131 @@
+"""n34-f19-latency: SPIR-V order distance from each expensive op to its first use.
+
+The ISA (SASS) order is owned by IGC's scheduler, so a source reorder can only be
+judged by what it does to the *module* order.  This script measures, for every
+OpExtInst Inversesqrt (= math.rsqt in SASS) and every OpFDiv (= math.inv in
+SASS), two distances in module order:
+
+  gap         to the first instruction that touches the result at all (usually
+              the f32->f16 convert, so this is ~1 by construction)
+  arith_gap   to the first *consumer that is not a pure data movement*: the walk
+              follows OpFConvert / OpComposite* / OpCopyObject / OpPhi and stops
+              at the first arithmetic op or store.  This is the SPIR-V analogue
+              of the ISA "rsqt -> first consumer" distance.
+
+CPU only, read-only.  Usage: python _c_spv_distance.py <spv> [...] [--json out]
+"""
+import hashlib
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST  # noqa: E402
+
+INVERSESQRT, SQRT, RECIP, RSQRT = 32, 31, 4, 26
+OP_FDIV = 136
+TRANSPARENT = {115, 116, 79, 80, 81, 82, 83, 77, 245}
+
+
+def analyse(path):
+    m = ST.Module(Path(path))
+    ins = m.instructions
+    res = {}
+    for i, (op, ops, _, _) in enumerate(ins):
+        rid = ST.result_id_of(op, ops)
+        if rid is not None:
+            res[rid] = i
+    users = {}
+    for i, (op, ops, _, _) in enumerate(ins):
+        for t in ops:
+            if isinstance(t, int) and t in res and res[t] < i:
+                users.setdefault(t, []).append(i)
+
+    def walk(start_id, stop_at_arith):
+        seen = {start_id}
+        stack = [start_id]
+        best = None
+        while stack:
+            rid = stack.pop()
+            for u in users.get(rid, ()):
+                op = ins[u][0]
+                if op in TRANSPARENT:
+                    nid = ST.result_id_of(op, ins[u][1])
+                    if nid is not None and nid not in seen:
+                        seen.add(nid)
+                        stack.append(nid)
+                    if not stop_at_arith:
+                        best = u if best is None else min(best, u)
+                else:
+                    best = u if best is None else min(best, u)
+                    if not stop_at_arith:
+                        nid = ST.result_id_of(op, ins[u][1])
+                        if nid is not None and nid not in seen:
+                            seen.add(nid)
+                            stack.append(nid)
+        return best
+
+    sites = []
+    for i, (op, ops, _, _) in enumerate(ins):
+        kind = None
+        if op == 12 and len(ops) > 3 and ops[3] in (INVERSESQRT, SQRT, RSQRT, RECIP):
+            kind = {INVERSESQRT: 'inversesqrt', SQRT: 'sqrt',
+                    RSQRT: 'rsqrt', RECIP: 'recip'}[ops[3]]
+        elif op == OP_FDIV:
+            kind = 'fdiv'
+        if kind is None:
+            continue
+        rid = ST.result_id_of(op, ops)
+        sites.append(dict(idx=i, op=kind, result_id=rid,
+                          first_use=(walk(rid, False)),
+                          arith_use=(walk(rid, True))))
+    for s in sites:
+        s['gap'] = (s['first_use'] - s['idx']) if s['first_use'] is not None else None
+        s['arith_gap'] = (s['arith_use'] - s['idx']) if s['arith_use'] is not None else None
+    gaps = [s['gap'] for s in sites if s['gap'] is not None]
+    agaps = [s['arith_gap'] for s in sites if s['arith_gap'] is not None]
+
+    def bucket(g):
+        if g is None:
+            return 'no-use'
+        if g <= 2:
+            return '<=2'
+        if g <= 7:
+            return '3-7'
+        if g <= 19:
+            return '8-19'
+        return '>=20'
+
+    regs = ST.function_regions(m)
+    return dict(
+        path=str(path), sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+        bytes=Path(path).stat().st_size, instructions=len(ins),
+        functions={ri: len(r) for ri, r in enumerate(regs)},
+        ops={k: sum(1 for s in sites if s['op'] == k) for k in sorted({s['op'] for s in sites})},
+        sites=sites,
+        hist=dict(Counter(bucket(s['gap']) for s in sites)),
+        hist_arith=dict(Counter(bucket(s['arith_gap']) for s in sites)),
+        gap_sorted=sorted(gaps), arith_gap_sorted=sorted(agaps),
+        min_gap=min(gaps) if gaps else None, max_gap=max(gaps) if gaps else None,
+        arith_min=min(agaps) if agaps else None, arith_max=max(agaps) if agaps else None,
+    )
+
+
+if __name__ == '__main__':
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    outc = None
+    if '--json' in sys.argv:
+        outc = sys.argv[sys.argv.index('--json') + 1]
+        args = [a for a in args if a != outc]
+    out = {}
+    for a in args:
+        r = analyse(a)
+        out[r['sha256']] = r
+        print('%-34s sha %s  instr %d' % (Path(a).name, r['sha256'][:16], r['instructions']))
+        print('   ops %s' % r['ops'])
+        print('   gap       hist %-28s %s' % (r['hist'], r['gap_sorted']))
+        print('   arith_gap hist %-28s %s' % (r['hist_arith'], r['arith_gap_sorted']))
+    if outc:
+        Path(outc).write_text(json.dumps(out, indent=1), encoding='utf-8')
+        print('wrote', outc)

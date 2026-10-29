@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""A1 evidence: the candidate is the parent minus exactly the four gM mirror stores.
+
+Strategy (no fragile per-ID alignment needed):
+  * histogram diff of (opcode, word-count) over the two function bodies;
+  * the child must add nothing (`child - parent == {}`) and the parent's missing
+    multiset must be small and fully classifiable;
+  * every missing instruction's *result type* is resolved through the type section
+    so the report states whether any float arithmetic disappeared;
+  * the four `OpCooperativeMatrixStoreKHR` sites whose pointer chain ends at the
+    StorageBuffer variable with Binding 5 must all be inside the missing set, and
+    the child must have zero of them while keeping all loads and barriers.
+"""
+import hashlib
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, r"@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts")
+import spv_tools_local as S  # noqa: E402
+
+W = Path(r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024")
+CARD = W / "candidates/a1-d034-gm-drop"
+BUILD = W / "build/a1-d034-gm-drop"
+
+NAME = {65: "OpAccessChain", 61: "OpLoad", 62: "OpStore", 82: "OpCompositeExtract",
+        81: "OpCompositeConstruct", 84: "OpCopyObject", 117: "OpBitcast",
+        124: "OpIAdd", 128: "OpISub", 130: "OpIMul", 131: "OpUMod", 132: "OpSRem",
+        133: "OpSMod", 134: "OpUDiv", 135: "OpSDiv", 143: "OpShiftLeftLogical",
+        144: "OpShiftRightLogical", 141: "OpShiftRightLogical",
+        142: "OpShiftRightArithmetic", 146: "OpBitwiseOr", 147: "OpBitwiseXor",
+        148: "OpBitwiseAnd", 109: "OpConvertFToU", 110: "OpConvertFToS",
+        111: "OpConvertSToF", 112: "OpConvertUToF", 113: "OpUConvert",
+        114: "OpSConvert", 115: "OpFConvert", 116: "OpQuantizeToF16",
+        126: "OpFAdd", 129: "OpFSub", 136: "OpFDiv", 137: "OpFDiv",
+        4458: "OpCooperativeMatrixStoreKHR", 4457: "OpCooperativeMatrixLoadKHR",
+        246: "OpControlBarrier", 247: "OpMemoryBarrier"}
+TYPE_KIND = {19: "void", 20: "bool", 21: "int", 22: "float", 23: "vector",
+             24: "matrix", 28: "array", 29: "runtime-array", 30: "struct",
+             32: "pointer", 33: "function", 4456: "coopmat"}
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def rid_of(op, ops):
+    if op == 4458:
+        return None
+    if op in (4457, 4456, 4459, 4460, 5358):
+        return ops[1]
+    return S.result_id_of(op, ops)
+
+
+def type_kind(mod, type_id, depth=0):
+    if depth > 6 or type_id is None:
+        return "?"
+    d = None
+    for op, ops, _, _ in mod.instructions:
+        r = rid_of(op, ops)
+        if r == type_id:
+            d = (op, ops)
+            break
+    if d is None:
+        return "?"
+    op, ops = d
+    k = TYPE_KIND.get(op, "op%d" % op)
+    if op == 32:                      # OpTypePointer -> resolve pointee
+        return k + "->" + type_kind(mod, ops[2], depth + 1)
+    if op == 23:                      # OpTypeVector -> component kind
+        return k + "<" + type_kind(mod, ops[1], depth + 1) + ">"
+    if op == 28:
+        return k + "<" + type_kind(mod, ops[1], depth + 1) + ">"
+    return k
+
+
+def store_sites(mod, binding=5):
+    bind = {}
+    for op, ops, _, _ in mod.instructions:
+        if op == 71 and len(ops) >= 3 and ops[1] == 33:
+            bind[ops[0]] = ops[2]
+    by_id = {}
+    for idx, (op, ops, _, _) in enumerate(mod.instructions):
+        r = rid_of(op, ops)
+        if r is not None:
+            by_id.setdefault(r, idx)
+
+    def chain(ptr, depth=0):
+        if depth > 16:
+            return None
+        d = by_id.get(ptr)
+        if d is None:
+            return None
+        op, ops = mod.instructions[d][0], mod.instructions[d][1]
+        if op == 59:
+            return ops[1]
+        if op in (65, 66, 67):
+            return chain(ops[2], depth + 1)
+        return None
+
+    out = []
+    for idx, (op, ops, _, _) in enumerate(mod.instructions):
+        if op == 4458 and ops:
+            v = chain(ops[0])
+            if v is not None and bind.get(v) == binding:
+                out.append(idx)
+    return out, bind
+
+
+def analyse(width, pp, cp):
+    P, C = S.Module(Path(pp)), S.Module(Path(cp))
+    pi = next(i for i, (o, _, _, _) in enumerate(P.instructions) if o == 54)
+    ci = next(i for i, (o, _, _, _) in enumerate(C.instructions) if o == 54)
+    hp = Counter((P.instructions[i][0], P.instructions[i][3]) for i in range(pi, len(P.instructions)))
+    hc = Counter((C.instructions[i][0], C.instructions[i][3]) for i in range(ci, len(C.instructions)))
+    missing, added = hp - hc, hc - hp
+
+    # resolve the result type of every missing instruction
+    kinds = Counter()
+    examples = []
+    for (op, wc), n in sorted(missing.items()):
+        hit = next((i for i in range(pi, len(P.instructions))
+                    if P.instructions[i][0] == op and P.instructions[i][3] == wc), None)
+        if hit is None:
+            continue
+        ops = P.instructions[hit][1]
+        ri = None
+        if op in (4457, 4456) or 19 <= op <= 39:
+            ri = 0
+        elif len(ops) > 1 and op not in (62, 4458, 246, 247, 249, 250, 251, 252, 253,
+                                         254, 255, 56, 71, 72, 5, 6):
+            ri = 0 if op == 61 else 1
+        tkind = "?"
+        if ri is not None and len(ops) > ri:
+            tkind = type_kind(P, ops[0] if ri == 1 else ops[1]) if op != 61 else type_kind(P, ops[0])
+        kinds[NAME.get(op, "op%d" % op) + "/" + str(wc) + "/" + tkind] += n
+        examples.append({"op": NAME.get(op, "op%d" % op), "wc": wc,
+                         "count": n, "result_type_kind": tkind,
+                         "operands_sample": ops[:6]})
+
+    gst, _ = store_sites(P)
+    cst, _ = store_sites(C)
+    n6058p = sum(1 for o, _, _, _ in P.instructions if o == 4458)
+    n6058c = sum(1 for o, _, _, _ in C.instructions if o == 4458)
+    bar_p = sum(1 for o, _, _, _ in P.instructions if o in (246, 247))
+    bar_c = sum(1 for o, _, _, _ in C.instructions if o in (246, 247))
+    words_p, words_c = len(P.words), len(C.words)
+    missing_words = sum(wc * n for (op, wc), n in missing.items())
+
+    float_like = [k for k in kinds if k.split("/")[2].startswith("float")]
+    res = {
+        "width": width,
+        "parent": {"path": str(pp), "sha256": sha(pp), "words": words_p,
+                   "instructions": len(P.instructions)},
+        "child": {"path": str(cp), "sha256": sha(cp), "words": words_c,
+                  "instructions": len(C.instructions)},
+        "missing_histogram": {"%s/wc%d" % (NAME.get(k[0], "op%d" % k[0]), k[1]): v
+                              for k, v in sorted(missing.items())},
+        "added_histogram": {str(k): v for k, v in added.items()},
+        "added_empty": len(added) == 0,
+        "missing_instruction_count": sum(missing.values()),
+        "missing_words": missing_words,
+        "word_delta_consistent": words_p - words_c == missing_words,
+        "missing_classified": dict(kinds),
+        "missing_float_typed": float_like,
+        "missing_examples": examples,
+        "gM_store_sites_parent": gst, "gM_store_sites_child": cst,
+        "gM_store_total_parent": n6058p, "gM_store_total_child": n6058c,
+        "coopmat_store_delta": n6058p - n6058c,
+        "barriers_parent": bar_p, "barriers_child": bar_c,
+        "loads_parent": sum(1 for o, _, _, _ in P.instructions if o == 4457),
+        "loads_child": sum(1 for o, _, _, _ in C.instructions if o == 4457),
+        "muladd_parent": sum(1 for o, _, _, _ in P.instructions if o == 4460),
+        "muladd_child": sum(1 for o, _, _, _ in C.instructions if o == 4460),
+    }
+    res["verdict"] = bool(res["added_empty"] and res["word_delta_consistent"]
+                          and len(gst) == 4 and len(cst) == 0
+                          and res["coopmat_store_delta"] == 4
+                          and not float_like
+                          and res["barriers_parent"] == res["barriers_child"]
+                          and res["loads_parent"] == res["loads_child"])
+    return res
+
+
+def main():
+    out, ok = {}, True
+    for w in ("c64", "c128", "c256"):
+        r = analyse(w, CARD / "spv" / f"parent_{w}.spv", BUILD / f"a1_{w}.spv")
+        out[w] = r
+        ok = ok and r["verdict"]
+    doc = {"card": "a1-d034-gm-drop",
+           "method": "code-section (opcode,word-count) multiset diff + pointer-chain "
+                     "resolution to the StorageBuffer variable with Binding 5 + "
+                     "result-type resolution of every missing instruction",
+           "widths": out, "all_verdicts_true": ok}
+    (CARD / "evidence" / "SPV-DELTA.json").write_text(
+        json.dumps(doc, indent=1) + "\n", encoding="utf-8", newline="\n")
+    for w, r in out.items():
+        print(w, "verdict", r["verdict"], "| added", r["added_empty"],
+              "| missing instr", r["missing_instruction_count"], "words", r["missing_words"],
+              "| gM stores", r["gM_store_total_parent"], "->", r["gM_store_total_child"],
+              "| loads", r["loads_parent"], "->", r["loads_child"],
+              "| barriers", r["barriers_parent"], "->", r["barriers_child"])
+        print("   missing:", r["missing_histogram"])
+        print("   float-typed missing:", r["missing_float_typed"])
+    print("ALL", ok)
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

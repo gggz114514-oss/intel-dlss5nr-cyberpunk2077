@@ -1,0 +1,142 @@
+"""n22-f15-den-pv: CPU proofs for the P->PV repack rewrite.
+
+1. `nrh_unpack2` identity: shuffle(shuffle(p, l^1), l^1) == p for every lane.
+2. join bit-identity: the parent's 8-block body and the candidate's 4-shuffle body write
+   the same 16 bits to every o[0..7] for every lane (randomised inputs, exact integer model).
+3. coordinate maps used by this shader (nrh_coord_A/B/C/CH) are bijections
+   (A/C/CH: 32 lanes x 4 comps -> 8x16, B: 32 x 8 -> 16x16).
+
+All arithmetic here is integer/bit manipulation only, which is exactly what packFloat2x16 /
+unpackFloat2x16 / subgroupShuffle do in the shader, so the comparison is bit-exact.
+
+Output: build/JOIN-BITS.json
+"""
+import json, random
+from pathlib import Path
+
+BASE = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+OUT = BASE / 'cards/n22-f15-den-pv/build/JOIN-BITS.json'
+
+LANES = 32
+
+
+def unpack(p):
+    """unpackFloat2x16: low half -> .x, high half -> .y (pure bit slicing)."""
+    return (p & 0xFFFF, (p >> 16) & 0xFFFF)
+
+
+def sl_of(lane):
+    return (((lane & 1) << 4) ^ ((lane & 30) >> 1)) & 31
+
+
+def shuffle(vals, idx):
+    """subgroupShuffle: lane L receives vals[idx(L)]."""
+    return [vals[idx(L)] for L in range(LANES)]
+
+
+def nrh_unpack2(vals):
+    """As compiled: unpackFloat2x16(subgroupShuffle(subgroupShuffle(p,l^1),l^1))."""
+    t = shuffle(vals, lambda L: L ^ 1)
+    u = shuffle(t, lambda L: L ^ 1)
+    return u
+
+
+def join_parent(F0, F0B, F1, F1B):
+    """The parent's 8-block body (2 blocks per packed value, nrh_unpack2 per component)."""
+    srcs = [F0, F0, F0B, F0B, F1, F1, F1B, F1B]
+    o = [None] * 8
+    for i in range(8):
+        v = shuffle(srcs[i], sl_of)
+        back = nrh_unpack2(v)                     # provable identity, kept explicit
+        o[i] = [(unpack(x)[0] if i % 2 == 0 else unpack(x)[1]) for x in back]
+    return o
+
+
+def join_candidate(F0, F0B, F1, F1B):
+    """The candidate's 4-shuffle body: one shuffle and one unpack per packed value."""
+    srcs = [F0, F0B, F1, F1B]
+    o = [None] * 8
+    for k, F in enumerate(srcs):
+        u = shuffle(F, sl_of)
+        o[2 * k] = [unpack(x)[0] for x in u]
+        o[2 * k + 1] = [unpack(x)[1] for x in u]
+    return o
+
+
+def coord_A(comp, lane):
+    x = ((lane << 2) | comp) & 0xFFFFFFFF
+    z = (((x & 3) << 5) ^ ((x & 124) >> 2)) & 0xFFFFFFFF
+    return z // 16, z % 16
+
+
+def coord_B(comp, lane):
+    x = ((lane << 3) | comp) & 0xFFFFFFFF
+    z = (((x & 7) << 5) ^ ((x & 8) << 1) ^ ((x & 240) >> 4)) & 0xFFFFFFFF
+    return z // 16, z % 16
+
+
+def main():
+    rnd = random.Random(20261027)
+    res = dict(card='n22-f15-den-pv', lanes=LANES, trials=0, mismatches=0, examples=[])
+
+    # ---- 1. nrh_unpack2 identity -----------------------------------------
+    ident_bad, ident_checked = 0, 0
+    for _ in range(4000):
+        vals = [rnd.getrandbits(32) for _ in range(LANES)]
+        back = nrh_unpack2(vals)
+        ident_checked += LANES
+        ident_bad += sum(1 for L in range(LANES) if back[L] != vals[L])
+    res['unpack2_identity'] = dict(checked=ident_checked, bad=ident_bad,
+                                   holds=ident_bad == 0,
+                                   proof='shuffle(.,l^1) is an involution over 32 lanes: '
+                                         'lane L reads v[L^1] twice, so the value returns to L')
+
+    # ---- 2. join bit identity --------------------------------------------
+    n_trials, bad = 2000, 0
+    for t in range(n_trials):
+        F0 = [rnd.getrandbits(32) for _ in range(LANES)]
+        F0B = [rnd.getrandbits(32) for _ in range(LANES)]
+        F1 = [rnd.getrandbits(32) for _ in range(LANES)]
+        F1B = [rnd.getrandbits(32) for _ in range(LANES)]
+        a = join_parent(F0, F0B, F1, F1B)
+        b = join_candidate(F0, F0B, F1, F1B)
+        if a != b:
+            bad += 1
+            if len(res['examples']) < 3:
+                for i in range(8):
+                    if a[i] != b[i]:
+                        res['examples'].append(dict(trial=t, component=i,
+                                                    parent=a[i][:4], candidate=b[i][:4]))
+        res['trials'] = t + 1
+    res['mismatches'] = bad
+    res['join_bit_identical'] = bad == 0
+    res['components_compared'] = 8 * LANES * n_trials
+
+    # ---- 3. coordinate map bijectivity -----------------------------------
+    maps = {}
+    for name, fn, ncomp, rows, cols in (('nrh_coord_A', coord_A, 4, 8, 16),
+                                        ('nrh_coord_C', coord_A, 4, 8, 16),
+                                        ('nrh_coord_CH', coord_A, 4, 8, 16),
+                                        ('nrh_coord_B', coord_B, 8, 16, 16)):
+        seen, dup = {}, 0
+        for lane in range(LANES):
+            for comp in range(ncomp):
+                rc = fn(comp, lane)
+                if rc in seen:
+                    dup += 1
+                seen[rc] = (lane, comp)
+        holes = rows * cols - len(seen)
+        maps[name] = dict(elements=LANES * ncomp, distinct=len(seen), shape=[rows, cols],
+                          expected=rows * cols, duplicates=dup, holes=holes,
+                          bijective=(dup == 0 and holes == 0))
+    res['coordinate_maps'] = maps
+    res['all_maps_bijective'] = all(v['bijective'] for v in maps.values())
+    res['den_tree_touched'] = False
+
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(json.dumps(res, indent=2), encoding='utf-8')
+    print(json.dumps({k: v for k, v in res.items() if k != 'examples'}, indent=2)[:2600])
+
+
+if __name__ == '__main__':
+    main()

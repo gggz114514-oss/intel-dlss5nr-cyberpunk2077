@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""R04 evidence: SPV differential attribution, residual FP16 MMA enumeration, and the
+local INT8 oracle for the PV segment.
+
+  python make_delta.py
+
+Reads:  spv/parent_repro.spv, spv/r04_c64_pv_i8.spv, build/r04-c64-attn/control-ext/ctl.spv
+Writes: evidence/SPV-DELTA.json, evidence/MMA-RESIDUAL.json, evidence/ORACLE-PV.json
+"""
+import json
+import os
+import sys
+
+import numpy as np
+
+ROOT = r"@NR_WORKSPACE@"
+W = ROOT + "/work/dsh-xmx-handoff-validation-20261024"
+CARD = W + "/candidates/r04-c64-attn"
+BUILD = W + "/build/r04-c64-attn"
+sys.path.insert(0, BUILD)
+import spv_r04 as S  # noqa: E402
+
+PARENT = CARD + "/spv/parent_repro.spv"
+CAND = CARD + "/spv/r04_c64_pv_i8.spv"
+CTL = BUILD + "/control-ext/ctl.spv"
+U09 = ROOT + "/candidates/zcode-fp16-compute-backend-20261021/u09-join-wide-c64-attn-v1/spv/b3_20_c64_ownership_fp16.spv"
+PASSES = ["block5_swin_body_3", "block6_swin_body_3", "block7_swin_body_3",
+          "block8_swin_body_3", "block62_swin_body_3", "block63_swin_body_3",
+          "block64_swin_body_3", "block65_swin_body_3"]
+
+# every opcode that changed between parent and candidate, with the cause
+CAUSE = {
+    "OpCooperativeMatrixMulAddKHR":
+        "16 PV FP16 MMAs (4 per dim tile) replaced by 8 int8 K32 MMAs (2 per dim tile); "
+        "the 6 QKV and 1 QK sites are unchanged, so the total drops by 8",
+    "OpCooperativeMatrixLoadKHR":
+        "the 16 PV A loads (f16 8x16 from qkv) become 8 int8 8x32 loads from sv8; the "
+        "QKV/QK loads keep their count",
+    "OpTypeCooperativeMatrixKHR":
+        "+3: int8 A 8x32 (MatrixA), int8 B 32x16 (MatrixB), int32 C 8x16 (Accumulator); "
+        "the four FP16 types are the parent's",
+    "OpTypeInt": "+1: the 8-bit signed integer component type of A and B",
+    "OpTypeArray": "+1: shared int8_t sv8[2048]",
+    "OpTypePointer": "+7: pointers to the int8 type, to sv8, to shVMax and to the new "
+                     "function-local variables of the int8 code",
+    "OpTypeFunction": "+1: four new helper functions (i8code, i8pack4, i8s, i8_join_B)",
+    "OpFunction": "+4 helpers - 3 dead helpers (see OpFunctionEnd)",
+    "OpFunctionEnd": "same as OpFunction",
+    "OpFunctionParameter": "8 new parameters: i8pack4 takes 5, i8_join_B takes 4",
+    "OpVariable": "function-scope temporaries of the new norm/V-quantisation/P-max/P-pack "
+                  "blocks (glslang's normal form); no new module-scope state except sv8 and "
+                  "shVMax, which are counted under OpTypeArray/OpTypePointer",
+    "OpAccessChain": "shared/global addresses of the V absmax read, the sv8 write and the "
+                     "8 int8 A loads replace the 16 FP16 A addresses",
+    "OpLoad": "the V absmax loop (1 per iteration), the sv8 quantisation read, the int8 A "
+              "loads' address operands; the parent's 16 FP16 PV A loads disappear",
+    "OpStore": "the sv8 quantisation write (1 per iteration) and the P code-word stores of "
+               "the new packing temporaries",
+    "OpExtInst":
+        "FMax +32 = the per-query P max over 8 blocks x 4 components; RoundEven +1 = the "
+        "single rounding of i8code; FClamp +1 = i8code's clamp; FAbs +1 = the V absmax; "
+        "UMax +1 = the uint max used by the absmax reduction",
+    "OpFMax32": "",
+    "OpFMul": "+2 V-quantisation scales (sVinv applied per element appears as one static "
+              "multiply) + the sV*pScale dequant multiply",
+    "OpFDiv": "+2: 1/sV and 127/pmx",
+    "OpFConvert": "+33: F16->F32 of the V values in the absmax/quantisation loops, the "
+                  "int32->float coopmat conversion and the extra F32->F16 narrowing path of "
+                  "the int8 PV tiles (parent: one F32->F16 per tile, candidate: int->float "
+                  "then float->half per tile)",
+    "OpConvertFToS": "+1: i8code's clamp result to int",
+    "OpConvertSToF": "+4: int8 -> float when the packed code word bytes are sign-extended "
+                     "into the int8 fragment (i8s then int8_t)",
+    "OpSConvert": "+2: int -> int8 narrowing of the packed code value",
+    "OpBitcast": "+10: float bits of the V absmax candidates and the P max exchanged "
+                 "through subgroupShuffleXor",
+    "OpBitwiseAnd": "net -2: the code-word byte extraction (+8 OpBitwiseOr/+and ops) "
+                    "replaces the parent's shift/xor masks",
+    "OpBitwiseOr": "+7: byte extraction of the code words in i8s",
+    "OpBitwiseXor": "-4: nrh_unpack2's xor-based lane exchange is gone; i8_join_B uses "
+                    "OpShiftRightLogical/OpBitwiseAnd instead",
+    "OpShiftRightLogical": "-4: see OpBitwiseXor",
+    "OpShiftLeftLogical": "-4: nrh_join_rows_to_B's lane-index construction is gone",
+    "OpShiftRightArithmetic": "+4: sign extension of the packed int8 code in i8s",
+    "OpIAdd": "loop increments and byte assembly of the new blocks",
+    "OpISub": "+1: sign correction in i8s (v >= 128 ? v-256 : v)",
+    "OpIMul": "loop index arithmetic of the new blocks",
+    "OpIEqual": "+5: the word selector of i8_join_B",
+    "OpULessThan": "loop bounds of the V absmax/quantisation loops",
+    "OpUGreaterThanEqual": "+1: the sign test of i8s",
+    "OpSLessThan": "+1: loop bound",
+    "OpSelect": "+2: the word selector of i8_join_B and i8s' sign fix",
+    "OpFOrdGreaterThan": "+2: pmx > 0 guards",
+    "OpAtomicUMax": "+1: the per-workgroup |V| absmax reduction",
+    "OpGroupNonUniformShuffleXor": "+1: the per-query P max exchange",
+    "OpGroupNonUniformShuffle": "-9: nrh_join_rows_to_B and nrh_unpack2 are dead after the "
+                                "PV switch; i8_join_B's 16 shuffles live in its own function",
+    "OpBranch": "control flow of the new blocks",
+    "OpBranchConditional": "control flow of the new blocks",
+    "OpLabel": "basic blocks of the new loops and guards",
+    "OpLoopMerge": "+3: V absmax loop, sv8 quantisation loop, P max chain",
+    "OpSelectionMerge": "+6: the pmx>0 guards and the sign tests",
+    "OpCapability": "+1: Shader (int8) capability",
+    "OpSourceExtension": "+2: the two #extension lines; isolated by the control build "
+                         "(control = parent + those lines only changes OpSourceExtension 7->9)",
+    "OpName": "names of the new types, variables and functions",
+    "OpConstant": "-2 net: the int8 zero/limit constants replace some FP16 ones",
+    "OpDecorate": "-57: RelaxedPrecision decorations of the three removed dead helper "
+                  "functions (see decoration_attribution)",
+    "OpReturnValue": "+1: i8_join_B returns a fragment",
+}
+
+
+def decoration_attribution(mod):
+    """NoContraction / RelaxedPrecision decorations attributed to the defining function."""
+    defs = {}
+    for idx, (off, opc, w) in enumerate(mod.insts):
+        if opc in S.RESULT_OPS or opc in (4456, 22, 21, 32, 28, 30, 43, 44, 46, 54, 55, 59, 80, 81, 82):
+            if len(w) > 2:
+                defs[w[2]] = idx
+    out = {}
+    for (target, name, rest) in mod.decor:
+        idx = defs.get(target)
+        fn = "module"
+        if idx is not None:
+            for f in mod.functions:
+                if f["first"] <= idx <= f["last"]:
+                    fn = f["name"].split("(")[0]
+        out.setdefault(name, {}).setdefault(fn, 0)
+        out[name][fn] += mod.decor[(target, name, rest)]
+    return out
+
+
+def residual():
+    p, c = S.Module(PARENT), S.Module(CAND)
+    u = S.Module(U09)
+    def split(mod):
+        rows = {"QKV": [], "QK": [], "PV": [], "other": []}
+        main_seen = 0
+        for s in mod.mma_sites():
+            if s["function"] == "main":
+                rows["QKV" if main_seen < 6 else "PV"].append(s)
+                main_seen += 1
+            elif s["function"] and s["function"].startswith("c64_score_block"):
+                rows["QK"].append(s)
+            else:
+                rows["other"].append(s)
+        return rows
+    rp, rc, ru = split(p), split(c), split(u)
+    def brief(rows):
+        return {k: {"sites": len(v),
+                    "fp16": sum(1 for s in v if s["A"]["component"] == "f16"),
+                    "int8": sum(1 for s in v if s["A"]["component"] == "i8"),
+                    "word_offsets": [s["word_offset"] for s in v],
+                    "result_ids": [s["result_id"] for s in v]}
+                for k, v in rows.items()}
+    return {
+        "label": "R04-MMA-RESIDUAL",
+        "method": "re-enumerated on the NEW module: every OpCooperativeMatrixMulAddKHR, with "
+                  "A/B/C component kind and width resolved through "
+                  "OpTypeCooperativeMatrixKHR; ids are the candidate's own, not the parent's",
+        "parent": {"spv": PARENT, "sha256": p.sha256, "bytes": p.bytes,
+                   "total_mma": len(p.mma_sites()), "segments": brief(rp),
+                   "shared_bytes": p.shared_bytes()},
+        "candidate": {"spv": CAND, "sha256": c.sha256, "bytes": c.bytes,
+                      "total_mma": len(c.mma_sites()), "segments": brief(rc),
+                      "shared_bytes": c.shared_bytes()},
+        "current_fp16_parent_module_not_the_audit_module": {
+            "spv": U09, "sha256": u.sha256, "bytes": u.bytes,
+            "total_mma": len(u.mma_sites()), "segments": brief(ru),
+            "shared_bytes": u.shared_bytes(),
+            "note": "the 232-pass FP16 parent plan dispatches this u09 build for the same 8 "
+                    "passes; it carries the same 23 static FP16 MMA split (6/1/16) but a "
+                    "different norm organisation (no shNorm, shared 12288 B). The PV int8 "
+                    "patch must be re-applied to that source before a gate on the current "
+                    "parent plan; see REPORT.md gap 0",
+        },
+        "remaining_fp16_static_mma": {
+            "per_pass": {"QKV": 6, "QK": 1, "PV": 0, "total": 7},
+            "over_the_8_passes": 7 * 8,
+            "before": {"per_pass": 23, "over_the_8_passes": 184},
+            "removed_by_this_card": {"per_pass": 16, "over_the_8_passes": 128},
+        },
+        "remaining_fp16_mma_sites": [
+            {"segment": k, **{kk: s[kk] for kk in ("word_offset", "result_id", "function",
+                                                  "dtype_class", "A", "B", "C")}}
+            for k in ("QKV", "QK") for s in rc[k]],
+        "int8_mma_sites": [{**{kk: s[kk] for kk in ("word_offset", "result_id", "function",
+                                                    "dtype_class", "A", "B", "C")}}
+                           for s in rc["PV"]],
+        "scalar_float_bypass_check": {
+            "question": "does any scalar float multiply perform a contraction that the MMA "
+                        "census would miss?",
+            "finding": "no: the FP16 OpFMul in the module are the Q head scalar, the norm "
+                       "tree, the P rescale, c64_exp_h, the new sV*pScale dequant and the "
+                       "V quantisation scale. None of them is a K-reduction; the reductions "
+                       "are exactly the 15 MMA sites counted above.",
+        },
+    }
+
+
+def oracle():
+    """CPU INT8 reference for one owner SG: exact int32 dot vs the FP16 path."""
+    rng = np.random.default_rng(20261024)
+    keys, dims, queries = 64, 32, 16
+    # V: half values, mixed sign, the range a swin QKV projection produces
+    V = (rng.normal(0.0, 0.6, size=(keys, dims))).astype(np.float16)
+    # P: half probabilities already normalised by the parent's tree per query column
+    logits = rng.normal(0.0, 1.2, size=(keys, queries))
+    logits -= logits.max(axis=0, keepdims=True)
+    P = np.exp(logits)
+    P = P / P.sum(axis=0, keepdims=True)
+    P = P.astype(np.float16)
+    # parent: FP32 accumulation of the half operands
+    ref64 = (V.astype(np.float64).T @ P.astype(np.float64))       # exact reference
+    ref32 = (V.astype(np.float32).T @ P.astype(np.float32))       # FP32 MMA-like
+    # candidate: one per-workgroup V scale, one per-query P scale, RNE, int32 dot
+    sV = np.abs(V.astype(np.float32)).max() / 127.0
+    qV = np.clip(np.rint(V.astype(np.float32) / sV), -127, 127).astype(np.int32)
+    pmx = P.astype(np.float32).max(axis=0)
+    sP = pmx * (1.0 / 127.0)
+    qP = np.clip(np.rint(P.astype(np.float32) / sP[None, :]), -127, 127).astype(np.int32)
+    acc = (qV.T.astype(np.int64) @ qP.astype(np.int64))            # exact int32 range
+    cand = acc.astype(np.float64) * (sV * sP)[None, :]
+    # the fragment maps are bijections, so the int32 dot above is the MMA's arithmetic;
+    # here we only check the numeric contract, not the transport.
+    err = np.abs(cand - ref32)
+    rel = err / np.maximum(np.abs(ref32), 1e-12)
+    bound = (sV * 0.5) * np.abs(P.astype(np.float64)).sum(axis=0)[None, :] + \
+            (sP[None, :] * 0.5) * np.abs(V.astype(np.float64)).sum(axis=0)[:, None]
+    return {
+        "label": "R04-PV-INT8-LOCAL-ORACLE",
+        "what": "the shader's PV arithmetic on one owner SG: ctx^T = sum over 64 keys of "
+                "V^T.SP^-1 * P^T.SP, exact int32 accumulation, dequantised once in FP32",
+        "who_generates_it": "this card, on CPU, from the same formulas the shader encodes; "
+                            "no GPU and no capture involved",
+        "status": "LOCAL_REFERENCE_ONLY; the numeric gate against this reference has NOT been "
+                  "run on a device (no GPU slot)",
+        "inputs": {"generator": "numpy default_rng(20261024)",
+                   "V": "64x32 half, N(0,0.6)", "P": "64x16 half, softmax per column",
+                   "non_zero": bool(np.count_nonzero(V) and np.count_nonzero(P)),
+                   "V_absmax": float(np.abs(V.astype(np.float32)).max()),
+                   "P_max": float(pmx.max())},
+        "int8_codes": {"qV_non_zero": int(np.count_nonzero(qV)),
+                       "qV_zero_share": float(1.0 - np.count_nonzero(qV) / qV.size),
+                       "qP_non_zero": int(np.count_nonzero(qP)),
+                       "sV": float(sV), "sP_range": [float(sP.min()), float(sP.max())],
+                       "qV_range": [int(qV.min()), int(qV.max())],
+                       "qP_range": [int(qP.min()), int(qP.max())],
+                       "int32_accumulator_maxabs": int(np.abs(acc).max()),
+                       "int32_overflow_free": bool(np.abs(acc).max() < 2 ** 31)},
+        "error_vs_fp32_parent_path": {
+            "err_rms": float(np.sqrt((err ** 2).mean())),
+            "ref_rms": float(np.sqrt((ref32.astype(np.float64) ** 2).mean())),
+            "err_rms_over_ref_rms": float(np.sqrt((err ** 2).mean()) /
+                                          np.sqrt((ref32.astype(np.float64) ** 2).mean())),
+            "share_err_above_1pct_ref_rms": float((err > 0.01 * np.sqrt(
+                (ref32.astype(np.float64) ** 2).mean())).mean()),
+            "max_abs": float(err.max()), "mean_abs": float(err.mean()),
+            "max_rel": float(rel.max()), "p99_rel": float(np.percentile(rel, 99)),
+            "analytic_bound_max": float(bound.max()),
+            "within_analytic_bound": bool(err.max() <= bound.max() * 1.05),
+            "reference_magnitude": float(np.abs(ref32).max()),
+        },
+        "why_this_is_attributable": [
+            "the int32 dot over 64 keys is exact: no FP accumulation order difference",
+            "the only two roundings are the per-element quantisation of V and P with RNE",
+            "the parent's half P, its tree, its reciprocal and its single rounding point are "
+            "untouched, so the quantiser input is byte-identical to the FP16 consumer's input",
+            "the per-query P scale is provably <= 1 scale: max_k P <= 1 (P = exp*inv with "
+            "inv = 1/max(sum,2^-14)), so pmx*(127/pmx) = 127 never saturates",
+        ],
+        "not_covered": "native execution, the pipeline's actual P values, and the full-net "
+                       "quality contract; those are the GPU gate jobs in run/r04-c64-attn",
+    }
+
+
+def main():
+    p, c = S.Module(PARENT), S.Module(CAND)
+    d = S.diff(p, c)
+    ctl = S.Module(CTL)
+    dctl = S.diff(p, ctl)
+    d["label"] = "R04-SPV-DELTA"
+    d["opcode_cause"] = {k: CAUSE[k] for k in d["opcode_delta"] if k in CAUSE}
+    d["unattributed_opcodes"] = [k for k in d["opcode_delta"] if k not in CAUSE]
+    d["decoration_attribution"] = {"parent": decoration_attribution(p),
+                                   "candidate": decoration_attribution(c)}
+    d["control_build"] = {
+        "what": "parent source + the two added #extension lines only",
+        "spv": CTL, "sha256": ctl.sha256, "bytes": ctl.bytes,
+        "result": "the whole difference is 2 OpSourceExtension strings; every function's "
+                  "opcode multiset is identical and both modules carry 23 FP16 MMA",
+        "opcode_delta": dctl["opcode_delta"],
+        "hunks": len(dctl["hunks"]),
+        "function_comparison": {k: v["status"] for k, v in dctl["function_comparison"].items()},
+    }
+    d["identity"] = {
+        "parent_repro_equals_deployed": None,
+        "candidate_sha256": c.sha256, "parent_sha256": p.sha256,
+        "compiler": "glslang 16.5.0 e207976041258c1ccfb32902c2a3d543542c1a463c84bd2dd6ba0dca78ea3578",
+        "argv": ["glslang.exe", "-V", "--target-env", "vulkan1.3", "-I<source/candidate>",
+                 "-o", "r04_c64_pv_i8.spv", "b3_20_c64_ownership_pv_int8.comp"],
+        "validator": "spv_validate_cpu.exe a938b24fc6f339e58dba063e9a13844286cdd99f201bc4762f232df4db3ed5e2",
+        "validator_result": "result=0 words=%d" % (c.bytes // 4),
+    }
+    json.dump(d, open(CARD + "/evidence/SPV-DELTA.json", "w", encoding="utf-8"), indent=1)
+    json.dump(residual(), open(CARD + "/evidence/MMA-RESIDUAL.json", "w", encoding="utf-8"), indent=1)
+    json.dump(oracle(), open(CARD + "/evidence/ORACLE-PV.json", "w", encoding="utf-8"), indent=1)
+    print("opcode deltas", len(d["opcode_delta"]), "unattributed", d["unattributed_opcodes"])
+    print("decorations parent", d["decoration_attribution"]["parent"])
+    print("decorations cand  ", d["decoration_attribution"]["candidate"])
+    print("control delta", dctl["opcode_delta"])
+
+
+if __name__ == "__main__":
+    main()

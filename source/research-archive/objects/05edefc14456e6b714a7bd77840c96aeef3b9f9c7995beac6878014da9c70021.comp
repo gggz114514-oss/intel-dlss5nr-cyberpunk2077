@@ -1,0 +1,342 @@
+// Isolated D3 store candidate; original family math/dispatch/seed retained.
+// c256_d3_attention_fp16.comp — D3: per-head QKV + norm + score/exp +
+// probability reduction + context (guide §5/§6). Grid 22×13×4 (z = head h);
+// shared 45,568 B per §6. Probability reduction uses the sealed C32 balanced
+// tree (guide §4.7), NOT the AMD left-associated branch.
+//
+// R06 PV-INT8 CANDIDATE (work/dsh-xmx-handoff-validation-20261024, card r06-c256-attn).
+// Parent: ../../source/parent/b3_06_swin_c256_fp16.comp (sha256 9d818d6b...), which
+// recompiles byte-identically to the G3-pinned module d3_direct.spv (54d793c5..., 33,980 B).
+// SCOPE: the PV (context) segment only — 2 of this module's 10 static FP16 MMA sites.
+// QKV (6) and QK (2) stay FP16 and are named gaps in REPORT.md.
+//   * P keeps the parent's shP half bridge, its balanced sum tree, its reciprocal and
+//     its single half rounding point. After the existing normalisation pass each P
+//     element is quantised once, in the same loop, into shared int8 (shP8); the
+//     per-query scale is the row max of the *rounded* half P, so no code can clip.
+//   * V is quantised once, in the existing scale pass, into shared int8 (shV8) with one
+//     per-workgroup (= per head per window) absmax; the absmax rides the existing
+//     post-QKV and post-norm barriers. No new pass, no new barrier.
+//   * ctx = P.V runs as 2 x M8N16K32 int8->int32 instead of 4 x K16 FP16, both K32
+//     slices accumulating into the SAME int32 fragments, so the two slices share one
+//     sP and one sV and the dequant is a single FP32 multiply per component.
+// K order, owner, store addresses, M/N tiling and every debug echo are the parent's.
+// The V half slab (qkv[4096..6143]) is retained because the debug echo and the
+// quantisation source still read it; it is no longer read by any matrix path.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256) in;
+#include "b3_06_swin_c256_common.glsl"
+
+layout(set = 0, binding = 6) buffer YBuf { float16_t gY[]; };
+layout(set = 0, binding = 7) buffer TBuf { float16_t gT[]; };
+
+// QKV reads gY directly; no shared Y array.
+shared float16_t qkv[6144]; // same Q/K/V half layout: +0/+2048/+4096
+shared float16_t shP[4096];      // [64][64]          8192 B
+// T2 (2026-10-18): shT[2048] (4096 B) and shScratch[1024] (4096 B) are deleted.
+//   shT only carried the context accumulator to a cooperative global write; the
+//   writeback read shT[e] with (t,d) = (e/32, e%32), i.e. the accumulator's own
+//   RowMajor stride-32 linear index, so the target element is exactly
+//   gT[(w*64+m0+row)*256 + 32*h + 16*side + col] and a direct coopMatStore writes
+//   the same elements (base (w*64+m0)*256 + 32*h + 16*side, stride 256, RowMajor;
+//   every base/stride is a multiple of 16).
+//   shScratch only ever served the p1.w debug echo of the raw FP32 logits, whose
+//   readback index was again the fragment's own linear index (row = lane/16 +
+//   2*ci, col = lane%16).  It is now written straight to dbgf per component.
+shared float16_t shNorm[256];    // nq/nk/inv         512 B
+
+// ---- R06 int8 PV state (6,660 B; declared shared 20,992 -> 27,652 B) ----
+shared int8_t shP8[4096];        // P quantised, [query 64][key 64], same index as shP
+shared int8_t shV8[2048];        // V quantised, [key 64][dim 32], same index as qkv[4096..]
+shared float shPS[64];           // per-query P dequant scale = max(half P of the row)/127
+shared float shPM[64];           // per-query P quantise multiplier = 127/max(half P)
+shared uint  shVMax;             // |V| bit-pattern max over this workgroup's head slab
+
+#define MAT_H coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+// Measured B580 SG32 int8 tuple (abi-probe/I8-ABI-MEASURED.json, verdict PASS):
+// A int8 8x32 MatrixA, B int8 32x16 MatrixB, C int32 8x16 Accumulator.
+#define CIAI  coopmat<int8_t, gl_ScopeSubgroup, 8, 32, gl_MatrixUseA>
+#define CIBI  coopmat<int8_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB>
+#define CACC  coopmat<int, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+
+// One quantisation per element: noContraction scale, roundEven, clamp to [-127,127].
+// Same helper (and same arithmetic) as the measured int8 adapter used by R04.
+int i8code(float16_t v, float invs) {
+    precise float scaled = float(v) * invs;
+    return int(clamp(roundEven(scaled), -127.0, 127.0));
+}
+
+void main() {
+    const uint t_local = gl_LocalInvocationID.x;
+    const uint sg = t_local / 32u;
+    const uint lane = t_local % 32u;
+    const uint wx = (pc.p1.z != 0) ? uint(pc.p2.x) : gl_WorkGroupID.x;
+    const uint wy = (pc.p1.z != 0) ? uint(pc.p2.y) : gl_WorkGroupID.y;
+    const uint h = gl_WorkGroupID.z;
+    const uint w = wy * uint(pc.p1.x) + wx;
+    const bool debug = pc.p1.w != 0;
+    const uint wq = uint(pc.p3.w);
+
+    // shVMax is written before any reader exists and is published by the existing
+    // post-QKV barrier, so the V absmax costs no additional synchronisation.
+    if (t_local == 0u) shVMax = 0u;
+
+    // ---- QKV 64×96×128: Nc=6, Np=3; rows 96h+0/32/64 = Q/K/V ----
+    const uint m0 = sg * 8u;
+    // Q/K share one Y load each K16. B pairs are born/die separately.
+    {
+        MAT_C accQ0 = MAT_C(float16_t(0.0));
+        MAT_C accQ1 = MAT_C(float16_t(0.0));
+        MAT_C accK0 = MAT_C(float16_t(0.0));
+        MAT_C accK1 = MAT_C(float16_t(0.0));
+        for (uint ki = 0u; ki < 16u; ++ki) {
+            uint k0 = ki * 16u;
+            MAT_A a; coopMatLoad(a, gY, (w * 64u + m0) * 256u + k0, 256u, LROW);
+            {
+                MAT_B b0; coopMatLoad(b0, pack, wq + (96u * h) * 256u + k0, 256u, LCOL);
+                MAT_B b1; coopMatLoad(b1, pack, wq + (96u * h + 16u) * 256u + k0, 256u, LCOL);
+                accQ0 = coopMatMulAdd(a, b0, accQ0);
+                accQ1 = coopMatMulAdd(a, b1, accQ1);
+            }
+            {
+                MAT_B b0; coopMatLoad(b0, pack, wq + (96u * h + 32u) * 256u + k0, 256u, LCOL);
+                MAT_B b1; coopMatLoad(b1, pack, wq + (96u * h + 48u) * 256u + k0, 256u, LCOL);
+                accK0 = coopMatMulAdd(a, b0, accK0);
+                accK1 = coopMatMulAdd(a, b1, accK1);
+            }
+        }
+        MAT_H narrowed = MAT_H(accQ0);
+        coopMatStore(narrowed, qkv, m0 * 32u, 32u, LROW);
+        narrowed = MAT_H(accQ1);
+        coopMatStore(narrowed, qkv, m0 * 32u + 16u, 32u, LROW);
+        narrowed = MAT_H(accK0);
+        coopMatStore(narrowed, qkv, 2048u + m0 * 32u, 32u, LROW);
+        narrowed = MAT_H(accK1);
+        coopMatStore(narrowed, qkv, 2048u + m0 * 32u + 16u, 32u, LROW);
+    }
+    // Q/K MCs have left scope before the original two-acc V pass.
+    {
+        MAT_C accV0 = MAT_C(float16_t(0.0));
+        MAT_C accV1 = MAT_C(float16_t(0.0));
+        for (uint ki = 0u; ki < 16u; ++ki) {
+            uint k0 = ki * 16u;
+            MAT_A a; coopMatLoad(a, gY, (w * 64u + m0) * 256u + k0, 256u, LROW);
+            MAT_B b0; coopMatLoad(b0, pack, wq + (96u * h + 64u) * 256u + k0, 256u, LCOL);
+            MAT_B b1; coopMatLoad(b1, pack, wq + (96u * h + 80u) * 256u + k0, 256u, LCOL);
+            accV0 = coopMatMulAdd(a, b0, accV0);
+            accV1 = coopMatMulAdd(a, b1, accV1);
+        }
+        MAT_H narrowed = MAT_H(accV0);
+        coopMatStore(narrowed, qkv, 4096u + m0 * 32u, 32u, LROW);
+        narrowed = MAT_H(accV1);
+        coopMatStore(narrowed, qkv, 4096u + m0 * 32u + 16u, 32u, LROW);
+    }
+    barrier();
+
+    // Existing full-WG barrier makes the raw QKV slab visible. Debug is
+    // single-window only: existing debug addresses have no window dimension.
+    if (debug) {
+        for (uint e = t_local; e < 2048u; e += 256u) {
+            uint dst = (e / 32u) * 256u + 32u * h + e % 32u;
+            dbg[180224u + dst] = qkv[e];
+            dbg[196608u + dst] = qkv[2048u + e];
+            dbg[212992u + dst] = qkv[4096u + e];
+        }
+    }
+
+    // ---- V absmax for the int8 scale: 256 threads x 8 elements cover all 2048 ----
+    // Runs in the existing norm phase, after the existing post-QKV barrier (so every
+    // V element is final) and before the existing post-norm barrier (which publishes
+    // shVMax to the quantising pass).  |V| bit patterns order like the floats.
+    for (uint e = t_local; e < 2048u; e += 256u)
+        atomicMax(shVMax, floatBitsToUint(abs(float(qkv[4096u + e]))));
+
+    // ---- norm: one owner thread per token computes nq/nk (S4 half tree) ----
+    if (t_local < 64u) {
+        uint t = t_local;
+        float qrow[32], krow[32];
+        for (uint c = 0u; c < 32u; ++c) {
+            qrow[c] = float(qkv[0u + (t * 32u + c)]);
+            krow[c] = float(qkv[2048u + (t * 32u + c)]);
+        }
+        float sq = c256_norm_sum32(qrow);
+        float sk = c256_norm_sum32(krow);
+        float eps = float(float16_t(0.000062));
+        shNorm[t]        = float16_t(inversesqrt(max(sq, eps)));  // inf -> 0
+        shNorm[64u + t]  = float16_t(inversesqrt(max(sk, eps)));
+    }
+    barrier();
+
+    // ---- scale: Q = H(H(Q0*nq)*H(scalar[h])); K = H(K0*nk); in place ----
+    // V is never scaled; the same pass now also quantises V to int8 (stride-1 copy:
+    // shV8[k] and qkv[4096u+k] address the same key*32+dim element).  Both the absmax
+    // and this pass are published by barriers that already existed.
+    const float vmax = uintBitsToFloat(shVMax);
+    const float sV = (vmax > 0.0) ? (vmax * (1.0 / 127.0)) : 1.0;   // dequant per head
+    const float sVinv = (vmax > 0.0) ? (127.0 / vmax) : 0.0;        // quantise per head
+    float16_t sh = float16_t(auxf[uint(pc.p5.x) + h]);
+    for (uint e = t_local; e < 2048u; e += 256u) {
+        uint t = e / 32u, d = e % 32u;
+        qkv[0u + (t * 32u + d)] = float16_t(float16_t(qkv[0u + (t * 32u + d)] * shNorm[t]) * sh);
+        qkv[2048u + (t * 32u + d)] = float16_t(qkv[2048u + (t * 32u + d)]
+                                     * float16_t(shNorm[64u + t]));
+        shV8[e] = int8_t(i8code(qkv[4096u + e], sVinv));
+    }
+    if (debug) {
+        barrier();
+        for (uint e = t_local; e < 2048u; e += 256u) {
+            uint t = e / 32u, d = e % 32u;
+            dbg[229376u + t * 256u + 32u * h + d] = qkv[0u + (e)];   // Q debug
+            dbg[245760u + t * 256u + 32u * h + d] = qkv[2048u + (e)];   // K debug
+        }
+    }
+    barrier();
+
+    // ---- score 64×64×32: Nc=4, Np=2; A=Q rows, B=K^T column-major ----
+    for (uint j = 0u; j < 2u; ++j) {
+        uint m0 = (sg / 2u + 4u * j) * 8u;
+        uint n0 = (sg % 2u) * 32u;
+        MAT_C acc0 = MAT_C(float16_t(0.0));
+        MAT_C acc1 = MAT_C(float16_t(0.0));
+        for (uint ki = 0u; ki < 2u; ++ki) {
+            uint k0 = ki * 16u;
+            MAT_A a;  coopMatLoad(a, qkv, 0u + (m0 * 32u + k0), 32u, LROW);
+            MAT_B b0; coopMatLoad(b0, qkv, 2048u + (n0 * 32u + k0), 32u, LCOL);
+            MAT_B b1; coopMatLoad(b1, qkv, 2048u + ((n0 + 16u) * 32u + k0), 32u, LCOL);
+            acc0 = coopMatMulAdd(a, b0, acc0);
+            acc1 = coopMatMulAdd(a, b1, acc1);
+        }
+        // Raw L diagnostic: component-store to dbgf, no shared bridge (T2).
+        if (debug) {
+            uint col = n0 + (lane & 15u);
+            uint row0 = m0 + (lane >> 4u);
+            for (int ci = 0; ci < acc0.length(); ++ci)
+                dbgf[131072u + h * 4096u + (row0 + 2u * uint(ci)) * 64u + col] = acc0[ci];
+        }
+        {
+            MAT_C bias;
+            coopMatLoad(bias, auxf, uint(pc.p4.w) + uint(h) * 4096u + m0 * 64u + n0, 64u, LROW);
+            for (int ci = 0; ci < acc0.length(); ++ci) {
+                precise float biased = acc0[ci] + bias[ci];
+                acc0[ci] = biased;
+            }
+            MAT_H values = MAT_H(acc0);
+            if (debug)
+                coopMatStore(values, dbg, 327680u + h * 4096u + m0 * 64u + n0, 64u, LROW);
+            for (int ci = 0; ci < values.length(); ++ci)
+                values[ci] = c256_exp_h(values[ci]);
+            coopMatStore(values, shP, m0 * 64u + n0, 64u, LROW);
+            if (debug)
+                coopMatStore(values, dbg, 360448u + h * 4096u + m0 * 64u + n0, 64u, LROW);
+        }
+        // Raw L diagnostic: component-store to dbgf, no shared bridge (T2).
+        if (debug) {
+            uint col = n0 + 16u + (lane & 15u);
+            uint row0 = m0 + (lane >> 4u);
+            for (int ci = 0; ci < acc1.length(); ++ci)
+                dbgf[131072u + h * 4096u + (row0 + 2u * uint(ci)) * 64u + col] = acc1[ci];
+        }
+        {
+            MAT_C bias;
+            coopMatLoad(bias, auxf, uint(pc.p4.w) + uint(h) * 4096u + m0 * 64u + n0 + 16u, 64u, LROW);
+            for (int ci = 0; ci < acc1.length(); ++ci) {
+                precise float biased = acc1[ci] + bias[ci];
+                acc1[ci] = biased;
+            }
+            MAT_H values = MAT_H(acc1);
+            if (debug)
+                coopMatStore(values, dbg, 327680u + h * 4096u + m0 * 64u + n0 + 16u, 64u, LROW);
+            for (int ci = 0; ci < values.length(); ++ci)
+                values[ci] = c256_exp_h(values[ci]);
+            coopMatStore(values, shP, m0 * 64u + n0 + 16u, 64u, LROW);
+            if (debug)
+                coopMatStore(values, dbg, 360448u + h * 4096u + m0 * 64u + n0 + 16u, 64u, LROW);
+        }
+    }
+    barrier();
+
+    // ---- probability reduction: one owner per query row, balanced tree ----
+    // The owner already visits all 64 keys of its row, so the per-query P maximum
+    // for the int8 scale is free: same loads, one extra max op per pair.
+    if (t_local < 64u) {
+        uint t = t_local;
+        float16_t part[8];
+        float16_t pmx = float16_t(0.0);
+        for (uint c = 0u; c < 8u; ++c) {
+            float16_t a = float16_t(0.0);
+            for (uint j = 0u; j < 4u; ++j) {
+                float16_t v0 = shP[t * 64u + 16u * j + c];
+                float16_t v1 = shP[t * 64u + 16u * j + c + 8u];
+                a = float16_t(a + (v0 + v1));
+                pmx = max(pmx, max(v0, v1));
+            }
+            part[c] = a;
+        }
+        float16_t even = (part[0] + part[2]) + (part[4] + part[6]);
+        float16_t odd  = (part[1] + part[3]) + (part[5] + part[7]);
+        float16_t s = even + odd;
+        float16_t inv = float16_t(1.0 / max(float(s), 6.103515625e-05));
+        shNorm[128u + t] = inv;
+        // The row's int8 P scale is the row max of the *rounded* half P.  half() is
+        // monotone, so max_i half(P_i*inv) == half(pmx*inv) and the coded maximum is
+        // exactly 127: the clamp never removes information.
+        float16_t pmxq = float16_t(pmx * inv);
+        shPS[t] = (pmxq > float16_t(0.0)) ? (float(pmxq) * (1.0 / 127.0)) : 0.0;
+        shPM[t] = (pmxq > float16_t(0.0)) ? (127.0 / float(pmxq)) : 0.0;
+    }
+    barrier();
+    for (uint e = t_local; e < 4096u; e += 256u) {
+        uint row = e / 64u;
+        float16_t hv = float16_t(shP[e] * shNorm[128u + row]);
+        shP[e] = hv;                              // parent value, unchanged
+        shP8[e] = int8_t(i8code(hv, shPM[row]));  // one quantisation, same value
+    }
+    if (debug) {
+        barrier();
+        for (uint e = t_local; e < 4096u; e += 256u)
+            dbg[393216u + h * 4096u + e] = shP[e];                    // P
+    }
+    barrier();
+
+    // ---- context 64×32×64: Nc=2, Np=1 --- 2 x M8N16K32 int8 -> int32, same tiling ----
+    {
+        uint m0 = sg * 8u;
+        CACC acc0 = CACC(0);
+        CACC acc1 = CACC(0);
+        for (uint ki = 0u; ki < 2u; ++ki) {
+            // slice ki = keys 32ki..32ki+31 (parent's K16 j = 2ki, 2ki+1).  Both slices
+            // feed the SAME int32 fragments and share shPS[row] and sV, so their partial
+            // sums are added exactly in int32: one mathematical K64 dot product.
+            CIAI a;  coopMatLoad(a, shP8, m0 * 64u + ki * 32u, 64u, LROW);
+            CIBI b0; coopMatLoad(b0, shV8, ki * 1024u + 0u, 32u, LROW);
+            CIBI b1; coopMatLoad(b1, shV8, ki * 1024u + 16u, 32u, LROW);
+            acc0 = coopMatMulAdd(a, b0, acc0);
+            acc1 = coopMatMulAdd(a, b1, acc1);
+        }
+        // One dequant per component: int32 -> float, times (sP of the query row) * sV,
+        // then the parent's single MC->MH narrowing per tile.  Measured accumulator map
+        // CH == CI: component (lane, ci) owns row (lane>>4)+2*ci, col lane&15.
+        MAT_H n0, n1;
+        for (int ci = 0; ci < n0.length(); ++ci) {
+            uint row = (lane >> 4u) + 2u * uint(ci);
+            float sc = shPS[m0 + row] * sV;
+            n0[ci] = float16_t(float(acc0[ci]) * sc);
+            n1[ci] = float16_t(float(acc1[ci]) * sc);
+        }
+        // Direct fragment store to the canonical global address (T2): the deleted
+        // shT readback wrote gT[(w*64+m0+row)*256 + 32*h + col], i.e. exactly this
+        // RowMajor stride-256 store.  No cross-SG exchange, so no barrier follows.
+        coopMatStore(n0,gT,(w*64u+m0)*256u+32u*h,256u,LROW);
+        if(debug) coopMatStore(n0,dbg,425984u+(w*64u+m0)*256u+32u*h,256u,LROW);
+        coopMatStore(n1,gT,(w*64u+m0)*256u+32u*h+16u,256u,LROW);
+        if(debug) coopMatStore(n1,dbg,425984u+(w*64u+m0)*256u+32u*h+16u,256u,LROW);
+    }
+}

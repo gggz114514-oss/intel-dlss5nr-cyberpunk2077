@@ -1,0 +1,567 @@
+#!/usr/bin/env python3
+"""Run and record the S00 acceptance tests (writes TESTS.json).
+
+Required by the S00 card:
+
+  T1  no-op patch on combo-34189 -> byte-identical output, SHA 2b5481d5..., CRLF kept
+  T2  single C64 scale-pack patch -> output passes planlib.validate, nothing else moves
+  T3  freeze identity -> matches HANDOFF-IDENTITIES.json for combo-34189 and QUALITY-24
+
+Supplementary negative controls show the conflict machinery fails closed:
+
+  N1  wrong base_sha256
+  N2  one patch carrying every conflict class (unknown name, shared target, duplicate
+      name, BIND overrun, missing file, SPV name drift, missing SPV SHA, non-basename
+      OUTPUT, duplicate/out-of-range PUSH)
+
+Run with the tool-env python::
+
+    <Q>/tool-env/Scripts/python.exe -X utf8 run_tests.py
+
+Everything is written under this card directory (out/, logs/, TESTS.json).
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List
+
+HERE = Path(__file__).resolve().parent
+PLANLIB_DIR = HERE.parent / "tools"
+sys.path.insert(0, str(PLANLIB_DIR))
+import planlib  # noqa: E402
+
+Q = Path("@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029")
+D = Q / "real-int8-24"
+C64 = D / "c64-family-static"
+C32 = D / "c32-equalized"
+HANDOFF = Q / "dsh-static-handoff" / "HANDOFF-IDENTITIES.json"
+OUT = HERE / "out"
+LOG = HERE / "logs"
+
+BASE_C64 = C64 / "combo-34189.txt"
+BASE_C32 = C32 / "combo-34189.txt"
+EXPECTED = {
+    "combo_34189_sha": "2b5481d5ce6b8ec8c1f62e68d2057b39d5267825d655e844a2ee2c5500f1c690",
+    "c32_34189_sha": "7e6b46121944f33c44f7be00e48143aae7f9255e67f2e744d6d32fef0d78139a",
+    "quality24_sha": "a2ea6f8d855c94da874953b42f95b0d3e30b53d598984056bb0c50da439c8681",
+    "b5_scale_sha": "bd57f21a38d0d183f44aa997d4c7a81021b6538ec4f62cf3d88c8a7f1c61c7a2",
+    "old_b5_scale_sha": "07c393205a518c02336c7f12591ed0c0319427e16a03e5e05b33febeafc2ba16",
+}
+FRAMES = [str(f) for f in list(range(34189, 34197)) + list(range(41444, 41452)) + list(range(43654, 43662))]
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def posix(p: Path | str) -> str:
+    return Path(p).as_posix()
+
+
+PYTHON = posix(sys.executable)
+
+
+def display(argv: List[str]) -> str:
+    return " ".join(f'"{a}"' if " " in a else a for a in argv)
+
+
+def run(argv: List[str], timeout: int = 1800) -> Dict[str, Any]:
+    start = time.time()
+    proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    return {
+        "argv": argv,
+        "command": display(argv),
+        "exit_code": proc.returncode,
+        "duration_seconds": round(time.time() - start, 3),
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }
+
+
+def assertions() -> List[Dict[str, Any]]:
+    return []
+
+
+def add(items: List[Dict[str, Any]], name: str, ok: bool, detail: Any = None) -> None:
+    items.append({"name": name, "ok": bool(ok), "detail": detail})
+
+
+def sha(path: Path) -> str:
+    return planlib.sha256_file(path)
+
+
+def test_t1(t: Dict[str, Any]) -> Dict[str, Any]:
+    a = assertions()
+    out = OUT / "test1-noop-34189.txt"
+    report = OUT / "test1-report.json"
+    for p in (out, report):
+        p.unlink(missing_ok=True)
+    r = run([PYTHON, "-X", "utf8", posix(HERE / "patch_merge.py"),
+             "--base", posix(BASE_C64), "--patch", posix(HERE / "patches" / "test1-noop.json"),
+             "--out", posix(out), "--report", posix(report)])
+    t["command"] = r["command"]
+    t["exit_code"] = r["exit_code"]
+    t["duration_seconds"] = r["duration_seconds"]
+    if r["stderr"].strip():
+        t["stderr"] = r["stderr"][:4000]
+    rep = json.loads(report.read_text(encoding="utf-8")) if report.is_file() else {}
+    base_bytes = BASE_C64.read_bytes()
+    add(a, "exit_code == 0", r["exit_code"] == 0, r["exit_code"])
+    add(a, "output file exists", out.is_file(), posix(out))
+    out_bytes = out.read_bytes() if out.is_file() else b""
+    add(a, "output is byte-identical to base", out_bytes == base_bytes,
+        {"out_bytes": len(out_bytes), "base_bytes": len(base_bytes)})
+    out_sha = hashlib.sha256(out_bytes).hexdigest() if out_bytes else None
+    add(a, "output SHA256 == 2b5481d5...", out_sha == EXPECTED["combo_34189_sha"], out_sha)
+    add(a, "CRLF line endings preserved",
+        out_bytes.count(b"\r\n") == base_bytes.count(b"\r\n") == out_bytes.count(b"\n"),
+        {"crlf": out_bytes.count(b"\r\n"), "lf": out_bytes.count(b"\n")})
+    add(a, "report ok=true", rep.get("ok") is True, rep.get("ok"))
+    add(a, "report changed_lines == 0", rep.get("out", {}).get("changed_lines") == 0,
+        rep.get("out", {}).get("changed_lines"))
+    add(a, "report byte_identical_to_base", rep.get("out", {}).get("byte_identical_to_base") is True, None)
+    add(a, "report base_sha256 matches expected", rep.get("base", {}).get("sha256") == EXPECTED["combo_34189_sha"], None)
+    add(a, "report planlib_validate == ok", rep.get("verified", {}).get("planlib_validate") == "ok", None)
+    t["assertions"] = a
+    t["pass"] = all(x["ok"] for x in a)
+    t["artifacts"] = {"out": posix(out), "report": posix(report), "out_sha256": out_sha}
+    return t
+
+
+def test_t2(t: Dict[str, Any]) -> Dict[str, Any]:
+    a = assertions()
+    out = OUT / "test2-b5-scale-34189.txt"
+    report = OUT / "test2-report.json"
+    for p in (out, report):
+        p.unlink(missing_ok=True)
+    r = run([PYTHON, "-X", "utf8", posix(HERE / "patch_merge.py"),
+             "--base", posix(BASE_C32), "--patch", posix(HERE / "patches" / "test2-c64-b5-scale.json"),
+             "--out", posix(out), "--report", posix(report)])
+    t["command"] = r["command"]
+    t["exit_code"] = r["exit_code"]
+    t["duration_seconds"] = r["duration_seconds"]
+    if r["stderr"].strip():
+        t["stderr"] = r["stderr"][:4000]
+    rep = json.loads(report.read_text(encoding="utf-8")) if report.is_file() else {}
+    add(a, "exit_code == 0", r["exit_code"] == 0, r["exit_code"])
+    add(a, "output file exists", out.is_file(), posix(out))
+    problems: List[str] = []
+    if out.is_file():
+        try:
+            cand = planlib.Plan(out)
+            problems = cand.validate()
+            base = planlib.Plan(BASE_C32)
+        except Exception as exc:  # noqa: BLE001 - recorded as a failed assertion
+            problems = [f"parse failed: {exc}"]
+            cand = base = None
+    else:
+        cand = base = None
+    add(a, "output passes planlib.validate", problems == [], problems)
+    if cand is not None and base is not None:
+        b5 = cand.buffers_by_name["c64_b5_scales"]
+        add(a, "c64_b5_scales bytes == 2368", b5.bytes == 2368, b5.bytes)
+        add(a, "c64_b5_scales file == new C64 pack", b5.file == posix(C64 / "b5-scales.bin"), b5.file)
+        add(a, "c64_b5_scales file SHA == bd57f21a...",
+            sha(Path(b5.file)) == EXPECTED["b5_scale_sha"], sha(Path(b5.file)))
+        bind_ok = True
+        bind_detail = []
+        for ordinal in (6, 7, 8):
+            p = cand.passes[ordinal]
+            binds = [x for x in p.binds if x.buffer == b5.index]
+            ok = len(binds) == 1 and binds[0].bytes == 2368 and binds[0].offset == 0
+            bind_ok &= ok
+            bind_detail.append({"ordinal": ordinal, "dispatch": p.name, "ok": ok,
+                                "binds": [[x.binding, x.offset, x.bytes] for x in binds]})
+        add(a, "BIND 1 for c64_b5_scales followed the resize at dispatches 6/7/8", bind_ok, bind_detail)
+        others = ["c64_b6_scales", "c64_b7_scales", "c64_b8_scales",
+                  "c64_b62_scales", "c64_b63_scales", "c64_b64_scales", "c64_b65_scales"]
+        untouched = []
+        for name in others:
+            before, after = base.buffers_by_name[name], cand.buffers_by_name[name]
+            untouched.append({"buffer": name, "bytes_before": before.bytes, "bytes_after": after.bytes,
+                              "file_same": before.file == after.file,
+                              "ok": before.bytes == after.bytes == 1856 and before.file == after.file})
+        add(a, "the other seven C64 scale packs untouched (1856 B, same file)", all(x["ok"] for x in untouched), untouched)
+        weights = [n for n in cand.buffers_by_name if "c64_b" in n and n.endswith("_weights")]
+        w_ok = all((cand.buffers_by_name[n].file, cand.buffers_by_name[n].bytes) ==
+                   (base.buffers_by_name[n].file, base.buffers_by_name[n].bytes) for n in weights)
+        add(a, f"all {len(weights)} C64 weight packs untouched", w_ok, None)
+        changed = [(x.name, x.bytes, x.file) for x in cand.buffers
+                   if (x.bytes, x.file) != (base.buffers_by_name[x.name].bytes, base.buffers_by_name[x.name].file)]
+        add(a, "exactly one BUFFER changed", len(changed) == 1, changed)
+        push_same = all(cand.passes[k].push == base.passes[k].push for k in range(len(base.passes)))
+        add(a, "all 288 PUSH lines unchanged", push_same and len(cand.passes) == len(base.passes), len(cand.passes))
+        add(a, "OUTPUT identity unchanged", cand.outputs[:1] == base.outputs[:1], cand.outputs)
+        cap_before = sorted((b.name, b.file) for b in base.buffers if b.file != "-" and "/dataset/" in b.file)
+        cap_after = sorted((b.name, b.file) for b in cand.buffers if b.file != "-" and "/dataset/" in b.file)
+        add(a, "capture input bindings unchanged", cap_before == cap_after, cap_before)
+        add(a, "report changed_lines == 4 (1 BUFFER + 3 BIND)", rep.get("out", {}).get("changed_lines") == 4,
+            rep.get("out", {}).get("changed_lines"))
+        add(a, "report only_planned_lines_changed", rep.get("verified", {}).get("only_planned_lines_changed") is True, None)
+        add(a, "report new file SHA recorded", rep.get("new_file_sha256", {}).get(posix(C64 / "b5-scales.bin")) == EXPECTED["b5_scale_sha"],
+            rep.get("new_file_sha256"))
+    t["assertions"] = a
+    t["pass"] = all(x["ok"] for x in a)
+    t["artifacts"] = {"out": posix(out), "report": posix(report),
+                      "out_sha256": sha(out) if out.is_file() else None}
+    return t
+
+
+def projection(freeze: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "plans": [(p["frame"], p["sha256"], p["resource_digest"], p["spv_digest"]) for p in freeze["plans"]],
+        "quality": {k: v["sha256"] for k, v in freeze["quality"].items()},
+        "files": {k: v["sha256"] for k, v in freeze["files"].items()},
+        "spvs": {k: v["sha256"] for k, v in freeze["spvs"].items()},
+        "buffer_layout": freeze["buffer_layout"],
+        "capture_input_buffers": freeze["summary"]["capture_input_buffers"],
+    }
+
+
+def test_t3(t: Dict[str, Any]) -> Dict[str, Any]:
+    a = assertions()
+    delivered = json.loads((HERE / "CANDIDATE-FREEZE.json").read_text(encoding="utf-8"))
+    regen = OUT / "T3-CANDIDATE-FREEZE.json"
+    regen.unlink(missing_ok=True)
+    r1 = run([PYTHON, "-X", "utf8", posix(HERE / "freeze_candidates.py"), "--out", posix(regen)])
+    r2 = run([PYTHON, "-X", "utf8", posix(HERE / "freeze_candidates.py"), "--verify", posix(HERE / "CANDIDATE-FREEZE.json")])
+    t["command"] = [r1["command"], r2["command"]]
+    t["exit_code"] = [r1["exit_code"], r2["exit_code"]]
+    t["duration_seconds"] = round(r1["duration_seconds"] + r2["duration_seconds"], 3)
+    if r1["stderr"].strip():
+        t["stderr"] = r1["stderr"][:4000]
+    fresh = json.loads(regen.read_text(encoding="utf-8")) if regen.is_file() else {}
+    verify = json.loads(r2["stdout"]) if r2["stdout"].strip().startswith("{") else {}
+    ho = json.loads(HANDOFF.read_text(encoding="utf-8"))
+    ho_files = {Path(k).as_posix(): v for k, v in ho["files"].items()}
+    add(a, "delivered freeze ok=true", delivered.get("ok") is True, delivered.get("failures"))
+    add(a, "24 plans frozen", len(delivered.get("plans", [])) == 24, len(delivered.get("plans", [])))
+    add(a, "frame set == 24 formal frames", [p["frame"] for p in delivered.get("plans", [])] == FRAMES,
+        [p["frame"] for p in delivered.get("plans", [])])
+    plan34189 = next(p for p in delivered["plans"] if p["frame"] == "34189")
+    add(a, "combo-34189 SHA == 2b5481d5...", plan34189["sha256"] == EXPECTED["combo_34189_sha"], plan34189["sha256"])
+    add(a, "combo-34189 SHA == HANDOFF-IDENTITIES record",
+        plan34189["sha256"] == ho_files[posix(BASE_C64)], ho_files[posix(BASE_C64)])
+    quality_sha = delivered["quality"]["QUALITY-24.json"]["sha256"]
+    add(a, "QUALITY-24.json SHA == a2ea6f8d...", quality_sha == EXPECTED["quality24_sha"], quality_sha)
+    add(a, "QUALITY-24.json SHA == HANDOFF-IDENTITIES record",
+        quality_sha == ho_files[posix(C64 / "QUALITY-24.json")], ho_files[posix(C64 / "QUALITY-24.json")])
+    add(a, "HANDOFF check: 66 entries, 0 required mismatch",
+        len(delivered["handoff"]["checked"]) == 66 and not delivered["handoff"]["required_mismatch"],
+        {"checked": len(delivered["handoff"]["checked"]),
+         "required_mismatch": delivered["handoff"]["required_mismatch"]})
+    add(a, "all 535 referenced files present",
+        delivered["summary"]["missing_files"] == 0 and delivered["summary"]["unique_files"] == 535,
+        delivered["summary"])
+    add(a, "all 60 SPVs present", delivered["summary"]["missing_spvs"] == 0 and delivered["summary"]["unique_spvs"] == 60,
+        {"unique_spvs": delivered["summary"]["unique_spvs"], "missing": delivered["summary"]["missing_spvs"]})
+    add(a, "capture inputs recorded", delivered["summary"]["capture_input_buffers"] ==
+        ["ioport_0_ioport_images", "ioport_70_ioport_images"], delivered["summary"]["capture_input_buffers"])
+    add(a, "every plan records its capture bindings",
+        all(len(p["capture_inputs"]) == 2 and len(p["capture_bindings"]) == 2 for p in delivered["plans"]), None)
+    add(a, "regenerated freeze reproduces the delivered identity",
+        bool(fresh) and projection(fresh) == projection(delivered), None if fresh else "regeneration failed")
+    add(a, "freeze --verify ok (no missing/changed resource)",
+        verify.get("ok") is True and r2["exit_code"] == 0, verify.get("summary"))
+    add(a, "freeze --verify exit_code == 0", r2["exit_code"] == 0, r2["exit_code"])
+    t["assertions"] = a
+    t["pass"] = all(x["ok"] for x in a)
+    t["artifacts"] = {"delivered": posix(HERE / "CANDIDATE-FREEZE.json"), "regenerated": posix(regen)}
+    return t
+
+
+def negative(t: Dict[str, Any], patch_name: str, out_name: str, expected_codes: List[str],
+             expect_min_conflicts: int = 1) -> Dict[str, Any]:
+    a = assertions()
+    out = OUT / out_name
+    report = OUT / f"{out_name}.report.json"
+    for p in (out, report):
+        p.unlink(missing_ok=True)
+    r = run([PYTHON, "-X", "utf8", posix(HERE / "patch_merge.py"),
+             "--base", posix(BASE_C64), "--patch", posix(HERE / "patches" / patch_name),
+             "--out", posix(out), "--report", posix(report)])
+    t["command"] = r["command"]
+    t["exit_code"] = r["exit_code"]
+    t["duration_seconds"] = r["duration_seconds"]
+    rep = json.loads(report.read_text(encoding="utf-8")) if report.is_file() else {}
+    codes = [c["code"] for c in rep.get("conflicts", [])]
+    add(a, "exit_code == 3 (conflict reported, fail closed)", r["exit_code"] == 3, r["exit_code"])
+    add(a, "ok=false", rep.get("ok") is False, rep.get("ok"))
+    add(a, "no output plan written", not out.exists(), posix(out))
+    add(a, "conflict_count >= %d" % expect_min_conflicts, rep.get("conflict_count", 0) >= expect_min_conflicts,
+        rep.get("conflict_count"))
+    missing = [c for c in expected_codes if c not in codes]
+    add(a, "expected conflict codes present", not missing, {"missing": missing, "reported": codes})
+    t["assertions"] = a
+    t["pass"] = all(x["ok"] for x in a)
+    t["artifacts"] = {"report": posix(report), "conflict_codes": codes}
+    return t
+
+
+def test_t4(t: Dict[str, Any]) -> Dict[str, Any]:
+    """Supplementary: MODEL-DIFF.json is reproducible and strictly capture-free."""
+    a = assertions()
+    delivered = json.loads((HERE / "MODEL-DIFF.json").read_text(encoding="utf-8"))
+    regen = OUT / "T4-MODEL-DIFF.json"
+    regen.unlink(missing_ok=True)
+    r = run([PYTHON, "-X", "utf8", posix(HERE / "model_diff.py"),
+             "--base", posix(BASE_C32), "--candidate", posix(BASE_C64),
+             "--sibling", posix(C64 / "combo-41444.txt"), "--out", posix(regen)])
+    t["command"] = r["command"]
+    t["exit_code"] = r["exit_code"]
+    t["duration_seconds"] = r["duration_seconds"]
+    if r["stderr"].strip():
+        t["stderr"] = r["stderr"][:4000]
+    fresh = json.loads(regen.read_text(encoding="utf-8")) if regen.is_file() else {}
+    add(a, "exit_code == 0", r["exit_code"] == 0, r["exit_code"])
+    add(a, "base is the c32-equalized parent", delivered["base"]["sha256"] == EXPECTED["c32_34189_sha"],
+        delivered["base"]["sha256"])
+    add(a, "candidate is combo-34189", delivered["candidate"]["sha256"] == EXPECTED["combo_34189_sha"],
+        delivered["candidate"]["sha256"])
+    expected_summary = {"MODEL_WEIGHT": 8, "SCALE": 8, "SPV": 16, "BIND": 24, "PUSH": 0,
+                        "OUTPUT_PATH": 0, "INPUT_BINDING": 8, "total": 64}
+    add(a, "model summary == 8 weight / 8 scale / 16 SPV / 24 BIND / 8 INPUT_BINDING",
+        delivered["model_diff"]["summary"] == expected_summary, delivered["model_diff"]["summary"])
+    items = delivered["model_diff"]["items"]
+    allowed = {"MODEL_WEIGHT", "SCALE", "SPV", "BIND", "PUSH", "OUTPUT_PATH", "INPUT_BINDING"}
+    add(a, "every model item has an allowed category", all(i["category"] in allowed for i in items), None)
+    capture_names = {"pre.bin", "post.bin", "network-output.bin"}
+    leaks = [i for i in items for k in ("buffer", "dispatch", "file_before", "file_after")
+             if isinstance(i.get(k), str)
+             and ("/dataset/" in i[k] or Path(i[k]).name.lower() in capture_names)]
+    add(a, "no dataset path or capture basename in the model list", not leaks, leaks[:3])
+    add(a, "capture section lists 2 fixtures with no model-level difference",
+        len(delivered["capture_input"]["buffers"]) == 2 and delivered["capture_input"]["differs"] == [],
+        delivered["capture_input"]["differs"])
+    coupled = [d["ordinal"] for d in delivered["capture_input"]["coupled_dispatches"]]
+    add(a, "capture-coupled dispatches are ordinals 0 and 287", coupled == [0, 287], coupled)
+    iso = delivered["checks"]["capture_isolation"]
+    add(a, "same-family sibling diff has an empty model list", iso["ok"] and iso["model_items"] == 0,
+        iso["model_summary"])
+    add(a, "sibling capture delta includes the per-frame PUSH word",
+        any(x["kind"] == "push_word" and x.get("word") == 22 for x in iso["capture_items"]),
+        iso["capture_items"])
+    add(a, "structure/warnings empty", delivered["structure"] == [] and delivered["warnings"] == [], None)
+    add(a, "model items reproducible from the tool",
+        bool(fresh) and fresh["model_diff"] == delivered["model_diff"]
+        and [b["buffer"] for b in fresh["capture_input"]["buffers"]] ==
+            [b["buffer"] for b in delivered["capture_input"]["buffers"]], None)
+    add(a, "verdict: not deployable, quality not accepted, GPU NOT_RUN",
+        delivered["verdict"]["deployable"] is False and delivered["verdict"]["quality_accepted"] is False
+        and delivered["verdict"]["gpu_verification"] == "NOT_RUN", delivered["verdict"])
+    t["assertions"] = a
+    t["pass"] = all(x["ok"] for x in a)
+    t["artifacts"] = {"delivered": posix(HERE / "MODEL-DIFF.json"), "regenerated": posix(regen)}
+    return t
+
+
+def test_t5(t: Dict[str, Any]) -> Dict[str, Any]:
+    """Supplementary: reconstruct a real block-5 C64 delta on the parent; dry-run PUSH/OUTPUT."""
+    a = assertions()
+    out = OUT / "test5-block5-delta-34189.txt"
+    report = OUT / "test5-report.json"
+    for p in (out, report):
+        p.unlink(missing_ok=True)
+    r = run([PYTHON, "-X", "utf8", posix(HERE / "patch_merge.py"),
+             "--base", posix(BASE_C32), "--patch", posix(HERE / "patches" / "test5-block5-delta.json"),
+             "--out", posix(out), "--report", posix(report)])
+    t["command"] = r["command"]
+    t["exit_code"] = r["exit_code"]
+    t["duration_seconds"] = r["duration_seconds"]
+    if r["stderr"].strip():
+        t["stderr"] = r["stderr"][:4000]
+    rep = json.loads(report.read_text(encoding="utf-8")) if report.is_file() else {}
+    add(a, "exit_code == 0", r["exit_code"] == 0, r["exit_code"])
+    cand = planlib.Plan(out) if out.is_file() else None
+    problems = cand.validate() if cand is not None else ["output missing"]
+    add(a, "single-block delta output passes planlib.validate", problems == [], problems)
+    if cand is not None:
+        c64 = planlib.Plan(BASE_C64)
+        pairs = [("c64_b5_weights", 6, 8)]
+        b5w, b5s = cand.buffers_by_name["c64_b5_weights"], cand.buffers_by_name["c64_b5_scales"]
+        c5w, c5s = c64.buffers_by_name["c64_b5_weights"], c64.buffers_by_name["c64_b5_scales"]
+        add(a, "block-5 weights match the C64 candidate",
+            (b5w.file, b5w.bytes) == (c5w.file, c5w.bytes) and sha(Path(b5w.file)) == sha(Path(c5w.file)),
+            {"file": b5w.file, "bytes": b5w.bytes})
+        add(a, "block-5 scales match the C64 candidate",
+            (b5s.file, b5s.bytes) == (c5s.file, c5s.bytes) and sha(Path(b5s.file)) == sha(Path(c5s.file)),
+            {"file": b5s.file, "bytes": b5s.bytes})
+        add(a, "block-5 SPVs match the C64 candidate",
+            cand.passes[6].spv == c64.passes[6].spv and cand.passes[8].spv == c64.passes[8].spv,
+            {"ordinal6": cand.passes[6].spv, "ordinal8": cand.passes[8].spv})
+        add(a, "BIND 1 followed the scale resize (6/7/8)",
+            all([x for x in cand.passes[k].binds if x.buffer == b5s.index][0].bytes == 2368 for k in (6, 7, 8)), None)
+        base = planlib.Plan(BASE_C32)
+        changed = [(x.name, x.file) for x in cand.buffers
+                   if (x.bytes, x.file) != (base.buffers_by_name[x.name].bytes, base.buffers_by_name[x.name].file)]
+        add(a, "exactly 2 BUFFERs changed (block-5 weights/scales)", len(changed) == 2, changed)
+        changed_spv = [k for k in range(len(base.passes)) if base.passes[k].spv != cand.passes[k].spv]
+        add(a, "exactly 2 SPVs changed (ordinals 6 and 8)", changed_spv == [6, 8], changed_spv)
+        add(a, "report changed_lines == 7 (2 BUFFER + 3 BIND + 2 SPV)",
+            rep.get("out", {}).get("changed_lines") == 7, rep.get("out", {}).get("changed_lines"))
+        # ---- T5b: dry-run PUSH + OUTPUT on the new plan -------------------
+        patch_b = {
+            "schema": "dsh-plan-patch/1",
+            "comment": "T5b dry-run machinery only: PUSH word and OUTPUT name; nothing is written.",
+            "base_sha256": cand.sha256(),
+            "set_push": [{"ordinal": 0, "name": cand.passes[0].name, "word": 22,
+                          "value": 12345, "expect_old": int(cand.passes[0].push[22])}],
+            "output": {"index": 0, "name": "dryrun-network.bin", "expect_old": "replayed-network.bin"},
+        }
+        pb = OUT / "T5b-patch.json"
+        pb.write_text(json.dumps(patch_b, indent=2) + "\n", encoding="utf-8")
+        dry_out = OUT / "T5b-dryrun.txt"
+        dry_out.unlink(missing_ok=True)
+        rb = run([PYTHON, "-X", "utf8", posix(HERE / "patch_merge.py"),
+                  "--base", posix(out), "--patch", posix(pb), "--out", posix(dry_out), "--dry-run"])
+        rep_b = json.loads(rb["stdout"]) if rb["stdout"].strip().startswith("{") else {}
+        kinds = [c.get("kind") for c in rep_b.get("changes", [])]
+        add(a, "dry-run exit_code == 0", rb["exit_code"] == 0, rb["exit_code"])
+        add(a, "dry-run reports PUSH and OUTPUT changes",
+            "PUSH" in kinds and "OUTPUT" in kinds, kinds)
+        add(a, "dry-run writes nothing", rep_b.get("out", {}).get("written") is False and not dry_out.exists(),
+            rep_b.get("out", {}).get("written"))
+        add(a, "dry-run output SHA differs from the base plan",
+            rep_b.get("out", {}).get("sha256") not in (None, cand.sha256()),
+            rep_b.get("out", {}).get("sha256"))
+        add(a, "dry-run planlib_validate == ok", rep_b.get("verified", {}).get("planlib_validate") == "ok", None)
+    t["assertions"] = a
+    t["pass"] = all(x["ok"] for x in a)
+    t["artifacts"] = {"out": posix(out), "report": posix(report),
+                      "out_sha256": sha(out) if out.is_file() else None,
+                      "dryrun_patch": posix(OUT / "T5b-patch.json")}
+    return t
+
+
+def test_n3(t: Dict[str, Any]) -> Dict[str, Any]:
+    """Supplementary: freeze --verify must detect a changed hash, a missing file and a changed plan."""
+    import copy
+
+    a = assertions()
+    frozen = json.loads((HERE / "CANDIDATE-FREEZE.json").read_text(encoding="utf-8"))
+    delivered_sha_before = sha(HERE / "CANDIDATE-FREEZE.json")
+    tampered = copy.deepcopy(frozen)
+    victim_file = sorted(tampered["files"])[0]
+    tampered["files"][victim_file]["sha256"] = "0" * 64
+    victim_layout = sorted(tampered["buffer_layout"])[0]
+    missing_path = posix(OUT / "missing-resource.bin")
+    tampered["buffer_layout"][victim_layout]["file"] = missing_path
+    tampered["plans"][0]["sha256"] = "1" * 64
+    tampered_path = OUT / "N3-tampered-freeze.json"
+    tampered_path.write_text(json.dumps(tampered, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    r = run([PYTHON, "-X", "utf8", posix(HERE / "freeze_candidates.py"), "--verify", posix(tampered_path)])
+    t["command"] = r["command"]
+    t["exit_code"] = r["exit_code"]
+    t["duration_seconds"] = r["duration_seconds"]
+    rep = json.loads(r["stdout"]) if r["stdout"].strip().startswith("{") else {}
+    problems = rep.get("problems", {})
+    add(a, "exit_code == 2 (drift detected)", r["exit_code"] == 2, r["exit_code"])
+    add(a, "ok == false", rep.get("ok") is False, rep.get("ok"))
+    add(a, "changed file hash detected", any(x.get("path") == victim_file for x in problems.get("files_changed", [])),
+        problems.get("files_changed", [])[:2])
+    add(a, "missing resource file detected", missing_path in problems.get("files_missing", []),
+        problems.get("files_missing", [])[:2])
+    add(a, "changed plan detected", any(x.get("frame") == frozen["plans"][0]["frame"]
+                                        for x in problems.get("plans_changed", [])),
+        problems.get("plans_changed", [])[:2])
+    add(a, "delivered freeze untouched",
+        sha(HERE / "CANDIDATE-FREEZE.json") == delivered_sha_before, delivered_sha_before)
+    t["assertions"] = a
+    t["pass"] = all(x["ok"] for x in a)
+    t["artifacts"] = {"tampered_freeze": posix(tampered_path), "problems": {k: len(v) for k, v in problems.items()}}
+    return t
+
+
+def main() -> int:
+    OUT.mkdir(parents=True, exist_ok=True)
+    LOG.mkdir(parents=True, exist_ok=True)
+    tests: List[Dict[str, Any]] = []
+    t1 = {"id": "T1", "requirement": "D.1 no-op patch on combo-34189 is byte-identical, SHA 2b5481d5..., CRLF kept",
+          "purpose": "prove the merger rewrites only intended lines", "kind": "required"}
+    tests.append(test_t1(t1))
+    t2 = {"id": "T2", "requirement": "D.2 single C64 scale-pack patch produces a planlib-valid plan, nothing else moves",
+          "purpose": "prove name-addressed replacement, resize/BIND follow and same-name isolation",
+          "kind": "required"}
+    tests.append(test_t2(t2))
+    t3 = {"id": "T3", "requirement": "D.3 freeze identity matches HANDOFF-IDENTITIES.json for combo-34189 and QUALITY-24",
+          "purpose": "prove the 24-plan freeze is reproducible and matches the recorded handoff", "kind": "required"}
+    tests.append(test_t3(t3))
+    n1 = {"id": "N1", "requirement": "supplementary: wrong base_sha256 must fail closed",
+          "purpose": "prove base drift cannot be patched", "kind": "supplementary"}
+    tests.append(negative(n1, "neg-1-base-sha.json", "neg1-out.txt", ["BASE_SHA_MISMATCH"]))
+    n2 = {"id": "N2", "requirement": "supplementary: one patch with every conflict class must list them all and write nothing",
+          "purpose": "prove unknown names, shared targets, duplicates, BIND overrun, missing files, SPV drift, OUTPUT structure and PUSH range all fail explicitly",
+          "kind": "supplementary"}
+    expected = ["UNKNOWN_BUFFER", "NEW_FILE_ALREADY_OWNED", "DUPLICATE_BUFFER_EDIT", "BIND_OVERRUN_ON_RESIZE",
+                "NEW_FILE_MISSING", "SPV_NAME_MISMATCH", "SPV_NEW_SHA_REQUIRED", "OUTPUT_NOT_BASENAME",
+                "DUPLICATE_PUSH_EDIT", "PUSH_WORD_OUT_OF_RANGE"]
+    tests.append(negative(n2, "neg-2-conflicts.json", "neg2-out.txt", expected, expect_min_conflicts=10))
+    t4 = {"id": "T4", "requirement": "supplementary: MODEL-DIFF.json model list is capture-free and reproducible",
+          "purpose": "prove the production-merge model delta contains no capture input and is regenerated identically",
+          "kind": "supplementary"}
+    tests.append(test_t4(t4))
+    t5 = {"id": "T5", "requirement": "supplementary: block-level C64 delta on the parent + dry-run PUSH/OUTPUT machinery",
+          "purpose": "prove the production-merge shape (weights/scales/SPVs only) and the remaining patch fields work",
+          "kind": "supplementary"}
+    tests.append(test_t5(t5))
+    n3 = {"id": "N3", "requirement": "supplementary: freeze --verify detects changed hash / missing file / changed plan",
+          "purpose": "prove the freeze can detect resource drift, not just record it", "kind": "supplementary"}
+    tests.append(test_n3(n3))
+
+    required = [t for t in tests if t["kind"] == "required"]
+    supplementary = [t for t in tests if t["kind"] == "supplementary"]
+    result = {
+        "schema": "dsh-s00-tests/1",
+        "created": now(),
+        "title": "S00 integration acceptance: patch_merge.py / freeze_candidates.py / model_diff.py",
+        "environment": {
+            "python": sys.version.split()[0],
+            "python_executable": posix(sys.executable),
+            "cwd": posix(Path.cwd()),
+            "planlib": {"path": posix(PLANLIB_DIR / "planlib.py"), "sha256": sha(PLANLIB_DIR / "planlib.py")},
+            "inputs": {
+                "base_c64": {"path": posix(BASE_C64), "sha256": sha(BASE_C64)},
+                "base_c32": {"path": posix(BASE_C32), "sha256": sha(BASE_C32)},
+                "handoff": {"path": posix(HANDOFF), "sha256": sha(HANDOFF)},
+            },
+            "tools": {name: {"path": posix(HERE / name), "sha256": sha(HERE / name)}
+                      for name in ("patch_merge.py", "freeze_candidates.py", "model_diff.py", "run_tests.py")},
+        },
+        "required_tests": required,
+        "supplementary_tests": supplementary,
+        "summary": {
+            "required_total": len(required),
+            "required_passed": sum(1 for t in required if t["pass"]),
+            "supplementary_total": len(supplementary),
+            "supplementary_passed": sum(1 for t in supplementary if t["pass"]),
+            "failed_ids": [t["id"] for t in tests if not t["pass"]],
+            "all_required_passed": all(t["pass"] for t in required),
+            "all_passed": all(t["pass"] for t in tests),
+        },
+    }
+    hygiene_doc = json.loads(json.dumps(result))
+    for item in hygiene_doc["required_tests"] + hygiene_doc["supplementary_tests"]:
+        item.pop("stderr", None)
+        item.pop("stdout", None)
+    backslashes = json.dumps(hygiene_doc, ensure_ascii=False).count("\\")
+    result["path_hygiene"] = {
+        "backslash_occurrences_in_structured_fields": backslashes,
+        "all_paths_forward_slash": backslashes == 0,
+        "note": "every recorded path/command uses forward-slash absolute paths",
+    }
+    (HERE / "TESTS.json").write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(json.dumps({t["id"]: {"pass": t["pass"], "exit_code": t["exit_code"],
+                                "failed_assertions": [x["name"] for x in t["assertions"] if not x["ok"]]}
+                      for t in tests}, indent=2, ensure_ascii=False))
+    print(json.dumps(result["summary"], indent=2, ensure_ascii=False))
+    return 0 if result["summary"]["all_passed"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

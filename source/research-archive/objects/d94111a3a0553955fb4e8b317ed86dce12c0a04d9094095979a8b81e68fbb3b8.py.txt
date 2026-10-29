@@ -1,0 +1,337 @@
+"""Minimal SPIR-V reflection for descriptor bindings and read/write intent.
+
+Only the subset needed for PORT_NETWORK plans is implemented: decorations,
+variable/storage-class, pointer/struct/array/image types.  It is deliberately
+strict: unknown instructions are skipped by word count, so it never guesses.
+"""
+from __future__ import annotations
+
+import struct
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional
+
+MAGIC = 0x07230203
+
+# opcodes
+OP_NAME = 5
+OP_MEMBER_NAME = 6
+OP_TYPE_VOID = 19
+OP_TYPE_BOOL = 20
+OP_TYPE_INT = 21
+OP_TYPE_FLOAT = 22
+OP_TYPE_VECTOR = 23
+OP_TYPE_MATRIX = 24
+OP_TYPE_IMAGE = 25
+OP_TYPE_SAMPLER = 26
+OP_TYPE_SAMPLED_IMAGE = 27
+OP_TYPE_ARRAY = 28
+OP_TYPE_RUNTIME_ARRAY = 29
+OP_TYPE_STRUCT = 30
+OP_TYPE_POINTER = 32
+OP_CONSTANT = 43
+OP_CONSTANT_COMPOSITE = 44
+OP_VARIABLE = 59
+OP_DECORATE = 71
+OP_MEMBER_DECORATE = 72
+OP_TYPE_COOPMAT_KHR = 4456
+OP_TYPE_COOPMAT_NV = 5358
+
+# decorations
+DEC_BLOCK = 2
+DEC_BUFFER_BLOCK = 3
+DEC_NON_WRITABLE = 24
+DEC_NON_READABLE = 25
+DEC_BINDING = 33
+DEC_DESCRIPTOR_SET = 34
+
+# storage classes
+SC_UNIFORM_CONSTANT = 0
+SC_UNIFORM = 2
+SC_STORAGE_BUFFER = 12
+SC_PUSH_CONSTANT = 9
+
+
+@dataclass
+class Descriptor:
+    binding: int
+    descriptor_set: int
+    storage_class: int
+    type_id: int
+    name: str = ""
+    non_writable: bool = False
+    non_readable: bool = False
+    is_block: bool = False
+    is_buffer_block: bool = False
+    is_image: bool = False
+    is_sampler: bool = False
+    array_length: Optional[int] = None
+    struct_members: List[int] = field(default_factory=list)
+
+    @property
+    def access(self) -> str:
+        if self.is_image or self.is_sampler:
+            return "SAMPLED"
+        if self.non_writable and self.non_readable:
+            return "NONE"
+        if self.non_writable:
+            return "READ"
+        if self.non_readable:
+            return "WRITE"
+        return "READ_WRITE"
+
+    @property
+    def kind(self) -> str:
+        if self.is_sampler:
+            return "sampler"
+        if self.is_image:
+            return "image"
+        if self.storage_class == SC_UNIFORM:
+            return "ubo"
+        if self.storage_class == SC_STORAGE_BUFFER:
+            return "ssbo"
+        if self.storage_class == SC_UNIFORM_CONSTANT:
+            return "uniform_constant"
+        return f"storage_class_{self.storage_class}"
+
+
+class SPVError(RuntimeError):
+    pass
+
+
+def _iter_instructions(words: List[int]):
+    i = 5
+    n = len(words)
+    while i < n:
+        w = words[i]
+        wc = w >> 16
+        op = w & 0xFFFF
+        if wc == 0 or i + wc > n:
+            raise SPVError(f"bad instruction at word {i}: wc={wc}")
+        yield op, words[i + 1:i + wc]
+        i += wc
+
+
+def reflect(path: Path | str) -> Dict[str, object]:
+    raw = Path(path).read_bytes()
+    if len(raw) < 20 or len(raw) % 4:
+        raise SPVError(f"{path}: not a SPIR-V blob")
+    words = list(struct.unpack("<%dI" % (len(raw) // 4), raw))
+    if words[0] != MAGIC:
+        raise SPVError(f"{path}: bad magic {words[0]:#x}")
+
+    names: Dict[int, str] = {}
+    decorations: Dict[int, Dict[int, List[int]]] = {}
+    types: Dict[int, tuple] = {}
+    variables: List[tuple] = []  # (result_id, type_id, storage_class)
+    value_types: Dict[int, int] = {}
+    muladds: List[tuple] = []  # (result_type, result_id, a_id, b_id, c_id)
+
+    for op, args in _iter_instructions(words):
+        if op == OP_NAME and len(args) >= 2:
+            target = args[0]
+            s = args[1:]
+            b = b"".join(struct.pack("<I", x) for x in s)
+            names[target] = b.split(b"\0", 1)[0].decode("utf-8", "replace")
+        elif op == OP_MEMBER_NAME:
+            pass
+        elif op == OP_DECORATE and len(args) >= 2:
+            target, dec = args[0], args[1]
+            decorations.setdefault(target, {}).setdefault(dec, []).extend(args[2:])
+        elif op == OP_MEMBER_DECORATE:
+            target, member, dec = args[0], args[1], args[2]
+            decorations.setdefault(target, {}).setdefault(("m", member, dec), []).extend(args[3:])
+        elif op in (OP_TYPE_VOID, OP_TYPE_BOOL, OP_TYPE_SAMPLER):
+            types[args[0]] = (op,)
+        elif op == OP_TYPE_INT:
+            types[args[0]] = (op, args[1], args[2], args[3] if len(args) > 3 else 0)
+        elif op == OP_TYPE_FLOAT:
+            types[args[0]] = (op, args[1])
+        elif op == OP_TYPE_VECTOR:
+            types[args[0]] = (op, args[1], args[2])
+        elif op == OP_TYPE_MATRIX:
+            types[args[0]] = (op, args[1], args[2])
+        elif op == OP_TYPE_IMAGE:
+            types[args[0]] = (op, args[1], args[2], args[3], args[4], args[5], args[6], args[7] if len(args) > 7 else 0)
+        elif op == OP_TYPE_SAMPLED_IMAGE:
+            types[args[0]] = (op, args[1], args[2])
+        elif op == OP_TYPE_ARRAY:
+            types[args[0]] = (op, args[1], args[2])
+        elif op == OP_TYPE_RUNTIME_ARRAY:
+            types[args[0]] = (op, args[1])
+        elif op == OP_TYPE_STRUCT:
+            types[args[0]] = (op, tuple(args[1:]))
+        elif op == OP_TYPE_POINTER:
+            types[args[0]] = (op, args[1], args[2])
+        elif op == OP_TYPE_COOPMAT_KHR:
+            types[args[0]] = (op, args[1], args[2], args[3], args[4], args[5] if len(args) > 5 else 0)
+        elif op == OP_TYPE_COOPMAT_NV:
+            types[args[0]] = (op, args[1], args[2], args[3], args[4])
+        elif op == 4457 and len(args) >= 2:
+            # OpCooperativeMatrixLoadKHR: result type, result id, ...
+            value_types[args[1]] = args[0]
+        elif op == 4459 and len(args) >= 5:
+            # OpCooperativeMatrixMulAddKHR: result type, result id, A, B, C
+            value_types[args[1]] = args[0]
+            muladds.append((args[0], args[1], args[2], args[3], args[4]))
+        elif op == 83 and len(args) >= 2:
+            # OpCopyObject
+            value_types[args[1]] = args[0]
+        elif op == 61 and len(args) >= 2:
+            # OpLoad: result type, result id, pointer...
+            value_types[args[1]] = args[0]
+        elif op == OP_CONSTANT:
+            # OpConstant: result type, result id, value...
+            if len(args) >= 2:
+                types[args[1]] = (op, args[0], tuple(args[2:]))
+        elif op == OP_VARIABLE and len(args) >= 3:
+            variables.append((args[1], args[0], args[2]))
+
+    const_values: Dict[int, int] = {}
+    for tid, t in types.items():
+        if t[0] == OP_CONSTANT and len(t) == 3 and t[2]:
+            const_values[tid] = t[2][0]
+
+    def resolve_type(tid: int, depth: int = 0):
+        if depth > 16 or tid not in types:
+            return ("unknown", tid)
+        t = types[tid]
+        if t[0] == OP_TYPE_POINTER:
+            return resolve_type(t[2], depth + 1)
+        return t
+
+    descs: List[Descriptor] = []
+    for result_id, type_id, sc in variables:
+        if sc not in (SC_UNIFORM, SC_STORAGE_BUFFER, SC_UNIFORM_CONSTANT):
+            continue
+        d = decorations.get(result_id, {})
+        binding = d.get(DEC_BINDING)
+        if not binding:
+            continue
+        desc = Descriptor(
+            binding=binding[0],
+            descriptor_set=(d.get(DEC_DESCRIPTOR_SET) or [0])[0],
+            storage_class=sc,
+            type_id=type_id,
+            name=names.get(result_id, ""),
+            non_writable=DEC_NON_WRITABLE in d,
+            non_readable=DEC_NON_READABLE in d,
+        )
+        t = resolve_type(type_id)
+        desc.is_image = t[0] == OP_TYPE_IMAGE
+        desc.is_sampler = t[0] == OP_TYPE_SAMPLER
+        if t[0] == OP_TYPE_STRUCT:
+            desc.struct_members = list(t[1])
+            st = decorations.get(tid if tid in types else -1, {})
+            # Block/BufferBlock is normally on the struct, but tolerate it on the variable.
+            desc.is_block = DEC_BLOCK in st
+            desc.is_buffer_block = DEC_BUFFER_BLOCK in st
+        # unwrap array of struct
+        inner = t
+        if inner[0] == OP_TYPE_ARRAY:
+            length_id = inner[2]
+            desc.array_length = const_values.get(length_id)
+            inner = resolve_type(inner[1])
+            if inner[0] == OP_TYPE_STRUCT:
+                desc.struct_members = list(inner[1])
+                desc.is_block = DEC_BLOCK in decorations.get(inner[0], {})
+        if not desc.is_block:
+            # Some compilers put NonWritable on a struct member; aggregate it.
+            for mid in desc.struct_members:
+                md = decorations.get(mid, {})
+                if any((k[0] == "m" and k[2] == DEC_NON_WRITABLE) for k in md if isinstance(k, tuple)):
+                    desc.non_writable = True
+        descs.append(desc)
+
+    # duplicate binding numbers are a plan-level error; keep all for caller.
+    descs.sort(key=lambda x: (x.binding, x.descriptor_set))
+
+    def scalar_name(tid: int) -> str:
+        t = types.get(tid)
+        if not t:
+            return f"type_{tid}"
+        if t[0] == OP_TYPE_INT:
+            return f"int{t[1]}"
+        if t[0] == OP_TYPE_FLOAT:
+            return f"float{t[1]}"
+        if t[0] == OP_TYPE_BOOL:
+            return "bool"
+        if t[0] in (OP_TYPE_VECTOR, OP_TYPE_MATRIX):
+            return f"{scalar_name(t[1])}x{t[2]}"
+        if t[0] == OP_TYPE_ARRAY:
+            return f"array<{scalar_name(t[1])}>"
+        if t[0] == OP_TYPE_RUNTIME_ARRAY:
+            return f"runtime_array<{scalar_name(t[1])}>"
+        if t[0] == OP_TYPE_STRUCT:
+            return "struct"
+        if t[0] == OP_TYPE_POINTER:
+            return scalar_name(t[2])
+        return f"op_{t[0]}"
+
+    coop = []
+    for tid, t in types.items():
+        if t[0] in (OP_TYPE_COOPMAT_KHR, OP_TYPE_COOPMAT_NV):
+            if t[0] == OP_TYPE_COOPMAT_KHR:
+                comp, rows, cols, use = t[1], t[3], t[4], t[5]
+            else:
+                comp, rows, cols, use = t[1], t[3], t[4], None
+            coop.append({
+                "type_id": tid,
+                "component": scalar_name(comp),
+                "rows": const_values.get(rows, rows),
+                "cols": const_values.get(cols, cols),
+                "use": const_values.get(use, use) if use is not None else None,
+                "opcode": t[0],
+            })
+
+    def component_of(vid: int) -> Optional[str]:
+        tid = value_types.get(vid)
+        if tid is None:
+            return None
+        t = types.get(tid)
+        if t and t[0] in (OP_TYPE_COOPMAT_KHR, OP_TYPE_COOPMAT_NV):
+            return scalar_name(t[1])
+        return None
+
+    mul = []
+    for rt, rid, a, b, c in muladds:
+        mul.append({
+            "result_type": rt,
+            "a_component": component_of(a),
+            "b_component": component_of(b),
+            "acc_component": component_of(rid),
+        })
+    fp16_mul = [m for m in mul if "float16" in (m["a_component"], m["b_component"])]
+    int8_mul = [m for m in mul if "int8" in (m["a_component"], m["b_component"])]
+    # Attach resolved member scalar types to descriptors where possible.
+    return {
+        "path": str(path),
+        "descriptor_count": len(descs),
+        "descriptors": [d.__dict__ | {"access": d.access, "kind": d.kind} for d in descs],
+        "cooperative_matrix_types": coop,
+        "has_int8_coopmat": any(c["component"] == "int8" for c in coop),
+        "has_float16_coopmat": any(c["component"] in ("float16", "float16x?") for c in coop),
+        "muladd_count": len(mul),
+        "fp16_muladd_count": len(fp16_mul),
+        "int8_muladd_count": len(int8_mul),
+        "fp16_muladds": fp16_mul,
+        "scalar_types": sorted({scalar_name(tid) for tid in types}),
+    }
+
+
+if __name__ == "__main__":
+    import argparse
+    import json
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("spv", nargs="+")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+    out = [reflect(p) for p in args.spv]
+    if args.json:
+        print(json.dumps(out, indent=2))
+    else:
+        for r in out:
+            print(r["path"], r["descriptor_count"])
+            for d in r["descriptors"]:
+                print(f"  set={d['descriptor_set']} bind={d['binding']:2d} {d['kind']:8s} {d['access']:10s} name={d['name']!r}")

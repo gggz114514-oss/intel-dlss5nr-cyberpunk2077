@@ -1,0 +1,94 @@
+"""R01 F1 - closure: apply the 5 recovered code corrections and re-run the gate.
+
+Also test the half-ULP-neighbour hypothesis for each corrected position.
+"""
+import json
+import struct
+import sys
+from pathlib import Path
+
+ROOT = Path("@NR_WORKSPACE@")
+DUMP = ROOT / "run/int8-coverage-v2-20261020/C/c32-i8-diag-f1-scalex2-001/diag_f1_debug.bin"
+WEIGHTS = ROOT / "candidates/int8-coverage-v2-20261020/C/pack/c32_f1_weights.i8.bin"
+SCALES = ROOT / "candidates/int8-coverage-v2-20261020/C/c32-scale-from-x-v2/pack/c32_f1_scales.f32.bin"
+FP16 = ROOT / "candidates/amd-map-20261015/s1-integrated/candidate/packs/ioport_0_ioport_pack.fp16.bin"
+
+sys.path.insert(0, str(ROOT / "work/int8-coverage-v2-20261020/C/tools"))
+from ref_c32 import Ref, half_array, f32, h16, code  # noqa: E402
+
+dbg = half_array(DUMP)
+ref = Ref(WEIGHTS, SCALES, FP16, 17280, 8)
+FIX = {23: (19, -1), 24: (14, -1), 30: (1, -1), 46: (8, -1), 52: (6, 1)}
+
+
+def act_h(x):
+    t = max(-4.0, min(4.0, x))
+    u = h16((-0.055908203125) * abs(t) + 0.447265625)
+    v = h16(t * u + 0.89453125)
+    return h16(x * v)
+
+
+def half_bits(v):
+    return struct.unpack("<H", struct.pack("<e", v))[0]
+
+
+def bits_half(b):
+    return struct.unpack("<e", struct.pack("<H", b))[0]
+
+
+def next_half(v, up=True):
+    b = half_bits(v)
+    if v >= 0:
+        b = b + 1 if up else b - 1
+    else:
+        b = b - 1 if up else b + 1
+    return bits_half(b)
+
+
+W = [[ref.w[(f // 8) * 1024 + k * 32 + (f % 8)] for k in range(32)] for f in range(128)]
+
+e_bad = y_bad = 0
+first_e = first_y = None
+neighbour = []
+for t in range(64):
+    x = [dbg[22528 + t * 32 + c] for c in range(32)]
+    qx = [code(x[c], ref.invx) for c in range(32)]
+    if t in FIX:
+        k, d = FIX[t]
+        qx[k] += d
+        p = f32(float(x[k]) * ref.invx)
+        nb = {nm: (float(v), code(v, ref.invx)) for nm, v in
+              (("down", next_half(x[k], False)), ("up", next_half(x[k], True)))}
+        neighbour.append({"t": t, "c": k, "x": float(x[k]), "prod": p,
+                          "code_dumped_x": code(x[k], ref.invx), "code_consumed": qx[k],
+                          "half_bits": half_bits(x[k]),
+                          "neighbours": nb,
+                          "dist_to_boundary_f32": abs(abs(p) % 1.0 - 0.5),
+                          "explained_by_1ulp_neighbour":
+                              any(v[1] == qx[k] for v in nb.values())})
+    # E, exactly as the kernel's expand epilogue (dequant -> half -> act)
+    acc = [sum(W[f][kk] * qx[kk] for kk in range(32)) for f in range(128)]
+    e_ref = [act_h(h16(f32(a * ref.mult_e[f]))) for f, a in enumerate(acc)]
+    qe = [code(e_ref[f], ref.inve) for f in range(128)]
+    for f in range(128):
+        g = dbg[t * 128 + f]
+        if g != e_ref[f]:
+            e_bad += 1
+            if first_e is None:
+                first_e = {"token": t, "feature": f}
+    for o in range(32):
+        a = sum(ref.w[16384 + ((o // 8) * 4 + e // 32) * 1024 + (e % 32) * 32 + (o % 8)] * qe[e]
+                for e in range(128))
+        real = f32(f32(a * ref.mult_c[o]) + float(h16(x[o] * ref.rs[o])))
+        yv = h16(real)
+        g = dbg[8192 + t * 32 + o]
+        if g != yv:
+            y_bad += 1
+            if first_y is None:
+                first_y = {"token": t, "channel": o, "gpu": g, "ref": yv}
+
+out = {"e_neq_after_fix": e_bad, "y_neq_after_fix": y_bad,
+       "e_first": first_e, "y_first": first_y, "neighbour_test": neighbour}
+print(json.dumps({k: out[k] for k in ("e_neq_after_fix", "y_neq_after_fix", "e_first", "y_first")}, indent=1))
+print(json.dumps(neighbour, indent=1))
+Path(__file__).with_name("f1_probe8.out.json").write_text(json.dumps(out, indent=1), encoding="utf-8")

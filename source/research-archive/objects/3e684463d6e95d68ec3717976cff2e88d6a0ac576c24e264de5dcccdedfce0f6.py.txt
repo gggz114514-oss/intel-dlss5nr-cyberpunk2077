@@ -1,0 +1,124 @@
+"""SPIR-V interface / FP audit for n06-f06-output (CPU only).
+
+Emits SPV-INTERFACE.json: capabilities, extensions, entry point/execution mode,
+storage classes, decoration multiset hash, binding/push-constant layout, and the
+FP opcode set with static x loop-trip = dynamic derivation.
+"""
+import hashlib, json, sys
+from pathlib import Path
+
+CARD = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/cards/n06-f06-output')
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST
+
+FP_OPS = {129: 'OpFAdd', 131: 'OpFSub', 133: 'OpFMul', 136: 'OpFDiv',
+          140: 'OpFRem', 141: 'OpFMod', 115: 'OpFConvert', 116: 'OpQuantizeToF16',
+          111: 'OpConvertSToF', 112: 'OpConvertUToF', 109: 'OpConvertFToU',
+          110: 'OpConvertFToS'}
+INT_CF = {128: 'OpIAdd', 130: 'OpISub', 132: 'OpIMul', 134: 'OpUDiv', 135: 'OpSDiv',
+          137: 'OpUMod', 138: 'OpSRem', 139: 'OpSMod'}
+SC_NAMES = {0: 'UniformConstant', 1: 'Input', 2: 'Uniform', 3: 'Output', 4: 'Workgroup',
+            5: 'CrossWorkgroup', 6: 'Private', 7: 'Function', 8: 'Generic', 9: 'PushConstant',
+            10: 'AtomicCounter', 11: 'Image', 12: 'StorageBuffer'}
+# loop trip counts read off the source: parent j=4, candidate jp=2; both ki=8
+TRIP = {'parent-rebuild.spv': 4, 'candidate.spv': 2}
+CALLS = {'parent-rebuild.spv': 2, 'candidate.spv': 4}   # seed conversions per M-loop iteration
+
+
+def spv_str(words):
+    b = b''.join(int(w).to_bytes(4, 'little') for w in words)
+    return b.split(b'\x00')[0].decode('utf-8', 'replace')
+
+
+def analyse(path, trip):
+    m = ST.Module(path)
+    caps, exts, modes, entry = [], [], [], []
+    vars_, dec_hist = {}, {}
+    fp, ints = {}, {}
+    for op, o, _, _ in m.instructions:
+        if op == 17:
+            caps.append(o[0])
+        elif op == 10:
+            exts.append(spv_str(o))
+        elif op == 16:
+            modes.append((o[1], o[2] if len(o) > 2 else None))
+        elif op == 15:
+            entry.append(dict(execution_model=o[0], name=spv_str(o[2:])))
+        elif op == 59:
+            sc = SC_NAMES.get(o[2], str(o[2]))
+            vars_[sc] = vars_.get(sc, 0) + 1
+        elif op == 71:
+            k = 'OpDecorate:%d' % o[1]
+            dec_hist[k] = dec_hist.get(k, 0) + 1
+        elif op == 72:
+            k = 'OpMemberDecorate:%d' % o[2]
+            dec_hist[k] = dec_hist.get(k, 0) + 1
+        if op in FP_OPS:
+            fp[FP_OPS[op]] = fp.get(FP_OPS[op], 0) + 1
+        if op in INT_CF:
+            ints[INT_CF[op]] = ints.get(INT_CF[op], 0) + 1
+    dec_text = json.dumps(dec_hist, sort_keys=True)
+    return dict(path=str(path), sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+                words=len(m.words), instructions=len(m.instructions), bound=m.bound,
+                capabilities=sorted(caps), extensions=sorted(exts),
+                entry_points=entry, execution_modes=sorted(map(str, modes)),
+                storage_class_variable_counts=vars_,
+                function_variables=vars_.get('Function', 0),
+                non_function_storage_classes={k: v for k, v in vars_.items() if k != 'Function'},
+                decoration_histogram=dec_hist,
+                decoration_multiset_sha256=hashlib.sha256(dec_text.encode()).hexdigest(),
+                decoration_count=sum(dec_hist.values()),
+                fp_static=fp, fp_dynamic={k: v * trip for k, v in fp.items()},
+                int_static=ints, int_dynamic={k: v * trip for k, v in ints.items()},
+                loop_trip_calls=trip)
+
+
+def main():
+    parent = analyse(CARD / 'parent-rebuild.spv', TRIP['parent-rebuild.spv'])
+    cand = analyse(CARD / 'candidate.spv', TRIP['candidate.spv'])
+    out = dict(
+        card='n06-f06-output',
+        note='dynamic = static x loop trip count (parent j=4, candidate jp=2; K loop ki=8 is '
+             'inside both and is not unrolled in SPIR-V)',
+        parent=parent, candidate=cand,
+        equal_capabilities=parent['capabilities'] == cand['capabilities'],
+        equal_extensions=parent['extensions'] == cand['extensions'],
+        equal_entry=parent['entry_points'] == cand['entry_points'],
+        equal_execution_modes=parent['execution_modes'] == cand['execution_modes'],
+        equal_non_function_storage_classes=(parent['non_function_storage_classes']
+                                            == cand['non_function_storage_classes']),
+        function_variables=dict(parent=parent['function_variables'],
+                                candidate=cand['function_variables'],
+                                note='Function locals differ with the number of live cooperative '
+                                     'matrix values; this is not an interface change'),
+        equal_decorations=parent['decoration_multiset_sha256'] == cand['decoration_multiset_sha256'],
+        decoration_histogram=dict(parent=parent['decoration_histogram'],
+                                  candidate=cand['decoration_histogram']),
+        equal_fp_dynamic=parent['fp_dynamic'] == cand['fp_dynamic'],
+        fp_audit=dict(
+            rule='rounding points: 8 half seed*scale multiplies, 8 MAT_H->MAT_C widens and 8 '
+                 'MAT_C->MAT_H narrows in both arms; no OpFAdd/OpFSub folding, no OpQuantizeToF16',
+            scale_mul_dynamic=parent['fp_dynamic'].get('OpFMul'),
+            widen_dynamic=parent['fp_dynamic'].get('OpFConvert'),
+            narrow_dynamic=parent['fp_dynamic'].get('OpFConvert'),
+            detail='OpFConvert static 4 -> 8 = 2 widen + 2 narrow per M-loop body; dynamic '
+                   '4x4 = 16 (parent) and 8x2 = 16 (candidate)',
+        ),
+        int_audit=dict(
+            rule='integer control-flow opcode set {128,130,132,134,135,137,138,139}; K trip count '
+                 'unchanged (8); the M loop shrinks 4 -> 2 but each iteration now covers 2 M blocks',
+            parent_static=parent['int_static'], candidate_static=cand['int_static'],
+            note='module-wide static counts include the shared prologue/debug code P: '
+                 'P + Bp = 59, P + Bc = 82 for OpIAdd, so the per-iteration body grows by 23 while '
+                 'carrying twice the M blocks; per M block the address ALU is (Bp+23)/2 < Bp for '
+                 'any Bp > 23, i.e. lower per output. OpIMul/OpUDiv module-wide counts drop '
+                 '(37->28, 10->7) because one bBase per pair replaces two per-tile bases',
+        ),
+    )
+    (CARD / 'SPV-INTERFACE.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print(json.dumps({k: v for k, v in out.items() if k not in ('parent', 'candidate')}, indent=1))
+    print('parent fp', parent['fp_dynamic'], 'cand fp', cand['fp_dynamic'])
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,92 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+// vit-qkv-int8-v1: the deployed vit_qkv kernel with ONLY its GEMM converted to INT8.
+//
+//   A = qY (int8 codes written once by the contract pass at VIT_QY_OFF in binding 4),
+//   B = WQKV int8 segment of the block pack, INT32 accumulate, then a per-output-channel
+//   dequant (aq[n] = sY*sWQKV[n]) into the same MH fragment the parent built from the
+//   FP32 accumulator.  The pairRaw staging, the per-head Q/K L2 normalisation, the scale
+//   read and the QKV store are byte-for-byte the parent's code: no lane-map guess enters
+//   (both operands come from memory), no extra dispatch, no buffer change.
+layout(local_size_x=256) in;
+#include "vit_qkv_common.glsl"
+#define MH coopmat<float16_t,gl_ScopeSubgroup,8,16,gl_MatrixUseAccumulator>
+shared float16_t pairRaw[4096];
+void main() {
+    uint tid=gl_LocalInvocationID.x,sg=gl_SubgroupID,lane=gl_SubgroupInvocationID;
+    uint mA=gl_WorkGroupID.x*128u+sg*8u,mB=mA+64u,n0=gl_WorkGroupID.y*32u;
+    const uint K=1024u;
+    {
+        AC8 accA0=AC8(0),accA1=AC8(0),accB0=AC8(0),accB1=AC8(0);
+        for(uint k0=0u;k0<K;k0+=32u) {
+            MB8 b0,b1;
+            coopMatLoad(b0,w8,vit_wbase8(VIT_W8_WQKV,n0,k0,K),32u,CM);
+            coopMatLoad(b1,w8,vit_wbase8(VIT_W8_WQKV,n0+16u,k0,K),32u,CM);
+            MA8 af;
+            if(mA<pc.p0.x) {
+                coopMatLoad(af,aHidden,VIT_QY_OFF+mA*K+k0,K,RM);
+                accA0=coopMatMulAdd(af,b0,accA0);
+                accA1=coopMatMulAdd(af,b1,accA1);
+            }
+            if(mB<pc.p0.x) {
+                coopMatLoad(af,aHidden,VIT_QY_OFF+mB*K+k0,K,RM);
+                accB0=coopMatMulAdd(af,b0,accB0);
+                accB1=coopMatMulAdd(af,b1,accB1);
+            }
+        }
+        for(uint group=0u;group<2u;++group) {
+            uint m=group==0u?mA:mB,localM=sg*8u+group*64u;
+            for(uint side=0u;side<2u;++side) {
+                AC8 acc;
+                if(group==0u) {
+                    if(side==0u)acc=accA0;else acc=accA1;
+                } else {
+                    if(side==0u)acc=accB0;else acc=accB1;
+                }
+                // dequant: one multiply per component by the resident per-output-channel
+                // factor sY*sWQKV[col] (col is the global column of this lane's fragment
+                // column, identical for the lane's four components on the sealed CH map)
+                uint col=n0+side*16u+(lane&15u);
+                float aq_c=aq[col];
+                MH halfResult;
+                {
+                    MF8 f=MF8(acc);
+                    for(uint ci=0u;ci<f.length();++ci)halfResult[ci]=float16_t(f[ci]*aq_c);
+                }
+                coopMatStore(halfResult,pairRaw,localM*32u+side*16u,32u,RM);
+                if(pc.p0.w!=0u&&m<pc.p0.x)
+                    coopMatStore(halfResult,dbg,pc.p6.z+pc.p3.y+m*3072u+n0+side*16u,3072u,RM);
+            }
+        }
+    } // Matrix objects end before the original owner norm array.
+    barrier();
+    if(tid<128u&&gl_WorkGroupID.x*128u+tid<pc.p0.x) {
+        uint t=gl_WorkGroupID.x*128u+tid;
+        float16_t inv=float16_t(1.0);
+        if(n0<2048u) {
+            precise float16_t s[16];
+            for(uint d=0u;d<16u;++d) {
+                precise float16_t a=pairRaw[tid*32u+d]*pairRaw[tid*32u+d];
+                precise float16_t b=pairRaw[tid*32u+d+16u]*pairRaw[tid*32u+d+16u];
+                s[d]=a+b;
+            }
+            for(uint step=8u;step>0u;step>>=1u)
+                for(uint d=0u;d<step;++d)s[d]=s[d]+s[d+step];
+            inv=float16_t(inversesqrt(float(max(s[0],float16_t(0.000062)))));
+        }
+        float16_t scale=float16_t(scales[pc.p2.z+(n0%1024u)/32u]);
+        for(uint d=0u;d<32u;++d) {
+            precise float16_t z=pairRaw[tid*32u+d];
+            if(n0<1024u)z=z*float16_t(5.65625);
+            if(n0<2048u)z=z*inv;
+            if(n0<1024u)z=z*scale;
+            qkv[pc.p6.x+t*3072u+n0+d]=z;
+        }
+    }
+}

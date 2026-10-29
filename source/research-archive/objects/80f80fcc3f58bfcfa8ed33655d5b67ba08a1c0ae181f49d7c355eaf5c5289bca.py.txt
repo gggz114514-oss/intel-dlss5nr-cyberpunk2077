@@ -1,0 +1,65 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,struct,re
+R=Path(__file__).resolve().parent;P=R/'f2';N=R/'f2-direct';N.mkdir(exist_ok=True);B=Path('@NR_WORKSPACE@');S=B/'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1/source';sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def rd(p):return json.loads(p.read_text(encoding='utf-8-sig'))
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+s=(P/'candidate.comp').read_text(encoding='utf-8-sig')
+a=s.index('    // ---- blend:');b=s.index('void nr_body_stage()',a)
+s=s[:a]+'}\n\n'+s[b:]
+helper="""f16vec2 nr_blend_pair(uint sg2,uint slot,uint ch){
+ uint sx=slot%4u,sy=slot/4u;
+ uint px=(2u*gl_WorkGroupID.x+(sg2&1u))*4u+sx;
+ uint py=(2u*gl_WorkGroupID.y+(sg2>>1u))*4u+sy;
+ uint ct=(2u*(sg2>>1u)+(sy>>1u))*4u+2u*(sg2&1u)+(sx>>1u);
+ precise f16vec2 main_scaled=f16vec2(shK[ct*32u+ch],shK[ct*32u+ch+1u]);
+ if(pc.p5.w==1u) main_scaled=main_scaled*f16vec2(pw[pc.p5.z+pc.p5.y+ch],pw[pc.p5.z+pc.p5.y+ch+1u]);
+ const f16vec2 skip_gain=f16vec2(pw[pc.p5.z+ch],pw[pc.p5.z+ch+1u]);
+ uint sa=pc.p4.z+nrf2_io_at0(px,py,ch,pc.p6.x,32u);
+ const f16vec2 skip_input=f16vec2(sk[sa],sk[sa+1u]);
+ precise f16vec2 skip_v=skip_input*skip_gain;
+ precise f16vec2 value=main_scaled+skip_v;
+ return value;
+}
+"""
+s=s.replace('void nr_body_stage()',helper+'\nvoid nr_body_stage()')
+setup=['NRH_CH nx00,nx01,nx10,nx11;']
+seen=set()
+for t in range(2):
+ for c in range(4):
+  setup+=['{',f'uint packed=packFloat2x16(nr_blend_pair(sg,{8*t+2*c}u+(lane>>4u),2u*(lane&15u)));']
+  for f in range(2):
+   setup+=[f'{{f16vec2 v=unpackFloat2x16(subgroupShuffle(packed,16u*(lane>>4u)+{8*f}u+((lane&15u)>>1u)));nx{t}{f}[{c}]=(lane&1u)==0u?v.x:v.y;}}']
+   for l in range(32):
+    sl=16*(l>>4)+8*f+((l&15)>>1)
+    got=(8*t+2*c+(sl>>4),2*(sl&15)+(l&1))
+    assert got==(8*t+2*c+(l>>4),16*f+(l&15))
+    seen.add(got)
+  setup+=['}']
+assert len(seen)==512
+setup+=['barrier(); // Retire all projection shK readers before later K overwrites.']
+s=s.replace('NRH_CH y00=','\n'.join(setup)+'\nNRH_CH y00=',1)
+for t in range(2):
+ for f in range(2):
+  old=f'coopMatLoad(x,shV,sg*512u+{t*256+f*16}u,32u,LROW);'
+  assert old in s;s=s.replace(old,f'x=nx{t}{f};')
+s=s.replace('subgroupBarrier(); // Retire this SG blend reads before its own V overwrite.','')
+src=N/'candidate.comp';src.write_text(s,encoding='utf-8');spv=N/'candidate.spv';run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(S),src,'-o',spv]);cm=ST.Module(spv);pm=ST.Module(P/'candidate.spv');keep=set(ST.no_contraction_ids(cm))
+def regions(mod):
+ ns={ops[0]:struct.pack('<'+'I'*len(ops[1:]),*ops[1:]).split(b'\0')[0].decode() for op,ops,*_ in mod.instructions if op==5};return {ns.get(mod.instructions[r[0]][1][1],'?'):r for r in ST.function_regions(mod)}
+for name,pr in regions(pm).items():
+ cr=regions(cm).get(name)
+ if not cr or name.startswith('nr_body_stage('):continue
+ if [(pm.instructions[i][0],pm.instructions[i][3]) for i in pr]!=[(cm.instructions[i][0],cm.instructions[i][3]) for i in cr]:continue
+ keep-={ST.result_id_of(cm.instructions[i][0],cm.instructions[i][1]) for i in cr}
+ for pos in ST.decoration_pattern(pm,pr):keep.add(ST.result_id_of(cm.instructions[cr[pos]][0],cm.instructions[cr[pos]][1]))
+ST.set_no_contraction(cm,keep,spv);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv]);plan=N/'plan.txt';plan.write_text((P/'plan.txt').read_text().replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8');m=rd(P/'CANDIDATE.json');m.update(label='f2-direct',source=ident(src),spv=ident(spv),plan=ident(plan),blend_coordinates=2048,removed_slm_bytes_per_WG=8192,added_packed_shuffles_per_SG=16);runner=Path(rd(P/'LUNA-GATES.json')['identities'][0]['path']);m['cpu_check']=run([runner,'--plan',plan,'--cpu-check']);(N/'CANDIDATE.json').write_text(json.dumps(m,indent=2));(N/'run').mkdir(exist_ok=True);(N/'captures').mkdir(exist_ok=True)
+for kind in ['GATES','NATIVE','ORDINARY']:
+ task=rd(P/f'LUNA-{kind}.json');task['output_root']=str(N);task['identities']=[x if x['path']!=str(P/'candidate.spv') else m['spv'] for x in task['identities']]
+ for j in task['jobs']:
+  j['id']=j['id'].replace('f2','f2-direct');j['runner_output']=str(N/'run'/j['id']);j['argv'][j['argv'].index('--out')+1]=j['runner_output']
+  if j['candidate']!='parent':j['candidate']='candidate' if kind=='ORDINARY' else 'f2-direct';j['plan']=m['plan'];j['argv'][j['argv'].index('--plan')+1]=m['plan']['path']
+  if kind=='NATIVE':j['argv'][5]=j['id'];j['argv'][7]=str(N/'captures');j['argv'][9]=str(N/(j['id']+'.log'));j['capture_output']=str(N/'captures'/j['id'])
+ (N/f'LUNA-{kind}.json').write_text(json.dumps(task,indent=2))
+print(m['cpu_check'],m['spv'])

@@ -1,0 +1,189 @@
+"""n13b-f13-contract: cost decomposition v2 (read only, CPU only).
+
+Fixes width detection (the ISA writes the exec mask as a separate token) and
+classifies every mov(32) by its data source:
+  ret   : source register was written by a preceding send in the same function
+          -> the copy that lands a message return value into a fragment slot
+  acc   : source register is a dpas accumulator destination
+          -> the loop-carried "home" copy (join / phi landing)
+  other : anything else (epilogue result shuffles, address splats, ...)
+
+Reports per basic block and per loop body. Writes JSON next to the card only.
+"""
+import json
+import re
+import sys
+from collections import Counter, OrderedDict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+import ISA  # noqa: E402
+
+LABEL = re.compile(r'^L(\d+):\s*$')
+WIDTH = re.compile(r'\((\d+)\|')
+REG = re.compile(r'^r(\d+)(\.\d+)?')
+
+
+def raw_width(raw):
+    m = WIDTH.search(raw)
+    return int(m.group(1)) if m else 1
+
+
+def op_of(i):
+    return i['op']
+
+
+def dst_regs_of(i):
+    """(base, count) of registers written by a send/dpas/mov destination."""
+    if not i['ops']:
+        return None
+    m = REG.match(i['ops'][0])
+    if not m:
+        return None
+    base = int(m.group(1))
+    if i['op'].startswith('send'):
+        rd = 1
+        c = i['comment'] or ''
+        mm = re.search(r'rd:(\d+)', c)
+        if mm:
+            rd = int(mm.group(1))
+        return (base, rd)
+    if i['op'].startswith('dpas'):
+        return (base, 4)   # 8x16 fp32 accumulator = 4 GRF
+    if i['op'].startswith('mov'):
+        w = raw_width(i['raw'])
+        # a mov of 2 bytes per lane (hf) writes 1 GRF per 2 lanes-worth; keep 1
+        return (base, 1 if ':hf' not in i['raw'] else 1)
+    return (base, 1)
+
+
+def msg_kind(i):
+    c = i['comment'] or ''
+    if 'store.ugm' in c:
+        return 'store'
+    m = re.search(r'load\.ugm\.(d\d+[a-z0-9]*)\.', c)
+    if m:
+        return 'load.' + m.group(1)
+    if 'end of thread' in c:
+        return 'end'
+    return c or '?'
+
+
+def main(path, out_json):
+    isa = ISA.parse(path)
+    # labels -> addr
+    lab_at = {}
+    pending = []
+    for line in Path(path).read_text(encoding='utf-8-sig', errors='replace').splitlines():
+        m = LABEL.match(line.strip())
+        if m:
+            pending.append(int(m.group(1)))
+            continue
+        lm = ISA.LINE.match(line)
+        if lm and pending:
+            a = int(lm.group('addr'), 16)
+            for p in pending:
+                lab_at[p] = a
+            pending = []
+    ordered = sorted(lab_at.items(), key=lambda kv: kv[1])
+    idx = 0
+    for i in isa:
+        while idx + 1 < len(ordered) and ordered[idx + 1][1] <= i['addr']:
+            idx += 1
+        i['label'] = ordered[idx][0] if ordered and ordered[0][1] <= i['addr'] else None
+
+    # producer maps over the whole kernel
+    send_dst, dpas_dst = set(), set()
+    for i in isa:
+        d = dst_regs_of(i)
+        if not d:
+            continue
+        base, n = d
+        if i['op'].startswith('send') and 'load' in (i['comment'] or ''):
+            send_dst.update(range(base, base + n))
+        elif i['op'].startswith('dpas'):
+            dpas_dst.update(range(base, base + 4))
+
+    blocks = OrderedDict()
+    for i in isa:
+        blocks.setdefault(i['label'], []).append(i)
+
+    rows = []
+    for lab, items in blocks.items():
+        c = Counter()
+        msgs = Counter()
+        mov32_cls = Counter()
+        for i in items:
+            op = op_of(i)
+            if op.startswith('send'):
+                c['send'] += 1
+                msgs[msg_kind(i)] += 1
+            elif op.startswith('dpas'):
+                c['dpas'] += 1
+            elif op.startswith('sync'):
+                c['sync'] += 1
+            elif op.startswith('mov'):
+                w = raw_width(i['raw'])
+                c['mov%d' % w] += 1
+                if w == 32:
+                    m = REG.match(i['ops'][1]) if len(i['ops']) > 1 else None
+                    src = int(m.group(1)) if m else None
+                    if src in send_dst:
+                        mov32_cls['ret'] += 1
+                    elif src in dpas_dst:
+                        mov32_cls['acc'] += 1
+                    else:
+                        mov32_cls['other'] += 1
+            elif op.startswith('jmpi') or op.startswith('goto') or op.startswith('brd'):
+                c['jmp'] += 1
+            elif op.startswith('barrier') or op.startswith('fence'):
+                c['barrier'] += 1
+            else:
+                c[op] += 1
+        rows.append(dict(label=lab, start=lab_at.get(lab), end=items[-1]['addr'],
+                         n=len(items), mov32=c.get('mov32', 0), mov16=c.get('mov16', 0),
+                         mov8=c.get('mov8', 0), mov4=c.get('mov4', 0), mov1=c.get('mov1', 0),
+                         mov32_class=dict(mov32_cls),
+                         send=c.get('send', 0), dpas=c.get('dpas', 0),
+                         sync=c.get('sync', 0), jmp=c.get('jmp', 0),
+                         msgs=dict(msgs),
+                         int_ops=sum(v for k, v in c.items()
+                                     if k not in ('send', 'dpas', 'sync', 'jmp', 'barrier')
+                                     and not k.startswith('mov'))))
+    tot = Counter()
+    totmsg = Counter()
+    totmov = Counter()
+    for r in rows:
+        for k in ('mov32', 'mov16', 'mov8', 'mov4', 'mov1', 'send', 'dpas', 'sync', 'jmp'):
+            tot[k] += r[k]
+        for k, v in r['mov32_class'].items():
+            totmov[k] += v
+        for k, v in r['msgs'].items():
+            totmsg[k] += v
+    regs = set()
+    for i in isa:
+        for o in i['ops']:
+            for m in re.finditer(r'r(\d+)(\.|\b)', o):
+                regs.add(int(m.group(1)))
+    out = dict(path=str(path), instructions=len(isa), totals=dict(tot),
+               mov32_class=dict(totmov), messages=dict(totmsg),
+               max_reg=max(regs), blocks=rows)
+    Path(out_json).write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print('instructions %d  max_r %d' % (len(isa), max(regs)))
+    print('totals', dict(tot))
+    print('mov32 class', dict(totmov))
+    print('messages', dict(totmsg))
+    print('%7s %7s %7s %5s %5s %5s %6s %5s %5s %5s %5s  %s' % (
+        'label', 'start', 'end', 'n', 'dpas', 'send', 'sync', 'm32', 'm8', 'm1', 'jmp', 'mov32cls/msgs'))
+    for r in rows:
+        if r['n'] == 0:
+            continue
+        print('%7s %7d %7d %5d %5d %5d %6d %5d %5d %5d %5d  %s %s' % (
+            r['label'], r['start'] or 0, r['end'], r['n'], r['dpas'], r['send'],
+            r['sync'], r['mov32'], r['mov8'], r['mov1'], r['jmp'],
+            json.dumps(r['mov32_class']) if r['mov32_class'] else '',
+            json.dumps(r['msgs']) if r['msgs'] else ''))
+
+
+if __name__ == '__main__':
+    main(sys.argv[1], sys.argv[2])

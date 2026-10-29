@@ -1,0 +1,59 @@
+import pathlib,json,re,hashlib,struct,collections
+A=pathlib.Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024');O=A/'fullnet-controlled-20261025';d=json.loads((A/'MAIN-AUDITOR-FULLNET-20261025.json').read_text());mods=d['modules'];P=pathlib.Path(d['plan']['path']);ls=P.read_text().splitlines();heads=[i for i,l in enumerate(ls) if l.startswith('PASS ')];build=json.loads((O/'BUILD-RESULTS.json').read_text())
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+def counts(p):
+ w=struct.unpack('<%dI'%(p.stat().st_size//4),p.read_bytes());i=5;c=collections.Counter()
+ while i<len(w):c[w[i]&65535]+=1;i+=w[i]>>16
+ return {'mma':c[4459],'matrix_load':c[4457],'matrix_store':c[4458],'control_barrier':c[224]}
+for b in build:
+ key=b['key']; folder=O/key;new=ls[:];diff=[];wg=0
+ for order in b['orders']:
+  i=heads[order];t=re.findall(r'"[^"\n]*"|\S+',ls[i]);old=t[:];t[3]='"'+(folder/'candidate.spv').as_posix()+'"';wg+=int(t[8])*int(t[9])*int(t[10])
+  if key=='f08-group1':t[5]='10240';t[9]=str(int(t[9])*2)
+  if key=='f06-c256-direct-a':t[5]='0'
+  new[i]=' '.join(t);diff.append({'order':order,'old':old,'new':t})
+ plan=folder/'plan-candidate-232.txt';plan.write_text('\n'.join(new)+'\n',encoding='utf8');b['plan']={'path':plan.as_posix(),'sha256':sha(plan)};b['plan_diff']=diff;b['counts']={arm:counts(folder/(arm+'.spv')) for arm in ['parent','candidate']}; b['wg_sum']=wg
+ assert b['parent_reproduced']
+ assert all(ls[i]==new[i] for i in range(len(ls)) if i not in {heads[x] for x in b['orders']})
+ if key=='f08-group1':
+  # bijection old WG.y/group/SG.local -> new WG.y/SG.local, all arithmetic coordinates retained.
+  for gy in [int(x['old'][9]) for x in diff]:
+   old={(y*2+sg//4,sg%4) for y in range(gy) for sg in range(8)}
+   cand={(y,sg) for y in range(gy*2) for sg in range(4)}
+   assert old==cand
+  for stage,C in [('sr',64),('sa',256)]:
+   writer={}
+   for sg in range(4):
+    for mm in ([sg//2] if stage=='sr' else range(2)):
+     starts=[(sg%2)*32] if stage=='sr' else [sg*32,sg*32+128]
+     for n0 in starts:
+      for r in range(mm*8,mm*8+8):
+       for col in range(n0,n0+32):
+        assert (r,col) not in writer;writer[r,col]=sg
+   assert len(writer)==16*C
+  b['proof']={'group_mapping':'(old_y,old_sg)->(new_y=2*old_y+old_sg//4,new_sg=old_sg%4)','enumerated_grid_y':sorted(set(int(x['old'][9]) for x in diff)),'same_global_coordinates':True,'shared_domains_per_group':{'sr':[0,1023],'sa':[0,4095]},'both_barriers_retained':True,'peak_acc_source_tiles':4,'weight_and_input_requests_total':'unchanged at source','wg_count':[wg,2*wg],'shared_bytes_per_wg':[20480,10240],'gpu':'NOT_RUN'}
+ elif key=='f05-c256-qkv6':
+  s=(folder/'parent.comp').read_text();c=(folder/'candidate.comp').read_text()
+  for acc in ['accQ0','accQ1','accK0','accK1','accV0','accV1']:
+   a=re.findall(r'\b'+acc+r'\s*=\s*coopMatMulAdd\([^;]+;',s);z=re.findall(r'\b'+acc+r'\s*=\s*coopMatMulAdd\([^;]+;',c);assert a==z and len(a)==1
+  b['proof']={'per_acc_ki_order':'0..15 retained for all six accumulators','qk_norm_function_and_calls':'unchanged','gY_requests_per_wg_bytes':[65536,32768],'frame_gY_request_reduction_bytes':wg*32768,'acc_source_tiles':[4,6],'added_live_acc_logical_bytes_per_sg':1024,'added_logical_bytes_per_lane_average':32,'norm_interval':'V accumulators newly live across Q/K norm and stores','shared_bytes_per_wg':[12288,12288],'wg_count':[wg,wg],'gpu':'NOT_RUN'}
+ else:
+  b['proof']={'address_equivalence':'shT[m0*256+k] = gT[w*16384+m0*256+k], same half values; read-only gT in shader','seed_and_ki_order':'unchanged','global_gT_request_bytes_per_wg':[32768,262144],'slm_read_bytes_removed_per_wg':262144,'slm_store_bytes_removed_per_wg':32768,'frame_extra_global_request_bytes':wg*(262144-32768),'shared_bytes_per_wg':[32768,0],'normal_barriers_removed':1,'debug_barrier_removed':1,'acc_source_tiles':[2,2],'wg_count':[wg,wg],'gpu':'NOT_RUN'}
+ (folder/'CPU-PROOF.json').write_text(json.dumps(b,indent=2),encoding='utf8')
+ print(key,b['counts'],b['proof'])
+(O/'BUILD-RESULTS.json').write_text(json.dumps(build,indent=2),encoding='utf8')
+# Independent static per-binding access, not first-binding writer heuristic.
+passrows=[];resources=collections.defaultdict(list)
+for order,i in enumerate(heads):
+ t=re.findall(r'"[^"\n]*"|\S+',ls[i]);m=next(m for m in mods if order in m['orders']);access={x['binding']:x for x in m['spirv']['bindings']};bind=[]
+ for line in ls[i+1:i+1+int(t[6])]:
+  bt=line.split();slot,res,off,size=map(int,bt[1:]);v=access.get(slot,{'access_seen':[],'name':'unused binding'});e={'slot':slot,'resource':res,'offset':off,'bytes':size,'variable':v['name'],'static_access':v['access_seen']};bind.append(e)
+  if v['access_seen']:resources[res].append({'order':order,**e})
+ passrows.append({'plan_order':order,'name':t[2].strip('"'),'native':m['native_hash'],'spv':m['spv'],'grid':list(map(int,t[8:11])),'shared_actual':sum(x['bytes'] for x in m['spirv']['shared']),'push':ls[i+1+int(t[6])],'bindings':bind,'coverage':'independent static pointer/call provenance; debug and runtime branches conservatively included'})
+connections=[]
+for rid,accesses in resources.items():
+ orders=sorted({x['order'] for x in accesses})
+ if len(orders)<2:continue
+ wr=sorted({x['order'] for x in accesses if any('write' in a for a in x['static_access'])});rd=sorted({x['order'] for x in accesses if any('read' in a for a in x['static_access'])});connections.append({'resource':rid,'orders':orders,'possible_writers':wr,'possible_readers':rd,'classification':'read-only cross-pass resource' if not wr else 'static read/write resource; byte-range and runtime branch analysis required','bindings':accesses})
+(A/'MAIN-AUDITOR-232-CONNECTIONS-20261025.json').write_text(json.dumps({'scope':'Current SPIR-V access provenance (including function parameters), not runtime last-writer or exact byte liveness','rows':passrows,'cross_pass_resources':connections},ensure_ascii=False,indent=2),encoding='utf8')
+print('connections',len(connections),'readonly',sum(not x['possible_writers'] for x in connections))

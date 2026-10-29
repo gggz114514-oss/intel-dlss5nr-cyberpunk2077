@@ -1,0 +1,104 @@
+n10-f10-next · F10 C512 QKV/attention：kc 供料循环的 A 地址与发布/退休
+状态：BUILT / AWAITING-GPU（无 GPU 工作、无部署、未改基线 plan/指针/COMMON.py/其他卡）
+日期：2026-10-27
+
+=====================================================================
+1. 身份
+=====================================================================
+基线（只读，唯一性能起点）
+  plan  a024c3c5aa1d1432ab3f0591bf03a897880d86be2c99d6de1e1492a2a7b2befe
+  SPV   6b7d2bd95f0c08044075dd0dceefc470bffc501d0c7406525b84fe023c2a4c48
+  src   0ed11cb2bd65fdeb6219476613597e3e589738192bbe284b44081e1e14c8e64b
+        （fullnet-mechanism-transfer-20261026/f10-weight-return-separation-20261027/）
+本卡候选（全部在本目录）
+  source  candidate.comp          ff2ffde62e44e11c3a5e4eff16e45160695b602b7c19a6e86f91757241b39c71
+  spv     candidate.spv           228dee8a437dd0827c4c7bc770707e645c753d493252fdda0907283889a9eb0e
+  plan    plan.txt                f01e0cf837154e0148ad2bbb13161836a0bf29df34e1e0f7b431ac0741fe7ce1
+  parent  parent-rebuild.spv      6b7d2bd95f0c08044075dd0dceefc470bffc501d0c7406525b84fe023c2a4c48（字节复现）
+
+=====================================================================
+2. 改了什么（两个 hunk，都在 QKV kc 循环，只动整数/地址）
+=====================================================================
+H1 地址递推：tiled(t,kc+c0,512) == tiled(t,c0,512) + 1024*i（kc=64i），
+   四个 staging base 循环前算一次、每 slice +1024 half（原来每 slice 重算 4 组 tiled）。
+   穷举 1024 token × 8 slice × 64 c0 = 524288 组恒等，见 PROOF.json T2。
+H2 slice 生命周期：phase+qkv 合成一个 10240 half 的 arena（shared 仍 20480 B），
+   A slice 窗口在 [0,4096) / [4096,8192) 间交替（i 偶数→4096、奇数→0），
+   删掉每 slice 尾部 retire barrier，只保留 staging 后的 publish barrier。
+   WAR/WAW 由「同一窗口两次使用之间必有中间 slice 的 publish barrier」关闭；
+   末 slice(7, 奇) 落在 [0,4096)，故 STORE_QKV 写 handoff 区不需要额外 barrier。
+   未改：三块独立 B 返回区、每 k-step 3 次权重读、六 DPAS 顺序、任何浮点语句、
+   16 次输入读/16 次 SLM 写/2 次 A 片段读、grid、lane 活跃度。
+
+=====================================================================
+3. 已证（CPU 侧，全部可复算）
+=====================================================================
+- 父字节复现：glslang 16.5.0 -V --target-env vulkan1.3 + 站点 include 目录
+  → 与基线 SPV **逐字节相同**，无需 NoContraction 装饰迁移。
+- 候选 spv_validate_cpu：result=0，words=26265。
+- NC：父 85 个 NC id（直方图 {129:47, 133:36, 136:1, 137:1}）；按 NC opcode 序列逐位配对，
+  配对集合 == 候选自身装饰集合；multiset 相等；重发射字节不变。
+  浮点站点 87 条全部保持父 opcode + operand signature（0 处不一致）。
+- 映射：staged 4096 单元双射 + 16384 个 A 片段地址还原同一 (r,k)。
+- 计划：正好替换 16 个 F10 PASS，232 PASS 保持，逐行比对只有 16 行不同且都是 F10；
+  clock_runner --cpu-check：CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded。
+- 静态：OpControlBarrier 5→4、kc 循环体内 2→1、kc 循环体 SPIR-V 708→558 指令、
+  整模块 6446→6513 指令（+1.0%），文件 103876→105060 B。
+
+=====================================================================
+4. 未证（必须有 GPU 才能回答）
+=====================================================================
+- native 是否真的只剩 1 个 sync.bar/slice（P1）与 staging 基址是否改成 4 个 add（P2）。
+- 三块 B 返回区是否仍独立且在首 DPAS 前（P4，硬判据）。
+- scratch 是否仍为 0（停止条件 2）。
+- 整体是否更快（本卡不测；主代理串行执行）。
+- arena +0x2000 是否被 IGC 折进 SLM 地址立即数（P6）。若未折叠，+33 OpIAdd 变成实测成本。
+
+=====================================================================
+5. 分诊（无 GPU 结果前的预判 + 具名触发条件）
+=====================================================================
+预判 **D（INDISTINCT）风险最高**：本卡只删 8 个 WG barrier + 每 slice 约 24 条 kc 依赖地址指令，
+且 barrier 在多 WG 驻留时本来可能被隐藏。这只是量级预判，不是结论。
+- 若 native 看不到 P1/P2 → **A 实现未落地**（不是方法无效）。
+- 若 P4 不成立（权重 send 落到首 DPAS 后 / 返回区重叠 / 多第 4 次读）→ **B 有副作用**，直接否，修一版。
+- 若 scratch>0 → B，停止条件 2。
+- 若 P1/P2/P4 全对而 ordinary 平 → **D**，按合同成包，不写成方向禁令。
+- 数值失败（不应发生）→ E，先定位首差阶段；本卡没有动任何浮点语句。
+
+=====================================================================
+6. 下一处具体代码改动（已定，不需要再探索）
+=====================================================================
+**软件流水：把 slice i+1 的 staging 提到 slice i 的 DPAS 之前。**
+当前候选已经给了两个窗口，因此可以写成
+    stage(w0, kc=0); barrier();
+    for i in 0..7 { if (i<7) stage(w_{i+1}, kc+64); consume(w_i); barrier(); }
+即下一次输入的 16 条全局读 + 16 条 SLM 写在上一次 24 条 DPAS 之前发出，
+把全局读延迟藏进 XMX 工作里；WAR 仍由「同一窗口相邻两次使用之间有一个 barrier」关闭
+（写 w_{i+1} 在 barrier 之前、读 w_i 在 barrier 之前；w_{i+1} 的上一使用者是 slice i-1，已被 i 的 barrier 退休）。
+停止条件：scratch > 0（寄存器不够）就立刻回退，不得靠"先测再看"掩盖溢出。
+这是本卡 H2 换来的唯一新自由度，不能与 H1/H2 同时再引入其它变化。
+
+=====================================================================
+7. 执行偏差与未决项（如实记录）
+=====================================================================
+- COMMON.py 的 K.rows() 依赖 handoff 目录的 CURRENT-232-ROWS.json；本机该文件不可读
+  （`.../handoff/dsh-fullnet-20261027/` 对 pwsh 与 python 间歇报"路径不存在"，
+   但 read 工具可读 START-HERE.txt/F10-LESSON，说明是宿主侧视图问题，不是本卡权限问题）。
+  因此 plan 替换没有走 K.make_plan，而是自实现等价逻辑并加了更严的断言：
+  基线 SPV 路径必须出现 16 次、替换后仍 232 PASS、最多 16 行不同且这些行都含基线 SPV 路径。
+  cpu-check / spv_validate / 编译仍用 COMMON.py 同款工具（clock_runner、spv_validate_cpu、glslang 16.5.0）。
+- 未使用 COMMON.py 的 gate_job/native_job/... 因为该宿主视图问题尚未影响到那些常量；
+  GPU-REQUEST.json 按合同结构给出，主代理可用自己的 manifest 生成器。
+- 协议更正已遵循：gates fb2 末帧 9c3e511e…（--warm 0 --reps 2 --feedback --save-frames），
+  ordinary 末帧 2b63d4ba…（--warm 1 --reps 30 --feedback）。两者不得混用。
+- 未决：是否需要第二条消融臂（只回退 H1 或只回退 H2）。这要等 P1/P2 都落地且 overall 有正收益才值得花 GPU。
+
+=====================================================================
+8. 恢复点（下一位执行者从这里开始）
+=====================================================================
+1) 读 GPU-REQUEST.json，按 base/cand 两臂跑 gates(fixed+fb2) → native → resources → ordinary
+   （6 组交替、30 样本/臂、全留、配对 t(df=5)）。
+2) 用 NATIVE-PREDICTION.md 的 P1/P2/P4/P7 逐条判 native；P4 不过就立刻停，不看时间。
+3) 若 native 全对：写 RESULTS 四层（源码意图→native→数值/资源→整体计时），分诊 A/B/C/D。
+4) 若时间平或负：先做 §6 的软件流水下一版（同一个卡目录，新名字，不覆盖本版产物）。
+5) 本目录所有产物保留原名，不覆盖历史证据；基线 plan/指针由主代理维护，本卡未动。

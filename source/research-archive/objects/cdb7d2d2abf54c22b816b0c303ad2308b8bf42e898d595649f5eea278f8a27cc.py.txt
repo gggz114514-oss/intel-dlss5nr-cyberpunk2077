@@ -1,0 +1,58 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys
+R=Path(__file__).resolve().parent;A=R.parent;B=A.parents[1];P=R/'f20-score-owner';T=R/'f20-q-consumer-scale';N=R/'f20-q-producer-handoff';N.mkdir(exist_ok=True)
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+ return r.stdout
+s=(T/'candidate.comp').read_text(encoding='utf-8-sig')
+start=s.index('    // ============ stage 4:');end=s.index('    // ============ stage 5:')
+qkv=s[start:end]
+qkv=qkv.replace('    for (uint j = 0u; j < 3u; ++j) {','''    MAT_A score_q0,score_q1;
+    // Independent K,V projections first; Q is born last for its score consumer.
+    for (uint qstep = 0u; qstep < 3u; ++qstep) {
+        uint j=(qstep==2u)?0u:qstep+1u;''',1)
+anchor='        coopMatStore(half1, shArena, region * 2048u + m0 * 32u + 16u, 32u, LROW);'
+assert qkv.count(anchor)==1
+qkv=qkv.replace(anchor,anchor+'''
+        if(j==0u) {
+            for(int d=0;d<4;++d) {score_q0[d]=half0[d];score_q1[d]=half1[d];}
+        }''')
+tail=s[end:];old='''    MAT_A score_q0,score_q1;
+    coopMatLoad(score_q0,shArena,sg*8u*32u,32u,LROW);
+    coopMatLoad(score_q1,shArena,sg*8u*32u+16u,32u,LROW);''';assert tail.count(old)==1
+tail=tail.replace(old,'    // Q fragments are the original half QKV results, retained by the score owner.')
+candidate=s[:start]+qkv+tail
+norm=lambda x:x[x.index('    // ============ stage 5:'):x.index('    // ============ stage 5b:')]
+assert norm(candidate)==norm((P/'candidate.comp').read_text(encoding='utf-8-sig'))
+assert candidate[candidate.index('    // Den is reduced'):]==s[s.index('    // Den is reduced'):]
+seen={}
+for sg in range(8):
+ for lane in range(32):
+  for d in range(4):
+   for half in range(2):
+    coord=(8*sg+2*d+lane//16,16*half+lane%16)
+    assert coord not in seen;seen[coord]=(sg,lane,d,half)
+assert len(seen)==2048
+src=N/'candidate.comp';spv=N/'candidate.spv';src.write_text(candidate,encoding='utf-8')
+run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv])
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+pm=ST.Module(T/'candidate.spv');cm=ST.Module(spv);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[]);assert len(keep)==8
+ST.set_no_contraction(cm,set(keep),spv)
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+plan=N/'plan.txt';plan.write_text((P/'plan.txt').read_text().replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8')
+for kind in ['GATES','NATIVE']:
+ t=json.loads((P/f'LUNA-{kind}.json').read_text().replace('f20-score-owner',N.name));t['identities']=[x for x in t['identities'] if not x['path'].endswith('.spv')]+[ident(spv)]
+ for j in t['jobs']:j['plan']=ident(plan)
+ (N/f'LUNA-{kind}.json').write_text(json.dumps(t,indent=2),encoding='utf-8')
+runner=json.loads((P/'LUNA-GATES.json').read_text())['identities'][0]['path']
+proof=dict(parent=ident(P/'plan.txt'),source_parent=ident(T/'candidate.spv'),source=ident(src),spv=ident(spv),plan=ident(plan),cpu=run([runner,'--plan',plan,'--cpu-check']),NC=sorted(keep),alignment=info,
+ mapping='All2048 Q elements enumerated: output CH and score A both row=8*sg+2*d+lane/16,col=16*half+lane%16. No transpose, subgroup shuffle or cross-owner transfer for Q.',
+ producer_order='K then V then Q; three independent output matrices. Each output retains zero,K0,K16,half. No weight reread. Loop control introduces qstep selection; native must quantify.',
+ rounding='Original scalar norm source and its inherited contraction policy unchanged. Original half Q values retained, scale H(Q*n) then H(result*headscale) uses separate NoContraction. Q/K/PV/etc accumulation orders unchanged.',
+ lifecycle='Q payload16B/lane born at last QKV projection, held across original norm and K scale, then consumed by score. Desired source schedule retires K/V projection accumulators before Q; physical register placement may differ. Across norm +16B/lane fragment payload excluding compiler temporaries. During final Q conversion C pair32+Q pair16B/lane can coexist; old QKV also converts/stores half fragments. No physical GRF peak assertion.',
+ cost_per_WG=dict(raw_Q_norm_store_retained=4096,raw_Q_norm_read_retained=4096,Q_scale_read_removed=4096,Q_scale_write_removed=4096,score_Q_read_removed=4096,total_source_bytes_removed=12288,weight_read_delta=0,barrier_delta=0,shared_delta=0,threads=256),
+ scope='Partial direct producer→consumer bridge, not elimination of norm staging. All original QKV/norm/K publication barriers retained; debug Q written from scaled A fragments. Existing baseline unchanged.',
+ stop='fixed/fb2 gate failure or new scratch: no ordinary. After native review, one ordinary/resources batch only. No speculative register growth or same-identity repeats.')
+(N/'PROOF.json').write_text(json.dumps(proof,indent=2),encoding='utf-8')
+print(ident(spv))

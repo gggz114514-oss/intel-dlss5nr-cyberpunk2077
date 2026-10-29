@@ -1,0 +1,110 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,shlex,shutil,collections,re
+D=Path(__file__).resolve().parent;A=D.parent;B=A.parent.parent;R=D/'f05-kv-consumer-layout';R.mkdir(exist_ok=True);P=D/'coefficient-reuse-combined';T=D/'f05-owner-concurrency/subgroup-owner-family'
+read=lambda p:json.loads(p.read_text(encoding='utf-8-sig'));sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+def ident(p):return dict(path=str(p),sha256=sha(p))
+def save(p,x):p.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding='utf-8')
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def restore(pm,cm,out):
+ ints={128,130,132,134,135,137,138,139};allnc=set(ST.no_contraction_ids(pm));nc={ST.result_id_of(op,a) for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in allnc and op not in ints};ops={op for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in nc};pr=ST.function_regions(pm);cr=ST.function_regions(cm);assert len(pr)==len(cr);keep=[];checked=0
+ for p,c in zip(pr,cr):
+  ps=[pm.instructions[i] for i in p if pm.instructions[i][0] in ops];cs=[cm.instructions[i] for i in c if cm.instructions[i][0] in ops];assert len(ps)==len(cs)
+  for x,y in zip(ps,cs):
+   assert (x[0],x[3])==(y[0],y[3]);a=ST.result_id_of(x[0],x[1]);b=ST.result_id_of(y[0],y[1]);assert pm.operand_signature(a,3)==cm.operand_signature(b,3);checked+=1
+   if a in nc:keep.append(b)
+ assert len(keep)==len(nc);raw=set(ST.no_contraction_ids(cm));keepint=[ST.result_id_of(op,a) for op,a,_,_ in cm.instructions if op in ints and ST.result_id_of(op,a) in raw];ST.set_no_contraction(cm,keep+keepint,out);return dict(checked=checked,float_NC=len(keep),integer_NC=len(keepint))
+
+
+import struct
+def function_map(m):
+ names={}
+ for op,a,_,_ in m.instructions:
+  if op==5:names[a[0]]=struct.pack('<'+'I'*(len(a)-1),*a[1:]).split(b'\0')[0].decode().split('(')[0]
+ return {names.get(m.instructions[r[0]][1][1],str(m.instructions[r[0]][1][1])):r for r in ST.function_regions(m)}
+def restore_pair(pm,cm,out,C):
+ ints={128,130,132,134,135,137,138,139};nc=set(ST.no_contraction_ids(pm));pr=function_map(pm);cr=function_map(cm);keep=[];report=[]
+ assert set(cr)==(set(pr)-{f'c{C}_score_block'})|{f'c{C}_score_finish',f'c{C}_score_pair'}
+ for name,p in pr.items():
+  cn=f'c{C}_score_finish' if name==f'c{C}_score_block' else name;c=cr[cn]
+  ops={pm.instructions[i][0] for i in p if ST.result_id_of(pm.instructions[i][0],pm.instructions[i][1]) in nc and pm.instructions[i][0] not in ints}
+  ps=[pm.instructions[i] for i in p if pm.instructions[i][0] in ops];cs=[cm.instructions[i] for i in c if cm.instructions[i][0] in ops];assert len(ps)==len(cs),(name,len(ps),len(cs))
+  for x,y in zip(ps,cs):
+   assert (x[0],x[3])==(y[0],y[3]);a=ST.result_id_of(x[0],x[1]);b=ST.result_id_of(y[0],y[1])
+   if name!=f'c{C}_score_block':assert pm.operand_signature(a,3)==cm.operand_signature(b,3),(name,a,b)
+   if a in nc:keep.append(b)
+  report.append(dict(parent_function=name,candidate_function=cn,checked=len(ps),exception='Score acc comes from same K-ordered pair accumulation, transport path changed' if name==f'c{C}_score_block' else None))
+ expected={ST.result_id_of(op,a) for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in nc and op not in ints};assert len(keep)==len(expected)
+ raw=set(ST.no_contraction_ids(cm));ki=[ST.result_id_of(op,a) for op,a,_,_ in cm.instructions if op in ints and ST.result_id_of(op,a) in raw];ST.set_no_contraction(cm,keep+ki,out);return dict(floating_NC=len(keep),functions=report)
+scan=read(D/'CURRENT-CENSUS.json')['rows'];pt=(P/'plan.txt').read_text(encoding='utf-8');planrows=[shlex.split(l) for l in pt.splitlines() if l.startswith('PASS ')];S=R/'family';S.mkdir(exist_ok=True);text=pt;sources=[];proof=[]
+for ordinal,C,rel in [(7,64,'f05-owner-concurrency/c64-subgroup-owner/c64/candidate.comp'),(19,128,'f05-owner-concurrency/subgroup-owner-family/c128/candidate.comp')]:
+ src=Path(scan[ordinal]['source']);parent=Path(planrows[ordinal][3]);selectedsource=D/rel;assert selectedsource.with_suffix('.spv').read_bytes()==parent.read_bytes();d=S/f'c{C}';d.mkdir(exist_ok=True)
+ def compile(label,t):
+  f=d/(label+'.comp');o=d/(label+'.spv');f.write_text(t,encoding='utf-8');run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(src.parent),f,'-o',o]);return o
+ original=selectedsource.read_text(encoding='utf-8-sig');pm=ST.Module(parent);rb=compile('parent-rebuild',original);rm=ST.Module(rb);keep,info=ST.transfer_decoration_pattern_aligned(pm,rm,set());ST.set_no_contraction(rm,keep,rb);assert sha(rb)==sha(parent)
+ changed=original
+ old='2048u + (kb * 32u + ki * 16u), 32u, LROW'
+ new='2048u + (kb / 8u * 2u + ki) * 128u, 8u, LCOL'
+ assert changed.count(old)==1;changed=changed.replace(old,new)
+ m='m0q' if C==64 else 'm0'
+ for side in range(2):
+  old=f'2048u+{m}*32u'+('' if side==0 else '+16u')+',32u,LROW'
+  new=f'2048u+({m}/8u*2u+{side}u)*128u,8u,LCOL'
+  assert changed.count(old)==1;changed=changed.replace(old,new)
+ # V: use existing C256 representation token-major; PV reads its transpose by LCOL.
+ for side in range(2):
+  old='4096u + '+('' if side==0 else '16u * 64u + ')+m+', 64u, LCOL'
+  new=f'4096u + {m} * 32u'+('' if side==0 else ' + 16u')+', 32u, LROW'
+  assert changed.count(old)==1,(C,old);changed=changed.replace(old,new)
+ pattern=r'4096u \+ (0u|8u|16u|24u) \* 64u \+ (0u|16u|32u|48u), 64u, LROW'
+ changed,n=re.subn(pattern,lambda x:f'4096u + {x[2]} * 32u + {x[1]}, 32u, LCOL',changed);assert n==16,n
+ old='4096u + (e % 32u) * 64u + e / 32u';assert changed.count(old)==1;changed=changed.replace(old,'4096u + e')
+ o=compile('candidate',changed);am=restore(pm,ST.Module(o),o);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',o]);ords=[i for i,t in enumerate(planrows) if Path(t[3])==parent];text=text.replace(parent.as_posix(),o.as_posix());sources.append(dict(width=C,ordinal=ordinal,ordinals=ords,parent=ident(parent),parent_rebuilt=ident(rb),source=ident(o.with_suffix('.comp')),candidate=ident(o),arithmetic_alignment=am))
+ # Exhaustive two-head publication/consumer bijection. Q and V ranges untouched.
+ written={}
+ for sg in range(8):
+  for phase in range(2):
+   token=(sg%4)*8+phase*32
+   for side in range(2):
+    for row in range(8):
+     for col in range(16):
+      addr=(sg//4)*6144+2048+(token//8*2+side)*128+col*8+row
+      assert addr not in written
+      written[addr]=(sg//4,token+row,side*16+col)
+ assert len(written)==4096
+ for sg in range(8):
+  for kb in range(0,64,8):
+   for ki in range(2):
+    for row in range(8):
+     for col in range(16):
+      addr=(sg//4)*6144+2048+(kb//8*2+ki)*128+col*8+row
+      assert written[addr]==(sg//4,kb+row,ki*16+col)
+ # V producer token-major matches PV A(rows=dim,columns=key), LCOL stride32.
+ v={}
+ for sg in range(8):
+  for phase in range(2):
+   token=(sg%4)*8+phase*32
+   for side in range(2):
+    for row in range(8):
+     for col in range(16):
+      addr=(sg//4)*6144+4096+(token+row)*32+side*16+col
+      assert addr not in v;v[addr]=(sg//4,token+row,side*16+col)
+ assert len(v)==4096
+ for sg in range(8):
+  for key in range(0,64,16):
+   for dim in range(0,32,8):
+    for row in range(8):
+     for col in range(16):
+      addr=(sg//4)*6144+4096+(key+col)*32+dim+row
+      assert v[addr]==(sg//4,key+col,dim+row)
+ proof.append(dict(width=C,scope=ords,mapping='Also 4096 V elements token-major publication and PV transpose LCOL32 exhaustive bijection; debug logical layout repaired. 4096 two-head K elements: unique producer, consumer tile LCOL stride8 exactly matches original K(row,channel). K range [2048,4096) in each6144half head unchanged. No Q/V alias.',rounding='Only K/V integer-address/layout changes. QKV/norm/score/exp/den/PV floating instructions and NC signature checked; exact parent rebuild.',lifetime='Same8SG, sixQKVacc, one scoreacc, same barrier and shared24576B. No new fragment or cross-subgroup lifetime. Producer store may transpose; native full costs required.',work='K publish tile8x16 columnmajor contiguous128half; consumer uses same tile. Does not claim lower hardware traffic until native; reject scratch growth.'))
+plan=S/'plan.txt';plan.write_text(text,encoding='utf-8');cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check']);save(S/'BUILD.json',dict(parent=ident(P/'plan.txt'),plan=ident(plan),sources=sources,CPU=cpu));save(S/'PROOF.json',dict(rows=proof))
+(S/'run').mkdir(exist_ok=True)
+for kind in ['GATES','RESOURCES','NATIVE','ORDINARY']:
+ t=read(T/f'LUNA-{kind}.json');ex=S/(kind.lower()+'-execution');ex.mkdir(exist_ok=True);t['output_root']=str(ex);t['identities']=[v for v in t['identities'] if not v['path'].endswith('.spv')]+[x['candidate'] for x in sources]+[x['parent'] for x in sources]
+ for j in t['jobs']:
+  jp=P/'plan.txt' if kind=='ORDINARY' and j['candidate']=='parent' else plan;j['plan']=ident(jp);j['runner_output']=str(S/'run'/j['id']);ar=j['argv'];ar[ar.index('--plan')+1]=str(jp);ar[ar.index('--out')+1]=j['runner_output']
+  if kind=='NATIVE':ar[ar.index('--output_dir')+1]=str(S/'captures');ar[ar.index('--msg_file')+1]=str(S/'native.log');j['capture_output']=str(S/'captures'/ar[ar.index('--profile_dir')+1])
+ save(S/f'LUNA-{kind}.json',t)
+(S/'execute.ps1').write_text((T/'execute.ps1').read_text(encoding='utf-8').replace('LUNA-F05-SUBGROUP-OWNER-FAMILY','LUNA-F05-KVTILE').replace('F05 owner concurrency','F05 K consumer tile'),encoding='utf-8');shutil.copyfile(T/'review_timing.py',S/'review_timing.py');print(cpu)

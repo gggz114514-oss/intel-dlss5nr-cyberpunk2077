@@ -1,0 +1,97 @@
+"""Create a private diagnostic source copy. Does not install or launch anything."""
+from pathlib import Path
+import shutil
+import hashlib
+import json
+Q=Path(__file__).resolve().parent
+parent=Q.parent/'game-latest-20261028/full'
+dst=Q/'capture'
+shutil.copytree(parent/'source',dst/'source',dirs_exist_ok=True)
+p=dst/'source/vulkan/port_network_bridge_backend.cpp'
+text=p.read_text(encoding='utf-8')
+def replace(a,b):
+    global text
+    if text.count(a)!=1:raise RuntimeError('source anchor mismatch: '+a[:80])
+    text=text.replace(a,b)
+replace('    size_t pre=0,post=0,output=0;', '''    size_t pre=0,post=0,output=0;
+    Buffer capture; void* capture_map=nullptr;
+    std::filesystem::path capture_root;
+    uint32_t capture_left=0; bool capture_pending=false, capture_submitted=false;
+    uint64_t capture_frame=0,capture_epoch=0; bool capture_history=false;
+    std::vector<uint32_t> capture_push;''')
+anchor='extern "C" int nrvk_backend_frame('
+helpers=r'''
+// Diagnostic-only snapshots: mapped bytes are read only after the actual submit fence.
+static void capture_flush(NRVK_Backend* b) {
+    if(!b->capture_pending || !b->capture_submitted)return;
+    auto dir=b->capture_root/(std::to_string(b->capture_epoch)+"-"+std::to_string(b->capture_frame));
+    if(!std::filesystem::create_directory(dir))throw std::runtime_error("capture frame directory already exists");
+    const size_t ids[]={b->pre,b->post,b->output};
+    const char* names[]={"pre.bin","post.bin","network-output.bin"};
+    std::string hashes[3];VkDeviceSize offset=0;
+    for(unsigned j=0;j<3;++j){auto bytes=b->plan.buffers[ids[j]].bytes;
+        std::ofstream f(dir/names[j],std::ios::binary);f.exceptions(std::ios::badbit|std::ios::failbit);
+        f.write(static_cast<const char*>(b->capture_map)+offset,static_cast<std::streamsize>(bytes));f.close();
+        hashes[j]=sha256(dir/names[j]);offset+=bytes;
+    }
+    std::ifstream identity(std::filesystem::path(b->manifest_dir)/"capture-plan-sha256.txt");std::string plan_sha;identity>>plan_sha;
+    if(plan_sha.size()!=64)throw std::runtime_error("capture-plan-sha256.txt missing/invalid");
+    std::ofstream m(dir/"capture.json");m.exceptions(std::ios::badbit|std::ios::failbit);
+    m<<"{\n\"schema\":1,\"source_plan_sha256\":\""<<plan_sha<<"\",\n\"frame_id\":"<<b->capture_frame
+     <<",\"control_epoch\":"<<b->capture_epoch<<",\"history_active\":"<<(b->capture_history?"true":"false")
+     <<",\"noise_seed\":"<<b->capture_push[22]<<",\"first_push\":[";
+    for(size_t i=0;i<b->capture_push.size();++i){if(i)m<<',';m<<b->capture_push[i];}m<<"],\n\"buffers\":[";
+    for(unsigned j=0;j<3;++j){if(j==1)m<<',';if(j==2)m<<"],\n\"output\":";
+        m<<"{\"resource\":"<<ids[j]<<",\"file\":\""<<names[j]<<"\",\"bytes\":"<<b->plan.buffers[ids[j]].bytes<<",\"sha256\":\""<<hashes[j]<<"\"}";}
+    m<<"}\n";m.close();b->capture_pending=false;b->capture_submitted=false;
+}
+static void capture_prepare(NRVK_Backend* b) {
+    capture_flush(b); // caller already checked last_network_fence
+    auto request=std::filesystem::path(b->manifest_dir)/"capture.request";
+    if(!b->capture_left && std::filesystem::exists(request)){
+        std::ifstream f(request);std::string root;uint32_t count=0;std::getline(f,root);f>>count;f.close();
+        if(root.empty()||count==0||count>32)throw std::runtime_error("capture.request requires output directory and 1..32 frames");
+        b->capture_root=root;std::filesystem::create_directories(b->capture_root);
+        if(!b->capture_map){b->capture.bytes=b->plan.buffers[b->pre].bytes+b->plan.buffers[b->post].bytes+b->plan.buffers[b->output].bytes;
+            make_buffer(b,b->capture,VK_BUFFER_USAGE_TRANSFER_DST_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            CHECK(b->vkMapMemory(b->device,b->capture.memory,0,VK_WHOLE_SIZE,0,&b->capture_map));}
+        std::filesystem::remove(request);b->capture_left=count;
+    }
+}
+static void capture_copy(NRVK_Backend* b,VkCommandBuffer cb,bool output) {
+    barrier(b,cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkDeviceSize pre=b->plan.buffers[b->pre].bytes,post=b->plan.buffers[b->post].bytes;
+    if(output){VkBufferCopy c{0,pre+post,b->plan.buffers[b->output].bytes};b->vkCmdCopyBuffer(cb,b->plan.buffers[b->output].handle,b->capture.handle,1,&c);}
+    else {VkBufferCopy c{0,0,pre};b->vkCmdCopyBuffer(cb,b->plan.buffers[b->pre].handle,b->capture.handle,1,&c);
+        c={0,pre,post};b->vkCmdCopyBuffer(cb,b->plan.buffers[b->post].handle,b->capture.handle,1,&c);}
+    barrier(b,cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_HOST_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_HOST_READ_BIT);
+}
+'''
+replace(anchor,helpers+'\n'+anchor)
+replace('    const bool have_depth=io.images[2].image!=VK_NULL_HANDLE;', '''    try {capture_prepare(b);}catch(const std::exception& e){last_error=e.what();return -8;}
+    const bool have_depth=io.images[2].image!=VK_NULL_HANDLE;''')
+replace('    for(size_t i=0;i<b->plan.passes.size();++i){auto& pass=b->plan.passes[i];bool clearing=false;', '''    const bool capturing=b->capture_left!=0;
+    if(capturing)capture_copy(b,cb,false);
+    for(size_t i=0;i<b->plan.passes.size();++i){auto& pass=b->plan.passes[i];bool clearing=false;''')
+replace('    const Pipeline& scatter=', '''    if(capturing){capture_copy(b,cb,true);b->capture_pending=true;b->capture_submitted=false;
+        b->capture_frame=io.frame_id;b->capture_epoch=io.control_epoch;b->capture_history=history;
+        b->capture_push=b->plan.passes.front().push;b->capture_push[22]=io.noise_seed;b->capture_push[23]&=~4u;--b->capture_left;}
+    const Pipeline& scatter=''')
+replace('    b->record_pending=false;\n    if(result==VK_SUCCESS)', '''    b->record_pending=false;
+    if(b->capture_pending){b->capture_submitted=result==VK_SUCCESS;if(result!=VK_SUCCESS)b->capture_pending=false;}
+    if(result==VK_SUCCESS)''')
+replace('    if(b->descriptors)b->vkDestroyDescriptorPool', '''    try{capture_flush(b);}catch(const std::exception& e){last_error=e.what();}
+    if(b->capture_map)b->vkUnmapMemory(b->device,b->capture.memory);
+    if(b->capture.handle)b->vkDestroyBuffer(b->device,b->capture.handle,nullptr);
+    if(b->capture.memory)b->vkFreeMemory(b->device,b->capture.memory,nullptr);
+    if(b->descriptors)b->vkDestroyDescriptorPool''')
+p.write_text(text,encoding='utf-8')
+cm=dst/'source/vulkan/CMakeLists.txt'
+with cm.open('a',encoding='utf-8') as f:
+    for target in ['capture_cpu','capture_gpu']:
+        if (cm.parent/(target+'.cpp')).exists():
+            f.write(f'\nadd_executable({target} {target}.cpp)\ntarget_link_libraries({target} PRIVATE bcrypt)\n')
+(dst/'SOURCE-IDENTITY.json').write_text(json.dumps({'parent':str(parent),'parent_cpp_sha256':hashlib.sha256((parent/'source/vulkan'/p.name).read_bytes()).hexdigest(),'candidate_cpp_sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'status':'PRIVATE_SOURCE_NOT_DEPLOYED'},indent=2),encoding='utf-8')
+print(p)

@@ -1,0 +1,188 @@
+"""n13-vit-attn build: parent byte reproduction, candidate compile, SPV validation,
+plan generation (8 F15 PASS lines only), cpu-check, and BUILD.json.
+
+CPU only: glslang + spv_validate_cpu + clock_runner --cpu-check. No Vulkan device.
+Run:  python build.py
+"""
+import sys, json, hashlib, subprocess
+from pathlib import Path
+
+CAMP = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(CAMP))
+import COMMON as K
+
+CARD = CAMP / 'cards/n13-vit-attn'
+PY = sys.executable
+F15 = [96, 101, 106, 111, 116, 121, 126, 131]
+
+
+def sh(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def ident(p):
+    p = Path(p)
+    return dict(path=str(p), sha256=sh(p))
+
+
+OPNAME = {224: 'OpControlBarrier', 345: 'OpGroupNonUniformShuffle', 346: 'OpGroupNonUniformShuffleXor',
+          4457: 'OpCooperativeMatrixLoadKHR', 4458: 'OpCooperativeMatrixStoreKHR',
+          4459: 'OpCooperativeMatrixMulAddKHR', 4456: 'OpTypeCooperativeMatrixKHR',
+          129: 'OpFAdd', 133: 'OpFMul', 115: 'OpFConvert', 61: 'OpLoad', 62: 'OpStore', 169: 'OpSelect',
+          80: 'OpCompositeConstruct', 81: 'OpCompositeExtract', 65: 'OpAccessChain', 196: 'OpShiftLeftLogical',
+          199: 'OpBitwiseAnd', 124: 'OpBitcast', 128: 'OpIAdd', 132: 'OpIMul', 134: 'OpUDiv', 176: 'OpULessThan',
+          83: 'OpCopyObject', 12: 'OpExtInst', 245: 'OpPhi', 249: 'OpBranch', 250: 'OpBranchConditional', 57: 'OpFunctionCall',
+          127: 'OpFNegate', 184: 'OpFOrdLessThan'}
+TRACK = [12, 224, 345, 346, 4457, 4458, 4459, 129, 133, 115, 169, 80, 81, 196, 199, 124, 128, 83, 57]
+
+
+def spv_stats(p):
+    """Opcode histogram + NoContraction site inventory of a SPIR-V module (CPU only)."""
+    import struct
+    b = Path(p).read_bytes()
+    u = struct.unpack('<%dI' % (len(b) // 4), b)
+    assert u[0] == 0x07230203, 'not SPIR-V'
+    i = 5
+    hist = {}
+    nc_targets = set()
+    while i < len(u):
+        w = u[i]
+        op = w & 0xFFFF
+        ln = w >> 16
+        hist[op] = hist.get(op, 0) + 1
+        if op == 71 and ln >= 3 and u[i + 2] == 42:      # OpDecorate NoContraction
+            nc_targets.add(u[i + 1])
+        i += ln
+    # opcode of every NoContraction-decorated instruction
+    RESULT_SET = {12, 61, 80, 81, 83, 115, 124, 127, 128, 129, 133, 169, 345, 346, 4457, 4459}
+    rid2op = {}
+    i = 5
+    while i < len(u):
+        op = u[i] & 0xFFFF
+        ln = u[i] >> 16
+        if ln >= 3 and op in RESULT_SET:
+            rid2op.setdefault(u[i + 2], op)
+        i += ln
+    nc_ops = {}
+    for t in nc_targets:
+        op = rid2op.get(t, 0)
+        nc_ops[op] = nc_ops.get(op, 0) + 1
+    return dict(total_instructions=sum(hist.values()),
+                tracked={OPNAME[o]: hist.get(o, 0) for o in TRACK if hist.get(o, 0)},
+                opcodes={str(k): v for k, v in sorted(hist.items())},
+                no_contraction=len(nc_targets),
+                no_contraction_opcodes={OPNAME.get(k, 'op%d' % k): v for k, v in sorted(nc_ops.items())})
+
+
+def main():
+    rep = dict(card='n13-vit-attn', family='F15', pass_ordinals=F15,
+               local_size_x=128, note='CPU-only build; no GPU, no device, no deployment')
+
+    # ---- 1. parent byte reproduction (recipe: raw, pinned headers) ----------
+    repro = K.reproduce_current(96, CARD / 'build/repro96')
+    rep['parent_reproduce'] = repro
+    assert repro['raw_match'], 'parent byte reproduction FAILED'
+    rep['parent'] = ident(Path(repro['target']))
+    import shutil
+    shutil.copyfile(CARD / 'build/repro96/rebuild.spv', CARD / 'parent-rebuild.spv')
+    rep['parent_rebuilt'] = ident(CARD / 'parent-rebuild.spv')
+    assert rep['parent']['sha256'] == rep['parent_rebuilt']['sha256']
+
+    # ---- 2. candidate compile ---------------------------------------------
+    comp = CARD / 'candidate.comp'
+    spv = CARD / 'candidate.spv'
+    incs = [CARD]
+    K.compile_glsl(comp, spv, incs)
+    K.validate_spv(spv)
+    rep['compile'] = dict(glslang=str(K.GLSLANG), argv=['-V', '--target-env', 'vulkan1.3'] +
+                          ['-I' + str(d) for d in incs] + [str(comp), '-o', str(spv)])
+    rep['source'] = ident(comp)
+    rep['candidate'] = ident(spv)
+    rep['headers'] = {p.name: ident(p) for p in (CARD / 'register_handoff.glsl', CARD / 'vit_common.glsl')}
+    rep['header_pins_expected'] = {
+        'register_handoff.glsl': 'dd8307b1c59c76e41d705442207fafd1c87e2a87fe57d04f343af5c27caa5f26',
+        'vit_common.glsl': '15c832e2e797ad6583c210b791587bf8a61efc4c124d2fcd1de3fe5050521346',
+    }
+    rep['headers_pinned_match'] = all(rep['headers'][k]['sha256'] == v
+                                      for k, v in rep['header_pins_expected'].items())
+
+    # ---- 3. SPV statistics, parent vs candidate ---------------------------
+    ps = spv_stats(rep['parent']['path'])
+    cs = spv_stats(spv)
+    rep['spv_stats'] = dict(parent=ps, candidate=cs)
+    rep['float_NC_checked'] = cs['no_contraction']
+    rep['float_NC_parent'] = ps['no_contraction']
+
+    # ---- 4. plan: replace only this group's 8 PASS lines ------------------
+    plan = CARD / 'plan.txt'
+    n = K.make_plan(spv, plan, parent_plan=K.BASELINE, spv_shas={rep['parent']['sha256']})
+    rep['plan'] = ident(plan)
+    rep['plan_replaced_passes'] = n
+    assert n == 8, n
+    rep['baseline_plan'] = ident(K.BASELINE)
+    assert rep['baseline_plan']['sha256'] == K.BASELINE_SHA
+
+    # every changed PASS line must be one of the 8 F15 rows, and nothing else may differ
+    base = K.BASELINE.read_text(encoding='utf-8-sig').splitlines()
+    card = plan.read_text(encoding='utf-8-sig').splitlines()
+    assert len(base) == len(card)
+    diff = [(i, a, b) for i, (a, b) in enumerate(zip(base, card)) if a != b]
+    rep['plan_changed_lines'] = len(diff)
+    rep['plan_changed_pass_rows'] = sorted({a.split()[1] for _, a, _ in diff})
+    rep['plan_changed_passes_all_f15'] = all('vit_attn_f15l' in a for _, a, _ in diff)
+    rep['plan_scope_ok'] = (len(diff) == 8 and rep['plan_changed_passes_all_f15'])
+
+    # ---- 5. cpu-check -----------------------------------------------------
+    out = K.cpu_check(plan)
+    rep['cpu_check'] = out.strip()
+    rep['CPU'] = out.strip()
+
+    # ---- 6. side artifacts produced by probe-geom.py / verify-maps.py ------
+    side = {}
+    pg = CARD / 'build/PROBE-GEOM.json'
+    if pg.exists():
+        d = K.read_json(pg)
+        side['probe_geom'] = dict(path=str(pg), sha256=sh(pg),
+                                  probe_sha256=d['probe_sha'],
+                                  total_spirv_probe=d['probe_stats']['total_instructions'],
+                                  total_spirv_parent=d['parent_stats']['total_instructions'],
+                                  opcode_diff=d['opcode_diff_parent_vs_probe'],
+                                  nc_probe=d['probe_stats']['no_contraction'],
+                                  nc_parent=d['parent_stats']['no_contraction'])
+    mv = CARD / 'build/MAP-VERIFY.json'
+    if mv.exists():
+        d = K.read_json(mv)
+        side['map_verify'] = dict(path=str(mv), sha256=sh(mv),
+                                  all_maps_bijective=d['checks']['all_maps_bijective'],
+                                  join_exact=d['checks']['join_rows_to_B_exact'],
+                                  den_tree={k: v for k, v in d['checks']['den_tree'].items()
+                                            if not k.startswith('mines')},
+                                  coverage=d['checks']['dispatch_liveness']['all_288_columns_covered_once'])
+    # measured resource report from the existing GPU run of THIS candidate (main agent,
+    # queue/n13-vit-attn/resources); read-only here, this card ran no GPU
+    rr = CARD / 'RESOURCE-REPORT-existing-run.json'
+    if rr.exists():
+        d = K.read_json(rr)
+        side['resource_report_existing_run'] = dict(
+            path=str(rr), sha256=sh(rr),
+            candidate_spv_sha256=d['candidate_spv_sha256'],
+            fixed_gate=d['fixed_gate']['verdict'],
+            scratch_bytes=d['delta']['scratch_bytes'],
+            instruction_count=d['delta']['instruction_count'],
+            basic_blocks=d['delta']['basic_blocks'],
+            loops=d['delta']['loops'],
+            verdict=d['verdict'])
+    rep['side_checks'] = side
+
+    K.write_json(CARD / 'BUILD.json', rep)
+    print(json.dumps({k: rep[k] for k in ('cpu_check', 'plan_changed_lines', 'float_NC_checked',
+                                          'float_NC_parent', 'headers_pinned_match')}, indent=2))
+    print('parent ', rep['parent']['sha256'])
+    print('cand   ', rep['candidate']['sha256'])
+    print('plan   ', rep['plan']['sha256'])
+    print('parent spv instrs/kernel-opcodes:', ps['total_instructions'], ' candidate:', cs['total_instructions'])
+    print('candidate size', Path(spv).stat().st_size, 'parent size', Path(rep['parent']['path']).stat().st_size)
+
+
+if __name__ == '__main__':
+    main()

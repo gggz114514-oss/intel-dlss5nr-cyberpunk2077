@@ -1,0 +1,210 @@
+"""n06d emit: SOURCE-DIFF.patch, COST-LEDGER.json, shT/barrier footprint accounting.
+
+CPU only. Reads the shipped candidate.comp / candidate.spv / BUILD.json / PROOF.json.
+"""
+import difflib
+import json
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+CAMP = CARD.parent.parent
+sys.path.insert(0, str(CAMP))
+sys.path.insert(0, str(CARD / 'scratch'))
+import COMMON as K
+import spvstat
+
+PARENT_SRC = K.D / 'f06-scale-fragments/family/c256/candidate.comp'
+BUILD = K.read_json(CARD / 'BUILD.json')
+PROOF = K.read_json(CARD / 'PROOF.json')
+NATIVE = K.read_json(CAMP / 'cards/n06c-f06-c256-sht/RESULTS.json')['layer2_native']
+BASE_MSG = NATIVE['messages']['base']
+BASE_ISA = NATIVE['base']
+
+
+def write_patch():
+    a = PARENT_SRC.read_text(encoding='utf-8-sig').splitlines(keepends=True)
+    b = (CARD / 'candidate.comp').read_text(encoding='utf-8-sig').splitlines(keepends=True)
+    diff = list(difflib.unified_diff(
+        a, b, fromfile='a/fullnet-mechanism-transfer-20261026/f06-scale-fragments/'
+                       'family/c256/candidate.comp',
+        tofile='b/cards/n06d-f06-c256-atile/candidate.comp', n=4))
+    (CARD / 'SOURCE-DIFF.patch').write_text(''.join(diff), encoding='utf-8')
+    hunks = sum(1 for l in diff if l.startswith('@@'))
+    adds = sum(1 for l in diff if l.startswith('+') and not l.startswith('+++'))
+    dels = sum(1 for l in diff if l.startswith('-') and not l.startswith('---'))
+    return dict(path=str(CARD / 'SOURCE-DIFF.patch'), hunks=hunks, added_lines=adds,
+                removed_lines=dels, sha256=K.sha(CARD / 'SOURCE-DIFF.patch'),
+                parent_source_sha256=K.sha(PARENT_SRC),
+                candidate_source_sha256=K.sha(CARD / 'candidate.comp'))
+
+
+def shT_footprint():
+    pm = spvstat.Mod(CARD / 'parent-rebuild.spv')
+    cm = spvstat.Mod(CARD / 'candidate.spv')
+    return dict(parent=dict(workgroup_bytes=32768, arrays=1, barriers=pm.hist.get(224, 0),
+                            instr=len(pm.instr), words=len(pm.words),
+                            loops=pm.hist.get(246, 0)),
+                candidate=dict(workgroup_bytes=32768, arrays=1, barriers=cm.hist.get(224, 0),
+                               instr=len(cm.instr), words=len(cm.words),
+                               loops=cm.hist.get(246, 0)),
+                note='shT is the same half[16384] Workgroup array in both arms (32768 B); '
+                     'only the slot a given element lands in changed')
+
+
+def main():
+    diff = write_patch()
+    foot = shT_footprint()
+    assert foot['parent']['workgroup_bytes'] == foot['candidate']['workgroup_bytes'] == 32768
+    assert foot['parent']['barriers'] == foot['candidate']['barriers'] == 2
+
+    nticks = 15
+    ledger = {
+        'card': CARD.name,
+        'units': 'per subgroup unless stated; 8 subgroups / 256 threads / 15 PASS; '
+                 'bytes are per workgroup unless stated',
+        'mechanism': 'shT kept (half[16384], 32 KiB, one 32 KiB global read, NOT segmented). '
+                     'The publish now writes the consumer tile order '
+                     'shT[(j*16+ki)*128 + dr*16 + dc] (every 8x16 A tile = 128 contiguous '
+                     'halves = 256 B) and the A read uses stride 16 instead of 256. '
+                     'Target: the A-read SLM messages, which the parent emits as 1024 '
+                     'transposed 32 B messages per subgroup.',
+        'removed': [
+            {
+                'item': 'A-read SLM messages per subgroup',
+                'parent': 1024,
+                'candidate_expected': [128, 256],
+                'delta_expected': [-896, -768],
+                'delta_pct': '-87% .. -75%',
+                'basis': 'per 8x16 tile the parent needs 8 messages of 32 B (its 8 rows are '
+                         '512 B apart, so IGC emits one (1|M0) transposed 32 B message per '
+                         'row); the candidate tile is 128 contiguous halves (256 B), i.e. '
+                         'one 32-lane message of 8 B/lane, so 128 tiles = 128 messages',
+                'bytes': 'unchanged: 1024 x 32 B = 128 x 256 B = 32768 B per subgroup',
+                'measured_parent': BASE_MSG.get('send.slm load.slm.d32x8t.a32'),
+                'source': 'cards/n06c-f06-c256-sht/RESULTS.json layer2_native.messages.base '
+                          '(read-only historical capture of kernel 6b7176820f28c8ca)',
+                'verdict_gate': 'native must show total A-read load.slm messages in [128,256] '
+                                'per subgroup, else A-class (not landed)',
+            },
+            {
+                'item': 'transposed address formation on the A read',
+                'parent': 8,
+                'candidate_expected': 1,
+                'unit': 'per 8x16 tile (address increments inside one tile read)',
+                'delta_expected': -7,
+                'delta_per_subgroup_expected': -896,
+                'basis': 'one message needs one address; the parent issues 8 because the 8 '
+                         'rows of a tile are separate 32 B messages',
+                'note': 'IGC may strength-reduce the parent increment chain, so this is '
+                        'booked as an expected, not guaranteed, reduction',
+            },
+        ],
+        'added': [
+            {
+                'item': 'publish address arithmetic (integer)',
+                'parent': '1 running element index per stolen element (64 per thread)',
+                'candidate': 'per tile row: t = q>>3, dr = q&7, src = ((t>>4)*8+dr)<<8 | '
+                             '(t&15)<<4, dst = q<<4 (about 8 integer ops per tile row, '
+                             '4 tile rows per thread)',
+                'spirv_static': {'OpIAdd': [56, 64], 'OpIMul': [34, 36],
+                                 'OpShiftRightLogical': [2, 11], 'OpShiftLeftLogical': [0, 7],
+                                 'OpBitwiseAnd': [4, 9], 'OpISub': [2, 2], 'OpUDiv': [10, 10]},
+                'cost_estimate': 'order 30 extra integer ops per thread against 32 KiB of '
+                                 'memory traffic moved by that thread; not expected to be '
+                                 'visible, but it is booked',
+            },
+            {
+                'item': 'one extra loop level in the publish',
+                'parent': '1 loop, 64 iterations, 1 scalar load + 1 scalar store per iteration',
+                'candidate': 'outer 4 iterations x inner 16 iterations (inner loop rolled in '
+                             'SPIR-V, trip count 16, same idiom as the parent copy loop)',
+                'spirv_static': {'OpLoopMerge': [6, 7]},
+                'risk': 'if IGC does not unroll the inner 16-trip loop, the publish keeps the '
+                        'parent message count but each 2 B/lane message touches 32 different '
+                        '32 B sectors instead of 2; DRAM stays 32 KiB (L1 absorbs the reuse) '
+                        'but sector requests per message rise. Observable: '
+                        'store.slm.d16u32 count and the slm-store message width',
+            },
+            {
+                'item': 'SPIR-V static size',
+                'parent': dict(instructions=860, words=3466, bytes=13864),
+                'candidate': dict(instructions=947, words=3811, bytes=15244),
+                'delta': dict(instructions=87, words=345, bytes=1380),
+                'basis': 'the publish body grows from 1 stolen element to 16 contiguous '
+                         'halves plus its index math, and the debug dump gains the inverse '
+                         'index map',
+                'note': 'static size, not dynamic work: both publish bodies are rolled loops',
+            },
+            {
+                'item': 'debug-path index math (not on the normal path)',
+                'parent': 'dbg[425984+e] = shT[e]',
+                'candidate': 'dbg[425984+e] = shT[((e>>11)*16 + ((e>>4)&15))*128 + '
+                             '((e>>8)&7)*16 + (e&15)]',
+                'delta': 'about 8 extra integer ops per debug element',
+                'scope': 'debug = 0 on every measured arm (fixed/fb2/ordinary); kept only so '
+                         'the dump content stays byte-identical to the parent',
+            },
+        ],
+        'unchanged': [
+            'shT exists, is one half[16384] Workgroup array, 32768 B, and is read once from '
+            'gT per workgroup (32 KiB) - not deleted, not segmented',
+            'workgroup memory 32768 B, function-local/Private variable count 0 growth '
+            '(OpLifetimeStart/Stop = 0 in both arms)',
+            'one workgroup barrier on the normal path and one in the debug branch - identical '
+            'OpControlBarrier count (2) and identical position in the phase order',
+            'dpas per subgroup 256 (8 j x 16 ki x 2 accumulators), K order ki = 0..15 ascending, '
+            'seed before K, two accumulators per ki',
+            'weight loads 256 per subgroup (OpCooperativeMatrixLoadKHR stride 16, LCOL) and '
+            'the whole weight reuse shape',
+            'seed loads (stride 256, LROW) and output stores (stride 16, LROW) - symbolic '
+            'address chains are byte-identical to the parent',
+            'FP expression set: OpFMul 2, OpFConvert 4, no OpFAdd/OpFSub/OpFDiv, no '
+            'OpQuantizeToF16, OpExtInst 2, NoContraction 0 - identical in both arms',
+            'grid, bindings, push constants, buffer count, pool bytes: --cpu-check output is '
+            'byte-identical to the chain head',
+            'active lanes: 1024 tile rows / 256 threads = exactly 4 iterations and the parent '
+            '16384 / 256 = exactly 64, so neither arm has tail divergence',
+        ],
+        'unknown': [
+            'whether IGC widens the 16 rolled publish iterations into one 32 B/lane message '
+            '(store.slm.d32x8) or keeps 16 x 2 B/lane; both keep the byte count, the second '
+            'raises sector requests per message',
+            'whether the A read really becomes one 8 B/lane message per tile (128 per '
+            'subgroup) or two (256) - both are inside the card gate',
+            'register pressure / occupancy: the parent runs at max_r 127 (2 workgroups per '
+            'core at 128 GRF); a rise past 127 or any scratch would be a real regression',
+            'real timing: no GPU on this card',
+        ],
+        'footprint': foot,
+        'diff': diff,
+        'passes': dict(group='F06 C256', ordinals=[38, 41, 44, 47, 50, 53, 56, 170, 173, 176,
+                                                  179, 182, 185, 188, 191], n=nticks),
+        'ceiling': {
+            'group_measured_us': 484.94,
+            'group_share_of_frame_pct': 2.76,
+            'frame_ms': 17.577,
+            'source': 'queue/n06-f06-output/resources/run/resources-base/hardware-counters.json '
+                      '(single sample, base arm; the C256 PASSes are untouched there)',
+            'A_read_messages_per_wg': {'parent': 8192, 'candidate': [1024, 2048]},
+            'A_read_bytes_per_wg': 262144,
+            'data_port_messages_per_wg_estimate': 13536,
+            'A_read_message_share_of_data_port_pct': {'parent': 60.5,
+                                                      'candidate': [7.6, 15.1]},
+            'reading': 'this card removes message slots, not bytes: the A read is 60.5% of '
+                       'the kernel data-port messages but 18.5% of its bytes. The honest '
+                       'expected effect is therefore a fraction of the group time, upper '
+                       'bound a few hundred microseconds per frame (<=1.4% of frame time, '
+                       '<=0.24 ms) if the kernel is SLM-issue bound; zero if it is byte '
+                       'bound. Unlike n06c this upper bound is above the ordinary CI '
+                       'resolution (~0.03 ms), so an ordinary measurement is worth spending.',
+        },
+    }
+    K.write_json(CARD / 'COST-LEDGER.json', ledger)
+    print(json.dumps({'diff': diff, 'footprint': foot, 'removed': len(ledger['removed']),
+                      'added': len(ledger['added']), 'unknown': len(ledger['unknown'])},
+                     indent=2))
+
+
+if __name__ == '__main__':
+    main()

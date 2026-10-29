@@ -1,0 +1,86 @@
+# RESUME — 全网 INT8 累计实施（DSH 空白上下文执行）
+
+更新：2026-10-24T23:2x+09:00　本轮工作目录：B/work/dsh-int8-fullnet-impl-20261024
+B = @NR_WORKSPACE@（所有业务命令显式 workdir=B，绝对路径）
+
+## 任务目标
+交付"全部实际矩阵操作数为 INT8"的可执行累计网络：静态线性层 + 动态 QK/PV，含本臂整数参考、
+非零输入与反馈验证。INT32 累加 / float 尺度 / norm / softmax / half 残差 可留；不得保留 FP16 矩阵，
+不得用标量 float 点积伪装。施工书：work/codex-astra-fp16-int8-audit-20261024/
+DSH-FRESH-CONTEXT-IMPLEMENTATION-20261024.txt（本目录外的只读输入）。
+
+## 已验证的父与累计版本（本轮用 operand 级工具独立复算，不转述）
+工具：tools/plan_mma_census.py（解析 plan → 每个 PASS 的 SPV 走
+work/dsh-xmx-handoff-validation-20261024/tools/mma_operand_audit.py，读 A/B/C/Result 分量类型与符号位）
+证据：logs/census-parents.json，logs/residual-v4.md
+
+| plan | sha256(前16) | passes | buffers | FP16 站点 | 含 FP16 的 PASS | 已关闭位置 |
+|---|---|---:|---:|---:|---:|---:|
+| G3 plan-g3-production.txt | d0bb75cf70f5def9 | 287 | 739 | 1594 | 129 | 0 |
+| cumulative-v1 | e2b84f1937df02ad | 287 | 781 | 1480 | 104 | 25 |
+| cumulative-v2 | a30b60d534d98a0f | 288 | 784 | 1476 | 102 | 27 |
+| cumulative-v3 | ae39cdce8cb8fedd | 288 | 784 | 1474 | 101 | 28 |
+| cumulative-v4 | daf89f2ffb06a71f | 288 | 802 | 1472 | 100 | **29** |
+| cumulative-v5（本轮，C128 合一） | f9a88f907e3743ee | 288 | 802 | 1456 | 92 | 37 |
+| **cumulative-v6（本轮，+C256 WO 15 位置）** | 8a88618dd7e5ae86 | 288 | 832 | **1426** | **77** | **52** |
+
+结论：**当前精确关闭 29 / 129，残余 100 位置 / 1472 站点**（v4）。v1 剩 104 与 HANDOFF §12.3 一致；
+v2 +2 = R13/R14 插入；v3 +1 = R17 修复臂；v4 +1 = C128 WO block61（其余 8 个被 R08 优先级跳过）。
+
+## 本轮已完成（C128 WO+qX 合一卡）
+卡：candidates/r07-c128-wo-qx-unified/
+- 冲突本体：R07 的 9 个 C128 输出投影里有 8 个（blocks 11,12,13,56,57,58,59,60）就是 R08 改成
+  qX producer 的同一批 PASS，merge_cumulative_v4.py 只能吃进 block61。不是优先级问题，是语义冲突。
+- 新内核 source/c128_d4_wo_qx.comp：WO 走 int8×int8→int32，反量化折进同一累加器，与 seed 相加后
+  **只窄化一次**，同一 half 同时喂 imgout store 与原 qX 量化器；qX 量化前强制 half round-trip
+  （C256 v3 的教训：编译器会把未舍入 FP32 累加器喂给量化器）。
+- spv/c128_d4_wo_qx.spv sha256 d0c316b9df595362…，21708 B，validate result=0 words=5427，
+  operand 审计 muladd=2 / fp16=0 / int8=2 → FP16_FREE。
+- plan-cumulative-v5.txt sha256 f9a88f907e3743eed14a878a98204f078ed40d44dd6d82c28f8bd101a1533181，
+  header PORT_NETWORK_1 152 802 288 1；只改 8 个 PASS 的 spv/shared(0→9224)/nbind(10→12)，
+  BIND 10/11 绑**已存在**的 r07_c128_b{11,12,13,56,57,58,59,60}_wo8 / _wosc（v4 声明未绑的 16 个），
+  不新增 BUFFER；PUSH 32 word、grid、ordinal 全不变。
+  plan_lint problems=[] notes=16（与父相同）；validate_pool_upload verdict=PASS。
+- pack 证据 evidence/WO-PACK-EVIDENCE.json：9 份 shipped pack 用内核实际 tile 布局解码，
+  rel_L2 0.00648–0.00714、SNR 42.9–43.8 dB、饱和 0.99–1.08%、scales 9/9 精确复现；
+  **密封量化器 = roundEven(half(W·(1/sW)))**（乘积先舍入到 half 再整数舍入），用它能逐字节复现
+  9/9 份码（残差 0）。本卡初版误称"不可复现"，已撤回（见 REPORT §4 的自我更正）。
+  参考仍直接解码 shipped codes，使参考与内核读同一份字节。
+
+## 正在做
+1. C128 合一卡的 CPU 整数参考：fixture = candidates/amd-map-20261015/s1-output-complete/
+   gpu-numeric/c128-full-b9-full/（T.bin/Y.bin/M.bin/image_out.bin，252 窗口，各 4128768 B），
+   ABI push 常量在同目录 numeric-cases.json 的 case "c128-full-b9-full"（c128_abi.bin 196 B）。
+   先证明模拟器能复现 GPU 的 image_out.bin，再跑 INT8 路径给出 rel_L2/SNR/饱和。
+2. 已并行派出 4 个子代理（用户明确要求开子代理并行）：C256 WO 15 位置卡、R16/R18/R19 投影、
+   R10/R11 DS、R04/R05 动态 attention。它们只写自己的卡目录，累计计划合并由本会话串行做。
+
+## 下一动作队列（本会话自己）
+- 完成 C128 合一卡 REPORT.md / CANDIDATE.json / MERGE-RECIPE.json。
+- 把 C256 WO 卡的 MERGE-RECIPE 合进累计 → v6；再依次合 R16/R18/R19、R10/R11、attention 卡。
+- 每合一次跑 plan_mma_census.py 复算并更新本文件与 STATE.json。
+- GPU：**本会话尚无新时段分配**。锁 @NR_GPU_WORKSPACE@/artifacts/parallel-port-20261013/GPU.lock
+  最后状态 FINISHED / owner r07-c256-qxlast / exit 0，但按本线规则不能把"锁空闲"当"已分配"。
+  GPU 只在用户/协调入口明确给时段后使用；等待期间继续 CPU 实施。
+
+## 真实阻断
+- GPU 时段未分配 → 数值门、反馈、质量、ordinary 全部只能排队（不阻断离线编译/接线/CPU 参考）。
+- 质量标准：run/codex-sol-int8-pilot-20261018/v3/QUALITY-FOUNDATION-AND-PROPOSAL.json 明确
+  "No preset INT8 tolerance exists"、quality_accepted=false → 不自设阈值，只交测量与标定序列身份。
+
+## 工具陷阱（已踩过，别再踩）
+- 本机 workspace-write 沙箱下 pwsh 一律 0xC0000142 起不来；当前会话策略为 danger-full-access 才能执行。
+- B/run/python312/python.exe **没有 numpy**；numpy 用
+  @NR_USER_HOME@/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe (3.12.14, numpy 2.3.5)。
+- PowerShell 没有 heredoc，`python - <<'PY'` 会炸；脚本要落文件再跑。
+- plan 的 PASS 数字标签不唯一，身份用 (pass_name, ordinal)。
+- 量化器用 f32 倒数乘法 vs 除法，会有约 1% 的码在 tie 上差 1。
+- merge_cumulative_v*.py 只复制 base 的 tail → **所有卡新增 BUFFER 的 POLICY 行都丢了**（v4 有 63 个
+  资源无 POLICY，validate_pool_upload 显示 effective_resident=1 / source=default，故未致错但属缺陷）。
+  已用 tools/merge_plans.py 取代：按 pass 名翻译 ordinal 把 POLICY 带过来。
+- **Python 导入会在只读包里生成 `__pycache__`**：本轮就在
+  work/dsh-int8-same-family-20261023/tools/ 与 work/dsh-xmx-handoff-validation-20261024/tools/ 各写了一个 .pyc。
+  前者已删除（整目录都是本轮新建的）；后者目录 20:05 就已存在，只刷新了 mma_operand_audit 的 .pyc，保留并登记。
+  **以后所有 python 调用先 `$env:PYTHONDONTWRITEBYTECODE='1'`。**
+- 子代理报称 Windows PowerShell 的 Get-Content/Set-Content 会破坏 UTF-8 中文文件（REPORT.md 被写坏过一次）；
+  读写中文文件用 write/read 工具或 python 显式 utf-8，不要用 PS 的 -Encoding 默认值。

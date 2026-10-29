@@ -1,0 +1,242 @@
+"""Generate candidate.comp (8x64 wide fb-bias read) and probe.comp (lane-map probe)
+from the parent source of the F02 body shader.
+
+CPU only.  Reads the parent source (read-only), writes only inside this card.
+
+The rewrite replaces the score/bias region of `main()` (8 sites of 8 row gathers)
+with two 8x64 f32 accumulator band loads.  Everything else is byte-identical to
+the parent, which is what makes the SOURCE-DIFF.patch auditable.
+
+Region contract (asserted, not assumed):
+  * the parent region starts at the line `NRH_CH p00,p10;`
+  * it holds exactly 8 `coopMatLoad(bias,fb,...)` sites with stride 64 in this order
+        (t0+0,0) (t0+8,0) (t0+0,16) (t0+8,16) (t0+0,32) (t0+8,32) (t0+0,48) (t0+8,48)
+  * it holds exactly 8 `coopMatLoad(b,shK,...)` sites at 0,1024,256,1280,512,1536,768,1792
+  * it holds exactly 8 `precise float biasedN=scM[N]+bias[N];` groups (32 adds)
+  * it ends immediately before the line `{` that opens the den reduction tree
+    (the line after the last `p13=nrh_narrow(sc1);` group)
+"""
+import re
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).parent
+PARENT_SRC = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                  'c32-rest-20261026/body-pv-den-overlap/candidate.comp')
+PARENT_SRC_SHA = '75e3474dc2749288261f3824fd0d45f9675e3b8e2fe95c5ba4b56d29d2698749'
+
+# column blocks in source order: (shK offset for K-block 0, shK offset for K-block 1)
+K_OFF = [(0, 1024), (256, 1280), (512, 1536), (768, 1792)]
+BANDS = [  # (row offset inside the subgroup tile, output variable prefix, A-fragment pair)
+    (0, 'p0', ('qa00', 'qa01')),
+    (8, 'p1', ('qa10', 'qa11')),
+]
+
+TYPE_BLOCK = '''#define NRH_C64 coopmat<float,gl_ScopeSubgroup,8,64,gl_MatrixUseAccumulator>
+#define NRH_C64_AT(b,c) (4u*(b)+(c))
+
+'''
+
+HEADER = '''// n02d-f02-bias-wide: fb bias is read as one 8x64 f32 accumulator band per row
+// half instead of four 8x16 sites x 8 row gathers.
+//
+// Why this shape: the 16x64 f32 bias tile of a subgroup is stored with a row
+// stride of 64 f32 = the whole row width, so 8 adjacent rows are ONE contiguous
+// 2048 B run.  An 8x16 site is a column slice and therefore 8 separate 64 B runs;
+// only the full 64-column band makes the run contiguous, so only this shape can
+// lower the message count.
+//
+// What is NOT changed: the f32 bias add stays a `precise` f32 add on the same
+// accumulator and the f32->f16 rounding point stays nrh_narrow() afterwards, the
+// DPAS K order, the counter/den reduction trees, the per-column-block shK block
+// reads (still 8, so the B-layout zip movs are untouched), and the order in which
+// the two row halves are produced.
+//
+// Lane map: the per-lane component order of the 8x64 band is measured by
+// PROBE-DESIGN.md, not assumed.  NRH_C64_AT(b,c) is the single line that encodes
+// the hypothesis (block-major: component 4*b+c of the band holds column block b,
+// component c -- i.e. exactly the four 8x16 sites' components, so the mapping is
+// a within-lane register permutation and the adds cost nothing).
+''' + TYPE_BLOCK
+
+
+def sha(p):
+    import hashlib
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def region_bounds(lines):
+    start = None
+    for i, l in enumerate(lines):
+        if l.strip() == 'NRH_CH p00,p10;':
+            start = i
+            break
+    assert start is not None, 'region start not found'
+    end = None
+    stop = None
+    for i in range(start, len(lines)):
+        if lines[i].strip() == 'p13=nrh_narrow(sc1);':
+            stop = i
+            break
+    assert stop is not None, 'region end not found'
+    for i in range(stop + 2, len(lines)):
+        if lines[i].strip() == '{':
+            end = i
+            break
+    assert end is not None, 'region end is not the den-tree opener'
+    return start, end
+
+
+def audit_region(text):
+    """Assert the parent region is exactly the shape the rewrite assumes."""
+    bias = re.findall(r'coopMatLoad\(bias,fb,uint\(pc\.p2\.w\)\+\(t0\+(\d+)u\)\*64u\+(\d+)u,64u,LROW\);', text)
+    assert bias == [('0', '0'), ('8', '0'), ('0', '16'), ('8', '16'),
+                    ('0', '32'), ('8', '32'), ('0', '48'), ('8', '48')], bias
+    shk = re.findall(r'NRH_B b;coopMatLoad\(b,shK,(\d+)u,16u,LROW\);', text)
+    assert shk == ['0', '1024', '256', '1280', '512', '1536', '768', '1792'], shk
+    adds = re.findall(r'precise float biased(\d)=(sc(\d)\[(\d)\]\+bias\[(\d)\]);sc\3\[\4\]=biased\1;', text)
+    assert len(adds) == 32, len(adds)
+    assert all(a[3] == a[4] for a in adds), 'add component order changed'
+    assert all(a[0] == a[3] for a in adds), 'biasedN component order changed'
+    assert len(re.findall(r'nrh_narrow\(sc(\d)\)', text)) == 8
+    assert text.count('nr_exp_h2') == 16, text.count('nr_exp_h2')
+    assert 'shV' not in text and 'dbg' not in text
+    return dict(bias_sites=len(bias), shk_sites=len(shk), f32_adds=len(adds),
+                narrows=8, exp_pairs=16)
+
+
+def band_block_text(kbi):
+    """One column block, parent structure kept exactly:
+       2 shK block reads -> 2 DPAS for the low row half -> 2 DPAS for the high half
+       -> f32 bias add (band component) -> nrh_narrow -> the two exp pairs.
+    Only the two bias operands change: they are band components instead of the
+    eight row-gather message registers of a freshly loaded 8x16 fragment.
+    """
+    out = []
+    out.append('{\n')
+    out.append('NRH_C sc0=NRH_C(0.0),sc1=NRH_C(0.0);\n')
+    for kk, a in ((0, ('qa00', 'qa10')), (1, ('qa01', 'qa11'))):
+        out.append('{\n')
+        out.append('NRH_B b;coopMatLoad(b,shK,%du,16u,LROW);\n' % K_OFF[kbi][kk])
+        out.append('sc0=coopMatMulAdd(%s,b,sc0);sc1=coopMatMulAdd(%s,b,sc1);\n' % a)
+        out.append('}\n')
+    for half, var in ((0, 'bias64a'), (1, 'bias64b')):
+        v = 'p%d%d' % (half, kbi)
+        out.append('{\n')
+        for c in range(4):
+            out.append('precise float biased%d=sc%d[%d]+%s[NRH_C64_AT(%du,%du)];sc%d[%d]=biased%d;\n'
+                       % (c, half, c, var, kbi, c, half, c, c))
+        out.append('%s=nrh_narrow(sc%d);\n' % (v, half))
+        out.append('{f16vec2 e=nr_exp_h2(f16vec2(%s[0],%s[1]));%s[0]=e.x;%s[1]=e.y;}\n' % (v, v, v, v))
+        out.append('{f16vec2 e=nr_exp_h2(f16vec2(%s[2],%s[3]));%s[2]=e.x;%s[3]=e.y;}\n' % (v, v, v, v))
+        out.append('}\n')
+    out.append('}\n')
+    return ''.join(out)
+
+
+def new_region():
+    out = ['NRH_CH p00,p10;\n']
+    out.append('// both row bands of this subgroup\'s 16x64 f32 bias tile are read once, as\n'
+               '// 8x64 accumulators: 8 rows x 64 columns is one contiguous 2048 B run each.\n')
+    out.append('NRH_C64 bias64a;coopMatLoad(bias64a,fb,uint(pc.p2.w)+(t0+0u)*64u,64u,LROW);\n')
+    out.append('NRH_C64 bias64b;coopMatLoad(bias64b,fb,uint(pc.p2.w)+(t0+8u)*64u,64u,LROW);\n')
+    for kbi in range(4):
+        if kbi:
+            out.append('NRH_CH p0%d,p1%d;\n' % (kbi, kbi))
+        out.append(band_block_text(kbi))
+    return ''.join(out)
+
+
+def generate_candidate():
+    text = PARENT_SRC.read_text(encoding='utf-8-sig')
+    assert sha(PARENT_SRC) == PARENT_SRC_SHA, 'parent source changed: %s' % sha(PARENT_SRC)
+    lines = text.splitlines(keepends=True)
+    start, end = region_bounds(lines)
+    region = ''.join(lines[start:end])
+    audit = audit_region(region)
+    new = ''.join(lines[:start]) + new_region() + ''.join(lines[end:])
+    # insert the type/macro block right after the "#define LCOL ..." line
+    anchor = '#define LCOL gl_CooperativeMatrixLayoutColumnMajor\n'
+    assert new.count(anchor) == 1
+    new = new.replace(anchor, anchor + HEADER)
+    out = CARD / 'candidate.comp'
+    out.write_text(new, encoding='utf-8')
+    return dict(region_lines=[start + 1, end], region_sha256=_sha_text(region),
+                parent_region_audit=audit, candidate=str(out), candidate_sha256=sha(out))
+
+
+def generate_probe():
+    """probe.comp: the parent shader (NOT the candidate) plus a debug-only dump of the
+    8x64 band fragment, so the fragment lane map is measured before any candidate
+    verdict.  debug is hard-wired to 1 in this artifact only (it is never deployed and
+    never enters a timing or gate arm)."""
+    text = PARENT_SRC.read_text(encoding='utf-8-sig')
+    lines = text.splitlines(keepends=True)
+    # 1. hard-wire debug for the probe artifact
+    d = 'const bool debug = pc.p0.z != 0;\n'
+    assert text.count(d) == 1
+    text2 = text.replace(d, 'const bool debug = true; // n02d PROBE ONLY: hard-wired dump arm\n')
+    # 2. add the wide band type/macros
+    anchor = '#define LCOL gl_CooperativeMatrixLayoutColumnMajor\n'
+    assert text2.count(anchor) == 1
+    text2 = text2.replace(anchor, anchor + TYPE_BLOCK
+                          + '// PROBE: dump bases (card-local, never in a plan that is timed)\n'
+                          + '#define NRH_PROBE_BAND0 24448u\n'
+                          + '#define NRH_PROBE_BAND1 10240u\n'
+                          + '#define NRH_PROBE_NARROW 12288u\n')
+    # 3. dump the band + a narrow cross-check right after the first shK score block
+    #    inside the score section (the same dispatch, same sg, same tile base).
+    hook = ('NRH_CH p00,p10;\n')
+    assert text2.count(hook) == 1
+    dump = '''NRH_CH p00,p10;
+if(debug && sg==0u) {
+// n02d PROBE: 8x64 band 0 (rows t0..t0+7, all 64 columns) in fragment order:
+// element k*32+lane holds whatever the implementation puts in component k of lane
+// lane.  Compared on the host against fb[] (see probe_read.py) this yields the map.
+NRH_C64 pb64; coopMatLoad(pb64,fb,uint(pc.p2.w)+(t0+0u)*64u,64u,LROW);
+dbg[NRH_PROBE_BAND0+0u*32u+lane]=float16_t(pb64[0]);
+dbg[NRH_PROBE_BAND0+1u*32u+lane]=float16_t(pb64[1]);
+dbg[NRH_PROBE_BAND0+2u*32u+lane]=float16_t(pb64[2]);
+dbg[NRH_PROBE_BAND0+3u*32u+lane]=float16_t(pb64[3]);
+dbg[NRH_PROBE_BAND0+4u*32u+lane]=float16_t(pb64[4]);
+dbg[NRH_PROBE_BAND0+5u*32u+lane]=float16_t(pb64[5]);
+dbg[NRH_PROBE_BAND0+6u*32u+lane]=float16_t(pb64[6]);
+dbg[NRH_PROBE_BAND0+7u*32u+lane]=float16_t(pb64[7]);
+dbg[NRH_PROBE_BAND0+8u*32u+lane]=float16_t(pb64[8]);
+dbg[NRH_PROBE_BAND0+9u*32u+lane]=float16_t(pb64[9]);
+dbg[NRH_PROBE_BAND0+10u*32u+lane]=float16_t(pb64[10]);
+dbg[NRH_PROBE_BAND0+11u*32u+lane]=float16_t(pb64[11]);
+dbg[NRH_PROBE_BAND0+12u*32u+lane]=float16_t(pb64[12]);
+dbg[NRH_PROBE_BAND0+13u*32u+lane]=float16_t(pb64[13]);
+dbg[NRH_PROBE_BAND0+14u*32u+lane]=float16_t(pb64[14]);
+dbg[NRH_PROBE_BAND0+15u*32u+lane]=float16_t(pb64[15]);
+// band 1 spot check: components 0..3 only (rows t0+8..t0+15)
+NRH_C64 pb64b; coopMatLoad(pb64b,fb,uint(pc.p2.w)+(t0+8u)*64u,64u,LROW);
+dbg[NRH_PROBE_BAND1+0u*32u+lane]=float16_t(pb64b[0]);
+dbg[NRH_PROBE_BAND1+1u*32u+lane]=float16_t(pb64b[1]);
+dbg[NRH_PROBE_BAND1+2u*32u+lane]=float16_t(pb64b[2]);
+dbg[NRH_PROBE_BAND1+3u*32u+lane]=float16_t(pb64b[3]);
+// narrow cross-check: the existing 8x16 site (h0,b0) in fragment order
+{NRH_C nb; coopMatLoad(nb,fb,uint(pc.p2.w)+(t0+0u)*64u+0u,64u,LROW);
+dbg[NRH_PROBE_NARROW+0u*32u+lane]=float16_t(nb[0]);
+dbg[NRH_PROBE_NARROW+1u*32u+lane]=float16_t(nb[1]);
+dbg[NRH_PROBE_NARROW+2u*32u+lane]=float16_t(nb[2]);
+dbg[NRH_PROBE_NARROW+3u*32u+lane]=float16_t(nb[3]);}
+}
+'''
+    text2 = text2.replace(hook, dump)
+    out = CARD / 'probe.comp'
+    out.write_text(text2, encoding='utf-8')
+    return dict(probe=str(out), probe_sha256=sha(out))
+
+
+def _sha_text(s):
+    import hashlib
+    return hashlib.sha256(s.encode('utf-8')).hexdigest()
+
+
+if __name__ == '__main__':
+    sys.dont_write_bytecode = True
+    import json
+    info = dict(candidate=generate_candidate(), probe=generate_probe())
+    print(json.dumps(info, indent=2)[:2000])

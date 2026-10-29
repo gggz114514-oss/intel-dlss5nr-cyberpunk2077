@@ -1,0 +1,620 @@
+"""S13: corrected-feedback simulation (CPU/offline) + 7 prepared GPU jobs.
+
+Applies the static 3x3+bias output correction (posterior, fitted on the 24-frame dev set)
+to the measured 8-frame autonomous-feedback outputs, builds the corrected history planes,
+stages the next frame's composite bundles with feedback_plan.py's own staging logic, checks
+byte geometry, and writes CORRECTED-FEEDBACK-SIM.json + CORRECTED-FEEDBACK-JOBS.json.
+
+Nothing here runs a GPU.  No plan, weight, game or shared file is modified; everything is
+written under S13-quality/.
+
+Two distinct quantities, never to be mixed:
+  * POSTERIOR UPPER BOUND - the correction applied offline to the *already measured* chain
+    outputs (history unchanged).  Measured, not predicted, but it assumes the history path
+    is untouched, which a real folded output layer would change.
+  * FOLDED / RE-RUN - needs the 7 GPU jobs.  The jobs feed the corrected history; each job's
+    own output is still the *uncorrected* network output, so the folded-equivalent reading
+    is that output with the same M,b applied offline (deterministic).  The closed-loop
+    variant additionally requires rebuilding each next job from the previous job's output.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import sys
+from pathlib import Path
+
+import numpy as np
+
+S13 = Path(__file__).resolve().parent
+sys.path.insert(0, str(S13))
+
+import feedback_plan as fp  # noqa: E402
+from planlib import Plan  # noqa: E402
+
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029"
+QA = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+DS = QA / "dataset"
+C64 = QA / "real-int8-24/c64-family-static"
+BASE = QA / "real-int8-24"
+REPORTS = W / "reports"
+
+SEQ = "day-street-static-formal-01"
+FRAMES = list(range(34189, 34197))
+CHAIN_FRAMES = FRAMES[1:]  # 34190..34196 -> 7 GPU jobs
+H, WD = 720, 1280
+PLANE_FLOATS = H * WD * 4
+OUT_BYTES = 2 * PLANE_FLOATS * 4
+PEAK = 1.0
+
+CORRECTED_HISTORY_DIR = S13 / "corrected-history"
+CORRECTED_STAGE_DIR = S13 / "corrected-staged"
+CORRECTED_PLAN_DIR = S13 / "corrected-plans"
+CORRECTED_RECEIPT_DIR = S13 / "corrected-receipts"
+CORRECTED_RUN_DIR = S13 / "corrected-runs"
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_output(path: Path) -> np.ndarray:
+    if path.stat().st_size != OUT_BYTES:
+        raise SystemExit(f"{path}: {path.stat().st_size} bytes, expected {OUT_BYTES}")
+    return np.fromfile(path, dtype="<f4").reshape(2, H, WD, 4)
+
+
+def psnr_from_mse(mse: float) -> float:
+    return float(-10.0 * math.log10(max(mse, 1e-30)))
+
+
+def chain_path(frame: int) -> Path:
+    if frame == FRAMES[0]:
+        return C64 / f"run-{frame}/replayed-network.bin"
+    return S13 / f"runs-static01/run-{frame}/feedback-network.bin"
+
+
+def ref_path(frame: int) -> Path:
+    return DS / SEQ / f"0-{frame}/network-output.bin"
+
+
+def single_path(frame: int) -> Path:
+    return C64 / f"run-{frame}/replayed-network.bin"
+
+
+def consumed_history(frame: int) -> np.ndarray:
+    """The FP16 history plane this captured frame actually consumed (pre.bin, offset 14745680)."""
+    return np.fromfile(DS / SEQ / f"0-{frame}/pre.bin", dtype="<f4", count=PLANE_FLOATS,
+                       offset=14745680).reshape(H, WD, 4)[:, :, :3]
+
+
+def matrix_of(rows) -> tuple[np.ndarray, np.ndarray]:
+    m = np.asarray(rows, dtype=np.float64)
+    return m[:3, :], m[3, :]
+
+
+def apply_correction(rgb: np.ndarray, mat: np.ndarray, bias: np.ndarray, clip: bool) -> np.ndarray:
+    """The study stores the least-squares solution C (4x3) of [x 1] @ C = y, so the rows of C[:3]
+    are indexed by INPUT channel and its columns by OUTPUT channel: y' = x @ C[:3] + C[3]."""
+    out = rgb.astype(np.float64) @ mat + bias
+    if clip:
+        np.clip(out, 0.0, 1.0, out=out)
+    return out.astype(np.float32)
+
+
+def write_corrected_output(src: Path, dst: Path, mat, bias) -> dict:
+    arr = load_output(src)
+    app = arr[0, :, :, :3]
+    hist = arr[1, :, :, :3]
+    out = np.empty_like(arr)
+    out[0, :, :, :3] = apply_correction(app, mat, bias, clip=True)
+    out[0, :, :, 3] = arr[0, :, :, 3]
+    out[1, :, :, :3] = apply_correction(hist, mat, bias, clip=False)
+    out[1, :, :, 3] = arr[1, :, :, 3]
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    out.tofile(tmp)
+    tmp.replace(dst)
+    return {"bytes": dst.stat().st_size, "sha256": sha256_file(dst)}
+
+
+def rgb_rms(a: np.ndarray, b: np.ndarray) -> float:
+    d = a.astype(np.float64) - b.astype(np.float64)
+    return float(np.sqrt(np.mean(d * d)))
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sim-out", type=Path, default=S13 / "CORRECTED-FEEDBACK-SIM.json")
+    ap.add_argument("--jobs-out", type=Path, default=S13 / "CORRECTED-FEEDBACK-JOBS.json")
+    ap.add_argument("--no-build", action="store_true", help="metrics only, do not stage/build plans")
+    ap.add_argument("--rebuild-from", type=Path, default=None,
+                    help="closed-loop step: apply M,b to the history plane of an existing run output "
+                         "(directory containing feedback-network.bin, or the file itself)")
+    ap.add_argument("--rebuild-frame", type=int, default=None,
+                    help="frame id of the run being corrected (written to corrected-loop/run-<frame>)")
+    args = ap.parse_args(argv)
+
+    study = json.loads((REPORTS / "OUTPUT-CORRECTION-STUDY.json").read_text(encoding="utf-8"))
+    full_rows = study["full_fit"]["matrix"]
+    loo_fold = next(f for f in study["folds"] if f["held_out"] == SEQ)
+    m_full, b_full = matrix_of(full_rows)
+    m_loo, b_loo = matrix_of(loo_fold["matrix"])
+
+    if args.rebuild_from is not None:
+        if args.rebuild_frame is None:
+            raise SystemExit("--rebuild-from requires --rebuild-frame")
+        src = args.rebuild_from
+        if src.is_dir():
+            src = src / "feedback-network.bin"
+        dst = S13 / "corrected-loop" / f"run-{args.rebuild_frame}" / "feedback-network.bin"
+        info = write_corrected_output(src, dst, m_full, b_full)
+        print(json.dumps({"corrected_from": str(src), "source_sha256": sha256_file(src),
+                          "corrected_output": str(dst), **info,
+                          "next": (f"feedback_plan.py build --sequence {SEQ} --frame {args.rebuild_frame + 1} "
+                                   f"--prev-run {dst.parent.as_posix()} --prev-frame {args.rebuild_frame} "
+                                   f"--prev-output-name feedback-network.bin")}, indent=2))
+        return 0
+
+    geometry, geometry_evidence = fp.derive_geometry(Plan(C64 / f"combo-{FRAMES[0]}.txt"))
+
+    # ---------------------------------------------------------------- 1. metrics
+    rows = []
+    corrected_files = {}
+    for f in FRAMES:
+        ref = load_output(ref_path(f))
+        ref_app = ref[0, :, :, :3].astype(np.float64)
+        ref_hist = ref[1, :, :, :3].astype(np.float64)
+        chain = load_output(chain_path(f))
+        chain_app = chain[0, :, :, :3].astype(np.float64)
+        chain_hist = chain[1, :, :, :3].astype(np.float64)
+        single = load_output(single_path(f))
+        single_app = single[0, :, :, :3].astype(np.float64)
+
+        base_mse = float(np.mean((chain_app - ref_app) ** 2))
+        corr_app = apply_correction(chain_app, m_full, b_full, clip=True).astype(np.float64)
+        corr_mse = float(np.mean((corr_app - ref_app) ** 2))
+        corr_noclip = apply_correction(chain_app, m_full, b_full, clip=False).astype(np.float64)
+        corr_noclip_mse = float(np.mean((corr_noclip - ref_app) ** 2))
+        corr_loo_app = apply_correction(chain_app, m_loo, b_loo, clip=True).astype(np.float64)
+        corr_loo_mse = float(np.mean((corr_loo_app - ref_app) ** 2))
+
+        single_mse = float(np.mean((single_app - ref_app) ** 2))
+        single_corr = apply_correction(single_app, m_full, b_full, clip=True).astype(np.float64)
+        single_corr_mse = float(np.mean((single_corr - ref_app) ** 2))
+
+        # corrected history plane (unclipped float, same space as the FP16 history plane)
+        corr_hist = apply_correction(chain_hist, m_full, b_full, clip=False).astype(np.float64)
+        hist_delta = corr_hist - ref_hist
+        hist_vs_ref_psnr = psnr_from_mse(float(np.mean(hist_delta ** 2)))
+
+        corrected_files[f] = write_corrected_output(chain_path(f),
+                                                    CORRECTED_HISTORY_DIR / f"run-{f}/feedback-network.bin",
+                                                    m_full, b_full)
+
+        rows.append({
+            "frame": f,
+            "psnr_measured_chain_db": psnr_from_mse(base_mse),
+            "mse_measured_chain": base_mse,
+            "psnr_posterior_corrected_db": psnr_from_mse(corr_mse),
+            "mse_posterior_corrected": corr_mse,
+            "psnr_posterior_corrected_no_clip_db": psnr_from_mse(corr_noclip_mse),
+            "posterior_gain_db": psnr_from_mse(corr_mse) - psnr_from_mse(base_mse),
+            "psnr_posterior_corrected_loo_matrix_db": psnr_from_mse(corr_loo_mse),
+            "loo_matrix_gain_db": psnr_from_mse(corr_loo_mse) - psnr_from_mse(base_mse),
+            "psnr_single_captured_history_db": psnr_from_mse(single_mse),
+            "mse_single_captured_history": single_mse,
+            "psnr_single_corrected_db": psnr_from_mse(single_corr_mse),
+            "mse_single_corrected": single_corr_mse,
+            "corrected_history_mse_vs_reference_history": float(np.mean(hist_delta ** 2)),
+            "corrected_history_psnr_vs_reference_history_db": hist_vs_ref_psnr,
+            "corrected_history_range": [float(corr_hist.min()), float(corr_hist.max())],
+            "reference_history_range": [float(ref_hist.min()), float(ref_hist.max())],
+            "corrected_history_outside_unit_range": int(((corr_hist < 0.0) | (corr_hist > 1.0)).sum()),
+            "reference_history_outside_unit_range": int(((ref_hist < 0.0) | (ref_hist > 1.0)).sum()),
+            "corrected_output_file": {"path": str(CORRECTED_HISTORY_DIR / f"run-{f}/feedback-network.bin"),
+                                      **corrected_files[f],
+                                      "source": str(chain_path(f)),
+                                      "source_sha256": sha256_file(chain_path(f))},
+        })
+
+    posterior_mean = float(np.mean([r["psnr_posterior_corrected_db"] for r in rows]))
+    posterior_noclip_mean = float(np.mean([r["psnr_posterior_corrected_no_clip_db"] for r in rows]))
+    measured_mean = float(np.mean([r["psnr_measured_chain_db"] for r in rows]))
+    loo_mean = float(np.mean([r["psnr_posterior_corrected_loo_matrix_db"] for r in rows]))
+    single_corr_mean = float(np.mean([r["psnr_single_corrected_db"] for r in rows]))
+
+    # ------------------------------------------- 2. history distances per link
+    links = []
+    for idx, f in enumerate(CHAIN_FRAMES):
+        prev = FRAMES[idx]
+        fed_uncorr = load_output(chain_path(prev))[1, :, :, :3]
+        consumed = consumed_history(f)
+        ref_hist_prev = load_output(ref_path(prev))[1, :, :, :3]
+        fed_corr = np.fromfile(CORRECTED_HISTORY_DIR / f"run-{prev}/feedback-network.bin",
+                               dtype="<f4", count=PLANE_FLOATS,
+                               offset=PLANE_FLOATS * 4).reshape(H, WD, 4)[:, :, :3]
+        d_uncorr = rgb_rms(fed_uncorr, consumed)
+        d_corr = rgb_rms(fed_corr, consumed)
+        d_ref_self = rgb_rms(ref_hist_prev, consumed)  # must be ~0: capture history = FP16 output history
+        links.append({
+            "frame": f,
+            "predecessor_frame": prev,
+            "history_distance_uncorrected_rms": d_uncorr,
+            "history_distance_corrected_rms": d_corr,
+            "ratio_corrected_over_uncorrected": d_corr / d_uncorr if d_uncorr > 0 else None,
+            "reference_history_equals_consumed_rms": d_ref_self,
+            "uncorrected_history_psnr_vs_consumed_db": psnr_from_mse(d_uncorr ** 2),
+            "corrected_history_psnr_vs_consumed_db": psnr_from_mse(d_corr ** 2),
+        })
+
+    # ------------------------------------------------- 3. expected-gain model
+    # e_chain = e_intrinsic + e_history ; the single-frame arm measures e_intrinsic exactly.
+    # Assume the history-driven error energy scales with the squared history distance
+    # (first-order sensitivity), calibrated on the measured link, then evaluated at the
+    # corrected distance.  The assumption is explicit and falsifiable by the 7 jobs.
+    predictions = []
+    for idx, f in enumerate(FRAMES):
+        row = rows[idx]
+        if f == FRAMES[0]:
+            predicted_mse = row["mse_posterior_corrected"]
+            ratio = 1.0
+            extra = 0.0
+        else:
+            link = links[idx - 1]
+            ratio = link["ratio_corrected_over_uncorrected"]
+            extra = row["mse_measured_chain"] - row["mse_single_captured_history"]
+            predicted_mse = row["mse_single_corrected"] + max(extra, 0.0) * (ratio ** 2)
+        predictions.append({
+            "frame": f,
+            "history_distance_ratio": ratio,
+            "feedback_extra_mse_measured": extra,
+            "feedback_extra_mse_after_correction": max(extra, 0.0) * (ratio ** 2) if f != FRAMES[0] else 0.0,
+            "predicted_folded_mse": predicted_mse,
+            "predicted_folded_psnr_db": psnr_from_mse(predicted_mse),
+            "posterior_readout_psnr_db": row["psnr_posterior_corrected_db"],
+            "ceiling_single_corrected_psnr_db": row["psnr_single_corrected_db"],
+        })
+    pred_mean = float(np.mean([p["predicted_folded_psnr_db"] for p in predictions]))
+    pred_steady = float(np.mean([p["predicted_folded_psnr_db"] for p in predictions[-3:]]))
+
+    # ------------------------------------------------------- 4. stage + plans
+    built = []
+    if not args.no_build:
+        for f in CHAIN_FRAMES:
+            prev = f - 1
+            predecessor = {"frame": prev,
+                           "run_dir": CORRECTED_HISTORY_DIR / f"run-{prev}",
+                           "output_file": "feedback-network.bin"}
+            receipt = fp.build_frame(
+                SEQ, f, C64 / f"combo-{f}.txt", CORRECTED_STAGE_DIR,
+                CORRECTED_PLAN_DIR / f"plan-{f}.txt",
+                CORRECTED_RECEIPT_DIR / f"receipt-{f}.json",
+                CORRECTED_RUN_DIR / f"run-{f}",
+                output_name="feedback-network.bin", predecessor=predecessor,
+                reuse=True, geometry=geometry, geometry_evidence=geometry_evidence)
+            ins_all = [v for v in receipt["inputs"].values()
+                       if v["provenance"] == "PREDECESSOR_CANDIDATE_OUTPUT"]
+            ins = ins_all[0]
+            built.append({
+                "frame": f,
+                "plan": receipt["plan"]["path"],
+                "plan_sha256": receipt["plan"]["sha256"],
+                "receipt": str(CORRECTED_RECEIPT_DIR / f"receipt-{f}.json"),
+                "receipt_sha256": sha256_file(CORRECTED_RECEIPT_DIR / f"receipt-{f}.json"),
+                "composite_file": ins["file"],
+                "composite_sha256": ins["sha256"],
+                "composite_bytes": ins["bytes"],
+                "composite_inputs": [{"buffer": v["buffer"], "file": v["file"], "sha256": v["sha256"],
+                                      "bytes": v["bytes"], "changed_bytes": v["changed_bytes"],
+                                      "changed_span_in_plane": v["changed_span_in_plane"],
+                                      "bytes_outside_plane_changed": v["bytes_outside_plane_changed"]}
+                                     for v in ins_all],
+                "changed_bytes": sum(v["changed_bytes"] for v in ins_all),
+                "changed_span_in_plane": ins["changed_span_in_plane"],
+                "bytes_outside_plane_changed": sum(v["bytes_outside_plane_changed"] for v in ins_all),
+                "history_source": ins["history_source"],
+                "plan_validation_problems": receipt["plan"]["validation_problems"],
+                "policy_table_unchanged": receipt["plan"]["policy_table_unchanged"],
+                "bindings_unchanged": receipt["plan"]["bindings_unchanged"],
+                "history_directives_removed": receipt["plan"]["history_directives_removed"],
+                "out_dir": str(CORRECTED_RUN_DIR / f"run-{f}"),
+                "output_path": str(CORRECTED_RUN_DIR / f"run-{f}/feedback-network.bin"),
+            })
+
+    # ------------------------------------------------------------ 5. jobs
+    runner = str(fp.RUNNER)
+    lock = "@NR_GPU_WORKSPACE@/artifacts/parallel-port-20261013/GPU.lock"
+    jobs = []
+    audit = []
+    for f in CHAIN_FRAMES:
+        b = next((x for x in built if x["frame"] == f), None)
+        plan_path = (b["plan"] if b else str(CORRECTED_PLAN_DIR / f"plan-{f}.txt"))
+        plan_sha = b["plan_sha256"] if b else None
+        out_dir = str(CORRECTED_RUN_DIR / f"run-{f}")
+        receipt = str(CORRECTED_RECEIPT_DIR / f"receipt-{f}.json")
+        jobs.append({
+            "card": "S13-corrected-feedback",
+            "priority": 10,
+            "sequence": "corrected-feedback",
+            "frame": f,
+            "plan": Path(plan_path).as_posix(),
+            "out": Path(out_dir).as_posix(),
+            "plan_sha256": plan_sha,
+            "expected_output_sha256": None,
+            "output_name": "feedback-network.bin",
+            "dump": False,
+            "note": ("corrected-history replay: input history plane = 3x3+bias posterior applied to the "
+                     "measured feedback output of the predecessor frame; output is the UNCORRECTED network"),
+            "preflight_problems": [],
+            "ready": bool(b is not None),
+        })
+        audit.append({
+            "job_index": len(audit) + 1,
+            "frame": f,
+            "kind": "CORRECTED_HISTORY_OPEN_LOOP",
+            "plan": Path(plan_path).as_posix(),
+            "plan_sha256": plan_sha,
+            "receipt": Path(receipt).as_posix(),
+            "receipt_sha256": b["receipt_sha256"] if b else None,
+            "out_dir": Path(out_dir).as_posix(),
+            "output_path": Path(out_dir, "feedback-network.bin").as_posix(),
+            "composite_inputs": ({"file": b["composite_file"], "sha256": b["composite_sha256"],
+                                  "bytes": b["composite_bytes"], "changed_bytes": b["changed_bytes"],
+                                  "bytes_outside_plane_changed": b["bytes_outside_plane_changed"]}
+                                 if b else None),
+            "history_source": b["history_source"] if b else None,
+            "argv": [runner, "--plan", Path(plan_path).as_posix(), "--out", Path(out_dir).as_posix(),
+                     "--pool", "--warm", "0", "--reps", "1"],
+            "must_not_pass": ["--feedback"],
+            "expected_result": next(p for p in predictions if p["frame"] == f),
+            "reading_rule": ("measure the run output vs the captured FP16 output WITHOUT correction "
+                             "(history-side effect only) and WITH the same M,b applied offline "
+                             "(folded-equivalent reading)"),
+        })
+    queue = {
+        "schema": "dsh-gpu-queue/1",
+        "status": "NOT_RUN",
+        "runner": runner,
+        "lock": lock,
+        "authorization": ("NOT_ALLOCATED.  Prepared by S13 on 2026-10-29; no GPU slot was requested or granted "
+                          "for these jobs.  The coordinator must record the allocation here (replace this "
+                          "string) before the queue runner will accept the file."),
+        "jobs": jobs,
+        "ready": sum(1 for j in jobs if j["ready"]),
+        "blocked": sum(1 for j in jobs if not j["ready"]),
+        "note": ("7 jobs, open-loop corrected-history replay.  Out dirs are fresh (do not pre-create them).  "
+                 "See CORRECTED-FEEDBACK-SIM.json for the reading rules and the closed-loop upgrade."),
+    }
+
+    # ------------------------------------------------------------ 6. risks
+    verify_path = S13 / "CORRECTED-STAGING-VERIFY.json"
+    verify = None
+    if verify_path.is_file():
+        v = json.loads(verify_path.read_text(encoding="utf-8"))
+        verify = {"path": str(verify_path), "sha256": sha256_file(verify_path), "ok": v["ok"],
+                  "frames": [{"frame": r["frame"],
+                              "pre_changed_bytes": r["pre_bundle"]["changed_bytes_in_plane"],
+                              "post_changed_bytes": r["post_bundle"]["changed_bytes_in_plane"],
+                              "bytes_outside_plane_identical": bool(r["pre_bundle"]["bytes_before_plane_identical"]
+                                                                   and r["pre_bundle"]["bytes_after_plane_identical"]
+                                                                   and r["post_bundle"]["bytes_before_plane_identical"]
+                                                                   and r["post_bundle"]["bytes_after_plane_identical"]),
+                              "changed_plan_lines": r["changed_line_kinds"],
+                              "ok": r["ok"]} for r in v["checks_per_frame"]],
+                  "method": v["method"]}
+
+    out_of_range = [r["corrected_history_outside_unit_range"] for r in rows]
+    ref_out_of_range = [r["reference_history_outside_unit_range"] for r in rows]
+    risks = {
+        "in_sample_matrix": {
+            "gain_db_clipped": posterior_mean - measured_mean,
+            "gain_db_with_loo_matrix": loo_mean - measured_mean,
+            "overfit_gap_db": (posterior_mean - measured_mean) - (loo_mean - measured_mean),
+            "note": ("the +0.88 dB is fitted on the same 24 frames, 8 of them this sequence; the honest "
+                     "generalization reading is the leave-this-sequence-out matrix (+0.65 dB here)"),
+        },
+        "history_stage_correction_is_small": {
+            "history_distance_ratio_range": [min(l["ratio_corrected_over_uncorrected"] for l in links),
+                                             max(l["ratio_corrected_over_uncorrected"] for l in links)],
+            "history_driven_error_energy_removed_fraction": 1.0 - max(
+                l["ratio_corrected_over_uncorrected"] ** 2 for l in links),
+            "consequence": ("the corrected history is only ~9-11% closer to the history the frame actually "
+                            "consumed, so the feedback loop itself is barely improved; folding the colour "
+                            "correction does not remove the ~1.7 dB feedback gap"),
+        },
+        "history_out_of_distribution": {
+            "corrected_history_outside_unit_range_per_frame": out_of_range,
+            "reference_history_outside_unit_range_per_frame": ref_out_of_range,
+            "ratio_mean": float(np.mean(out_of_range)) / max(float(np.mean(ref_out_of_range)), 1.0),
+            "note": ("the corrected history pushes ~3x more values outside [0,1] than the FP16 reference "
+                     "history; range is similar otherwise, but this is an untested input-distribution shift"),
+        },
+        "scene_coverage": ("the fit uses only daytime street frames (3 clips).  Night / indoor / high-dynamic "
+                           "transitions are not covered by any correction estimate; do not generalize the dB gain"),
+        "open_loop_jobs": ("the 7 prepared jobs measure a one-step history effect, not the folded steady "
+                           "state; see closed_loop_protocol"),
+        "clip_order": ("folding into the 4x32 exit puts the correction before the [0,1] output clip; that "
+                       "variant is +0.02..0.03 dB better than the published no-clip readout and is what the "
+                       "primary numbers use"),
+    }
+    summary = {
+        "measured_chain_mean_psnr_db": measured_mean,
+        "posterior_output_only_mean_psnr_db_clipped": posterior_mean,
+        "posterior_output_only_mean_psnr_db_no_clip": posterior_noclip_mean,
+        "posterior_gain_db_clipped": posterior_mean - measured_mean,
+        "loo_matrix_gain_db": loo_mean - measured_mean,
+        "predicted_folded_mean_psnr_db": pred_mean,
+        "predicted_folded_steady_last3_psnr_db": pred_steady,
+        "single_frame_corrected_mean_psnr_db": single_corr_mean,
+        "residual_feedback_gap_db": single_corr_mean - pred_mean,
+        "uncorrected_feedback_gap_db": float(np.mean([r["psnr_single_captured_history_db"] for r in rows]))
+        - measured_mean,
+        "gpu_jobs_prepared": len(jobs),
+        "gpu_jobs_run": 0,
+    }
+
+    # ------------------------------------------------------------- 7. output
+    sim = {
+        "schema": 1,
+        "kind": "CORRECTED_FEEDBACK_SIMULATION",
+        "card": "S13",
+        "sequence": SEQ,
+        "frames": FRAMES,
+        "generated_by": "S13-quality/corrected_feedback_sim.py",
+        "gpu_executed": False,
+        "correction": {
+            "form": "y' = y @ C[:3] + C[3], i.e. 3x3 matrix + 3 bias (12 parameters); rows of C[:3] are indexed by input channel, columns by output channel; applied in output RGB space, peak=1",
+            "source": "reports/OUTPUT-CORRECTION-STUDY.json",
+            "matrix_full_fit": full_rows,
+            "matrix_loo_excluding_this_sequence": loo_fold["matrix"],
+            "primary_matrix": "full_fit (in-sample on this sequence: the +0.86 dB figure is NOT a generalization estimate)",
+            "application": ("output plane 0 (application, clipped to [0,1] after correction) and output plane 1 "
+                            "(history, NOT clipped: the FP16 history plane is unclipped float)"),
+            "alpha": "channel 3 untouched on both planes",
+        },
+        "posterior_upper_bound": {
+            "definition": ("M,b applied offline to the ALREADY MEASURED 8-frame chain outputs; the history path is "
+                           "not re-run, so this assumes the correction can be taken at the very end without "
+                           "changing what the network consumed next"),
+            "mean_psnr_db_clipped": posterior_mean,
+            "mean_psnr_db_no_clip": posterior_noclip_mean,
+            "measured_chain_mean_psnr_db": measured_mean,
+            "mean_gain_db_clipped": posterior_mean - measured_mean,
+            "mean_gain_db_no_clip": posterior_noclip_mean - measured_mean,
+            "primary_variant": ("clipped: folding into the 4x32 exit weights puts M,b before the [0,1] output "
+                                "boundary, so the application plane is clipped after correction (+0.02..0.03 dB)"),
+            "per_frame": [{k: r[k] for k in ("frame", "psnr_measured_chain_db", "psnr_posterior_corrected_db",
+                                            "psnr_posterior_corrected_no_clip_db", "posterior_gain_db")}
+                          for r in rows],
+            "same_fit_but_loo_matrix_mean_psnr_db": loo_mean,
+            "same_fit_but_loo_matrix_mean_gain_db": loo_mean - measured_mean,
+            "reproduction_check": {
+                "published_mean_psnr_db_no_clip": 28.5308,
+                "recomputed_mean_psnr_db_no_clip": posterior_noclip_mean,
+                "matches_no_clip": abs(posterior_noclip_mean - 28.5308) < 5e-4,
+                "note": ("the published FEEDBACK-CORRECTION-STUDY applied the correction without clipping; that "
+                         "variant reproduces to <1e-6 dB, so the matrix and its orientation are confirmed"),
+            },
+        },
+        "folded_rerun_expectation": {
+            "distinction": ("NOT measured.  The 7 GPU jobs feed corrected history but still run the uncorrected "
+                            "network; the folded-weights re-run does not exist yet (S03 owns the folding decision)."),
+            "model": ("MSE_folded(k) ~= MSE_single_corrected(k) + (MSE_chain(k) - MSE_single(k)) * r_k^2, "
+                      "where r_k = corrected/uncorrected history-distance to the history frame k actually "
+                      "consumed.  Assumes the history-driven error energy scales with the squared history "
+                      "distance and that the correction transfers from captured-history to chain-history inputs."),
+            "predicted_mean_psnr_db": pred_mean,
+            "predicted_steady_last3_psnr_db": pred_steady,
+            "band_low_posterior_only_db": posterior_mean,
+            "band_high_single_frame_corrected_db": single_corr_mean,
+            "per_frame": predictions,
+            "caveat": ("the band is a plausibility range, not a bound: a corrected history that leaves the FP16 "
+                       "history distribution could in principle hurt more than it helps"),
+        },
+        "history_links": links,
+        "per_frame": rows,
+        "summary": summary,
+        "risks": risks,
+        "independent_verification": verify,
+        "gpu_jobs": {"count": len(jobs), "run": 0, "prepared": len(built),
+                     "file": str(args.jobs_out)},
+        "staging": {
+            "builder": "S13-quality/feedback_plan.py build_frame (planlib set_buffer/set_output/validate/diff)",
+            "geometry": geometry.to_json(),
+            "geometry_evidence": geometry_evidence,
+            "jobs": built,
+            "all_plans_validated": bool(built) and all(not b["plan_validation_problems"] for b in built),
+            "all_outside_plane_bytes_zero": bool(built) and all(b["bytes_outside_plane_changed"] == 0 for b in built),
+            "note": ("each composite is the frame's own captured pre/post with only the 14745600-byte history "
+                     "plane replaced; the plans differ from the frozen candidate plan only in the two BUFFER "
+                     "files and the OUTPUT name"),
+        },
+        "closed_loop_protocol": {
+            "why": ("the 7 prepared jobs are OPEN LOOP: every composite uses the corrected history of the "
+                    "*measured* predecessor output.  A real folded chain feeds C(new output) forward, so the "
+                    "steady state needs one rebuild after each run."),
+            "steps": [
+                "run job 1 (34190) unchanged - its input is already C(h_34189), so open loop and closed loop agree there",
+                "python corrected_feedback_sim.py --rebuild-from corrected-runs/run-34190 --rebuild-frame 34190 "
+                "-> corrected-loop/run-34190/feedback-network.bin",
+                "python feedback_plan.py build --sequence day-street-static-formal-01 --frame 34191 "
+                "--prev-run corrected-loop/run-34190 --prev-frame 34190 --prev-output-name feedback-network.bin "
+                "--stage-dir corrected-loop-staged --plan-out corrected-loop-plans/plan-34191.txt "
+                "--receipt corrected-loop-receipts/receipt-34191.json --out-run corrected-loop-runs/run-34191",
+                "run that plan, then repeat the last two steps for 34192..34196",
+            ],
+            "cost": "6 extra CPU steps (rebuild + build, ~1 min each); still 7 GPU runs in total, no extra run",
+            "divergence_point": ("frames 34191..34196 in the prepared open-loop jobs would be superseded; use the "
+                                 "corrected-loop-* directories so the prepared plans stay reproducible"),
+            "status": "NOT_DONE",
+        },
+        "verdict": {
+            "quality_accepted": False,
+            "feedback_stable": False,
+            "correction_folded": False,
+            "claim_boundary": ("CPU/offline.  No GPU run, no timing, no game, no weight edit.  Every number is "
+                               "versus the captured FP16 output, not truth.  The posterior number is in-sample "
+                               "on this sequence; the LOO-matrix number is the honest generalization reading."),
+        },
+        "reproduce": f'"{sys.executable}" -X utf8 "{Path(__file__).as_posix()}"',
+    }
+    args.sim_out.write_text(json.dumps(sim, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    jobs_doc = {
+        "schema": 1,
+        "kind": "CORRECTED_FEEDBACK_GPU_JOBS",
+        "card": "S13",
+        "gpu_executed": False,
+        "job_count": len(jobs),
+        "authorization": queue["authorization"],
+        "semantics": ("OPEN_LOOP_CORRECTED_HISTORY: each job's input history = M,b applied to the measured "
+                      "feedback output of the predecessor frame.  Not a closed feedback chain and not the "
+                      "folded-weights candidate.  See CORRECTED-FEEDBACK-SIM.json -> closed_loop_protocol."),
+        "serial_protocol": ("one exclusive GPU.lock holder; jobs may run in any order because their inputs are "
+                            "already staged, but the executor should still run them serially and record plan/"
+                            "output/receipt sha256 per job"),
+        "queue": queue,
+        "jobs": audit,
+        "files": {
+            "runner": runner,
+            "lock": lock,
+            "candidate_plan_dir": str(C64),
+            "corrected_history_dir": str(CORRECTED_HISTORY_DIR),
+            "stage_dir": str(CORRECTED_STAGE_DIR),
+            "plan_dir": str(CORRECTED_PLAN_DIR),
+            "receipt_dir": str(CORRECTED_RECEIPT_DIR),
+            "run_dir": str(CORRECTED_RUN_DIR),
+        },
+        "not_run_reason": "prepared for the main executor; this card must not run GPU or touch GPU.lock",
+    }
+    args.jobs_out.write_text(json.dumps(jobs_doc, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # runner-ready queue in the exact dsh-gpu-queue/1 schema (authorization still NOT_ALLOCATED)
+    queue_path = S13 / "CORRECTED-FEEDBACK-QUEUE.json"
+    queue_path.write_text(json.dumps(queue, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    print(json.dumps({
+        "sim": str(args.sim_out), "jobs": str(args.jobs_out),
+        "measured_mean": measured_mean, "posterior_mean": posterior_mean,
+        "posterior_noclip_mean": posterior_noclip_mean,
+        "posterior_gain": posterior_mean - measured_mean,
+        "loo_matrix_mean": loo_mean, "loo_gain": loo_mean - measured_mean,
+        "single_corrected_mean": single_corr_mean,
+        "predicted_folded_mean": pred_mean, "predicted_steady": pred_steady,
+        "history_ratio": [round(l["ratio_corrected_over_uncorrected"], 4) for l in links],
+        "reference_history_equals_consumed_max_rms": max(l["reference_history_equals_consumed_rms"] for l in links),
+        "built": len(built), "jobs": len(jobs),
+    }, indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

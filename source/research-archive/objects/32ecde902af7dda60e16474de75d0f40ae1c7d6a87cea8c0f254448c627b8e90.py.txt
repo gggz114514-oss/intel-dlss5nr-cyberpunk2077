@@ -1,0 +1,101 @@
+"""S01: build self-contained candidate plans with planlib (no string replacement).
+
+Arms
+  candidate-local-b4.txt        local block-4 arm: same FP16 teacher input, output skip4
+  candidate-<frame>.txt         full-network combo (3 frames) = frozen combo + block-4 swap
+  oracle-local-b4-debug.txt     diagnostic arm: block-4 debug stores ON + swin_4_debug OUTPUT
+"""
+import hashlib
+import json
+import shlex
+from pathlib import Path
+
+import sys
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/tools")
+from planlib import Plan, sha256_file  # noqa: E402
+
+B = Path(r"@NR_WORKSPACE@")
+D = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+HERE = Path(__file__).resolve().parent
+PACK = HERE / "PACK"
+SRC = HERE / "SOURCE"
+W8 = (PACK / "c32_block4_xe_weights.i8.bin").as_posix()
+FSC = (PACK / "c32_block4_xe_scales.f32.bin").as_posix()
+SPV = (SRC / "c32_b4_xe.spv").as_posix()
+ORD = 4
+
+log = {}
+
+
+def swap_block4(plan_path, out_path, spv=SPV, w8=W8, fsc=FSC, fsc_bytes=1808):
+    p = Plan(plan_path)
+    before = {"sha256": p.sha256(), "spv": p.dispatch(ORD).spv,
+              "scales": p.buffer("c32_block4_unified_scales").file,
+              "scales_bytes": p.buffer("c32_block4_unified_scales").bytes,
+              "weights": p.buffer("c32_block4_unified_weights").file}
+    changes = []
+    changes.append(p.set_spv(ORD, spv, name="block4_swin_body_1"))
+    changes.append(p.set_buffer("c32_block4_unified_weights", file=w8))
+    changes.append(p.set_buffer("c32_block4_unified_scales", file=fsc, bytes_=fsc_bytes))
+    p.assert_valid()
+    p.write(out_path, check=False)
+    after = Plan(out_path)
+    after.assert_valid()
+    return {
+        "out": str(out_path).replace("\\", "/"),
+        "out_sha256": sha256_file(out_path),
+        "base": str(plan_path).replace("\\", "/"),
+        "base_sha256": before["sha256"],
+        "block4_before": before,
+        "changes": changes,
+        "diff_buffers": [b.name for b in after.buffers
+                         if b.name in ("c32_block4_unified_scales", "c32_block4_unified_weights")],
+        "spv_sha256": sha256_file(spv),
+        "fsc_sha256": sha256_file(fsc),
+        "w8_sha256": sha256_file(w8),
+    }
+
+
+def add_output(plan_path, out_path, buffer_index, fmt, filename):
+    """Insert one OUTPUT row (kept contiguous, before POLICY) and fix the header count."""
+    p = Plan(plan_path)
+    text = Path(plan_path).read_text()
+    lines = text.splitlines()
+    last_out = max(o[3] for o in p.outputs)
+    lines.insert(last_out + 1, f'OUTPUT {buffer_index} {fmt} "{filename}"')
+    hdr = lines[p.header_line].split()
+    hdr[4] = str(len(p.outputs) + 1)
+    lines[p.header_line] = " ".join(hdr)
+    nl = "\r\n" if "\r\n" in text else "\n"
+    Path(out_path).write_text(nl.join(lines) + (nl if text.endswith(("\n", "\r\n")) else ""))
+    q = Plan(out_path)
+    q.assert_valid()
+    return {"out": str(out_path).replace("\\", "/"), "out_sha256": sha256_file(out_path),
+            "outputs": [list(o[:3]) for o in q.outputs], "base_sha256": p.sha256()}
+
+
+# 1) local arm on the current best block-4 arm (X-equalised reference)
+log["local_b4"] = swap_block4(D / "c32-equalized-b4/local-b4.txt", HERE / "candidate-local-b4.txt")
+print("local-b4 ", log["local_b4"]["out_sha256"][:16])
+
+# 2) frozen full-network combos
+for frame in (34189, 41444, 43654):
+    r = swap_block4(D / f"c64-family-static/combo-{frame}.txt", HERE / f"candidate-{frame}.txt")
+    log[f"combo_{frame}"] = r
+    print(f"combo-{frame}", r["out_sha256"][:16], "base", r["base_sha256"][:16])
+
+# 3) oracle arm: block-4 debug stores on, swin_4_debug exported
+tmp = HERE / "tmp-oracle-base.txt"
+p = Plan(D / "c32-minmax/local-b4.txt")
+p.set_push_word(ORD, 2, 1)          # p0.z = debug flag
+p.assert_valid()
+p.write(tmp, check=False)
+r = add_output(tmp, HERE / "oracle-local-b4-debug.txt", 16, "raw", "swin_4_debug.bin")
+r["note"] = ("debug=1 writes dbg[0:8192]=post-activation E (t0*128 + channel, stride 128), "
+             "dbg[8192:10240]=Y, 10240 Q, 12288 K, 14336 P, 18432 ctx, 20480 O, 22528 X; "
+             "64 tokens per workgroup (4 subgroups x 16 columns).")
+log["oracle_debug"] = r
+tmp.unlink()
+print("oracle    ", r["out_sha256"][:16])
+
+(HERE / "PLANS.json").write_text(json.dumps(log, indent=2))

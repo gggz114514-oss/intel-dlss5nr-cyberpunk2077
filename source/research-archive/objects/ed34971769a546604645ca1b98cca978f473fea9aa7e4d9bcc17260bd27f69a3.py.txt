@@ -1,0 +1,369 @@
+"""n32-f05-aluwr task A: dependency graph + L24-weighted ALUWR price for the three
+F05 shader groups (C64 8 PASS / C128 12 PASS / C256 16 PASS).
+
+Identity (chain head accepted/n29-f01-alu-chain-20261027):
+  c64  -> f05-kv-consumer-layout/family/c64/candidate.spv  sha 0d83192b5368...
+  c128 -> f05-kv-consumer-layout/family/c128/candidate.spv sha 20f4074fc70c...
+  c256 -> cards/n05a-f05-c256-mreuse/candidate.spv          sha 7a9576d15a18...
+ISA: queue/n29-f01-alu-chain/native/captures/native-native-base/ISA (one batch,
+base and cand arms byte-identical for all three F05 kernels).
+
+Definitions (all recomputable):
+  live    every instruction outside the (W&~f2.0) jmpi debug spans (debug==0)
+  edge    use -> reaching definition of the same dword
+  sink    every live send that writes memory
+  chain   union of live backward slices from the sinks; side = live minus chain
+  depth   longest dependent path (1 per edge); weighted depth uses LAT
+  N(p)    per-lane independent chains: greedy def-use path cover, then the number of
+          disjoint chains whose [min_addr,max_addr] extent covers p; max over p.
+  price   L24 class weights (inv/rsqt 30, dpas 6, send.slm 12, mul/mad 2, add/sel/cmp 1,
+          mov 0.3, sync.nop 0.1) applied to the *live ALU* ops only, because ALUWR is
+          the ALU write-back wait (send waits are SENDWR).
+
+ms model: ALUWR is measured per PASS (evidence/STALL-TARGETS.json, 35 clean F05 rows:
+c64 0.3258 ms / 8 PASS, c128 0.3137 / 12, c256 0.2890 / 15).  Within a kernel the
+measured ALUWR is split over its live weighted ALU ops, so
+    ms(delete class X in group k, per PASS) = ALUWR_k/PASS * W(X) / W(k,ALU)
+"""
+import json, sys, hashlib
+from collections import Counter, defaultdict
+from pathlib import Path
+
+HERE = Path(__file__).parent
+CAMP = HERE.parent.parent
+sys.path.insert(0, str(CAMP))
+sys.path.insert(0, str(HERE))
+import ISA  # noqa: E402
+import _regions as R  # noqa: E402
+
+OUT = HERE / "A-AUDIT.json"
+
+# measured, evidence/STALL-TARGETS.json (clean rows only); block48 has no stall row
+MEAS = {
+    "c64": dict(rows=8, aluwr=0.325758, note="block5..8,62..65"),
+    "c128": dict(rows=12, aluwr=0.313742, note="block9..14,56..61"),
+    "c256": dict(rows=16, aluwr=0.289025, note="block15..22,49..55 (15 rows); block48/ord169 has no stall row, priced at the c256 mean"),
+}
+TYPE_W = {"ud": 1, "d": 1, "w": 1, "uw": 1, "f": 1, "v": 1, "hf": 0.5,
+          "q": 2, "uq": 2, "df": 2, "b": 0.25, "ub": 0.25, "bf": 0.25}
+LAT = {"mul": 5, "mad": 5, "macl": 5, "mach": 5, "fma": 5, "dpas.8x8": 8,
+       "math.inv": 12, "math.rsqt": 12, "math.sqrt": 12, "math.log": 12,
+       "math.exp": 12, "rndd": 6, "rndu": 6, "rnde": 6, "rndz": 6, "frc": 6,
+       "add": 4, "add3": 4, "sub": 4, "shl": 4, "shr": 4, "asr": 4, "and": 4,
+       "or": 4, "xor": 4, "not": 4, "bfn.0xFE": 4, "bfn.0xF8": 4, "cmp": 4,
+       "sel": 4, "min": 4, "max": 4, "mov": 1, "movf": 1, "sync.nop": 0,
+       "send.ugm": 20, "send.slm": 20, "send.gtwy": 20, "illegal": 0,
+       "jmpi": 0, "goto": 0, "join": 1, "sync.allrd": 4, "sync.allwr": 4,
+       "sync.bar": 4}
+WEIGHT = {"math.inv": 30, "math.rsqt": 30, "math.log": 30, "math.exp": 30,
+          "dpas.8x8": 6, "send.slm": 12, "send.ugm": 12, "sync.bar": 12,
+          "sync.allwr": 8, "sync.allrd": 6, "fma": 2, "mad": 2, "mul": 2,
+          "add": 1, "add3": 1, "sel": 1, "cmp": 1, "mov": 0.3, "and": 1,
+          "or": 1, "shl": 1, "shr": 1, "bfn.0xFE": 1, "bfn.0xF8": 1,
+          "sync.nop": 0.1, "illegal": 1}
+DPAS_DST, DPAS_AB = 4, 8
+
+
+def exec_size(flags, default=32):
+    import re
+    m = re.search(r"\((\d+)\|M\d+\)", flags or "")
+    return int(m.group(1)) if m else default
+
+
+def region_spec(op):
+    import re
+    m = re.search(r"<(\d+);(\d+),(\d+)>", op)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def elem_type(op):
+    import re
+    m = re.search(r":([a-z0-9]+)\s*$", op)
+    return m.group(1) if m else None
+
+
+def grf_suffix(op):
+    import re
+    m = re.search(r"^[ra]?\d+(?:\.\d+)?:(\d+)$", op.strip())
+    return int(m.group(1)) if m else None
+
+
+def reg_base(op):
+    import re
+    o = op.lstrip("-").replace("(abs)", "").strip()
+    m = re.match(r"^r(\d+)\.(\d+)", o)
+    if m:
+        return ("r", int(m.group(1)), int(m.group(2)))
+    m = re.match(r"^r(\d+)(?![\d.])", o)
+    if m:
+        return ("r", int(m.group(1)), 0)
+    m = re.match(r"^acc(\d+)\.(\d+)", o)
+    if m:
+        return ("acc", int(m.group(1)), int(m.group(2)))
+    return None
+
+
+def span_of(op, flags, opcode):
+    """dwords written/read per lane.
+
+    One lane of an Xe SIMD instruction touches one register dword per operand
+    unless the operand is an explicit GRF region (`r11:4` = 4 GRF = 32 dwords) or
+    a dpas accumulator/A/B tile.  The `<v;w,h>` suffix is a swizzle, not a width.
+    """
+    g = grf_suffix(op)
+    if g is not None:
+        return max(1, g * 8)
+    if opcode.startswith("dpas"):
+        return DPAS_DST
+    return 1
+
+
+def is_send(ins):
+    return ins["op"].startswith("send")
+
+
+def classify(ins):
+    import re
+    op, ops, com = ins["op"], ins["ops"], ins["comment"] or ""
+    w, r = [], []
+    if is_send(ins):
+        store = "store." in com or "fence" in com
+        if store:
+            if len(ops) > 2:
+                b = reg_base(ops[2])
+                if b:
+                    r.append((b[0], b[1], b[2], span_of(ops[2], ins["flags"], op)))
+        else:
+            if ops:
+                b = reg_base(ops[0])
+                if b:
+                    g = grf_suffix(ops[0])
+                    n = max(1, g * 8) if g is not None else span_of(ops[0], ins["flags"], op)
+                    w.append((b[0], b[1], b[2], n))
+        for o in ops:
+            if re.match(r"^a0\.\d+", o):
+                r.append(("a0", 0, 0, 2))
+        return w, r
+    if op.startswith("dpas"):
+        if ops:
+            b = reg_base(ops[0])
+            if b:
+                w.append((b[0], b[1], b[2], 4))
+        for o in ops[2:4]:
+            b = reg_base(o)
+            if b:
+                r.append((b[0], b[1], b[2], DPAS_AB))
+        return w, r
+    if not ops:
+        return w, r
+    if ops[0] != "null":
+        b = reg_base(ops[0])
+        if b:
+            w.append((b[0], b[1], b[2], span_of(ops[0], ins["flags"], op)))
+        else:
+            m = re.match(r"^f(\d)\.(\d)<", ops[0])
+            if m:
+                w.append(("f", int(m.group(1)), int(m.group(2)), 1))
+    for o in ops[1:]:
+        if o.startswith("null"):
+            continue
+        b = reg_base(o)
+        if b:
+            r.append(("a0", 0, 0, 2) if b[0] == "a0" else (b[0], b[1], b[2],
+                                                           span_of(o, ins["flags"], op)))
+    for o in ops:
+        if re.match(r"^a0\.\d+", o) and not any(x[0] == "a0" for x in r):
+            r.append(("a0", 0, 0, 2))
+    return w, r
+
+
+def load(width):
+    """Rich ISA dicts (ISA.parse) + the debug-skip mask of _regions.classify."""
+    fs = list(R.CAP.glob("CS_asm%s*" % R.KERN[width]))
+    assert len(fs) == 1, fs
+    path = fs[0]
+    isa = ISA.parse(path)
+    rins, labels = R.load(width)
+    rins, guard = R.classify(width, rins, labels)
+    live_by_addr = {it["addr"]: it["live"] for it in rins}
+    for i, it in enumerate(isa):
+        it["idx"] = i
+        it["live"] = live_by_addr.get(it["addr"], True)
+        it["w"], it["r"] = classify(it)
+    by_dw = defaultdict(list)
+    for it in isa:
+        for f, no, dw, n in it["w"]:
+            for d in range(dw, dw + n):
+                by_dw[(f, no, d)].append(it["idx"])
+    for v in by_dw.values():
+        v.sort()
+    return isa, by_dw, guard, path
+
+
+def reaching(by_dw, key, idx):
+    lst = by_dw.get(key)
+    if not lst:
+        return None
+    hit = None
+    for w in lst:
+        if w < idx:
+            hit = w
+        else:
+            break
+    return hit
+
+
+def analyse(width):
+    ins, by_dw, guard, path = load(width)
+    live = [i for i in ins if i["live"]]
+    live_idx = {i["idx"] for i in live}
+
+    def par(k):
+        out = set()
+        for f, no, dw, cnt in ins[k]["r"]:
+            for d in range(dw, dw + cnt):
+                p = reaching(by_dw, (f, no, d), k)
+                if p is not None and p in live_idx:
+                    out.add(p)
+        return out
+
+    sinks = [i["idx"] for i in live if is_send(i) and
+             ("store." in (i["comment"] or "") or "signal barrier" in (i["comment"] or "")
+              or "end of thread" in (i["comment"] or ""))]
+    chain, stack = set(), list(sinks)
+    while stack:
+        k = stack.pop()
+        if k in chain:
+            continue
+        chain.add(k)
+        stack.extend(par(k))
+    side = live_idx - chain
+
+    memo, wmemo = {}, {}
+    for k in sorted(live_idx, key=lambda k: ins[k]["addr"]):
+        ps = par(k)
+        memo[k] = 1 + max((memo.get(p, 0) for p in ps), default=0)
+        wmemo[k] = LAT.get(ins[k]["op"], 4) + max((wmemo.get(p, 0) for p in ps), default=0)
+
+    order = sorted(chain, key=lambda k: ins[k]["addr"])
+    owner, chains = {}, []
+    for k in order:
+        cand = None
+        for p in sorted(par(k), reverse=True):
+            if p in owner:
+                cand = owner[p]
+                break
+        if cand is None:
+            cand = len(chains)
+            chains.append(dict(id=cand, lo=ins[k]["addr"], hi=ins[k]["addr"], n=0, ops=Counter()))
+        owner[k] = cand
+        c = chains[cand]
+        c["n"] += 1
+        c["lo"] = min(c["lo"], ins[k]["addr"])
+        c["hi"] = max(c["hi"], ins[k]["addr"])
+        c["ops"][ins[k]["op"]] += 1
+    ev = []
+    for c in chains:
+        ev.append((c["lo"], 1))
+        ev.append((c["hi"] + 1, -1))
+    ev.sort()
+    cur = best = 0
+    best_at = 0
+    for a, d in ev:
+        cur += d
+        if cur > best:
+            best, best_at = cur, a
+
+    def tab(s):
+        return Counter(ins[k]["op"] for k in s)
+
+    # ---- L24 price over live ALU ops (sends excluded: those are SENDWR)
+    alu = [k for k in live_idx if not is_send(ins[k]) and not ins[k]["op"].startswith("sync")]
+    price = defaultdict(lambda: [0, 0.0, 0, 0])
+    for k in alu:
+        op = ins[k]["op"]
+        w = WEIGHT.get(op, 1.0)
+        price[op][0] += 1
+        price[op][1] += w
+        if k in chain:
+            price[op][2] += 1
+            price[op][3] += w
+    w_alu = sum(v[1] for v in price.values())
+    w_chain = sum(v[3] for v in price.values())
+    a = MEAS["c%d" % width]
+    aluwr_pass = a["aluwr"] / a["rows"]
+
+    def ms_all(wclass):
+        return aluwr_pass * wclass / w_alu
+
+    rows = []
+    for op, (n, w, cn, cw) in sorted(price.items(), key=lambda kv: -kv[1][1]):
+        rows.append(dict(op=op, live=n, weight=round(w, 1), chain_n=cn, chain_weight=round(cw, 1),
+                         ms_all_per_pass=round(ms_all(w), 5),
+                         ms_all_family=round(ms_all(w) * a["rows"], 5),
+                         ms_one_family=round(ms_all(WEIGHT.get(op, 1.0)) * a["rows"], 6),
+                         on_chain_pct=round(100.0 * cw / w, 1) if w else 0.0))
+
+    # ---- long-latency islands: rsqt/inv and the distance to first consumer
+    ll = [k for k in live_idx if ins[k]["op"] in ("math.rsqt", "math.inv")]
+    islands = []
+    for k in sorted(ll, key=lambda k: ins[k]["addr"]):
+        users = [j for j in live_idx if j > k and k in par(j)]
+        nxt = min(users) if users else None
+        # independent work between this op and its first consumer
+        gap = [j for j in sorted(live_idx) if k < j < (nxt if nxt is not None else k + 1)]
+        islands.append(dict(addr=hex(ins[k]["addr"]), op=ins[k]["op"],
+                            first_use_gap=len(gap),
+                            first_use=hex(ins[nxt]["addr"]) if nxt is not None else None))
+
+    seg = []
+    marks = [i for i in live if i["op"] in ("dpas.8x8", "send.slm", "sync.bar",
+                                           "math.rsqt", "math.inv", "sync.allwr")]
+    return dict(
+        width=width, guard=guard, isa_path=path,
+        isa=str(path), isa_sha=hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+        live=len(live), dead=len(ins) - len(live), total=len(ins),
+        sinks=len(sinks),
+        chain=len(chain), side=len(side),
+        chain_pct=round(100.0 * len(chain) / len(live), 2),
+        depth=int(max(memo[k] for k in chain)),
+        depth_weighted=int(max(wmemo[k] for k in chain)),
+        chains=len(chains), max_concurrent=best, max_concurrent_at=hex(best_at),
+        w_alu=round(w_alu, 1), w_chain=round(w_chain, 1),
+        aluwr_pass=round(aluwr_pass, 6), rows=a["rows"], aluwr_family=round(a["aluwr"], 6),
+        price=rows,
+        islands=islands,
+        op_live=dict(tab(live_idx).most_common()),
+        op_chain=dict(tab(chain).most_common()),
+        op_side=dict(tab(side).most_common()),
+        wdeepest=[[wmemo[k], hex(ins[k]["addr"]), ins[k]["op"]]
+                  for k in sorted(chain, key=lambda k: -wmemo[k])[:10]],
+    )
+
+
+if __name__ == "__main__":
+    out = {}
+    for w in (64, 128, 256):
+        r = analyse(w)
+        out["c%d" % w] = r
+        print("=" * 78)
+        print("c%-3d live %d (debug-skipped %d)  sinks %d" %
+              (w, r["live"], r["dead"], r["sinks"]))
+        print("      chain %d (%.1f%%)  side %d  depth %d  weighted %d" %
+              (r["chain"], r["chain_pct"], r["side"], r["depth"], r["depth_weighted"]))
+        print("      chains %d   max concurrent per lane %d at %s" %
+              (r["chains"], r["max_concurrent"], r["max_concurrent_at"]))
+        print("      W(ALU)=%.0f  W(chain)=%.0f  ALUWR %.4f ms/PASS x %d PASS" %
+              (r["w_alu"], r["w_chain"], r["aluwr_pass"], r["rows"]))
+        print("  %-12s %5s %7s %6s %8s %9s %9s" %
+              ("op", "live", "weight", "chain", "chainW", "ms/PASS", "ms/family"))
+        for p in r["price"][:14]:
+            print("  %-12s %5d %7.1f %6d %8.1f %9.5f %9.5f" %
+                  (p["op"], p["live"], p["weight"], p["chain_n"], p["chain_weight"],
+                   p["ms_all_per_pass"], p["ms_all_family"]))
+        print("  long-latency islands (rsqt/inv): %d" % len(r["islands"]))
+        print("   " + " ".join("%s@%s+%d" % (i["op"][5:], i["addr"], i["first_use_gap"])
+                               for i in r["islands"]))
+        print("  weighted-deepest:", r["wdeepest"][:5])
+    OUT.write_text(json.dumps(out, indent=1, default=str), encoding="utf-8")
+    print("\nwrote", OUT)

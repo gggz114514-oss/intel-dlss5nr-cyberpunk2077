@@ -1,0 +1,50 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,shlex
+R=Path(__file__).resolve().parent;A=R.parent;B=A.parents[1];P=R/'f20-score-owner';N=R/'family-norm-owner';N.mkdir(exist_ok=True)
+S=B/'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1/source'
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+ return r.stdout
+families=[('body',A/'c32-feed-owner-20261025/kv-tile',7),('f01',A/'c32-entry-chain-20261025/f01-residual',1),('f2',A/'c32-entry-chain-20261025/f2-direct',1)]
+plantext=(P/'plan.txt').read_text();passes=[shlex.split(l) for l in plantext.splitlines() if l.startswith('PASS ')];stats=json.loads((P/'run/resource-score-owner/pipeline-statistics.json').read_text())
+# Ordered XOR reduction yields exactly the same tree in every lane of each16-lane row.
+values=[('seed',i) for i in range(16)]
+for mask in [8,4,2,1]:values=[('add',values[i] if not i&mask else values[i^mask],values[i^mask] if not i&mask else values[i]) for i in range(16)]
+assert all(x==values[0] for x in values)
+old='return f16vec2(float16_t(inversesqrt(max(float(q),float(float16_t(0.000062))))),float16_t(inversesqrt(max(float(k),float(float16_t(0.000062))))));}'
+new='''// Every16-lane row already has bit-identical ordered q/k sums.
+bool q_owner=(col&1u)==0u;
+float v=q_owner?float(q):float(k);
+float16_t own=float16_t(inversesqrt(max(v,float(float16_t(0.000062)))));
+float16_t peer=unpackFloat2x16(subgroupShuffleXor(packFloat2x16(f16vec2(own,float16_t(0.0))),1u)).x;
+return q_owner?f16vec2(own,peer):f16vec2(peer,own); }'''
+rows=[]
+for name,parent,count in families:
+ d=N/name;d.mkdir(exist_ok=True);s=(parent/'candidate.comp').read_text(encoding='utf-8-sig');assert s.count(old)==1
+ src=d/'candidate.comp';spv=d/'candidate.spv';src.write_text(s.replace(old,new),encoding='utf-8')
+ run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(S),src,'-o',spv])
+ pm=ST.Module(parent/'candidate.spv');cm=ST.Module(spv);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[]);assert len(keep)==len(ST.no_contraction_ids(pm))
+ ST.set_no_contraction(cm,set(keep),spv);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+ indices=[i for i,p in enumerate(passes) if p[3]==(parent/'candidate.spv').as_posix()];assert len(indices)==count,(name,indices)
+ plan=d/'plan.txt';plan.write_text(plantext.replace((parent/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8')
+ for kind in ['GATES','NATIVE']:
+  task=json.loads((P/f'LUNA-{kind}.json').read_text().replace('f20-score-owner','family-norm-owner/'+name));task['identities']=[x for x in task['identities'] if not x['path'].endswith('.spv')]+[ident(spv),ident(S/'register_handoff.glsl')]
+  # Replacement with slash is appropriate for paths, but IDs/profile names must be flat.
+  for j in task['jobs']:
+   j['id']=j['id'].replace('family-norm-owner/'+name,'family-'+name);j['candidate']=name;j['plan']=ident(plan);j['runner_output']=str(d/'run'/j['id']);j['argv'][j['argv'].index('--out')+1]=j['runner_output']
+   if kind=='NATIVE':
+    j['argv'][j['argv'].index('--profile_dir')+1]=j['id'];j['argv'][j['argv'].index('--output_dir')+1]=str(d/'captures');j['argv'][j['argv'].index('--msg_file')+1]=str(d/(j['id']+'.log'));j['capture_output']=str(d/'captures'/j['id'])
+  (d/f'LUNA-{kind}.json').write_text(json.dumps(task,indent=2))
+ runner=json.loads((P/'LUNA-GATES.json').read_text())['identities'][0]['path']
+ proof=dict(family=name,parent=ident(parent/'candidate.spv'),source=ident(src),spv=ident(spv),plan=ident(plan),baseline=ident(P/'plan.txt'),pass_indices=indices,pipeline_indices=sorted(set(stats['pass_pipeline_indices'][i] for i in indices)),pass_names=[passes[i][2] for i in indices],cpu=run([runner,'--plan',plan,'--cpu-check']),NC_count=len(keep),alignment=info,
+ change='Only full_norm root inverse-sqrt ownership: even lanes Q,odd lanes K,one xor1 coefficient exchange. Entire norm square/FMA/XOR8/4/2/1 tree and every caller unchanged.',
+ proof='Symbolic ordered XOR tree identical across16 lanes. XOR1 never crosses16-lane row. Each receiver gets same Q/K input to original f32 max,rsqrt,half narrowing. Hardware equivalence still gated.',
+ cost='Intended two rsqrt evaluations per lane become one, all lanes active. Adds one packed16-bit subgroup exchange plus select/reassembly. No extra shared storage/barriers/weight loads; Q/K/scaling lifecycle unchanged apart from one half peer temporary. Verify native math count and scratch; not infer speed from scalar-work reduction.',
+ includes=ident(S/'register_handoff.glsl'))
+ (d/'PROOF.json').write_text(json.dumps(proof,indent=2));rows.append(proof);print(name,indices,proof['pipeline_indices'],ident(spv)['sha256'])
+combo=N/'combo';combo.mkdir(exist_ok=True);text=plantext
+for row in rows:text=text.replace(row['parent']['path'].replace('\\','/'),row['spv']['path'].replace('\\','/'))
+text=text.replace((P/'candidate.spv').as_posix(),(R/'f20-norm-compact-pairs/candidate.spv').as_posix());(combo/'plan.txt').write_text(text)
+(N/'FAMILY-COVERAGE.json').write_text(json.dumps(dict(baseline=ident(P/'plan.txt'),families=rows,F20_existing=ident(R/'f20-norm-compact-pairs/candidate.spv'),combo=ident(combo/'plan.txt'),status='INDIVIDUAL_GATES_FIRST_COMBO_NOT_AUTHORIZED_UNTIL_ALL_PASS',scope='10 C32 passes: F01,7body,F2,F20. Other modules unchanged.'),indent=2))

@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Word-level SPIR-V delta attribution for the A1 gM-mirror drop.
+
+Question answered per width: *is the candidate module the parent module minus the
+four unused `gM` mirror stores and the address arithmetic that dies with them, and
+nothing else?*
+
+Operand grammar used (verified against a 40-line probe kernel compiled with the same
+glslang, `build/a1-d034-gm-drop/probe.comp`):
+  4456 OpTypeCooperativeMatrixKHR   [result, component, scope, rows, cols, use]
+  4457 OpCooperativeMatrixLoadKHR   [type, result, pointer, layout, stride, memop]
+  4458 OpCooperativeMatrixStoreKHR  [pointer, object, layout, stride, memop]
+  65   OpAccessChain                [type, result, base, indexes...]
+  59   OpVariable                   [type, result, storage, init]
+
+Method
+------
+1. reproduce: caller already proved parent source -> parent SPV is byte-identical.
+2. classify every 4458 whose pointer chain terminates at the StorageBuffer variable
+   with Binding 5; there must be exactly 4.
+3. in-order (opcode, word-count) skeleton alignment of the two function bodies:
+   unmatched parent instructions = deleted, unmatched child instructions = inserted.
+4. require: zero inserted; the 4 gM stores deleted; the deleted opcodes are only
+   address arithmetic / composite extracts / access chains / the stores themselves
+   (no float, no cooperative-matrix arithmetic, no barrier, no control flow);
+   words(parent)-words(child) == words(deleted); and the surviving
+   (opcode, word-count) histogram is identical.
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, r"@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts")
+import spv_tools_local as S  # noqa: E402
+
+W = Path(r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024")
+CARD = W / "candidates/a1-d034-gm-drop"
+BUILD = W / "build/a1-d034-gm-drop"
+
+OPNAME = {
+    5: "OpName", 6: "OpMemberName", 11: "OpExtInstImport", 12: "OpExtInst",
+    15: "OpEntryPoint", 16: "OpExecutionMode", 17: "OpCapability", 19: "OpTypeVoid",
+    20: "OpTypeBool", 21: "OpTypeInt", 22: "OpTypeFloat", 23: "OpTypeVector",
+    28: "OpTypeArray", 29: "OpTypeRuntimeArray", 30: "OpTypeStruct",
+    32: "OpTypePointer", 33: "OpTypeFunction", 40: "OpConstantTrue",
+    41: "OpConstantFalse", 43: "OpConstant", 44: "OpConstantComposite",
+    46: "OpConstantNull", 54: "OpFunction", 55: "OpFunctionParameter",
+    56: "OpFunctionEnd", 57: "OpFunctionCall", 59: "OpVariable", 61: "OpLoad",
+    62: "OpStore", 65: "OpAccessChain", 66: "OpInBoundsAccessChain",
+    67: "OpPtrAccessChain", 71: "OpDecorate", 72: "OpMemberDecorate",
+    79: "OpVectorInsertDynamic", 80: "OpVectorShuffle", 81: "OpCompositeConstruct",
+    82: "OpCompositeExtract", 83: "OpCompositeInsert", 84: "OpCopyObject",
+    109: "OpConvertFToU", 110: "OpConvertFToS", 111: "OpConvertSToF",
+    112: "OpConvertUToF", 113: "OpUConvert", 114: "OpSConvert", 115: "OpFConvert",
+    116: "OpQuantizeToF16", 117: "OpBitcast", 119: "OpSNegate", 120: "OpFNegate",
+    124: "OpIAdd", 126: "OpFAdd", 128: "OpISub", 129: "OpFSub", 130: "OpIMul",
+    133: "OpFMul", 134: "OpUDiv", 135: "OpSDiv", 137: "OpFDiv",
+    141: "OpShiftRightLogical", 142: "OpShiftRightArithmetic",
+    143: "OpShiftLeftLogical", 146: "OpBitwiseOr", 147: "OpBitwiseXor",
+    148: "OpBitwiseAnd", 152: "OpSelect", 154: "OpIEqual", 155: "OpINotEqual",
+    246: "OpControlBarrier", 247: "OpMemoryBarrier", 248: "OpLabel",
+    249: "OpBranch", 250: "OpBranchConditional", 251: "OpSwitch",
+    252: "OpKill", 253: "OpReturn", 254: "OpReturnValue", 255: "OpUnreachable",
+    327: "OpPhi", 4456: "OpTypeCooperativeMatrixKHR",
+    4457: "OpCooperativeMatrixLoadKHR", 4458: "OpCooperativeMatrixStoreKHR",
+    4459: "OpCooperativeMatrixLengthKHR", 4460: "OpCooperativeMatrixConvert?",
+    5358: "OpCooperativeMatrixConvertKHR",
+}
+ALLOWED_DELETED = {65, 66, 67, 82, 83, 81, 84, 117, 124, 128, 130, 134, 135, 141,
+                   142, 143, 146, 148, 152, 154, 155, 40, 41, 43, 44, 46, 4458,
+                   109, 110, 111, 112, 113, 114, 115}
+FORBIDDEN_DELETED = ({126, 129, 133, 137, 120, 116, 4456, 4457, 4459, 4460, 5358,
+                      12, 57, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255,
+                      327, 59, 54, 55, 56})
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def rid_of(op, ops):
+    if op == 4458:
+        return None
+    if op in (4457, 4456, 4459, 4460, 5358):
+        return ops[1]
+    return S.result_id_of(op, ops)
+
+
+def global_var_binding(mod):
+    bind = {}
+    for op, ops, _, _ in mod.instructions:
+        if op == 71 and len(ops) >= 3 and ops[1] == 33:
+            bind.setdefault(ops[0], {})["binding"] = ops[2]
+        if op == 71 and len(ops) >= 3 and ops[1] == 34:
+            bind.setdefault(ops[0], {})["set"] = ops[2]
+    return bind
+
+
+def store_sites(mod, binding=5):
+    """4458 store indices whose pointer chain ends at the variable with `binding`."""
+    by_id = {}
+    bind = global_var_binding(mod)
+    for idx, (op, ops, _, _) in enumerate(mod.instructions):
+        r = rid_of(op, ops)
+        if r is not None:
+            by_id.setdefault(r, idx)
+
+    def chain(ptr, depth=0):
+        if depth > 16:
+            return None
+        d = by_id.get(ptr)
+        if d is None:
+            return None
+        op, ops = mod.instructions[d][0], mod.instructions[d][1]
+        if op == 59:
+            return ops[1]
+        if op in (65, 66, 67):
+            return chain(ops[2], depth + 1)
+        return None
+
+    out = []
+    for idx, (op, ops, _, _) in enumerate(mod.instructions):
+        if op != 4458 or not ops:
+            continue
+        v = chain(ops[0])
+        if v is not None and bind.get(v, {}).get("binding") == binding:
+            out.append(idx)
+    return out
+
+
+NO_RESULT = {0, 2, 3, 4, 5, 6, 8, 14, 15, 16, 17, 56, 62, 63, 64, 71, 72, 73, 74,
+             75, 77, 84, 99, 246, 247, 249, 250, 251, 252, 253, 254, 255, 4458}
+
+
+def result_index(op, ops=()):
+    """Position of the result id inside an instruction's operand list (None: none)."""
+    if op in NO_RESULT:
+        return None
+    if op == 4456 or op == 248 or 19 <= op <= 39 or op in (7, 11):
+        return 0
+    return 1 if len(ops) > 1 else None
+
+
+def align_by_ids(P, C, pi, ci):
+    """Exact in-order alignment that also checks operand identity under the ID map.
+
+    Both modules are produced by the same compiler, so the child is the parent with
+    instructions removed.  Walking both streams in order and only accepting a match
+    when every non-result operand agrees under the accumulated parent->child ID map
+    makes the alignment unique apart from genuine operand coincidence; the caller
+    re-validates with a histogram diff.
+    """
+    p2c = {}
+    deleted, inserted, pairs = [], [], []
+    i, j = pi, ci
+    while i < len(P.instructions):
+        op_p, ops_p, _, _ = P.instructions[i]
+        if j >= len(C.instructions):
+            deleted.append(i)
+            i += 1
+            continue
+        op_c, ops_c, _, _ = C.instructions[j]
+        ok = op_p == op_c and len(ops_p) == len(ops_c)
+        if ok:
+            ri = result_index(op_p, ops_p)
+            for k, v in enumerate(ops_p):
+                if ri is not None and k == ri:
+                    continue
+                u = ops_c[k]
+                if v in p2c:
+                    if p2c[v] != u:
+                        ok = False
+                        break
+                elif u != v:
+                    ok = False
+                    break
+        if ok:
+            ri = result_index(op_p, ops_p)
+            if ri is not None and ops_p[ri] != 0:
+                p2c[ops_p[ri]] = ops_c[ri]
+            pairs.append((i, j))
+            i += 1
+            j += 1
+        else:
+            deleted.append(i)
+            i += 1
+    inserted.extend(range(j, len(C.instructions)))
+    return pairs, deleted, inserted
+
+
+def compare(width, parent_path, child_path):
+    P, C = S.Module(Path(parent_path)), S.Module(Path(child_path))
+    pi = next(i for i, (op, _, _, _) in enumerate(P.instructions) if op == 54)
+    ci = next(i for i, (op, _, _, _) in enumerate(C.instructions) if op == 54)
+    gst = store_sites(P)
+    cst = store_sites(C)
+
+    ps = [(P.instructions[i][0], P.instructions[i][3]) for i in range(pi, len(P.instructions))]
+    cs = [(C.instructions[i][0], C.instructions[i][3]) for i in range(ci, len(C.instructions))]
+    pairs, deleted, ins_local = align_by_ids(P, C, pi, ci)
+    del_local = [i - pi for i in deleted]
+    deleted_ops = [P.instructions[i][0] for i in deleted]
+    deleted_words = sum(P.instructions[i][3] for i in deleted)
+    from collections import Counter
+    hist_parent, hist_child = Counter(ps), Counter(cs)
+    hist_del = Counter(ps[i] for i in del_local)
+    hist_missing = hist_parent - hist_child
+
+    bp, bc = global_var_binding(P), global_var_binding(C)
+    gvars_p = sorted((str(ops[2]), str(bp.get(ops[1], {}).get("set")),
+                      str(bp.get(ops[1], {}).get("binding")))
+                     for op, ops, _, _ in P.instructions[:pi] if op == 59)
+    gvars_c = sorted((str(ops[2]), str(bc.get(ops[1], {}).get("set")),
+                      str(bc.get(ops[1], {}).get("binding")))
+                     for op, ops, _, _ in C.instructions[:ci] if op == 59)
+
+    windows, cur = [], []
+    for x in del_local:
+        if cur and x != cur[-1] + 1:
+            windows.append(cur)
+            cur = []
+        cur.append(x)
+    if cur:
+        windows.append(cur)
+
+    def win_info(w):
+        ids = [pi + x for x in w]
+        ops = [P.instructions[i][0] for i in ids]
+        return {"count": len(ids), "words": sum(P.instructions[i][3] for i in ids),
+                "opcodes": sorted({OPNAME.get(o, str(o)) for o in ops}),
+                "has_coopmat_store": 4458 in ops}
+
+    res = {
+        "width": width,
+        "parent_sha256": sha(parent_path), "child_sha256": sha(child_path),
+        "parent_words": len(P.words), "child_words": len(C.words),
+        "parent_instructions": len(P.instructions), "child_instructions": len(C.instructions),
+        "inserted_instructions": len(ins_local),
+        "deleted_instructions": len(deleted),
+        "removed_words": deleted_words,
+        "words_consistent": len(P.words) - len(C.words) == deleted_words,
+        "deleted_hist_matches_histogram_diff": hist_del == hist_missing,
+        "missing_histogram": {"%s/%d" % (OPNAME.get(k[0], str(k[0])), k[1]): v
+                              for k, v in sorted(hist_missing.items())},
+        "gM_store_sites_parent": gst, "gM_store_sites_child": cst,
+        "gM_store_count_parent": len(gst), "gM_store_count_child": len(cst),
+        "all_gM_stores_deleted": set(gst) <= set(deleted),
+        "deleted_opcode_hist": {OPNAME.get(o, str(o)): deleted_ops.count(o)
+                                for o in sorted(set(deleted_ops))},
+        "deleted_forbidden": sorted({OPNAME.get(o, str(o)) for o in deleted_ops
+                                     if o in FORBIDDEN_DELETED}),
+        "deleted_all_allowed": all(o in ALLOWED_DELETED for o in deleted_ops),
+        "deleted_windows": [win_info(w) for w in windows],
+        "surviving_skeleton_equal": (hist_parent - hist_child) == hist_del
+        and (hist_child - hist_parent) == Counter(),
+        "store_total_parent": sum(1 for op, _, _, _ in P.instructions if op == 4458),
+        "store_total_child": sum(1 for op, _, _, _ in C.instructions if op == 4458),
+        "load_total_parent": sum(1 for op, _, _, _ in P.instructions if op == 4457),
+        "load_total_child": sum(1 for op, _, _, _ in C.instructions if op == 4457),
+        "barrier_total_parent": sum(1 for op, _, _, _ in P.instructions if op in (246, 247)),
+        "barrier_total_child": sum(1 for op, _, _, _ in C.instructions if op in (246, 247)),
+        "globals_unchanged": gvars_p == gvars_c,
+        "globals_vars_parent": gvars_p, "globals_vars_child": gvars_c,
+    }
+    res["verdict"] = bool(
+        res["inserted_instructions"] == 0
+        and res["gM_store_count_parent"] == 4 and res["gM_store_count_child"] == 0
+        and res["all_gM_stores_deleted"]
+        and res["words_consistent"]
+        and res["deleted_all_allowed"] and not res["deleted_forbidden"]
+        and res["surviving_skeleton_equal"]
+        and res["store_total_child"] == res["store_total_parent"] - 4
+        and res["load_total_child"] == res["load_total_parent"]
+        and res["barrier_total_child"] == res["barrier_total_parent"]
+        and res["globals_unchanged"])
+    return res
+
+
+def main():
+    out, ok = {}, True
+    for w in ("c64", "c128", "c256"):
+        r = compare(w, CARD / "spv" / f"parent_{w}.spv", BUILD / f"a1_{w}.spv")
+        ok = ok and r["verdict"]
+        out[w] = r
+    doc = {"card": "a1-d034-gm-drop", "tool": "work/.../tools/spv_delta_a1.py",
+           "opcode_grammar_source": "build/a1-d034-gm-drop/probe.comp (glslang 16.5.0)",
+           "widths": out, "all_verdicts_true": ok}
+    (CARD / "evidence").mkdir(parents=True, exist_ok=True)
+    (CARD / "evidence" / "SPV-DELTA.json").write_text(
+        json.dumps(doc, indent=1) + "\n", encoding="utf-8", newline="\n")
+    for w, r in out.items():
+        print(w, "verdict", r["verdict"], "| deleted", r["deleted_instructions"],
+              "ins", r["inserted_instructions"], "words", r["removed_words"],
+              "| gM", r["gM_store_count_parent"], "->", r["gM_store_count_child"],
+              "| stores", r["store_total_parent"], "->", r["store_total_child"],
+              "| loads", r["load_total_parent"], "->", r["load_total_child"],
+              "| bar", r["barrier_total_parent"], "->", r["barrier_total_child"])
+        print("   deleted opcodes:", r["deleted_opcode_hist"])
+        print("   windows:", [(x["count"], x["opcodes"]) for x in r["deleted_windows"]])
+        if r["deleted_forbidden"]:
+            print("   FORBIDDEN:", r["deleted_forbidden"])
+    print("ALL", ok)
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,248 @@
+"""S09: ViT block31..38 QK/PV dynamic-vs-static scale study (CPU only, no GPU).
+
+Reference model validated against the FP16 teacher dumps:
+  tools/vit-validation.json  (relL2 3.7e-4..4.4e-4 per block over 32 heads = f16 rounding level)
+
+Frames: F1 = real-int8-24/dump-fp16 (34189)  <- calibration frame
+        F2 = teacher-diagnostics/teacher-41444
+        F3 = teacher-diagnostics/teacher-43654
+
+CPU simulation on FP16 teacher dumps only: local score / P / context errors.
+NOT a GPU result, NOT a full-network quality statement.
+"""
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from vit_attn_model import EPS_INV, HD, HEADS, PADK, TOK, den_tree, rel_l2, vit_exp
+
+BASE = r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+FRAMES = {
+    "F1-34189": os.path.join(BASE, "dump-fp16"),
+    "F2-41444": os.path.join(BASE, "teacher-diagnostics", "teacher-41444"),
+    "F3-43654": os.path.join(BASE, "teacher-diagnostics", "teacher-43654"),
+}
+OUT = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S09-qkv-attn"
+BLOCKS = list(range(31, 39))
+NWG = (TOK + 63) // 64
+NCH = (PADK + 63) // 64
+WGS = [(i * 64, min((i + 1) * 64, TOK)) for i in range(NWG)]
+EXP0 = vit_exp(np.float16(0.0))
+PAD = np.float16(np.float32(PADK - TOK) * np.float32(EXP0))
+
+
+def load_qkv(dirname, block):
+    a = np.fromfile(os.path.join(dirname, "dump_vit_block%d_QKV.bin" % block), dtype=np.float16)
+    assert a.size == TOK * 3072, (block, a.size)
+    a = a.reshape(TOK, 3072)
+    return (a[:, :1024].reshape(TOK, HEADS, HD),
+            a[:, 1024:2048].reshape(TOK, HEADS, HD),
+            a[:, 2048:3072].reshape(TOK, HEADS, HD))
+
+
+def codes(x, s):
+    return np.clip(np.round(np.asarray(x, np.float32) / np.float32(s)), -127.0, 127.0)
+
+
+def amax(x):
+    return float(np.abs(np.asarray(x, np.float32)).max())
+
+
+def dyn_scales(q, k, v):
+    qs = np.array([amax(q[a:b]) for a, b in WGS]) / 127.0
+    ks = np.zeros((NWG, NCH))
+    vs = np.zeros((NWG, NCH))
+    for wg in range(NWG):
+        for ci in range(NCH):
+            j0, j1 = ci * 64, min(ci * 64 + 64, TOK)
+            ks[wg, ci] = amax(k[j0:j1]) / 127.0
+            vs[wg, ci] = amax(v[j0:j1]) / 127.0
+    return qs, ks, vs
+
+
+def run(q, k, v, qs=None, ks=None, vs=None, pscale=None, normalise_p=False):
+    """qs (NWG,)|None   ks,vs (NWG,NCH)|None   pscale None->dyn | float | ('pmax', value)"""
+    Qf, Kf, Vf = (np.asarray(x, np.float32) for x in (q, k, v))
+    score = np.zeros((TOK, PADK), np.float32)
+    P = np.zeros((TOK, PADK), np.float32)
+    den = np.zeros(TOK, np.float16)
+    ctx = np.zeros((TOK, HD), np.float32)
+    nclip = 0
+    ntot = 0
+    Qc = None
+    if qs is not None:
+        Qc = np.zeros_like(Qf)
+        for wg, (a, b) in enumerate(WGS):
+            Qc[a:b] = codes(Qf[a:b], qs[wg])
+    Vp = np.zeros((PADK, HD), np.float32)
+    Vp[:TOK] = Vf
+    for wg, (a, b) in enumerate(WGS):
+        n = b - a
+        for ci in range(NCH):
+            j0, j1 = ci * 64, min(ci * 64 + 64, TOK)
+            keys = np.zeros((64, HD), np.float32)
+            keys[:max(j1 - j0, 0)] = Kf[j0:j1]
+            sv = np.float32(1.0)
+            if vs is None:
+                vcodes = Vp[j0:j0 + 64]
+            else:
+                sv = np.float32(vs[wg][ci])
+                vcodes = codes(Vp[j0:j0 + 64], sv)
+            if ks is None:
+                kd = keys
+            else:
+                sk = np.float32(ks[wg][ci])
+                kd = codes(keys, sk) * sk
+            qd = Qf[a:b] if qs is None else Qc[a:b] * np.float32(qs[wg])
+            acc = qd @ kd.T
+            s = acc.astype(np.float16)
+            score[a:b, j0:j0 + 64] = s.astype(np.float32)
+            pv = vit_exp(s).astype(np.float32)
+            if normalise_p:
+                pv = pv / np.maximum(pv.sum(axis=1), np.float32(1e-30))[:, None]
+            P[a:b, j0:j0 + 64] = pv
+            if pscale is None:
+                pmx = pv.max(axis=1)
+                sp = np.where(pmx > 0.0, pmx * (1.0 / 127.0), 1.0).astype(np.float32)
+            elif isinstance(pscale, tuple) and pscale[0] == "pmax":
+                sp = np.full(n, np.float32(pscale[1]) * (1.0 / 127.0), np.float32)
+            else:
+                sp = np.full(n, np.float32(pscale), np.float32)
+            c = np.round(pv / sp[:, None])
+            nclip += int((np.abs(c) > 127).sum())
+            ntot += c.size
+            c = np.clip(c, -127.0, 127.0)
+            Prow = np.full((n, 64), EXP0, np.float16)
+            po = pv.astype(np.float16)
+            if j1 - j0 < 64:
+                po[:, j1 - j0:] = EXP0
+            Prow[:, :] = po
+            den[a:b] = (den[a:b].astype(np.float32) +
+                        den_tree(Prow).astype(np.float32)).astype(np.float16)
+            ctx[a:b] += (c @ vcodes) * (sp * sv)[:, None]
+    den = (den.astype(np.float32) - np.float32(PAD)).astype(np.float16)
+    inv = (np.float32(1.0) / np.maximum(den.astype(np.float32),
+                                        np.float32(EPS_INV))).astype(np.float16)
+    out = (ctx.astype(np.float16).astype(np.float32) * inv[:, None]).astype(np.float16)
+    return {"out": out, "score": score, "P": P, "clip_frac": nclip / max(ntot, 1)}
+
+
+def p_headmax(q, k):
+    Qf, Kf = np.asarray(q, np.float32), np.asarray(k, np.float32)
+    m = 0.0
+    for ci in range(NCH):
+        j0, j1 = ci * 64, min(ci * 64 + 64, TOK)
+        keys = np.zeros((64, HD), np.float32)
+        keys[:max(j1 - j0, 0)] = Kf[j0:j1]
+        p = vit_exp((Qf @ keys.T).astype(np.float16)).astype(np.float32)
+        m = max(m, float(p.max()))
+    return m
+
+
+def summarise(lst):
+    arr = np.asarray(lst, np.float64)
+    return {"mean": float(arr.mean()), "p90": float(np.percentile(arr, 90)),
+            "max": float(arr.max())}
+
+
+def main():
+    res = {"schema": "s09-vit-static-study-v2",
+           "not_a_gpu_result": True, "not_a_full_network_statement": True,
+           "contract": "r12r15 ViT attention QK8/PV8: UNNORMALISED P, per (query,chunk) sP, "
+                       "single reciprocal per query after all 5 chunks; QK K=32 dims, PV K=64 keys",
+           "calibration_frame": "F1-34189", "frames": list(FRAMES), "blocks": BLOCKS,
+           "results": {}}
+    cal = {}
+    for b in BLOCKS:
+        Q, K, V = load_qkv(FRAMES["F1-34189"], b)
+        cal[b] = {"Q": [amax(Q[:, h, :]) for h in range(HEADS)],
+                  "K": [amax(K[:, h, :]) for h in range(HEADS)],
+                  "V": [amax(V[:, h, :]) for h in range(HEADS)],
+                  "Pmax": [p_headmax(Q[:, h, :], K[:, h, :]) for h in range(HEADS)]}
+    res["head_absmax_F1"] = {str(b): cal[b] for b in BLOCKS}
+
+    for fname, fdir in FRAMES.items():
+        res["results"][fname] = {}
+        for b in BLOCKS:
+            Q, K, V = load_qkv(fdir, b)
+            A = {}
+            for h in range(HEADS):
+                q, k, v = Q[:, h, :], K[:, h, :], V[:, h, :]
+                qsd, ksd, vsd = dyn_scales(q, k, v)
+                sq = np.full(NWG, cal[b]["Q"][h] / 127.0)
+                sk = np.full((NWG, NCH), cal[b]["K"][h] / 127.0)
+                sv = np.full((NWG, NCH), cal[b]["V"][h] / 127.0)
+                R = run(q, k, v)
+                Rsw = run(q, k, v, normalise_p=True)
+                qnorm = float(np.median(np.linalg.norm(q.astype(np.float32), axis=1)[
+                    np.linalg.norm(q.astype(np.float32), axis=1) > 0]))
+                sq_b = np.full(NWG, qnorm / 127.0)          # a-priori norm bound, no data
+                sk_b = np.full((NWG, NCH), 1.0 / 127.0)     # L2-normalised K row bound
+                variants = {
+                    "dyn": run(q, k, v, qsd, ksd, vsd),
+                    "sQ": run(q, k, v, sq, ksd, vsd),
+                    "sK": run(q, k, v, qsd, sk, vsd),
+                    "sQK": run(q, k, v, sq, sk, vsd),
+                    "sV": run(q, k, v, qsd, ksd, sv),
+                    "sQK_bound": run(q, k, v, sq_b, sk_b, vsd),
+                    "sP_fixed_1_127": run(q, k, v, qsd, ksd, vsd, pscale=1.0/127.0),
+                    "sP_head_pmax": run(q, k, v, qsd, ksd, vsd, pscale=("pmax", cal[b]["Pmax"][h])),
+                    "sQK_x1_25": run(q, k, v, sq * 1.25, sk * 1.25, vsd),
+                    "sQK_x1_50": run(q, k, v, sq * 1.5, sk * 1.5, vsd),
+                    "swinP_dyn": run(q, k, v, qsd, ksd, vsd, normalise_p=True),
+                    "swinP_static_1_127": run(q, k, v, qsd, ksd, vsd, pscale=1.0/127.0, normalise_p=True),
+                }
+                refs = {}
+                for name, r in variants.items():
+                    ref = Rsw if name.startswith("swinP") else R
+                    e = A.setdefault(name, {"ctx": [], "score": [], "P": [], "clip": []})
+                    e["ctx"].append(rel_l2(r["out"], ref["out"]))
+                    e["score"].append(rel_l2(r["score"], ref["score"]))
+                    e["P"].append(rel_l2(r["P"], ref["P"]))
+                    e["clip"].append(r["clip_frac"])
+                ra = A.setdefault("resolution", {"Q": [], "K": [], "V": []})
+                ra["Q"].append(float(np.median(qsd) * 127.0 / max(cal[b]["Q"][h], 1e-12)))
+                ra["K"].append(float(np.median(ksd) * 127.0 / max(cal[b]["K"][h], 1e-12)))
+                ra["V"].append(float(np.median(vsd) * 127.0 / max(cal[b]["V"][h], 1e-12)))
+                pm = A.setdefault("pmx_vit", [])
+                pm.append([float(R["P"].max(axis=1).min()),
+                           float(np.median(R["P"].max(axis=1))),
+                           float(R["P"].max())])
+                pms = A.setdefault("pmx_swinproxy", [])
+                pms.append([float(Rsw["P"].max(axis=1).min()),
+                            float(np.median(Rsw["P"].max(axis=1))),
+                            float(Rsw["P"].max())])
+            summ = {}
+            for name, e in A.items():
+                if name == "resolution":
+                    arr = np.asarray([e["Q"], e["K"], e["V"]], np.float64)
+                    summ[name] = {"mean": arr.mean(axis=1).tolist(),
+                                  "min": arr.min(axis=1).tolist(),
+                                  "max": arr.max(axis=1).tolist()}
+                elif name in ("pmx_vit", "pmx_swinproxy"):
+                    arr = np.asarray(e, np.float64)
+                    summ[name] = {"mean": arr.mean(axis=0).tolist(),
+                                  "min": arr.min(axis=0).tolist(),
+                                  "max": arr.max(axis=0).tolist()}
+                elif isinstance(e, dict) and "ctx" in e:
+                    summ[name] = {"ctx": summarise(e["ctx"]), "score": summarise(e["score"]),
+                                  "P": summarise(e["P"]),
+                                  "clip_frac_mean": float(np.mean(e["clip"]))}
+            res["results"][fname][str(b)] = summ
+            g = lambda n, f="mean": summ[n]["ctx"][f]
+            print("%s b%02d dyn=%.5f | sQ=%.5f sK=%.5f sQK=%.5f sV=%.5f | sP127=%.3f sPpmax=%.3f"
+                  " | x1.25=%.5f x1.5=%.5f | swinP dyn=%.5f static=%.5f | resQ=%.2f" % (
+                      fname, b, g("dyn"), g("sQ"), g("sK"), g("sQK"), g("sV"),
+                      g("sP_fixed_1_127"), g("sP_head_pmax"), g("sQK_x1_25"), g("sQK_x1_50"),
+                      g("swinP_dyn"), g("swinP_static_1_127"), summ["resolution"]["mean"][0]))
+            sys.stdout.flush()
+    with open(os.path.join(OUT, "tools", "vit-static-study.json"), "w", encoding="utf-8") as f:
+        json.dump(res, f, indent=1)
+    print("wrote tools/vit-static-study.json")
+
+
+if __name__ == "__main__":
+    main()

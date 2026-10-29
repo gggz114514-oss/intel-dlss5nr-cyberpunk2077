@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""CPU integer reference for the fused C128 "WO INT8 + qX" kernel.
+
+Two arms are simulated on the SAME real, non-zero captured input:
+
+  FP16 arm  — the deployed parent arithmetic (c128_d4_full.comp): half A and half B,
+              FP32 accumulate seeded by the half residual product, one narrowing.
+  INT8 arm  — the candidate arithmetic (c128_d4_wo_qx.comp): per-window int8 activation
+              quantisation, int8xint8 -> int32 accumulate, one dequant product folded
+              into the same FP32 accumulator, the same half seed, one narrowing, then
+              the qX quantiser applied to that same narrowed half.
+
+The FP16 arm is first checked against the GPU's own captured output for the fixture, so
+the simulator is anchored to real hardware output before it is used to judge the INT8 arm.
+
+The qX quantiser question is answered separately: how many elements would get a different
+int8 code if the quantiser were fed the unrounded FP32 accumulator instead of the half
+that imgout receives (the defect the C256 v3 arm hit).
+
+usage: oracle_wo_qx.py [--case c128-full-b9-full] [--korder seq|bulk] [--json out.json]
+"""
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+B = Path("@NR_WORKSPACE@")
+S1 = B / "candidates/amd-map-20261015/s1-output-complete"
+CASES = S1 / "numeric-cases.json"
+B9_PACK = (B / "work/dsh-xmx-handoff-validation-20261024/candidates/r07-c128-wo-i8"
+           "/packs/c128_b9_wo.i8.bin")
+K = N = 128
+TOK = 64
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def half(x):
+    return np.asarray(x, np.float32).astype(np.float16).astype(np.float32)
+
+
+def load_abi(path):
+    a = np.frombuffer(Path(path).read_bytes(), dtype="<i4")
+    return {n: a[16 + 4 * i:20 + 4 * i].tolist()
+            for i, n in enumerate(["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7"])}
+
+
+def decode_w(pack, wo):
+    idx = (np.arange(N)[:, None] // 16 * 2048 + np.arange(K)[None, :] // 16 * 256
+           + np.arange(N)[:, None] % 16 * 16 + np.arange(K)[None, :] % 16)
+    return pack[wo + idx]
+
+
+def decode_i8_codes(blob):
+    codes = np.frombuffer(blob[:N * K], np.int8)
+    off = (np.arange(N)[:, None] // 16 * 2048 + np.arange(K)[None, :] // 32 * 512
+           + np.arange(N)[:, None] % 16 * 32 + np.arange(K)[None, :] % 32)
+    return codes[off].astype(np.int32)
+
+
+def window_map(tiles_x, tiles_y, grid_x, grid_y, shift_x, shift_y):
+    """one entry per (window, tile-quarter): (window, q, oob, linear tile id)"""
+    out = []
+    for wy in range(grid_y):
+        for wx in range(grid_x):
+            w = wy * grid_x + wx
+            for q in range(4):
+                tx = 2 * wx + shift_x + (q & 1)
+                ty = 2 * wy + shift_y + (q >> 1)
+                oob = tx < 0 or ty < 0 or tx >= tiles_x or ty >= tiles_y
+                stx = min(max(tx, 0), tiles_x - 1)
+                sty = min(max(ty, 0), tiles_y - 1)
+                out.append((w, q, oob, sty * tiles_x + stx))
+    return out
+
+
+def run_arm(T, Y, W, rsv, wB, wosc, mode, geom, korder, img_n):
+    tiles_x, tiles_y, grid_x, grid_y, sx, sy = geom
+    img = np.zeros(img_n, np.float32)
+    written = np.zeros(img_n, bool)
+    wm = window_map(tiles_x, tiles_y, grid_x, grid_y, sx, sy)
+    st = {"windows": int(T.shape[0]), "blocks": 0, "sat_share": 0.0, "acc_absmax": 0,
+          "amax_min": np.inf, "amax_max": -np.inf, "narrow_changed": 0, "elements": 0,
+          "qx_code_diff_synthetic": 0}
+    sat = nA = accmax = 0
+    for (w, q, oob, tile) in wm:
+        Tw = T[w].reshape(TOK, N)
+        Yw = Y[w].reshape(TOK, N)
+        if mode == "int8":
+            amax = float(np.abs(Tw).max())
+            invC = np.float32(127.0 / amax) if amax > 0 else np.float32(0.0)
+            sC = np.float32(amax / 127.0) if amax > 0 else np.float32(0.0)
+            qA = np.clip(np.rint(Tw * invC), -127.0, 127.0).astype(np.int32)
+            sat += int(np.count_nonzero(np.abs(qA) >= 127))
+            nA += qA.size
+            st["amax_min"], st["amax_max"] = min(st["amax_min"], amax), max(st["amax_max"], amax)
+            iacc = qA @ wB.T
+            accmax = max(accmax, int(np.abs(iacc).max()))
+            prod = iacc.astype(np.float32) * (wosc * sC)[None, :]
+        else:
+            prod = None
+        seed = half(Yw * rsv[None, :])
+        if mode == "int8":
+            acc = seed + prod
+        elif korder == "bulk":
+            acc = seed + Tw @ W.T
+        else:                                    # sequential in k, seed first
+            acc = seed.copy()
+            for k in range(K):
+                acc = acc + np.float32(Tw[:, k:k + 1] * W[:, k][None, :])
+        narrowed = half(acc)
+        st["narrow_changed"] += int(np.count_nonzero(narrowed != acc))
+        st["elements"] += acc.size
+        amaxh = float(np.abs(narrowed).max())
+        if amaxh > 0:
+            invX = np.float32(127.0 / amaxh)
+            st["qx_code_diff_synthetic"] += int(np.count_nonzero(
+                np.clip(np.rint(narrowed * invX), -127, 127) !=
+                np.clip(np.rint(acc * invX), -127, 127)))
+        for m0 in range(0, TOK, 8):
+            if m0 // 16 != q:
+                continue
+            s0 = m0 % 16
+            for nb in range(0, N, 16):
+                blk = narrowed[m0:m0 + 8, nb:nb + 16]
+                if not oob:
+                    base = (tile * 8 + nb // 16) * 256 + s0 * 16
+                    for m in range(8):
+                        st0 = base + m * 16
+                        img[st0:st0 + 16] = blk[m]
+                        written[st0:st0 + 16] = True
+                st["blocks"] += 1
+    st["sat_share"] = float(sat / nA) if nA else 0.0
+    st["acc_absmax"] = int(accmax)
+    st["amax_min"] = float(st["amax_min"]) if np.isfinite(st["amax_min"]) else None
+    st["amax_max"] = float(st["amax_max"]) if np.isfinite(st["amax_max"]) else None
+    return img, written, st
+
+
+def cmp(x, y, mask):
+    d = (x - y)[mask]
+    ym = y[mask]
+    return {"compared": int(mask.sum()),
+            "bit_identical_share": float(np.mean(
+                x[mask].astype(np.float16) == y[mask].astype(np.float16))),
+            "max_abs_diff": float(np.abs(d).max()),
+            "rms": float(np.sqrt((d ** 2).mean())),
+            "rel_L2": float(np.sqrt((d ** 2).sum() / (ym ** 2).sum())),
+            "snr_db": float(10 * np.log10((ym ** 2).sum() / max((d ** 2).sum(), 1e-30))),
+            "x_absmax": float(np.abs(x[mask]).max()), "y_absmax": float(np.abs(ym).max())}
+
+
+def main(argv):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--case", default="c128-full-b9-full")
+    ap.add_argument("--korder", default="seq", choices=["seq", "bulk"])
+    ap.add_argument("--json", default=None)
+    a = ap.parse_args(argv)
+    case = [c for c in json.loads(CASES.read_text(encoding="utf-8"))["cases"]
+            if c["name"] == a.case][0]
+    outdir = Path(case["out"])
+    T = np.fromfile(outdir / "T.bin", dtype="<f2").astype(np.float32)
+    Y = np.fromfile(outdir / "Y.bin", dtype="<f2").astype(np.float32)
+    gpu_img = np.fromfile(outdir / "image_out.bin", dtype="<f2").astype(np.float32)
+    pack = np.fromfile(case["inputs"]["pack"]["path"], dtype="<f2").astype(np.float32)
+    pc = load_abi(case["inputs"]["abi"]["path"])
+    tiles_x, tiles_y, sx, sy = pc["p0"]
+    grid_x, grid_y = pc["p1"][0], pc["p1"][1]
+    wo, ars = pc["p4"][0], pc["p4"][2]
+    nwin = T.size // (TOK * N)
+    T, Y = T.reshape(nwin, TOK * N), Y.reshape(nwin, TOK * N)
+    W, rsv = decode_w(pack, wo), pack[ars:ars + N]
+    blob = Path(B9_PACK).read_bytes()
+    wB = decode_i8_codes(blob)
+    wosc = np.frombuffer(blob[N * K:], "<f4").astype(np.float32)
+    deq = wB.astype(np.float32) * wosc[:, None]
+    pack_rel = float(np.sqrt(((deq - W) ** 2).sum() / (W ** 2).sum()))
+    geom = (tiles_x, tiles_y, grid_x, grid_y, sx, sy)
+    img16, wr16, st16 = run_arm(T, Y, W, rsv, wB, wosc, "fp16", geom, a.korder, gpu_img.size)
+    img8, wr8, st8 = run_arm(T, Y, W, rsv, wB, wosc, "int8", geom, a.korder, gpu_img.size)
+    assert np.array_equal(wr16, wr8)
+    res = {"case": a.case, "korder": a.korder, "windows": int(nwin),
+           "grid": [grid_x, grid_y], "p0": pc["p0"], "p4": pc["p4"],
+           "inputs": {k: {"path": v["path"], "sha256": v["sha256"]}
+                      for k, v in case["inputs"].items() if k in ("pack", "abi", "input")},
+           "gpu_image_sha256": sha(outdir / "image_out.bin"),
+           "wo_pack": {"path": str(B9_PACK), "sha256": sha(B9_PACK),
+                       "dequant_vs_fp16_rel_L2": pack_rel,
+                       "sW_max": float(wosc.max()), "sW_min": float(wosc.min())},
+           "A_simulator_vs_gpu_capture": cmp(img16, gpu_img, wr16),
+           "B_int8_vs_fp16_same_input": cmp(img8, img16, wr16),
+           "C_int8_vs_gpu_capture": cmp(img8, gpu_img, wr16),
+           "arm_stats_fp16": st16, "arm_stats_int8": st8,
+           "int32_range": {"acc_absmax": st8["acc_absmax"],
+                           "fits_int32": bool(st8["acc_absmax"] < 2 ** 31)}}
+    print(json.dumps(res, indent=1))
+    if a.json:
+        Path(a.json).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.json).write_text(json.dumps(res, indent=1) + "\n", encoding="utf-8", newline="\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

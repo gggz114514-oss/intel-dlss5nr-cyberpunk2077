@@ -1,0 +1,240 @@
+"""n33 task A step 1: identity + expensive-op distance histogram + register pressure.
+
+Read-only.  Prints:
+  1. identity of the F02 kernel across every campaign capture (bytes must match)
+  2. the 24 expensive ops (16 math.rsqt + 8 math.inv), their first consumer and
+     the number of LIVE instructions strictly between them
+  3. the distance histogram (<=2 / 3-10 / >10) - the card's hard criterion
+  4. register pressure: max register index per window and globally
+  5. per-lane independent chains (n32 method) for the parent
+"""
+import sys, json, hashlib
+from pathlib import Path
+from collections import Counter, defaultdict
+
+HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE))
+import _isa  # noqa: E402
+
+C = _isa.C
+
+
+# ------------------------------------------------------------------ live mask
+def live_mask(ins, labels):
+    """debug == 0: the echo path is guarded by (W&f2.0) or (W&~f2.0) jmpi.
+
+    F02 uses `cmp (eq)f2.0 null, r2.3, 0` in the prologue (see listing), so the
+    guard that skips the echo block when r2.3 == 0 is (W&f2.0) - one of the two
+    polarities _regions.py accepts.  We detect it the same way.
+    """
+    guard = None
+    for it in ins:
+        if it["op"] == "cmp" and "f2.0" in it["text"] and "r2.3" in it["text"]:
+            guard = "(W&~f2.0)" if "(ne)f2.0" in it["text"] else "(W&f2.0)"
+            break
+    if guard is None:
+        # fall back: whichever jmpi predicate occurs with f2.0
+        for it in ins:
+            if it["op"] == "jmpi" and "f2.0" in it["flags"]:
+                guard = it["flags"]
+                break
+    assert guard, "no debug guard found"
+    live = [True] * len(ins)
+    for it in ins:
+        if it["op"] == "jmpi" and it["flags"] == guard:
+            a = it["args"] if "args" in it else " ".join(it["ops"])
+            tgt = None
+            for tok in a.split():
+                if tok.startswith("L"):
+                    tgt = labels.get(int(tok[1:]))
+                    break
+            if tgt is not None:
+                for j in range(it["idx"], tgt):
+                    live[j] = False
+    return live, guard
+
+
+# ------------------------------------------------------------------ def/use
+def reg_base(op):
+    o = op.lstrip("-").replace("(abs)", "").strip()
+    import re
+    m = re.match(r"^r(\d+)\.(\d+)", o)
+    if m:
+        return ("r", int(m.group(1)), int(m.group(2)))
+    m = re.match(r"^r(\d+)(?![\d.])", o)
+    if m:
+        return ("r", int(m.group(1)), 0)
+    m = re.match(r"^acc(\d+)\.(\d+)", o)
+    if m:
+        return ("acc", int(m.group(1)), int(m.group(2)))
+    return None
+
+
+def grf_suffix(op):
+    import re
+    m = re.search(r"^[ra]?\d+(?:\.\d+)?:(\d+)$", op.strip())
+    return int(m.group(1)) if m else None
+
+
+def span_of(op, opcode):
+    g = grf_suffix(op)
+    if g is not None:
+        return max(1, g * 8)
+    if opcode.startswith("dpas"):
+        return 4
+    return 1
+
+
+def classify(ins):
+    import re
+    op, ops = ins["op"], ins["ops"]
+    com = ins["comment"] or ""
+    w, r = [], []
+    if op.startswith("send"):
+        store = "store." in com or "fence" in com
+        if store:
+            if len(ops) > 2:
+                b = reg_base(ops[2])
+                if b:
+                    r.append((b[0], b[1], b[2], span_of(ops[2], op)))
+        else:
+            if ops:
+                b = reg_base(ops[0])
+                if b:
+                    w.append((b[0], b[1], b[2], span_of(ops[0], op)))
+        for o in ops:
+            if re.match(r"^a0\.\d+", o):
+                r.append(("a0", 0, 0, 2))
+        return w, r
+    if op.startswith("dpas"):
+        if ops:
+            b = reg_base(ops[0])
+            if b:
+                w.append((b[0], b[1], b[2], 4))
+        for o in ops[2:4]:
+            b = reg_base(o)
+            if b:
+                r.append((b[0], b[1], b[2], 8))
+        return w, r
+    if not ops:
+        return w, r
+    if ops[0] != "null":
+        b = reg_base(ops[0])
+        if b:
+            w.append((b[0], b[1], b[2], span_of(ops[0], op)))
+    for o in ops[1:]:
+        if o.startswith("null"):
+            continue
+        b = reg_base(o)
+        if b:
+            r.append(("a0", 0, 0, 2) if b[0] == "a0"
+                     else (b[0], b[1], b[2], span_of(o, op)))
+    return w, r
+
+
+def build(fname):
+    ins, labels = _isa.parse(fname)
+    live, guard = live_mask(ins, labels)
+    for i, it in enumerate(ins):
+        it["live"] = live[i]
+        it["w"], it["r"] = classify(it)
+    by_dw = defaultdict(list)
+    for it in ins:
+        for f, no, dw, n in it["w"]:
+            for d in range(dw, dw + n):
+                by_dw[(f, no, d)].append(it["idx"])
+    for v in by_dw.values():
+        v.sort()
+    return ins, by_dw, guard
+
+
+def reaching(by_dw, key, idx):
+    lst = by_dw.get(key)
+    if not lst:
+        return None
+    hit = None
+    for w in lst:
+        if w < idx:
+            hit = w
+        else:
+            break
+    return hit
+
+
+def main():
+    # ---- 1. identity across batches
+    print("== 1. identity ==")
+    rows = []
+    for p in sorted((C / "queue").rglob("CS_asm7a38a17947f21ae6*.asm")):
+        rows.append((hashlib.sha256(p.read_bytes()).hexdigest()[:16], p))
+    print("  kernel files found: %d; distinct sha16: %s"
+          % (len(rows), sorted({r[0] for r in rows})))
+    for sha16, p in rows[:2]:
+        print("   ", sha16, p)
+
+    ins, by_dw, guard = build(_isa.FILES[0])
+    live = [i for i in ins if i["live"]]
+    live_idx = {i["idx"] for i in live}
+    print("  guard=%s  total=%d live=%d debug-skipped=%d"
+          % (guard, len(ins), len(live), len(ins) - len(live)))
+    print("  op histogram (live):", dict(Counter(i["op"] for i in live).most_common(14)))
+
+    # ---- 2. expensive ops
+    exp = [k for k in sorted(live_idx) if ins[k]["op"] in ("math.rsqt", "math.inv")]
+    users = defaultdict(list)
+    for k in sorted(live_idx):
+        for f, no, dw, n in ins[k]["r"]:
+            for d in range(dw, dw + n):
+                p = reaching(by_dw, (f, no, d), k)
+                if p is not None and p in live_idx:
+                    users[p].append(k)
+    rows = []
+    for k in exp:
+        us = sorted(users[k])
+        first = us[0] if us else None
+        gap = sum(1 for j in sorted(live_idx) if k < j < (first if first is not None else k + 1))
+        # ALL consumers (for the "last consumer" view)
+        last = us[-1] if us else None
+        gap_all = (last - k - 1) if last is not None else None
+        rows.append(dict(idx=k, addr=hex(ins[k]["addr"]), op=ins[k]["op"],
+                         first_use=first, first_use_addr=hex(ins[first]["addr"]) if first else None,
+                         gap=gap, n_users=len(us), last_use=last, gap_last=gap_all,
+                         user_ops=[ins[u]["op"] for u in us[:6]]))
+    print("\n== 2. expensive ops (%d) ==" % len(rows))
+    print("  %5s %7s %-9s %6s %5s %6s %s" % ("idx", "addr", "op", "1stuse", "gap", "nuse", "user ops"))
+    for r in rows:
+        print("  %5d %7s %-9s %6s %5d %6d %s"
+              % (r["idx"], r["addr"], r["op"], r["first_use"], r["gap"], r["n_users"],
+                 ",".join(r["user_ops"])))
+    hist = Counter("<=2" if r["gap"] <= 2 else ("3-10" if r["gap"] <= 10 else ">10") for r in rows)
+    print("\n  distance histogram (all 24):", dict(hist))
+    for op in ("math.rsqt", "math.inv"):
+        h = Counter("<=2" if r["gap"] <= 2 else ("3-10" if r["gap"] <= 10 else ">10")
+                    for r in rows if r["op"] == op)
+        print("   ", op, dict(h))
+
+    # ---- 4. register pressure
+    import re
+    def maxreg(lo, hi):
+        m = 0
+        for i in ins[lo:hi]:
+            for mm in re.finditer(r"r(\d+)", i["text"]):
+                m = max(m, int(mm.group(1)))
+        return m
+    print("\n== 4. register pressure ==")
+    print("  global max r:", maxreg(0, len(ins)))
+    for lo, hi, name in ((2100, 2520, "norm group A"), (2650, 3020, "norm group B"),
+                         (3760, 3830, "softmax inv 0/1"), (3900, 3960, "softmax inv 2/3"),
+                         (4120, 4190, "inv 4/5"), (4250, 4320, "inv 6/7")):
+        print("  %-16s [%d,%d) max r=%d" % (name, lo, hi, maxreg(lo, hi)))
+
+    out = dict(guard=guard, total=len(ins), live=len(live),
+               op_live=dict(Counter(i["op"] for i in live).most_common()),
+               expensive=rows, histogram=dict(hist),
+               max_r_global=maxreg(0, len(ins)))
+    (HERE / "A-DISTANCE.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
+    print("\nwrote", HERE / "A-DISTANCE.json")
+
+
+if __name__ == "__main__":
+    main()

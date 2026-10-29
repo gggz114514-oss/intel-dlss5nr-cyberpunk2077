@@ -1,0 +1,158 @@
+"""S01: assemble CONTRACT.json from the live plans / packs (all SHAs measured here)."""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/tools")
+from planlib import Plan, sha256_file  # noqa: E402
+
+B = Path(r"@NR_WORKSPACE@")
+D = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+HERE = Path(__file__).resolve().parent
+
+
+def P(p):
+    return str(p).replace("\\", "/")
+
+
+def dispatch_facts(plan_path, ordinal=4):
+    p = Plan(plan_path)
+    d = p.dispatch(ordinal)
+    buf = {b.binding: p.buffers[b.buffer] for b in d.binds}
+    push = [int(w) for w in d.push]
+    sgn = lambda u: u - 2**32 if u >= 2**31 else u
+    binds = []
+    for b in d.binds:
+        bb = p.buffers[b.buffer]
+        binds.append(dict(binding=b.binding, buffer_index=b.buffer, name=bb.name,
+                          buffer_bytes=bb.bytes, offset=b.offset, bytes=b.bytes,
+                          file=P(bb.file) if bb.file != "-" else "-",
+                          file_sha256=(sha256_file(bb.file) if bb.file not in ("-",) and Path(bb.file).is_file() else None)))
+    return dict(
+        plan=P(plan_path), plan_sha256=p.sha256(), ordinal=ordinal, name=d.name,
+        group=d.group, spv=P(d.spv),
+        spv_sha256=(sha256_file(d.spv) if Path(d.spv).is_file() else None),
+        grid_workgroups=dict(x=int(d.tail_tokens[4]), y=int(d.tail_tokens[5]), z=int(d.tail_tokens[6])),
+        local_size=128, push16=push[:16],
+        push_semantics=dict(p0=["tiles_x", "shift_x(signed)", "debug_flag", "window_x_if_p3y"],
+                            p1=["unused", "unused", "unused_fp16_pack", "0"],
+                            p2=["rs_fp16_offset", "ars_fp16_offset", "fb_scalar_index", "qk_bias_fb_offset"],
+                            p3=["window_y_if_p3y", "use_window_coords", "tiles_y", "shift_y(signed)"]),
+        tiles_x=push[0], tiles_y=push[14], shift_x=sgn(push[1]), shift_y=sgn(push[15]),
+        binds=binds)
+
+
+base_local = D / "c32-minmax/local-b4.txt"
+equalx_local = D / "c32-equalized-b4/local-b4.txt"
+mine_local = HERE / "candidate-local-b4.txt"
+frozen_combo = D / "c64-family-static/combo-34189.txt"
+
+contract = dict(
+    card="S01 C32 body1..4/67..69 FFN - vertical slice: block4",
+    author="DSH S01 subagent",
+    written="2026-10-29 (Asia/Tokyo)",
+    write_area=P(HERE),
+    gpu_touched=False,
+    frozen_base=dict(plan=P(frozen_combo), sha256=sha256_file(frozen_combo),
+                     role="current best 24-frame candidate; used read-only as the plan base"),
+    # ------------------------------------------------------------------ identity
+    block4=dispatch_facts(frozen_combo, 4),
+    block4_variants={
+        "minmax_parent_spv": dispatch_facts(base_local, 4),
+        "x_equalised": dispatch_facts(equalx_local, 4),
+        "this_card_x_plus_e": dispatch_facts(mine_local, 4),
+    },
+    # ------------------------------------------------------- logical geometry
+    logical_shape=dict(
+        tokens_per_tile=16, channels=32, halves_per_tile=512,
+        tiles_x=168, tiles_y=96, tiles_total=168 * 96,
+        tokens_total=168 * 96 * 16,
+        input_buffer_bytes=16515072, output_buffer_bytes=16515072,
+        expand="E[f,t] = sum_c We[f,c] X[c,t], N=128 K=32",
+        contract="Y[o,t] = sum_f Wc[o,f] E[f,t] + res, N=32 K=128 as 4 x K32",
+        attention_tail_in_same_dispatch="QKV 32x32 x3, QK 8 sites K=32, PV 2 x K32, WO 4 x K32",
+    ),
+    address_formula=dict(
+        x_and_y="addr(tile,col,c) = tile*512 + (c//16)*256 + ((c//8)%2)*8 + col*16 + (c%8)",
+        note="identical for the fp16 input (binding 2) and output (binding 3) accumulators; "
+             "col-major 8x16 fragments at bases +0,+8,+256,+264 with MemoryStride 16",
+        verified_against="calibrate_c64_reconstruction.py (proven bit-exact on C64) uses the same "
+                         "tile*1024 + (c//16)*256 + t*16 + (c%16) form for 64 channels",
+    ),
+    int8_weight_layout=dict(
+        expand="byte g*1024 + k*32 + m  ->  We[8g+m][k]   (g=0..15, k=0..31, m=0..7; "
+               "bytes 8..31 of every 32-byte row are zero padding, verified on the pack)",
+        contract="byte 16384 + (g*4+step)*1024 + (e%32)*32 + m -> Wc[8g+m][32*step + e%32]",
+        contract_proof="inside one K32 E-group the four A tiles loaded are (g*4+step) for g=0..3 "
+                       "with step fixed, and their dequant mbase is 0/8/16/24, which pins tile->"
+                       "output-channel group; measured line numbers 365-371 (step0, tiles 0,4,8,12), "
+                       "440-446 (step1), 515-521 (step2), 590-596 (step3)",
+        qkv_wo="32768..49151 unchanged, copied verbatim",
+        row_absmax="all 16 expand tiles x 8 rows and all 16 contract tiles x 8 rows have max|code| = 127",
+    ),
+    scale_table=dict(
+        base_entries=292,
+        layout=["0 sX", "1 invX", "2 sE", "3 invE",
+                "4..131 expand dequant tap sX*sWe[128]",
+                "132..163 contract dequant tap sE*sWc[32]",
+                "164..195 sWq, 196..227 sWk, 228..259 sWv, 260..291 sWo",
+                "292..323 per-input-channel inverse (X equalisation SPV, blocks 1..4)",
+                "324..451 per-E-channel inverse (THIS CARD)"],
+        bytes={"base": 1168, "x_equalised": 1296, "x_plus_e": 1808},
+    ),
+    scales_static_vs_dynamic=dict(
+        static=["X (per-tensor or per-channel after the X-equalisation SPV)",
+                "E (per-tensor base pack, per-channel after this card)",
+                "expand / contract / QKV / WO weight taps"],
+        dynamic_out_of_scope=["Y per token (nr_col_max32)", "Q/K per token", "P per query",
+                              "V per dimension", "ctx per query"],
+        note="the dynamic activation scales above are NOT changed by this card; they are S10/S11 "
+             "registration objects and remain untouched",
+    ),
+    residual=dict(
+        contract_residual="seed = float16(X[c,t] * rs[c]); rs[c] = wb[pc.p2.x + 8 + c] (32 halves); "
+                          "read with MemoryStride 0 so every token column shares rs[c]",
+        rs_offset_bytes=16512 + 8, rs_offset_halves=16520,
+        pad_note="wb[16512..16519] is an unused 8-half pad and is zero in every block pack",
+        ordering="Yc = (int32 acc) * fsc[132+o] + seed in f32 (precise), then ONE narrow to half",
+        output_projection_residual="o = WO*ctx + float16(Y[c,t] * ars[c]); ars[c] = wb[pc.p2.y + c]",
+        residual_kept_original_half=True,
+    ),
+    # -------------------------------------------------------------- the blocker
+    cpu_gpu_validation=dict(
+        status="BLOCKED_ON_ORACLE",
+        what_was_proved=[
+            "the plan parses/validates and all SHAs in this file are measured",
+            "the SPV toolchain is exact: compiling the untouched c32-equalized-b4 sources "
+            "reproduces candidate.spv byte for byte (cb50782a...), so the E patch is the only delta",
+            "the int8 pack is internally consistent: every weight row of every tile has max|code|=127",
+            "the tile->channel mapping is pinned twice (dequant mbase order and the A-tile load order)",
+        ],
+        what_failed_or_is_missing=[
+            "numeric CPU/GPU agreement of the FFN Y could NOT be shown, and cannot be shown against "
+            "the existing arms: dispatch 4 is the WHOLE swin body. It writes the attention/WO output "
+            "to binding 3, so local-b4/replayed-network.bin is the block exit, not the FFN Y.",
+            "a free least-squares fit of the GPU rule 'Y_gpu - seed = A @ E_codes' leaves 29% residual "
+            "for the CPU E basis, exactly as expected when the target also contains "
+            "WO*ctx + y*ars; therefore this residual is NOT evidence of a layout bug and must not be "
+            "tuned against.",
+            "no FP16 teacher dump of the block-4 FFN Y exists (dump_skip4 is the block exit; "
+            "dump_swin_4_* was never written for the fp16 teacher).",
+        ],
+        minimal_oracle_job="oracle-local-b4-debug.txt: push word 2 (p0.z debug) = 1 and add "
+                           "OUTPUT 16 -> swin_4_debug.bin. With that buffer the CPU expand/contract "
+                           "can be aligned bit for bit at dbg[0:8192] (E, t0*128 + channel, "
+                           "stride 128), dbg[8192:10240] (Y), dbg[22528:22784] (X).",
+    ),
+    deliverables_identity=dict(
+        spv=P(HERE / "SOURCE/c32_b4_xe.spv"), spv_sha256=sha256_file(HERE / "SOURCE/c32_b4_xe.spv"),
+        pack_weights=P(HERE / "PACK/c32_block4_xe_weights.i8.bin"),
+        pack_weights_sha256=sha256_file(HERE / "PACK/c32_block4_xe_weights.i8.bin"),
+        pack_scales=P(HERE / "PACK/c32_block4_xe_scales.f32.bin"),
+        pack_scales_sha256=sha256_file(HERE / "PACK/c32_block4_xe_scales.f32.bin"),
+    ),
+)
+(HERE / "CONTRACT.json").write_text(json.dumps(contract, indent=2))
+print("CONTRACT.json written", len(json.dumps(contract)))
+print("block4 spv sha (frozen combo)", contract["block4"]["spv_sha256"][:16])
+print("this card spv sha        ", contract["deliverables_identity"]["spv_sha256"][:16])

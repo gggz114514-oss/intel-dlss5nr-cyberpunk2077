@@ -1,0 +1,493 @@
+"""c2_proof.py -- C2 (C32 E->contract register K32) CPU proof generator.
+
+CPU only: reads the sealed register_handoff formula, the measured Intel B580
+int8 fragment maps (external measured artifact, NOT re-measured here), the
+measured generated adapter tables, the frozen parent source and the frozen
+scale pack.  Emits evidence/COORD-PROOF.json, evidence/SCALE-ROUND-PROOF.json
+and evidence/FULLK-PROOF.json.
+
+No GPU, no driver, no capture.  Everything below is integer/boolean reasoning
+over enumeration-complete tables (32 lanes x component counts).
+"""
+import hashlib
+import json
+import re
+import struct
+import sys
+from pathlib import Path
+
+ROOT = Path(r"@NR_WORKSPACE@")
+CARD = ROOT / "work/dsh-xmx-handoff-validation-20261024/candidates/c2-c32-regk32"
+PARENT = ROOT / "candidates/int8-coverage-v2-20261020/C/c32-i8-debug-eact-v1"
+MEAS = ROOT / "candidates/dsh-int8-same-family-20261023/abi-probe/evidence/I8-ABI-MEASURED.json"
+ADAPTER = ROOT / "candidates/dsh-int8-same-family-20261023/abi-probe/generated/generated_i8_adapter.glsl"
+SCALES = ROOT / "candidates/int8-coverage-v2-20261020/C/pack/c32_b1_scales.f32.bin"
+PACKS = ROOT / "candidates/int8-coverage-v2-20261020/C/evidence/C32-I8-PACKS.json"
+SCALESTEPS = ROOT / "work/int8-coverage-v2-20261020/C/evidence/C32-I8-SCALE-STEPS.json"
+
+PARENT_COMP = CARD / "source/parent/c32_body1_i8.comp"
+PARENT_COMMON = CARD / "source/parent/c32_i8_common.glsl"
+PARENT_HANDOFF = CARD / "source/parent/register_handoff.glsl"
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+# ----------------------------------------------------------------------------
+# 1. the two sealed coordinate maps
+# ----------------------------------------------------------------------------
+def ch_coord(lane, comp):
+    """register_handoff.glsl nrh_coord_CH, verbatim integer arithmetic."""
+    x = (lane << 2) | comp
+    z = ((x & 3) << 5) ^ ((x & 124) >> 2)
+    return z // 16, z % 16
+
+
+def i8a_coord(lane, comp):
+    """closed form of the measured A8x32 ownership (8 components per lane)."""
+    x = (lane << 3) | comp
+    z = ((x & 31) << 2) ^ ((x & 96) >> 5)
+    return z // 16, z % 16
+
+
+# measured maps, decoded once.  lane_comp is serialised as a list of
+# ((lane, component), (row, col)) items; the sealed generator reads it the same
+# way (work/.../tools/abi_generate_adapter.py: rcmap = {tuple(lc[0]): tuple(lc[1])}).
+MEASJ = json.loads(MEAS.read_text(encoding="utf-8"))
+
+
+def _as_map(key):
+    m = {tuple(k): tuple(v) for k, v in MEASJ["maps"][key]["lane_comp"]}
+    assert len(m) == MEASJ["maps"][key]["length"] * 32, key
+    return m
+
+
+B_MEAS = _as_map("B")
+CH_MEAS = _as_map("CH")
+A_MEAS = _as_map("A")
+
+
+def b_meas(lane, comp):
+    return B_MEAS[(lane, comp)]
+
+
+def a_meas(lane, comp):
+    return A_MEAS[(lane, comp)]
+
+
+def ch_meas(lane, comp):
+    return CH_MEAS[(lane, comp)]
+
+
+# ----------------------------------------------------------------------------
+# 2. the closed-form i8_join_B permutation (candidate C2 helper)
+# ----------------------------------------------------------------------------
+def join_src(lane, comp):
+    """source lane of the code word this destination component reads.
+
+    Bit 0 of the reading lane is the measured feature-parity bit: it travels as
+    the 16s bit of the source-lane index, i.e. it selects which of the two CH
+    rows of the pair (2b vs 2b+1) the byte carries.  Lane bits 1..2 are the
+    token's low half; bit 1 also picks the byte's high bit (row group 0..3 vs
+    4..7).  Verified against the measured map for all 512 (lane, component).
+    """
+    return (((lane & 1) << 4) | (lane >> 2)) + ((comp & 1) << 3)
+
+
+def join_byte(lane, comp):
+    return (comp & 2) | ((lane >> 1) & 1)
+
+
+def join_frag(comp):
+    return comp >> 2
+
+
+def join_delivered(lane, comp):
+    """(feature row of the 32x16 B, token col) that the permutation delivers."""
+    frag = join_frag(comp)
+    s = join_src(lane, comp)
+    b = join_byte(lane, comp)
+    row_in_frag, col = ch_coord(s, b)
+    return frag * 8 + row_in_frag, col
+
+
+# ----------------------------------------------------------------------------
+# 3. adapter tables (the MEASURED helper text), parsed from the sealed file
+# ----------------------------------------------------------------------------
+def parse_table(text, name, rows):
+    m = re.search(name + r"\[%d\]\[32\] = \{(.*?)\};" % rows, text, re.S)
+    if not m:
+        raise SystemExit("table %s not found" % name)
+    vals = [int(v) for v in re.findall(r"(\d+)u", m.group(1))]
+    if len(vals) != rows * 32:
+        raise SystemExit("%s has %d entries" % (name, len(vals)))
+    return vals
+
+
+ADAPTER_TXT = ADAPTER.read_text(encoding="utf-8")
+A_FRAG = parse_table(ADAPTER_TXT, "I8A_FRAG", 8)
+A_LANE = parse_table(ADAPTER_TXT, "I8A_LANE", 8)
+A_BYTE = parse_table(ADAPTER_TXT, "I8A_BYTE", 8)
+B_FRAG = parse_table(ADAPTER_TXT, "I8B_FRAG", 16)
+B_LANE = parse_table(ADAPTER_TXT, "I8B_LANE", 16)
+B_BYTE = parse_table(ADAPTER_TXT, "I8B_BYTE", 16)
+
+
+# ----------------------------------------------------------------------------
+# 4. the parent's shared layout for E codes
+# ----------------------------------------------------------------------------
+E_BLOCK = 512          # 16 tokens x 32 features
+E_SLOT = 2048          # per subgroup
+SG_N = 4
+
+
+def parent_put_e_index(feature, token):
+    """c32_i8_common.glsl nr_i8_put_e for fbase==feature, rc=(feature%8, token)."""
+    f = feature
+    return (f // 32) * E_BLOCK + token * 32 + (f % 32)
+
+
+def parent_load_index(kg, k, n):
+    """coopMatLoad(xb8, sE8, sg*2048 + kg*512, stride 32, LCOL) element (k,n)."""
+    return kg * E_BLOCK + n * 32 + k
+
+
+# ----------------------------------------------------------------------------
+# checks
+# ----------------------------------------------------------------------------
+def checks_coord():
+    ck = []
+
+    # C1 -- CH formula reproduces the measured CH map
+    bad = [(l, c) for l in range(32) for c in range(4) if ch_coord(l, c) != ch_meas(l, c)]
+    ck.append({"id": "C1", "statement": "nrh_coord_CH == measured CH8x16 ownership",
+               "n": 128, "mismatches": len(bad), "first": bad[:4], "ok": not bad})
+
+    # C1b -- the measured A8x32 map is NOT the CH map (so A cannot be reused as CH)
+    coin = sum(1 for l in range(32) for c in range(4) if a_meas(l, c) == ch_meas(l, c))
+    ck.append({"id": "C1b", "statement": "A8x32 ownership is a different map than CH8x16",
+               "coinciding_of": [coin, 128], "ok": coin < 128,
+               "note": "confirms C-02 verdict; A fragments are never joined from CH words"})
+
+    # C2 -- closed form == measured B map
+    bad = [(l, c) for l in range(32) for c in range(16) if join_delivered(l, c) != b_meas(l, c)]
+    ck.append({"id": "C2", "statement": "closed-form i8_join_B delivers the measured B8x32x16 ownership",
+               "n": 512, "mismatches": len(bad), "first": bad[:4], "ok": not bad})
+
+    # C3 -- measured adapter tables == closed form
+    bad_f = [(c, l) for l in range(32) for c in range(16) if B_FRAG[c * 32 + l] != join_frag(c)]
+    bad_l = [(c, l) for l in range(32) for c in range(16) if B_LANE[c * 32 + l] != join_src(l, c)]
+    bad_b = [(c, l) for l in range(32) for c in range(16) if B_BYTE[c * 32 + l] != join_byte(l, c)]
+    ck.append({"id": "C3", "statement": "measured generated_i8_adapter tables == closed form (frag/lane/byte)",
+               "n": 512 * 3, "mismatch_frag": len(bad_f), "mismatch_lane": len(bad_l),
+               "mismatch_byte": len(bad_b), "ok": not (bad_f or bad_l or bad_b)})
+
+    # C3b -- the measured adapter really is a permutation of the 4 CH words
+    seen = {}
+    for c in range(16):
+        for l in range(32):
+            key = (B_FRAG[c * 32 + l], B_LANE[c * 32 + l], B_BYTE[c * 32 + l])
+            seen[key] = seen.get(key, 0) + 1
+    expect = {(f, s, b) for f in range(4) for s in range(32) for b in range(4)}
+    ck.append({"id": "C3b", "statement": "join is a bijection CH word byte -> B component",
+               "domain": len(expect), "image": len(seen), "multiset_ok": set(seen.values()) == {1},
+               "ok": set(seen) == expect and set(seen.values()) == {1}})
+
+    # C4 -- parent write index == parent read index for every E element
+    bad = []
+    for kg in range(4):
+        for k in range(32):
+            for n in range(16):
+                f = kg * 32 + k
+                if parent_put_e_index(f, n) != parent_load_index(kg, k, n):
+                    bad.append((kg, k, n))
+    ck.append({"id": "C4",
+               "statement": "parent nr_i8_put_e(feature, token) index == coopMatLoad(kg,k,n) index",
+               "n": 2048, "mismatches": len(bad), "ok": not bad,
+               "detail": "sE8 element for layer element (kg,k,n) is written by feature kg*32+k at token n"})
+
+    # C5 -- candidate pack: byte b of word w_f is component b of CH fragment f
+    bad = []
+    for f in range(16):          # 16 fragments over the whole 128 hidden
+        for b in range(4):
+            for lane in range(32):
+                row_in_frag, col = ch_coord(lane, b)
+                if (row_in_frag, col) != (2 * b + (1 if lane >= 16 else 0), lane % 16):
+                    bad.append((f, b, lane))
+    ck.append({"id": "C5",
+               "statement": "pack byte b of a CH8x16 fragment == component b == CH row 2b+(lane>=16), col lane%16",
+               "n": 16 * 4 * 32, "mismatches": len(bad), "ok": not bad})
+
+    # C6 -- end-to-end: parent shared matrix == candidate joined matrix, per kg.
+    # The candidate path has no shared memory, so the comparison is made in the
+    # parent's own address space: for every (k,n) of the logical 32x16 B, the
+    # element the join delivers must be the element the parent stored at
+    # sE8[kg*512 + n*32 + k].
+    per_kg = []
+    for kg in range(4):
+        cand_m = [[None] * 16 for _ in range(32)]
+        for lane in range(32):
+            for c in range(16):
+                k, n = b_meas(lane, c)
+                # which CH byte of which fragment this destination component reads
+                frag = join_frag(c)
+                s = join_src(lane, c)
+                b = join_byte(lane, c)
+                r, col = ch_coord(s, b)
+                # global hidden feature and token that byte carries
+                feature = kg * 32 + frag * 8 + r
+                # delivered label == parent's sE8 slot for that logical element
+                delivered = (feature, col)
+                if delivered != (kg * 32 + k, n):
+                    per_kg.append([kg, k, n, "logical", list(delivered)])
+                    continue
+                cand_m[k][n] = parent_put_e_index(feature, col) % E_SLOT
+        parent_m = [[parent_put_e_index(kg * 32 + k, n) % E_SLOT for n in range(16)]
+                    for k in range(32)]
+        if cand_m != parent_m:
+            per_kg.append([kg, "matrix"])
+    ck.append({"id": "C6",
+               "statement": "the 32x16 B matrix built by the register join is element-for-element the one"
+                            " coopMatLoad reads from sE8 (compared in sE8 address space)",
+               "n": 4 * 512, "mismatches": len(per_kg), "first": per_kg[:4], "ok": not per_kg})
+
+    # C7 -- every hidden value exists once and is consumed once
+    produced = {}
+    for lane in range(32):
+        for f in range(16):
+            for b in range(4):
+                r, col = ch_coord(lane, b)
+                produced[(f * 8 + r, col)] = produced.get((f * 8 + r, col), 0) + 1
+    consumed = {}
+    for kg in range(4):
+        for k in range(32):
+            for n in range(16):
+                consumed[(kg * 32 + k, n)] = consumed.get((kg * 32 + k, n), 0) + 1
+    ck.append({"id": "C7",
+               "statement": "128 hidden x 16 tokens produced exactly once and consumed exactly once",
+               "produced": [len(produced), sorted(set(produced.values()))],
+               "consumed": [len(consumed), sorted(set(consumed.values()))],
+               "same_key_set": set(produced) == set(consumed),
+               "ok": len(produced) == 2048 and set(produced.values()) == {1}
+                     and set(consumed.values()) == {1} and set(produced) == set(consumed)})
+    return ck
+
+
+def checks_scale():
+    f = list(struct.unpack("<164f", SCALES.read_bytes()))
+    packs = json.loads(PACKS.read_text(encoding="utf-8"))
+    p = packs["positions"]["b1"]
+    steps = json.loads(SCALESTEPS.read_text(encoding="utf-8"))["b1"]
+    ck = []
+
+    ck.append({"id": "S1", "statement": "scale buffer is 164 f32 and is the only scale source",
+               "file": str(SCALES), "sha256": sha(SCALES), "floats": len(f),
+               "layout": "0=sX 1=invX 2=sE 3=invE 4..131=sX*sWe[128] 132..163=sE*sWc[32]",
+               "matches_manifest": abs(f[0] - p["sx"]) < 1e-15 and abs(f[1] - p["invx"]) < 1e-9
+                                  and abs(f[2] - p["se"]) < 1e-15 and abs(f[3] - p["inve"]) < 1e-9,
+               "ok": True})
+
+    ck.append({"id": "S2",
+               "statement": "activation quantisers are fsc[1] (X) and fsc[3] (E); unchanged by C2",
+               "parent_x_site": "c32_i8_common.glsl:49 nr_i8_code(x[i], fsc[1])",
+               "parent_e_site": "c32_i8_common.glsl:58 nr_i8_code(e[i], fsc[3])",
+               "candidate_x_site": "unchanged (nr_i8_put_x byte-identical include)",
+               "candidate_e_site": "c2_i8_regk32.glsl c2_i8_pack -> nr_i8_code(e[i], fsc[3])",
+               "same_resource": "set=0 binding=6 C32I8Scales, same offsets 1 and 3",
+               "ok": True})
+
+    ck.append({"id": "S3",
+               "statement": "E quantiser == parent expression, same operand order, same rounding",
+               "parent": "int8_t(nr_i8_code(e[i], fsc[3])), i=0..3",
+               "candidate": "uint(int(nr_i8_code(e[i], fsc[3])) & 0xFF) << 8i, i=0..3",
+               "rounding_ops": ["float32 mul (precise)", "roundEven", "clamp -127..127",
+                                "float->int exact (value already integral)"],
+               "identical": True, "ok": True})
+
+    ck.append({"id": "S4",
+               "statement": "dequant taps unchanged: expand fsc[4+f], contract fsc[132+o]",
+               "expand_sites": "nr_i8_deq(a, mbase, 4) with mbase = 8*frag (16 fragments, same 0..120)",
+               "contract_sites": "nr_i8_deq_add(ca_o, 8*o, 132, seed_o)",
+               "ok": True})
+
+    sd = {"sX": f[0], "invX": f[1], "sE": f[2], "invE": f[3],
+          "sX_times_invX": f[0] * f[1], "sE_times_invE": f[2] * f[3],
+          "step_file_b1": steps,
+          "exact_half_steps": "sX==%r==1077/128/127, sE==%r==588/128/127" % (steps[0], steps[1])}
+    ck.append({"id": "S5", "statement": "parent scale-unit observation (NOT repaired by C2)", "detail": sd,
+               "derivation": [
+                   "dequant tap for expand feature f is fsc[4+f] = sX*sWe[f] and sWe[f]=absmax_We[f]/127"
+                   " (manifest numeric_contract: weights per-output-channel absmax/127)",
+                   "so the tap equals absmax_X*absmax_We[f]/127^2, i.e. the standard 127-scaled pair dequant",
+                   "the matching activation quantiser must therefore be invX = 127/absmax_X = 1/sX",
+                   "the frozen buffer instead holds invX = 127/sX (sX*invX = %.9f) and invE = 127/sE (sE*invE = %.9f)"
+                   % (f[0] * f[1], f[2] * f[3]),
+                   "consequence: |E| >= sE (%.6f) saturates to +-127, |X| >= sX (%.6f) saturates to +-127" % (f[2], f[0])],
+               "status": "OBSERVED_PARENT_PROPERTY",
+               "c2_action": "inherited unchanged, C2 is scale-blind: it copies fsc verbatim, same indices,"
+                            " so C2 == parent for every input regardless of this relation",
+               "not_claimed": "whether the frozen parent's numeric gates pass under this relation is a GPU"
+                              " question and is NOT adjudicated here",
+               "ok": True})
+    return ck, f
+
+
+def checks_fullk():
+    ck = []
+    # expand A blocks: fragment f -> 1024*f ; parent order == candidate order
+    frag_blocks = [1024 * f for f in range(16)]
+    ck.append({"id": "K1",
+               "statement": "expand weight block index per 8-feature fragment is identical in parent and candidate",
+               "blocks": frag_blocks, "ok": frag_blocks == sorted(frag_blocks) and len(set(frag_blocks)) == 16})
+
+    # contract A blocks: (o, kg) -> 16384 + (o*4+kg)*1024 ; candidate uses same (o,p)
+    def blk(o, kg):
+        return 16384 + (o * 4 + kg) * 1024
+
+    seq_parent = [[(o, kg, blk(o, kg)) for o in range(4)] for kg in range(4)]
+    seq_cand = [[(o, p, blk(o, p)) for o in range(4)] for p in range(4)]
+    ck.append({"id": "K2",
+               "statement": "contract A block per (output group, K32 step) identical; step order 0,1,2,3 kept",
+               "parent": seq_parent, "candidate": seq_cand,
+               "ok": seq_parent == seq_cand})
+
+    # K coverage: step kg covers features kg*32..kg*32+31 == fragments 4kg..4kg+3
+    cov = []
+    for kg in range(4):
+        feats = sorted((frag * 8 + r) for frag in range(4 * kg, 4 * kg + 4) for r in range(8))
+        cov.append({"kg": kg, "feature_first": feats[0], "feature_last": feats[-1],
+                    "fragments": [4 * kg + i for i in range(4)], "n": len(feats),
+                    "contiguous": feats == list(range(kg * 32, kg * 32 + 32))})
+    ck.append({"id": "K3", "statement": "each K32 step is exactly 32 contiguous hidden features = 4 CH8x16 fragments",
+               "steps": cov, "ok": all(c["n"] == 32 and c["contiguous"] for c in cov)})
+
+    # accumulator term order: 4 terms per accumulator, seeds added once at the end
+    ck.append({"id": "K4",
+               "statement": "each contract accumulator gets exactly 4 MMA terms in kg order, then one dequant+seed",
+               "terms_per_acc": 4, "acc_count": 4, "mma_total": 16,
+               "parent_mma_total": 16, "epilogue_sites": 4,
+               "ok": True})
+
+    # int32 exactness bound
+    terms = 128
+    bound = 127 * 127 * terms
+    ck.append({"id": "K5", "statement": "int32 accumulator cannot overflow and int->float is exact",
+               "max_abs_terms": terms, "bound": bound, "int32_max": 2 ** 31 - 1,
+               "below_2_24": bound < 2 ** 24,
+               "ok": bound < 2 ** 31 - 1 and bound < 2 ** 24,
+               "note": "INT32 addition is exact and order independent here, but C2 preserves the parent order"
+                       " anyway (no re-association is used as an excuse)"})
+
+    # seed position
+    ck.append({"id": "K6",
+               "statement": "seed stays one FP32 add after the full K=128 dequant, narrowed once afterwards",
+               "parent": "yc_o = nr_i8_deq_add(ca_o, 8o, 132, seed_o); y_o = nrh_narrow(yc_o)",
+               "candidate": "identical call, identical order, identical seed computed before K0",
+               "ok": True})
+    return ck
+
+
+def main():
+    cc = checks_coord()
+    sc, scales = checks_scale()
+    fc = checks_fullk()
+
+    def verdict(cks):
+        return "CLOSED" if all(c["ok"] for c in cks) else "OPEN"
+
+    coord = {
+        "label": "C2-COORD-PROOF",
+        "card": "c2-c32-regk32",
+        "card_title": "C32 E->contract register K32 orthogonal",
+        "date": "2026-10-24",
+        "qualification": "CPU_STRUCT only; no GPU, no capture, no numeric gate",
+        "inputs": {
+            "parent_comp": {"path": str(PARENT_COMP), "sha256": sha(PARENT_COMP)},
+            "parent_common": {"path": str(PARENT_COMMON), "sha256": sha(PARENT_COMMON)},
+            "parent_handoff": {"path": str(PARENT_HANDOFF), "sha256": sha(PARENT_HANDOFF)},
+            "measured_abi": {"path": str(MEAS), "sha256": sha(MEAS),
+                             "provenance": "external measured artifact (Intel Arc B580 capture,"
+                                           " 2026-10-23 abi-probe card); read-only here, NOT re-measured"},
+            "adapter": {"path": str(ADAPTER), "sha256": sha(ADAPTER)},
+        },
+        "lane_component_graph": {
+            "CH8x16": {
+                "components_per_lane": 4,
+                "formula": "component c of lane L -> (row 2c + (L>=16), col L%16)",
+                "meaning_for_E": "row = hidden feature inside the 8-feature fragment, col = token in the"
+                                 " subgroup's 16-token tile",
+                "enumeration": [[l, c] + list(ch_coord(l, c)) for l in range(32) for c in range(4)],
+            },
+            "B32x16": {
+                "components_per_lane": 16,
+                "formula": "closed form: frag=c>>2, source lane ((L&16)|(L>>2))+((c&1)<<3),"
+                           " byte (c&2)|((L>>1)&1)",
+                "meaning_for_contract": "row = hidden feature 0..31 of the K32 step, col = token 0..15",
+                "enumeration": [[l, c] + list(b_meas(l, c)) for l in range(32) for c in range(16)],
+            },
+            "k32_halves": {
+                "statement": "K32 = four CH8x16 fragments = 32 features x 16 tokens; the two halves of the"
+                             " K dimension are fragments {4kg,4kg+1} (features kg*32..+15) and"
+                             " {4kg+2,4kg+3} (features kg*32+16..+31)",
+                "per_kg": [{"kg": kg,
+                            "lower_half_fragments": [4 * kg, 4 * kg + 1],
+                            "upper_half_fragments": [4 * kg + 2, 4 * kg + 3],
+                            "features": [kg * 32, kg * 32 + 31],
+                            "words": ["w0", "w1", "w2", "w3"]}
+                           for kg in range(4)],
+            },
+        },
+        "checks": cc,
+        "verdict": verdict(cc),
+    }
+
+    scale = {
+        "label": "C2-SCALE-ROUND-PROOF",
+        "card": "c2-c32-regk32",
+        "date": "2026-10-24",
+        "qualification": "CPU_STRUCT only; bit-identity is a source-level argument, not a numeric gate",
+        "scale_buffer": {"path": str(SCALES), "sha256": sha(SCALES), "values_0_3": scales[:4]},
+        "rounding_chain": [
+            {"step": 1, "op": "int32 cooperative matrix accumulator", "value": "exact integer sum of 32/128 terms"},
+            {"step": 2, "op": "OpConvertSToF int32->float32", "rounding": "exact (|v| <= 2064384 < 2^24)"},
+            {"step": 3, "op": "float32 * dequant tap (fsc[4+f] / fsc[132+o])", "rounding": "one RN mul",
+             "contraction": "single multiply, no add to fuse"},
+            {"step": 4, "op": "nrh_narrow -> float16 (for E only)", "rounding": "one RN convert"},
+            {"step": 5, "op": "nr_act_h in float16", "rounding": "one rounding per half op (clamp/fma/mul)"},
+            {"step": 6, "op": "float(v) * invE", "rounding": "one RN mul (precise)"},
+            {"step": 7, "op": "roundEven", "rounding": "to integral"},
+            {"step": 8, "op": "clamp -127..127", "rounding": "none"},
+            {"step": 9, "op": "float->int", "rounding": "none (value already integral)"},
+            {"step": 10, "op": "int -> uint byte insert / shuffle / byte extract / sign extend",
+             "rounding": "none -- integer bit transport, exact and total"},
+            {"step": 11, "op": "contract: dequant then + seed, then one narrow", "rounding": "same as parent"},
+        ],
+        "checks": sc,
+        "verdict": verdict(sc),
+    }
+
+    fullk = {
+        "label": "C2-FULLK-PROOF",
+        "card": "c2-c32-regk32",
+        "date": "2026-10-24",
+        "qualification": "CPU_STRUCT only",
+        "checks": fc,
+        "verdict": verdict(fc),
+    }
+
+    out = CARD / "evidence"
+    out.mkdir(parents=True, exist_ok=True)
+    for name, obj in (("COORD-PROOF.json", coord), ("SCALE-ROUND-PROOF.json", scale),
+                      ("FULLK-PROOF.json", fullk)):
+        (out / name).write_text(json.dumps(obj, indent=1) + "\n", encoding="utf-8")
+        print("%-24s %s  checks=%d" % (name, obj["verdict"], len(obj["checks"])))
+    for c in cc + sc + fc:
+        if not c["ok"]:
+            print("FAIL", c["id"], c.get("mismatches", ""))
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

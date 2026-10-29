@@ -1,0 +1,21 @@
+
+第四轮跨head owner实施卡：完整context驻留与分阶段投影
+证据CROSS-HEAD-OWNER-PROOF.json、prove-cross-head-owner.py、prove-cross-head-q32.py。只有CPU owner、地址、K次序与源级成本模型通过；没有实现/编译/native/GPU结果。下列方案具体推进独立候选，不以“有融合阻碍”关闭，也不未经性能验证替换生产父。
+
+方案H16：一WG负责16query×全部32head，先完成attention，再执行projection
+local_size=256，8SG。WG.x=qTile，qBase=16*qTile；grid=(18,1,1)，每块288token。attention四轮wave=0..3，每SG的head=8*wave+sg，独占这16query的完整32维context。每个有效query/head仅计算一次；保留原QK转置、half exp/den树、5个64key chunk、padding exp(0)与最终inverse时机。QKV仍由独立前驱生产，不在本融合核重复QKV投影。
+attention阶段不设跨head sk/sv缓存；各SG直接从前驱QKV加载自己head的K/V片段。Q按16query保留；K/V只保当前操作数。FP16 K8×16 ROW stride3072，V^T8×16 COL stride3072；无效padding key片段必须完整置零，不能越界load后再mask。288对8/16均对齐，尾部可按完整片段判断。INT8按R15已验证Q8/K8/V8物理布局使用K32，不能把half元素偏移照抄到byte view。分chunk den处理及P→PV与各自主线父一致。
+最终context必须经过原half numerator/half inverse边界；FP16写shared T[16][1024] half，INT8在同一最终half点按本块ws[10]量化写shared qT[16][1024] int8。写者head唯一、各轮目标区域不重叠；四轮之间无需WG barrier。该阶段不得预建projection累加器。
+所有head完成后一次WG barrier发布T。结束Q/den/P/attention ctx的词法作用域，进入projection：sweep=0..3，每SG n0=sweep*256+sg*32；同时算M8 row0与row8、N16 side0与16，共四宽acc=64B/lane。按父K递增完成整个K1024，两块B分别复用给两个M8，维持原weight pack。每轮处理完原残差FMA/half输出再销毁acc，进入下一sweep。T只读无需轮间WG同步；最后无需退休barrier，因为没有覆盖。
+CPU完整16384个T元素、16384个输出元素均唯一覆盖；FP16 K16和INT8 K32各16384个A来源地址无差异。输出scatter/矩阵store用原canonical raster布局，原half残差Y一直保留。本融合核不删除下一层所需half输出。
+
+成本账（每ViT块、源级逻辑字节，非DRAM计数）：
+FP16：shared T=32768B；K/V读取5898240→21233664（3.6倍）；删除context全局写589824及当前N16 projection全局读37748736；新N32 projection改为SLM读18874368。这一子集全局字节净少23003136，未计Q/权重/残差/debug/事务放大。N16→N32本身改变A复用，需明确归因；如native显示N32压力过高，可用N16八sweep对照（两个acc=32B/lane，SLM读恢复37748736），不同时扩大其它tile。
+INT8（假设R15已完整INT8、父K/V缓存也是byte）：shared qT=16384B；K/V读取2949120→10616832；删除qT写294912及projection读9437184，新SLM读9437184；该子集净少2064384B。当前G3混合attention不是这个成本父，必须先满足全INT8覆盖。
+两者attention四ctx净64B/lane、projection四acc净64B/lane，分阶段不相加；attention期间另有Q、score、P/den与地址，64B不是总GRF峰值。禁止编译器因大函数/动态coopmat索引将两阶段活区意外重叠：用明确独立scope/静态变量，检查native live range与scratch。源模型不保证没有spill。
+每块融合WG仅18个，原attention有160个WG，projection另有192(FP16)/96(INT8)个WG；减少dispatch/共享边不等于保持并行度。SG在四head轮期间全部工作，仍须验证18WG是否足以覆盖设备，不能通过增加N输出WG无声重复attention。
+plan接线：当前8对attention/projection的binding完全相同，PUSH仅word2由3变4；这是兼容线索，不是任意拷PUSH许可。新核显式划阶段，核对word2实际读取；保留所有其它PUSH、绑定范围、weight/scale身份。先用融合核替换一对PASS，输出和debug逐段验收，再推广8块；去掉中间context资源前核诊断读者和物理池生命周期。INT8 X5修正必须先完成，两个错误绑定相同不代表正确。
+
+streaming对照的定量裁定：8head一轮，只保16×256 context，FP168192B/INT84096B；每轮attention之后立即更新projection，四轮publication+三次覆盖前retirement=7WG barrier。若单WG覆盖全部N1024，projection累计256B/lane长期存活，再加attention ctx64B=320B/lane宽值净payload，尚未计Q/score/P。若拆成两个N512输出WG，宽值净192B/lane、attention重复2次；四个N256则128B/lane、重复4次。不能声称少共享同时零寄存器代价。本轮以H16分阶段方案先实施；streaming仅在native证实H16共享/并行限制且具名模型更优时再开，不为填卡默认全排GPU。
+
+split16的适用界限与可实施顺序：当前QKV就在attention核内。把64query窗口分成4个16query WG，会把QKV投影/归一化重复4次，不能套ViT不重算结论。若保留每窗口64query、循环16head并完整缓存context，FP16 T=65536B另加现有QKV/输入缓存20480B，合计86016B；INT8 T=32768B加经过I-PC11证明的QKV8/sy8 arena6144B=38912B。后者可作为后续完整INT8 split H64候选：每head先原QKV与完整attention，最终qT写window-local[64][512]；16head全部完成后一次发布；projection按4个M16×2个N256 sweep串行完成，4acc/SG=64B/lane。原窗口边界/shift/token映射、投影seed与写域单列，QKV缓存每head覆盖前必须等全部score/PV读者退休。只剩每个window一WG且16head串行，平行度大降；先核native与工作组数量，不从ViT结果继承性能结论。FP16 86016B必须先核设备与编译SLM上限，不假定可用，不作为首发。不能用跨head浮点partial sum改原投影K顺序规避存储。

@@ -1,0 +1,184 @@
+"""N17C F20 composite: read-only ISA accounting for the parent (ord 230) capture.
+
+No GPU, no writes outside this card.  Produces build/isa-sites.json with
+
+  * instruction histogram / send taxonomy of the parent kernel (hash 76902ef344609c8a)
+  * the per-`sync.bar` segmentation used to localise the 20 fragment-store sites and
+    the 38 fragment-load sites (stage 1 / 3 / 4 / 6 / 8 / 9), so the four sites this
+    card moves under a uniform debug predicate can be named without ambiguity
+  * the runtime message arithmetic for parent / Q / Y / Q+Y, from the measured
+    "8 messages per fragment transfer" constant of this kernel
+"""
+import collections
+import hashlib
+import json
+import re
+from pathlib import Path
+
+ISA = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+           r'fullnet-mechanism-transfer-20261026/f10-weight-return-separation-20261027/'
+           r'captures/native-f20-pixel-owner/ISA/'
+           r'CS_asm76902ef344609c8a_simd32_0000000000000027_38_orig.asm')
+OUT = Path(__file__).resolve().parent / 'build'
+
+INSTR = re.compile(r'^/\* \[([0-9A-Fa-f]+)\]\s*\*/\s*(.*)$')
+LABEL = re.compile(r'^(L\d+):')
+
+
+def parse():
+    ins, labels = [], []
+    for ln in ISA.read_text(encoding='utf-8', errors='replace').splitlines():
+        m = LABEL.match(ln.strip())
+        if m:
+            labels.append(dict(index=len(ins), label=m.group(1)))
+            continue
+        m = INSTR.match(ln)
+        if not m:
+            continue
+        addr, body = m.group(1), m.group(2)
+        pred = None
+        mp = re.match(r'^(\([^)]*\))\s*', body)
+        if mp:
+            pred = mp.group(1)
+            body = body[mp.end():]
+        body = body.strip()
+        comment = None
+        if '//' in body:
+            body, comment = body.split('//', 1)
+            comment = comment.strip()
+        tok = body.split()
+        if not tok:
+            continue
+        op = tok[0]
+        unit = None
+        mu = re.match(r'\((\d+)\|', body)
+        if mu:
+            unit = mu.group(1)
+        rec = dict(index=len(ins), addr=addr, pred=pred, op=op, body=body,
+                   comment=comment, unit=unit)
+        if op.startswith('send.'):
+            rec['cls'] = op.split('.')[1]
+            rec['msg'] = ''
+            if comment:
+                mm = re.match(r'wr:(\d+)\+(\d+),\s*rd:(\d+);\s*(.+)$', comment)
+                if mm:
+                    rec['msg'] = mm.group(4).strip()
+        ins.append(rec)
+    return ins, labels
+
+
+def main():
+    OUT.mkdir(parents=True, exist_ok=True)
+    ins, labels = parse()
+    hist = collections.Counter(r['op'] for r in ins)
+    sends = [r for r in ins if r['op'].startswith('send.')]
+    by_msg = collections.Counter(r['msg'] for r in sends)
+
+    bars = [i for i, r in enumerate(ins) if r['op'] == 'sync.bar']
+    bounds = [0] + bars + [len(ins)]
+    STAGE = {0: 'stage 0 fold', 1: 'stage 0 -> stage 1 debug dump',
+             2: 'stage 1 expand (2 rounds x 4 sites, M publication)',
+             3: 'stage 3 contract (Y publication + seeds)',
+             4: 'stage 3 -> stage 4 debug dump (shY)',
+             5: 'stage 4 QKV (V pair, K pair, Q pair in this order)',
+             6: 'stage 4 -> stage 6 debug dump (NR_Q, NR_K)',
+             7: 'stage 6 score + den + stage 8 context',
+             8: 'stage 8 -> stage 9 debug dump (NR_CTX)', 9: 'debug barrier',
+             10: 'stage 9 projection (seed loads + O publication)',
+             11: 'pixel tail + residual_out stores', 12: 'debug O dump'}
+    segments = []
+    for a, b in zip(bounds, bounds[1:]):
+        part = ins[a:b]
+        if not part:
+            continue
+        st_msgs = [r for r in part if r.get('msg', '').startswith('store.slm.d32x8t')]
+        ld_msgs = [r for r in part if r.get('msg', '').startswith('load.slm.d32x8t')]
+        seg = dict(first_addr=part[0]['addr'], last_addr=part[-1]['addr'],
+                   n_instr=len(part),
+                   sends=sum(1 for r in part if r['op'].startswith('send.')),
+                   dpas=sum(1 for r in part if r['op'].startswith('dpas')),
+                   store_slm_msgs=len(st_msgs), load_slm_msgs=len(ld_msgs),
+                   store_slm_transfers=len(st_msgs) // 8,
+                   load_slm_transfers=len(ld_msgs) // 8,
+                   store_addrs=[r['addr'] for r in st_msgs],
+                   load_addrs=[r['addr'] for r in ld_msgs],
+                   msgs=dict(collections.Counter(r.get('msg', '') for r in part
+                                                 if r['op'].startswith('send.'))))
+        segments.append(seg)
+
+    # fragment-store pairs inside a segment (a pair is two consecutive messages:
+    # columns 0..15 and 16..31 of the same transfer)
+    for i, s in enumerate(segments):
+        s['stage'] = STAGE.get(i, '?')
+        s['store_pairs'] = [s['store_addrs'][k:k + 2] for k in range(0, len(s['store_addrs']), 2)]
+        s['load_pairs'] = [s['load_addrs'][k:k + 2] for k in range(0, len(s['load_addrs']), 2)]
+
+    # message classes
+    store_slm = by_msg.get('store.slm.d32x8t.a32', 0)
+    load_slm = by_msg.get('load.slm.d32x8t.a32', 0)
+    debug_only = sum(n for msg, n in by_msg.items() if 'store.ugm' in msg
+                     and ('debug' or True))
+    # the debug-only population is exactly the dbg[] writer classes:
+    #   store.ugm.d32x8t (96 = 12 sites x 8, inside `if (debug)`) and
+    #   store.ugm.d16u32 (11 = 6 element loops + 5 scalars, inside `if (debug)`)
+    dbg_store_frag = sum(n for m, n in by_msg.items() if m.startswith('store.ugm.d32x8t'))
+    dbg_store_elem = sum(n for m, n in by_msg.items() if m.startswith('store.ugm.d16u32'))
+    runtime = len(sends) - dbg_store_frag - dbg_store_elem
+
+    # composite arithmetic (per warp)
+    per_transfer = 8
+    q_loads = 2
+    q_stores = 2
+    y_loads = 2
+    y_stores = 2
+    removed_static = (q_loads + y_loads) * per_transfer          # load instructions disappear
+    predicated = (q_stores + y_stores) * per_transfer            # stores stay static, not issued
+    out = dict(
+        isa=dict(path=str(ISA), sha256=hashlib.sha256(ISA.read_bytes()).hexdigest()),
+        n_instructions=len(ins), n_labels=len(labels),
+        histogram=dict(sorted(hist.items(), key=lambda kv: -kv[1])),
+        sends=dict(total=len(sends),
+                   by_class=dict(collections.Counter(r['cls'] for r in sends)),
+                   by_message=dict(sorted(by_msg.items(), key=lambda kv: -kv[1])),
+                   n_sites_store_slm=store_slm // per_transfer,
+                   n_sites_load_slm=load_slm // per_transfer),
+        sync=dict(collections.Counter(r['op'] for r in ins if r['op'].startswith('sync'))),
+        dpas=sum(1 for r in ins if r['op'].startswith('dpas')),
+        barriers=len(bars),
+        segments=segments,
+        messages=dict(
+            per_transfer=per_transfer,
+            store_slm_d32x8t=store_slm, load_slm_d32x8t=load_slm,
+            debug_only_static=dbg_store_frag + dbg_store_elem,
+            debug_only_breakdown=dict(fragment_stores_store_ugm_d32x8t=dbg_store_frag,
+                                      element_stores_store_ugm_d16u32=dbg_store_elem),
+            runtime_per_warp_parent=runtime,
+            removed_static_this_card=removed_static,
+            predicated_not_issued_this_card=predicated,
+            removed_runtime_this_card=removed_static + predicated,
+            share_of_runtime_pct=round(100.0 * (removed_static + predicated) / runtime, 3),
+            runtime_per_warp_candidate=runtime - removed_static - predicated,
+            warps_per_dispatch=16393 * 8,
+            runtime_messages_per_dispatch_parent=runtime * 16393 * 8,
+            runtime_messages_per_dispatch_candidate=(runtime - removed_static - predicated) * 16393 * 8,
+        ),
+    )
+    (OUT / 'isa-sites.json').write_text(json.dumps(out, indent=1), encoding='utf-8')
+
+    print('instructions', out['n_instructions'], 'sends', len(sends),
+          'dpas', out['dpas'], 'sync.bar', out['barriers'])
+    print('sends by class', out['sends']['by_class'])
+    print('store.slm messages', store_slm, '=', out['sends']['n_sites_store_slm'], 'transfers',
+          '| load.slm messages', load_slm, '=', out['sends']['n_sites_load_slm'], 'transfers')
+    print('debug-only static', out['messages']['debug_only_static'],
+          'runtime parent', out['messages']['runtime_per_warp_parent'],
+          'runtime candidate', out['messages']['runtime_per_warp_candidate'])
+    print('segments:')
+    for i, s in enumerate(segments):
+        print(' %2d %s..%s instr=%4d send=%3d dpas=%2d store=%2d load=%2d  %s'
+              % (i, s['first_addr'], s['last_addr'], s['n_instr'], s['sends'],
+                 s['dpas'], s['store_slm_msgs'], s['load_slm_msgs'], s['stage']))
+
+
+if __name__ == '__main__':
+    main()

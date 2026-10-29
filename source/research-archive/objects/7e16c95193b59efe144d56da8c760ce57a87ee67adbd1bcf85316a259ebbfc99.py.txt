@@ -1,0 +1,64 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys
+R=Path(__file__).resolve().parent;A=R.parent;B=Path('@NR_WORKSPACE@');P=A/'c32-lifecycle-next-20261025/f20-qkv-owner';N=R/'f20-den-pv-owner';N.mkdir(exist_ok=True)
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+rd=lambda p:json.loads(p.read_text(encoding='utf-8-sig'))
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(args):
+ p=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert p.returncode==0,p.stdout+p.stderr;return p.stdout
+s=(P/'candidate.comp').read_text(encoding='utf-8-sig');original=s
+# Mapping/ordered tree proof must pass before shader generation.
+run([sys.executable,'-B',N/'prove_mapping.py'])
+a=s.index('    // den keeps its original half tree;')
+b=s.index('    // ============ stage 8:',a)
+new="""    // Den is reduced in native PV-A ownership, without a P layout conversion.
+    f16vec4 p_cache[4];
+    float16_t pv_inv[4];
+    {
+        f16vec4 partial=f16vec4(float16_t(0.0));
+        for(uint j=0u;j<4u;++j){
+            MAT_A pa; coopMatLoad(pa,shP,sg*8u*64u+j*16u,64u,LROW);
+            p_cache[j]=f16vec4(pa[0],pa[1],pa[2],pa[3]);
+            vec2 b01=unpackHalf2x16(subgroupShuffleXor(packHalf2x16(vec2(float(pa[0]),float(pa[1]))),8u));
+            vec2 b23=unpackHalf2x16(subgroupShuffleXor(packHalf2x16(vec2(float(pa[2]),float(pa[3]))),8u));
+            f16vec4 peer=f16vec4(b01,b23);
+            if((lane&8u)==0u){
+                for(int d=0;d<4;++d){
+                    float16_t pair=p_cache[j][d]+peer[d];
+                    partial[d]=partial[d]+pair;
+                }
+            }
+        }
+"""
+for offset,mask in [(2,10),(4,14),(1,15)]:
+    new+=f"""        {{
+            vec2 b01=unpackHalf2x16(subgroupShuffleXor(packHalf2x16(vec2(float(partial[0]),float(partial[1]))),{offset}u));
+            vec2 b23=unpackHalf2x16(subgroupShuffleXor(packHalf2x16(vec2(float(partial[2]),float(partial[3]))),{offset}u));
+            f16vec4 peer=f16vec4(b01,b23);
+            if((lane&{mask}u)==0u) for(int d=0;d<4;++d) partial[d]=partial[d]+peer[d];
+        }}
+"""
+new+="""        f16vec4 inv=f16vec4(float16_t(0.0));
+        if((lane&15u)==0u) for(int d=0;d<4;++d)
+            inv[d]=float16_t(1.0/max(float(partial[d]),6.103515625e-05));
+        vec2 i01=unpackHalf2x16(subgroupShuffle(packHalf2x16(vec2(float(inv[0]),float(inv[1]))),lane&16u));
+        vec2 i23=unpackHalf2x16(subgroupShuffle(packHalf2x16(vec2(float(inv[2]),float(inv[3]))),lane&16u));
+        pv_inv[0]=float16_t(i01.x);pv_inv[1]=float16_t(i01.y);
+        pv_inv[2]=float16_t(i23.x);pv_inv[3]=float16_t(i23.y);
+    }
+
+"""
+s=s[:a]+new+s[b:]
+old='MAT_A a; coopMatLoad(a, shP, m0 * 64u + k0, 64u, LROW);   // shared A'
+assert s.count(old)==1
+s=s.replace(old,'MAT_A a; for(int d=0;d<4;++d) a[d]=p_cache[ki][d]; // Same lane/component; no P shuffle.')
+src=N/'candidate.comp';src.write_text(s,encoding='utf-8');spv=N/'candidate.spv';run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv]);pm=ST.Module(P/'candidate.spv');cm=ST.Module(spv);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[]);assert len(keep)==len(ST.no_contraction_ids(pm))==7;ST.set_no_contraction(cm,set(keep),spv);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+baseline=rd(R/'BASELINE.json');text=Path(baseline['plan']['path']).read_text();assert text.count((P/'candidate.spv').as_posix())==1;plan=N/'plan.txt';plan.write_text(text.replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8');tmpl=A/'c32-entry-chain-20261025/f01-residual';runner=Path(rd(tmpl/'LUNA-GATES.json')['identities'][0]['path']);m=dict(source=ident(src),spv=ident(spv),plan=ident(plan),parent_spv=ident(P/'candidate.spv'),parent_plan=baseline['plan'],no_contraction_count=7,shared_unchanged=True,ordered_den_tree_unchanged=True,new_barriers=0,removed_normal_WG_barriers=0,removed_P_half_reads_per_WG=4096,added_packed_shuffles_per_SG=10,retained_P_bytes_per_lane=32,mapping_coordinates_proved=4096,cpu_check=run([runner,'--plan',plan,'--cpu-check']));(N/'CANDIDATE.json').write_text(json.dumps(m,indent=2));(N/'run').mkdir(exist_ok=True);(N/'captures').mkdir(exist_ok=True)
+for kind in ['GATES','NATIVE','ORDINARY']:
+ task=rd(tmpl/f'LUNA-{kind}.json');task['output_root']=str(N);task['identities']=[x for x in task['identities'] if not x['path'].endswith('.spv') and not x['path'].endswith('weights.bin')]+[m['spv']]
+ for j in task['jobs']:
+  j['id']=j['id'].replace('f01-residual','f20-den-pv-owner');j['runner_output']=str(N/'run'/j['id']);j['argv'][j['argv'].index('--out')+1]=j['runner_output'];j['plan']=baseline['plan'] if j['candidate']=='parent' else m['plan'];j['argv'][j['argv'].index('--plan')+1]=j['plan']['path']
+  if j['candidate']!='parent':j['candidate']='candidate' if kind=='ORDINARY' else 'f20-den-pv-owner'
+  if kind=='NATIVE':j['argv'][5]=j['id'];j['argv'][7]=str(N/'captures');j['argv'][9]=str(N/(j['id']+'.log'));j['capture_output']=str(N/'captures'/j['id'])
+ (N/f'LUNA-{kind}.json').write_text(json.dumps(task,indent=2))
+print(m['cpu_check'],m['spv'])

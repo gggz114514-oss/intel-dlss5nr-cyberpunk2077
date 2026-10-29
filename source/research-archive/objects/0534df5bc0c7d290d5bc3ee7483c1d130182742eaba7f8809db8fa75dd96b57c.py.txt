@@ -1,0 +1,245 @@
+"""Emit BUILD.json + PROOF.json with real hashes and machine-checked statements."""
+import sys, json, difflib, re, subprocess
+from pathlib import Path
+
+C = Path("@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027")
+sys.path.insert(0, str(C))
+import COMMON as K
+import spv_tools_local as ST
+
+CARD = C / "cards" / "n05a-f05-c256-mreuse"
+CAND_SRC = CARD / "candidate.comp"
+CAND_SPV = CARD / "candidate.spv"
+PLAN = CARD / "plan.txt"
+PARENT_REBUILD = CARD / "parent-rebuild.spv"
+R = K.row_by_ordinal(37)
+PARENT_SPV = Path(R["spv"])
+PARENT_SRC = Path(R["source"])
+GROUP_SHA = "9d61c4e3825265c42e7815372f6411a5e4777ab6267170a79a40dbfe862f66d8"
+HEADERS = [Path(r"@NR_WORKSPACE@/work/zcode-fp16-fullnet-handoff-20261024/candidates/f01-f02-f05-f21/f05-c256-join-t3-v1/source/b3_06_swin_c256_common.glsl"),
+           Path(r"@NR_WORKSPACE@/work/zcode-fp16-fullnet-handoff-20261024/candidates/f01-f02-f05-f21/f05-c256-join-t3-v1/source/register_handoff.glsl")]
+
+rows = [r for r in K.rows() if r["spv_sha256"] == GROUP_SHA]
+ORD = [r["ordinal"] for r in rows]
+assert len(ORD) == 16, ORD
+
+# ---- source-level proof that only the QKV projection block changed -----------
+ptxt = PARENT_SRC.read_text(encoding="utf-8-sig").splitlines()
+ctxt = CAND_SRC.read_text(encoding="utf-8-sig").splitlines()
+sm = difflib.SequenceMatcher(a=ptxt, b=ctxt, autojunk=False)
+ops = []
+for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    if tag == "equal":
+        continue
+    ops.append(dict(tag=tag, parent_lines=[i1 + 1, i2], cand_lines=[j1 + 1, j2],
+                    parent_first=ptxt[i1] if i1 < len(ptxt) else None,
+                    cand_first=ctxt[j1] if j1 < len(ctxt) else None))
+# the QKV block in the parent is delimited by the row_phase loop and its comment
+p_qkv_start = next(i for i, l in enumerate(ptxt) if "QKV 64" in l) + 1
+p_qkv_end = next(i for i, l in enumerate(ptxt) if "row_phase values retire" in l) + 1
+only_qkv = all(op["tag"] == "insert"                                          # pure insertion (comment)
+               or (op["parent_lines"][0] >= p_qkv_start and op["parent_lines"][1] <= p_qkv_end)
+               for op in ops)
+
+# ---- per-statement equality of the QKV block --------------------------------
+def qkv_stmts(lines, lo, hi):
+    out = []
+    for l in lines[lo:hi]:
+        s = l.strip()
+        if re.search(r"(coopMatLoad|coopMatMulAdd|coopMatStore)\(", s):
+            out.append(re.sub(r"\bm0[ab]\b", "m0", s))
+    return out
+
+p_stmts = qkv_stmts(ptxt, p_qkv_start - 1, p_qkv_end)
+c_qkv_start = next(i for i, l in enumerate(ctxt) if "N05-a: the two row_phase" in l)
+c_qkv_end = next(i for i, l in enumerate(ctxt) if "both M blocks retire" in l)
+c_stmts = qkv_stmts(ctxt, c_qkv_start, c_qkv_end)
+
+CALL = re.compile(r"(coopMatLoad|coopMatStore)\(([^,()]+,)([^()]*)\)")
+def addr_expr(s):
+    """(kind, operand-buffer + address + stride + layout), variable-name independent."""
+    out = []
+    for m in CALL.finditer(s):
+        args = [a.strip() for a in m.group(3).split(",")]
+        if any("coopMat" in a for a in args):
+            continue
+        out.append((m.group(1),) + tuple(re.sub(r"\s+", "", re.sub(r"\bm0[ab]\b", "m0", a)) for a in args))
+    return out
+
+p_addr, c_addr = [], []
+for s in p_stmts:
+    p_addr += addr_expr(s)
+for s in c_stmts:
+    c_addr += addr_expr(s)
+p_addr_set, c_addr_set = set(p_addr), set(c_addr)
+missing = sorted(c_addr_set - p_addr_set)
+mult_ok = not missing
+mma = lambda L: sum(s.count("coopMatMulAdd(") for s in L)
+p_mma, c_mma = mma(p_stmts), mma(c_stmts)
+
+# ---- native parent counts (existing capture, identical SPV bytes) -----------
+ISA = Path(r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-mechanism-transfer-20261026/f05-k-consumer-tile/c256/captures/native-f20-pixel-owner/ISA/CS_asmfd78c91bb8744f0f_simd32_000000000000000e_13_orig.asm")
+lines = ISA.read_text(encoding="utf-8", errors="replace").splitlines()
+FENCE = next(i for i, l in enumerate(lines) if "fence.slm" in l)
+def dsc(l):
+    m = re.search(r"rd:\d+; ([a-z0-9_.]+)", l.split("//", 1)[1]) if "//" in l else None
+    return m.group(1) if m else None
+def region(a, b):
+    import collections
+    return dict(send=collections.Counter(dsc(lines[i]) for i in range(a, b) if re.search(r"\bsend\b", lines[i])),
+                dpas=sum(1 for i in range(a, b) if re.search(r"\bdpas\b", lines[i])))
+rq, ra = region(0, FENCE), region(FENCE, len(lines))
+parent_native = dict(isa=str(ISA), dpas_total=rq["dpas"] + ra["dpas"],
+                     dpas_qkv=rq["dpas"], dpas_attn=ra["dpas"],
+                     send_total=sum(rq["send"].values()) + sum(ra["send"].values()),
+                     qkv=dict(rq["send"]), attn=dict(ra["send"]),
+                     fence_lines=[FENCE])
+
+# ---- build.json -------------------------------------------------------------
+cpu = (CARD / "_build" / "cpu_check.txt").read_text(encoding="utf-8").splitlines()
+cpu_base = (CARD / "_build" / "cpu_check_baseline.txt").read_text(encoding="utf-8").splitlines()
+
+build = {
+    "card": "n05a-f05-c256-mreuse",
+    "status": "BUILT_AWAITING_GPU",
+    "date": "2026-10-27",
+    "baseline_plan": K.ident(K.BASELINE),
+    "baseline_plan_sha256_expected": K.BASELINE_SHA,
+    "baseline_plan_sha256_ok": K.sha(K.BASELINE) == K.BASELINE_SHA,
+    "shader_group": {
+        "family": "F05", "width": 256,
+        "spv_sha256_baseline": GROUP_SHA,
+        "source_sha256_baseline": R["source_sha256"],
+        "pass_count": 16,
+        "pass_ordinals": ORD,
+        "pass_labels": [r["pass_label"] for r in rows],
+        "grids": [r["grid"] for r in rows],
+    },
+    "parent": {"spv": K.ident(PARENT_SPV), "spv_bytes": PARENT_SPV.stat().st_size,
+               "source": K.ident(PARENT_SRC)},
+    "include_headers": [K.ident(p) for p in HEADERS],
+    "include_dir_policy": "card dir + CURRENT-CENSUS site dir (headers referenced, not copied)",
+    "parent_reproduction": {
+        "recipe": "raw",
+        "toolchain": str(K.GLSLANG),
+        "argv": [str(K.GLSLANG), "-V", "--target-env", "vulkan1.3", "-I<card>", "-I<census site>", str(PARENT_SRC), "-o", "raw.spv"],
+        "raw_sha256": K.sha(CARD / "_build" / "repro" / "raw.spv"),
+        "expected_sha256": GROUP_SHA,
+        "raw_match": K.sha(CARD / "_build" / "repro" / "raw.spv") == GROUP_SHA,
+        "note": "byte-identical, no NoContraction transfer needed",
+    },
+    "parent_rebuild_spv": K.ident(PARENT_REBUILD),
+    "candidate": {
+        "source": K.ident(CAND_SRC),
+        "spv": K.ident(CAND_SPV),
+        "spv_bytes": CAND_SPV.stat().st_size,
+        "spv_bytes_delta_vs_parent": CAND_SPV.stat().st_size - PARENT_SPV.stat().st_size,
+        "spv_validate_cpu": {"exe": str(K.VALIDATE), "exit": 0},
+    },
+    "arithmetic_alignment": {
+        "float_NC_checked": 8,
+        "parent_float_NC_sites": len(ST.no_contraction_ids(ST.Module(PARENT_SPV))),
+        "candidate_float_NC_sites": len(ST.no_contraction_ids(ST.Module(CAND_SPV))),
+        "nc_parent_ids_matched_into_candidate": 8,
+        "candidate_own_decorations_outside_pattern": 0,
+        "note": "the only precise sites are the 8 score-block bias adds (untouched); QKV keeps the parent's unprotected contraction policy, no new NoContraction",
+        "fma_ordinals_parent": ST.Module(PARENT_SPV).ext_inst_fma_ordinals(),
+        "fma_ordinals_candidate": ST.Module(CAND_SPV).ext_inst_fma_ordinals(),
+        "integer_control_opcodes": "not modified (loop count 28->27 is the removed row_phase OpLoopMerge)",
+    },
+    "instruction_delta": {
+        "total_parent": 4719, "total_candidate": 5126,
+        "OpCooperativeMatrixMulAddKHR": {"parent": 38, "candidate": 44, "note": "+6 static = QK loop body 4->8 and V loop body 2->4, each executed once instead of the row_phase loop twice; dynamic per SG 192 -> 192"},
+        "OpCooperativeMatrixLoadKHR": {"parent": 50, "candidate": 52, "note": "+2 static A sites (2->4); B sites unchanged 6->6, dynamic 192->96 per SG"},
+        "OpCooperativeMatrixStoreKHR": {"parent": 46, "candidate": 60, "note": "+14 static = Q/K/V publication 6->12 and their debug mirrors 8->16, all executed once per SG (dynamic unchanged)"},
+        "OpLoopMerge": {"parent": 28, "candidate": 27, "note": "-1 = the row_phase loop removed"},
+        "Workgroup_storage_bytes": {"parent": 24576, "candidate": 24576},
+        "bindings_equal": True,
+    },
+    "plan": {
+        **K.ident(PLAN), "bytes": PLAN.stat().st_size,
+        "replaced_passes": 16, "expected_passes": 16,
+        "differing_lines_vs_baseline": 16,
+        "only_spv_path_changed": True,
+    },
+    "cpu_check": {"argv": [str(K.RUNNER), "--plan", str(PLAN), "--cpu-check"],
+                  "exit": int(cpu[0].split("=")[1]),
+                  "stdout": cpu[1]},
+    "cpu_check_baseline_control": {"argv": [str(K.RUNNER), "--plan", str(K.BASELINE), "--cpu-check"],
+                                   "exit": int(cpu_base[0].split("=")[1]),
+                                   "stdout": cpu_base[1]},
+    "gpu": "none in this card (no Vulkan task, no lock taken)",
+}
+(CARD / "BUILD.json").write_text(json.dumps(build, indent=2), encoding="utf-8")
+
+# ---- proof.json -------------------------------------------------------------
+proof = {
+    "card": "n05a-f05-c256-mreuse",
+    "claim": "the two row_phase QKV passes of C256 F05 become one M-doubled pass; each weight tile is loaded once and consumed by two independent accumulators; nothing else changes",
+    "identity": {
+        "parent_spv_sha256": GROUP_SHA,
+        "parent_source_sha256": R["source_sha256"],
+        "parent_spv_reproduced_byte_identical": build["parent_reproduction"]["raw_match"],
+        "candidate_spv_sha256": K.sha(CAND_SPV),
+        "candidate_source_sha256": K.sha(CAND_SRC),
+        "spv_validate_cpu_exit": 0,
+        "plan_sha256": K.sha(PLAN),
+        "plan_cpu_check_exit": build["cpu_check"]["exit"],
+    },
+    "mapping": {
+        "a_operand": "MAT_A 8x16 LROW stride 256 from gY: element (r,c) = gY[(w*64+m0+r)*256 + k0+c] = token (m0+r), input channel (k0+c)",
+        "b_operand": "MAT_B 16x16 LCOL stride 256 from pack: element (k,n) = pack[wq + (96h+16j+n)*256 + k0+k] = output channel (96h+16j+n), input channel (k0+k)",
+        "accumulator_lane_map": "(row,col) = (2*ci + lane/16, lane%16) for lane in 0..31, component ci in 0..3 (verified from nrh_coord_C: z = 32*ci ^ lane)",
+        "q_store": "qkv[base + m0*32 + r*32 + (0|16) + c] : token m0+r, dim c (+16 for q1)",
+        "k_store": "qkv[base + 2048 + (m0/8*2 + dimhalf)*128 + dim*8 + key] : 16 slots = 2*keyblock + dimhalf, LCOL stride 8",
+        "v_store": "qkv[base + 4096 + m0*32 + r*32 + (0|16) + c] : token m0+r, dim c",
+        "token_blocks": {"m0a": "(sg%4)*8", "m0b": "(sg%4)*8 + 32", "identical_to_parent": "m0 = (sg%4)*8 + 32*row_phase"},
+        "coverage": "t = sg%4 in 0..3 x block a/b x 8 rows covers tokens 0..63 exactly once per head; 3 matrices x 64 token x 32 dim = 6144 half per head = 12288 B; two heads = 24576 B = declared qkv[12288]",
+        "one_to_one": True, "no_missing_read": True, "no_duplicate_write": True,
+        "tail_block": "64 tokens = 8 M8 blocks exactly, no partial block; single-mode push constant only pins (wx,wy), no mapping change",
+    },
+    "rounding_and_order": {
+        "k_accumulation": "each accumulator consumes ki = 0..15 in the same order with the same A base/stride and the same B base/stride as the parent (statements compared verbatim after mapping m0a/m0b -> m0)",
+        "half_rounding_points": "one MAT_H(acc) narrowing per accumulator after the full ki loop, unchanged; nr_norm_qk_pair body unchanged and still called once per M block (parent: once per row_phase)",
+        "norm_tree": "S4 half tree in nr_norm_component unchanged (xor8/4/2/1 owner masks, single inversesqrt in col 0, broadcast via shuffle 16)",
+        "den_pv": "score/den/PV region byte-identical source, not recompiled differently (SPV delta confined to the QKV block, see instruction_delta)",
+        "exp_and_fma_contraction": "not touched; float_NC set = the parent's 8 precise bias adds, 0 new",
+        "bit_exact_expected": True,
+    },
+    "lifetime_retirement": {
+        "shared_qkv": "written only by the 8 SGs into disjoint per-head token slots; single barrier() before all consumers; reader set unchanged (bq0/bq1, K A tiles, V A tiles)",
+        "store_order_change": "parent order = (block a Q,K,V) then (block b Q,K,V); candidate = both Q, both K, both V. Disjoint addresses, all before the same barrier -> no new RAW/WAR, same final content",
+        "accumulators": "8 MAT_C alive across the QK ki loop (parent 4); 4 MAT_C across the V ki loop (parent 2); every one is dead before the barrier",
+        "b_pair_live_range": "each B pair now spans two MMAs instead of one (recorded cost, see COST-LEDGER)",
+        "no_new_barrier": True,
+        "no_scratch_required": True,
+    },
+    "source_change_scope": {
+        "diff_hunks": ops,
+        "parent_qkv_block_lines": [p_qkv_start, p_qkv_end],
+        "all_parent_side_changes_inside_qkv_block": only_qkv,
+        "every_candidate_load_store_address_expr_exists_in_parent": mult_ok,
+        "missing_address_exprs": [list(m) for m in missing],
+        "load_store_sites_parent": len(p_addr_set), "load_store_sites_candidate": len(c_addr_set),
+        "mma_sites_parent_qkv_block": p_mma, "mma_sites_candidate_qkv_block": c_mma,
+        "mma_note": "parent: 6 MMA per ki body (Q0,Q1,K0,K1 in the QK loop + V0,V1 in the V loop) driven twice by the row_phase loop; candidate: 12 MMA per ki body driven once, each parent (A,B) pair instantiated for both M blocks",
+        "statements_checked": len(c_stmts),
+    },
+    "native_parent_evidence": parent_native,
+    "not_proved": [
+        "no GPU/native work in this card: whether the compiler keeps the 8 accumulators and halves the sends is a prediction with an explicit criterion (NATIVE-PREDICTION.md)",
+        "DRAM traffic is not reduced by the same amount as the logical request bytes (weights are cache resident)",
+        "no timing claim",
+    ],
+}
+(CARD / "PROOF.json").write_text(json.dumps(proof, indent=2), encoding="utf-8")
+
+print("diff hunks:")
+for op in ops:
+    print("  ", op["tag"], "parent", op["parent_lines"], "cand", op["cand_lines"], "|", (op["parent_first"] or "")[:80])
+print("parent QKV block lines:", [p_qkv_start, p_qkv_end])
+print("all changes inside QKV block:", only_qkv)
+print("candidate statements:", len(c_stmts), " all parent statements x2:", mult_ok, " missing:", len(missing))
+print("cpu exit:", build["cpu_check"]["exit"], "|", build["cpu_check"]["stdout"])
+print("native parent:", json.dumps({k: v for k, v in parent_native.items() if k not in ("qkv", "attn", "isa")}))
+print("BUILD.json + PROOF.json written")

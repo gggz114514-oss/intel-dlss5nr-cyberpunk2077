@@ -1,0 +1,136 @@
+// R03 ioport_block4_0: pooled C32 -> INT8 K32 projection, two N16 outputs.
+//
+// Parent module (unchanged math, deployed):
+//   candidates/amd-map-20261015/s2-ds-complete/f33-k32/source/ds_complete_fp16.comp
+//   = candidates/amd-map-20261015/round4-integrated/candidate/spv/ds-f33-k32.spv
+//   sha256 101924e70cb6eb62384e0e9bba809192e43b1123a1c513197053d041d0c68c30
+//
+// Enumerable change set (line numbers in REPORT.md):
+//   C1  shared float16_t a_half[8*32]  -> shared int8_t a_i8[8*32]   (512 B -> 256 B)
+//   C2  one RNE/clamp quantization at the production point of v (the four-point half
+//       pooling tree itself is unchanged, expression for expression)
+//   C3  the two FP16 K16 MMA-loop bodies -> one INT8 K32 step that feeds the same two
+//       N16 accumulators (A: int8 tile, B: offline int8 K32/N16 pack, C: int32)
+//   C4  epilogue: int32 accumulator -> f32 -> one per-output-channel dequant multiply
+//       -> half narrow -> the parent's own direct consumer-layout fragment store
+//   C5  scale handoff through binding 4 (the parent's unused debug binding)
+// The four-point pool tree, the ds_pixel owner, the input guard, the barrier, the
+// grid, the push-constant layout, the two N16 outputs and the store addressing are
+// unchanged; no scratch buffer and no extra dispatch is introduced.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+
+// Two compile-time arms of the same math:
+//   default      ENTRY_Q float16_t : the C64 entry keeps its half reader (layout unchanged)
+//   -DR03_QX=1   ENTRY_Q int8_t    : qX for a C64 INT8 entry, same io_at index space
+#ifndef R03_QX
+#define R03_QX 0
+#endif
+#if R03_QX
+#define ENTRY_Q int8_t
+#else
+#define ENTRY_Q float16_t
+#endif
+#include "r03_common.glsl"
+layout(local_size_x=32) in;
+
+// Existing PAIR2: one subgroup computes eight pixels and thirty-two channels.
+// The A tile is one quantized int8 copy of the pooled window (8 pixels x K32).
+shared int8_t a_i8[8*32];
+// Whole-fragment half stores use the public accumulator conversion/store API.
+// No scalar fragment-component ownership is assumed.
+#define MAT_H coopmat<float16_t,gl_ScopeSubgroup,8,16,gl_MatrixUseAccumulator>
+#define MAT_F coopmat<float,gl_ScopeSubgroup,8,16,gl_MatrixUseAccumulator>
+#define I8A coopmat<int8_t,gl_ScopeSubgroup,8,32,gl_MatrixUseA>
+#define I8B coopmat<int8_t,gl_ScopeSubgroup,32,16,gl_MatrixUseB>
+#define I8C coopmat<int,gl_ScopeSubgroup,8,16,gl_MatrixUseAccumulator>
+#define MAT_Q coopmat<ENTRY_Q,gl_ScopeSubgroup,8,16,gl_MatrixUseAccumulator>
+// Scale table (float32, packs/r03_ioport4_ds_scales.f32.bin):
+//   0 sV, 1 invV=127/sV, 2 sWmax, 3 1/sWmax, 4..67 f32(sV*sW[n]), 68..131 qx output multiplier
+//   256..639   per-channel dequant step (sV*sW[n]), 128 floats per N16 block, col-major ld 8
+//   768..1151  per-channel qx output multiplier (127/amax_out[n]), same packing (qx arm)
+#define SC_DEQ 256u
+#define SC_OUT 768u
+uvec2 ds_pixel(uint u) {
+    if(pc.p2.y==0u) {
+        uint tile=u/16u,slot=u%16u,tiles_x=pc.p0.z/4u;
+        return uvec2(4u*(tile%tiles_x)+slot%4u,4u*(tile/tiles_x)+slot/4u);
+    }
+    return uvec2(u%pc.p0.z,u/pc.p0.z);
+}
+void main() {
+    uint lane=gl_LocalInvocationID.x,m0=gl_WorkGroupID.x*8u,n0=gl_WorkGroupID.y*32u;
+    // One static symmetric code point: real * invV, RNE, clamp to +-127.
+    precise float invV=sc[1];
+    for(uint i=lane;i<8u*pc.p1.x;i+=32u) {
+        uint m=i/pc.p1.x,k=i%pc.p1.x;
+        uvec2 pixel=ds_pixel(m0+m);uint px=pixel.x,py=pixel.y;
+        precise float16_t v=float16_t(0);
+        if(py<pc.p0.w&&px<pc.p3.z&&py<pc.p3.w) {
+            precise float16_t top=io_read(2u*px,2u*py,k)+io_read(2u*px+1u,2u*py,k);
+            precise float16_t bottom=io_read(2u*px,2u*py+1u,k)+io_read(2u*px+1u,2u*py+1u,k);
+            precise float16_t sum=top+bottom;
+            v=sum*float16_t(0.25);
+        }
+        // The single quantization of the pooled value at its production point.
+        precise float code=float(v)*invV;
+        a_i8[i]=int8_t(clamp(roundEven(code),-127.0,127.0));
+    }
+    barrier();
+    I8C ci0=I8C(0);
+    I8C ci1=I8C(0);
+    // K32 is consumed in one step; the two N16 tiles are the parent's two outputs.
+    {
+        I8A aa;
+        coopMatLoad(aa,a_i8,0u,pc.p1.x,gl_CooperativeMatrixLayoutRowMajor);
+        I8B bb;
+        coopMatLoad(bb,w8,((n0/16u)*(pc.p1.x/32u))*512u,32u,gl_CooperativeMatrixLayoutColumnMajor);
+        ci0=coopMatMulAdd(aa,bb,ci0);
+        I8B bb1;
+        coopMatLoad(bb1,w8,(((n0+16u)/16u)*(pc.p1.x/32u))*512u,32u,gl_CooperativeMatrixLayoutColumnMajor);
+        ci1=coopMatMulAdd(aa,bb1,ci1);
+    }
+    // Per-output-channel dequant of one complete K32 accumulator; the step fragment is
+    // loaded with ld 8 (each channel's step replicated over the eight fragment rows),
+    // so no fragment component coordinate map is assumed.
+    uvec2 first=ds_pixel(m0);
+    {
+        MAT_F f0=MAT_F(ci0);
+        MAT_F st0;
+        coopMatLoad(st0,sc,SC_DEQ+(n0/16u)*128u,8u,gl_CooperativeMatrixLayoutColumnMajor);
+        for(int i=0;i<f0.length();++i) f0[i]=f0[i]*st0[i];
+#if R03_QX
+        MAT_F o0;
+        coopMatLoad(o0,sc,SC_OUT+(n0/16u)*128u,8u,gl_CooperativeMatrixLayoutColumnMajor);
+        for(int i=0;i<f0.length();++i) f0[i]=clamp(roundEven(f0[i]*o0[i]),-127.0,127.0);
+        MAT_Q q0=MAT_Q(f0);
+        uint dst=pc.p4.y+io_at(first.x,first.y,n0,pc.p0.z,pc.p0.w,pc.p1.y,pc.p2.y);
+        coopMatStore(q0,o,dst,16u,gl_CooperativeMatrixLayoutRowMajor);
+#else
+        MAT_H half0=MAT_H(f0);
+        uint dst=pc.p4.y+io_at(first.x,first.y,n0,pc.p0.z,pc.p0.w,pc.p1.y,pc.p2.y);
+        coopMatStore(half0,o,dst,16u,gl_CooperativeMatrixLayoutRowMajor);
+#endif
+    }
+    {
+        MAT_F f1=MAT_F(ci1);
+        MAT_F st1;
+        coopMatLoad(st1,sc,SC_DEQ+(n0/16u)*128u+128u,8u,gl_CooperativeMatrixLayoutColumnMajor);
+        for(int i=0;i<f1.length();++i) f1[i]=f1[i]*st1[i];
+#if R03_QX
+        MAT_F o1;
+        coopMatLoad(o1,sc,SC_OUT+(n0/16u)*128u+128u,8u,gl_CooperativeMatrixLayoutColumnMajor);
+        for(int i=0;i<f1.length();++i) f1[i]=clamp(roundEven(f1[i]*o1[i]),-127.0,127.0);
+        MAT_Q q1=MAT_Q(f1);
+        uint dst=pc.p4.y+io_at(first.x,first.y,n0+16u,pc.p0.z,pc.p0.w,pc.p1.y,pc.p2.y);
+        coopMatStore(q1,o,dst,16u,gl_CooperativeMatrixLayoutRowMajor);
+#else
+        MAT_H half1=MAT_H(f1);
+        uint dst=pc.p4.y+io_at(first.x,first.y,n0+16u,pc.p0.z,pc.p0.w,pc.p1.y,pc.p2.y);
+        coopMatStore(half1,o,dst,16u,gl_CooperativeMatrixLayoutRowMajor);
+#endif
+    }
+}

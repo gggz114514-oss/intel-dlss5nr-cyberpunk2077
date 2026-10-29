@@ -1,0 +1,168 @@
+"""S12 slice step 4: final candidate pack for C256 block15 WO + round-trip check.
+
+Candidate = the deployed geometry (65536 B int8 codes in the r07 tile convention +
+1024 B f32 per-output-channel scale), with the per-output-channel scale chosen by
+an offline weighted grid search on  sum_k (dW[n,k]*sigma_k)^2,  sigma_k = RMS of the
+real written activation of input channel k.  No ABI change, no size change.
+
+Writes PACK/r07m-c256-b15-wo.codes.i8.bin and PACK/r07m-c256-b15-wo.sc.f32.bin,
+then re-reads them and recomputes the local error from the FILES (round trip).
+"""
+import json
+import numpy as np
+import hashlib
+import os
+
+D_ = r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+CAND = r"@NR_WORKSPACE@/work/dsh-int8-fullnet-impl-20261024/candidates/r07-c256-wo-merged"
+PACKSRC = r"@NR_WORKSPACE@/candidates/amd-map-20261015/round4-integrated/candidate/packs/swin_15_weights.fp16.bin"
+WORK = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S12-proj/_work"
+OUTDIR = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S12-proj/PACK"
+
+NW, NT, NC = 66, 64, 256
+TX, TY, GX = 21, 12, 11
+WO, ARS = 0, 98304
+
+
+def sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+pack = np.fromfile(PACKSRC, dtype=np.float16).astype(np.float32)
+T = np.fromfile(f"{D_}/dump-fp16/dump_swin_15_T.bin", dtype=np.float16).astype(np.float32).reshape(NW, NT, NC)
+Y = np.fromfile(f"{D_}/dump-fp16/dump_swin_15_Y.bin", dtype=np.float16).astype(np.float32).reshape(NW, NT, NC)
+Wq_raw = np.fromfile(f"{CAND}/packs/c256_b15_wo.codes.i8.bin", dtype=np.int8)
+Wsc_old = np.fromfile(f"{CAND}/packs/c256_b15_wo.sc.f32.bin", dtype=np.float32)
+Wf = pack[WO: WO + NC * NC].reshape(NC, NC)
+f_ar = pack[ARS: ARS + NC]
+
+_n, _k = np.arange(NC)[:, None], np.arange(NC)[None, :]
+widx = ((_n // 16) * 8 * 512 + (_k // 32) * 512 + (_n % 16) * 32 + (_k % 32))
+W8_old = Wq_raw[widx].astype(np.float32)
+
+tt = np.repeat(np.arange(NT), NC)
+wmask = np.zeros((NW, NT, NC), dtype=bool)
+keep_t = np.zeros((NW, NT), dtype=bool)
+for wx in range(GX):
+    for wy in range(TY // 2):
+        w = wy * GX + wx
+        q = tt >> 4
+        tx, ty = 2 * wx + (q & 1), 2 * wy + (q >> 1)
+        kt = ~((tx < 0) | (ty < 0) | (tx >= TX) | (ty >= TY))
+        kt2 = kt.reshape(NT, NC)
+        keep_t[w] = kt2.all(axis=1)
+        wmask[w] = kt2
+
+s1 = np.zeros(NC); s2 = np.zeros(NC); n_tok = 0
+for w in range(NW):
+    blk = T[w][keep_t[w]]
+    n_tok += blk.shape[0]
+    s1 += blk.sum(axis=0, dtype=np.float64)
+    s2 += (blk.astype(np.float64) ** 2).sum(axis=0)
+rms_k = np.sqrt(np.maximum(s2 / n_tok - (s1 / n_tok) ** 2, 1e-30))
+
+Yhat = np.einsum("wtk,nk->wtn", T, Wf) + Y * f_ar[None, None, :]
+res = Y * f_ar[None, None, :]
+Ynorm = float(np.linalg.norm(Yhat[wmask]))
+
+
+def q_r(x):
+    return np.clip(np.rint(x), -127.0, 127.0)
+
+
+def rel(armY):
+    return float(np.linalg.norm((armY - Yhat)[wmask]) / Ynorm)
+
+
+def a_quant(X):
+    cA = np.empty_like(X)
+    sA = np.empty(NW, np.float32)
+    for w in range(NW):
+        m = float(np.abs(X[w]).max())
+        sA[w] = m / 127.0 if m > 0 else 0.0
+        cA[w] = q_r(X[w] * (127.0 / m if m > 0 else 0.0))
+    return cA, sA
+
+
+cA, sA = a_quant(T)
+
+# ---- weighted scale search (finer grid) ------------------------------------
+rowamax = np.abs(Wf).max(axis=1)
+base = np.where(rowamax > 0, rowamax / 127.0, 0.0).astype(np.float64)
+w2 = (rms_k ** 2)[None, :]
+best_s = base.copy()
+best_e = np.full(NC, np.inf)
+grid = np.linspace(0.35, 1.70, 271)
+for c in grid:
+    s = base * c
+    s_safe = np.where(s > 0, s, 1e-30)
+    q = np.clip(np.rint(Wf / s_safe[:, None]), -127, 127)
+    dw = q * s_safe[:, None] - Wf
+    e = (dw.astype(np.float64) ** 2 * w2).sum(axis=1)
+    better = e < best_e
+    best_e = np.where(better, e, best_e)
+    best_s = np.where(better, s, best_s)
+sW_new = best_s.astype(np.float32)
+sW_new[rowamax == 0] = 0.0
+
+codes_new = np.zeros((NC, NC), dtype=np.int8)
+nzch = rowamax > 0
+codes_new[nzch] = q_r(Wf[nzch] / sW_new[nzch, None].astype(np.float32)).astype(np.int8)
+
+# pack back into the r07 tile convention
+raw = np.zeros(NC * NC, dtype=np.int8)
+raw[widx.reshape(-1)] = codes_new.reshape(-1)
+
+os.makedirs(OUTDIR, exist_ok=True)
+p_codes = f"{OUTDIR}/r07m-c256-b15-wo.codes.i8.bin"
+p_sc = f"{OUTDIR}/r07m-c256-b15-wo.sc.f32.bin"
+raw.tofile(p_codes)
+sW_new.tofile(p_sc)
+
+# ---- round trip from the files --------------------------------------------
+r_raw = np.fromfile(p_codes, dtype=np.int8)
+r_sc = np.fromfile(p_sc, dtype=np.float32)
+r_W = r_raw[widx].astype(np.float32)
+Ynew = np.einsum("wtk,nk->wtn", cA, r_W) * (r_sc[None, None, :] * sA[:, None, None]) + res
+Yold = np.einsum("wtk,nk->wtn", cA, W8_old) * (Wsc_old[None, None, :] * sA[:, None, None]) + res
+
+res_out = {
+    "arm_definition": {
+        "A": "gT half -> per-window (64x64) in-kernel amax, RNE, clamp +-127 (UNCHANGED)",
+        "B_old": "c256_b15_wo.codes.i8.bin + c256_b15_wo.sc.f32.bin (deployed, sW=amax_k|W|/127)",
+        "B_new": "same sizes; sW from the weighted grid search, codes requantised with that sW",
+        "residual": "gY * pack[98304+n] added in f32 after dequant (UNCHANGED)",
+        "domain": "the 1032192 elements c256_img_half_index() writes; 49152 padding-token elements excluded",
+    },
+    "files": {
+        "codes": {"path": p_codes, "bytes": os.path.getsize(p_codes), "sha256": sha(p_codes)},
+        "scales": {"path": p_sc, "bytes": os.path.getsize(p_sc), "sha256": sha(p_sc)},
+        "deployed_codes_sha256": sha(f"{CAND}/packs/c256_b15_wo.codes.i8.bin"),
+        "deployed_scales_sha256": sha(f"{CAND}/packs/c256_b15_wo.sc.f32.bin"),
+    },
+    "n_bytes_changed": 0,
+    "old_relL2": rel(Yold),
+    "new_relL2": rel(Ynew),
+    "delta_abs": rel(Yold) - rel(Ynew),
+    "delta_rel": (rel(Yold) - rel(Ynew)) / rel(Yold),
+    "codes_changed_frac": float((codes_new != W8_old.astype(np.int8)).mean()),
+    "clipped_code_frac_new": float((np.abs(codes_new) >= 127).mean()),
+    "scale_ratio_stats": {
+        "mean": float(np.mean(sW_new[nzch] / (rowamax[nzch] / 127.0))),
+        "min": float(np.min(sW_new[nzch] / (rowamax[nzch] / 127.0))),
+        "max": float(np.max(sW_new[nzch] / (rowamax[nzch] / 127.0))),
+    },
+    "dead_output_channels": int((rowamax == 0).sum()),
+    "deployed_scales_for_dead_channels": [float(v) for v in Wsc_old[~nzch]],
+    "roundtrip_identical": bool(np.array_equal(r_raw, raw) and np.array_equal(r_sc, sW_new)),
+    "weight_error_before": float(np.linalg.norm((W8_old * Wsc_old[:, None] - Wf) * rms_k[None, :])
+                                 / np.linalg.norm(Wf * rms_k[None, :])),
+    "weight_error_after": float(np.linalg.norm((r_W * r_sc[:, None] - Wf) * rms_k[None, :])
+                                / np.linalg.norm(Wf * rms_k[None, :])),
+}
+print(json.dumps(res_out, indent=1))
+json.dump(res_out, open(f"{WORK}/slice4.json", "w", encoding="utf-8"), indent=1)

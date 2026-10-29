@@ -1,0 +1,180 @@
+"""Read-only digest of the GPU receipts the MAIN AGENT's queue already produced for this card.
+
+This script runs NO GPU work. It only reads queue/n06-f06-output/{gates,native,resources} and
+records the observed ISA counts and per-pass GpuTime, so the card can state what landed.
+"""
+import hashlib, json, re, collections, sys
+from pathlib import Path
+
+CARD = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/cards/n06-f06-output')
+QROOT = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/queue/n06-f06-output')
+CAMP = CARD.parent.parent
+sys.path.insert(0, str(CAMP))
+import ISA
+
+PARENT_KERNEL = 'a558554d30105096'
+CAND_KERNEL = 'e662a7728e588f29'
+ORD = [20, 23, 26, 29, 32, 196, 199, 202, 205, 208, 211]
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def census(path):
+    isa = ISA.parse(path)
+    ops = collections.Counter(i['op'] for i in isa)
+    forms = collections.Counter()
+    for i in isa:
+        if i['op'].startswith('send'):
+            m = re.search(r'(load|store)\.ugm\.([A-Za-z0-9]+)\.', i['comment'] or '')
+            forms[(m.group(1) + '.' + m.group(2)) if m else 'other'] += 1
+    regs = set()
+    for i in isa:
+        for o in i['ops']:
+            for m in re.finditer(r'\br(\d+)', o):
+                regs.add(int(m.group(1)))
+    first = next(k for k, i in enumerate(isa) if i['op'].startswith('dpas'))
+    return dict(path=str(path), instructions_isa_lines=len(isa),
+                dpas=ops['dpas.8x8'], sends=sum(v for k, v in ops.items() if k.startswith('send')),
+                send_forms=dict(forms), mov=ops['mov'], add=ops['add'], mul=ops['mul'],
+                sync_nop=ops['sync.nop'], allwr=ops['allwr'], allrd=ops['sync.allrd'],
+                syncs=(ops['sync.nop'] + ops['sync.allwr'] + ops['sync.allrd'] + ops['sync.bar']),
+                shl=ops['shl'], max_r=max(regs),
+                first_dpas_addr=hex(isa[first]['addr']), first_dpas_instruction_index=first)
+
+
+def pipeline_stats(arm):
+    d = json.loads((QROOT / 'resources/run' / arm / 'pipeline-statistics.json')
+                   .read_text(encoding='utf-8-sig'))
+    st = {s['name']: s['value'] for s in d['pipelines'][10]['executables'][0]['statistics']}
+    return {k: st[k] for k in ('Instruction Count', 'Basic Block Count', 'Scratch Memory Size',
+                               'Loop Count', 'Workgroup Memory Size')}
+
+
+def passes(arm):
+    d = json.loads((QROOT / 'resources/run' / arm / 'hardware-counters.json')
+                   .read_text(encoding='utf-8-sig'))
+    return {p['index']: (p['name'], p['values'][0]) for p in d['frames'][0]['passes']}
+
+
+def main():
+    base_isa = QROOT / f'native/captures/native-native-base/ISA/CS_asm{PARENT_KERNEL}_simd32_000000000000000b_10_orig.asm'
+    cand_isa = QROOT / f'native/captures/native-native-cand/ISA/CS_asm{CAND_KERNEL}_simd32_000000000000000b_10_orig.asm'
+    b, c = census(base_isa), census(cand_isa)
+    p_base, p_cand = pipeline_stats('resources-base'), pipeline_stats('resources-cand')
+    pb, pc = passes('resources-base'), passes('resources-cand')
+    rows = []
+    for i in ORD:
+        n, bv = pb[i]
+        n2, cv = pc[i]
+        rows.append(dict(ordinal=i, name=n, base_ns=bv, cand_ns=cv, delta_ns=cv - bv,
+                         base_us=round(bv / 1000, 3), cand_us=round(cv / 1000, 3),
+                         delta_us=round((cv - bv) / 1000, 3)))
+    tb = sum(r['base_ns'] for r in rows)
+    tc = sum(r['cand_ns'] for r in rows)
+    fa = sum(v for _, v in pb.values())
+    fc = sum(v for _, v in pc.values())
+    noisy = [dict(index=i, name=pb[i][0], base_us=round(pb[i][1] / 1000, 2),
+                  cand_us=round(pc[i][1] / 1000, 2))
+             for i in pb if abs(pc[i][1] - pb[i][1]) > 0.03 * pb[i][1]]
+    gates = json.loads((QROOT / 'gates/STAGE-SUMMARY.json').read_text(encoding='utf-8-sig'))
+    out = dict(
+        card='n06-f06-output',
+        provenance=dict(
+            executed_by='MAIN AGENT queue (serial GPU lock). This card did NOT run these jobs; '
+                        'this file is a read-only digest of the receipts.',
+            queue_root=str(QROOT),
+            plan_rebased=dict(path=str(QROOT / 'plan-rebased.txt'),
+                              sha256=sha(QROOT / 'plan-rebased.txt'),
+                              note='accepted n05a plan + this card\'s 11 F06 C128 SPV paths'),
+            accepted_baseline=dict(
+                path=str(CAMP / 'accepted/n05a-f05-c256-mreuse-20261027/plan.txt'),
+                sha256=sha(CAMP / 'accepted/n05a-f05-c256-mreuse-20261027/plan.txt')),
+            receipts=dict(
+                gates=str(QROOT / 'gates/STAGE-SUMMARY.json'),
+                native=str(QROOT / 'native/STAGE-SUMMARY.json'),
+                resources=str(QROOT / 'resources/STAGE-SUMMARY.json')),
+        ),
+        gates=dict(stage_status=gates['status'],
+                   jobs=[dict(id=j['id'], status=j['status'], frame_sha256=j['frame_sha'],
+                              samples=j['samples']) for j in gates['jobs']],
+                   verdict='all four gate jobs completed; base and candidate agree with the fixed '
+                           'gold 1755e9c2... and the fb2 last-frame gold 9c3e511e... '
+                           '(bit-identical arms, as predicted by PROOF.json)'),
+        native=dict(
+            pipeline_index=10,
+            base=dict(kernel_hash=PARENT_KERNEL, **b),
+            candidate=dict(kernel_hash=CAND_KERNEL, **c),
+            pipeline_statistics=dict(base=p_base, candidate=p_cand),
+            delta=dict(sends=b['sends'] - c['sends'], weight_d32x8=64 - 32,
+                       instructions=p_base['Instruction Count'] - p_cand['Instruction Count'],
+                       dpas=0, scratch=0, basic_blocks=0, workgroup_memory=0),
+            landed=dict(
+                weight_512B_loads='64 -> 32 (exactly the predicted halving of the weight tile '
+                                  'loads; the second M block consumes the same return window)',
+                a_plus_seed_transposed_loads='320 -> 320 (unchanged, as predicted)',
+                store_sends='64 -> 64 (unchanged, as predicted)',
+                total_send_ugm='481 -> 449 (predicted ~449)',
+                dpas='64 -> 64 (per-output K order untouched)',
+                scratch='0 -> 0, workgroup memory 0 -> 0, basic blocks 50 -> 50',
+                instruction_count='2257 -> 2005 (the prediction range 2150..2320 was WRONG in the '
+                                  'good direction: halving the number of unrolled M bodies saves '
+                                  'more than the 4-accumulator body adds)',
+                register_ceiling='max_r 127 -> 127 (no new register index; no spill)',
+                first_dpas='instruction index 272 -> 353: the prologue grows by ~81 instructions '
+                           'because 4 seed tiles are loaded before the first DPAS instead of 2 '
+                           '(one-time per dispatch, not per k step)',
+                dpas_adjacency_caveat='consecutive-DPAS-shares-the-weight-window is NOT a valid '
+                                      'observable after IGC rescheduling (register numbers are '
+                                      'reused after reloads); the load-count halving is the '
+                                      'reliable proof of reuse',
+            ),
+        ),
+        resources=dict(
+            caveat='single sample per arm (zprof --warm 0 --reps 1); this stage is a resource '
+                   'check, not a timing measurement. 40 of 232 passes moved by >3% between the '
+                   'two arms, so the whole-frame sum of these two runs is NOT attributable.',
+            per_pass=rows,
+            group_total=dict(base_us=round(tb / 1000, 3), cand_us=round(tc / 1000, 3),
+                             delta_us=round((tc - tb) / 1000, 3),
+                             percent=round(100.0 * (tc - tb) / tb, 2),
+                             passes_faster=sum(1 for r in rows if r['delta_ns'] < 0),
+                             passes=len(rows)),
+            whole_frame_sum=dict(base_us=round(fa / 1000, 3), cand_us=round(fc / 1000, 3),
+                                 delta_us=round((fc - fa) / 1000, 3),
+                                 percent=round(100.0 * (fc - fa) / fa, 3),
+                                 attributable=False),
+            non_target_passes_moved=noisy[:12],
+            non_target_passes_moved_count=len(noisy),
+        ),
+        official_result=dict(
+            status='ADOPTED_CHAIN_HEAD (main agent verdict)',
+            files=[str(CARD / 'RESULTS.json'), str(CARD / 'NOTES-main.json'), str(CARD / 'TIMING.json')],
+            triage_note='main agent: native landed (send -32, mul -32, static -250), same-batch '
+                        'ordinary FASTER_95; CI lower bound only +0.0012 ms, so it is a small gain '
+                        'and a family package must carry an ablation arm without this change',
+            chain_head_plan_sha256=('ae9fe38dc6dcd7439066a772e98a247740f22f790a1f9f72822393f9c9bc2e9a'),
+        ),
+        card_conclusion=dict(
+            mechanism='LANDED (not A)',
+            side_effect='no spill, no SLM, no barrier, instruction count DOWN (not B on the '
+                        'register-pressure axis)',
+            group_signal='11/11 F06 C128 passes faster, -28.49 us (-14.6%) in the single-sample '
+                         'resources arm',
+            frame_signal='pending ordinary (two-arm, six alternating pairs, 30 samples each); the '
+                         'group is 195 us of a 17577 us arm, so even the full group gain is '
+                         '~0.16% and below ordinary resolution',
+            triage='D at whole-frame scope (single-point scope small; package with C64/C256 same '
+                   'mechanism) unless ordinary resolves the group; NOT A, NOT B, NOT E',
+        ),
+    )
+    (CARD / 'GPU-RECEIPTS-READONLY.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print(json.dumps({k: out[k] for k in ('gates',)}, indent=1)[:900])
+    print(json.dumps(out['native']['delta'], indent=1))
+    print(json.dumps(out['resources']['group_total'], indent=1))
+    print(json.dumps(out['native']['landed'], indent=1)[:900])
+
+
+if __name__ == '__main__':
+    main()

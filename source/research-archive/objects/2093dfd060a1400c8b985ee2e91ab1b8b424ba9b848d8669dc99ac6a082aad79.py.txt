@@ -1,0 +1,92 @@
+"""S01 turn 2 final: fold the real-input audit into the docs and add the ablation plans/jobs."""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/tools")
+from planlib import Plan, sha256_file  # noqa: E402
+
+B = Path(r"@NR_WORKSPACE@")
+D = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+HERE = Path(__file__).resolve().parent
+C = HERE / "CPU"
+audit = json.loads((C / "real_input_audit.json").read_text())
+recal = json.loads((C / "real_calibration.json").read_text())
+prereg = json.loads((C / "ablation_preregistration.json").read_text())
+
+# real-calibrated combo plan (same 4-line swap, different pack)
+p = Plan(D / "c64-family-static/combo-34189.txt")
+p.set_spv(4, (HERE / "SOURCE/c32_b4_xe.spv").as_posix(), name="block4_swin_body_1")
+p.set_buffer("c32_block4_unified_weights",
+             file=(HERE / "PACK/c32_block4_real_cal-weights.i8.bin").as_posix())
+p.set_buffer("c32_block4_unified_scales",
+             file=(HERE / "PACK/c32_block4_real_cal-scales.f32.bin").as_posix(), bytes_=1808)
+p.assert_valid()
+dest = HERE / "candidate-34189-realcal.txt"
+p.write(dest, check=False)
+Plan(dest).assert_valid()
+realcal_plan = dict(plan=str(dest).replace("\\", "/"), sha256=sha256_file(dest),
+                    weights_sha256=sha256_file(HERE / "PACK/c32_block4_real_cal-weights.i8.bin"),
+                    scales_sha256=sha256_file(HERE / "PACK/c32_block4_real_cal-scales.f32.bin"))
+print("real-cal plan", realcal_plan["sha256"][:16])
+
+cal = json.loads((HERE / "CALIBRATION.json").read_text())
+cal["real_upstream_input"] = dict(
+    source=audit["inputs"],
+    verified=dict(
+        flat_rel_l2_vs_teacher=audit["inputs"]["flat_rel_l2"],
+        gathered_rel_l2=0.210948,
+        note="a wrong address formula would give ~1.4, not 0.21, so the (tile, col, channel) "
+             "extraction is consistent with the resident buffer; the oracle dbg X columns could "
+             "not be used because the dbg buffer is a workgroup race",
+        per_channel_absmax_ratio=dict(min=0.948, median=0.998, max=1.039),
+        x_code_saturation=audit["x_codes"],
+    ),
+    recalibration=dict(
+        e_amax_real_max=max(recal["e_amax_real"]), e_amax_teacher_max=max(recal["e_amax_teacher"]),
+        per_channel_amax_ratio=dict(min=0.9243, median=0.9915, max=1.0708),
+        contract_codes_differing=recal["contract_codes_differing"],
+        invE_rel_diff=recal["invE_rel_diff"],
+        conclusion="the 21% upstream input error does NOT move the per-E-channel statistics: the "
+                   "real-X calibrated pack differs from the teacher-X one in 297/16384 contract "
+                   "codes and the median inverse differs by 1%. The teacher-X calibration is "
+                   "therefore validated, and teacher-vs-real calibration is NOT the cause of the "
+                   "network regression.",
+    ),
+    cpu_metrics_both_feeds=recal["runs"],
+    prediction="a real-X calibrated run is expected to land within a few 0.01 dB of the rejected "
+               "arm (-0.14..-0.25 dB), so it is a low-information use of the GPU queue",
+)
+cal["network_regression_forensics"]["ruled_out"]["teacher_vs_real_calibration"] = (
+    "real capture audit + recalibration (see real_upstream_input): the two packs are numeric twins")
+(HERE / "CALIBRATION.json").write_text(json.dumps(cal, indent=2))
+
+q = json.loads((HERE / "QUALITY.json").read_text())
+q["gpu_metrics"]["real_input_check"] = dict(
+    real_input_rel_l2_vs_teacher=audit["inputs"]["flat_rel_l2"],
+    ffn_y_error_teacher_input=dict(frozen=0.11263, teacher_cal=0.04468, real_cal=0.04387),
+    ffn_y_error_real_input=dict(frozen=0.10735, teacher_cal=0.04362, real_cal=0.04256),
+    saturation="0 codes in all four cells (1 in one cell)",
+    reading="the E equalisation keeps a 2.4-2.5x FFN-Y advantage under the real 21%-error upstream "
+            "input; it is not a teacher-data artefact",
+)
+q["verdict"] = ("REJECTED for accumulation (3/3 frames, -0.136..-0.251 dB) while the block exit is "
+                "1.94x better and no mechanical cause was found. Direction kept, pack not adopted.")
+(HERE / "QUALITY.json").write_text(json.dumps(q, indent=2))
+
+jobs = json.loads((HERE / "JOBS.json").read_text())
+jobs["round2"].insert(0, dict(
+    id="S01-B4-REALCAL", priority=3,
+    purpose="optional: real-input calibrated pack (expected to reproduce the rejection; kept only "
+            "so the audit is falsifiable)",
+    plan=realcal_plan["plan"], plan_sha256=realcal_plan["sha256"],
+    argv=["clock_runner.exe", "--plan", realcal_plan["plan"], "--out",
+          str(HERE / "runs/S01-B4-REALCAL"), "--pool", "--warm", "0", "--reps", "1"],
+    expected_output_sha256=None,
+    prediction="within a few 0.01 dB of candidate-34189.txt (29.0474 dB)"))
+jobs["round2_note"] = ("priority order: ABL-EONLY and CHAIN-DUMP first.  ABL-EONLY is the only "
+                       "experiment that separates 'the E stage' from 'the X-equalised expand path' "
+                       "with the same local metric; CHAIN-DUMP is the only way to see where the "
+                       "regression enters, because block 4 itself measurably improves.")
+(HERE / "JOBS.json").write_text(json.dumps(jobs, indent=2))
+print("docs updated")

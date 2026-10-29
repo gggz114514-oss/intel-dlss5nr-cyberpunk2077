@@ -1,0 +1,111 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,re,shlex
+R=Path(__file__).resolve().parent; A=R.parent; B=A.parents[1]; P=R/'f20-score-owner'
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def ident(p): return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True); assert r.returncode==0,r.stdout+r.stderr
+ return r.stdout
+s=(P/'candidate.comp').read_text(encoding='utf-8-sig'); pt=(P/'plan.txt').read_text(encoding='utf-8-sig')
+assert ident(P/'plan.txt')['sha256']=='d655b6b16c1c7949d912812e84748c503c33278a8f32f5fe12438de2d510e666'
+cards=[]
+# Q stays unscaled in shared memory; each score owner scales its existing two A fragments.
+q=s.replace('for (uint e = 2u*t_local; e < 4096u; e += 512u)', 'for (uint e = 2048u+2u*t_local; e < 4096u; e += 512u)')
+q=q.replace('            if (e < 2048u) r = r * f16vec2(scalar0);','')
+q=q.replace('        for (uint e = t_local; e < 2048u; e += 256u) dbg[10240u + e] = NR_Q(e / 32u, e % 32u);','')
+anchor='    coopMatLoad(score_q1,shArena,sg*8u*32u+16u,32u,LROW);'
+q=q.replace(anchor,anchor+'''
+    {
+        float16_t scalar0=float16_t(fb[uint(pc.p2.z)]);
+        for(int d=0;d<4;++d) {
+            float16_t n=shNorm[sg*8u+2u*uint(d)+(gl_SubgroupInvocationID>>4u)];
+            precise f16vec2 r=f16vec2(score_q0[d],score_q1[d])*f16vec2(n);
+            r=r*f16vec2(scalar0);
+            score_q0[d]=r.x;score_q1[d]=r.y;
+        }
+        if(debug) {
+            coopMatStore(score_q0,dbg,10240u+sg*8u*32u,32u,LROW);
+            coopMatStore(score_q1,dbg,10240u+sg*8u*32u+16u,32u,LROW);
+        }
+    }
+''')
+assert len({(8*g+2*d+l//16,16*k+l%16) for g in range(8) for d in range(4) for l in range(32) for k in range(2)})==2048
+cards.append(('f20-q-consumer-scale',q,dict(mapping='A[row=8*sg+2*d+lane/16,col=16*k+lane%16] consumes norm[row]. Exhaustive 2048 coordinates unique.',removed='4096B raw Q scale read + 4096B normalized Q write per WG; score Q read retained.',added='Fragment half2 construction and shNorm consumer addressing; no additional matrix weight read.',lifetime='Existing two Q fragments, one half2 result and one half norm scalar; temporaries retire before score MMA. No raw32 cache. K publication barrier retained.',rounding='Original norm tree unchanged. H(Q*n) then H(result*scalar) separately NoContraction. K H(K*n) unchanged.'),None))
+# Previously tested FFN mechanism, explicitly rebase to current score-owner as one interaction test.
+f=(R/'f20-peer8-fouracc/candidate.comp').read_text(encoding='utf-8-sig')
+start=s.index('    // ============ stage 1:');end=s.index('    // ============ stage 4:')
+fs=f.index('    // One publication:');fe=f.index('    // ============ stage 4:')
+ff=s[:start]+f[fs:fe]+s[end:]
+cards.append(('f20-ffn-fouracc-rebase',ff,dict(mapping='Exact previously verified peer8-fouracc FFN prefix, current score-owner stage4 onward and current shared allocation.',removed='Old FFN full shared publication replaced with one peer publication; known mechanism, not a new algorithm.',added='Peer exchange/selection and four-accumulator payload, same weight reuse and 8 SG.',lifetime='Inherited proof: conservative fragment peak144B/lane vs104 old parent. Physical allocation and spill require fresh native.',rounding='Unchanged per-output seed, K order, activation and half boundaries.',prior='INDISTINCT on P03; this is ONE new-baseline interaction check.'),None))
+# Reuse dead fold X for consumer-ready normalized K; no new shared allocation.
+def ix(t,c):return (c//16)*1024+(t//16)*256+(c%16)*16+t%16
+assert sorted(ix(t,c) for t in range(64) for c in range(32))==list(range(2048))
+for t in range(64):
+ for c in range(32):assert ix(t,c)==(c//16)*1024+(t//16)*256+(c%16)*16+t%16
+k=s.replace('            shArena[e]=r.x;\n            shArena[e+1u]=r.y;','''            if(e<2048u) {shArena[e]=r.x;shArena[e+1u]=r.y;}
+            else {
+                uint t=(e-2048u)/32u,c=e%32u;
+                uint dst=(c/16u)*1024u+(t/16u)*256u+(c%16u)*16u+t%16u;
+                shX[dst]=r.x;shX[dst+16u]=r.y;
+            }''')
+k=k.replace('dbg[12288u + e] = NR_K(e / 32u, e % 32u);','dbg[12288u + e] = shX[((e%32u)/16u)*1024u+((e/32u)/16u)*256u+(e%16u)*16u+(e/32u)%16u];')
+k=k.replace('coopMatLoad(b0, shArena, 2048u + n0 * 32u + k0, 32u, LCOL);','coopMatLoad(b0, shX, (k0/16u)*1024u+(n0/16u)*256u, 16u, LROW);')
+k=k.replace('coopMatLoad(b1, shArena, 2048u + (n0 + 16u) * 32u + k0, 32u, LCOL);','coopMatLoad(b1, shX, (k0/16u)*1024u+(n0/16u+1u)*256u, 16u, LROW);')
+cards.append(('f20-k-consumer-tile',k,dict(mapping='K feature-row/key-column 16x16 tiles: (c/16)*1024+(t/16)*256+(c%16)*16+t%16. Exhaustive bijection2048.',removed='No byte reduction claimed; replaces strided K transpose consumption with packed row-major tiles.',added='Producer scatter stride16 plus address/selection operations.',lifetime='shX fold data last consumed before QKV. Reuse begins after norm. Last K reader score; later debug O writes occur after retained full-WG ctx publication barriers. Normal path no later shX writes.',rounding='Original Q/K scale and norm arithmetic unchanged; only K destination addresses and reader layout.',shared_delta=0,barrier_delta=0),None))
+# Offline B tile records matching the measured Intel B component map.
+n=R/'f20-packed-weights';n.mkdir(exist_ok=True)
+bl=[l for l in pt.splitlines() if l.startswith('BUFFER ')][475];bp=Path(shlex.split(bl)[3]);old=bp.read_bytes();new=bytearray(old)
+for base,count in [(0,16),(4096,16),(8576,12),(15872,4)]:
+ for tile in range(count):
+  off=(base+tile*256)*2
+  for lane in range(32):
+   for d in range(8):
+    src=((lane//2)*16+2*d+(lane&1))*2;dst=(lane*8+d)*2
+    new[off+dst:off+dst+2]=old[off+src:off+src+2]
+    assert new[off+dst:off+dst+2]==old[off+src:off+src+2]
+assert new[16896*2:]==old[16896*2:]
+pack=n/'weights.bin';pack.write_bytes(new)
+w=s.replace('layout(set = 0, binding = 0) buffer HalfBuf', 'layout(set = 0, binding = 0) readonly buffer PackedWeights { uvec4 wpack[]; };\nlayout(set = 0, binding = 0) buffer HalfBuf')
+helper='''MAT_B nr_wb(uint off) {
+    uvec4 v=wpack[(off>>3u)+gl_SubgroupInvocationID];
+    MAT_B b;
+    f16vec2 h0=f16vec2(unpackHalf2x16(v.x)),h1=f16vec2(unpackHalf2x16(v.y));
+    f16vec2 h2=f16vec2(unpackHalf2x16(v.z)),h3=f16vec2(unpackHalf2x16(v.w));
+    b[0]=h0.x;b[1]=h0.y;b[2]=h1.x;b[3]=h1.y;
+    b[4]=h2.x;b[5]=h2.y;b[6]=h3.x;b[7]=h3.y;
+    return b;
+}
+'''
+w=w.replace('// half MpCubicSilu',helper+'\n// half MpCubicSilu',1)
+w,count=re.subn(r'MAT_B (\w+);\s*coopMatLoad\(\1,\s*wb,\s*([^;]+?),\s*16u,\s*LCOL\);',lambda m:f'MAT_B {m[1]}=nr_wb(uint({m[2]}));',w)
+assert count>0 and not re.search(r'coopMatLoad\([^,]+,\s*wb,.*LCOL',w)
+cards.append(('f20-packed-weights',w,dict(mapping='Measured B: k=2*d+(lane&1),n=lane>>1. Repack48 512B tiles into lane records8half; bitwise inverse mapping checked.',removed='Hypothesis only: compiler weight assembly/address operations. Parent already has wide loads; no guaranteed deletion.',added='Four unpackHalf2x16 per lane per tile, binding0 uvec4 alias.',lifetime='Each packed record retires after B assembly; existing B pair and C lifetime unchanged. Native actual temporary overlap/spill required.',rounding='Weights preserve half bits, no math changes. Pack trailing data from half16896 onward identical, including final projection at17024.',pack_parent=ident(bp),pack=ident(pack),weight_load_sites=count), (bl,pack)))
+for name,src,proof,packinfo in cards:
+ if len(sys.argv)>1 and name!=sys.argv[1]:continue
+ N=R/name;N.mkdir(exist_ok=True);source=N/'candidate.comp';spv=N/'candidate.spv';source.write_text(src,encoding='utf-8')
+ run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',source,'-o',spv])
+ pm=ST.Module(P/'candidate.spv');cm=ST.Module(spv)
+ if name=='f20-q-consumer-scale':
+  pattern=N/'parent-pattern-only.spv';ST.set_no_contraction(pm,set(ST.no_contraction_ids(pm))-{1436,1444},pattern)
+  ids=cm.id_to_instruction()
+  # precise propagates backwards into the unchanged norm tree: remove those
+  # scalar-half decorations. Retain only explicit half2 scale operations.
+  raw_half2=[rid for rid in ST.no_contraction_ids(cm) if ids[rid][0]==133 and ids.get(ids[rid][1][0],(0,[]))[0]==23]
+  assert len(raw_half2)==5
+  keep,info=ST.transfer_decoration_pattern_aligned(ST.Module(pattern),cm,raw_half2)
+  assert len(keep)==8
+ else:keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[])
+ ST.set_no_contraction(cm,set(keep),spv)
+ run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+ plan=N/'plan.txt';txt=pt.replace((P/'candidate.spv').as_posix(),spv.as_posix())
+ if packinfo:txt=txt.replace(packinfo[0],packinfo[0].replace(bp.as_posix(),packinfo[1].as_posix()))
+ plan.write_text(txt,encoding='utf-8')
+ for kind in ['GATES','NATIVE']:
+  task=json.loads((P/f'LUNA-{kind}.json').read_text().replace('f20-score-owner',name));task['identities']=[v for v in task['identities'] if not v['path'].endswith('.spv')]+[ident(spv)]
+  if packinfo:task['identities'].append(ident(packinfo[1]))
+  for j in task['jobs']:j['plan']=ident(plan)
+  (N/f'LUNA-{kind}.json').write_text(json.dumps(task,indent=2),encoding='utf-8')
+ runner=json.loads((P/'LUNA-GATES.json').read_text())['identities'][0]['path']
+ proof.update(parent=ident(P/'plan.txt'),source=ident(source),spv=ident(spv),plan=ident(plan),NC=sorted(keep),alignment=info,cpu=run([runner,'--plan',plan,'--cpu-check']),status='CPU_READY_GPU_UNTESTED')
+ (N/'PROOF.json').write_text(json.dumps(proof,indent=2),encoding='utf-8');print(name,ident(spv)['sha256'],len(keep))
+(R/'EXACT-FOUR.json').write_text(json.dumps([str(R/x[0]) for x in cards],indent=2),encoding='utf-8')

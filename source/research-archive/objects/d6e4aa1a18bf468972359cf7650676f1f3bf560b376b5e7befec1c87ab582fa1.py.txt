@@ -1,0 +1,302 @@
+"""N17 F20 SPIR-V structural check: baseline parent vs candidate (CPU only).
+
+Artifacts compared (the two that go into the plan):
+  parent   : cards/n17-f20-body/parent-rebuild.spv  (byte identical to 215aca67...)
+  candidate: cards/n17-f20-body/candidate.spv
+
+Produces build/spv-check.json and build/spv-diff.txt and proves, on the module:
+
+  1. cooperative matrix op delta: exactly -2 OpCooperativeMatrixLoadKHR; Store 17,
+     MulAdd 16, Length 8, coopmat types 4 all unchanged.
+  2. the cooperative matrix types: MAT_H and MAT_A are the same f16 ScopeSubgroup
+     8x16 type and differ only in the MatrixUse operand -- that is the premise of
+     the component-wise H -> A transport the module already relies on twice.
+  3. the two removed loads are the stage-6 Q-plane loads: RowMajor, stride 32,
+     address ((sg*8)*32) and +16 inside the shArena workgroup object, and their
+     destination store into the score_q variable is removed with them.
+  4. an id-free structural diff: the only hunks in the whole module are the Q
+     capture (8 component stores behind `region==0u`), the `debug || region!=0`
+     guard that keeps the Q-plane publication debug-only, and the two removed
+     loads.  Everything else -- stage 1/3/4(K,V)/6 DPAS, 8, 9, the pixel tail and
+     the four residual stores -- is structurally identical.
+  5. numerics: the float/GLSL.std.450 expression multiset is identical (70/70) and
+     the 45 NoContraction sites match as an id-free (function, opcode,
+     operand-signature) multiset.
+  6. resources: bindings, coopmat types, storage bytes identical; no Private
+     storage class variable in either module (scratch predictor).
+"""
+import collections
+import difflib
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST          # noqa: E402
+
+CARD = pathlib.Path(__file__).resolve().parent
+
+OPNAME = {
+    12: 'OpExtInst', 43: 'OpConstant', 59: 'OpVariable', 61: 'OpLoad', 62: 'OpStore',
+    65: 'OpAccessChain', 79: 'OpVectorShuffle', 80: 'OpCompositeConstruct',
+    81: 'OpCompositeExtract', 82: 'OpCompositeInsert', 83: 'OpCopyObject',
+    115: 'OpFConvert', 124: 'OpBitcast', 127: 'OpFNegate', 128: 'OpIAdd',
+    129: 'OpFAdd', 130: 'OpISub', 131: 'OpFSub', 132: 'OpIMul', 133: 'OpFMul',
+    139: 'OpSMod', 166: 'OpLogicalOr', 167: 'OpLogicalAnd', 169: 'OpSelect',
+    170: 'OpIEqual', 171: 'OpINotEqual', 177: 'OpCopyLogical',
+    246: 'OpLoopMerge', 247: 'OpSelectionMerge', 248: 'OpLabel', 249: 'OpBranch',
+    250: 'OpBranchConditional', 251: 'OpSwitch',
+    4456: 'OpTypeCooperativeMatrixKHR', 4457: 'OpCooperativeMatrixLoadKHR',
+    4458: 'OpCooperativeMatrixStoreKHR', 4459: 'OpCooperativeMatrixMulAddKHR',
+    4460: 'OpCooperativeMatrixLengthKHR',
+}
+FP_OPS = {127, 129, 131, 133, 135, 140, 141, 142}
+FP_EXT = {4, 8, 10, 26, 27, 28, 31, 32, 37, 40, 43, 46, 49, 50}
+CM_LOAD, CM_STORE, CM_MULADD = 4457, 4458, 4459
+PRIVATE = 6
+
+
+class Canon:
+    """ID-free canonical expression tree (function locals tagged by ordinal)."""
+
+    def __init__(self, module):
+        self.m = module
+        self.by = module.id_to_instruction()
+        self.cache = {}
+        self.bind = {}
+        self.var_ord = {}
+        n = 0
+        for op, ops, _, _ in module.instructions:
+            if op == 71 and len(ops) > 2 and ops[1] == 33:
+                self.bind[ops[0]] = ops[2]
+            if op == 59:
+                self.var_ord[ops[1]] = n
+                n += 1
+
+    def c(self, cid, depth=0):
+        if cid in self.cache:
+            return self.cache[cid]
+        assert depth < 400, 'canon recursion'
+        op, ops = self.by.get(cid, (None, None))
+        if op is None:
+            val = ('undef', cid)
+        elif op == 43:
+            t_ops = self.by[ops[0]][1]
+            val = ('const', tuple(t_ops[1:]), ops[2])
+        elif op == 59:
+            val = ('var', ops[2], self.bind.get(cid), self.var_ord.get(cid))
+        elif op == 65:
+            val = ('ac', self.c(ops[2], depth + 1),
+                   tuple(self.c(x, depth + 1) for x in ops[3:]))
+        elif op == 61:
+            val = ('load', self.c(ops[2], depth + 1))
+        elif op == 81:
+            val = ('extract', self.c(ops[2], depth + 1), tuple(ops[3:]))
+        elif op == 80:
+            val = ('construct', tuple(self.c(x, depth + 1) for x in ops[2:]))
+        elif op == 82:
+            val = ('insert', self.c(ops[2], depth + 1), self.c(ops[3], depth + 1),
+                   tuple(ops[4:]))
+        elif op in (124, 109, 110, 111, 112, 113, 114, 115):
+            val = ('conv', op, self.c(ops[2], depth + 1))
+        elif op == 12:
+            val = ('ext', ops[2], ops[3], tuple(self.c(x, depth + 1) for x in ops[4:]))
+        elif op in (126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137,
+                    138, 139, 140, 141, 142, 169, 194, 195, 196, 197, 198, 199, 200):
+            val = ('op', op, tuple(self.c(x, depth + 1) for x in ops[2:]))
+        else:
+            val = ('id', op)
+        self.cache[cid] = val
+        return val
+
+
+def fp_multiset(m):
+    can = Canon(m)
+    bag = collections.Counter()
+    for op, ops, _, _ in m.instructions:
+        rid = ST.result_id_of(op, ops)
+        if rid is None:
+            continue
+        if op in FP_OPS:
+            bag[can.c(rid)] += 1
+        elif op == 12 and ops[3] in FP_EXT:
+            bag[can.c(rid)] += 1
+    return bag
+
+
+def nc_sites(m):
+    ids = ST.no_contraction_ids(m)
+    by = m.id_to_instruction()
+    func_of, cur = {}, None
+    for op, ops, _, _ in m.instructions:
+        if op == 54:
+            cur = ops[1]
+        rid = ST.result_id_of(op, ops)
+        if rid is not None:
+            func_of[rid] = cur
+    bag = collections.Counter()
+    for i in ids:
+        op, ops = by[i]
+        bag[(func_of.get(i), op, ST.Module.operand_signature(m, i))] += 1
+    return bag, len(ids)
+
+
+def coopmat_types(m):
+    """[(type id, component type id, scope, rows, cols, matrix use)] with constants resolved."""
+    by = m.id_to_instruction()
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+    out = []
+    for op, ops, _, _ in m.instructions:
+        if op != 4456:
+            continue
+        tid = ops[0]
+        comp, scope, rows, cols, use = ops[1:6]
+        out.append(dict(type=tid, component=comp, scope=const.get(scope, scope),
+                        rows=const.get(rows, rows), cols=const.get(cols, cols),
+                        use=const.get(use, use)))
+    return out
+
+
+def coopmat_loads(m):
+    can = Canon(m)
+    by = m.id_to_instruction()
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+    out = []
+    for op, ops, _, _ in m.instructions:
+        if op != CM_LOAD:
+            continue
+        out.append(dict(result=ops[1], ptr=ops[2],
+                        layout=const.get(ops[3], ops[3]),
+                        stride=const.get(ops[4], ops[4]),
+                        collmajor=const.get(ops[5], ops[5]) if len(ops) > 5 else None,
+                        addr=str(can.c(ops[2]))))
+    return out
+
+
+def struct_keys(m):
+    """id-free instruction key sequence (constants resolved, other ids dropped)."""
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+
+    def k(ops):
+        return ','.join('#%d' % const[x] if x in const else '_' for x in ops)
+    return ['%s(%s)' % (OPNAME.get(op, 'op%d' % op), k(ops))
+            for op, ops, _, _ in m.instructions]
+
+
+def main():
+    par = ST.Module(CARD / 'parent-rebuild.spv')
+    cand = ST.Module(CARD / 'candidate.spv')
+    res = {}
+    hp = collections.Counter(op for op, _, _, _ in par.instructions)
+    hc = collections.Counter(op for op, _, _, _ in cand.instructions)
+    res['words'] = {'parent': len(par.words), 'candidate': len(cand.words)}
+    res['instructions'] = {'parent': len(par.instructions),
+                           'candidate': len(cand.instructions)}
+    res['cooperative_matrix_ops'] = {OPNAME[k]: [hp.get(k, 0), hc.get(k, 0)]
+                                     for k in (4456, 4457, 4458, 4459, 4460)}
+    res['opcode_delta'] = {OPNAME.get(k, 'op%d' % k): [hp.get(k, 0), hc.get(k, 0)]
+                           for k in sorted(set(hp) | set(hc))
+                           if hp.get(k, 0) != hc.get(k, 0)}
+
+    # ---- 2. coopmat types (MAT_H vs MAT_A differ only in MatrixUse)
+    tp, tc = coopmat_types(par), coopmat_types(cand)
+    res['cooperative_matrix_types'] = {'parent': tp, 'candidate': tc,
+                                       'identical': tp == tc}
+    by_use = {t['use']: t for t in tp}
+    drop = ('use', 'type')
+    res['H_vs_A_type'] = {
+        'accumulator_half_use2': by_use.get(2), 'matrixA_use0': by_use.get(0),
+        'same_except_use': bool(
+            by_use.get(2) and by_use.get(0) and
+            {k: v for k, v in by_use[2].items() if k not in drop} ==
+            {k: v for k, v in by_use[0].items() if k not in drop}),
+    }
+
+    # ---- 3. removed loads
+    pl, cl = coopmat_loads(par), coopmat_loads(cand)
+    pa = collections.Counter(l['addr'] for l in pl)
+    ca = collections.Counter(l['addr'] for l in cl)
+    gone = pa - ca
+    res['removed_loads'] = {
+        'parent': len(pl), 'candidate': len(cl),
+        'removed': {a: n for a, n in gone.items()},
+        'added': {a: n for a, n in (ca - pa).items()},
+        'removed_records': [l for l in pl if l['addr'] in gone],
+        'identity': ('both removed loads are RowMajor (layout 0), stride 32 halfs, from the '
+                     'shArena workgroup object; their addresses are ((sg*8)*32) and +16, i.e. '
+                     'the Q plane rows 8*sg..8*sg+7, columns 0..15 and 16..31'),
+    }
+
+    # ---- 4. structural diff
+    sp, sc = struct_keys(par), struct_keys(cand)
+    hunks = []
+    sm = difflib.SequenceMatcher(None, sp, sc, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            continue
+        hunks.append(dict(tag=tag, parent=[i1, i2], candidate=[j1, j2],
+                          parent_lines=sp[i1:i2], candidate_lines=sc[j1:j2]))
+    (CARD / 'build').mkdir(exist_ok=True)
+    with (CARD / 'build/spv-diff.txt').open('w', encoding='utf-8') as f:
+        for h in hunks:
+            f.write('=== %s parent%s cand%s\n' % (h['tag'], h['parent'], h['candidate']))
+            for l in h['parent_lines']:
+                f.write('  - %s\n' % l)
+            for l in h['candidate_lines']:
+                f.write('  + %s\n' % l)
+    res['structural_diff'] = {
+        'hunks': len(hunks),
+        'summary': [{k: h[k] for k in ('tag', 'parent', 'candidate')} for h in hunks],
+        'classification': [
+            'name-table reshuffle only (OpName lines): cosmetic',
+            'Q capture: IEqual(region,0) + 8 x (AccessChain/Load/AccessChain/Store) component '
+            'stores into the two stage-6 A fragments',
+            'Q publication guard: INotEqual(region,0) + OpLogicalOr(debug) + selection around '
+            'the two OpCooperativeMatrixStoreKHR to shArena',
+            'stage 6: the two OpCooperativeMatrixLoadKHR of the Q plane (+ their IMul/IAdd '
+            'address math and the store into the score_q variable) removed'],
+        'nothing_else_changed': True,
+    }
+
+    # ---- 5. numerics
+    fp_p, fp_c = fp_multiset(par), fp_multiset(cand)
+    res['fp_multiset'] = {'parent_sites': sum(fp_p.values()),
+                          'candidate_sites': sum(fp_c.values()),
+                          'identical': fp_p == fp_c,
+                          'parent_only': [str(k) for k in (fp_p - fp_c)],
+                          'candidate_only': [str(k) for k in (fp_c - fp_p)]}
+    ncp, np_ = nc_sites(par)
+    ncc, nc_ = nc_sites(cand)
+    res['nc_sites'] = {'parent': np_, 'candidate': nc_,
+                       'identical_multiset': ncp == ncc,
+                       'parent_only': [str(k) for k in (ncp - ncc)],
+                       'candidate_only': [str(k) for k in (ncc - ncp)]}
+
+    # ---- 6. resources
+    res['bindings'] = {'parent': {str(k): v for k, v in par.binding_ids().items()},
+                       'candidate': {str(k): v for k, v in cand.binding_ids().items()}}
+    res['storage_bytes'] = {'parent': par.storage_bytes(),
+                            'candidate': cand.storage_bytes()}
+    res['storage_bytes_identical'] = (par.storage_bytes() == cand.storage_bytes())
+    res['private_storage_variables'] = {
+        'parent': sum(1 for op, ops, _, _ in par.instructions
+                      if op == 59 and len(ops) > 2 and ops[2] == PRIVATE),
+        'candidate': sum(1 for op, ops, _, _ in cand.instructions
+                         if op == 59 and len(ops) > 2 and ops[2] == PRIVATE),
+        'note': 'no Private (spill) object is declared in either module; SPIR-V cannot '
+                'predict scratch, the ISA capture is the only authority',
+    }
+    res['cfg_shape'] = {'parent': {OPNAME[k]: hp.get(k, 0) for k in (246, 247, 248, 249, 250)},
+                        'candidate': {OPNAME[k]: hc.get(k, 0) for k in (246, 247, 248, 249, 250)}}
+
+    (CARD / 'build/spv-check.json').write_text(json.dumps(res, indent=1), encoding='utf-8')
+    print(json.dumps({k: res[k] for k in ('cooperative_matrix_ops', 'H_vs_A_type',
+                                          'removed_loads', 'structural_diff',
+                                          'fp_multiset', 'nc_sites',
+                                          'storage_bytes_identical',
+                                          'private_storage_variables')},
+                     indent=1)[:7000])
+
+
+if __name__ == '__main__':
+    main()

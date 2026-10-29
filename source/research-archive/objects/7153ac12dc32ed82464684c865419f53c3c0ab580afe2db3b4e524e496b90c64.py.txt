@@ -1,0 +1,321 @@
+# S09: emit ATTENTION-SITES.json + DYNAMIC-SCALE-REMAINDERS.json from the verified census.
+# Inputs (read only): CURRENT-ROWS.json rows, attention SPV binaries, the candidate sources.
+# Write zone: this card directory only.
+import hashlib
+import json
+import os
+import sys
+
+ROWS = r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/dsh-static-handoff/CURRENT-ROWS.json"
+CAND = r"@NR_WORKSPACE@/work/dsh-int8-fullnet-impl-20261024/candidates"
+CARD = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S09-qkv-attn"
+
+# ---------------------------------------------------------------- kernel census table
+# Source line numbers are 1-based and were read in this session.
+FAM = {
+    "swin_c64": {
+        "family": "Swin C64 (blocks 5..8, 62..65)",
+        "kernel_source": CAND + "/r04-r05-attn-dynamic/source/candidate/b3_20_c64_ownership_full_i8.comp",
+        "spv": CAND + "/r04-r05-attn-dynamic/spv/c64_attn_full_i8.spv",
+        "geometry": {"tokens_per_window": 64, "head_dim": 32, "heads": 2, "qkv_k": 64, "qkv_n": 192},
+        "int32": {"qkv": 64 * 16129, "qk": 32 * 16129, "pv": 64 * 16129},
+        "p_contract": "P is NORMALISED before PV (Swin contract)",
+        "sites": [
+            ("S-A", "qkv_projection_a_side", "sX",
+             "per-workgroup absmax over the whole 64x64 Y window tile of this dispatch "
+             "(= per window)", "activation", "int8 A operand of the 192x64 QKV GEMM",
+             "source L206-220 (atomicMax(shAbsMax) L214, sX L216-218, code L220); "
+             "binary: 1 of 4 OpAtomicUMax", 1032256),
+            ("S-Q", "qk_q_scale", "sQ",
+             "per-workgroup absmax over the 64x32 POST-scale Q slab (one scalar, constant "
+             "inside the 32-dim dot product)", "activation", "int8 B operand of QK",
+             "source L327 (atomicMax(shQMax)) + L344 (sQ); score dequant sK*sQ L357-364; "
+             "binary: OpAtomicUMax", 516128),
+            ("S-K", "qk_k_scale", "sK",
+             "per-workgroup absmax over the 64x32 post-scale K slab (constant inside K)",
+             "activation", "int8 A operand of QK",
+             "source L328 + L345; binary: OpAtomicUMax", 516128),
+            ("S-V", "pv_v_scale", "sV",
+             "per-workgroup absmax over the 2048-value V slab (= per (head, window))",
+             "activation", "int8 A operand (V^T) of PV",
+             "source L305 (atomicMax(shVMax)), L311-312, L332; binary: OpAtomicUMax", 1032256),
+            ("S-P", "pv_p_scale", "pScale",
+             "per-query absmax over that query's 64 normalised P halves (row owner thread, "
+             "no atomic)", "probability", "int8 B operand (P^T) of PV",
+             "source L424-425 (pScale/pInv), dequant L466-467; binary: no OpAtomicUMax for "
+             "this one (register reduction)", 1032256),
+        ],
+    },
+    "swin_c128": {
+        "family": "Swin C128 (blocks 9..14, 56..61)",
+        "kernel_source": CAND + "/r04-r05-attn-dynamic/source/candidate/c128_attention_ownership_full_i8.comp",
+        "spv": CAND + "/r04-r05-attn-dynamic/spv/c128_attn_full_i8.spv",
+        "geometry": {"tokens_per_window": 64, "head_dim": 32, "heads": 4, "qkv_k": 128, "qkv_n": 384},
+        "int32": {"qkv": 128 * 16129, "qk": 32 * 16129, "pv": 64 * 16129},
+        "p_contract": "P is NORMALISED before PV (Swin contract)",
+        "sites": [
+            ("S-A", "qkv_projection_a_side", "sX",
+             "per-workgroup absmax over the whole 64x128 Y window tile (= per window)",
+             "activation", "int8 A operand of the 384x128 QKV GEMM",
+             "source L231 (atomicMax(shAbsMax)), L233-237; binary: 1 of 4 OpAtomicUMax", 2064512),
+            ("S-Q", "qk_q_scale", "sQ", "per-workgroup absmax over the 64x32 post-scale Q slab",
+             "activation", "int8 B operand of QK",
+             "source L346 + L366; score dequant L379-386; binary: OpAtomicUMax", 516128),
+            ("S-K", "qk_k_scale", "sK", "per-workgroup absmax over the 64x32 post-scale K slab",
+             "activation", "int8 A operand of QK",
+             "source L347 + L367; binary: OpAtomicUMax", 516128),
+            ("S-V", "pv_v_scale", "sV", "per-workgroup absmax over the 2048-value V slab",
+             "activation", "int8 A operand (V^T) of PV",
+             "source L323, L329-330, L352; binary: OpAtomicUMax", 1032256),
+            ("S-P", "pv_p_scale", "pScale",
+             "per-query absmax over that query's 64 normalised P halves", "probability",
+             "int8 B operand (P^T) of PV",
+             "source L454-455, dequant L497; binary: no atomic for this one", 1032256),
+        ],
+    },
+    "swin_c256": {
+        "family": "Swin C256 (blocks 15..22, 48..55)",
+        "kernel_source": CAND + "/r06-c256-attn-dynamic/source/candidate/b3_06_swin_c256_full_i8.comp",
+        "spv": CAND + "/r06-c256-attn-dynamic/spv/c256_attn_full_i8.spv",
+        "geometry": {"tokens_per_window": 64, "head_dim": 32, "heads": 8, "qkv_k": 256, "qkv_n": 768},
+        "int32": {"qkv": 256 * 16129, "qk": 32 * 16129, "pv": 64 * 16129},
+        "p_contract": "P is NORMALISED before PV (Swin contract)",
+        "sites": [
+            ("S-A", "qkv_projection_a_side", "sY",
+             "per-workgroup absmax over all 16384 elements of the 64x256 Y window tile "
+             "(= per window)", "activation", "int8 A operand of the 768x256 QKV GEMM",
+             "source L122-142 (atomicMax(shYMax) L136, sY L139-140, code L142); "
+             "binary: 1 of 4 OpAtomicUMax", 4129024),
+            ("S-Q", "qk_q_scale", "sQ", "per-workgroup absmax over this head's 2048 post-scale |Q|",
+             "activation", "int8 A operand of QK",
+             "source L262, L277-283; binary: OpAtomicUMax", 516128),
+            ("S-K", "qk_k_scale", "sK", "per-workgroup absmax over this head's 2048 post-scale |K|",
+             "activation", "int8 B operand of QK",
+             "source L263, L278-283; binary: OpAtomicUMax", 516128),
+            ("S-V", "pv_v_scale", "sV", "per-workgroup absmax over the 2048-value V slab",
+             "activation", "int8 B operand of PV",
+             "source L220-260 (atomicMax L225, sV L246-248, code L260); binary: OpAtomicUMax",
+             1032256),
+            ("S-P", "pv_p_scale", "shPS/shPM",
+             "per query row: max of the *rounded* half P of that row (largest code is exactly 127)",
+             "probability", "int8 A operand of PV",
+             "source L357-382 (pmx L375-381, shPS/shPM L380-382); binary: no atomic", 1032256),
+        ],
+    },
+    "split16_l2": {
+        "family": "C512 split16 layer 2 attention (blocks 23..30, 40..47)",
+        "kernel_source": CAND + "/r12-r15-split16-vit/source/candidate/split16_attention_qkv_int8_qk8_pv8.comp",
+        "spv": CAND + "/r12-r15-split16-vit/spv/r12r15_split16_l2_qk8_pv8.spv",
+        "spv_b30": CAND + "/r12-r15-split16-vit/spv/r12r15_split16_b30_l2_qk8_pv8.spv",
+        "geometry": {"tokens_per_window": 64, "head_dim": 32, "heads": 16, "qkv_k": 512, "qkv_n": 96},
+        "int32": {"qkv": 512 * 16129, "qk": 32 * 16129, "pv": 64 * 16129},
+        "p_contract": "P is NORMALISED before PV (Swin contract)",
+        "build_flags": "-DL2_INLINE_QT=1 -DL2_NO_T_WRITE=1 (build-receipt.json argv)",
+        "sites": [
+            ("S-Q", "qk_q_scale", "sQ",
+             "per-workgroup absmax over the 64x32 post-scale Q slab (scale = normalise then "
+             "multiply by the static per-head aux[] scalar)", "activation",
+             "int8 A operand of QK",
+             "source L240-241 (sQ/sK), atomicMax L214-215, code L243-246; dequant sQK L268-272; "
+             "binary: 1 of 3 OpAtomicUMax", 516128),
+            ("S-K", "qk_k_scale", "sK",
+             "per-workgroup absmax over the 64x32 post-scale K slab (K is only L2-normalised, "
+             "no head scalar)", "activation", "int8 B operand of QK",
+             "source L241, L245; binary: OpAtomicUMax", 516128),
+            ("S-V", "pv_v_scale", "sV", "per-workgroup absmax over the 2048-value V slab",
+             "activation", "int8 A operand (V^T) of PV",
+             "source L248-253 (atomicMax L253), L354-355, code L397; binary: OpAtomicUMax",
+             1032256),
+            ("S-P", "pv_p_scale", "pScale",
+             "per-query absmax over that query's 64 normalised P halves", "probability",
+             "int8 B operand (P^T) of PV",
+             "source L380-383 (pScale/pInv, shPsf = pScale*sV), dequant L418-436; "
+             "binary: no atomic", 1032256),
+        ],
+        "already_static": [
+            ("qkv_projection_a_side", "A = qx8 int8 codes written by the predecessor "
+             "(split16_qx_producer / split16_l0_s23_qx / split16_projection_l1_qx), one static "
+             "per-output-channel dequant wsc[96h+n] carries the activation step; the kernel has "
+             "no A-side absmax (binary: 3 OpAtomicUMax, not 4)"),
+            ("context_to_wo", "qt written int8 with the STATIC per-head invT (BIND 11 "
+             "split16_b23_invt, 4 floats) under -DL2_INLINE_QT=1; T is not written "
+             "(-DL2_NO_T_WRITE=1)"),
+        ],
+    },
+    "vit": {
+        "family": "ViT blocks 31..38 attention",
+        "kernel_source": CAND + "/r12-r15-split16-vit/source/vit21-cand/vit_attention_qk8_pv8.comp",
+        "spv": CAND + "/r12-r15-split16-vit/spv/r12r15_vit_attention_qk8_pv8.spv",
+        "qkv_source": "@NR_WORKSPACE@/candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-qkv-v2/source/vit_nb04_qkv_int8.comp",
+        "qkv_spv": "@NR_WORKSPACE@/candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-qkv-v2/spv/vit_nb04_qkv_int8.spv",
+        "geometry": {"tokens_live": 288, "tokens_nonzero_in_dump": 264, "padded_keys": 320,
+                     "head_dim": 32, "heads": 32, "qkv_k": 1024, "qkv_n": 3072},
+        "int32": {"qkv": 1024 * 16129, "qk": 32 * 16129, "pv_per_k32_slice": 32 * 16129},
+        "p_contract": "P is UNNORMALISED into PV; one reciprocal per query AFTER all 5 key "
+                      "chunks (ViT contract)",
+        "sites": [
+            ("S-Q", "qk_q_scale", "sQ",
+             "per-workgroup absmax over this WG's 64 query tokens x 32 head dims, measured on "
+             "the POST-scale Q (the per-head producer scalar scales[h] is already applied and "
+             "is static)", "activation", "int8 B operand of QK",
+             "source L122-137 (atomicMax(shQMax) L130, sQ L132, codes q8 L136); dequant sQK "
+             "L196-198; binary: 1 of 3 OpAtomicUMax", 516128),
+            ("S-K", "qk_k_scale", "sK",
+             "per (workgroup, 64-key chunk) absmax over the chunk's 64 key tokens x 32 dims",
+             "activation", "int8 A operand of QK",
+             "source L147-167 (atomicMax(shKMax) L157, sK L161, codes sk8 L165); "
+             "binary: OpAtomicUMax", 516128),
+            ("S-V", "pv_v_scale", "sV",
+             "per (workgroup, 64-key chunk) absmax over the chunk's 64 V tokens x 32 dims",
+             "activation", "int8 A operand (V^T) of PV",
+             "source L147-167 (atomicMax(shVMax) L158, sV L162, codes sv8 L166); "
+             "binary: OpAtomicUMax", 516128),
+            ("S-P", "pv_p_scale", "sP (pstep/pinv)",
+             "per (query, 64-key chunk) absmax over that query's 64 UNNORMALISED P halves",
+             "probability", "int8 B operand (P^T) of PV",
+             "source L236-264 (pmx L239, pmx_all L252, pinv/pstep L253-254, shPmf = sV*pstep "
+             "L264), dequant L270-279; binary: no atomic", 516128),
+        ],
+        "already_static": [
+            ("qkv_projection_a_side", "A = qY int8 codes at VIT_QY_OFF in binding 4, dequantised "
+             "with the resident static per-output-channel aq[col] = sY*sWQKV[col] "
+             "(vit_nb04_qkv_int8.comp L52-61); the QKV kernel has 0 OpAtomicUMax"),
+            ("context_to_wo", "context is stored int8 with the static invT = ws[10] (127/absmax, "
+             "resident in the block weight pack), source L340-364"),
+        ],
+    },
+}
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def main():
+    j = json.load(open(ROWS, encoding="utf-8"))
+    rows = j["rows"]
+    spv_sha = {}
+    for r in rows:
+        spv_sha.setdefault(os.path.basename(r["spv"]), set()).add(r["sha256"])
+    fam_ord = {}
+    for r in rows:
+        b = os.path.basename(r["spv"])
+        key = {  # dispatch ordinal routing by deployed SPV basename
+            "c64_attn_full_i8.spv": "swin_c64",
+            "c128_attn_full_i8.spv": "swin_c128",
+            "c256_attn_full_i8.spv": "swin_c256",
+            "r12r15_split16_l2_qk8_pv8.spv": "split16_l2",
+            "r12r15_split16_b30_l2_qk8_pv8.spv": "split16_l2",
+            "r12r15_vit_attention_qk8_pv8.spv": "vit",
+        }.get(b)
+        if key:
+            fam_ord.setdefault(key, []).append(
+                {"ordinal": r["ordinal"], "name": r["name"], "pass_number": r["pass_number"],
+                 "spv": r["spv"], "spv_sha256": r["sha256"]})
+    for k in fam_ord:
+        fam_ord[k].sort(key=lambda d: d["ordinal"])
+
+    sites = []
+    total = 0
+    counts = {}
+    for key, F in FAM.items():
+        ords = fam_ord.get(key, [])
+        counts[key] = {"modules": len(ords), "sites": len(F["sites"]),
+                       "instances": len(ords) * len(F["sites"])}
+        total += len(ords) * len(F["sites"])
+        for sid, kind, var, gran, unit, consumer, ev, bound in F["sites"]:
+            rec = {
+                "site_id": "S09:%s:%s" % (key, sid),
+                "family": key,
+                "family_label": F["family"],
+                "kernel_source": F["kernel_source"],
+                "spv": F["spv"],
+                "spv_sha256": sha256(F["spv"]),
+                "site_kind": kind,
+                "scale_variable": var,
+                "granularity": gran,
+                "unit_kind": unit,
+                "consumer": consumer,
+                "evidence_source_and_binary": ev,
+                "geometry": F["geometry"],
+                "int32_bound": bound,
+                "int32_bound_expr": {1032256: "K*127*127 with K=64", 516128: "K*127*127 with K=32",
+                                     2064512: "K*127*127 with K=128",
+                                     4129024: "K*127*127 with K=256",
+                                     8258048: "K*127*127 with K=512",
+                                     16516096: "K*127*127 with K=1024"}.get(bound, "K*127*127"),
+                "p_contract": F["p_contract"],
+                "static_replacement": "NONE (dynamic in the deployed SPV)",
+                "instances": [{"ordinal": o["ordinal"], "pass_name": o["name"],
+                               "pass_number": o["pass_number"], "spv": o["spv"],
+                               "spv_sha256": o["spv_sha256"]} for o in ords],
+                "instance_count": len(ords),
+            }
+            if key == "split16_l2" and "b30" in str(rec["spv"]):
+                rec["spv_b30"] = F.get("spv_b30")
+            sites.append(rec)
+    # already-static points
+    closed = []
+    for key, F in FAM.items():
+        for kind, txt in F.get("already_static", []):
+            ords = fam_ord.get(key, [])
+            closed.append({"site_id": "S09:%s:closed:%s" % (key, kind), "family": key,
+                           "site_kind": kind, "state": "ALREADY_STATIC",
+                           "why": txt, "spv_sha256": sha256(F["spv"]),
+                           "instances": len(ords),
+                           "ordinals": [o["ordinal"] for o in ords]})
+    out = {
+        "schema": "s09-attention-sites-v1",
+        "card": "S09/S10/S11 QKV + QK + PV pure-static replacement",
+        "generated_from": {
+            "rows": ROWS,
+            "rows_sha256": sha256(ROWS),
+            "plan": j.get("plan"), "plan_sha256": j.get("sha256"),
+            "note": "the plan is the 34189-bound c64-family-static combo; NOT deployable",
+        },
+        "scope": "every attention dispatch of the current candidate (59 modules, 5 families), "
+                 "plus the QKV projection A-side scale inside each attention kernel",
+        "counts": {"families": counts, "site_records": len(sites),
+                   "dynamic_scale_instances_total": total,
+                   "dynamic_scale_instances_by_kind": {
+                       "qkv_projection_a_side": sum(c["instances"] for k, c in
+                                                    counts.items()) and sum(
+                           len(fam_ord.get(k, [])) for k in ("swin_c64", "swin_c128", "swin_c256")),
+                       "qk_q_scale": sum(len(fam_ord.get(k, [])) for k in FAM),
+                       "qk_k_scale": sum(len(fam_ord.get(k, [])) for k in FAM),
+                       "pv_v_scale": sum(len(fam_ord.get(k, [])) for k in FAM),
+                       "pv_p_scale": sum(len(fam_ord.get(k, [])) for k in FAM)}},
+        "binary_evidence": {
+            "method": "SPIR-V opcode census of the deployed binaries (tools/spv_census.py); "
+                      "OpAtomicUMax = opcode 239 is the in-kernel absmax publisher",
+            "result": "c64/c128/c256 = 4 publishers (sA,sQ,sK,sV); split16 l2 = 3 (no QKV A-side); "
+                      "ViT attention = 3 (no QKV A-side); ViT qkv = 0",
+            "artifact": "tools/spv-opcode-census.json",
+        },
+        "sites": sites,
+        "already_static_sites": closed,
+        "out_of_card_neighbours": [
+            {"what": "WO / output projection A-side int8 quantisation (attention T -> WO)",
+             "owner": "S12",
+             "note": "C64 T is FP16 out of the attention kernel and quantised inside "
+                     "r07_c64_output_wo_i8 / c128_d4_wo_qx / r07m_c256_wo_qx_i8; not a dynamic "
+                     "attention scale"},
+            {"what": "split16 / ViT WO A-side", "owner": "S12",
+             "note": "already static (invT / ws[10]) and consumed by the WO kernels"},
+        ],
+        "cpu_study": "tools/vit-static-study.json (ViT, 3 frames x 8 blocks x 32 heads; "
+                     "model validated to f16 level in tools/vit-validation.json)",
+    }
+    p1 = os.path.join(CARD, "ATTENTION-SITES.json")
+    json.dump(out, open(p1, "w", encoding="utf-8"), indent=1)
+    print("wrote", p1, "sites", len(sites), "instances", total)
+    print(json.dumps(out["counts"], indent=1))
+    return out
+
+
+if __name__ == "__main__":
+    main()

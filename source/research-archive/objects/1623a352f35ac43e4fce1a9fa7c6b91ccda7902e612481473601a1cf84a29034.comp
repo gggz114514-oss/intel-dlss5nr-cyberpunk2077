@@ -1,0 +1,86 @@
+// c3x_pre_c64.comp — R07 dispatch A (C64): one full-N projection per tile plus
+// the four-corner blend, published to global memory for the body dispatch.
+//
+// T3d C64 direction B (T3b's C128 result applied to this width): the blended
+// activation is published ONCE, in the canonical io_at layout 0 over the
+// 336x192 image (binding 10, resource 248).  The tiled per-workgroup
+// staging (binding 12, resource 484, xbase + t3*64 + c) is no longer
+// written: its only consumer, the body's expand A load, now reads this
+// canonical copy with row stride 16 halves.  Out-of-bounds tiles are not
+// written here; the body skips those tokens with its own oob guard and the
+// contract zeroes them.
+//
+// Replaces the per-head (z) repetition of the same projection and the same
+// blend: in the fused kernel every z slice rebuilt the identical 16-row ×
+// 64-channel projection and re-ran the identical blend loop, publishing to
+// blout under a z==0 guard.  Here there is one WG per tile, so the publication
+// has a single owner by construction and no guard is needed.
+//
+// Grid 42×24×1 (z = 1).  Shared: the 16×64 half projection = 2,048 B.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256) in;
+#include "nb05_swin_c64_common.glsl"
+
+layout(set = 0, binding = 8) buffer Nr3Pack { float16_t pw[]; };
+layout(set = 0, binding = 9) buffer Nr3Skip { float16_t sk[]; };
+layout(set = 0, binding = 10) buffer Nr3BlendOut { float16_t blout[]; };
+layout(set = 0, binding = 11) buffer Nr3ProjIn { float16_t x65[]; };
+// Retained descriptor only: the plan keeps 13 bindings and resource 484
+// is still allocated for this pass, but direction B leaves this tiled
+// staging unwritten (and therefore unread: the body's binding-12
+// reference is gone as well).
+layout(set = 0, binding = 12) buffer C3X { float16_t xg[]; };
+
+// Projection-to-blend scratch retired.
+
+#define MAT_H coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+
+// ioport_common.glsl io_at, layout 0 (spatial 4x4 tiles, 16 channels).
+uint nr3_io_at0(uint px, uint py, uint c, uint W, uint C) {
+    uint t = ((py / 4u) * (W / 4u) + px / 4u) * 16u + 4u * (py % 4u) + px % 4u;
+    return ((t / 16u) * (C / 16u) + c / 16u) * 256u + (t % 16u) * 16u + c % 16u;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = tid / 32u;
+    const uint wx = (pc.p1.z != 0) ? uint(pc.p2.x) : gl_WorkGroupID.x;
+    const uint wy = (pc.p1.z != 0) ? uint(pc.p2.y) : gl_WorkGroupID.y;
+
+
+    const uint lane=gl_SubgroupInvocationID;
+    const uint rh=sg>>2u,cg=sg&3u;
+    const uint tile=wy*uint(pc.p1.x)+wx;
+    const uint abase=pc.p4.x+tile*(pc.p5.x/16u)*256u+rh*128u;
+    const uint wbase=pc.p4.y+cg*(pc.p5.x/16u)*256u;
+    MAT_C acc=MAT_C(0.0);
+    for(uint kc=0u;kc<pc.p5.x;kc+=16u) {
+        MAT_A a;MAT_B b;
+        coopMatLoad(a,x65,abase+(kc/16u)*256u,16u,LROW);
+        coopMatLoad(b,pw,wbase+(kc/16u)*256u,16u,LCOL);
+        acc=coopMatMulAdd(a,b,acc);
+    }
+    MAT_H h=MAT_H(acc);
+    const uint c=cg*16u+(lane&15u);
+    for(uint ci=0u;ci<4u;++ci) {
+        const uint ps=rh*8u+2u*ci+(lane>>4u);
+        const uint px0=8u*wx+2u*(ps%4u),py0=8u*wy+2u*(ps/4u);
+        const uint base=nr3_io_at0(px0,py0,c,uint(pc.p0.x)*4u,pc.p5.y);
+        for(uint child=0u;child<4u;++child) {
+            const uint ba=base+(child&1u)*16u+(child>>1u)*64u;
+            precise float16_t main_scaled=h[ci];
+            if(pc.p5.w==1u) main_scaled=main_scaled*pw[pc.p5.z+pc.p5.y+c];
+            const float16_t skip_gain=pw[pc.p5.z+c];
+            const float16_t skip_input=sk[pc.p4.z+ba];
+            precise float16_t skip_v=skip_input*skip_gain;
+            precise float16_t value=main_scaled+skip_v;
+            blout[ba]=value;
+        }
+    }
+}

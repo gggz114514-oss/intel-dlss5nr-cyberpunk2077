@@ -1,0 +1,50 @@
+"""Exercise real NNCF, export its quantization parameters; NOT formal calibration."""
+from pathlib import Path
+import json
+import argparse
+import numpy as np
+import nncf
+import onnx
+from onnx import numpy_helper
+import onnxruntime as ort
+from nncf.quantization.advanced_parameters import AdvancedQuantizationParameters,QuantizationParameters
+from nncf.quantization.range_estimator import RangeEstimatorParametersSet
+parser=argparse.ArgumentParser();parser.add_argument('--minmax',action='store_true');args=parser.parse_args()
+suffix='minmax' if args.minmax else 'default'
+Q=Path(__file__).resolve().parent/'reference-lift'
+data=np.load(Q/'smoke-input.npz')
+x=data['features']; gold=data['fp16_capture']
+dataset=nncf.Dataset([{'features':x[i:i+1]} for i in range(len(x))])
+params=AdvancedQuantizationParameters(
+    activations_quantization_params=QuantizationParameters(num_bits=8,per_channel=False),
+    weights_quantization_params=QuantizationParameters(num_bits=8,per_channel=True))
+if args.minmax:params.activations_range_estimator_params=RangeEstimatorParametersSet.MINMAX
+model=nncf.quantize(onnx.load(Q/'lift.onnx'),dataset,subset_size=len(x),preset=nncf.QuantizationPreset.PERFORMANCE,
+                    target_device=nncf.TargetDevice.ANY,advanced_parameters=params)
+onnx.checker.check_model(model);onnx.save(model,Q/f'lift-nncf-smoke-{suffix}.onnx')
+session=ort.InferenceSession(str(Q/f'lift-nncf-smoke-{suffix}.onnx'),providers=['CPUExecutionProvider'])
+y=session.run(None,{'features':x})[0]
+delta=y.astype(float)-gold.astype(float)
+initializers={a.name:numpy_helper.to_array(a) for a in model.graph.initializer}
+qdq=[]
+for node in model.graph.node:
+    if node.op_type in ['QuantizeLinear','DequantizeLinear']:
+        qdq.append({'name':node.name,'op':node.op_type,'inputs':list(node.input),
+                    'parameters':{name:initializers[name].tolist() for name in node.input[1:] if name in initializers},
+                    'attributes':{a.name:onnx.helper.get_attribute_value(a) for a in node.attribute}})
+report={'status':'TOOL_SMOKE_ONLY_SINGLE_WINDOW_REUSED_FOR_EVALUATION',
+        'formal_calibration':False,'vulkan_validated':False,
+        'note':'Tool-selected signedness/range; explicit per-tensor A and per-output-channel W. Existing Vulkan narrow-range signed A contract must be reconciled before translation; no runtime pack produced.',
+        'rmse':float(np.sqrt(np.mean(delta**2))),'max_abs':float(abs(delta).max()),
+        'relL2':float(np.linalg.norm(delta)/np.linalg.norm(gold.astype(float))),
+        'quantizers':qdq,'op_counts':{op:sum(n.op_type==op for n in model.graph.node) for op in sorted({n.op_type for n in model.graph.node})}}
+report['range_estimator']=suffix
+node=next(n for n in model.graph.node if n.op_type=='QuantizeLinear')
+scale=initializers[node.input[1]];zero=initializers[node.input[2]];bounds=np.iinfo(zero.dtype)
+codes=np.rint(x/scale)+zero
+report['activation_contract']={'dtype':str(zero.dtype),'scale':scale.tolist(),'zero':zero.tolist(),
+    'quant_min':int(bounds.min),'quant_max':int(bounds.max),
+    'clipped_values':int(np.count_nonzero((codes<bounds.min)|(codes>bounds.max))),
+    'values':int(x.size),'observed_absmax':float(abs(x).max())}
+(Q/f'NNCF-SMOKE-{suffix}.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
+print(json.dumps({k:v for k,v in report.items() if k!='quantizers'},indent=2))

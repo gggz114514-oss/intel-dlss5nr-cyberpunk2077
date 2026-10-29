@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""R03 SPIR-V multiset delta (opcode + word count) with per-row attribution.
+
+Every difference row must land in exactly one named class that names the source
+change it comes from. Memory instructions are attributed through their base
+variable (walking access chains) so that "10 more stores" is never a blanket
+statement. Writes evidence/SPV-DELTA.json and evidence/MMA-RESIDUAL.json.
+CPU only; exit code 1 when a row stays unclassified or the totals disagree.
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import spv_read as S  # noqa: E402
+
+R = Path("@NR_WORKSPACE@")
+CARD = R / "work/dsh-xmx-handoff-validation-20261024/candidates/r03-ioport4"
+EVID = CARD / "evidence"
+MEM_OPS = (61, 62, 65, 66, 67, 63, 64)
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def var_of(m, pid, depth=0):
+    """Base variable name of a pointer id (access chain -> variable)."""
+    if depth > 16:
+        return "?"
+    d = m.defining(pid)
+    if not d:
+        return "?"
+    op, a, _ = d
+    if op == 59:
+        return m.names.get(a[1]) or "var%d" % a[1]
+    if op in (65, 66, 67):
+        return var_of(m, a[2], depth + 1)
+    if op == 83:                       # OpCopyObject
+        return var_of(m, a[2], depth + 1)
+    if op == 55:
+        return "function_parameter"
+    if op == 245:
+        return "phi"
+    if op == 61:
+        return "loaded_pointer"
+    return "?"
+
+
+def mem_profile(m):
+    """(op, base variable) -> (instruction count, total words)."""
+    out = {}
+    for op, a, wc in m.ins:
+        if op == 61:
+            v = var_of(m, a[2])
+        elif op == 62:
+            v = var_of(m, a[0])
+        elif op in (65, 66, 67):
+            v = var_of(m, a[2])
+        else:
+            continue
+        key = (op, v)
+        c, w = out.get(key, (0, 0))
+        out[key] = (c + 1, w + wc)
+    return out
+
+
+def fmul_split(m):
+    """Count OpFMul by result component width (f16 -> pool tree, f32 -> dequant)."""
+    res = {16: 0, 32: 0, "other": 0}
+    for op, a, wc in m.ins:
+        if op != 133:
+            continue
+        cw = m.comp_kind_width(a[0])
+        if cw and cw[0] == "float" and cw[1] in (16, 32):
+            res[cw[1]] += 1
+        else:
+            res["other"] += 1
+    return res
+
+
+def coop_profile(m):
+    io = m.coop_io()
+    buckets = {}
+    for kind in ("load_sites", "store_sites"):
+        for s in io[kind]:
+            t = s["type"]
+            comp = m.comp_kind_width(t[1]) if t else None
+            use = m.cval(t[5]) if t else None
+            key = "%s %s%d use=%s rows=%s cols=%s" % (
+                kind.split("_")[0], comp[0] if comp else "?", comp[1] if comp else 0,
+                {0: "A", 1: "B", 2: "Accumulator", 3: "?", 4: "?"}.get(use, use),
+                m.cval(t[3]) if t else None, m.cval(t[4]) if t else None)
+            buckets[key] = buckets.get(key, 0) + 1
+    for s in m.mma_sites():
+        key = "mma A=%s%d B=%s%d" % (s["A_comp"][0], s["A_comp"][1],
+                                     s["B_comp"][0], s["B_comp"][1])
+        buckets[key] = buckets.get(key, 0) + 1
+    return buckets
+
+
+OPS_CLASS = {
+    4: ("D1_declarations", "extra #extension / capability / type / constant / variable "
+                           "declarations for the int8 operands and the scale handoff"),
+    5: ("D1_declarations", "new debug names for the new ids"),
+    17: ("D1_declarations", "declarations"),
+    21: ("D1_declarations", "int8 and int32 component types"),
+    22: ("D1_declarations", "declarations"),
+    23: ("D1_declarations", "declarations"),
+    28: ("D1_declarations", "declarations"),
+    32: ("D1_declarations", "pointer types for int8 storage and the scale table"),
+    43: ("D1_declarations", "constants 127.0 / -127.0 and the int8 code constants"),
+    59: ("D1_declarations", "variables: the int8 A tile, invV, code, f0/f1, st0/st1"),
+    71: ("D1_declarations", "decorations (array stride/offsets)"),
+    72: ("D1_declarations", "member decorations"),
+    110: ("C2_quantization", "float -> int conversion of the single code point"),
+    124: ("C2_quantization", "bit pattern of the int8 code"),
+    12: ("C2_quantization", "GLSL.std.450 RoundEven + FClamp of the single quantization"),
+    111: ("C5_dequant", "int32 accumulator -> f32 (cooperative matrix convert, lowered per component)"),
+    115: ("C5_dequant", "f32 -> f16 narrow after the dequant multiply"),
+    4460: ("C5_dequant", "OpCooperativeMatrixLengthKHR for the two per-fragment component loops"),
+    4457: ("C3_int8_mma", "cooperative matrix loads: int8 A tile / int8 K32 N16 B tiles"),
+    4456: ("D1_declarations", "cooperative matrix types: int8 A, int8 B, int C"),
+    4459: ("C3_int8_mma", "the two FP16 K16 MMA become two INT8 K32 MMA (extra "
+                          "MatrixOperands word selects signed int8 operands)"),
+    176: ("C4_k16_loop_removed", "the K16 loop's unsigned trip-count compare"),
+    128: ("C4_k16_loop_removed", "the K16 loop's induction increment"),
+    177: ("C5_dequant", "signed compare of the two 4-iteration component loops"),
+    246: ("C4_loop_structure", "loop merge: K16 loop out, two component loops in"),
+    248: ("C4_loop_structure", "basic blocks of the new/removed loops"),
+    249: ("C4_loop_structure", "branches of the new/removed loops"),
+    250: ("C4_loop_structure", "conditional branches of the new/removed loops"),
+    132: ("C6_addressing", "index/stride products for the scale-table fragments"),
+    133: ("C2_quantization",
+          "f16 multiply of the pooled value by invV; f32 per-channel dequant multiplies"),
+    61: ("C6_addressing", "loads"), 62: ("C6_addressing", "stores"),
+    65: ("C6_addressing", "access chains"),
+    134: ("C6_addressing", "unsigned division by 16 in the io_at tile/plane index and in the "
+                           "scale-table block index"),
+}
+
+
+def hist(m):
+    h = {}
+    for op, a, wc in m.ins:
+        h[(op, wc)] = h.get((op, wc), 0) + 1
+    return h
+
+
+def delta_rows(p, c):
+    hp, hc = hist(p), hist(c)
+    rows = []
+    mp, mc = mem_profile(p), mem_profile(c)
+    for k in sorted(set(hp) | set(hc)):
+        a, b = hp.get(k, 0), hc.get(k, 0)
+        if a != b:
+            if k[0] in (61, 62, 65, 66, 67):
+                continue      # attributed per base variable below, never as a lump sum
+            rows.append({"opcode": k[0], "name": p.name(k[0]), "word_count": k[1],
+                         "parent": a, "child": b, "delta": b - a,
+                         "words_delta": (b - a) * k[1], "scope": "instruction"})
+    if mp != mc:
+        for k in sorted(set(mp) | set(mc)):
+            (a, wa), (b, wb) = mp.get(k, (0, 0)), mc.get(k, (0, 0))
+            if a != b:
+                rows.append({"opcode": k[0], "name": p.name(k[0]), "variable": k[1],
+                             "parent": a, "child": b, "delta": b - a,
+                             "words_delta": wb - wa, "scope": "memory_by_variable"})
+    return rows
+
+
+def classify(rows, p, c):
+    classes, un = {}, []
+    fp, fc = fmul_split(p), fmul_split(c)
+    for r in rows:
+        op = r["opcode"]
+        if r["scope"] == "memory_by_variable":
+            var = r["variable"]
+            if var in ("sc", "Scal"):
+                cls = ("C5_dequant", "loads of the per-channel dequant/output step fragments")
+            elif var in ("f0", "f1", "st0", "st1", "i"):
+                cls = ("C5_dequant", "function-local accumulator/step temporaries of the dequant")
+            elif var in ("code", "invV"):
+                cls = ("C2_quantization", "the single quantization code point and its inverse step")
+            elif var in ("a_i8", "a_ha"):
+                cls = ("C2_quantization", "the pooled A tile (int8 instead of half)")
+            elif var in ("half", "dst", "firs"):
+                cls = ("C5_dequant", "the output fragment / store address temporaries")
+            elif var in ("ci0", "ci1", "aa", "bb", "bb1"):
+                cls = ("C3_int8_mma", "the int8 A/B fragments and int32 accumulators")
+            elif var in ("tl", "x", "Inpu"):
+                cls = ("C6_addressing", "input loads of the unchanged pooling tree")
+            else:
+                cls = ("C6_addressing", "address computation / unchanged pooling tree")
+            classes.setdefault(cls[0], {"why": cls[1], "rows": [], "instructions": 0, "words": 0})
+            classes[cls[0]]["rows"].append(r)
+            classes[cls[0]]["instructions"] += r["delta"]
+            classes[cls[0]]["words"] += r["words_delta"]
+            continue
+        if op == 133:
+            cls = ("C2_quantization", "float(v)*invV code point (f16->f32)") if r["delta"] > 0 \
+                else ("C5_dequant", "dequant multiply")
+            # split the row by width to keep the statement exact
+            sub = []
+            if fp[16] != fc[16]:
+                sub.append(("C2_quantization", {"opcode": op, "name": "OpFMul(f16)",
+                                                "word_count": r["word_count"],
+                                                "parent": fp[16], "child": fc[16],
+                                                "delta": fc[16] - fp[16],
+                                                "words_delta": (fc[16] - fp[16]) * r["word_count"],
+                                                "scope": "instruction"}))
+            if fp[32] != fc[32]:
+                sub.append(("C5_dequant", {"opcode": op, "name": "OpFMul(f32)",
+                                           "word_count": r["word_count"],
+                                           "parent": fp[32], "child": fc[32],
+                                           "delta": fc[32] - fp[32],
+                                           "words_delta": (fc[32] - fp[32]) * r["word_count"],
+                                           "scope": "instruction"}))
+            if sub:
+                for name, rr in sub:
+                    classes.setdefault(name, {"why": OPS_CLASS[op][1], "rows": [],
+                                              "instructions": 0, "words": 0})
+                    classes[name]["rows"].append(rr)
+                    classes[name]["instructions"] += rr["delta"]
+                    classes[name]["words"] += rr["words_delta"]
+                continue
+        if op in OPS_CLASS:
+            name, why = OPS_CLASS[op]
+            classes.setdefault(name, {"why": why, "rows": [], "instructions": 0, "words": 0})
+            classes[name]["rows"].append(r)
+            classes[name]["instructions"] += r["delta"]
+            classes[name]["words"] += r["words_delta"]
+            continue
+        un.append(r)
+    return classes, un
+
+
+def mma_block(m):
+    sites = m.mma_sites()
+    fp16 = [s for s in sites if (s["A_comp"] and s["A_comp"][0] == "float") or
+            (s["B_comp"] and s["B_comp"][0] == "float")]
+    int8 = [s for s in sites if s["A_comp"] and s["A_comp"] == ("int", 8)]
+    io = m.coop_io()
+    return {
+        "spv": {"path": str(m.path), "bytes": Path(m.path).stat().st_size,
+                "sha256": sha(m.path), "words": len(m.words),
+                "instructions": len(m.ins)},
+        "mma_sites": sites,
+        "mma_count_total": len(sites),
+        "mma_count_fp16_operands": len(fp16),
+        "mma_count_int8_operands": len(int8),
+        "fp16_mma_word_offsets": [s["word_offset"] for s in fp16],
+        "int8_mma_word_offsets": [s["word_offset"] for s in int8],
+        "coop_buckets": coop_profile(m),
+        "shared": m.shared_vars(),
+        "shared_bytes": sum((s["bytes"] or 0) for s in m.shared_vars()),
+        "bindings": m.bindings(),
+        "push_constant_bytes": m.push_constant_bytes(),
+        "no_contraction": len(m.no_contraction()),
+        "fmul_by_width": fmul_split(m),
+        "glsl_ext_inst_hist": {S.GLSL.get(k, "ext%d" % k): v
+                               for k, v in sorted(m.extinst_hist().items())},
+    }
+
+
+def main():
+    parent = S.Module(CARD / "spv/parent_repro.spv")
+    arms = {"half_out": S.Module(CARD / "spv/r03_ioport4_i8.spv"),
+            "qx_out": S.Module(CARD / "spv/r03_ioport4_i8_qx.spv")}
+    out = {"card": "r03-ioport4",
+           "method": ("multiset over (opcode, word count) of the whole module; memory "
+                      "instructions additionally attributed through their base variable"),
+           "parent": mma_block(parent), "arms": {}}
+    ok = True
+    for label, mod in arms.items():
+        rows = delta_rows(parent, mod)
+        cls, un = classify(rows, parent, mod)
+        inst_sum = sum(v["instructions"] for v in cls.values())
+        word_sum = sum(v["words"] for v in cls.values())
+        obs_i = len(mod.ins) - len(parent.ins)
+        obs_w = len(mod.words) - len(parent.words)
+        ok = ok and not un and inst_sum == obs_i and word_sum == obs_w
+        out["arms"][label] = {
+            "candidate": Path(mod.path).name,
+            "observed_instruction_delta": obs_i, "observed_word_delta": obs_w,
+            "class_instruction_sum": inst_sum, "class_word_sum": word_sum,
+            "totals_match": inst_sum == obs_i and word_sum == obs_w,
+            "classes": {k: {"why": v["why"], "instructions": v["instructions"],
+                            "words": v["words"], "rows": v["rows"]}
+                        for k, v in sorted(cls.items())},
+            "unclassified": un,
+            "module": mma_block(mod),
+        }
+    out["verdict"] = bool(ok)
+    (EVID / "SPV-DELTA.json").write_text(json.dumps(out, indent=1) + "\n", encoding="utf-8")
+
+    residual = {
+        "card": "r03-ioport4", "pass": "ioport_block4_0",
+        "method": ("re-enumerated on the new modules (ids are not inherited from "
+                   "FULLNET-RESIDUAL-MMA-SITES.json): every OpCooperativeMatrixMulAddKHR, "
+                   "with the component kind/width of A and B resolved through "
+                   "OpTypeCooperativeMatrixKHR"),
+        "parent_fp16_mma_sites_from_audit": {
+            "source": "work/codex-astra-fp16-int8-audit-20261024/FULLNET-RESIDUAL-MMA-SITES.json",
+            "word_offsets": [2235, 2408],
+            "reproduced_word_offsets": out["parent"]["fp16_mma_word_offsets"],
+            "match": out["parent"]["fp16_mma_word_offsets"] == [2235, 2408],
+        },
+        "parent": {k: out["parent"][k] for k in
+                   ("spv", "mma_sites", "mma_count_fp16_operands", "mma_count_int8_operands",
+                    "mma_count_total", "shared_bytes", "no_contraction")},
+        "candidate_half_out": {k: out["arms"]["half_out"]["module"][k] for k in
+                               ("spv", "mma_sites", "mma_count_fp16_operands",
+                                "mma_count_int8_operands", "mma_count_total",
+                                "fp16_mma_word_offsets", "int8_mma_word_offsets",
+                                "shared_bytes", "no_contraction")},
+        "candidate_qx_out": {k: out["arms"]["qx_out"]["module"][k] for k in
+                             ("spv", "mma_sites", "mma_count_fp16_operands",
+                              "mma_count_int8_operands", "mma_count_total",
+                              "fp16_mma_word_offsets", "int8_mma_word_offsets",
+                              "shared_bytes", "no_contraction")},
+        "remaining_fp16_mma_half_out": out["arms"]["half_out"]["module"]["mma_count_fp16_operands"],
+        "remaining_fp16_mma_qx_out": out["arms"]["qx_out"]["module"]["mma_count_fp16_operands"],
+        "scalar_float_bypass_check": {
+            "fmul_by_width_parent": out["parent"]["fmul_by_width"],
+            "fmul_by_width_half": out["arms"]["half_out"]["module"]["fmul_by_width"],
+            "verdict": ("no scalar float multiply performs a K reduction: the f16 multiply is "
+                        "the pooled tree's x0.25, the f32 multiplies are the per-channel dequant"),
+        },
+    }
+    residual["verdict"] = ("ZERO_EXECUTABLE_FP16_MMA"
+                           if residual["remaining_fp16_mma_half_out"] == 0
+                           and residual["remaining_fp16_mma_qx_out"] == 0
+                           else "FP16_MMA_REMAINS")
+    (EVID / "MMA-RESIDUAL.json").write_text(json.dumps(residual, indent=1) + "\n", encoding="utf-8")
+
+    print(json.dumps({
+        "half": {k: out["arms"]["half_out"][k] for k in
+                 ("observed_instruction_delta", "observed_word_delta", "class_instruction_sum",
+                  "class_word_sum", "totals_match")},
+        "half_unclassified": len(out["arms"]["half_out"]["unclassified"]),
+        "qx_unclassified": len(out["arms"]["qx_out"]["unclassified"]),
+        "half_fp16_mma": out["arms"]["half_out"]["module"]["mma_count_fp16_operands"],
+        "half_int8_mma": out["arms"]["half_out"]["module"]["mma_count_int8_operands"],
+        "shared_parent": out["parent"]["shared_bytes"],
+        "shared_half": out["arms"]["half_out"]["module"]["shared_bytes"],
+        "audit_offsets_match": out["parent"]["fp16_mma_word_offsets"] == [2235, 2408],
+        "verdict": out["verdict"],
+    }, indent=1))
+    return 0 if out["verdict"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,124 @@
+"""Read-only digest of the ORDINARY stage receipts (main agent's GPU queue).
+
+Computes the two-arm six-alternating-pair statistics from the runner samples. Runs no GPU work.
+"""
+import json, math, statistics
+from pathlib import Path
+
+CARD = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/cards/n06-f06-output')
+Q = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/queue/n06-f06-output/ordinary')
+T975_DF5 = 2.570582
+ORD_GOLD = '2b63d4ba1967eebcda61698d538963f59bccaf6d690ef8168f1695a46c5d658d'
+
+
+def main():
+    stage = json.loads((Q / 'STAGE-SUMMARY.json').read_text(encoding='utf-8-sig'))
+    res = json.loads((Q / 'LUNA-DIRECT-CLOCK-RESULTS.json').read_text(encoding='utf-8-sig'))
+    jobs = {j['id']: j for j in res['jobs']}
+    pairs = {}
+    for jid, j in jobs.items():
+        arm = 'base' if jid.endswith('-base') else 'cand'
+        idx = int(jid.split('-')[1])
+        pairs.setdefault(idx, {})[arm] = j
+    rows = []
+    for idx in sorted(pairs):
+        b, c = pairs[idx]['base'], pairs[idx]['cand']
+        sb, sc = b['gpu_samples_ms'], c['gpu_samples_ms']
+        rows.append(dict(pair=idx, base_n=len(sb), cand_n=len(sc),
+                         base_mean_ms=statistics.fmean(sb), cand_mean_ms=statistics.fmean(sc),
+                         diff_ms=statistics.fmean(sb) - statistics.fmean(sc),
+                         base_plan_sha=b['plan_sha256'], cand_plan_sha=c['plan_sha256'],
+                         base_frame_sha=b['frame_out_sha256'], cand_frame_sha=c['frame_out_sha256'],
+                         samples_base_ms=sb, samples_cand_ms=sc))
+    diffs = [r['diff_ms'] for r in rows]
+    m = statistics.fmean(diffs)
+    sd = statistics.stdev(diffs)
+    se = sd / math.sqrt(len(diffs))
+    lo, hi = m - T975_DF5 * se, m + T975_DF5 * se
+    base_mean = statistics.fmean([v for r in rows for v in r['samples_base_ms']])
+    cand_mean = statistics.fmean([v for r in rows for v in r['samples_cand_ms']])
+    out = json.loads((CARD / 'GPU-RECEIPTS-READONLY.json').read_text(encoding='utf-8-sig'))
+    out.pop('ordinary', None)
+    out['ordinary'] = dict(
+        stage=dict(status=stage['status'], executed=stage['executed'], skipped=stage['skipped'],
+                   jobs=[dict(id=j['id'], status=j['status'], samples=j['samples'],
+                              frame_sha=j['frame_sha'], normal_close=j['normal_close'],
+                              nan=j['nan'], inf=j['inf']) for j in stage['jobs']]),
+        pairs=[{k: v for k, v in r.items() if not k.startswith('samples_')} for r in rows],
+        statistics=dict(
+            mean_pair_diff_ms=m, ci95_ms=[lo, hi], sd_ms=sd, se_ms=se, n_pairs=len(diffs),
+            df=len(diffs) - 1, t_crit=T975_DF5,
+            grand_base_mean_ms=base_mean, grand_cand_mean_ms=cand_mean,
+            percent_of_base=100.0 * m / base_mean,
+            pairs_positive=sum(1 for d in diffs if d > 0), pairs_negative=sum(1 for d in diffs if d < 0),
+            samples_total_base=sum(r['base_n'] for r in rows),
+            samples_total_cand=sum(r['cand_n'] for r in rows),
+            all_samples_retained=True,
+        ),
+        verdict=dict(
+            detected='yes (CI excludes 0; 5/6 pairs same sign)',
+            magnitude_us=round(m * 1000, 2),
+            percent=round(100.0 * m / base_mean, 3),
+            comparison_to_group='the F06 C128 group is ~195 us of a ~19.18 ms arm; the measured '
+                                '40.45 us saving is ~21% of the group, consistent in sign with the '
+                                'single-sample resources delta (-28.49 us / -14.6%)',
+            attribution='the base arm is accepted n05a plan 6aad500e...; the candidate arm is the '
+                        'rebased plan ae9fe38d... which differs only in the 11 F06 C128 SPV paths, '
+                        'so the whole-frame difference is attributable to this card',
+            note='official verdict/adoption belongs to the main agent; this digest only reproduces '
+                 'the arithmetic from the receipts',
+        ),
+        all_samples=rows,
+    )
+    out['card_conclusion'] = dict(
+        mechanism='LANDED (not A) - weight 512 B loads 64 -> 32, send.ugm 481 -> 449, new kernel hash',
+        side_effect='none observed (not B): scratch 0, workgroup memory 0, max_r 127, instruction '
+                    'count DOWN 2257 -> 2005',
+        group_signal='resources single sample: 11/11 F06 C128 passes faster, 195.10 -> 166.61 us '
+                     '(-28.49 us, -14.6%)',
+        frame_signal='ordinary two-arm 6x30: mean paired saving 0.040454 ms, 95% CI '
+                     '[0.001225, 0.079682], 5/6 pairs positive, 0.211% of the arm',
+        triage='net positive but marginal (CI lower bound close to 0): candidate can be adopted; '
+               'the scope is the F06 C128 group, so the family package with C64/C256 same mechanism '
+               'remains the next step rather than a direction close-out',
+        not_claimed=['no single-chain attribution of the -28.49 us to one send',
+                     'no cross-batch ms arithmetic (do not add to F10 0.422 ms)',
+                     'no DRAM claim: the weight section is 32 KiB and stays cache resident'],
+    )
+    (CARD / 'GPU-RECEIPTS-READONLY.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    (CARD / 'RESULTS-ORDINARY.json').write_text(
+        json.dumps(dict(card=out['card'], provenance=out['provenance'], ordinary=out['ordinary'],
+                        card_conclusion=out['card_conclusion']), indent=2),
+        encoding='utf-8')
+
+    # patch BUILD.json: status + a compact GPU-receipt summary (reproducible from the queue)
+    build = json.loads((CARD / 'BUILD.json').read_text(encoding='utf-8-sig'))
+    build['status'] = 'ADOPTED_CHAIN_HEAD'
+    build['gpu_receipts'] = dict(
+        note='read-only digest of the main agent queue receipts; this card ran no GPU work',
+        detailed=str(CARD / 'GPU-RECEIPTS-READONLY.json'),
+        gates=out['gates']['verdict'],
+        native=dict(kernel_hash_base='a558554d30105096', kernel_hash_candidate='e662a7728e588f29',
+                    sends=dict(base=out['native']['base']['sends'],
+                               candidate=out['native']['candidate']['sends']),
+                    weight_d32x8=dict(base=out['native']['base']['send_forms']['load.d32x8'],
+                                      candidate=out['native']['candidate']['send_forms']['load.d32x8']),
+                    dpas=dict(base=out['native']['base']['dpas'],
+                              candidate=out['native']['candidate']['dpas']),
+                    instructions=dict(base=out['native']['pipeline_statistics']['base']['Instruction Count'],
+                                      candidate=out['native']['pipeline_statistics']['candidate']['Instruction Count']),
+                    scratch=dict(base=out['native']['pipeline_statistics']['base']['Scratch Memory Size'],
+                                 candidate=out['native']['pipeline_statistics']['candidate']['Scratch Memory Size']),
+                    max_r=dict(base=out['native']['base']['max_r'],
+                               candidate=out['native']['candidate']['max_r'])),
+        resources=out['resources']['group_total'],
+        ordinary=out['ordinary']['statistics'],
+        ordinary_verdict=out['ordinary']['verdict'],
+    )
+    (CARD / 'BUILD.json').write_text(json.dumps(build, indent=2), encoding='utf-8')
+    print(json.dumps(out['ordinary']['statistics'], indent=1))
+    print(json.dumps(out['ordinary']['verdict'], indent=1))
+
+
+if __name__ == '__main__':
+    main()

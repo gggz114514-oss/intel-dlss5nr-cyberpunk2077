@@ -1,0 +1,209 @@
+"""n33 task D1: SPIR-V level before/after (CPU only).
+
+Answers one question the ISA cannot: does the *source* change actually ask for a
+larger distance between an expensive op and its first consumer?  The driver is
+free to ignore it (L26), so this number is the upper bound of what a native
+capture could show.
+
+Method: inline every OpFunctionCall (unique renaming per call site, like n32's
+_b4_spv.py), then walk the flattened instruction stream:
+  * math.rsqt  = OpExtInst GLSL.std.450 InverseSqrt (32)
+  * math.inv   = OpFDiv with a constant 1.0 numerator
+  * distance   = index of the first flattened instruction that consumes the result
+Also counts the reduction shuffles before the first rsqrt (n32 used this as the
+cheap "did the reorder reach the IR" signature).
+"""
+import sys, json
+from pathlib import Path
+from collections import Counter, defaultdict
+
+HERE = Path(__file__).parent
+CAMP = HERE.parent.parent
+sys.path.insert(0, str(CAMP))
+import COMMON as K  # noqa: E402
+
+ST = K.ST
+BUILD = HERE / "build"
+PARENT_SPV = Path("@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/"
+                  "c32-rest-20261026/body-pv-den-overlap/candidate.spv")
+SKIP = {0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26,
+        27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 71, 72, 73, 74, 75, 77,
+        248, 249, 250, 251, 252, 253, 254, 255, 56, 54, 55, 331}
+EXT = 12
+INVERSE_SQRT = 32
+FMAX, FMIN, FCLAMP = 40, 37, 43
+
+
+def parse_functions(m):
+    funcs, cur, entry = {}, None, None
+    for op, ops, *_ in m.instructions:
+        if op == 54:
+            cur = dict(id=ops[1], params=[], body=[], ret=None)
+            funcs[ops[1]] = cur
+            entry = entry or ops[1]
+            continue
+        if cur is None:
+            continue
+        if op == 55:
+            cur["params"].append(ops[1])
+        elif op == 56:
+            cur = None
+        else:
+            cur["body"].append((op, ops))
+            if op == 254:
+                cur["ret"] = ops[0]
+    return funcs, entry
+
+
+def expand(funcs, fid, ns, argmap, out):
+    f = funcs[fid]
+    ren = dict(argmap)
+    ret = None
+    for op, ops in f["body"]:
+        if op in (253, 254):
+            ret = ren.get(ops[0], ("c", ns, ops[0])) if op == 254 else None
+            break
+        if op == 57:
+            callee, args = ops[2], [ren.get(x, ("c", ns, x)) for x in ops[3:]]
+            cns = (ns, len(out))
+            expand(funcs, callee, cns, dict(zip(funcs[callee]["params"], args)), out)
+            ren[ops[1]] = ("c", cns, funcs[callee]["ret"])
+            continue
+        if op in SKIP:
+            continue
+        ops2 = []
+        for k, x in enumerate(ops):
+            if k == 0:
+                ops2.append(("type", x))
+                continue
+            if op == EXT and k <= 3:
+                ops2.append(("lit", x))
+                continue
+            ops2.append(ren.get(x, ("c", ns, x)))
+        out.append(dict(op=op, ops=ops2, idx=len(out), res=("c", ns, ops[1]) if len(ops) > 1 else None))
+    return ret
+
+
+def flat(path):
+    m = ST.Module(path)
+    funcs, entry = parse_functions(m)
+    out = []
+    expand(funcs, entry, ("root",), dict(zip(funcs[entry]["params"],
+                                             [("arg", k) for k in range(len(funcs[entry]["params"]))])), out)
+    return m, out
+
+
+def analyse(path):
+    m, fl = flat(path)
+    users = defaultdict(list)
+    for n in fl:
+        for k, x in enumerate(n["ops"]):
+            if k == 0:
+                continue
+            users[x].append(n["idx"])
+    rsqt, inv = [], []
+    for n in fl:
+        if n["op"] == EXT and n["ops"][3] == ("lit", INVERSE_SQRT):
+            rsqt.append(n)
+        if n["op"] == 136:  # OpFDiv = the eight 1/max(d,eps) reciprocals
+            inv.append(n)
+    def dist(n):
+        u = sorted(x for x in users.get(n["res"], []) if x > n["idx"])
+        return (u[0] - n["idx"]) if u else None
+    # first consumer that does arithmetic (skips the f32->f16 rounding conversion,
+    # composite extracts/builds and moves): this is the number a source reorder can
+    # actually change, see _a2_arith.py for the ISA counterpart.
+    PASSTHRU = {115, 111, 110, 109, 112, 113, 114, 124, 79, 80, 81, 82, 83,
+                1, 2, 3, 61, 62, 245, 169}   # converts/composites/load-store/phi/select
+    def dist_arith(n):
+        seen, frontier = {n["idx"]}, [n["idx"]]
+        for _ in range(8):
+            nxt = []
+            for c in frontier:
+                for u in sorted(users.get(fl[c]["res"], [])):
+                    if u <= n["idx"] or u in seen:
+                        continue
+                    seen.add(u)
+                    if fl[u]["op"] not in PASSTHRU:
+                        return u - n["idx"]
+                    nxt.append(u)
+            frontier = nxt
+            if not frontier:
+                break
+        return None
+    r_d = [dist(n) for n in rsqt]
+    i_d = [dist(n) for n in inv]
+    r_a = [dist_arith(n) for n in rsqt]
+    i_a = [dist_arith(n) for n in inv]
+    # reduction shuffles before the first rsqrt
+    first = min((n["idx"] for n in rsqt), default=None)
+    shuf_ops = (435, 436)     # OpGroupNonUniformShuffle, ...ShuffleXor
+    n_shuf = sum(1 for n in fl[:first] if n["op"] in shuf_ops) if first is not None else 0
+    span = (max(n["idx"] for n in rsqt) - first) if rsqt else None
+    return dict(spv=str(path), sha256=K.sha(path), bytes=Path(path).stat().st_size,
+                instructions=len(m.instructions), expanded=len(fl),
+                rsqt=len(rsqt), inv=len(inv), float_NC=len(ST.no_contraction_ids(m)),
+                rsqt_distance=r_d, inv_distance=i_d,
+                rsqt_arith=r_a, inv_arith=i_a,
+                rsqt_distance_hist=dict(Counter("<=2" if d is None or d <= 2 else
+                                                ("3-10" if d <= 10 else ">10") for d in r_d)),
+                inv_distance_hist=dict(Counter("<=2" if d is None or d <= 2 else
+                                               ("3-10" if d <= 10 else ">10") for d in i_d)),
+                rsqt_arith_hist=dict(Counter("<=2" if d is None or d <= 2 else
+                                             ("3-10" if d <= 10 else ">10") for d in r_a)),
+                inv_arith_hist=dict(Counter("<=2" if d is None or d <= 2 else
+                                            ("3-10" if d <= 10 else ">10") for d in i_a)),
+                first_rsqt=first, shuffles_before_first_rsqt=n_shuf, rsqt_span=span,
+                op_hist=dict(Counter(n["op"] for n in fl).most_common(10)))
+
+
+# opcode -> name for the shuffle test
+_NAMES = {}
+
+
+def op_name(op):
+    return _NAMES.get(op, str(op))
+
+
+def main():
+    # map opcode -> name from the module's own instruction dump is not available;
+    # use the SPIR-V operand names the tool keeps (falls back to the number).
+    global _NAMES
+    for n in ("OpGroupNonUniformShuffleXor", "OpGroupNonUniformShuffle"):
+        _NAMES[{"OpGroupNonUniformShuffleXor": 436, "OpGroupNonUniformShuffle": 435}[n]] = n
+    a = analyse(PARENT_SPV)
+    b = analyse(HERE / "candidate.spv")
+    # patch the name lookup: analyse() used op_name() before _NAMES was populated
+    def fix(rec):
+        return rec
+    print("%-28s %12s %12s" % ("", "parent", "candidate"))
+    for k in ("instructions", "expanded", "rsqt", "inv", "float_NC", "first_rsqt",
+              "shuffles_before_first_rsqt", "rsqt_span"):
+        print("%-28s %12s %12s" % (k, a[k], b[k]))
+    print("\nrsqt -> first consumer distance")
+    print("   parent   ", a["rsqt_distance"])
+    print("   candidate", b["rsqt_distance"])
+    print("   parent hist   ", a["rsqt_distance_hist"])
+    print("   candidate hist", b["rsqt_distance_hist"])
+    print("\nrsqt -> first consumer past the rounding conversion: %s"
+          % ("not resolvable in SPIR-V (the narrowed value is re-packed through\n"
+             "OpCompositeConstruct/OpStore/OpLoad before the multiply; the ISA-side number\n"
+             "is in A-ARITH.json: 3..187)"))
+
+    print("\ninv  -> first consumer distance")
+    print("   parent   ", a["inv_distance"])
+    print("   candidate", b["inv_distance"])
+    print("   parent hist   ", a["inv_distance_hist"])
+    print("   candidate hist", b["inv_distance_hist"])
+    print("\ninv  -> first ARITHMETIC consumer distance")
+    print("   parent   ", a["inv_arith"], a["inv_arith_hist"])
+    print("   candidate", b["inv_arith"], b["inv_arith_hist"])
+    out = dict(parent=a, candidate=b,
+               d_expanded=b["expanded"] - a["expanded"],
+               d_instructions=b["instructions"] - a["instructions"])
+    (BUILD / "spv.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
+    print("\nwrote", BUILD / "spv.json")
+
+
+if __name__ == "__main__":
+    main()

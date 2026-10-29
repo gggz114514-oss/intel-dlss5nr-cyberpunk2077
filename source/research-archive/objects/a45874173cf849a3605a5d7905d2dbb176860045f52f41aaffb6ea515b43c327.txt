@@ -1,0 +1,338 @@
+ZCODE 长任务：FP16全网生产消费、寄存器与生命周期优化（第二主线）
+日期：2026-10-24。用户明确：DSH继续全网INT8第一主线；zcode负责FP16全网第二主线。主审计者给出本研究指导并复核结果。无需新开子代理。持续完成下列全网队列，不在计划、CPU准备或单卡结果后停止；遇外部GPU排程等待继续独立CPU工作。
+
+一、目标、基线与隔离
+目标：保持当前FP16操作数/FP32累加及现有数值合同，减少XMX之外的全局中间写读、重复加载、片段重排、同步和长寿命活值；产出完整可复核的全网候选。借鉴AMD FP8的生产消费组织，不引入FP8/INT8量化，不改变残差、激活、归一化或历史反馈语义。
+业务根@NR_WORKSPACE@，业务命令显式workdir。先读根AGENTS.md、SOURCE_BINDING.md及适用目录规则。
+固定主父 candidates/dsh-fp16-same-family-20261023/combo-d01-d034-s32k11-v1/plan-combo-d01-d034-s32k11-v1.txt，SHA256 772e14bfb926581936dd5d6c393eed8351848a5add28fff5a673c7b4a2a332f9，232 PASS。
+不得把265父当232，也不把旧收益重新计入本轮。232已有30帧链记录但既有审计指出原fixed/fb2回执不齐；按现有NR/media规则补当前父和候选资格，不能把预期hash当实测。
+独立工作在work/zcode-fp16-fullnet-handoff-20261024；候选/build/run使用同名独立目录。主审计目录、DSH目录、旧候选与冻结输入只读；不改游戏、驱动、全局环境、共享runtime或稳定包。离线实现/编译/CPU验证可推进；GPU device/pipeline/native/dispatch严格按协调入口明确分配时段，不能因锁FINISHED自行占用，不并发GPU作业。
+读取审计 AUDIT.md、CORRECTIONS-REQUIRED.md、NEXT-STEPS.md、FULLNET-SHARED-CENSUS.json。FP16全网逐PASS绑定见FP16-ZCODE-POSITION-LEDGER.json。声明shared不是native SLM，static指令不是动态工作量，BIND容量不是DRAM流量，scratch访问才需结合native判断是否溢出。
+
+二、先固定全网生产消费合同
+每条真实连接记录：生产点/最终half舍入点、消费者全集、tensor有效域/padding、布局/stride/offset、元素owner（lane/SG/WG）、读写次数、最后读、覆盖前同步、全局缓冲寿命、history/debug/skip读者。含混合与池化内核内部阶段，不只看PASS之间。
+四种交接：同SG优先寄存器片段→必要重排→下一矩阵；同WG跨SG保留最小共享发布；跨WG/dispatch直接写消费者布局；多读者保留确有用途的共享/全局副本。外部中间存储与寄存器spill分账。
+保留原H舍入点，但H可在寄存器中形成，无需为舍入强制落显存。不能把half乘法改为float乘后窄化，不能改变K累加顺序/seed位置/exp与den树；FP16与FP32 accumulator lane映射不可未经证明互当。coopmat转换可能改变片段所有权，使用实测register_handoff helper与CPU坐标证明；不能靠类型大小推断同lane同元素。
+不要追求整网一个kernel或完全不分块。跨WG缺少普通全局barrier；扩大融合前先算输出复用、重复权重加载、工作组数下降、长活累加器和同步成本。
+
+三、AMD FP8可迁移的组织原则与B580实现约束
+依据本地src/amd-reference/windows/shaders/rdna4/include/fswin_body.glsl：在值产生点直接形成消费者片段；同一个A喂多个B；边生产边消费；共享空间按阶段重用，覆盖前有读退休屏障；选择owner让归约与后继矩阵相容。源码有量化且部分分支使用requantized残差，不能照搬该数值路径。
+B580本线采用既有SG32、M8N16K16 half矩阵组合。以实际query/ABI为准，不照搬AMD wave/MFMA/FP8操作数宽度。FP16的B片段布局与INT8 K32不同；INT8“8次shuffle”不能未经证明转为FP16成本。
+寄存器预算按每个程序点的活值计算：FP32累加器、half seed/片段、A/B加载、归约暂存、地址与mask都计入。优先缩短活跃区间，避免全阶段缓存、动态索引coopmat数组、同时保留宽窄副本与深度预取。
+实际native检查DPAS周边mov/shuffle/pack、GRF/scratch/SLM；寄存器变量更多不等于溢出，源码短不等于native更少。现有D034 C128的192B scratch涉及少量索引/prologue站点，不得写成大量矩阵溢出显存。
+
+四、全网实施卡（39模块/232 PASS逐项映射；每卡含入口、候选、约束与关闭条件）
+
+F01 F1，1 PASS，当前D01 K03，shared为K/V各4096B。
+已完成入口特征暂存优化，不再复做D01。追查lift输出到body输入、FFN到QKV、PV到output的片段生产消费。只在仍有实测搬运的边界修改。K/V跨SG被多个query消费，不能因有register helper就删共享K/V；不引入全head大工作组。入口图像有效域、边缘padding与debug完整保留。
+先交函数级寿命图与实际native热点；没有独立剩余问题就记已满足，不能制造改动。
+
+F02 C32普通body，7 PASS。
+当前u09-register路径，仅shK/shV共8192B。X/FFN/P/context已大量寄存器交接，先找宽化过早、重复片段转换与地址长活；采用half seed延后宽化须针对本FP16源码重新核对，不能套INT8 B3。
+对每次nrh_join/转换建立输入owner→输出owner与动态频次；仅当同一片段被重复构造且延长少量寿命可接受时复用。保留完整K累加次序、原residual seed及half乘法。保留K/V发布与最后读取；如调整owner，先算重复K/V加载和活跃query数。历史全heads合并负收益不原样重跑。
+
+F03 ioport_block4_0 DS，1 PASS。
+当前a_half512B。池化最终half→矩阵A；尝试用现有SG所有权直接构造A，替代512B共享往返，前提是四点half树、OOB和ds_pixel两种布局完全相同。新shuffle成本可能高于小SLM，先小卡比较；没有证明不删barrier。两个N16结果直接store已经存在，不重建输出scratch。
+
+F04 D034 FFN，33 PASS（三宽7/11/15），mLocal8192B。
+优先复用DSH A1删gM镜像，不重复实现。ordinary路径实际没有M消费者的证据与dump-intermediates例外分别保留；池内后继别名必须满足写域/清理合同。动态删写统计曾出现倍数差异，按真实grid、执行SG数和每次coopstore元素数重新核对一次，不照抄任何估算。
+mLocal承接跨阶段/可能跨SG消费，不未经owner证明全寄存器化。下一候选为按hidden片段生产消费，保持原contract K顺序；对比共享访问减少与contract累加器提前存活，只有具名收益理由才做。不要为消除8KiB把整展开结果加全部输出累加器长期持有。
+C128 native192B scratch先核具体scratch读写与跨阶段地址活区，优先缩短索引/地址寿命，不能据此重写整个矩阵计算。
+
+F05 宽attention，36 PASS（C64 8/C128 12/C256 16），各qkv12288B。
+当前u09已经消除shNorm，C256已继承register-P/相关交接，不能再拿旧G3模块的shP/norm当FP16当前缺口。
+QKV→norm：在保留原half归约树的条件下，让完整归一化向量有稳定owner，减少重复qkv读取/写回；Q/K消费方向按现有score转置布局，V按PV布局。Q/K是全窗口多query读者，V活到PV结束，三者寿命不能凭“阶段先后”一概别名。
+QK→P→PV保持寄存器路径；检查P片段是否跨多个key块长期保存，允许流式只有在den/归约顺序和PV顺序完全保持时。不能擅改成另一种online softmax。
+PV→D4：跨dispatch的T仍必要，先改生产者直接写D4高效消费格式，再联合改consumer；同一T的debug/skip读者列齐。不要为消除T盲融合所有heads与D4。
+
+F06 宽output，33 PASS（C64 7/C128 11/C256 15）。
+C64/C128当前无Workgroup数组，重点是输入布局、权重读取、seed与地址寿命，不套C256共享策略。
+C256当前shT32768B；DSH C1的16token条带候选可复用，但其父是265/u08，必须重接当前232并核输入/pack/PUSH。它将每WG barrier1→7，全球输入读不减少，不默认采用。
+额外可行路线：把F05 context生产直接改成现有B-only输出核可连续加载的消费布局，尝试直接global A加载替代整块shT；必须以每元素被多少SG重读来对比，不把global加载命令次数当DRAM。保留WO离线重排版本身份，不能反复运行时transpose。
+同族C64/C128无shared是组织线索，不证明C256照搬一定快。先独立卡，不与F05内部数值改动混臂。
+
+F07 F3融合下采样，C64/C128/C256各1 PASS。
+阶段：输出projection→half片段→2x2池化→mean→DS→输出。当前C64 pair8192/mean2048/stage2048B，C128 pair4096/mean4096/stage2048B，C256另有shT32768、pair4096、mean8192B。
+第一候选：C64/C128后段nrf_stage复用已经退休的nrf_pair前缀；先核body结束后的全WG发布屏障与stage地址范围，预计可去掉独立2048B声明，实际native可能已复用。不得将pair与mean直接重叠：mean跨j逐步累积时pair仍在复写。
+第二候选：同SG拥有两片half输出，直接按现有2x2顺序从片段提取并用必要shuffle算mean，删除pair store/load；先证明所有读者属于同SG、片段转换映射及边缘zero一致。不能把half池化改成FP32求和。
+C256 shT按F06处理；DS结果能直接coopstore则删纯重排stage，但核布局、stride、OOB和完整写域。保留仍有skip消费者的body imgout。
+
+F08 split16 l0，16 PASS。
+当前S20同A多B已存在，sr4096+sa16384B，原sx已消除。保持stage2一个A喂四累加器，不重新引入sx。
+关键禁区：FP16 sr与sa不能像INT8三阶段arena直接共址。stage2 mm=0写sa时mm=1仍需sr；跨SG也没有读退休屏障。需要先重排token处理范围并证明退休，不能直接替换数组名。
+可研究每8token的生产消费strip：stage1中间、stage2激活和stage3限定同一token片区，在原每输出K顺序下完成后释放。代价是阶段切换/屏障、权重重读和累加器活区变化，必须列账。先保留分组2、同A两B/四B复用，避免为了省SLM砍掉现有复用。
+普通路径activation在half片段内，debug走实际half共享读，两条路径分别保持，不用未经证明的MC(MH)解释debug数值。
+
+F09 split16 l1，16 PASS。
+当前S21 seed-direct，sx16384B；没有原FP32 seed scratch开销可再删。检查gx/gf输入是否能由l0最终store直接形成该核矩阵A布局，减少sx全块暂存；对比直接global A与分条共享，保留同A两个B复用。
+不把l0+l1全融合当第一步：l0分组维度和l1输出投影K域不同，跨WG数据重组会引入重复计算或协作变化。先用消费布局直写形成完整两核对照。
+seed half乘法与加入累加器的位置不能改为INT8式后置seed；缩短seed寿命不得改变FP16累加图。
+
+F10 split16 l2，16 PASS。
+当前S22 register-P，phase8192+qkv12288B；P普通路径已寄存器化，但phase仍用于QKV阶段sy输入tile，不是死数组。先证明真正使用点再删，不能看到#define sp就称8KiB可全去。
+QKV阶段每K片的输入gather→phase→多个QKV累加器是共享复用；试直接消费上游布局或更小K strip时，保持权重/输入复用次数与Q/K norm树。phase与qkv能否复用取决于所有QKV片段产出与后续kc/j读取，不能整块盲别名。
+register-P、Q/K/V物理布局、context输出顺序原样继承。最后context消费布局与F11/F12联合设计，block30单列有效域。
+
+F11 普通split16 l3，15 PASS。
+当前projection-swap无Workgroup数组。已做到直接消费的部分不再加缓存。重点核S22输出到本核的布局是否一致、同一A是否重复加载、seed/地址活区；投影输出直接满足下个l0及残差读者。按输出tile比较权重复用与并行度，禁止为合并dispatch重复完整K计算。
+
+F12 block30 l3/l4，2 PASS。
+l3 projection+pool已有seed-direct，l4 finalhead各sx16384B。先在l3产生最终投影片段时直接形成原half池化结果，按l4消费布局写pool；保留skip30_l3。l4输出保持ViT入口24×12×1024 raster。
+原写域589824B与分配786432B不同，24padding token是计算出的值，不能当作零；尾部清理/未读合同保留。尝试l3/l4融合前核pool跨WG读者与N分片重算，默认两核优化。不得因为输入有效token264就把288token几何缩小。
+
+F13 ViT FFN expand/contract，8+8 PASS。
+当前expand S32 K11、contract T01快路径；均无shared。先列E的实际消费者、写域和两核grid关系，区分必要的跨WG E与重复镜像。只能在不减少并行度且不会重复expand的owner范围内试局部融合。
+若寄存器stream展开→收缩，必须保留原half激活与contract K顺序，评估contract全部输出累加器长活代价。历史D16融合失败保留首差/原因，不能原样重试，也不把它扩展为永不可融合。
+K11已在父，不能重复认领；K10曾有大scratch、K24指令更少仍负收益，表明native资源与ordinary都要看。先做连接布局/地址活区，再考虑大融合。
+
+F14 ViT QKV，8 PASS。
+当前norm-owner-v2无Workgroup数组；不能再消除旧pairRaw/norm scratch。保持每头32维完整owner，生成Q/K/V时直接匹配F15加载方向。head=32、dim=32；norm与scale按头保持。
+尝试合并相邻输出写或减少重复输入读取时核head并行数、权重重复和寄存器峰值；不要把相邻两头拼64维。输入/输出half的必要舍入必须保持。
+
+F15 ViT attention，8 PASS。
+当前chunk-split + register P/den，sk/sv各4096B。保留完整32维context owner和原288token处理/64key chunk。Q片段跨chunk复用与K/V分块发布已经存在。
+优化对象：K/V加载格式、padding与mask开销、chunk间临时量寿命；不能删掉跨SG被读的sk/sv。可比较更小K/V驻留strip，但会增加barrier与加载，需保持原P未归一化进入PV、最终reciprocal在全部chunk后的顺序，不能改在线softmax。
+不要把全部K/V或所有P片段提前预取进寄存器；native核查context累加器与P临时值是否重叠过长。head/query粒度变更先保持算术次序再计并行度。
+
+F16 ViT projection，8 PASS。
+当前U03-F18-v2无shared。context→投影布局直接匹配，投影→下个FFN保持消费者高效连续访问，避免独立transpose。残差seed load只在必要范围内存活；如果原FP32累加从seed开始，不能简单后置加法来缩寿命。
+现有packed WO身份和NoContraction继承；不要用减少源码操作数作为性能证明。
+
+F17 block39 project+blend，1 PASS，tile_f512B。
+当前PROJECT_PAIR融合已把投影接上采样blend。tile_f是FP32值、存在half操作次序，不能先随意改为half；先核实际四个上采样读者是否同SG、同lane能复用值，若可则寄存器广播代替小共享发布。
+只在最后blend输出处改变存储布局，使split16入口直接消费；保留skip_gain/main_gain、四输出像素owner与OOB。512B共享很小，新增shuffle和长活可能更贵；有限候选，无收益就关闭。
+
+F18 UPS3 pre/body/contract，9 PASS。
+优先复用DSH A2已准备的三组body+contract融合，232→229候选；pre保持不动。整份contract PUSH作为候选，先统一plan/metadata/测试票身份（DSH CANDIDATE.json曾仍指word17-only，不能混用）。逐分量核实际读取，不用“p0..p4声明”推断所有20word都读取。
+只改word17与整份PUSH若可证明所有实际读值相同，不额外跑冗余GPU对照；确有读差才按具名差异验证。保留gM镜像，A1独立验证后再组合删除，不能把A1/A2两卡资格互相替代。
+pre阶段先投影gather、后blend、再body消费。C256/C128 nr3_gbuf8192，C64 proj2048；按实际读者复用既有空间，不让UPS融合扩大到跨全head重算。blend完成后canonical与窗口消费者布局如果不同，优先写一个被实际使用的布局，其他skip读者单独保留。
+
+F19 F2，1 PASS。
+当前FP16 nrf2_proj1024+nrf2_blend4096+K/V8192=13312B。候选将proj映射shK前512half、blend映射shV，可删独立5120B声明。
+原projection发布WG barrier、blend发布WG barrier保留；四个X片段读完后需显式SG读取退休同步再允许覆盖同SG shV。FP16没有INT8 X量化发布屏障，不能照抄DSH B2“无需新增同步”的结论。核4个SG分区，不能把128线程算8SG；K/V最终WG发布保留。
+projection输出到blend跨SG，不能用shuffle替代；保留half乘法、skip4与原边缘规则。
+
+F20 S37尾部融合，1 PASS。
+当前context-A已融合postblend/body，shXP8192、shArena16384、shY4096、shNorm512。已有X/P别名、A/QKV/Ctx别名，不再重复认领。
+寿命：shXP的X要活到FFN残差结束才可P覆盖；shY作为attention输出残差活到最终projection，不能复用于P；shArena的FFN中间与QKV分阶段，但V活到PV，Q/K读者退休前不能覆盖。
+新候选先针对shNorm owner与score/PV的P片段寄存器交接，借C32已验证helper但保留S37独立布局、norm树、256线程及debug。每项小卡，不一次重写所有阶段；已有Ctx直接A消费保留。普通/diagnostic实际barrier分别计数，不能把22个源码barrier都当普通每WG执行次数。
+尾部history/输出接口完整验收；不能因最终只写图像而删除真实反馈读者。
+
+F21 surfaces尾处理，1 PASS，无矩阵。
+属于全网第二主线，检查上游输出布局、必要格式转换、历史输出/表面写入、边界与dispatch。只删重复copy/无读者暂存，不把必须输出流量列为可消除。无需强行引入XMX；保持原RGBA/有效域与history契约。
+
+五、生命周期证明与实现格式
+每个候选交一张阶段表：资源/字节、write owner、read owner、首次写、最后读、publish barrier、retire barrier、下一覆盖者、有效域。地址枚举只覆盖实际改动，要求同一时刻不互相覆盖、跨SG有正确同步；两数组大小相同不是可alias证明。
+寄存器交接交坐标映射与必要shuffle数量，区分源级次数和native指令。FP16 accumulator→operand重排必须核dtype/use/layout，不能复用INT8 lane表。全体参与者需一致执行的barrier不能置于不一致OOB分支。
+全局缓冲删除须检查普通OUTPUT/HISTORY、skip和真实shader读取；调试dump路径另列。pool复用还需核后继写域与clear，不能仅证明被删资源“无显式读者”。
+
+六、执行、验收与协作
+第一组：继承A1/A2候选并核身份；F19 FP16专属退休同步；F07 pair/stage复用及寄存器pool证明。只做独立CPU工作即可推进，不等INT8第一组结束。
+第二组：F06消费者布局直写/直接加载与C1条带对照；F08–F12 split16连接与寿命；F20 norm/P交接。
+第三组：F01/F02/F05/F13–F17/F21按已测热点做必要剩余候选；清楚标已满足的路径，避免重复优化。上述顺序是成本排序，不是遗漏卡的理由。
+DSH旧A1/A2/C1是支撑候选，zcode只读复用到自己的目录，不改其文件，不重复CPU证明，确有新父/新行为才补必要检查。INT8第一主线与本线不合并plan；只交换已验证owner/ABI/寿命经验。GPU由协调统一串行排程，第一主线优先级不被本线覆盖。
+每卡检查：必要CPU地址/类型/生命周期→离线compile/validate→同身份native→既有非零数值/fixed/fb2与受影响反馈门→同批ordinary。数值不等先定位首差，不调阈值掩盖；未分配时段只写具名作业并推进其它CPU项。
+ordinary沿既有3进程对×每进程30样本规则，以进程对为统计单位；同runner/输入/参数/分配方式，保留坏样本。少shared/指令不能代替净收益。新卡组合重新验收，历史单卡收益不能相加；GPU通过不自动授予游戏换装。
+既有负结果E05全head合并、D06/D09、S64K09、K24、K10和D16记录按具体身份保留；无新机制/新证据不换标签重跑，也不泛化为所有融合不可行。
+
+七、交付与关闭
+STATUS：每张F卡/每个PASS的已继承、准备、可提交、数值过、收益/无差异/失败、具名阻碍；避免把已启动算完成。
+CONNECTION-LEDGER：232个PASS的生产消费和必要half/共享/全局驻留理由，所有未优化连接有原因。
+LIFETIME-LEDGER：改动资源的phase/owner/publish/retire与峰值活跃数据。
+RESULTS + MANIFEST：源/SPV/pack/plan/runner/实际执行身份、native数据、数值和ordinary原始样本。写明声明与实际分配差异。
+最终交一份完整可运行候选及相对232的可复核结果；如果等待GPU则交全部完成CPU项和精确待执行队列，不说优化已完成。主审计复核后再决定接纳与关闭；不得自行安装稳定包。
+追加 F07-D：F3 C64/C128 输出片段直接scatter，删除nrf_stage
+证据 DIRECT-FRAGMENT-EDGES-PROOF.json / prove-direct-fragment-edges.py。原nrf_write_group的标量e=lane+32*ci，与实测MH分量坐标row=2*ci+(lane>>4)、col=lane&15完全相同。不存在跨lane数据搬运需要。
+实现：每个DS累加器按原顺序形成MH h；在当前lane对ci0..3计算px=px0+(row&3)、py=py0+(row>>2)，保留原OOB条件与nrf_ds_at，直接写h[ci]。删除该片段的nrf_stage coopstore、publish SG barrier、标量stage read及retire SG barrier；原nr_body_stage→DS的WG barrier保留。
+C64枚举2150400个尝试写，2064384个有效唯一地址；C128枚举1171456个尝试写，1032192个有效唯一地址；零差异，完整覆盖当前232父grid/OW/OH/N。
+各去掉2048B stage声明；C64每WG源级去4096B共享写及同量读、32次SG barrier执行；C128去8192B写及同量读、64次SG barrier执行。global写不减少，地址计算与旧标量scatter同类；不需要shuffle、不改变DS累加器寿命。
+这比F07的stage别名复用更完整，二者作为替代实现，不重复计2048B。CPU证明依赖现有实测MH映射，新compiler/SPV仍需本臂数值门与native确认。
+
+追加 F07-P：F3 C128 projection片段直接池化，删除nrf_pair
+证据 F3-POOL-REGISTER-PROOF.json / prove-f3-pool-register.py。仅先实施C128，C64四片段owner另外证明，不强行推广。
+保留每个j两片MH h0/h1、原imgout/debug store。旧池化每lane选择side=lane>>4、channel=lane&15；dx0需要row0,1,4,5，dx1需要row2,3,6,7。
+对h0与h1各自pack(ci0,ci1)与pack(ci2,ci3)，总4个uint分别subgroupShuffleXor(16)。必须先对两片各自shuffle，再按lane>>4选择side：如果先选h0/h1再shuffle，partner lane选的是另一片，会串通道。
+按lane parity把even/odd顺序恢复，严格执行原half top=a+b、bottom=c+d、sum=top+bottom、v=sum*half(0.25)，保留所有tile_ok/有效域判断；写原nrf_mean下标。shuffle需统一参与，不能放入非一致OOB分支。删除pair两个coopstore与前后两次SG barrier；保留全WG mean发布。
+CPU验证每WG2048池化结果、8192个来源元素、零位差（有界有限half测试，且逐元素来源相同）；不是新shader编译或GPU验收。
+去掉4096B pair声明；每WG源级pair写16384B、读16384B和64次SG barrier执行消失，增加每lane每j4次packed shuffle。两片half+shuffle临时值需要native峰值检查，不能只算SLM。
+F07-D与F07-P同时通过后，C128只需nrf_mean4096B，声明10240→4096B；它们是两个独立数值改动，先单卡再组合。global imgout仍保留真实读者；不要顺带删，避免扩大证明范围。
+第二轮FP16连接深挖：F07-P64与F07-P的短寿命实现；证据REMAINING-EDGE-LIFETIME-PROOF.json
+F07-P64：C64四片段逐片直接池化，删除nrf_pair[4096] half=8192B。
+当前f3-c64-fused-half-patch-v1/source/fused_c64_body_ds.comp在四个MAT_H narrowed后写pair，之后只按2×2树读。采用每次一个片段：sy1=0/1、side=0/1分别对应accA0/A1/B0/B1。在现有imgout/debug store之后，pack(h[0],h[1])与pack(h[2],h[3])，所有32lane各执行两次uint subgroupShuffleXor(16)。只由lane<16写pool，每lane输出dx=0/1；当前lane给偶数行，partner给奇数行。dx0取0,1,4,5，dx1取2,3,6,7，严格half top/bottom/sum/*0.25。
+原pool的lane>=16负责side1，改成该片段的lane<16负责side1；这是写者迁移，不能按原lane>>4选side再shuffle。kk=(sg&1)*32+side*16+(lane&15)，ly=2*sy1+((sg>>1)&1)，lx=2*(sg>>2)+dx，写nrf_mean[(4*ly+lx)*64+kk]。保留原tx/ty、tile_ok、px/py有效域，越界时显式写half0，不能跳写让旧值残留。shuffle在非一致边界判断之外。
+CPU每WG1024个mean地址唯一全覆盖、逐来源与有限half树零位差。每片段2次packed shuffle、每SG4片段=8次；删pair 8192B、每WG8192B共享写及同量读、2次SG同步/每SG（共16执行），nr_body_stage后的全WG mean发布保留。与F07-D结合，声明12288→2048B，只剩mean。
+寄存器安排：沿用原单个narrowed的词法区间，在该区间立即pool，不额外保存四个MH。其它原FP32累加器仍待消费，shuffle临时值可能提高epilogue峰值，需要native确认；不要声称删除pair必然无spill。四个累加器不能为了提前pool而改变seed或K累加顺序。
+
+F07-P短寿命替代实现（C128）：同样每片段单独两次packed XOR16，只由lane<16写两项pool，side作为编译期常量。两个side合计仍4次shuffle/每j，与原F07-P数量相同；避免同时持有两片MH并在每lane按side选择。保留原nrf_mean channel/j/pixel索引。此为F07-P的替代实现，不新增共享节省，也不把两种方案收益叠加。优先编译单片段版本核native；若native已同等生命周期则不额外排无区别计时臂。
+
+已满足与不可照搬：当前FP16普通split16 l3直接以K16从gt tiled读取B，无sx8/qtail；I-PC5的qtail优化不适用于当前FP16 15位置。KIND4 half_tail只存在源码分支，当前实际模块没有Workgroup数组，不认领未执行路径节省。FP16 l3四个MC由half seed初始化后累加，不能用INT8 I-PC8的post-K seed移位，数值图不同。
+F12-A：block30 l3/l4用标准K16矩阵load直接消费前驱tiled布局，独立对照候选
+证据FP16-B30-DIRECT-A-PROOF.json、prove-fp16-b30-direct-a.py。l3当前seed-direct common的spatial_token(tile,slot)=tile*16+slot；l4 token_at亦线性。m0=0/8，K按16步进，8×16 A片段始终位于一个16×16 tiled块内。因此把coopMatLoad(a,sx,m0*512+k,512,ROW)换为coopMatLoad(a,gt或gp,tiled(token_at(m0),k,512),16,ROW)，可直接删除sx[8192] half及初始化WG barrier。标准矩阵load，无新的A寄存器ABI猜测。
+l3 540672、l4 147456来源坐标全枚举一致。两核各16384→0B共享；MC seed的K前位置、K循环、权重、pool/gh输出全保持，不改padding tokens或buffer尾部合同。
+代价必须正面计入：每个M8 tile被4个N子组复用，源级全局A读从每WG16384B变为65536B（4倍），同时删除16384B SLM写与65536B SLM读。不能把它写成减少所有访存；是否靠cache、取消barrier/SLM配额获得收益由native与同批ordinary决定。现有普通FP16 l3已直接读gt，是机制参考，不是本两核获益证据。
+先保持相同SG/两累加器，不顺带增大输出tile来“摊薄读取”；增大tile会提高累加器峰值。若native/ordinary表明重复读取更贵，保留原sx版本并登记此具体父失败，而非扩大融合。
+此K16直读不能原样复制INT8 K32：32通道跨两个16列块，单个stride16/512都不能同时满足两半；INT8需独立消费者K32布局或已有实测B/A重组证明，不以FP16地址证明替代。
+第二轮跨卡生命周期裁定（同时适用于两条主线，数值合同分别保持）
+1. ViT expand→contract不是单消费者边：完整contract N=1024。若每个M8 token片段由单SG保有全部输出，FP32/INT32累加器净payload为8*1024*4/32=1024B/lane，尚未计expand累加器、输入、half激活、地址和量化临时量。若独立N32融合核各自重算expand，则同token片段完整expand会重算32次。两种数字是该owner模型的代价，不是硬件寄存器上限，也不是所有融合的下界。
+可行的下一步必须明确改变owner：多个N子组在同WG共享小块已激活E/qE，保持contract完整K顺序，并在覆盖E前等所有消费者退休。为减少重算而覆盖全部N会保有更多contract累加器；只覆盖部分N则其它WG重复expand。先交N覆盖范围、每SG累加器数、token并行数、重复expand倍数、共享E块大小与每K块屏障次数，再决定是否值得新候选。不能把历史D16失败改名重跑，也不能用“矩阵直接消费矩阵”掩盖这些成本。
+2. block30 l3→l4：l3每WG只生产128通道，l4的K512需要同token全部通道。当前4个生产WG之间没有核内全局barrier；保留dispatch边界是正确的直接消费者格式方案。要融合必须重划生产owner并承担四倍投影输出驻留/共享与l4多N读者，禁止用subgroup或workgroup barrier代替跨WG发布。
+3. QKV→QK/PV：本SG Q可以短活直接消费，K/V通常有跨query子组读者，不能因为本SG最后用完就复用。R12/R15 INT8动态scale若覆盖全行/全chunk，必须登记归约完成点与首个消费者；不能先消费、后得到scale再声称同一量化合同。允许制定本臂分块scale合同，但不得隐式改变P/den、累加或归一化时机；保留原注意力数值路径作定位依据。
+4. 删除half transport不等于删除half rounding或残差。I-PC6保留half输出且qX仅新增短活量化值；F12-A保留全局half前驱、只删除重复共享拷贝。这些外部张量存储是显式读者边，不是compiler spill。spill只以native scratch/实际读写为证据。
+5. 新卡native账必须给峰值发生阶段，而非只给总GRF：K内、K结束后第一片epilogue、第二group未消费时、pool/norm shuffle期分别列宽累加器、half片段、量化暂存、地址与scale；标编译器已sink/DCE者，避免把源码删除重复算收益。无需为未受影响模块扩测试；只做新行为必要门及既有NR/反馈/质量验收。
+第三轮FP16 attention链：F10-N / F10-P / F15-L（ATTENTION-CHAIN-CPU-PROOF.json）
+F10-N：split QKV完整norm owner，M16×N48→M8×N96
+当前S22六个FP32累加器/SG，但QKV输出分割让每行K的32维跨SG。改为每SG8token全部96列，六累加器数不变（96B/lane逻辑payload），A每K2load→1，B3load→6，逐输出K16顺序不变。完整Q/K32 norm在原half窄化之后直接在两片段上完成，原norm32 half树与owner广播；Q=H(H(Q*nq)*scale)、K=H(K*nk)，V不norm。CPU逐行树一致但仍待新shader gate。
+删raw Q/K的共享往返（写/读各8192B/WG），只写最终normalized Q/K及half V，最终发布保留。不能删除qkv容量：后继仍跨SG读取。诊断raw QKV直接从片段写同坐标，原raw读取退休barrier只有在诊断桥也移除后才可取消。phase仍供前端sy，不能删除。
+六half48B与逐对narrow后保留宽值的两种epilogue安排先看native峰值，不自动多排计时臂；增加B读取代价明确计入。新M8 producer与当前M16-query score owner仍不一致，所以本卡消除norm桥，不宣称Q→QK全寄存器直连。四SG M16N96需要十二累加器192B/lane且半数SG闲置，不默认采用。
+
+F10-P：split register-P按消费块归一化，缩短normalized P与PV重叠
+当前S22已无P共享桥，不重复认领。64key的8个half P必须先保留以完成原den树，不能改成ViT式未归一化PV。den/inv完成后，不先归一化全部8片再生成ctx；按(p00,p01)、(p10,p11)、(p20,p21)、(p30,p31)依次原half multiply→当前片段debug→Bjoin→四ctx K16 MMA。每组原P消费后立即退休，inverse标量广播保持，不增加归约或重复score。
+源码峰值需要辨别：8片P逻辑64B/lane，四ctx又64B/lane，Q片段在score结束后应死亡。调序并不自动降低所有P的物理驻留（未处理P仍须保留），目标是避免normalized副本与debug widen同时拉长活区。若native已相同则封存无变化，不能把作用域调整算性能提升。原half归约树、K16顺序、debug最终内容全部保留。
+
+F15-L：ViT PV operand、context epilogue和末chunk退休
+当前chunk-split full/tail两个宏均先load四个vf再消费。改为一个具名MA逐一load→对应ctx MMA；四个A同时活逻辑32B/lane→8B/lane，仍保留pf及四ctx、Q与den，实际GRF看编译器是否已调度。full和tail必须都改，不只改一个宏。
+最终num0..3、out0..3改成逐个ctx→half num→原debug→half乘inverse→coopstore；绝不把ctx*inverse搬到FP32窄化前。保留必要half点，避免为所有输出保留两套half片段。未消费ctx的宽活区仍存在，native报告峰值阶段。
+两个chunk宏末尾WAR改成统一条件j0+64<pc.p0.y才执行，或在下一轮fill前做等价退休；条件对WG所有SG一致。5次发布+4次跨chunk退休=9，父为10。最后iteration之后无sk/sv读者或写者，epilogue只有寄存器/全局输出，故末次不保护后继。不能把中间4次也删，fill helper SG可能先覆盖下一chunk而score SG仍在读上一chunk。8个位置共1280 WG源级barrier执行减少，native/收益未知。
+保持S32=288token、padded320、每head32dim、5个64keychunk与原pad-exp0/den顺序。half输入路径不能顺便改INT8接口。
+attention链跨子组/跨dispatch裁定与寄存器账
+A. split：QKV原M16N48把K分成跨SG两半；完整norm新M8N96可去raw norm桥，但M8 producer仍对不上M16 score owner。K/V被四个query-owner SG反复读，final QKV发布不可删；不能在第一个SG完成后复用K/V。
+B. ViT QKV→attention：当前QKV按128token×32channel输出，attention按64query×单head读取全288key，5个query-WG重复消费同head K/V。把QKV融合进每个query-WG会重复生产K/V；只有Q是本query局部，但QKV融合已有B重用，拆Q可能增加权重/输入开销。本轮默认生产者直接输出Q8/K8/V8消费布局，并保留跨dispatch边界，不把融合当覆盖前提。
+C. split PV→投影：每个attention工作组只算1个head32维，投影K512需要16个head；ViT为32个head×32维，投影K1024。当前head由不同WG生产，不能用SG shuffle或WG barrier把所有head连起来。直接生成投影所需tiled/canonical qT已经是合法生产消费；它有显式外部张量边，不是寄存器spill。
+D. 真正融合attention→projection必须重划head owner：同WG生产足够head并共享小块context，或按head串流同时保持projection输出累加器，且不改变FP16投影原K顺序及context half舍入。单SG M8完整N1024 projection累加器净payload1024B/lane；若N32独立输出组各自重算全部attention，重复32次。M16 owner完整N1024则2048B/lane。多SG共享可改变该模型，但必须列共享量、输出N覆盖、head重算与同步数，不能直接上“全融合”。当前FP16已有直接context布局，不应再添加中间transpose。
+E. 原ViT register-P已把score和完整32维PV交同SG，伙伴SG仅协助填sk/sv；不能因为它“只填缓存”就删伙伴或改local_size而不重做qg/填充覆盖/工作组资源与时序。新INT8路径沿同owner让P留寄存器，K32量化/adapter是新成本，不能从已有FP16 helper推断零成本。
+F. 源级payload盘点，不作为native GRF峰值或spill结论：split QKV六宽acc=96B/lane；八half P=64B/lane；四宽ctx=64B/lane；ViT两FP16 Q-B=32B/lane；四FP16 V-A=32B/lane（顺序单个=8）；一个P-B=16B/lane。这些阶段并非全同时活，必须以最后使用和编译器实际寄存器分配判定。split完整den前不能释放未归一化P；ViT可每K32量化并消费P，但Q与ctx跨全部chunk存活。
+G. arena禁配：I-PC11若把sy8与QKV8共址，最后kc的输入读取退休barrier是覆盖前必需，不能沿“最后iteration没有下一轮”理由删除。F15-L删末chunk退休仅因为该kernel之后没有共享覆盖/读者，不能泛化到其它循环。
+H. 直接生产Q/K/V codes与保存half debug是不同读者合同。每条新scale按head/vector/chunk范围记录生产点、最终使用点与是否全K共同；无资格的scale不能借用QKV权重alpha。新INT8数值合同与原FP16诊断对齐但不要求逐字节相同；正常/反馈/质量门仍按既有要求执行。
+
+Z-PC13 / F16-WOOWNER：attention→WO 同 WG 重划 head owner（FP16 版，与 I-PC13 同构）
+
+同一结构事实：Swin 三族 body_3（attention，local=32、grid.z=head 数）与 body_4（WO，grid.z=1）之间走一份全局 context。
+窗口数 = grid.x × grid.y：C64 42×24 = 1008 窗、每窗 context 64×64×2 B = 8 KB ⇒ 往返 **16.5 MB/块/帧**；
+C128 21×12 = 252 窗、16 KB/窗 ⇒ **8.26 MB**；C256 11×6 = 66 窗、32 KB/窗 ⇒ **4.33 MB**。
+把同一窗口全部 head 收进一个 WG 后 context 留在 shared，**FP16 侧删的就是这三笔往返**；
+FP16 WO 累加器与 INT8 同形（M8×N64/128/256 = 64/128/256 B/lane），WO 权重读不变。
+
+与 INT8 版的差别（必须分别记）：
+1. FP16 attention 已 register-P、P 不进 shared；本卡只动 context，不动 P。
+2. FP16 WO 的 K 顺序（k0 升序、16 一步）与 context half 舍入点必须原样保留；INT8 的 dequant/epilogue 合同不适用。
+3. C256 的 local 32→256 与 32-token 分块在 FP16 侧同样需要；ViT 在 FP16 侧同样被否决
+   （全 N 累加器 1024 B/lane 超预算；N 分片则 36 WG × 2 MB 权重 = 72 MB 换 1.18 MB，净亏约 61×）。
+4. FP16 侧不得因"INT8 版已论证"直接采用；两边数值身份不同，各自过门。
+
+落地顺序：C64 → C128（同构、+1 WG barrier、WG 数 3024→1008 / 1260→252），C256 先做 local/分块设计，
+ViT 记"权重复用是前置，暂不列候选"。禁配与前置同 I-PC13：context 寿命缩短后重算池别名；debug 坐标不动；
+诊断配置另出 plan；无 GPU 时段只到"可提交"。
+
+并行文档变更协调：HOWN-V16 / HOWN-V32独立编号（本节补充现有I-PC13/R22、Z-PC13，不覆盖原记录）
+保存时发现任务尾部存在另一份Swin/ViT owner裁定，本轮已写入的H16/H32正文不在当前任务版本中。保留现有内容，重新以HOWN-V16（两主线）与HOWN-V32（仅INT8）追加以下完整方案，避免I-PC13/I-PC14编号冲突。
+既有“ViT否决”不适用于此候选：本方案每WG16query，两M8同时复用B，18WG而非36；projection分N sweep并在attention结束后创建acc，每lane四宽acc64B，不是一次全N1024累加器。当前FP16父N16按输出块重复读context64次，不能只计整张context一次读。权重也必须比较父的实际读量，不能把候选全部权重读当成净新增。
+未提供同身份native依据的“128×4B预算、必spill”不作为验收事实；设备寄存器分配粒度、模式与编译实际活区待查。8个CH half片段在本审计采用的4half/lane映射下为64B/lane，不是16B；其它shape需独立计。
+Swin C64/C128/C256卡来自当前文件另一裁定，本轮未逐源码验证其权重复用/往返统计，不冒称已复核。其32KB“超出现有声明”不等于超过设备上限，应以设备能力和native SLM为准。本节只为已完成CPU证明的ViT HOWN-V16/V32授权候选路径解除错误概括性否决；性能结论仍未获得。
+第四轮跨head owner实施卡：完整context驻留与分阶段投影
+证据CROSS-HEAD-OWNER-PROOF.json、prove-cross-head-owner.py、prove-cross-head-q32.py。只有CPU owner、地址、K次序与源级成本模型通过；没有实现/编译/native/GPU结果。下列方案具体推进独立候选，不以“有融合阻碍”关闭，也不未经性能验证替换生产父。
+
+方案H16：一WG负责16query×全部32head，先完成attention，再执行projection
+local_size=256，8SG。WG.x=qTile，qBase=16*qTile；grid=(18,1,1)，每块288token。attention四轮wave=0..3，每SG的head=8*wave+sg，独占这16query的完整32维context。每个有效query/head仅计算一次；保留原QK转置、half exp/den树、5个64key chunk、padding exp(0)与最终inverse时机。QKV仍由独立前驱生产，不在本融合核重复QKV投影。
+attention阶段不设跨head sk/sv缓存；各SG直接从前驱QKV加载自己head的K/V片段。Q按16query保留；K/V只保当前操作数。FP16 K8×16 ROW stride3072，V^T8×16 COL stride3072；无效padding key片段必须完整置零，不能越界load后再mask。288对8/16均对齐，尾部可按完整片段判断。INT8按R15已验证Q8/K8/V8物理布局使用K32，不能把half元素偏移照抄到byte view。分chunk den处理及P→PV与各自主线父一致。
+最终context必须经过原half numerator/half inverse边界；FP16写shared T[16][1024] half，INT8在同一最终half点按本块ws[10]量化写shared qT[16][1024] int8。写者head唯一、各轮目标区域不重叠；四轮之间无需WG barrier。该阶段不得预建projection累加器。
+所有head完成后一次WG barrier发布T。结束Q/den/P/attention ctx的词法作用域，进入projection：sweep=0..3，每SG n0=sweep*256+sg*32；同时算M8 row0与row8、N16 side0与16，共四宽acc=64B/lane。按父K递增完成整个K1024，两块B分别复用给两个M8，维持原weight pack。每轮处理完原残差FMA/half输出再销毁acc，进入下一sweep。T只读无需轮间WG同步；最后无需退休barrier，因为没有覆盖。
+CPU完整16384个T元素、16384个输出元素均唯一覆盖；FP16 K16和INT8 K32各16384个A来源地址无差异。输出scatter/矩阵store用原canonical raster布局，原half残差Y一直保留。本融合核不删除下一层所需half输出。
+
+成本账（每ViT块、源级逻辑字节，非DRAM计数）：
+FP16：shared T=32768B；K/V读取5898240→21233664（3.6倍）；删除context全局写589824及当前N16 projection全局读37748736；新N32 projection改为SLM读18874368。这一子集全局字节净少23003136，未计Q/权重/残差/debug/事务放大。N16→N32本身改变A复用，需明确归因；如native显示N32压力过高，可用N16八sweep对照（两个acc=32B/lane，SLM读恢复37748736），不同时扩大其它tile。
+INT8（假设R15已完整INT8、父K/V缓存也是byte）：shared qT=16384B；K/V读取2949120→10616832；删除qT写294912及projection读9437184，新SLM读9437184；该子集净少2064384B。当前G3混合attention不是这个成本父，必须先满足全INT8覆盖。
+两者attention四ctx净64B/lane、projection四acc净64B/lane，分阶段不相加；attention期间另有Q、score、P/den与地址，64B不是总GRF峰值。禁止编译器因大函数/动态coopmat索引将两阶段活区意外重叠：用明确独立scope/静态变量，检查native live range与scratch。源模型不保证没有spill。
+每块融合WG仅18个，原attention有160个WG，projection另有192(FP16)/96(INT8)个WG；减少dispatch/共享边不等于保持并行度。SG在四head轮期间全部工作，仍须验证18WG是否足以覆盖设备，不能通过增加N输出WG无声重复attention。
+plan接线：当前8对attention/projection的binding完全相同，PUSH仅word2由3变4；这是兼容线索，不是任意拷PUSH许可。新核显式划阶段，核对word2实际读取；保留所有其它PUSH、绑定范围、weight/scale身份。先用融合核替换一对PASS，输出和debug逐段验收，再推广8块；去掉中间context资源前核诊断读者和物理池生命周期。INT8 X5修正必须先完成，两个错误绑定相同不代表正确。
+
+streaming对照的定量裁定：8head一轮，只保16×256 context，FP168192B/INT84096B；每轮attention之后立即更新projection，四轮publication+三次覆盖前retirement=7WG barrier。若单WG覆盖全部N1024，projection累计256B/lane长期存活，再加attention ctx64B=320B/lane宽值净payload，尚未计Q/score/P。若拆成两个N512输出WG，宽值净192B/lane、attention重复2次；四个N256则128B/lane、重复4次。不能声称少共享同时零寄存器代价。本轮以H16分阶段方案先实施；streaming仅在native证实H16共享/并行限制且具名模型更优时再开，不为填卡默认全排GPU。
+
+split16的适用界限与可实施顺序：当前QKV就在attention核内。把64query窗口分成4个16query WG，会把QKV投影/归一化重复4次，不能套ViT不重算结论。若保留每窗口64query、循环16head并完整缓存context，FP16 T=65536B另加现有QKV/输入缓存20480B，合计86016B；INT8 T=32768B加经过I-PC11证明的QKV8/sy8 arena6144B=38912B。后者可作为后续完整INT8 split H64候选：每head先原QKV与完整attention，最终qT写window-local[64][512]；16head全部完成后一次发布；projection按4个M16×2个N256 sweep串行完成，4acc/SG=64B/lane。原窗口边界/shift/token映射、投影seed与写域单列，QKV缓存每head覆盖前必须等全部score/PV读者退休。只剩每个window一WG且16head串行，平行度大降；先核native与工作组数量，不从ViT结果继承性能结论。FP16 86016B必须先核设备与编译SLM上限，不假定可用，不作为首发。不能用跨head浮点partial sum改原投影K顺序规避存储。
+第四轮（zcode 主线自研补充，2026-10-24 晚）：跨head生产消费 owner 重分配定量裁定
+本节由 zcode 线以真实几何（288token、32head×32dim、K=1024/512、M8N16K16、SG32、half边=2B）算账落地，
+替代"仅列融合阻碍"；结论对两条主线同构适用（INT8 只替换量化合同，几何相同）。所有数字为源级
+流量/MAC/寄存器 payload 账，不是实测毫秒；收益与否最终仍由同批 ordinary 裁决。
+
+H1 ViT attention→projection（context 外部张量边 288×1024×2B=589,824B）：
+- N-tile owner（每WG认领N=128输出列并为其token重算attention）：N=1024/128=8组 → QK^T+PV 重算×8
+  （每帧基线约340M MAC → +2.7G MAC），且每组须读全部288token的K/V：K/V全局读×8 = 4.72MB，
+  远大于被删的context边0.59MB。定量否决，不是"难以融合"。
+- token-tile owner（每WG认领24token×全N，重算其attention）：K/V读×12组 = 7.08MB。否决。
+- K-slice owner（每WG算32head中自己的K=32片，FP32部分和跨WG归约）：部分和写读
+  = 288×1024×4B×片数；即使只切4片也达4.7MB写+4.7MB读，>被删边。否决。
+- 寄存器payload本身可行（M8N128 FP32=128B/lane；M8N1024=1024B/lane），不构成否决理由；
+  否决依据是全局流量与重算倍数。生产者直写消费布局（父内已有）保留为该边的终态结构。
+H2 split16 attention→l3 projection（context边 288×512×2B=294,912B）：同构，N-tile(4组)重算×4、
+  K/V读+0.88MB vs 删边0.59MB（含写读）；否决。l3 已是 projection-swap 直消费（父内已有）。
+H3 ViT QKV→attention 融合（qkv缓冲0.59MB；5个query-WG各读全量K/V=2.95MB）：
+  融入每query-WG → 输入X读×5（2.95MB）且 W_qkv 权重包读×5（1024×3072×2B=6.29MB → 31.5MB）。
+  权重回读放大31.5MB vs 省边3.5MB；定量否决。QKV核内同A喂多B的既有复用保留。
+H4 落地例外（不属否决）：(a) 同WG内多head共享一份输入/权重复用（如QKV一次A喂Q/K/V三个B）
+  已存在且正确；(b) F15-L 的逐片V消费/末chunk退休删除与 F10-P 的P片段分块归一化是
+  本边上真正可落地的寿命手段（已在任务内），不依赖跨head重分配；(c) INT8 线把 H1–H3 的
+  结构结论用于qX边时，量化/scale合同另立，几何账相同。
+裁定：跨head融合在当前几何下没有一条重分配路线的流量/重算账为正；不得以"减少dispatch"名义
+重启 E05/D06/D09 同族整head串行化。此账为结构否决，非硬件不可能；若未来token/head几何变化须重算。
+
+落盘复核（2026-10-24，G3 计划 + SPV 绑定声明，不是推断）：
+- context 就是 slot7 的 `swin_N_T`；四个 body PASS 都在计划里 BIND 它（模板绑定），但**只有 body_3 与 body_4 的 SPV 声明 binding 7**
+  （body_1/body_2 声明的是 {0,1,2,4,5,6}，不含 7）——与 A1 的 M 镜像同一类"模板 BIND 残留、SPV 无该 binding"。
+- 每窗字节数按 声明大小 ÷ 窗口数 精确整除：C64 8,257,536/1008 = **8192 B**；C128 4,128,768/252 = **16384 B**；
+  C256 2,162,688/66 = **32768 B**。与上面表格的 context/窗 完全一致，可删往返即 2× 该值。
+- POLICY 上 T 的窗口就是相邻两个 PASS（例如 C64 T 的 first 落在 body_3、last 落在 body_4），
+  即这份中间张量的寿命只有一个 pass 边界——这是本卡成立的最强证据；融合后它退化为 WG 内 shared。
+
+HOWN第二轮：HOWN-KVPACK 与 HOWN-KV2（独立于HOWN-V16/V32，20261024）
+证据HOWN-READ-PARALLELISM-PROOF.json / prove-hown-read-parallelism.py。CPU证明完成；kernel实现、compile、native、GPU均未完成。本轮不把源级流量当DRAM，也不把累加器净payload当峰值GRF。
+
+HOWN-KVPACK：QKV生产点直接写compact Q + head-major K/V，无额外重排PASS
+当前ViT QKV末尾两次coopstore使用m*3072+n0、stride3072，attention按head取K/V。改布局但保留数值边界：Q区域[0,294912)，Q[t,d]=t*1024+d；K区域[294912,589824)，K[h,t,d]=294912+h*9216+t*32+d；V区域[589824,884736)，V[h,t,d]=589824+h*9216+t*32+d。所有base加原binding相对的pc.p6.x，单位由本臂dtype明确指定。
+QKV dispatch仍n0以32递增：kind=n0/1024，head=(n0%1024)/32。Q片段用ROW stride1024；K/V片段用ROW stride32。norm-owner的h0/h1经过原Q/K归一化及scale后，直接写最终布局，不先canonical再转换。raw debug仍按父t*3072+n0写独立dbg，不拿packed QKV当旧格式读回。
+attention Q加载改stride1024，K/V直接读取或缓存fill使用head*9216+t*32+d；V^T coopload为COL stride32，K为ROW stride32。CPU884736个元素唯一全覆盖，无孔洞、无额外空间，FP16仍1769472B；完整INT8 codes为884736B（可以保留原较大allocation，不能据此提前缩池）。288..319仍由消费者guard/零填充，禁止默默扩到320后越过原capacity。
+此卡减少跨大stride的访问和改善矩阵块连续性，源级字节数不减；是否减少SEND/事务、提升cache命中要看native和计时。生产者写地址也变更，可能改善或损伤coalescing；不预先算收益。特别HOWN-V16的3.6倍逻辑K/V读取不会因pack自动消失。
+兼容：producer与全部实际QKV消费者必须同臂换layout；其它仅模板BIND的核逐SPV核对不当成真实读者；普通attention、HOWN-V16、V32、KV2都需对应专用读取版本。不要让旧consumer读新layout。现有诊断/抓取工具若解码QKV必须标新布局版本，原debug内容保持。INT8必须先完成R15真实Q8/K8/V8尺度和接口，不能把half输入强制当byte来省流量。
+
+HOWN-KV2：两个head×四query-owner，一WG8SG全部工作，保留projection边界
+这是HOWN全融合并行度不足时的可执行对照，不声称仍消除了context全局边。grid=(5,16,1)，local_size256；h=2*WG.y+sg/4，qg=(sg%4)*16，q0=WG.x*64。八个SG都执行原score/PV，替换父四个score SG+四个纯cache helper。每head/query owner任务不重复：原640个16query/head tile与新640个一一对应，其中576个有效（288token）。每SG完整32维ctx仍四宽acc64B/lane；不增加同SG并行query，也不延长projection累加器，因为projection保持独立PASS。
+共享K/V按两个head分区，各[64key][32dim]；FP16总16384B，完整INT8总8192B。cache fill以e=tid; e<4096; e+=256遍历两个head：headLocal=e/2048，t=j0+(e%2048)/32，d=e%32；分别写K[e]、V[e]，每元素唯一写者。score/PV地址加headLocal*2048；两个head不得共用同一缓存地址。
+5次publication+4次跨chunk退休=9 barrier/WG，80WG合计720次/块；保留WG一致参与。最后没有后继覆盖则可沿F15-L去末次退休。每head全局K/V仍被5个query-WG读取，与原单head父相同：FP16 5898240B/块，完整INT8 2949120B/块。HOWN-V16分别是21233664/10616832B，因此此卡恢复了原K/V复用。
+WG80个（原attention160，HOWN-V16 18、V32 9）；八SG都执行MMA，不能只用WG数量判断吞吐。FP16/INT8共享容量分别增加为单head attention父的2倍，可能改变驻留；native峰值与occupancy待核。attention输出仍按当前consumer-format T/qT写全局，projection仍有原全局读取，必须把这笔成本保留。可与KVPACK组合，也可独立，不叠加未经测量的收益。
+迁移时把score_owner条件改成所有SG，而不是只改h/qg；Q寄存器初始化、最终write guard、den/debug query地址、full/tail两宏全部使用新h与qg。原half den树、padding exp(0)处理与ctx K顺序不变。QKV阶段未合并，因此没有QKV重复计算。首个候选先不改projection N tile，不把它与N32试验混臂。
+
+FP16裁定：优先KVPACK+KV2与HOWN-V16形成对照。若需要更多工作组，不能把INT8的head部分和归约照搬为FP32 partial sum；那会改变父逐K累加舍入，必须另立数值合同，不属于当前保持FP16计算图的优化。不要为追求融合标签牺牲可验证性。
+HOWN-FPRJ4：FP16投影4SG输出owner，提高并行度并保持每输出原K序
+父candidates/codex-fp16-continuation-20261021/A/u03-f18-v2/source/vit_nb04_mpair.glsl，实际N16，不按旧头注释N32推断。保留两M8累加器、同一K16循环及weight pack、最后残差FMA和half。新local_size128(4SG)，grid=(18,16,1)，mA=WG.x*16，mB=mA+8，n0=WG.y*64+sg*16。每SG独占一个M16×N16输出，原K0..1008逐16顺序逐输出不变，不引入分K、浮点partial reduction或seed后移。
+原grid=(3,64,1)、local256，每SG mA=128*WG.x+8*sg，mB=mA+64，最后WG有未配对M8和完全无效SG，而B load在mA/mB判定外。本方案将288token刚好分成18个完整M16批次，所有SG有效。CPU294912输出坐标唯一覆盖、与父一致。
+源级账：WG192→288；launched SG1536→1152，原active1280（1024个两M8+256个单M8），新1152全部两M8。旧256个完全无效SG仍源级load B，另有尾部未配对M8导致128个额外B加载等价单元；合计源weight读取50331648→37748736B/块（-12582912），context读取37748736B不变。编译器可能已sink部分无效B读取，须看native，不能重复算掉。这里增加的是工作组粒度并行，未增加总有效矩阵工作。
+每lane累加器净32B，shared0、barrier0，原地址/权重操作数之外无新的整片长期暂存。与KV2组合仍保留全局context边；可单独先测projection，避免attention改动干扰。硬件权重cache局部性从同WG多query同N改为同query多N，可能有代价，ordinary决定是否保留。
+该核只适用于当前288token、N1024的8个ViT projection，逐位置PUSH/权重/输出基址继承；debug/残差读者不改变。不得把后处理N16改N32一并混入首臂；若希望推广contract/其它shape，另算K/尾部，不自动覆盖。
+FP16并行路线：KVPACK改善布局、KV2恢复K/V复用、FPRJ4改善投影调度，三个可独立验收后组合；HOWN-V16继续作为全融合对照。没有用改变浮点累加顺序换并行度。
+
+HOWN GPU启动票与生命周期补充（2026-10-24；建议队列，未提交、未运行）
+现在开启实施和离线资格检查，不等待全网研究全部结束。已编译且合同闭合的独立候选应进入首个获分配GPU时段。锁FINISHED不能代替调度授权；本研究不申请设备、不建pipeline、不修改游戏或驱动。native若必须依赖设备生成，则放在获分配时段的第一阶段，不设置“先拿native才能申请时段”的循环条件。
+离线入口：每臂明确父source/SPV/pack/plan身份；编译及SPIR-V验证；owner覆盖/尾部/读写域/尺度/实际绑定/PUSH和资源生命周期闭合；本臂参考定义齐全。CPU脚本通过只证明脚本中的模型，不等于shader可提交。实现者填写实际产物路径和hash后才能将“待实现”改“可提交”。
+GPU阶段：先native资源记录和非零输入数值门，再按已有固定输入、反馈、NR/media和画质验收要求执行；数值失败立即回到实现，不拿错误结果报性能。FP16保持每输出K序候选先比较父逐输出bit及最终输出，差异必须定位而非解释成容差。INT8 partial比较原INT32完整dot与最终原epilogue，包含负数、-128权重和实际非零数据。
+记录同shape每线程GRF、scratch字节及实际spill/fill、SLM、SG/WG驻留、barrier等待、kernel和整网时间；源码有效载荷不等于编译分配。寄存器分配粒度或编译器把生命期拉长都可能改变驻留。若新scratch出现，先定位spill阶段与原父差异再裁决；不能用“累加器只有64B/lane”证明无spill。
+首批并行推进两条主线：DSH先完成当前全网INT8 R01–R21的正确性覆盖候选，HOWN不能替代残留FP16消除；zcode首选最早编译就绪的FPRJ4或KV2。KVPACK必须producer和全部实际consumer同布局接线，禁止只替换一端。三卡先独立数值和计时，再组合，避免首次测试把归因打散。
+DSH HOWN队列：R15及投影qT/scale/pack门闭合后，先P16原INT32 partial基线，再相同调度的P24；两者直接比较打包代价。P8仅在P16驻留/并行度或tail证据支持时开；P-LAST仅在partial读写或归约核确为瓶颈时开，不因理论字节减少自动排第一。P16/P8仍全网INT8，不回落FP16 MMA。慢但正确的全INT8覆盖父保留为后续优化基线。
+性能按任务现有ordinary规程：3对独立进程、每臂30样本，同批父/候选交错或括号基线；保留原完整NR/media验收，禁止为本票降低要求。先单臂，再只测有证据的组合，不展开笛卡尔积。未编译、未分配、未运行必须分别标记。
+
+P16/P8生命周期与寄存器账（净数据负载下界，非native峰值）
+attention阶段：上下文累加器64B/lane，另有Q/K/V操作数、score/概率、尺度、地址与循环状态，实际峰值尚未知。全部本组head完成后发布qT，结束这些attention寄存器生命期，才进入projection；不要保留全组Q/K/V寄存器或同时算下组attention。projection四个M8×N16累加片共64B/lane，另计矩阵操作数与地址。两阶段错峰时不能简单相加为128B，也不能声称整核峰值只有64B。
+P24生产端：先完成一片四个INT32，再逐片打包并store，避免一次生成全部四片packed副本。保留其它三片时48B加当前片16B及最多12B输出word为76B/lane的概念数据集合；移位/掩码临时、输入fragment和编译器副本另计，因此76不是上界。允许优化器覆用已死原分量，不允许手写提前覆盖后续仍需要的位。独立归约端流式每组3word(12B)+4INT32和(16B)=28B/lane的数据集合，另计解码临时/epilogue/地址；G=2变4不应把加载字数组扩大到全部G。
+P-LAST最终group仍可能持有四片acc：必须逐片读取旧partial、加总、epilogue并释放；不要建立另一套完整输出acc。旧group packed读入12B与64B现存acc可同活，至少要检查这段，而不能套独立归约核28B账。输出浮点转换/残差读取只在最终片段进行。
+同步：P16/P8保留原每WG40/20个barrier、总720次/块，P24无新增barrier/跨lane交换。普通partial方案需生产dispatch→归约dispatch的compute-write/read依赖。P-LAST也是两阶段全局依赖，只取消独立归约核、不取消依赖；P16第一阶段9WG、最后9WG，P8为27+9。禁止跨WG自旋等待或凭WG编号判断先后。
+访存：P24仅压缩partial，P16读写4718592→3538944B，P8为9437184→7077888B；P-LAST叠P24为1769472/5308416B。以上均每块源级字节，不是DRAM流量，不能与缓存命中收益重复记账。qT/共享KV空间P16为32KiB、P8为24KiB不变，KV源读5308416B/块不变。P24并未减少整数归约项数：G=2仍每输出1加，G=4仍3加；它新增解码而减少传输，P-LAST省去独立核及最后partial往返，但也没有减少整数加法。
+FP16 FPRJ4：同一个输出完全由同一SG沿原K16累加，独立输出间重新分配owner；无跨SG中间值、无共享内存、无barrier、无浮点partial归约。两片acc净32B/lane，其它操作数和编译器分配另计。WG192→288不等于驻留或速度必升，须核4SG工作组下的native资源与cache。保留context边可独立验证，再与KV2/KVPACK组合。
+
+最新轮次任务入口（2026-10-24）：@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\ZCODE-NEXT-FP16-HOTSPOT-LONG-TASK-20261024.txt。该文件的本轮优先级与验收条件覆盖旧队列；历史证据保留。交由用户转交外部工具，未自动发送。
+
+最新连续施工入口：@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\ZCODE-EXECUTE-HOTSPOTS-TO-COMPLETION-20261024.txt。覆盖旧阶段停止条件；用户转交外部zcode，未自动发送。
+
+空白上下文最新自包含施工入口：@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\ZCODE-FRESH-CONTEXT-IMPLEMENTATION-20261024.txt。以该文件恢复工作，旧任务仅作证据索引。
+
+2026-10-25主审计源码研究新增：@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\f08-construction-20261025\ZCODE-F08-AND-XMX-CONSTRUCTION.txt；已提供未编译G1/M8草稿及CPU映射证明。普通F08仅两道WG barrier，先按XMX瓶颈证据选择候选，勿按22静态barrier盲删。
+
+2026-10-25用户最新优先级：先查清“非XMX75%”来源和当前瓶颈，按@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\XMX-75PCT-ATTRIBUTION-FIRST-20261025.txt恢复当前画像，再选择优化卡。暂停无依据的候选计时排列。
+
+2026-10-25最新执行任务：@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\ZCODE-COMBO1-NATIVE-COUNTERS-EXECUTE-20261025.txt。本轮先采当前COMBO-1 native/硬件计数，不展开新优化候选；F01/F02实际128线程=4SG，纠正旧8SG假设。

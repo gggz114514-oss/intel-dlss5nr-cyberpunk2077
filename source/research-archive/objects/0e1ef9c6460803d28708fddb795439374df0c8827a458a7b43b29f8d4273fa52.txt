@@ -1,0 +1,89 @@
+n04b-f05-c128-feed / F05 C128 QKV 供料（A 地址/发布/退休）
+状态: BUILT — AWAITING-GPU（CPU 侧全通过；无 GPU、无部署、未改基线 plan/指针/COMMON.py/其他卡）
+日期: 2026-10-27
+
+== 身份 ==
+基线（本组 12 PASS 现役）: f05-kv-consumer-layout/family/c128/candidate.spv  20f4074f…（源 d628a08e…）
+父复现: parent-rebuild.spv 字节等于基线 SPV（glslang 16.5.0 -V --target-env vulkan1.3，无 decoration 迁移）
+候选: candidate.spv 0f496a6b6a0722ae7b3b2740e347e8ddf9c3415c1c6193fbc2a0028f68d24630
+  spv_validate_cpu: OK
+  NoContraction: 73 = 73，装饰点序列逐条相同（float_NC_checked=73，Fma 站点 1=1）
+  Workgroup 内存 24576 B 不变，PushConstant 128 B 不变
+  SPIR-V 代码指令数 2692 = 父（54792 -> 54796 B 只是调试名/变量 id）
+plan: plan.txt  16106a3eb433f074b6119e122218da94c65aefa97618dc449686a49036d1ce16
+  只替换本组 12 个 PASS 的 SPV 路径（断言 replaced==12）
+  cpu_check: CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded
+
+== 候选机制（具名）==
+AAR（Accumulator All-Retire）+ APB（A Panel Base binding）
+  AAR: 六个 f32 累加器在收尾段入口全部窄化并退休；V 先发布（因为 accV1 是 K 循环里 A 的
+       最后一个消费者），两个 f16 值各自立即 store，不再跨 Q/K norm 与 4 次发布存活。
+       父用同一个 `narrowed` 变量串行化两次 V 窄化 -> 改成两个作用域值。
+  APB: `const uint aPanel = (w*64u+m0)*128u` 每面板绑定一次，A 流地址成为单一仿射标量。
+  位等价：不改任何浮点表达式/顺序/舍入点；只改发布顺序与一个整数不变式的绑定位置。
+
+== 已证（CPU 侧，可复核）==
+1. A 供料的指令形状在本身份是下界：每片段 8 条 32 B 行 send（gY 行距 256 B、每行只需 32 B）
+   + 4 条 32 B 同宽 mov（8 条 32 B 返回装进 4 个 {row+4,row} 操作数寄存器的下界）。
+   当前基线 native 复核: d32x8t 行 send = 257 = 128(QKV) + 128(PV) + 1；上半区组装 mov = 64 = 2×32。
+2. 与 f05-a-return-separation/A-PROVENANCE.json 逐项一致：128 行 / 32 B 有效 / 64 B 分配 /
+   每行 6 DPAS / 每 DPAS 8 行 / 16 片段 / 每片段 4 条复制（每条 1 行）/ 96 DPAS。
+   唯一需解释项：58/128 行 `overwritten_A_labels` 非空 = 64 B 分配包络复用，不是 32 B 载荷被覆盖
+   （与 NAMED-CONFLICTS 第 3 条同结论），已在 ANALYSIS.md §7 解释后才动手。
+3. A 退休已经即时：最后 DPAS 0x0DD0 -> 地址覆盖 0x0DE0 -> 下一片段首条 send 0x0E00（3 条指令）。
+4. 映射一一覆盖：token 0..63、K 0..127、每 head 输出通道 0..95 各一次；qkv 发布地址
+   6144 半字/head 无重复写（PROOF.json 机器校验，failures=[]）。
+5. 唯一还能删的 A 工作量是"重复片段"（WG 内两 head 各读一遍同一 16 KB），需要 12 个 f32
+   累加器 = 96 GRF；本身份 6 acc 已占 48 GRF、峰值 ~107/128 -> 装不下。权重侧同理
+   （16 token 共用一次 B 也要 12 acc）。这是**本身份的下界**，不是方向禁令。
+
+== 未证（需 GPU）==
+1. AAR 是否落地（IGC 是否采纳源级退休顺序）。判据 N1：六个 acc 的最后一次读是否全在
+   收尾段入口；accV0/V1 窄化间距是否从"跨 norm+4 发布"缩到 <=2 条；V 的 store.slm 是否早于 shfl/mufu。
+2. 相位交界是否出现 A 发布穿插（N3）。
+3. scratch 是否仍为 0、occupancy 是否不变（resources 臂）。
+4. 整体 ordinary 计时（两臂 6 组交替，30 样本 × 6，warm1/feedback）。
+
+== 分诊（预判，最终以 GPU 为准）==
+D（INDISTINCT）为主，C（当前身份无净收益）为次；若 native 逐类计数全同 -> A（实现未落地）。
+明确不是 E（数值）：候选不改浮点语义，NC 73=73 且 SPIR-V 代码指令数不变；固定/fb2 门预期 gold。
+也不把任何结果推广成"生命周期分离/地址分层"方向的禁令。
+
+== 下一处具体代码改动（按证据排序，都不在本卡写区）==
+1. 【给 pack 生产者/另一张卡】把每 head 的 96 个输出通道块从"16 通道块相距 8 KB"改成
+   连续阻塞，使 Q0+Q1（及 V0+V1）可以合并成 8×32 累加器与 16×32 B 片段：
+   预计删掉 30~45 条发布 send/phase，且累加器 GRF 不变（16 vs 2×8）。
+   当前被 pack 布局挡住（本卡不可写），且 coopmat<f16,8,32,Accumulator> 本工作区无先例，需先做形状探针。
+2. 【给 n05a/n08】M 批量的 GRF 账：本卡给出 1 acc = 8 GRF、6 acc = 48 GRF、峰值 ~107/128。
+   任何"M 面板共享 B"的方案先按 +8 GRF/额外 acc 算总量，超过 ~120 就必须先减 acc 或减 B 在途。
+3. 【本族下一个可试的 QKV 侧改动】把 phase0/phase1 的收尾段与下一相位的 A 首发显式交错
+   （需要第二个 A 返回 bank，双 A 已证单独做无益；因此必须在"收尾段变短"之后再做，
+   即先接受/否决本卡的 AAR）。顺序：AAR 落地 -> 退休段变短 -> 再试交错。
+4. 【不建议】A 行地址再分层：ISA 已是 base+imm（`add (1|M0) r107.0 r1.12 1312:w`），按 N15 不开新卡。
+
+== 文件 ==
+ANALYSIS.md 六问（含映射枚举表、RAW/WAR/WAW 表、成本表、A 供料下界证明、与 A-PROVENANCE 对齐）
+PROOF.json 机器校验（mapping/rounding_order/lifetime/tail/publication/candidate_spirv，failures=[]）
+SOURCE-DIFF.patch 12 增 6 删（两个 hunk）
+COST-LEDGER.json removed/added/unknown 逐项带计数与依据
+NATIVE-PREDICTION.md N1..N6 可观察点与"看不到就等于什么"
+BUILD.json 父 plan/SPV/源、父重编译（字节相同）、候选 SPV/源、plan、float_NC_checked=73、cpu_check 输出
+GPU-REQUEST.json 严格按合同结构
+candidate.comp / candidate.spv / parent-rebuild.comp / parent-rebuild.spv / plan.txt
+build/ 证据：parent-repro.json, spv-stats.json, baseline-native-census.json, a-provenance-summary.json
+脚本（只读历史账本、只写本卡）：build.py, build2.py, mkdiff.py, proof.py, a_trace.py, census.py, probe_rows.py
+
+== 未决项 ==
+1. A-PROVENANCE 的 PC 来自 rolling 父（952f7545…），本卡基线是 20f4074f…；结构断言逐项相等，
+   PC 不可直接对照。已在 ANALYSIS §7 说明，未据此推断任何 native 时序。
+2. 本卡未取得 20f4074f 身份 QKV 段的独立 ISA dump（只有全核 dump 与 rolling 段 dump），
+   因此 QKV 段的地址类计数（261/phase）标注为"rolling 段实测"，全核地址类 1530/5010 为本卡在
+   基线 native 上的直接统计。
+3. coopmat<f16,8,32,Accumulator> 的驱动支持未验证（本工作区只有 int8 8×32 的 A 用先例）。
+   若下一张卡要用，应先做形状探针再改源。
+4. 写区副产物（透明披露）：`import COMMON` 会让 Python 刷新
+   `fullnet-continuous-20261027/__pycache__/COMMON.cpython-312.pyc`（该目录由主代理先前运行已存在）。
+   本卡没有写任何其他目录；`evidence/GLSL-INDEX.json` 只读未改（mtime 15:05:07，早于本卡开工）。
+   除此之外本卡的所有写入都在 cards/n04b-f05-c128-feed/ 内。
+5. 计数口径：全核 4812 指令（NATIVE-REVIEW），dump 4813 行带 PC + 197 行 label；
+   百分比一律以 4812 为分母（地址类 1530/4812 = 31.8%）。

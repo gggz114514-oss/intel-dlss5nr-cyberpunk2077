@@ -1,0 +1,115 @@
+"""Why does a halved local FFN error not survive end-to-end? Test the Y edge (qY).
+
+The contract writes qY = roundEven(Y * ws[12]) and the qkv kernel dequantises with
+aq[col] = sY*sWQKV[col]. Neither ws[12] nor aq was touched by S08, so both still describe the
+OLD Y distribution. If the new pack raises |Y|, the qY codes saturate harder and the downstream
+qkv/attention/projection chain pays for the FFN's "improvement".
+"""
+import json
+from pathlib import Path
+
+import numpy as np
+
+R = Path("@NR_WORKSPACE@")
+S = R / "work/dsh-fullnet-static-20261029/S08-vit"
+Q = R / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+ACTUAL = R / "work/dsh-fullnet-static-20261029/gpu/runs/input-capture/xq-vit-b31.bin"
+FP16W = R / "src/project/artifacts/parallel-port-20261013/vit/block31/vit_weights.fp16.bin"
+OLD = R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-v1/pack/vit_block31_weights.int8.bin"
+A = S / "PACK/vit_block31_weights.int8.s08.bin"
+B = S / "PACK/vit_block31_weights.int8.s08b.bin"
+WC8 = 4194304
+WS_OFF, EW_OFF, AC_OFF, WG_OFF, AQ_OFF = 9437184, 9437248, 9453632, 9461824, 12611648
+NEW_X, NEW_A = 12623936, 12628032
+M, KX, NE, NY = 288, 1024, 4096, 1024
+W_HALF = dict(WE=(0, 4096, 1024), WC=(4194304, 1024, 4096))
+GAIN_HALF = 12582912
+
+
+def idx_int8(n, k, N, K):
+    return (n // 32) * (K // 32) * 1024 + (k // 32) * 1024 + (n % 32) * 32 + (k % 32)
+
+
+def idx_half(n, k, N, K):
+    return (n // 32) * (K // 16) * 512 + (k // 16) * 512 + (n % 32) * 16 + (k % 16)
+
+
+def half(v):
+    return np.asarray(v, np.float32).astype(np.float16).astype(np.float32)
+
+
+def cubic(z):
+    z = np.float16(z)
+    t = np.clip(z, np.float16(-4.0), np.float16(4.0)).astype(np.float32)
+    u = half(np.float32(-0.055908203125) * np.abs(t) + np.float32(0.447265625))
+    v = half(t * u + np.float32(0.89453125))
+    return half(z.astype(np.float32) * v)
+
+
+def code(v, inv):
+    return np.clip(np.rint(np.asarray(v, np.float32) * np.asarray(inv, np.float32)), -127, 127)
+
+
+def main():
+    flat16 = np.frombuffer(FP16W.read_bytes(), dtype="<f2")
+    n = np.arange(4096)[:, None]
+    k = np.arange(1024)[None, :]
+    WE = flat16[idx_half(n, k, 4096, 1024)].astype(np.float64)
+    n2 = np.arange(1024)[:, None]
+    k2 = np.arange(4096)[None, :]
+    WC = flat16[4194304 + idx_half(n2, k2, 1024, 4096)].astype(np.float64)
+    gain = flat16[GAIN_HALF:GAIN_HALF + 1024].astype(np.float32).astype(np.float64)
+    cWE, cWC = np.abs(WE).max(axis=1), np.abs(WC).max(axis=1)
+    sWE = np.where(cWE > 0, cWE / 127.0, 1.0)
+    sWC = np.where(cWC > 0, cWC / 127.0, 1.0)
+    dWE = np.clip(np.rint(WE / sWE[:, None]), -127, 127) * sWE[:, None]
+    dWC = np.clip(np.rint(WC / sWC[:, None]), -127, 127) * sWC[:, None]
+    X = np.fromfile(ACTUAL, dtype="<f2")[:M * KX].reshape(M, KX).astype(np.float32)
+    Yref = half(gain[None, :] * X.astype(np.float64)
+                + (cubic(half(X @ dWE.T)) @ dWC.T).astype(np.float64)).astype(np.float32)
+
+    out = {"reference_fp16_Y": dict(absmax=float(np.abs(Yref).max()),
+                                    rms=float(np.sqrt(np.mean(Yref.astype(np.float64) ** 2))))}
+    for name, path in (("old", OLD), ("A", A), ("B", B)):
+        b = Path(path).read_bytes()
+        p8 = np.frombuffer(b, np.int8)
+        cE = p8[idx_int8(np.arange(4096)[:, None], np.arange(1024)[None, :], 4096, 1024)]
+        cC = p8[WC8 + idx_int8(np.arange(1024)[:, None], np.arange(4096)[None, :], 1024, 4096)]
+        ws = np.frombuffer(b[WS_OFF:WS_OFF + 64], dtype="<f4")
+        ew = np.frombuffer(b[EW_OFF:EW_OFF + 16384], dtype="<f4")
+        ac = np.frombuffer(b[AC_OFF:AC_OFF + 4096], dtype="<f4")
+        wg = np.frombuffer(b[WG_OFF:WG_OFF + 2048], dtype="<f2").astype(np.float32)
+        invx = np.frombuffer(b[NEW_X:NEW_X + 4096], dtype="<f4") if path != OLD else np.float32(ws[8])
+        inva = np.frombuffer(b[NEW_A:NEW_A + 16384], dtype="<f4") if path != OLD else np.float32(ws[9])
+        qX = np.clip(np.rint(X * np.atleast_1d(invx)[None, :]), -127, 127)
+        E = half((qX.astype(np.float64) @ cE.astype(np.float64).T).astype(np.float32) * ew[None, :])
+        Ah = cubic(E)
+        qA = np.clip(np.rint(Ah * np.atleast_1d(inva)[None, :]), -127, 127)
+        lin = (qA.astype(np.float64) @ cC.astype(np.float64).T).astype(np.float32) * ac[None, :]
+        Y = half(wg.astype(np.float64)[None, :] * X + lin.astype(np.float64)).astype(np.float32)
+        invY = np.float32(ws[12])
+        qY = code(Y, invY)
+        c = np.abs(Y * invY)
+        out[name] = dict(
+            Y_rel_l2_vs_ref=float(np.linalg.norm(Y.astype(np.float64) - Yref.astype(np.float64))
+                                  / np.linalg.norm(Yref.astype(np.float64))),
+            Y_absmax=float(np.abs(Y).max()),
+            qY_absmax_ratio=float(c.max()), qY_sat=int(np.count_nonzero(c > 127.0)),
+            qY_gt120=int(np.count_nonzero(c > 120.0)),
+            qY_gt110=int(np.count_nonzero(c > 110.0)),
+            invY_still=float(invY), sY_still=float(ws[11]),
+            implied_absmax_of_the_Y_edge=float(127.0 / invY))
+    ref_sat = out["reference_fp16_Y"]["absmax"] * float(np.frombuffer(Path(OLD).read_bytes()[WS_OFF:WS_OFF + 64],
+                                                                     dtype="<f4")[12])
+    out["reference_qY_ratio"] = float(ref_sat)
+    out["reading"] = ("qY saturation counts are computed against the UNCHANGED ws[12]; the reference "
+                      "ratio is what the pure FP16 Y would need. Any growth in the ratio for A/B is "
+                      "downstream damage the local Y objective never saw.")
+    (S / "QY-EDGE-CHECK.json").write_text(json.dumps(out, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps(out, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

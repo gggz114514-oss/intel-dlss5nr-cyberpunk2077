@@ -1,0 +1,43 @@
+import pathlib,json,subprocess,hashlib,re,difflib,struct
+B=pathlib.Path('@NR_WORKSPACE@'); A=B/'work/codex-astra-fp16-int8-audit-20261024'; O=A/'fullnet-controlled-20261025';O.mkdir(exist_ok=True)
+mods=json.loads((A/'MAIN-AUDITOR-FULLNET-20261025.json').read_text())['modules']; compiler=B/'src/project/tools/glslang-16.5.0/bin/glslang.exe'; result=[]
+for key,h in [('f05-c256-qkv6','2e483fec'),('f08-group1','3bc96c53'),('f06-c256-direct-a','3344e9f2')]:
+ m=next(x for x in mods if x['native_hash'].startswith(h)); src=pathlib.Path(m['source']['path']);s=src.read_text(encoding='utf-8-sig');c=s;out=O/key;out.mkdir(exist_ok=True)
+ if key=='f05-c256-qkv6':
+  decl='        MAT_C accK1 = MAT_C(float16_t(0.0));'
+  c=c.replace(decl,decl+'\n        MAT_C accV0 = MAT_C(float16_t(0.0));\n        MAT_C accV1 = MAT_C(float16_t(0.0));',1)
+  anchor='                accK1 = coopMatMulAdd(a, b1, accK1);\n            }'
+  v='''
+            {
+                MAT_B b0; coopMatLoad(b0, pack, wq + (96u * h + 64u) * 256u + k0, 256u, LCOL);
+                MAT_B b1; coopMatLoad(b1, pack, wq + (96u * h + 80u) * 256u + k0, 256u, LCOL);
+                accV0 = coopMatMulAdd(a, b0, accV0);
+                accV1 = coopMatMulAdd(a, b1, accV1);
+            }'''
+  assert anchor in c;c=c.replace(anchor,anchor+v,1)
+  start=c.index('    }\n    // Q/K MCs have left scope');end=c.index('        MAT_H narrowed = MAT_H(accV0);',start)
+  c=c[:start]+c[end:]
+ elif key=='f08-group1':
+  c=c.replace('layout(local_size_x=256)','layout(local_size_x=128)').replace('sr[2048],sa[8192]','sr[1024],sa[4096]').replace('gBase=gl_WorkGroupID.y*2u','gBase=gl_WorkGroupID.y').replace('uint sgLocal=sg%4u,localGroup=sg/4u,g=gBase+localGroup;','uint sgLocal=sg,localGroup=0u,g=gBase;')
+ else:
+  c=c.replace('shared float16_t shT[16384];','')
+  start=c.index('    for (uint e = t_local; e < 16384u; e += 256u)');end=c.index('    for (uint j = 0u;',start)
+  c=c[:start]+'''    if (debug) {
+        for (uint e = t_local; e < 16384u; e += 256u)
+            dbg[425984u + e] = gT[w * 16384u + e];
+    }
+
+'''+c[end:]
+  c=c.replace('coopMatLoad(a, shT, m0 * 256u + k0, 256u, LROW)','coopMatLoad(a, gT, (w * 64u + m0) * 256u + k0, 256u, LROW)')
+ assert c!=s
+ (out/'parent.comp').write_text(s,encoding='utf8');(out/'candidate.comp').write_text(c,encoding='utf8');(out/'change.diff').write_text(''.join(difflib.unified_diff(s.splitlines(True),c.splitlines(True),fromfile='parent.comp',tofile='candidate.comp')),encoding='utf8')
+ rec={'key':key,'orders':m['orders'],'source':m['source'],'deployed_spv':m['spv'],'build':{}}
+ for arm in ['parent','candidate']:
+  argv=[str(compiler),'-V','--target-env','vulkan1.3','-I'+str(src.parent),'-o',str(out/(arm+'.spv')),str(out/(arm+'.comp'))];r=subprocess.run(argv,capture_output=True,text=True,cwd=B)
+  (out/(arm+'-build.log')).write_text(r.stdout+r.stderr,encoding='utf8'); rec['build'][arm]={'exit_code':r.returncode,'argv':argv}
+  if r.returncode:print(key,arm,r.stdout+r.stderr);continue
+  f=out/(arm+'.spv');rec['build'][arm]['sha256']=hashlib.sha256(f.read_bytes()).hexdigest()
+ rec['parent_reproduced']=rec['build']['parent'].get('sha256')==m['spv']['sha256']
+ result.append(rec); print(key,'parent_identity',rec['parent_reproduced'],'build',rec['build']['candidate']['exit_code'])
+(O/'BUILD-RESULTS.json').write_text(json.dumps(result,indent=2),encoding='utf8')
+

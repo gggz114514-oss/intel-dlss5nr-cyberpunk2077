@@ -1,0 +1,304 @@
+import datetime
+import json
+import os
+import time
+from pathlib import Path
+
+GAME_PLUGINS = Path(r"@NR_GAME@\bin\x64\plugins")
+PKG_CFG = Path(r"@NR_WORKSPACE@\work\github-experimental-game-install-20261024\package\config")
+OUT_DIR = Path(r"@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\prep-gpu-handoff-20261028\dsh-time-diagnosis-20261028")
+CTL_INI = GAME_PLUGINS / "dsh_diag_control.ini"
+SNAPSHOTS_PATH = OUT_DIR / "window-snapshots.jsonl"
+META_PATH = OUT_DIR / "window-metadata.json"
+PROGRESS_PATH = OUT_DIR / "capture-progress.json"
+
+
+def write_ctl_ini(mode: int, window_id: int, arm_reuse: int, flush_seq: int) -> None:
+    content = (
+        f"[diag]\r\n"
+        f"mode={mode}\r\n"
+        f"window_id={window_id}\r\n"
+        f"arm_reuse={arm_reuse}\r\n"
+        f"flush_seq={flush_seq}\r\n"
+        f"out_dir={OUT_DIR}\r\n"
+    )
+    tmp = CTL_INI.with_suffix(".ini.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, CTL_INI)
+
+
+def read_json_safe(path: Path):
+    for _ in range(5):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            time.sleep(0.05)
+    return None
+
+
+def update_progress(state: str, detail: dict) -> None:
+    payload = {
+        "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "state": state,
+        **detail,
+    }
+    try:
+        PROGRESS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    print(json.dumps(payload), flush=True)
+
+
+def wait_for_stationary_scene() -> None:
+    update_progress("WAITING_FOR_STATIONARY_SCENE", {"instruction": "Please enter the in-game 3D save scene (nr_completed > 3100)"})
+    last_frames = None
+    last_change_t = time.perf_counter()
+    consecutive_active_updates = 0
+    polls = 0
+    while True:
+        polls += 1
+        now_t = time.perf_counter()
+        comp = read_json_safe(PKG_CFG / "component_status.json") or {}
+        panel = read_json_safe(PKG_CFG / "panel_state.json") or {}
+        diag = read_json_safe(OUT_DIR / "DIAG-LIVE-STATUS.json") or {}
+        stage = panel.get("stage") or {}
+        handoff = panel.get("handoff") or {}
+
+        valid_context = (
+            comp.get("build_id") == "optimized-full-gpu-handoff-v1"
+            and comp.get("init_state") == 2
+            and comp.get("gpu_timeout") == 0
+            and comp.get("fallback") == 0
+            and panel.get("backend") == "small"
+            and panel.get("mounted") == 1
+            and (handoff.get("bypasses") or 0) > 0
+            and bool(diag.get("active"))
+        )
+        frames = int(diag.get("nr_completed") or stage.get("frames") or 0)
+        total_ms = float(stage.get("total") or 0.0)
+
+        if last_frames is None:
+            last_frames = frames
+            last_change_t = now_t
+        elif frames != last_frames:
+            delta = frames - last_frames
+            last_frames = frames
+            last_change_t = now_t
+            in_save_scene = (frames >= 150 and 24.3 <= total_ms <= 36.0) or (frames > 3100)
+            if valid_context and in_save_scene and delta >= 12:
+                consecutive_active_updates += 1
+            else:
+                consecutive_active_updates = 0
+        else:
+            if (now_t - last_change_t) > 2.5:
+                consecutive_active_updates = 0
+
+        if polls % 8 == 0:
+            update_progress(
+                "WAITING_STATUS",
+                {
+                    "valid_context": valid_context,
+                    "nr_completed": frames,
+                    "panel_total_ms": total_ms,
+                    "consecutive_active_updates": consecutive_active_updates,
+                },
+            )
+
+        if valid_context and consecutive_active_updates >= 5:
+            update_progress(
+                "SCENE_READY",
+                {
+                    "nr_completed": frames,
+                    "panel_total_ms": total_ms,
+                    "consecutive_active_updates": consecutive_active_updates,
+                },
+            )
+            return
+
+        time.sleep(0.25)
+
+
+def wait_for_diag_ack(mode: int, window_id: int, arm_reuse: int, timeout_s: float = 10.0) -> dict:
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        diag = read_json_safe(OUT_DIR / "DIAG-LIVE-STATUS.json") or {}
+        if (
+            diag.get("active") is True
+            and int(diag.get("mode", -1)) == mode
+            and int(diag.get("window_id", -1)) == window_id
+            and int(diag.get("arm_reuse", -1)) == arm_reuse
+        ):
+            return diag
+        time.sleep(0.1)
+    return read_json_safe(OUT_DIR / "DIAG-LIVE-STATUS.json") or {}
+
+
+def main() -> None:
+    if SNAPSHOTS_PATH.exists():
+        SNAPSHOTS_PATH.unlink()
+    if (OUT_DIR / "DIAG-LIVE-STATUS.json").exists():
+        (OUT_DIR / "DIAG-LIVE-STATUS.json").unlink()
+
+    flush_seq = 0
+    write_ctl_ini(mode=0, window_id=0, arm_reuse=0, flush_seq=flush_seq)
+    wait_for_stationary_scene()
+
+    # In the live in-game save scene, rendering continues indefinitely.
+    # Require >= 360 frames per window and >= 9.0s elapsed (with 1.5s / 50-frame settling),
+    # guaranteeing >= 310 post-settling frames in every single window.
+    windows = [
+        {"name": "D1_OFF_1", "phase": "D1", "window_id": 1, "mode": 0, "arm_reuse": 0, "settling_s": 1.5, "min_duration_s": 9.0, "target_ack_delta_frames": 360},
+        {"name": "D1_CPU_ONLY", "phase": "D1", "window_id": 2, "mode": 1, "arm_reuse": 0, "settling_s": 1.5, "min_duration_s": 9.0, "target_ack_delta_frames": 360},
+        {"name": "D1_CPU_GPU", "phase": "D1", "window_id": 3, "mode": 2, "arm_reuse": 0, "settling_s": 1.5, "min_duration_s": 9.0, "target_ack_delta_frames": 360},
+        {"name": "D1_OFF_2", "phase": "D1", "window_id": 4, "mode": 0, "arm_reuse": 0, "settling_s": 1.5, "min_duration_s": 9.0, "target_ack_delta_frames": 360},
+        {"name": "D2_B1", "phase": "D2", "window_id": 11, "mode": 2, "arm_reuse": 0, "settling_s": 1.5, "min_duration_s": 9.0, "target_ack_delta_frames": 360},
+        {"name": "D2_C1", "phase": "D2", "window_id": 12, "mode": 2, "arm_reuse": 1, "settling_s": 1.5, "min_duration_s": 9.0, "target_ack_delta_frames": 360},
+        {"name": "D2_B2", "phase": "D2", "window_id": 13, "mode": 2, "arm_reuse": 0, "settling_s": 1.5, "min_duration_s": 9.0, "target_ack_delta_frames": 360},
+        {"name": "D2_C2", "phase": "D2", "window_id": 14, "mode": 2, "arm_reuse": 1, "settling_s": 1.5, "min_duration_s": 9.0, "target_ack_delta_frames": 360},
+    ]
+
+    window_meta = []
+
+    with SNAPSHOTS_PATH.open("w", encoding="utf-8", newline="\n") as snap_file:
+        for idx, w in enumerate(windows):
+            write_ctl_ini(w["mode"], w["window_id"], w["arm_reuse"], flush_seq)
+            ack_diag = wait_for_diag_ack(w["mode"], w["window_id"], w["arm_reuse"])
+            win_start_frame = int(ack_diag.get("nr_completed") or 0)
+            win_start_pooled = int(ack_diag.get("pooled_private_composite_count") or 0)
+            win_start_unique = int(ack_diag.get("unique_composite_heap_creates") or 0)
+            settling_end_frame = None
+            settling_end_pooled = None
+            settling_end_unique = None
+
+            update_progress(
+                "RUNNING_WINDOW",
+                {
+                    "window_name": w["name"],
+                    "window_id": w["window_id"],
+                    "mode": w["mode"],
+                    "arm_reuse": w["arm_reuse"],
+                    "win_start_frame": win_start_frame,
+                    "flush_seq": flush_seq,
+                },
+            )
+
+            start_t = time.perf_counter()
+            i = 0
+            stalled_polls = 0
+            last_seen_frames = win_start_frame
+            while True:
+                target_t = start_t + i * 0.5
+                now_t = time.perf_counter()
+                if now_t < target_t:
+                    time.sleep(target_t - now_t)
+                elapsed = time.perf_counter() - start_t
+                is_settling = elapsed < (w["settling_s"] - 1e-3)
+
+                comp = read_json_safe(PKG_CFG / "component_status.json")
+                panel = read_json_safe(PKG_CFG / "panel_state.json")
+                diag = read_json_safe(OUT_DIR / "DIAG-LIVE-STATUS.json")
+
+                cur_frames = int((diag or {}).get("nr_completed") or 0)
+                if cur_frames == last_seen_frames:
+                    stalled_polls += 1
+                    if stalled_polls == 3:
+                        flush_seq += 1
+                        write_ctl_ini(w["mode"], w["window_id"], w["arm_reuse"], flush_seq)
+                        if idx == len(windows) - 1:
+                            break
+                else:
+                    stalled_polls = 0
+                    last_seen_frames = cur_frames
+
+                if not is_settling and settling_end_frame is None and diag:
+                    settling_end_frame = cur_frames
+                    settling_end_pooled = int(diag.get("pooled_private_composite_count") or 0)
+                    settling_end_unique = int(diag.get("unique_composite_heap_creates") or 0)
+
+                stage = (panel or {}).get("stage") or {}
+                handoff = (panel or {}).get("handoff") or {}
+                valid_ctx = bool(
+                    comp
+                    and panel
+                    and comp.get("build_id") == "optimized-full-gpu-handoff-v1"
+                    and comp.get("init_state") == 2
+                    and comp.get("gpu_timeout") == 0
+                    and comp.get("fallback") == 0
+                    and panel.get("backend") == "small"
+                    and panel.get("mounted") == 1
+                    and (handoff.get("bypasses") or 0) > 0
+                )
+
+                rec = {
+                    "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "phase": w["phase"],
+                    "window_name": w["name"],
+                    "window_id": w["window_id"],
+                    "mode": w["mode"],
+                    "arm_reuse": w["arm_reuse"],
+                    "elapsed_sec": round(elapsed, 3),
+                    "settling": is_settling,
+                    "valid_context": valid_ctx,
+                    "stage_ms": {k: stage.get(k) for k in ("prep", "host", "composite", "tail", "total", "last", "frames")},
+                    "handoff": {k: handoff.get(k) for k in ("bypasses", "cpu_waits", "motion_waits")},
+                    "diag_live": diag,
+                    "component": comp,
+                    "panel": panel,
+                }
+                snap_file.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                snap_file.flush()
+
+                if (elapsed >= w["min_duration_s"] and (cur_frames - win_start_frame) >= w["target_ack_delta_frames"]) or elapsed >= 20.0:
+                    break
+                i += 1
+
+            end_diag = read_json_safe(OUT_DIR / "DIAG-LIVE-STATUS.json") or {}
+            win_end_frame = int(end_diag.get("nr_completed") or 0)
+            win_end_pooled = int(end_diag.get("pooled_private_composite_count") or 0)
+            win_end_unique = int(end_diag.get("unique_composite_heap_creates") or 0)
+            if settling_end_frame is None:
+                settling_end_frame = win_start_frame
+                settling_end_pooled = win_start_pooled
+                settling_end_unique = win_start_unique
+
+            window_meta.append(
+                {
+                    **w,
+                    "window_start_frame": win_start_frame,
+                    "settling_end_frame": settling_end_frame,
+                    "window_end_frame": win_end_frame,
+                    "post_settling_frames": max(0, win_end_frame - settling_end_frame),
+                    "pooled_private_composite_delta_post_settling": max(0, win_end_pooled - settling_end_pooled),
+                    "unique_composite_heap_creates_delta_post_settling": max(0, win_end_unique - settling_end_unique),
+                }
+            )
+            META_PATH.write_text(json.dumps({"windows": window_meta}, indent=2), encoding="utf-8")
+
+    # Final flush while game is still running
+    flush_seq += 1
+    write_ctl_ini(mode=0, window_id=99, arm_reuse=1, flush_seq=flush_seq)
+    deadline = time.perf_counter() + 15.0
+    final_diag = {}
+    while time.perf_counter() < deadline:
+        final_diag = read_json_safe(OUT_DIR / "DIAG-LIVE-STATUS.json") or {}
+        if int(final_diag.get("last_flush_seq") or 0) >= flush_seq:
+            break
+        time.sleep(0.2)
+
+    META_PATH.write_text(
+        json.dumps({"windows": window_meta, "final_diag_live": final_diag}, indent=2),
+        encoding="utf-8",
+    )
+    update_progress(
+        "COMPLETE",
+        {
+            "windows_completed": len(window_meta),
+            "final_flush_seq": final_diag.get("last_flush_seq"),
+            "bridge_records": final_diag.get("bridge_records"),
+            "nrvk_records": final_diag.get("nrvk_records"),
+        },
+    )
+
+
+if __name__ == "__main__":
+    main()

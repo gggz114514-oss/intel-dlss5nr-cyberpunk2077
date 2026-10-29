@@ -1,0 +1,52 @@
+"""CPU tool integration smoke test; one captured window is NOT calibration data."""
+from pathlib import Path
+import hashlib
+import json
+import importlib.metadata
+import numpy as np
+import onnx
+from onnx import helper as h, numpy_helper as nh, TensorProto as T
+import onnxruntime as ort
+
+Q = Path(__file__).resolve().parent
+B = Q.parents[2]
+D = Q.parent / 'int8-v15-offline-20261028/first-difference'
+out = Q / 'reference-lift'
+out.mkdir(exist_ok=True)
+wp = B / 'candidates/amd-map-20261015/s1-integrated/candidate/packs/ioport_0_ioport_pack.fp16.bin'
+cp = D / 'f01-feature-capture/run/c32_f1_f2_diag_f1.bin'
+hp = D / 'fp16-stage/run/f01-half-debug.bin'
+w = np.fromfile(wp, dtype='<f2')
+weight = np.array([[w[8192+(c//8)*128+(c%8)*16+k] for c in range(32)] for k in range(16)], dtype=np.float32)
+raw = np.fromfile(cp, dtype='<i4')
+x = raw[57440:58464].view('<f4').reshape(64,16).copy()
+gold = np.fromfile(hp, dtype='<f2')[22528:24576].reshape(64,32)
+graph = h.make_graph([
+    h.make_node('MatMul', ['features','weight'], ['acc'], name='F01_lift'),
+    h.make_node('Cast', ['acc'], ['lift'], to=T.FLOAT16, name='lift_half_boundary'),
+], 'F01_lift_math_reference', [h.make_tensor_value_info('features',T.FLOAT,['tokens',16])],
+   [h.make_tensor_value_info('lift',T.FLOAT16,['tokens',32])], [nh.from_array(weight,'weight')])
+model = h.make_model(graph, opset_imports=[h.make_opsetid('',17)], ir_version=9)
+onnx.checker.check_model(model)
+onnx.save(model,out/'lift.onnx')
+np.savez(out/'smoke-input.npz', features=x, fp16_capture=gold)
+options = ort.SessionOptions()
+options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+session = ort.InferenceSession(str(out/'lift.onnx'),options,providers=['CPUExecutionProvider'])
+actual = session.run(None,{'features':x})[0]
+# Explicit sequential FP32 rounding reference; ONNX MatMul is not a GPU order contract.
+acc = np.zeros((64,32),np.float32)
+for k in range(16):
+    acc = (acc.astype(np.float64)+x[:,k,None].astype(np.float64)*weight[None,k,:].astype(np.float64)).astype(np.float32)
+ordered = acc.astype(np.float16)
+def metrics(a,b):
+    delta = a.astype(np.float64)-b.astype(np.float64)
+    return {'unequal':int(np.count_nonzero(a!=b)), 'max_abs':float(abs(delta).max()),
+            'rmse':float(np.sqrt(np.mean(delta*delta)))}
+report = {'status':'SMOKE_ONLY_NOT_FORMAL_CALIBRATION', 'shape':[64,16],
+          'onnx_vs_fp16_capture':metrics(actual,gold), 'ordered_vs_fp16_capture':metrics(ordered,gold),
+          'note':'MatMul is a mathematical reference; GPU reduction and half rounding remain separate acceptance requirements.',
+          'sources':{str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in [wp,cp,hp]},
+          'versions':{n:importlib.metadata.version(n) for n in ['numpy','onnx','onnxruntime','nncf']}}
+(out/'REFERENCE-RESULT.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
+print(json.dumps(report,indent=2))

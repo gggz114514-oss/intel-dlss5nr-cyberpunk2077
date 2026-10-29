@@ -1,0 +1,55 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,re,shutil
+D=Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-mechanism-transfer-20261026');A=D.parent;B=A.parent.parent;S=D/'f10-qkv-a-consumer-layout-20261027';T=D/'f08-register-chain-20261027'
+read=lambda p:json.loads(p.read_text(encoding='utf-8-sig'))
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+ident=lambda p:dict(path=str(p),sha256=sha(p))
+def run(argv):
+ r=subprocess.run(list(map(str,argv)),capture_output=True,text=True,encoding='utf-8',errors='replace');assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+row=read(D/'remaining-amd-production-audit-20261027/INTEL-ROWS.json')[62];src=Path(row['source']);parent=Path(row['spv']);pm=ST.Module(parent)
+def compile(label,s):
+ f=S/(label+'.comp');o=S/(label+'.spv');f.write_text(s,encoding='utf-8');run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(src.parent),f,'-o',o]);return o
+original=src.read_text(encoding='utf-8-sig');rb=compile('parent-rebuild',original);rm=ST.Module(rb);keep,info=ST.transfer_decoration_pattern_aligned(pm,rm,set());ST.set_no_contraction(rm,keep,rb);assert sha(rb)==sha(parent)
+changed=original
+# Map sy[row*64+k] to 8x16 tiles stored column-major, stride8.
+needle='#define STAGE(A,V,O) sy[lid+(O)]=(V)?gy[(A)]:float16_t(0.0)'
+assert changed.count(needle)==1
+changed=changed.replace(needle,'#define STAGE(A,V,O) sy[qkv_a_offset(lid+(O))]=(V)?gy[(A)]:float16_t(0.0)')
+changed=changed.replace('void main() {','uint qkv_a_offset(uint e) { uint r=e/64u,k=e%64u; return ((r/8u)*4u+k/16u)*128u+(k%16u)*8u+r%8u; }\nvoid main() {')
+for v in ['mA','mB']:
+ old=f'coopMatLoad(a{0 if v=="mA" else 1},sy,{v}*64u+k,64u,ROW);'
+ new=f'coopMatLoad(a{0 if v=="mA" else 1},sy,(({v}/8u)*4u+k/16u)*128u,8u,COL);'
+ assert changed.count(old)==1;changed=changed.replace(old,new)
+# Exhaustive source-address equivalence including every producer and consumer.
+cells={}
+for r in range(64):
+ for k in range(64):
+  addr=((r//8)*4+k//16)*128+(k%16)*8+r%8
+  assert addr not in cells;cells[addr]=(r,k)
+assert set(cells)==set(range(4096))
+for sg in range(8):
+ for m in [(sg//2)*16,(sg//2)*16+8]:
+  for k0 in range(0,64,16):
+   for r in range(8):
+    for c in range(16):assert cells[((m//8)*4+k0//16)*128+c*8+r]==(m+r,k0+c)
+o=compile('candidate',changed);cm=ST.Module(o)
+# Added integer control-flow only. Floating arithmetic remains one-to-one.
+ints={128,130,132,134,135,137,138,139};nc=set(ST.no_contraction_ids(pm));ncf={ST.result_id_of(op,a) for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in nc and op not in ints};ops={op for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in ncf};keep=[];checked=0
+for pr,cr in zip(ST.function_regions(pm),ST.function_regions(cm)):
+ ps=[pm.instructions[i] for i in pr if pm.instructions[i][0] in ops];cs=[cm.instructions[i] for i in cr if cm.instructions[i][0] in ops];assert len(ps)==len(cs)
+ for x,y in zip(ps,cs):
+  assert (x[0],x[3])==(y[0],y[3]);xi=ST.result_id_of(x[0],x[1]);yi=ST.result_id_of(y[0],y[1]);assert pm.operand_signature(xi,3)==cm.operand_signature(yi,3);checked+=1
+  if xi in ncf:keep.append(yi)
+assert len(keep)==len(ncf);raw=set(ST.no_contraction_ids(cm));keep += [ST.result_id_of(op,a) for op,a,_,_ in cm.instructions if op in ints and ST.result_id_of(op,a) in raw];ST.set_no_contraction(cm,keep,o)
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',o]);text=(T/'plan.txt').read_text(encoding='utf-8-sig');assert text.count(parent.as_posix())==16;text=text.replace(parent.as_posix(),o.as_posix());plan=S/'plan.txt';plan.write_text(text,encoding='utf-8');cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check'])
+build=dict(parent=ident(T/'plan.txt'),plan=ident(plan),sources=[dict(parent=ident(parent),parent_rebuilt=ident(rb),candidate=ident(o),source=ident(o.with_suffix('.comp')))],float_NC_checked=checked,CPU=cpu);(S/'BUILD.json').write_text(json.dumps(build,indent=2),encoding='utf-8');print(cpu)
+for kind in ['GATES','NATIVE','RESOURCES','ORDINARY']:
+ t=read(T/f'LUNA-{kind}.json');t['output_root']=str(S/(kind.lower()+'-execution'));t['identities']=[x for x in t['identities'] if not x['path'].endswith('.spv')]+[ident(o),ident(parent)]
+ for j in t['jobs']:
+  jp=T/'plan.txt' if j.get('candidate')=='parent' else plan;j['plan']=ident(jp);j['runner_output']=str(S/'run'/j['id']);ar=j['argv'];ar[ar.index('--plan')+1]=str(jp);ar[ar.index('--out')+1]=j['runner_output']
+  if kind=='NATIVE':ar[ar.index('--output_dir')+1]=str(S/'captures');ar[ar.index('--msg_file')+1]=str(S/'native.log');j['capture_output']=str(S/'captures'/ar[ar.index('--profile_dir')+1])
+ (S/f'LUNA-{kind}.json').write_text(json.dumps(t,indent=2),encoding='utf-8')
+(S/'execute.ps1').write_text((T/'execute.ps1').read_text(encoding='utf-8-sig').replace('F08 complete register chain','F10 QKV A consumer layout').replace('LUNA-F08-REGISTER-CHAIN','LUNA-F10-QKV-A-LAYOUT'),encoding='utf-8')
+(S/'run').mkdir(exist_ok=True)
+(S/'captures').mkdir(exist_ok=True)

@@ -1,0 +1,271 @@
+# -*- coding: utf-8 -*-
+"""C00 parts B/C/D: fixed colour metrics for three frames, two INT8 arms.
+
+Outputs
+  COLOR-METRICS.csv        long table (frame x arm x region x channel)
+  evidence/metrics-raw.json  same numbers plus bucket/tile/ROI bookkeeping
+
+Nothing here corrects, normalises or tone-maps the data: every number is a
+raw signed difference against the captured FP16 reference.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+OUT = Path(__file__).resolve().parent.parent
+B = Path(r"@NR_WORKSPACE@")
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+W = B / "work/dsh-fullnet-static-20261029"
+
+H, WD = 720, 1280
+LUMA = np.array([0.2126, 0.7152, 0.0722])
+BUCKETS = [("dark", 0.0, 0.25), ("mid", 0.25, 0.70), ("bright", 0.70, 1.0e9)]
+
+FRAMES = [(34189, "day-street-static-formal-01"),
+          (41444, "day-street-motion-formal-01"),
+          (43654, "day-street-motion-formal-02")]
+
+ROIS = {
+    "sky-bright":     (646, 155, 700, 205),
+    "building-bright": (706, 150, 762, 232),
+    "ncpd-sign":      (455, 255, 620, 305),
+    "blue-ground":    (100, 600, 300, 672),
+    "blue-wall":      (640, 368, 720, 430),
+    "neutral-wall":   (1090, 192, 1130, 230),
+}
+
+ARMS = {
+    "xe": lambda f: W / f"S02-f01/runs24/run-{f}/replayed-network.bin",
+    "c64": lambda f: Q / f"real-int8-24/c64-family-static/run-{f}/replayed-network.bin",
+}
+
+
+def load(p):
+    a = np.fromfile(p, dtype="<f4")
+    assert a.size == 2 * H * WD * 4, (p, a.size)
+    return a.reshape(2, H, WD, 4).astype(np.float64)
+
+
+def pct(x, q):
+    return float(np.percentile(x, q)) if x.size else float("nan")
+
+
+def chan_metrics(ref, cand):
+    """ref/cand: 1-D float64 sample arrays of one channel background."""
+    d = cand - ref
+    a = np.abs(d)
+    return {
+        "npx": int(d.size),
+        "ref_mean": float(ref.mean()),
+        "cand_mean": float(cand.mean()),
+        "signed_mean": float(d.mean()),
+        "mae": float(a.mean()),
+        "rmse": float(np.sqrt((d * d).mean())),
+        "abs_p95": pct(a, 95.0),
+        "abs_p99": pct(a, 99.0),
+        "abs_max": float(a.max()) if a.size else float("nan"),
+        "ref_clip_frac": float((ref >= 1.0).mean()),
+        "cand_clip_frac": float((cand >= 1.0).mean()),
+    }
+
+
+def group_metrics(ref_rgb, cand_rgb):
+    """ref_rgb/cand_rgb: Nx3 float64. Returns per-channel + derived rows."""
+    out = {}
+    for i, ch in enumerate("RGB"):
+        out[ch] = chan_metrics(ref_rgb[:, i], cand_rgb[:, i])
+    ref_y = ref_rgb @ LUMA
+    cand_y = cand_rgb @ LUMA
+    out["Y"] = chan_metrics(ref_y, cand_y)
+    ref_rg, cand_rg = ref_rgb[:, 0] - ref_rgb[:, 1], cand_rgb[:, 0] - cand_rgb[:, 1]
+    out["RG"] = chan_metrics(ref_rg, cand_rg)
+    ref_bg, cand_bg = ref_rgb[:, 2] - ref_rgb[:, 1], cand_rgb[:, 2] - cand_rgb[:, 1]
+    out["BG"] = chan_metrics(ref_bg, cand_bg)
+    any_ref = (ref_rgb >= 1.0).any(axis=1)
+    any_cand = (cand_rgb >= 1.0).any(axis=1)
+    out["ANY"] = {"npx": int(ref_rgb.shape[0]),
+                  "ref_clip_frac": float(any_ref.mean()),
+                  "cand_clip_frac": float(any_cand.mean())}
+    return out
+
+
+def sel(arr, mask):
+    """arr: HxWxC, mask: HxW bool -> NxC"""
+    return arr[mask]
+
+
+def main():
+    rows = []
+    raw = {"frames": [], "definitions": {
+        "array": "little-endian float32, shape [2,720,1280,4]",
+        "plane0": "delivered RGB (clamped to [0,1]) + alpha",
+        "plane1": "unclamped network RGB + network alpha; NOT an independent history image "
+                  "(verified plane0 == clip(plane1) to <= 3e-8)",
+        "luma_proxy": "Y = 0.2126R + 0.7152G + 0.0722B on FP16 reference plane0; display proxy only, "
+                      "colour space / transfer function of the output buffer is UNVERIFIED, so no Lab/dE is reported",
+        "buckets": {"dark": "<0.25", "mid": "0.25<=Y<0.70", "bright": ">=0.70",
+                    "threshold_source": "FP16 reference plane0 luma (fixed once, same mask both arms)"},
+        "clip_definition": "clip_frac = fraction of samples with channel value >= 1.0 (exact, post-clamp plane0); "
+                           "ref = FP16, cand = INT8 arm",
+        "percentile": "numpy linear interpolation on |error| over all samples in the region",
+        "tiles": "32x32 screen-space grid, 23 rows (last row is 16 px tall) x 40 cols = 920 tiles",
+    }}
+
+    for frame, seq in FRAMES:
+        fdir = Q / f"dataset/{seq}/0-{frame}"
+        ref = load(fdir / "network-output.bin")
+        ref_rgb = ref[0, :, :, :3]
+        ref_a = ref[0, :, :, 3]
+        ref_p1_rgb = ref[1, :, :, :3]
+        ref_p1_a = ref[1, :, :, 3]
+        y_ref = ref_rgb @ LUMA
+
+        masks = {}
+        for name, lo, hi in BUCKETS:
+            masks[name] = (y_ref >= lo) & (y_ref < hi) if hi < 1e8 else (y_ref >= lo)
+        masks["clipped_any"] = (ref_rgb >= 1.0).any(axis=2)
+        masks["unclipped_exceed"] = (ref_p1_rgb > 1.0).any(axis=2)
+
+        frame_rec = {"frame": frame, "sequence": seq,
+                     "bucket_pixels": {k: int(v.sum()) for k, v in masks.items()},
+                     "bucket_fraction": {k: float(v.mean()) for k, v in masks.items()},
+                     "arms": {}}
+        print(f"frame {frame} {seq}: buckets " + ", ".join(
+            f"{k}={int(m.sum())} ({m.mean()*100:.2f}%)" for k, m in masks.items() if k in ("dark", "mid", "bright")))
+
+        for arm, path_fn in ARMS.items():
+            cand = load(path_fn(frame))
+            cand_rgb = cand[0, :, :, :3]
+            cand_a = cand[0, :, :, 3]
+            arm_rec = {"replayed": str(path_fn(frame)).replace("\\", "/"),
+                       "scopes": {}}
+
+            def emit(region, rid, ch_metrics):
+                for ch, m in ch_metrics.items():
+                    row = {"frame": frame, "arm": arm, "region": region, "region_id": rid, "channel": ch}
+                    row.update(m)
+                    rows.append(row)
+                return ch_metrics
+            arm_rec["scopes"]["global"] = emit("global", "all",
+                                               group_metrics(ref_rgb.reshape(-1, 3),
+                                                             cand_rgb.reshape(-1, 3)))
+
+            # ---- fixed luma buckets (FP16-defined mask, shared)
+            arm_rec["scopes"]["buckets"] = {}
+            for name, _lo, _hi in BUCKETS:
+                m = masks[name]
+                arm_rec["scopes"]["buckets"][name] = emit(
+                    f"bucket:{name}", name,
+                    group_metrics(ref_rgb[m], cand_rgb[m]))
+
+            # ---- clipping-focused scopes
+            bright_not_clipped = masks["bright"] & ~masks["clipped_any"]
+            bright_clipped = masks["bright"] & masks["clipped_any"]
+            arm_rec["scopes"]["clip"] = {
+                "clipped_any": emit("clip:ref-clipped", "clipped_any",
+                                    group_metrics(ref_rgb[masks["clipped_any"]],
+                                                  cand_rgb[masks["clipped_any"]])),
+                "unclipped_exceed": emit("clip:ref-unclipped-exceeds-1", "unclipped_exceed",
+                                         group_metrics(ref_rgb[masks["unclipped_exceed"]],
+                                                       cand_rgb[masks["unclipped_exceed"]])),
+                "bright_not_clipped": emit("clip:bright-not-clipped", "bright_not_clipped",
+                                           group_metrics(ref_rgb[bright_not_clipped],
+                                                         cand_rgb[bright_not_clipped])),
+                "bright_clipped": emit("clip:bright-clipped", "bright_clipped",
+                                       group_metrics(ref_rgb[bright_clipped],
+                                                     cand_rgb[bright_clipped])),
+                "plane1_global": emit("plane1:global", "unclipped",
+                                      group_metrics(ref_p1_rgb.reshape(-1, 3),
+                                                    cand[1, :, :, :3].reshape(-1, 3))),
+                "plane1_exceed_ref": int((ref_p1_rgb > 1.0).sum()),
+                "plane1_exceed_cand": int((cand[1, :, :, :3] > 1.0).sum()),
+                "plane0_alpha_all_one_ref": bool((ref_a == 1.0).all()),
+                "plane0_alpha_all_one_cand": bool((cand_a == 1.0).all()),
+                "plane1_alpha": {
+                    "npx": int(ref_p1_a.size),
+                    "ref_mean": float(ref_p1_a.mean()),
+                    "cand_mean": float(cand[1, :, :, 3].mean()),
+                    "signed_mean": float((cand[1, :, :, 3] - ref_p1_a).mean()),
+                    "mae": float(np.abs(cand[1, :, :, 3] - ref_p1_a).mean()),
+                    "rmse": float(np.sqrt(((cand[1, :, :, 3] - ref_p1_a) ** 2).mean())),
+                },
+            }
+
+            # ---- 32x32 tiles
+            tiles = []
+            ycuts = list(range(0, H, 32)) + [H]
+            xcuts = list(range(0, WD, 32)) + [WD]
+            d_rgb = cand_rgb - ref_rgb
+            for yi in range(len(ycuts) - 1):
+                for xi in range(len(xcuts) - 1):
+                    y0, y1, x0, x1 = ycuts[yi], ycuts[yi + 1], xcuts[xi], xcuts[xi + 1]
+                    d = d_rgb[y0:y1, x0:x1].reshape(-1, 3)
+                    r = ref_rgb[y0:y1, x0:x1].reshape(-1, 3)
+                    c = cand_rgb[y0:y1, x0:x1].reshape(-1, 3)
+                    dl = (c - r) @ LUMA
+                    tiles.append({
+                        "tile": f"{x0}_{y0}", "x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0,
+                        "npx": int(d.shape[0]),
+                        "ref_Y_mean": float((r @ LUMA).mean()),
+                        "signed_mean_R": float(d[:, 0].mean()),
+                        "signed_mean_G": float(d[:, 1].mean()),
+                        "signed_mean_B": float(d[:, 2].mean()),
+                        "mae_R": float(np.abs(d[:, 0]).mean()),
+                        "mae_G": float(np.abs(d[:, 1]).mean()),
+                        "mae_B": float(np.abs(d[:, 2]).mean()),
+                        "mae_Y": float(np.abs(dl).mean()),
+                        "signed_mean_Y": float(dl.mean()),
+                        "rmse_Y": float(np.sqrt((dl * dl).mean())),
+                        "max_abs": float(np.abs(d).max()),
+                    })
+            arm_rec["tiles"] = tiles
+
+            # ---- fixed ROIs
+            arm_rec["scopes"]["roi"] = {}
+            arm_rec["roi_meta"] = {}
+            for name, (x0, y0, x1, y1) in ROIS.items():
+                m = np.zeros((H, WD), bool)
+                m[y0:y1, x0:x1] = True
+                g = group_metrics(ref_rgb[m], cand_rgb[m])
+                arm_rec["scopes"]["roi"][name] = emit(f"roi:{name}", name, g)
+                ry = ref_rgb[m] @ LUMA
+                arm_rec["roi_meta"][name] = {
+                    "box": [x0, y0, x1, y1], "npx": int(m.sum()),
+                    "ref_Y_mean": float(ry.mean()),
+                    "ref_bucket_frac": {b: float(((ry >= lo) & (ry < hi)).mean())
+                                        for b, lo, hi in BUCKETS},
+                    "ref_clip_frac_any": float((ref_rgb[m] >= 1.0).any(axis=1).mean()),
+                }
+            frame_rec["arms"][arm] = arm_rec
+            g = arm_rec["scopes"]["global"]
+            b = arm_rec["scopes"]["buckets"]["bright"]
+            print(f"  {arm}: global R{g['R']['signed_mean']:+.5f} G{g['G']['signed_mean']:+.5f} "
+                  f"B{g['B']['signed_mean']:+.5f} | bright R{b['R']['signed_mean']:+.5f} "
+                  f"G{b['G']['signed_mean']:+.5f} B{b['B']['signed_mean']:+.5f} "
+                  f"(n={b['R']['npx']}) | tiles={len(tiles)}")
+        raw["frames"].append(frame_rec)
+
+    # ---- CSV
+    cols = ["frame", "arm", "region", "region_id", "channel", "npx", "ref_mean", "cand_mean",
+            "signed_mean", "mae", "rmse", "abs_p95", "abs_p99", "abs_max",
+            "ref_clip_frac", "cand_clip_frac"]
+    lines = [",".join(cols)]
+    for r in rows:
+        vals = []
+        for c in cols:
+            v = r.get(c, "")
+            if isinstance(v, float):
+                vals.append("" if v != v else f"{v:.9g}")
+            else:
+                vals.append(str(v))
+        lines.append(",".join(vals))
+    (OUT / "COLOR-METRICS.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (OUT / "evidence").mkdir(parents=True, exist_ok=True)
+    (OUT / "evidence/metrics-raw.json").write_text(json.dumps(raw, indent=1), encoding="utf-8")
+    print("rows", len(rows), "->", OUT / "COLOR-METRICS.csv")
+
+
+if __name__ == "__main__":
+    main()

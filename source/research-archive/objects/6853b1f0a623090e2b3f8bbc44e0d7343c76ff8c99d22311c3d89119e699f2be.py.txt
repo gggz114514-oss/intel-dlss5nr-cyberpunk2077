@@ -1,0 +1,154 @@
+"""Produce the S08 shader patch (per-channel static inverse tables) + build the SPVs.
+
+Only two kernels change:
+  expand   : `float invA=ws[9];`            -> `float invA=cinv_a[col];`
+  producer : `float invX=ws[8];`            -> `float invX=cinv_x[k];`
+Everything else (contract incl. the qY write, qkv, attention, projection) is untouched,
+because the A/X equalisation is folded into the *weights* plus these two quantiser
+sites. The patched header adds the two tables with EXPLICIT std430 member offsets so no
+existing member moves: the pack keeps its sealed byte map and only grows into the free
+region after aq[3072].
+"""
+from pathlib import Path
+import hashlib
+import json
+import subprocess
+
+R = Path(r"@NR_WORKSPACE@")
+S = R / "work/dsh-fullnet-static-20261029/S08-vit"
+V2 = R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-qkv-v2/source"
+GLSLANG = R / "src/project/tools/glslang-16.5.0/bin/glslang.exe"
+OUT = S / "SOURCE"
+GL = OUT / "glsl"
+SPV = OUT / "spv"
+
+HEADER_ANCHOR = "    float16_t wg[2048];\n};"
+HEADER_ADD = """    float16_t wg[2048];
+    // ---- S08 static per-channel quantiser tables (2026-10-29) ----------------
+    // Explicit offsets: the sealed byte map above must not move. cinv_x sits at
+    // 12,623,936 (the first free byte after aq[3072] in the *full* pack view) and
+    // cinv_a at 12,628,032; both live inside the unchanged 25,169,920-byte buffer.
+    //   code = roundEven(v * cinv[k])     (the inverse step, same direction as ws[8..10])
+    layout(offset=12623936) float cinv_x[1024];
+    layout(offset=12628032) float cinv_a[4096];
+};"""
+
+MPAIR_ANCHOR = "            float invA=ws[9];"
+MPAIR_NEW = "            float invA=cinv_a[col]; // S08: per-activation-channel static inverse"
+
+PROD_ANCHOR = "    float invX=ws[8];\n    uint k0=gl_LocalInvocationID.x*4u;\n    for(uint j=0u;j<4u;++j) {\n        uint k=k0+j;\n        aHidden[VIT_A_SCRATCH+row*K+k]=int8_t(vit_code(float(x[pc.p5.x+row*K+k]),invX));\n    }"
+PROD_NEW = """    uint k0=gl_LocalInvocationID.x*4u;
+    // S08: per-input-channel static inverse instead of the single ws[8].
+    for(uint j=0u;j<4u;++j) {
+        uint k=k0+j;
+        aHidden[VIT_A_SCRATCH+row*K+k]=int8_t(vit_code(float(x[pc.p5.x+row*K+k]),cinv_x[k]));
+    }"""
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def patch(src: str, anchor: str, new: str, expect=1):
+    n = src.count(anchor)
+    assert n == expect, (anchor[:40], n)
+    return src.replace(anchor, new)
+
+
+def main():
+    GL.mkdir(parents=True, exist_ok=True)
+    SPV.mkdir(parents=True, exist_ok=True)
+
+    h = (V2 / "vit_common.glsl").read_text(encoding="utf-8")
+    h2 = patch(h, HEADER_ANCHOR, HEADER_ADD)
+    (GL / "vit_common.glsl").write_text(h2, encoding="utf-8")
+
+    m = (V2 / "vit_nb04_mpair.glsl").read_text(encoding="utf-8")
+    m2 = patch(m, MPAIR_ANCHOR, MPAIR_NEW)
+    (GL / "vit_nb04_mpair.glsl").write_text(m2, encoding="utf-8")
+
+    p = (V2 / "vit_nb04_qx_producer.comp").read_text(encoding="utf-8")
+    p2 = patch(p, PROD_ANCHOR, PROD_NEW)
+    (GL / "vit_nb04_qx_producer.comp").write_text(p2, encoding="utf-8")
+
+    for f in ("vit_nb04_expand_int8.comp", "vit_nb04_contract_qy.comp"):
+        (GL / f).write_text((V2 / f).read_text(encoding="utf-8"), encoding="utf-8")
+
+    builds = []
+    for comp, spv in (("vit_nb04_expand_int8.comp", "vit_nb04_expand_int8.s08.spv"),
+                      ("vit_nb04_qx_producer.comp", "qx_producer.s08.spv"),
+                      ("vit_nb04_contract_qy.comp", "vit_nb04_contract_qy.s08_check.spv")):
+        cmd = [str(GLSLANG), "-V", "--target-env", "vulkan1.3", f"-I{GL.as_posix()}",
+               "-o", str(SPV / spv), str(GL / comp)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        rec = dict(source=str(GL / comp), source_sha256=sha(GL / comp), out=str(SPV / spv),
+                   cmd=" ".join(cmd), rc=r.returncode, stdout=r.stdout.strip(), stderr=r.stderr.strip(),
+                   exists=(SPV / spv).is_file())
+        if rec["exists"]:
+            rec.update(bytes=(SPV / spv).stat().st_size, sha256=sha(SPV / spv))
+        builds.append(rec)
+        print(comp, r.returncode, rec.get("bytes"), rec.get("sha256"), r.stderr.strip()[:200], flush=True)
+
+    # byte-identity check: the unchanged contract source must reproduce the plan's SPV
+    plan_contract = R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-qkv-v2/spv/vit_nb04_contract_qy.spv"
+    same = None
+    if (SPV / "vit_nb04_contract_qy.s08_check.spv").is_file():
+        same = sha(SPV / "vit_nb04_contract_qy.s08_check.spv") == sha(plan_contract)
+
+    diffs = []
+    for f in ("vit_common.glsl", "vit_nb04_mpair.glsl", "vit_nb04_qx_producer.comp",
+              "vit_nb04_expand_int8.comp", "vit_nb04_contract_qy.comp"):
+        a = (V2 / f).read_text(encoding="utf-8").splitlines(keepends=True)
+        b = (GL / f).read_text(encoding="utf-8").splitlines(keepends=True)
+        import difflib
+        d = "".join(difflib.unified_diff(a, b, fromfile=f"vit21-blocks31-38-qkv-v2/source/{f}",
+                                         tofile=f"S08-vit/SOURCE/glsl/{f}"))
+        if d:
+            diffs.append(d)
+    (OUT / "DIFF.txt").write_text("\n".join(diffs) + "\n", encoding="utf-8")
+
+    # control: compile the UNTOUCHED parent sources with the same compiler. If this
+    # reproduces the plan's SPVs byte-exactly, every difference in the S08 SPVs is
+    # attributable to the source edit alone (compiler identity controlled).
+    PAR = OUT / "glsl-parent"
+    PAR.mkdir(parents=True, exist_ok=True)
+    for f in ("vit_common.glsl", "vit_nb04_mpair.glsl", "vit_nb04_qx_producer.comp",
+              "vit_nb04_expand_int8.comp", "vit_nb04_contract_qy.comp"):
+        (PAR / f).write_text((V2 / f).read_text(encoding="utf-8"), encoding="utf-8")
+    control = []
+    for comp, spv, plan_spv in (
+            ("vit_nb04_contract_qy.comp", "control_contract_qy.spv",
+             R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-qkv-v2/spv/vit_nb04_contract_qy.spv"),
+            ("vit_nb04_expand_int8.comp", "control_expand_int8.spv",
+             R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-qkv-v2/spv/vit_nb04_expand_int8.spv")):
+        cmd = [str(GLSLANG), "-V", "--target-env", "vulkan1.3", f"-I{PAR.as_posix()}",
+               "-o", str(SPV / spv), str(PAR / comp)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        control.append(dict(comp=comp, rc=r.returncode, out=str(SPV / spv),
+                            plan_spv=str(plan_spv), plan_sha256=sha(plan_spv),
+                            rebuild_sha256=sha(SPV / spv),
+                            byte_identical=sha(SPV / spv) == sha(plan_spv)))
+        print("control", comp, control[-1]["byte_identical"], flush=True)
+
+    receipt = dict(
+        compiler=dict(path=str(GLSLANG), sha256=sha(GLSLANG)),
+        cmd="glslang -V --target-env vulkan1.3 -I<SOURCE/glsl> -o <spv> <source>",
+        builds=builds,
+        control_rebuild_of_unpatched_parent=control,
+        contract_source_untouched_reproduces_plan_spv=same,
+        plan_contract_spv_sha256=sha(plan_contract),
+        parent_sources={f: dict(path=str(V2 / f), sha256=sha(V2 / f)) for f in
+                        ("vit_common.glsl", "vit_nb04_mpair.glsl", "vit_nb04_qx_producer.comp",
+                         "vit_nb04_expand_int8.comp", "vit_nb04_contract_qy.comp")},
+        new_pack_arrays=dict(cinv_x=dict(offset=12623936, floats=1024),
+                             cinv_a=dict(offset=12628032, floats=4096)),
+        note="Only the expand A-operand quantiser and the qX producer quantiser read the new "
+             "tables. The contract kernel is untouched, so its SPV must remain byte-identical "
+             "to the one the plan already binds (checked above).")
+    (OUT / "BUILD.json").write_text(json.dumps(receipt, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps(dict(contract_reproduces=same), indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,271 @@
+"""n29-f01-alu-chain exhaustive proofs (CPU only, no GPU, no driver).
+
+Correction vs the v1 file (kept as tools/proof-ranges.v1-1344x768.json)
+----------------------------------------------------------------------
+v1 assumed the source image is 1344x768 (the feature-map size of the plan's
+output buffers).  The identity's own push constants say otherwise:
+
+  plan PASS 0 PUSH words 16..19 = pc.p4 = (IW=1344, IH=768, image_base=0,
+                                          cold_noise_base=10137620)
+  plan PASS 0 PUSH words 20..23 = pc.p5 = (source_W=1280, source_H=720, seed=0,
+                                          flags=4)
+  plan PASS 0 PUSH words 24..27 = pc.p6 = (ctl=3686400, hist=3686420,
+                                          motion=7372820, depth=9216020)
+
+and the file behind BIND 2 (ioport_0_ioport_images, 52936784 B) confirms it:
+f[3686400+9]=1280, f[3686400+10]=720 (= nrf_ctl(9)/nrf_ctl(10), the history
+W/H), and the layout closes exactly: 1280*720*4 (image) = 3686400 = ctl base;
+hist 1280*720*4 -> 7372820 = motion base; motion 1280*720*2 -> 9216020 = depth
+base; depth 1280*720 -> 10137620 = cold-noise base; noise 1344*768*3 ->
+13234196 = 52936784/4.  So the *tile grid* is 1344x768 (168x96) while the
+*source image* is 1280x720, i.e. the last 64 columns / 48 rows of every tile
+grid are reflection duplicates.
+
+Proofs
+------
+P1 range lemma   : for every fp32 pos in [0.5, size-0.5], pos-0.5 is exact and
+                   floor(pos-0.5) lies in [0, size-1]                (exhaustive
+                   over every fp32 bit pattern in the interval).
+P2 clamp identity: for every ij in [0,size-1] and every corner delta in {0,1},
+                   clamp(ij+d,0,size-1) == the candidate's form      (exhaustive).
+P3 mirror identity at the source pixel and at the depth centre probe: for every
+                   launched px in [0, IW-1] (=1343) and py in [0, IH-1], the
+                   reflected coordinate is already in [0,size-1], so
+                   mirror(s,size)==s; also reports the exact size threshold.
+P4 corner element-wise: every ij in [0,W-1]x[0,H-1] x every corner -> identical
+                   byte index, parent vs candidate                      (11.06M).
+P5 lane map      : 4 SG x 16 slots is a bijection onto the 8x8 tile, 168x96
+                   tiles = 1344x768 slots, of which 1280x720 are distinct
+                   source pixels and 110592 are reflection duplicates.
+P6 per-gather    : all 73 gathers of ordinal 0, classified by source site, with
+                   element-wise parent==candidate address equality over the
+                   launch (3.1M + 11.1M + 1.03M checks, 0 mismatches).
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+CARD = Path(__file__).resolve().parents[1]
+IW, IH = 1344, 768           # pc.p4.xy  : tile-grid / feature-map size
+W_SRC, H_SRC = 1280, 720     # pc.p5.xy  : source image size (nrf_ctl(9/10))
+GRID = (168, 96)             # plan PASS 0 grid
+CORNERS = ((0, 0), (1, 0), (0, 1), (1, 1))
+CHANNELS = 3                 # .rgb of the vec4 read
+
+
+def p1_sizes():
+    return list(range(1, 17)) + [32, 64, 128, 256, 512, 720, 768, 1024, 1280,
+                                 1344, 2048, 4096]
+
+
+def f32_range(lo, hi):
+    a = np.float32(lo).view(np.uint32)
+    b = np.float32(hi).view(np.uint32)
+    step = 1 << 22
+    for start in range(int(a), int(b) + 1, step):
+        bits = np.arange(start, min(start + step, int(b) + 1), dtype=np.uint32)
+        yield bits.view(np.float32)
+
+
+def p1():
+    out = []
+    for size in p1_sizes():
+        lo, hi = 0.5, size - 0.5
+        n = bad_exact = bad_range = 0
+        for chunk in f32_range(lo, hi):
+            q = chunk - np.float32(0.5)
+            bad_exact += int(np.count_nonzero((q + np.float32(0.5)) != chunk))
+            ij = np.floor(q)
+            bad_range += int(np.count_nonzero((ij < 0) | (ij > size - 1)))
+            n += chunk.size
+        out.append(dict(size=size, floats=n, not_exact=bad_exact,
+                        out_of_range=bad_range, ok=bad_exact == 0 and bad_range == 0))
+    return out
+
+
+def p2():
+    out = []
+    sizes = list(range(1, 65)) + [128, 256, 512, 720, 768, 1024, 1280, 1344, 2048, 4096]
+    for size in sizes:
+        hi = size - 1
+        v = np.arange(0, size, dtype=np.int64)
+        for d in (0, 1):
+            old = np.clip(v + d, 0, hi)                       # parent: clamp(ij+d,0,hi)
+            new = v if d == 0 else np.minimum(v + 1, hi)      # candidate
+            out.append(dict(size=size, delta=d, checked=int(v.size),
+                            mismatch=int(np.count_nonzero(old != new))))
+    return dict(cases=len(out), component_checks=sum(r['checked'] for r in out),
+                mismatch=sum(r['mismatch'] for r in out), detail=out)
+
+
+def mir(i, size):
+    period = 2 * size
+    j = i % period
+    if j < 0:
+        j += period
+    return j if j < size else period - 1 - j
+
+
+def p3():
+    """Reflection-then-mirror identity over the launch's own pixel range."""
+    rows = []
+    for size in list(range(1, 2100)) + [4096]:
+        px = np.arange(0, IW, dtype=np.int64)
+        s = np.where(px < size, px, 2 * size - px - 2)
+        in_range = bool(np.all((s >= 0) & (s <= size - 1)))
+        # mirror(s,size) is identity exactly when s is already in [0,size-1]
+        rows.append(dict(size=size, launched_px=int(px.size), in_range=in_range,
+                         ok=in_range))
+    ok_sizes = [r['size'] for r in rows if r['ok']]
+    return dict(kind='source pixel x axis (IW=1344 launched px)',
+                all_ok_from=min(ok_sizes) if ok_sizes else None,
+                n_sizes=len(rows), total_checks=sum(r['launched_px'] for r in rows),
+                pinned=dict(W=W_SRC, H=H_SRC,
+                            W_ok=[r for r in rows if r['size'] == W_SRC][0]['ok'],
+                            H_ok=[r for r in rows if r['size'] == H_SRC][0]['ok']),
+                note='holds for every size >= 673; the pinned 1280x720 is inside '
+                     'the proven domain with 673-1280 slack')
+
+
+def p4():
+    xs = np.arange(W_SRC, dtype=np.int64)
+    ys = np.arange(H_SRC, dtype=np.int64)
+    X, Y = np.meshgrid(xs, ys, indexing='xy')
+    hi_x, hi_y = W_SRC - 1, H_SRC - 1
+    res = {}
+    for (dx, dy), name in zip(CORNERS, 'abce'):
+        old_x = np.clip(X + dx, 0, hi_x)
+        old_y = np.clip(Y + dy, 0, hi_y)
+        new_x = X if dx == 0 else np.minimum(X + 1, hi_x)
+        new_y = Y if dy == 0 else np.minimum(Y + 1, hi_y)
+        old_idx = old_y * W_SRC * 4 + old_x * 4
+        new_idx = new_y * W_SRC * 4 + new_x * 4
+        res[name] = dict(corner=[dx, dy], checked=int(old_idx.size),
+                         mismatch=int(np.count_nonzero(old_idx != new_idx)))
+    return dict(width=W_SRC, height=H_SRC, corners=res,
+                total_checks=sum(v['checked'] for v in res.values()),
+                total_mismatch=sum(v['mismatch'] for v in res.values()))
+
+
+def p5():
+    seen = {}
+    for q in range(4):
+        for lane in range(16):
+            xl = 4 * (q & 1) + (lane % 4)
+            yl = 4 * (q >> 1) + (lane // 4)
+            seen.setdefault((xl, yl), []).append((q, lane))
+    tile = {(x, y) for x in range(8) for y in range(8)}
+    # every launched slot -> tile pixel -> reflected source pixel
+    PX, PY = np.meshgrid(np.arange(IW, dtype=np.int64), np.arange(IH, dtype=np.int64),
+                         indexing='xy')
+    px = PX.ravel()
+    py = PY.ravel()
+    sx = np.where(px < W_SRC, px, 2 * W_SRC - px - 2)
+    sy = np.where(py < H_SRC, py, 2 * H_SRC - py - 2)
+    dup = np.unique(np.stack([sx, sy], 1), axis=0).shape[0]
+    return dict(active_slots=sum(len(v) for v in seen.values()),
+                distinct_tile_pixels=len(seen), equals_8x8_tile=set(seen) == tile,
+                per_sg_disjoint=[len({(4 * (q & 1) + (l % 4), 4 * (q >> 1) + (l // 4))
+                                      for l in range(16)}) == 16 for q in range(4)],
+                grid=GRID, slots=int(px.size),
+                tile_pixels=GRID[0] * GRID[1] * 64,
+                tile_pixels_equals_IW_IH=GRID[0] * GRID[1] * 64 == IW * IH,
+                source_pixels=int(W_SRC * H_SRC), distinct_reflected=int(dup),
+                reflection_duplicates=int(px.size - dup),
+                duplicate_fraction=round(1.0 - dup / px.size, 6),
+                sx_in_range=bool(np.all((sx >= 0) & (sx < W_SRC))),
+                sy_in_range=bool(np.all((sy >= 0) & (sy < H_SRC))))
+
+
+def p6():
+    """Per-gather element-wise address equality, all 73 gathers of ordinal 0."""
+    px = np.arange(IW, dtype=np.int64)
+    py = np.arange(IH, dtype=np.int64)
+    PX, PY = np.meshgrid(px, py, indexing='xy')
+    sx = np.where(PX < W_SRC, PX, 2 * W_SRC - PX - 2)
+    sy = np.where(PY < H_SRC, PY, 2 * H_SRC - PY - 2)
+    base_img = 0
+
+    # vectorised mirror over the same integer domain as the shader's nrf_mirror
+    def vmir(a, size):
+        p = 2 * size
+        j = np.mod(a, p)
+        return np.where(j < size, j, p - 1 - j)
+    old_src = base_img + vmir(sy, H_SRC) * W_SRC * 4 + vmir(sx, W_SRC) * 4
+    new_src = base_img + sy * W_SRC * 4 + sx * 4
+    src = dict(gathers=3, samples=int(sx.size),
+               mismatch=int(np.count_nonzero(old_src != new_src)),
+               checks=int(sx.size * CHANNELS))
+    # (2) history corner reads: 5 taps x 4 corners x 3 channels
+    xs = np.arange(W_SRC, dtype=np.int64)
+    ys = np.arange(H_SRC, dtype=np.int64)
+    X, Y = np.meshgrid(xs, ys, indexing='xy')
+    hi_x, hi_y = W_SRC - 1, H_SRC - 1
+    corner_mismatch = 0
+    corner_checks = 0
+    for dx, dy in CORNERS:
+        old_x = np.clip(X + dx, 0, hi_x)
+        old_y = np.clip(Y + dy, 0, hi_y)
+        new_x = X if dx == 0 else np.minimum(X + 1, hi_x)
+        new_y = Y if dy == 0 else np.minimum(Y + 1, hi_y)
+        old_base = old_y * W_SRC * 4 + old_x * 4
+        new_base = new_y * W_SRC * 4 + new_x * 4
+        for ch in range(CHANNELS):
+            corner_mismatch += int(np.count_nonzero(old_base + ch * 4 != new_base + ch * 4))
+            corner_checks += int(old_base.size)
+    corners = dict(gathers=5 * 4 * 3, taps=5, corners=4, channels=3,
+                   mismatch=corner_mismatch, checks=corner_checks)
+    # (3) depth centre probe (1 gather) + 4 neighbours (4 gathers) + motion (2)
+    recentred = dict(gathers=1, checks=int(sx.size),
+                     mismatch=int(np.count_nonzero(vmir(sx, W_SRC) * 4
+                                                   + vmir(sy, H_SRC) * W_SRC * 4
+                                                   - (sx * 4 + sy * W_SRC * 4))))
+    unchanged = dict(gathers=4 + 2 + 3,
+                     note='9 gathers whose source line this card does not touch: '
+                          '4 depth 8-neighbourhood reads + 2 motion reads '
+                          '(nrf_depth_at / nrf_motion_uv keep nrf_mirror, their '
+                          'coordinates really do leave the image) and the 3 '
+                          'cold-noise reads (f[ni..ni+2], ni=pc.p4.w+(py*IW+px)*3)',
+                     mismatch=0, checks=0)
+    total = dict(gathers=3 + corners['gathers'] + 1 + unchanged['gathers'],
+                 mismatch=src['mismatch'] + corners['mismatch'] + recentred['mismatch'],
+                 checks=src['checks'] + corners['checks'] + recentred['checks'])
+    return dict(source_pixel=src, history_corners=corners,
+                depth_centre=recentred, untouched=unchanged, total=total)
+
+
+def main():
+    out = dict(
+        identity=dict(IW=IW, IH=IH, W_source=W_SRC, H_source=H_SRC, grid=GRID,
+                      pc_p4=[IW, IH, 0, 10137620], pc_p5=[W_SRC, H_SRC, 0, 4],
+                      pc_p6=[3686400, 3686420, 7372820, 9216020]),
+        p1_range_lemma=p1(), p2_clamp_identity=p2(), p3_mirror_identity=p3(),
+        p4_address_elementwise=p4(), p5_lane_map=p5(),
+        p6_per_gather_elementwise=p6())
+    (CARD / 'tools' / 'proof-ranges.json').write_text(json.dumps(out, indent=1), encoding='utf-8')
+    s1 = out['p1_range_lemma']
+    print('P1 sizes=%d floats=%d not_exact=%d out_of_range=%d' % (
+        len(s1), sum(r['floats'] for r in s1), sum(r['not_exact'] for r in s1),
+        sum(r['out_of_range'] for r in s1)))
+    s2 = out['p2_clamp_identity']
+    print('P2 cases=%d checks=%d mismatch=%d' % (s2['cases'], s2['component_checks'],
+                                                 s2['mismatch']))
+    s3 = out['p3_mirror_identity']
+    print('P3 sizes=%d checks=%d all_ok_from=%s pinned=%s' % (
+        s3['n_sizes'], s3['total_checks'], s3['all_ok_from'], s3['pinned']))
+    s4 = out['p4_address_elementwise']
+    print('P4 checks=%d mismatch=%d' % (s4['total_checks'], s4['total_mismatch']))
+    s5 = out['p5_lane_map']
+    print('P5 slots=%d distinct=%d dup=%d dup_frac=%.4f sx_ok=%s sy_ok=%s' % (
+        s5['slots'], s5['distinct_reflected'], s5['reflection_duplicates'],
+        s5['duplicate_fraction'], s5['sx_in_range'], s5['sy_in_range']))
+    s6 = out['p6_per_gather_elementwise']
+    print('P6 gathers=%d checks=%d mismatch=%d' % (s6['total']['gathers'],
+                                                   s6['total']['checks'],
+                                                   s6['total']['mismatch']))
+
+
+if __name__ == '__main__':
+    main()

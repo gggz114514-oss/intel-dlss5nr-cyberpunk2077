@@ -1,0 +1,296 @@
+"""fold_fit.py - clamp-aware fit of the foldable exit family, with a history-free control.
+
+The foldable family is  y' = clamp((1-blend) * clamp(base + A (z-base)) + blend * hist_s).
+Scoring it needs hist_s, which this card recovers with a Python re-implementation of the
+shader's history5 - an unvalidated component (JOBS J4).  The fit is therefore run twice:
+
+  pooled      all sampled pixels; the model then depends on hist_s everywhere
+  lowblend    only pixels with blend < 1e-3, where z is recoverable from the dump with no
+              history model at all (|mix error| <= 1e-3).  A gain measured here is a
+              model-exact gain and cannot be an artefact of the history resampler.
+
+If the two agree, the pooled number is trustworthy; if they disagree, the pooled number is
+inflated by the history model and only the low-blend one may be quoted.
+
+Families: scalar (s*I), diagonal, full 3x3.  Objective is the real clamped squared error,
+optimised by Gauss-Newton with a numeric Jacobian.  The chosen fixed matrix is the mean of the
+three leave-one-sequence-out fits of the low-blend full 3x3 family, scored on all 921,600
+pixels of every frame.
+
+Output: ../FOLD-FIT-<ARM>.json , ../_work/fold-A-<ARM>.npz
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+
+import fold_analysis as fa
+
+OUT = fa.OUT
+SUBSAMPLE = 200_000
+LOW_BLEND = 1e-3
+SEED = 20261029
+
+
+def build_cache(frames, n=SUBSAMPLE):
+    rng = np.random.default_rng(SEED)
+    idx = rng.choice(fa.IW * fa.IH, n, replace=False)
+    cache = []
+    for r in frames:
+        a = fa.frame_arrays(r["post"], r["cand"], r["ref"], keep_ref=True)
+        cache.append({"frame": r["frame"], "seq": r["seq"],
+                      "base": a["base"].reshape(-1, 3)[idx].astype(np.float32),
+                      "z": a["z"].reshape(-1, 3)[idx].astype(np.float32),
+                      "blend": a["blend"].reshape(-1)[idx].astype(np.float32),
+                      "hist": a["hist_s"].reshape(-1, 3)[idx].astype(np.float32),
+                      "ref": a["ref"].reshape(-1, 3)[idx].astype(np.float32)})
+        del a
+    for r in cache:                       # history-free rows: z becomes y_pre exactly
+        m = r["blend"] < LOW_BLEND
+        r["z_exact"] = np.where(m[:, None], r["z"] + (r["blend"] / (1.0 - r["blend"]))[:, None]
+                                * (r["hist"] - r["z"]), r["z"]).astype(np.float32)
+        r["mask_low"] = m
+    return cache
+
+
+def predict(A, base, z, blend, hist):
+    zz = np.clip(base + (z - base) @ np.asarray(A, dtype=np.float64).T, 0.0, 1.0)
+    return np.clip((1.0 - blend)[:, None] * zz + blend[:, None] * hist, 0.0, 1.0)
+
+
+def subset(rows, mask_key=None):
+    if mask_key is None:
+        return rows
+    out = []
+    for r in rows:
+        m = r[mask_key]
+        out.append({"base": r["base"][m], "z": r["z_exact"][m], "blend": r["blend"][m],
+                    "hist": r["hist"][m], "ref": r["ref"][m], "seq": r["seq"]})
+    return out
+
+
+def sse_n(A, rows):
+    tot, n = 0.0, 0
+    for r in rows:
+        e = predict(A, r["base"], r["z"], r["blend"], r["hist"]) - r["ref"]
+        tot += float((e * e).sum())
+        n += e.size
+    return tot, n
+
+
+def psnr_of(A, rows):
+    tot, n = sse_n(A, rows)
+    return float(-10.0 * np.log10(tot / n))
+
+
+def gn_fit(rows, A0=None, iters=35, free=None, eps=1e-5):
+    A = np.zeros((3, 3)) if A0 is None else np.asarray(A0, dtype=np.float64).copy()
+    free = [(i, j) for i in range(3) for j in range(3)] if free is None else free
+    cat = {k: np.concatenate([r[k] for r in rows]) for k in ("base", "z", "blend", "hist", "ref")}
+    base, z, b, h, ref = cat["base"], cat["z"], cat["blend"], cat["hist"], cat["ref"]
+    ref = ref.reshape(-1)
+    for _ in range(iters):
+        pred = predict(A, base, z, b, h)
+        res = (pred.reshape(-1) - ref)
+        cur = float(res @ res)
+        cols = []
+        for (i, j) in free:
+            Ap, Am = A.copy(), A.copy()
+            Ap[i, j] += eps
+            Am[i, j] -= eps
+            cols.append(((predict(Ap, base, z, b, h).reshape(-1) - ref) -
+                         (predict(Am, base, z, b, h).reshape(-1) - ref)) / (2 * eps))
+        Jm = np.stack(cols, axis=1)
+        try:
+            d = np.linalg.solve(Jm.T @ Jm + 1e-9 * np.eye(len(free)), -(Jm.T @ res))
+        except np.linalg.LinAlgError:
+            break
+        step = 1.0
+        moved = False
+        for _ in range(25):
+            trial = A.copy()
+            for k, (i, j) in enumerate(free):
+                trial[i, j] += step * d[k]
+            tr = (predict(trial, base, z, b, h).reshape(-1) - ref)
+            if float(tr @ tr) < cur:
+                A = trial
+                moved = True
+                break
+            step *= 0.5
+        if not moved or np.max(np.abs(step * d)) < 1e-7:
+            break
+    return A
+
+
+def reduce_scalar(A, free):
+    s = float(np.mean([A[i, i] for i in range(3)]))
+    return np.eye(3) * s
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--arm", default="xe", choices=sorted(fa.ARMS))
+    args = ap.parse_args()
+    arm = fa.ARMS[args.arm]
+    jobs = [j for j in json.loads((fa.Q / "real-int8-24/JOBS.json").read_text()) if not j["dump"]]
+    rev = json.loads((OUT / f"REVIEW-LOO-{args.arm.upper()}.json").read_text())
+    C = np.asarray(rev["models"]["m3b_3x3_plus_bias"]["fixed_mean_transform"]["coefficient_matrix"])
+    m_eff, b_eff = C[:3].T.copy(), C[3].copy()
+    frames = [{"frame": j["frame"], "seq": j["sequence"],
+               "post": Path(j["reference"]).parent / "post.bin",
+               "cand": arm["dir"] / f"run-{j['frame']}/replayed-network.bin",
+               "ref": Path(j["reference"])} for j in jobs]
+    seqs = sorted({r["seq"] for r in frames})
+    cache = build_cache(frames)
+    low = subset(cache, "mask_low")
+    n_low = sum(len(r["base"]) for r in low)
+    n_all = sum(len(r["base"]) for r in cache)
+    print(f"cache {len(cache)} frames, pooled {n_all} px, low-blend {n_low} px "
+          f"({100.0 * n_low / n_all:.1f}%)", flush=True)
+
+    d = np.concatenate([((1.0 - r["blend"])[:, None] * (r["z"] - r["base"])) for r in cache])
+    sv = np.linalg.svd(d.T @ d, compute_uv=False)
+    cond = {"design_singular_values": sv.tolist(),
+            "design_condition_number": float(sv[0] / max(sv[-1], 1e-30)),
+            "design_corrcoef": np.corrcoef(d.T).tolist(),
+            "reading": "the three channels of z-base are nearly collinear, so the unconstrained "
+                       "linearised 3x3 is ill-conditioned; the clamped Gauss-Newton fit on the "
+                       "real objective is the one used here"}
+
+    fams = {"scalar": [(0, 0), (1, 1), (2, 2)], "diag": [(0, 0), (1, 1), (2, 2)],
+            "full3x3": [(i, j) for i in range(3) for j in range(3)]}
+    fits = {}
+    for space_name, rows in (("pooled", cache), ("lowblend", low)):
+        fits[space_name] = {}
+        for name, free in fams.items():
+            A0 = m_eff if name == "full3x3" else np.eye(3)
+            A = gn_fit(rows, A0, free=free, iters=35 if name == "full3x3" else 20)
+            if name == "scalar":
+                A = reduce_scalar(A, free)
+            fits[space_name][name] = {"A": A.tolist(),
+                                      "psnr_in_sample_subsample": psnr_of(A, rows),
+                                      "psnr_identity_subsample": psnr_of(np.eye(3), rows)}
+            print(f"   {space_name:<9} {name:<8} in-sample {fits[space_name][name]['psnr_in_sample_subsample']:.4f} dB "
+                  f"A={np.round(A, 4).tolist()}", flush=True)
+
+    # LOO on the history-free subset for the full 3x3 family (the family we will ship)
+    loo = []
+    for held in seqs:
+        tr = [r for r in low if r["seq"] != held]
+        te = [r for r in low if r["seq"] == held]
+        A = gn_fit(tr, m_eff, free=fams["full3x3"], iters=35)
+        b0 = psnr_of(np.eye(3), te)
+        c0 = psnr_of(A, te)
+        loo.append({"held_out": held, "base_db": b0, "corrected_db": c0, "gain_db": c0 - b0,
+                    "A": A.tolist()})
+        print(f"   LOO lowblend {held:<28} {b0:.4f} -> {c0:.4f}  {c0 - b0:+.4f}", flush=True)
+    A_low = np.mean([np.asarray(v["A"]) for v in loo], axis=0)
+    A_pooled = np.asarray(fits["pooled"]["full3x3"]["A"])
+
+    # ---------------------------------------------------------------- full-resolution scoring
+    def full_eval(A):
+        acc = {}
+        for s in seqs:
+            acc[s] = {"base": [0.0, 0], "fold": [0.0, 0], "post": [0.0, 0],
+                      "lb_base": [0.0, 0], "lb_fold": [0.0, 0], "lb_post": [0.0, 0]}
+        for r in frames:
+            a = fa.frame_arrays(r["post"], r["cand"], r["ref"])
+            m = a["blend"] < LOW_BLEND
+            tgt_fold = fa.fold_predict(A, a["base"], a["z"], a["blend"], a["hist_s"])
+            tgt_post = np.clip(a["y_disp"] @ m_eff.T + b_eff, 0.0, 1.0)
+            slot = acc[r["seq"]]
+            for tag, pred in (("base", a["y_disp"]), ("fold", tgt_fold), ("post", tgt_post)):
+                e = (pred - a["ref"]) ** 2
+                slot[tag][0] += float(e.sum())
+                slot[tag][1] += e.size
+                em = e[m]
+                slot["lb_" + tag][0] += float(em.sum())
+                slot["lb_" + tag][1] += em.size
+            del a, tgt_fold, tgt_post
+        out = {}
+        for s in seqs:
+            k = acc[s]
+            row = {}
+            for tag in ("base", "fold", "post"):
+                row[tag] = float(-10.0 * np.log10(k[tag][0] / k[tag][1]))
+                row["low_" + tag] = float(-10.0 * np.log10(k["lb_" + tag][0] / k["lb_" + tag][1]))
+            row["gain_fold"] = row["fold"] - row["base"]
+            row["gain_post"] = row["post"] - row["base"]
+            row["low_gain_fold"] = row["low_fold"] - row["low_base"]
+            row["low_gain_post"] = row["low_post"] - row["low_base"]
+            out[s] = row
+        out["mean"] = {k: float(np.mean([out[s][k] for s in seqs]))
+                       for k in out[seqs[0]]}
+        return out
+
+    print("\n== full resolution scoring (all 921600 px, and the history-free subset)", flush=True)
+    full_low = full_eval(A_low)
+    full_pooled = full_eval(A_pooled)
+    for tag, v in (("A_lowblend_fit", full_low), ("A_pooled_fit", full_pooled)):
+        print(f"   {tag}: pooled gain {v['mean']['gain_fold']:+.4f} dB   "
+              f"low-blend gain {v['mean']['low_gain_fold']:+.4f} dB   "
+              f"post-pass pooled {v['mean']['gain_post']:+.4f} / low {v['mean']['low_gain_post']:+.4f}",
+              flush=True)
+
+    # ---------------------------------------------------------------- hist_s robustness check
+    pert = {}
+    for c in (-0.05, 0.05):
+        rows = []
+        for r in cache:
+            dh = c * (r["hist"] - r["base"])
+            b = r["blend"]
+            z2 = (r["z"] - (b / np.maximum(1.0 - b, 1e-6))[:, None] * dh).astype(np.float32)
+            rows.append({"base": r["base"], "z": z2, "blend": b,
+                         "hist": (r["hist"] + dh).astype(np.float32), "ref": r["ref"],
+                         "seq": r["seq"]})
+        A = gn_fit(rows, m_eff, free=fams["full3x3"], iters=35)
+        pert[f"{c:+.2f}"] = {"A": A.tolist(), "psnr_in_sample": psnr_of(A, rows),
+                             "psnr_identity": psnr_of(np.eye(3), rows),
+                             "gain_db": psnr_of(A, rows) - psnr_of(np.eye(3), rows)}
+        print(f"   hist perturb {c:+.2f}: in-sample gain {pert[f'{c:+.2f}']['gain_db']:+.4f} dB  "
+              f"A={np.round(A, 3).tolist()}", flush=True)
+
+    # ---------------------------------------------------------------- fp16 rounding
+    raw = fa.PACK.read_bytes()
+    w = np.frombuffer(raw, dtype="<f2").astype(np.float64)
+    block = w[fa.W_HALF_OFF:fa.W_HALF_OFF + 128].reshape(4, 32).copy()
+    exact = block.copy()
+    exact[:3, :] = A_low @ block[:3, :]
+    f16 = exact.astype(np.float16).astype(np.float64)
+    rounding = {
+        "A": A_low.tolist(),
+        "max_abs_weight_change": float(np.abs(exact[:3] - block[:3]).max()),
+        "rms_weight_before": float(np.sqrt((block[:3] ** 2).mean())),
+        "max_abs_fp16_error": float(np.abs(f16[:3] - exact[:3]).max()),
+        "rms_fp16_error": float(np.sqrt(((f16[:3] - exact[:3]) ** 2).mean())),
+        "row3_bit_identical": bool((f16[3] == block[3]).all()),
+        "new_rows_012": exact[:3, :].tolist(),
+    }
+
+    report = {"schema": "dsh-s03-tail-fold-fit/1", "arm": args.arm, "arm_label": arm["label"],
+              "subsample_per_frame": SUBSAMPLE, "low_blend_threshold": LOW_BLEND, "seed": SEED,
+              "sampled_pixels": {"pooled": n_all, "low_blend": n_low},
+              "design_conditioning": cond,
+              "fits": fits,
+              "loo_lowblend_full3x3": loo,
+              "A_fixed": A_low.tolist(), "A_pooled_fit": A_pooled.tolist(),
+              "full_resolution": {"A_fixed": full_low, "A_pooled_fit": full_pooled},
+              "history_robustness": pert,
+              "postpass_matrix": {"m_eff": m_eff.tolist(), "b": b_eff.tolist()},
+              "fp16_rounding": rounding,
+              "reading": {
+                  "exact": "the low-blend subset needs no history model, so a gain there is "
+                           "model-exact; the pooled gain additionally assumes history5 is right",
+                  "fold_vs_postpass": "compare mean.gain_fold with mean.gain_post",
+              }}
+    (OUT / f"FOLD-FIT-{args.arm.upper()}.json").write_text(json.dumps(report, indent=2),
+                                                           encoding="utf-8")
+    np.savez(OUT / "_work" / f"fold-A-{args.arm}.npz", A_low=A_low, A_pooled=A_pooled,
+             m_eff=m_eff, b=b_eff)
+
+
+if __name__ == "__main__":
+    main()

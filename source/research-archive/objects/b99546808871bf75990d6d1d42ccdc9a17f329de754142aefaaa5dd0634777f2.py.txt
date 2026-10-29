@@ -1,0 +1,154 @@
+"""n31: simulate the D-step edit on the captured ISA graph (CPU only).
+
+Edit under test = delete the operand-swap identity selects:
+    (lower ? x : peer) + (lower ? peer : x)   ->   x + peer
+at all 68 `add acc,acc` sites of the post-0x4A90 region.  In the graph that is
+"bypass the two sel nodes": the add inherits the sels' parents.
+
+The four card metrics are recomputed for both graphs, so the before/after
+comparison is machine-checked rather than asserted.
+"""
+import json
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+CAMP = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(CAMP))
+sys.path.insert(0, str(CAMP / 'cards/n31-f01-dpas-chain/tools'))
+import post_chain as P  # noqa: E402
+
+
+def dst(op):
+    return op.split('<')[0]
+
+
+def srcs(ins):
+    return [o.split('<')[0] for o in ins['ops'][1:]]
+
+
+def find_pairs(isa, lo):
+    last, pairs = {}, []
+    for k, ins in enumerate(isa):
+        if ins['addr'] < lo:
+            continue
+        d = dst(ins['ops'][0]) if ins['ops'] else ''
+        if ins['op'] in ('add', 'add3') and len(ins['ops']) == 3:
+            a, b = dst(ins['ops'][1]), dst(ins['ops'][2])
+            if a.startswith('acc') and b.startswith('acc'):
+                sa, sb = last.get(a), last.get(b)
+                if sa is not None and sb is not None and isa[sa]['op'] == 'sel' and isa[sb]['op'] == 'sel':
+                    oa, ob = srcs(isa[sa]), srcs(isa[sb])
+                    if len(oa) >= 2 and len(ob) >= 2 and oa[0] == ob[1] and oa[1] == ob[0]:
+                        pairs.append((k, sa, sb))
+        if d:
+            last[d] = k
+    return pairs
+
+
+def metrics(isa, par, live_idx, sinks):
+    chain = set()
+    stack = list(sinks)
+    while stack:
+        k = stack.pop()
+        if k in chain:
+            continue
+        chain.add(k)
+        stack.extend(par(k))
+    memo, wmemo = {}, {}
+    for k in sorted(live_idx, key=lambda k: isa[k]['addr']):
+        ps = par(k)
+        memo[k] = 1 + max((memo.get(p, 0) for p in ps), default=0)
+        wmemo[k] = P.LAT.get(isa[k]['op'], 4) + max((wmemo.get(p, 0) for p in ps), default=0)
+    owner, chains = {}, []
+    for k in sorted(chain, key=lambda k: isa[k]['addr']):
+        cand = None
+        for p in sorted(par(k), reverse=True):
+            if p in owner:
+                cand = owner[p]
+                break
+        if cand is None:
+            cand = len(chains)
+            chains.append(dict(lo=isa[k]['addr'], hi=isa[k]['addr'], n=0))
+        owner[k] = cand
+        c = chains[cand]
+        c['n'] += 1
+        c['lo'] = min(c['lo'], isa[k]['addr'])
+        c['hi'] = max(c['hi'], isa[k]['addr'])
+    ev = []
+    for c in chains:
+        ev.append((c['lo'], 1))
+        ev.append((c['hi'] + 1, -1))
+    ev.sort()
+    cur = best = 0
+    best_at = 0
+    for a, d in ev:
+        cur += d
+        if cur > best:
+            best, best_at = cur, a
+    return dict(chain=len(chain), side=len(live_idx) - len(chain),
+                depth=max(memo[k] for k in chain),
+                wdepth=max(wmemo[k] for k in chain),
+                nchains=len(chains), concurrent=best, at=hex(best_at),
+                ops=Counter(isa[k]['op'] for k in chain))
+
+
+def main():
+    isa, by_dw = P.load()
+    post = [i for i in isa if i['addr'] >= P.ENTRY_END]
+    live = [i for i in post if not i['dead']]
+    live_idx = {i['idx'] for i in live}
+    sinks = [i['idx'] for i in live if P.is_send(i) and
+             ('store.' in (i['comment'] or '') or 'signal barrier' in (i['comment'] or '')
+              or 'end of thread' in (i['comment'] or ''))]
+
+    def raw_par(k):
+        out = set()
+        for f, no, dw, cnt in isa[k]['r']:
+            for d in range(dw, dw + cnt):
+                p = P.reaching(by_dw, (f, no, d), k)
+                if p is not None and p in live_idx:
+                    out.add(p)
+        return out
+
+    def par_base(k):
+        return raw_par(k)
+
+    pairs = find_pairs(isa, P.ENTRY_END)
+    bypass_of = {}   # add idx -> set(sel idx)
+    for k, sa, sb in pairs:
+        bypass_of.setdefault(k, set()).update((sa, sb))
+
+    def par_sim(k):
+        ps = raw_par(k)
+        if k not in bypass_of:
+            return ps
+        out = set(ps) - bypass_of[k]
+        for s in bypass_of[k]:
+            out |= raw_par(s)
+            out.discard(s)
+        return {p for p in out if p not in bypass_of}
+
+    a = metrics(isa, par_base, live_idx, sinks)
+    b = metrics(isa, par_sim, live_idx, sinks)
+    print('metric                    before      after     delta')
+    for k in ('chain', 'side', 'depth', 'wdepth', 'nchains', 'concurrent'):
+        print('%-22s %9s %10s %9s' % (k, a[k], b[k], b[k] - a[k]))
+    print('concurrent at: %s -> %s' % (a['at'], b['at']))
+    print('\nop delta on chain (before -> after):')
+    for op in sorted(set(a['ops']) | set(b['ops']), key=lambda o: -(a['ops'][o] - b['ops'][o])):
+        if a['ops'][op] != b['ops'][op]:
+            print('  %-12s %5d -> %5d   (%+d)' % (op, a['ops'][op], b['ops'][op],
+                                                  b['ops'][op] - a['ops'][op]))
+    print('\nsel total live %d  identity sels %d' %
+          (sum(1 for i in live if i['op'] == 'sel'), 2 * len(pairs)))
+    out = dict(before={k: v for k, v in a.items() if k != 'ops'},
+               after={k: v for k, v in b.items() if k != 'ops'},
+               pairs=len(pairs), identity_sels=2 * len(pairs),
+               sel_live=sum(1 for i in live if i['op'] == 'sel'))
+    (CAMP / 'cards/n31-f01-dpas-chain/tools/sim-delete.json').write_text(
+        json.dumps(out, indent=1), encoding='utf-8')
+
+
+if __name__ == '__main__':
+    main()

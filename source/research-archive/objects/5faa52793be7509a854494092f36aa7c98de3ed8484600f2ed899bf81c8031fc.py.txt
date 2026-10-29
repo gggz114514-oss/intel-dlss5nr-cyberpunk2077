@@ -1,0 +1,142 @@
+# C02b (minimal merge): F20 stage 5 keeps the baseline scalar norm verbatim
+# (threads<128, sq[32], exact tree), but the norm thread keeps n in registers
+# and scales its own row inline; stage 5b and shNorm are deleted, one WG
+# barrier is removed. No shuffles, no packing, no lane remapping: every
+# arithmetic op is the baseline's own code shape (baseline ISA = plain half
+# mul/add, verified in the c11529fb capture).
+from pathlib import Path
+import hashlib, json, subprocess, sys
+
+R = Path(__file__).resolve().parent
+A = R.parent
+B = A.parents[1]
+P = A / 'c32-stream-balanced-20261025/f20-score-owner'
+N = R / 'c02e-f20-shared25088'
+N.mkdir(exist_ok=True)
+
+def ident(p):
+    return dict(path=str(p), sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+
+def run(args):
+    r = subprocess.run(list(map(str, args)), capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return r.stdout
+
+s = (P / 'candidate.comp').read_text(encoding='utf-8-sig')
+
+helper = "float16_t nr_c02_tree_add(float16_t x, float16_t y) { return x + y; }"
+helper = helper + chr(10) + chr(10)
+
+s = s.replace("void main() {", helper + "void main() {", 1)
+
+old_decl = "shared float16_t shNorm[256];     // nq[64] nk[64] inv[64]        512 B\n"
+assert s.count(old_decl) == 1
+s = s.replace(old_decl, "")
+
+old5_start = s.index("    // ============ stage 5: Q/K half norm")
+old5_end = s.index("    if (debug) {", old5_start)
+old_block = s[old5_start:old5_end]
+for probe in ["if (t_local < 128u)", "shNorm[t + (isQ ? 0u : 64u)] = n;",
+              "float16_t scalar0 = float16_t(fb[uint(pc.p2.z)]);",
+              "for (uint e = 2u*t_local; e < 4096u; e += 512u) {"]:
+    assert probe in old_block, probe
+
+new_block = """    // ============ stage 5: Q/K norm + inline scale (merged) ================
+    // C02b: the baseline scalar norm verbatim; the norm thread keeps n in a
+    // register and scales its own row in place (Q rows also by scalar0), so
+    // the separate scale pass, shNorm and one WG barrier are removed. Threads
+    // 128..255 have no row and stay idle exactly as in the baseline norm.
+    if (t_local < 128u) {
+        bool isQ = t_local < 64u;
+        uint t = t_local % 64u;
+        uint base = (isQ ? 0u : 2048u) + t * 32u;
+        float16_t rv[32], sq[32];
+        for (uint c = 0u; c < 32u; ++c) {
+            float16_t v = shArena[base + c];
+            rv[c] = v;
+            sq[c] = v * v;
+        }
+        float16_t s[8];
+        for (uint c = 0u; c < 8u; ++c) {
+            float16_t a = nr_c02_tree_add(sq[c], sq[c + 16]);
+            float16_t b = nr_c02_tree_add(sq[c + 8], sq[c + 24]);
+            s[c] = nr_c02_tree_add(a, b);
+        }
+        float16_t t4[4], t2[2];
+        for (uint c = 0u; c < 4u; ++c) t4[c] = nr_c02_tree_add(s[c], s[c + 4]);
+        for (uint c = 0u; c < 2u; ++c) t2[c] = nr_c02_tree_add(t4[c], t4[c + 2]);
+        float16_t sum = nr_c02_tree_add(t2[0], t2[1]);
+        float mx = max(float(sum), float(float16_t(0.000062)));
+        float16_t n = float16_t(inversesqrt(mx));
+        float16_t scalar0 = float16_t(fb[uint(pc.p2.z)]);
+        for (uint c = 0u; c < 32u; ++c) {
+            precise float16_t r = rv[c] * n;
+            if (isQ) r = r * scalar0;
+            shArena[base + c] = r;
+        }
+    }
+    barrier();
+    // ============ end merged norm+scale ============
+
+"""
+s = s[:old5_start] + new_block + s[old5_end:]
+
+post_scale = "    }\n    barrier();\n\n    // ============ stage 6: score + bias/exp"
+assert s.count(post_scale) == 1
+s = s.replace(post_scale, "    }\n\n    // ============ stage 6: score + bias/exp")
+s = s.replace("// ---- shared: 25088 B; no shared score P publication ----",
+              "// ---- shared: 24576 B; no shNorm: scale merged into the norm threads ----")
+
+src = N / 'candidate.comp'; spv = N / 'candidate.spv'
+src.write_text(s, encoding='utf-8')
+run([B / 'src/project/tools/glslang-16.5.0/bin/glslang.exe', '-V', '--target-env', 'vulkan1.3', src, '-o', spv])
+sys.path.insert(0, str(B / 'build/zcode-fp16-compute-backend-20261021/scripts'))
+import spv_tools_local as ST
+pm = ST.Module(P / 'candidate.spv'); cm = ST.Module(spv)
+keep, info = ST.transfer_decoration_pattern_aligned(pm, cm, [])
+assert len(keep) == len(ST.no_contraction_ids(pm)) == 7
+def _names_fadds(module):
+    names, fadds, cur = {}, {}, None
+    for op, ops, _, _ in module.instructions:
+        if op == 54: cur = ops[1]
+        elif op == 56: cur = None
+        elif op == 5:
+            b = b''.join(int(w).to_bytes(4, 'little') for w in ops[1:])
+            names[ops[0]] = b.split(bytes([0]))[0].decode('utf-8', 'replace')
+        elif op == 129 and cur is not None:
+            fadds.setdefault(cur, []).append(ops[1])
+    return names, fadds
+_names, _fadds = _names_fadds(cm)
+_hf = [fid for fid, nm in _names.items() if 'nr_c02_tree_add' in nm]
+assert len(_hf) == 1, _hf
+_tadds = _fadds.get(_hf[0], [])
+assert len(_tadds) == 1, len(_tadds)
+_calls = sum(1 for op, ops, _, _ in cm.instructions if op == 57 and len(ops) > 2 and ops[2] == _hf[0])
+assert _calls == 6, _calls  # 3 in the c-loop body, 1 t4, 1 t2, 1 sum
+ST.set_no_contraction(cm, set(keep) | set(_tadds), spv)
+run([B / 'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe', spv])
+text = (P / 'plan.txt').read_text(encoding='utf-8-sig')
+assert text.count((P / 'candidate.spv').as_posix()) == 1
+plan = N / 'plan.txt'
+plan.write_text(text.replace((P / 'candidate.spv').as_posix(), spv.as_posix()), encoding='utf-8')
+T = A / 'c32-stream-balanced-20261025/f20-peer8-fouracc'
+runner = Path(json.loads((T / 'LUNA-GATES.json').read_text())['identities'][0]['path'])
+cpu = run([runner, '--plan', plan, '--cpu-check'])
+(N / 'CANDIDATE.json').write_text(json.dumps(dict(
+    source=ident(src), spv=ident(spv), plan=ident(plan), parent=ident(P / 'plan.txt'),
+    cpu_check=cpu.strip().splitlines()[-3:], no_contraction_count=7,
+    change='stage5 verbatim + inline per-row scale by the norm thread; stage5b/shNorm/one barrier removed'),
+    indent=2), encoding='utf-8')
+for kind in ['GATES', 'NATIVE']:
+    task = json.loads((T / f'LUNA-{kind}.json').read_text().replace('f20-peer8-fouracc', 'c02e-f20-shared25088'))
+    task['identities'] = [v for v in task['identities'] if not v['path'].endswith('.spv')] + [ident(spv)]
+    for j in task['jobs']:
+        j['plan'] = ident(plan); j['argv'][j['argv'].index('--plan') + 1] = str(plan)
+        if 'candidate' in j: j['candidate'] = 'c02e-f20-shared25088'
+        j['id'] = j['id'].replace('f20-peer8-fouracc', 'c02e-f20-shared25088')
+        j['runner_output'] = str(N / 'run' / j['id'])
+        j['argv'][j['argv'].index('--out') + 1] = str(N / 'run' / j['id'])
+        if kind == 'NATIVE' and not j.get('expected_frame_out'):
+            j['expected_frame_out'] = '1755e9c2fadba97f08cb5b02b7a4294cde3675379bdec75352287505f7e129d6'
+    (N / f'LUNA-{kind}.json').write_text(json.dumps(task, indent=2), encoding='utf-8')
+print(json.dumps(ident(spv)))

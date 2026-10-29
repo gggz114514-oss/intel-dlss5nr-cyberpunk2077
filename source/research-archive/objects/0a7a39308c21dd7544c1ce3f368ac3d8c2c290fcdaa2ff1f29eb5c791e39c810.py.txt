@@ -1,0 +1,137 @@
+"""C00 B-class boundary inventory: producers/consumers/typology for candidate buffers.
+
+Read-only. Emits BOUNDARIES-RAW.json next to this script.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+W = HERE.parent
+sys.path.insert(0, str(W / "tools"))
+import planlib  # noqa: E402
+
+B = Path("@NR_WORKSPACE@")
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+CAND = W / "S02-f01" / "candidate-xe-34189.txt"
+FP16 = B / "work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/backend-merged/plan.txt"
+
+TARGETS = ["block0_out", "block4_out", "block8_out", "block14_out", "block30_out", "block66_out"]
+# companion branches worth reporting
+EXTRA = ["skip4", "skip8", "skip14", "skip30_l3", "block31_out", "vit_block31_QKV"]
+
+TEACHER_DIRS = {
+    "34189": D / "dump-fp16",
+    "41444": D / "teacher-diagnostics/teacher-41444",
+    "43654": D / "teacher-diagnostics/teacher-43654",
+}
+
+
+def dump_for(name: str, frame: str = "34189") -> Path:
+    return TEACHER_DIRS[frame] / f"dump_{name}.bin"
+
+
+def describe(plan: planlib.Plan, name: str) -> dict:
+    buf = plan.buffer(name)
+    pol = next((p for p in plan.policies if p.buffer == buf.index), None)
+    users = []
+    for p in plan.passes:
+        for b in p.binds:
+            if b.buffer == buf.index:
+                others = [plan.buffers[o.buffer].name for o in p.binds if o.buffer != buf.index]
+                users.append({
+                    "ordinal": p.ordinal,
+                    "name": p.name,
+                    "spv": Path(p.spv).name,
+                    "binding": b.binding,
+                    "offset": b.offset,
+                    "bytes": b.bytes,
+                    "other_buffers": others,
+                    "n_binds": len(p.binds),
+                    "push_len": len(p.push or []),
+                })
+    return {
+        "buffer_index": buf.index,
+        "bytes": buf.bytes,
+        "file": buf.file,
+        "policy": None if pol is None else {
+            "resident": pol.resident, "first": pol.first, "last": pol.last, "clear": pol.clear_first},
+        "half_elements": buf.bytes / 2,
+        "users": users,
+    }
+
+
+def main() -> None:
+    cand = planlib.Plan(CAND)
+    # The FP16 baseline plan uses the older unquoted PASS syntax and is NOT planlib-parseable.
+    # Only its BUFFER table is needed (declared half sizes), so read it with a strict regex.
+    fp_buffers = {}
+    fp_problems = []
+    import re as _re
+    buf_re = _re.compile(r'^BUFFER\s+"([^"]+)"\s+(\d+)\s+"([^"]*)"\s*$')
+    for ln, line in enumerate(FP16.read_text(encoding="utf-8").splitlines(), 1):
+        m = buf_re.match(line)
+        if m:
+            fp_buffers[m.group(1)] = {"bytes": int(m.group(2)), "file": m.group(3)}
+    try:
+        planlib.Plan(FP16)
+    except planlib.PlanError as e:
+        fp_problems.append(f"FP16 baseline not planlib-parseable (old syntax): {e}")
+    out = {
+        "candidate": {"path": str(CAND), "sha256": planlib.sha256_file(CAND),
+                      "header": list(cand.header), "problems": cand.validate()},
+        "fp16": {"path": str(FP16), "sha256": planlib.sha256_file(FP16),
+                 "buffer_count": len(fp_buffers), "notes": fp_problems,
+                 "buffers": fp_buffers},
+        "buffers": {},
+    }
+    for name in TARGETS + EXTRA:
+        row = {"candidate": None, "fp16": None, "teacher": {}}
+        try:
+            row["candidate"] = describe(cand, name)
+        except planlib.PlanError as e:
+            row["candidate"] = {"error": str(e)}
+        row["fp16"] = fp_buffers.get(name)
+        for fr in TEACHER_DIRS:
+            p = dump_for(name, fr)
+            row["teacher"][fr] = ({"path": str(p), "bytes": p.stat().st_size,
+                                   "sha256": planlib.sha256_file(p)} if p.is_file() else None)
+        c = row["candidate"]
+        if c and "bytes" in c:
+            t = row["teacher"]["34189"]
+            row["size_match_34189"] = bool(t and t["bytes"] == c["bytes"])
+            row["cand_elems_if_half"] = c["bytes"] / 2
+            row["teacher_elems_if_half"] = (t["bytes"] / 2) if t else None
+            row["bytes_ratio_cand_over_teacher"] = (c["bytes"] / t["bytes"]) if t else None
+        out["buffers"][name] = row
+
+    # whole-plan inventory: which candidate buffers have a same-size half teacher dump
+    teacher_names = {p.name[len("dump_"):-len(".bin")] for p in TEACHER_DIRS["34189"].glob("dump_*.bin")}
+    inv = []
+    for b in cand.buffers:
+        if b.name in teacher_names:
+            t = dump_for(b.name)
+            inv.append({"name": b.name, "cand_bytes": b.bytes, "teacher_bytes": t.stat().st_size,
+                        "equal": t.stat().st_size == b.bytes,
+                        "policy": next(({"resident": p.resident, "first": p.first, "last": p.last}
+                                        for p in cand.policies if p.buffer == b.index), None),
+                        "n_users": sum(1 for p in cand.passes for x in p.binds if x.buffer == b.index)})
+    out["same_name_teacher_dumps"] = inv
+    out["count_same_name"] = len(inv)
+    out["count_same_size"] = sum(1 for r in inv if r["equal"])
+    out["count_size_mismatch"] = sum(1 for r in inv if not r["equal"])
+
+    (HERE / "BOUNDARIES-RAW.json").write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps({
+        "cand_header": out["candidate"]["header"], "cand_problems": out["candidate"]["problems"],
+        "same_name_dumps": out["count_same_name"],
+        "same_size": out["count_same_size"], "size_mismatch": out["count_size_mismatch"],
+        "mismatches": [r["name"] for r in inv if not r["equal"]],
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()

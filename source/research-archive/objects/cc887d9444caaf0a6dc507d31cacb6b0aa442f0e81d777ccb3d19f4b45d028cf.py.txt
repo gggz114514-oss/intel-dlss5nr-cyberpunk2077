@@ -1,0 +1,96 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys
+R=Path(__file__).resolve().parent;A=R.parent;B=A.parents[1]
+P=A/'c32-norm-owner-20261025/f20-den-pv-owner';N=R/'f20-peer8-single';N.mkdir(exist_ok=True)
+rd=lambda p:json.loads(p.read_text(encoding='utf-8-sig'))
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(args):
+ p=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert p.returncode==0,p.stdout+p.stderr;return p.stdout
+
+# Independent mapping and ordered-consumer proof.
+production={};stores={};consumption={}
+for sg in range(8):
+ for h in range(4):
+  k=(sg%2)*4+h
+  for m in [sg,sg^1]:
+   key=(m,k);assert key not in production;production[key]=sg
+   if m!=sg:stores[key]=sg
+for sg in range(8):
+ for k in range(8):
+  key=(sg,k);prod=production[key]
+  assert prod==sg or stores[key]==(sg^1)
+  consumption[key]=dict(producer=prod,consumer=sg,transport='register' if prod==sg else 'SLM')
+assert len(production)==64 and len(stores)==32
+proof=dict(all_64_expand_tiles_unique=True,contract_K_order=list(range(0,128,16)),
+ active_SG=dict(expand=[8,8],contract=[8,8],QKV=[8,8]),
+ weight_tile_reads=dict(expand=[64,64],contract=[128,128],QKV=[96,96]),
+ logical_SLM_bytes=dict(activation_write=[16384,8192],activation_read=[16384,8192],X_read=[20480,12288],Y_write=[4096,4096],Y_QKV_read=[0,0]),
+ normal_barriers=dict(activation_publication=[1,1],Y_retirement=[1,1]),
+ lifecycle='Production scope has four half X fragments32B/lane + four own half fragments32 + two current expansion f32 fragments32: conservative96B/lane subtotal. No contract accumulators exist in that scope. X dies before publication. Reload own X only for half seed, then contract32+own32 plus current inputs. No simultaneous X+expand+contract peak. Native scratch gate remains required.',
+ synchronization='All 32 peer tiles published once. No overlapping writers. Existing Y barrier retires all peer reads before QKV arena reuse. Uniform SG parity branch contains no barriers.',
+ rounding='Expansion zero,K0,K16,half,nr_act_h unchanged. Seed H(X*rs) is computed later using unchanged shX. Contract K0..112 in BOTH parity arms, then half. No partial sums or reordered accumulations.',
+ cost_boundary='Same weight reads and normal barriers as P03; 24KiB/WG fewer logical SLM bytes. Compared with peer8, extra4KiB X reads avoid keeping contract accumulators during expansion; four own half fragments held instead of two. One parity branch per contraction, native lowering unproven.')
+(N/'PROOF.json').write_text(json.dumps(proof,indent=2))
+(N/'PEER-MAP.json').write_text(json.dumps({str(k):v for k,v in consumption.items()},indent=2))
+s=(P/'candidate.comp').read_text(encoding='utf-8-sig');original=s
+lines=['    // One publication: delay contract seed/accumulators until expansion retires.',
+       '    MAT_A handoff0,handoff1;', '    {','        uint m0=sg*8u,mp=(sg^1u)*8u;',
+       '        MAT_A own0,own1,own2,own3;', '        {']
+for row,m in [('O','m0'),('P','mp')]:
+ for c in range(2):
+  lines += [f'            MAT_A xa{row}{c}; coopMatLoad(xa{row}{c},shX,{m}*32u+{c*16}u,32u,LROW);']
+for h in range(4):
+ lines += ['            {',f'                uint ki={h}u+(sg&1u)*4u;',
+           '                MAT_C eo=MAT_C(float16_t(0.0)),ep=MAT_C(float16_t(0.0));']
+ for k in range(2):
+  lines += ['                {',f'                    MAT_B w; coopMatLoad(w,wb,uint(pc.p1.x)+ki*512u+{k*256}u,16u,LCOL);',
+            f'                    eo=coopMatMulAdd(xaO{k},w,eo); ep=coopMatMulAdd(xaP{k},w,ep);','                }']
+ lines += ['                MAT_H ho=MAT_H(eo),hp=MAT_H(ep);',
+   '                if(debug) { coopMatStore(ho,dbg,m0*128u+ki*16u,128u,LROW); coopMatStore(hp,dbg,mp*128u+ki*16u,128u,LROW); }',
+   '                for(int d=0;d<4;++d) { ho[d]=nr_act_h(ho[d]); hp[d]=nr_act_h(hp[d]); }',
+   f'                for(int d=0;d<4;++d) own{h}[d]=ho[d];',
+   '                coopMatStore(hp,shArena,mp*128u+ki*16u,128u,LROW);','            }']
+lines += ['        }','        barrier(); // All peer tiles published; production X and f32 banks retired.']
+for c in range(2):
+ lines += [f'        MAT_C c{c};','        {',
+           f'            MAT_H x; coopMatLoad(x,shX,m0*32u+{c*16}u,32u,LROW);',
+           f'            MAT_H scale; coopMatLoad(scale,wb,uint(pc.p2.x)+8u+{c*16}u,0u,LROW);',
+           f'            MAT_H seed=x*scale; c{c}=MAT_C(seed);','        }']
+for parity in range(2):
+ lines += ['        if((sg&1u)==0u) {' if parity==0 else '        else {']
+ for ki in range(8):
+  lines += ['            {']
+  if ki//4==parity:lines += [f'                MAT_A a=own{ki%4};']
+  else:lines += [f'                MAT_A a; coopMatLoad(a,shArena,m0*128u+{ki*16}u,128u,LROW);']
+  for c in range(2):
+   lines += ['                {',f'                    MAT_B w; coopMatLoad(w,wb,uint(pc.p1.y)+{c*2048+ki*256}u,16u,LCOL);',
+             f'                    c{c}=coopMatMulAdd(a,w,c{c});','                }']
+  lines += ['            }']
+ lines += ['        }']
+for c in range(2):
+ lines += ['        {',f'            MAT_H h=MAT_H(c{c}); for(int d=0;d<4;++d) handoff{c}[d]=h[d];',
+           f'            coopMatStore(h,shY,m0*32u+{c*16}u,32u,LROW);','        }']
+lines += ['    }','    if(debug) {','        barrier();','        for(uint e=t_local;e<2048u;e+=256u) dbg[8192u+e]=shY[e];',
+          '        barrier();','    }','    barrier(); // Retire all peer reads before QKV reuses shArena.','']
+start=s.index('    // ============ stage 1:');end=s.index('    // ============ stage 4:',start)
+s=s[:start]+'\n'.join(lines)+'\n'+s[end:]
+assert s[s.index('    // ============ stage 4:'):]==original[end:]
+src=N/'candidate.comp';src.write_text(s,encoding='utf-8');spv=N/'candidate.spv'
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv])
+pm=ST.Module(P/'candidate.spv');cm=ST.Module(spv);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[])
+assert len(keep)==len(ST.no_contraction_ids(pm))==7;ST.set_no_contraction(cm,set(keep),spv)
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+baseline=rd(A/'LATEST-FP16-COMBO.json');assert baseline['plan']['sha256']=='73892993c22df2be0e3174b229a22d614c2259174d54f0f79f1896e5fb572e24'
+text=Path(baseline['plan']['path']).read_text();assert text.count((P/'candidate.spv').as_posix())==1
+plan=N/'plan.txt';plan.write_text(text.replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8')
+tmpl=R/'f20-owner-bridge';runner=Path(rd(tmpl/'LUNA-GATES.json')['identities'][0]['path'])
+m=dict(source=ident(src),spv=ident(spv),plan=ident(plan),parent_spv=ident(P/'candidate.spv'),parent_plan=baseline['plan'],proof=proof,no_contraction_count=7,QKV_and_downstream_source_identical=True,cpu_check=run([runner,'--plan',plan,'--cpu-check']))
+(N/'CANDIDATE.json').write_text(json.dumps(m,indent=2));(N/'run').mkdir(exist_ok=True);(N/'captures').mkdir(exist_ok=True)
+for kind in ['GATES','NATIVE','ORDINARY']:
+ task=json.loads((tmpl/f'LUNA-{kind}.json').read_text().replace('f20-owner-bridge','f20-peer8-single'))
+ task['identities']=[x for x in task['identities'] if not x['path'].endswith('.spv')]+[m['spv']]
+ for j in task['jobs']:
+  j['plan']=baseline['plan'] if j['candidate']=='parent' else m['plan'];j['argv'][j['argv'].index('--plan')+1]=j['plan']['path']
+ (N/f'LUNA-{kind}.json').write_text(json.dumps(task,indent=2))
+print(m['cpu_check'],m['spv'])

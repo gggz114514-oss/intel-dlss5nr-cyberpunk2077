@@ -1,0 +1,153 @@
+// C128 D4 directA+WOtileB+cooperative seed/output: original seed-before-K math and two-accumulator ownership.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256) in;
+// diagnostics: NR_D4_SEED_ONLY / NR_D4_MMA_ONLY isolate the two O components
+#ifndef NR_D4_MODE
+#define NR_D4_MODE 0   // 0 = full, 1 = seed only, 2 = mma only
+#endif
+#include "c64_c128_common.glsl"
+
+layout(set = 0, binding = 6) buffer YBuf { float16_t gY[]; };
+layout(set = 0, binding = 7) buffer TBuf { float16_t gT[]; };
+// R07-C128: static INT8 WO tiles, 8 output-channel groups x 4 K32 tiles x 512 B.
+layout(set = 0, binding = 8) readonly buffer Wo8Buf { int8_t gWo8[]; };
+// R07-C128: per output channel scale (128 f32 = amax_k|W[o][k]| / 127).
+layout(set = 0, binding = 9) readonly buffer WoScaleBuf { float gWosc[]; };
+
+#define MAT_H coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define I8A   coopmat<int8_t, gl_ScopeSubgroup, 8, 32, gl_MatrixUseA>
+#define I8B   coopmat<int8_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB>
+#define I8C   coopmat<int, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+// 64 tokens x 128 channels of int8, laid out so one 8x32 K32 A fragment is a
+// column-major stride-32 view: ((t>>5)*128 + k)*32 + (t&31).  8 KiB per workgroup.
+shared int8_t sT8[8192];
+shared float shMax[256];
+shared float shScale[2];
+
+void main() {
+    const uint t_local = gl_LocalInvocationID.x;
+    const uint sg = t_local / 32u;
+    const uint lane = t_local % 32u;
+    const uint wx = (pc.p1.z != 0) ? uint(pc.p2.x) : gl_WorkGroupID.x;
+    const uint wy = (pc.p1.z != 0) ? uint(pc.p2.y) : gl_WorkGroupID.y;
+    const uint w = wy * uint(pc.p1.x) + wx;
+    const bool debug = pc.p1.w != 0;
+    const uint wo = uint(pc.p4.x);
+    const uint ars = uint(pc.p4.z);   // p4.y is rs (used by D2) — ars is p4.z
+
+    if (debug) {
+        for (uint e = t_local; e < 8192u; e += 256u) {
+            dbg[212992u + e] = gT[w * 8192u + e];
+            dbg[81920u + e] = gY[w * 8192u + e];
+        }
+        barrier();
+    }
+
+    // ---- R07-C128 activation quantiser (per tensor per workgroup) -----------
+    {
+        float amax = 0.0;
+        for (uint e = t_local; e < 8192u; e += 256u)
+            amax = max(amax, abs(float(gT[w * 8192u + e])));
+        shMax[t_local] = amax;
+    }
+    barrier();
+    if (t_local == 0u) {
+        float m = 0.0;
+        for (uint i = 0u; i < 256u; ++i) m = max(m, shMax[i]);
+        shScale[0] = (m > 0.0) ? 127.0 / m : 0.0;   // invC
+        shScale[1] = (m > 0.0) ? m / 127.0 : 0.0;   // sC (dequant)
+    }
+    barrier();
+    const float invC = shScale[0];
+    const float sC = shScale[1];
+    for (uint e = t_local; e < 8192u; e += 256u) {
+        const uint t = e >> 7u;          // 0..63 token
+        const uint k = e & 127u;         // 0..127 channel
+        sT8[((t >> 5u) * 128u + k) * 32u + (t & 31u)] =
+            int8_t(clamp(roundEven(float(gT[w * 8192u + e]) * invC), -127.0, 127.0));
+    }
+    barrier();
+
+    for (uint j = 0u; j < 4u; ++j) {
+        uint m0 = (sg / 4u + 2u * j) * 8u;
+        uint n0 = (sg % 4u) * 32u;
+        MAT_C acc0;
+        {
+            MAT_H seed;
+            coopMatLoad(seed, gY, (w * 64u + m0) * 128u + n0, 128u, LROW);
+            MAT_H scale;
+            coopMatLoad(scale, pack, ars + n0, 0u, LROW);
+            seed = seed * scale;
+#if NR_D4_MODE == 2
+            acc0 = MAT_C(0.0);
+#else
+            acc0 = MAT_C(seed);
+#endif
+        }
+        MAT_C acc1;
+        {
+            MAT_H seed;
+            coopMatLoad(seed, gY, (w * 64u + m0) * 128u + (n0 + 16u), 128u, LROW);
+            MAT_H scale;
+            coopMatLoad(scale, pack, ars + (n0 + 16u), 0u, LROW);
+            seed = seed * scale;
+#if NR_D4_MODE == 2
+            acc1 = MAT_C(0.0);
+#else
+            acc1 = MAT_C(seed);
+#endif
+        }
+        // R07-C128: INT8 K32.  Same K order (k ascending, 32 at a time), same
+        // accumulator pair, INT32 instead of FP32.
+        I8C iacc0 = I8C(0), iacc1 = I8C(0);
+        for (uint ki = 0u; ki < 4u; ++ki) {
+            const uint k0 = ki * 32u;
+            I8B b0, b1;
+            coopMatLoad(b0, gWo8, (n0 / 16u) * 2048u + ki * 512u, 32u, LCOL);
+            coopMatLoad(b1, gWo8, ((n0 + 16u) / 16u) * 2048u + ki * 512u, 32u, LCOL);
+            I8A a;
+            coopMatLoad(a, sT8, (m0 / 32u) * 4096u + k0 * 32u + (m0 % 32u), 32u, LCOL);
+#if NR_D4_MODE != 1
+            iacc0 = coopMatMulAdd(a, b0, iacc0);
+            iacc1 = coopMatMulAdd(a, b1, iacc1);
+#endif
+        }
+        // one dequant product (sC * sWo[n]) folded into the same accumulator, then
+        // the parent's seed add and its single narrow.
+        {
+            MAT_C wsc0, wsc1;
+            coopMatLoad(wsc0, gWosc, n0, 0u, LROW);
+            coopMatLoad(wsc1, gWosc, n0 + 16u, 0u, LROW);
+            wsc0 = wsc0 * MAT_C(sC);
+            wsc1 = wsc1 * MAT_C(sC);
+            acc0 = acc0 + MAT_C(iacc0) * wsc0;
+            acc1 = acc1 + MAT_C(iacc1) * wsc1;
+        }
+        {
+            MAT_H narrowed = MAT_H(acc0);
+            if (debug)
+                coopMatStore(narrowed, dbg, 221184u + m0 * 128u + n0, 128u, LROW);
+            bool oob;
+            uint addr = c128_img_half_index(m0, n0, wx, wy, oob);
+            if (!oob)
+                coopMatStore(narrowed, imgout, addr, 16u, LROW);
+        }
+        {
+            MAT_H narrowed = MAT_H(acc1);
+            if (debug)
+                coopMatStore(narrowed, dbg, 221184u + m0 * 128u + (n0 + 16u), 128u, LROW);
+            bool oob;
+            uint addr = c128_img_half_index(m0, (n0 + 16u), wx, wy, oob);
+            if (!oob)
+                coopMatStore(narrowed, imgout, addr, 16u, LROW);
+        }
+    }
+}

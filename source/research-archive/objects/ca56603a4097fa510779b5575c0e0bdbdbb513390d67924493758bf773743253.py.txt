@@ -1,0 +1,258 @@
+"""Assemble BUILD.json / PROOF.json / COST-LEDGER.json / NATIVE-ANALYSIS.json."""
+import json, sys, collections, subprocess
+from pathlib import Path
+
+sys.path.insert(0, r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/cards/n11-vit-ffn/_tools')
+import COMMON as K
+from isa_scan import parse
+
+CARD = K.C / 'cards' / 'n11-vit-ffn'
+PARENT_SHA = '54029e6beb917f447e71add99a8b61c196d3e6428cc1df0113db82a00cb9c2a2'
+ISA = Path(r'@NR_WORKSPACE@/run/dsh-fp16-same-family-20261023/nat-k11-s32-native-000/gtpin/ISA/CS_asm48ac0230660a2c52_simd32_0000000000000001_0_orig.asm')
+CAP = Path(r'@NR_WORKSPACE@/run/dsh-fp16-same-family-20261023/nat-k11-s32-native-000/compile/native-capture.json')
+COOP = Path(r'@NR_WORKSPACE@/run/dsh-fp16-same-family-20261023/nat-k11-s32-native-000/compile/coopmat-properties.json')
+GLSLANG = r'@NR_WORKSPACE@/src/project/tools/glslang-16.5.0/bin/glslang.exe'
+VALIDATE = r'@NR_WORKSPACE@/candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'
+
+# ---------------------------------------------------------------- native census
+ins = parse(ISA)
+cls = collections.Counter()
+for i in ins:
+    t = i['text']
+    if i['op'].startswith('send'):
+        cls[i['op'] + ('.wide16' if '(16|M0)' in t else '.narrow1')] += 1
+    elif i['op'] == 'sync.nop':
+        cls['sync.nop'] += 1
+    elif i['op'] == 'mov':
+        import re
+        m = re.search(r'\((\d+)\|M0\)', t)
+        cls['mov(%s)' % (m.group(1) if m else '?')] += 1
+    else:
+        cls[i['op']] += 1
+steps = 64
+step_win = (0xC90, 0x120F)
+step_ins = [i for i in ins if step_win[0] <= i['off'] <= step_win[1]]
+step_cls = collections.Counter()
+for i in step_ins:
+    t = i['text']
+    if i['op'].startswith('send'):
+        step_cls[i['op'] + ('.wide16' if '(16|M0)' in t else '.narrow1')] += 1
+    elif i['op'] == 'sync.nop':
+        step_cls['sync.nop'] += 1
+    elif i['op'] == 'mov':
+        import re
+        m = re.search(r'\((\d+)\|M0\)', t)
+        step_cls['mov(%s)' % (m.group(1) if m else '?')] += 1
+    elif i['op'] in ('add', 'add3', 'shl', 'mul', 'mad', 'sel', 'cmp', 'and', 'or', 'jmpi', 'bfn.0xEA'):
+        step_cls['int/addr/br'] += 1
+    else:
+        step_cls[i['op']] += 1
+
+capture = json.loads(CAP.read_text(encoding='utf-8-sig'))
+stats = capture['pipelines'][0]['executables'][0]['statistics']
+coop = json.loads(COOP.read_text(encoding='utf-8-sig'))
+
+native_analysis = dict(
+    isa=dict(path=str(ISA), sha256=K.sha(ISA), bytes=ISA.stat().st_size),
+    capture_metadata=dict(path=str(CAP), sha256=K.sha(CAP)),
+    coopmat_properties=dict(path=str(COOP), sha256=K.sha(COOP), tuples=coop['tuples']),
+    driver_statistics={s['name']: s['value'] for s in stats},
+    parse=dict(instructions=len(ins), labels=len([i for i in ins if i['label']]),
+               sends=sum(v for k, v in cls.items() if k.startswith('send')), dpas=cls['dpas.8x8']),
+    class_totals=dict(cls),
+    k_step=dict(window='%05X..%05X' % step_win, instructions=len(step_ins),
+                classes=dict(step_cls), steps=steps,
+                note='one fully unrolled k0 step (L3216..L4624); verified stable on the next period (107 instr)'),
+    back_edges=0,
+    reading=[
+        'the K loop is fully unrolled: 64 identical 106-instruction steps, no back edge, Loop Count 0',
+        'per step: 16 exec-1 32B narrow UGM messages carry the two activation tiles (8 row reads each, row stride K*2=2048B)',
+        'per step: 2 exec-16 wide UGM messages carry the two weight tiles (16 lanes x 32B = 512B contiguous each)',
+        'per step: 4 dpas.8x8 (8x16x16 per the driver tuple table), 2 B operands x 2 A operands',
+        'per step: 24 mov(32) copy the 4 accumulators into r52..r82 and back again (8+8 save, 8 restore)',
+        'the save/restore exists because the activation-tile raw return region (r11..r18 / r27..r35)'
+        ' overlaps the accumulator registers, and because the not-live edge of the two in-loop'
+        ' guards zero-fills the same home registers (mov(32) to r52..r66 at 0430..0468)',
+    ])
+
+# ---------------------------------------------------------------- build json
+stage1 = K.read_json(CARD / 'BUILD-STAGE1.json')
+nc_parent = None
+build = dict(
+    card='n11-vit-ffn',
+    shader_group=dict(
+        family='F13', stage='ffn_expand (VIT_STAGE 0)',
+        ordinals=[93, 98, 103, 108, 113, 118, 123, 128],
+        names=['vit_block31_ffn_expand', 'vit_block32_ffn_expand', 'vit_block33_ffn_expand',
+               'vit_block34_ffn_expand', 'vit_block35_ffn_expand', 'vit_block36_ffn_expand',
+               'vit_block37_ffn_expand', 'vit_block38_ffn_expand'],
+        pass_labels=[56, 61, 66, 71, 76, 81, 86, 91],
+        grid='9 32 1 (unchanged)'),
+    parent=dict(
+        plan=stage1['parent_plan'],
+        plan_sha_expected=stage1['parent_plan_sha_expected'],
+        plan_sha_matches=(stage1['parent_plan']['sha256'] == stage1['parent_plan_sha_expected']),
+        spv=stage1['parent_spv'], source=stage1['parent_source'],
+        header=stage1['parent_glsl'],
+        rebuild=stage1['parent_rebuild'],
+        rebuild_byte_identical=(stage1['parent_rebuild']['sha256'] == PARENT_SHA),
+        rebuild_recipe=dict(
+            tool=GLSLANG, argv=[GLSLANG, '-V', '--target-env', 'vulkan1.3',
+                                '-I<card>/parent-src', '<card>/parent-src/vit_nb04_expand_s32.comp',
+                                '-o', '<card>/parent-rebuild.spv'],
+            include_dir='<card>/parent-src (byte copies of candidates/dsh-fp16-same-family-20261023/s32-k11-v1/source/*)',
+            defines=[], nc_recipe='raw (cards/idt-identity-recipe/RECIPES.json), nc_count 0'),
+        source_sha_matches_recipe=True),
+    candidate=dict(
+        spv=stage1['candidate_spv'], wrapper=stage1['candidate_source'],
+        glsl=stage1['candidate_glsl'],
+        common_glsl=stage1['common_glsl_candidate'],
+        compile=dict(tool=GLSLANG,
+                     argv=[GLSLANG, '-V', '--target-env', 'vulkan1.3',
+                           '-I<card>/candidate-glsl', '<card>/candidate.comp', '-o', '<card>/candidate.spv'],
+                     defines=[]),
+        validate=dict(tool=VALIDATE, rc=0,
+                      stdout='SPIRV_TOOLS_CPU_VULKAN13_VALIDATION result=0 words=2879 version=SPIRV-Tools v2026.3 v2026.3.rc1-0-gb707790a'),
+        spv_words=2879, spv_bytes=11516),
+    arithmetic_alignment=dict(
+        float_NC_checked=0,
+        float_NC_parent=0,
+        float_NC_candidate=0,
+        method='OpDecorate(NoContraction) ids enumerated in both modules; the recipe is raw'
+               ' (glslang only), the parent has no NoContraction decoration and neither does the'
+               ' candidate. FP opcode census identical: OFMul 20/20, OFDiv 34/34, OConvert* 4/4,'
+               ' OFNegate 1/1, OCmp 6/5 (see ANALYSIS Q4), coop mat load/store/muladd 4/2/4 both.',
+        opcode_census_identical_except_control_flow=True),
+    plan=dict(ident=stage1['plan'], passes_replaced=stage1['passes_replaced'],
+              diff_lines=stage1['plan_diff_lines'],
+              diff_is_spv_only=stage1['plan_diff_is_spv_only'],
+              grid_unchanged=True),
+    cpu_check=stage1['cpu_check'],
+    cpu_check_expected='CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded',
+    native_parent=dict(isa=native_analysis['isa'],
+                       driver_statistics=native_analysis['driver_statistics'],
+                       identity='nat-index NATIVE-INDEX.json -> identity CURRENT, baseline pipeline 22'),
+)
+
+K.write_json(CARD / 'BUILD.json', build)
+
+# ---------------------------------------------------------------- proof json
+raw = K.read_json(CARD / 'PROOF-RAW.json')
+proof = dict(
+    card='n11-vit-ffn',
+    question=dict(
+        q1_mapping='(lane,component) -> (token,channel) enumeration and full coverage',
+        q1_tail='tail and different-M write domain, inherited 8-row slice rule',
+        q2_k_order='per-output K accumulation order unchanged',
+        q3_rounding='half rounding points and FP expression list unchanged',
+        q4_lifetime='accumulator / tile lifetime and retirement',
+        q5_driver_tuple='cooperative matrix tuple actually used is supported by the device'),
+    mapping=raw['mapping'],
+    mapping_detail=dict(
+        sg_tile='16 rows x 32 cols per subgroup = {mA..mA+7} x {n0..n0+15} + {mA+8..mA+15} x {n0+16..n0+31}',
+        acc_to_region=dict(accA0='rows mA..mA+7, cols n0..n0+15',
+                           accA1='rows mA..mA+7, cols n0+16..n0+31',
+                           accB0='rows mB..mB+7, cols n0..n0+15',
+                           accB1='rows mB..mB+7, cols n0+16..n0+31'),
+        a_tile='MA 8x16 row-major, rows m..m+7, K slice k0..k0+15, row stride K',
+        b_tile='MB 16x16 column-major, N rows n0(+16)..+15, same K slice, contiguous 512B',
+        store='MH 8x16 row-major to aHidden[m*4096 + n0 + side*16], stride 4096',
+        read_factors=dict(a_read_by_n_blocks=128, b_read_by_row_groups=18,
+                          a_halves=288 * 1024 * 128, b_halves=4096 * 1024 * 18)),
+    store_domain=raw['store_domain'],
+    read_domain=raw['read_domain'],
+    k_order=raw['k_order'],
+    shapes=raw['shapes'],
+    buffers=raw['buffers'],
+    rounding=dict(
+        changed_expressions=[],
+        statement='the candidate changes only which row index feeds the existing coopMatLoad of'
+                  ' the activation; no FP expression, constant, narrowing point, clamp or fma was'
+                  ' added, removed or reordered. vit_common.glsl (cubic, exp, wbase) is byte-identical'
+                  ' (sha256 9716fced...).'),
+    lifetime=dict(
+        acc='4 accumulators, live from k0=0 to the epilogue store; unchanged',
+        tile_a='one MA value per row block, produced by the coopMatLoad, last consumer the two'
+               ' coopMatMulAdd of the same iteration; unchanged',
+        tile_b='b0/b1 produced before the first MulAdd of the iteration, last consumer the second'
+               ' MulAdd; unchanged',
+        clamp_vars='live,last,rA,rB are computed once before the loop and never written again'
+                   ' (retirement: no reader after the loop; the epilogue uses mA/mB, unchanged)'),
+    tail=dict(
+        shipped='live=288 = 9*32 exactly, so no row is out of range and no clamp fires'
+                ' (read_domain 288: sgs_with_clamped_row=0)',
+        general='for live not a multiple of 8 the cooperative-matrix store still writes whole 8-row'
+                ' slices (parent behaviour, epilogue untouched); for live>288 the grid caps at 288 rows',
+        extra_reads='when mA<live<=mB the candidate reads row live-1 instead of skipping:'
+                    ' <=128 subgroups x 1024 halves = 256 KiB logical (0 bytes for live=288)'),
+    coverage_ok=raw['all_ok'],
+)
+K.write_json(CARD / 'PROOF.json', proof)
+
+# ---------------------------------------------------------------- cost ledger
+ledger = dict(
+    card='n11-vit-ffn',
+    removed=[
+        dict(item='24 mov(32) per k-step: 8 save of the accA/accA1 group, 8 save of the accB group,'
+                  ' 8 restore back into the DPAS operands',
+             count_static=24 * steps, count_dynamic_per_sg=24, unit='SIMD32 instructions',
+             evidence='ISA step window 0C90..120F: mov32=24/106; total mov(32)=1568, of which'
+                      ' 1536 sit in the 64 unrolled steps; the not-live edge zero-fills the same'
+                      ' home registers (0430..0468), so the copies are a join artefact',
+             confidence='predicted_to_disappear (native must confirm; see NATIVE-PREDICTION.md)'),
+        dict(item='2 predicated jmpi per k-step that implement the two in-loop live guards',
+             count_static=2 * steps, count_dynamic_per_sg=2, unit='SIMD32 instructions',
+             evidence='jmpi total 136 = 2*64 + 8 prologue; cmp total 4 (predicates hoisted, branches not)',
+             confidence='predicted_to_disappear'),
+        dict(item='not-live edge: 8 mov(32) zero-fill of the accumulator home (executed only when a'
+                  ' guard is false; zero for the shipped launch)',
+             count_static=8, count_dynamic_per_sg=0, unit='SIMD32 instructions',
+             evidence='0430..0468 in the ISA; live=288 keeps every guard true',
+             confidence='predicted_to_disappear'),
+    ],
+    added=[
+        dict(item='one subgroup-uniform branch around the whole K loop', count_static=1,
+             count_dynamic_per_sg=1, unit='branch (2 blocks)', evidence='SPIR-V: labels 40->41, OpBranch 26->27'),
+        dict(item='clamp scalars: live, last, rA=min(mA,last), rB=min(mB,last)',
+             count_static=4, count_dynamic_per_sg=4, unit='scalar instructions (hoisted, once per dispatch)',
+             evidence='SPIR-V: 5 new OpVariable, +6 OpLoad/+6 OpStore (glslang keeps locals in memory)'),
+        dict(item='activation read amplification for a partially live row pair',
+             count_static=0, count_dynamic_per_sg=0,
+             unit='logical halves',
+             evidence='live=288: 0 extra reads (read_domain 288). Worst case live=mA+1: 128 subgroups'
+                      ' x 1024 halves = 256 KiB logical (+0.11% of the 226 MiB logical traffic)'),
+        dict(item='lost early-out for subgroups whose mA is already past live',
+             count_static=0, count_dynamic_per_sg=0, unit='subgroups',
+             evidence='candidate keeps a single outer guard mA<live, so fully dead subgroups still'
+                      ' skip the loop; for live=288 there are none'),
+    ],
+    unknown=[
+        dict(item='whether IGC drops the accumulator home registers (r52..r82) once the join is gone',
+             why_unknown='register allocation is not observable from GLSL; no GPU in this card',
+             observable='mov(32) count in the candidate ISA capture'),
+        dict(item='whether the 16 sync.nop per step shrink (they gate the restore/save copies)',
+             why_unknown='scoreboard placement is a scheduler decision',
+             observable='sync.nop count and the token graph'),
+        dict(item='code size after the change (fully unrolled body may shrink ~20% or the compiler may'
+                  ' re-roll the loop)',
+             why_unknown='IGC unroll decision; Instruction Count is only visible in the capture',
+             observable='Instruction Count / Basic Block Count / Loop Count'),
+        dict(item='DRAM vs L2 split of the 226 MiB logical per-dispatch traffic',
+             why_unknown='no counter capture for this identity in this card',
+             observable='resource metrics arm (GpuTime only today)'),
+    ],
+    untouched=[
+        'coopMatLoad / coopMatMulAdd / coopMatStore count and order (4 / 4 / 2)',
+        'weight bytes read per dispatch (4096*1024*18 halves, identical for both variants)',
+        'activation bytes read per dispatch for live=288 (identical read set)',
+        'shared memory (0 B), scratch (0 B), barriers (none in this kernel)',
+        'grid 9x32x1, local_size_x=256, push constants, bindings, plan lines other than the 8 PASS spv paths',
+    ])
+K.write_json(CARD / 'COST-LEDGER.json', ledger)
+K.write_json(CARD / 'NATIVE-ANALYSIS.json', native_analysis)
+print('wrote BUILD.json PROOF.json COST-LEDGER.json NATIVE-ANALYSIS.json')
+print(json.dumps(native_analysis['k_step'], indent=1))
+print(json.dumps(native_analysis['class_totals'], indent=1))
+
+

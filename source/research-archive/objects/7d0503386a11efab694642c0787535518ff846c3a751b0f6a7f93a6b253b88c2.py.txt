@@ -1,0 +1,266 @@
+"""S08 stage 2: fine search + leave-one-frame-out check + final pack for ViT b31 FFN.
+
+Stage 1 (calibrate_b31_ffn.py) established: old pack 0.020987, scalar recalibration
+0.017074, X-equalised 0.016091, A-equalised 0.012173, both 0.010792.
+This stage asks the only question that matters before recommending anything:
+does the calibration generalise off the frame it was fitted on, and is (f_X,f_A)=(1,1)
+really the optimum (or an artefact of a coarse grid)?
+"""
+from pathlib import Path
+import hashlib
+import json
+
+import numpy as np
+
+R = Path(r"@NR_WORKSPACE@")
+S = R / "work/dsh-fullnet-static-20261029/S08-vit"
+Q = R / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+
+OLD_PACK = R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-v1/pack/vit_block31_weights.int8.bin"
+FP16W = R / "src/project/artifacts/parallel-port-20261013/vit/block31/vit_weights.fp16.bin"
+W_HALF = dict(WE=(0, 4096, 1024), WC=(4194304, 1024, 4096))
+GAIN_HALF_OFF, GAIN_BYTE = 12582912, 25165824
+TOTAL = 25169920
+WE8, WC8 = 0, 4194304
+WS_OFF, EW_OFF, AC_OFF = 9437184, 9437248, 9453632
+NEW_X, NEW_A = 12623936, 12628032
+M_ROWS, K_X, N_E, N_Y = 288, 1024, 4096, 1024
+TEACHERS = [D / "dump-fp16", D / "teacher-diagnostics/teacher-41444",
+            D / "teacher-diagnostics/teacher-43654"]
+
+
+def sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def idx_half(n, k, N, K):
+    return (n // 32) * (K // 16) * 512 + (k // 16) * 512 + (n % 32) * 16 + (k % 16)
+
+
+def idx_int8(n, k, N, K):
+    return (n // 32) * (K // 32) * 1024 + (k // 32) * 1024 + (n % 32) * 32 + (k % 32)
+
+
+def unpack_half(flat, off, N, K):
+    n = np.arange(N)[:, None]
+    k = np.arange(K)[None, :]
+    return flat[off + idx_half(n, k, N, K)]
+
+
+def pack_int8(W, N, K):
+    n = np.arange(N)[:, None]
+    k = np.arange(K)[None, :]
+    pos = idx_int8(n, k, N, K)
+    buf = np.zeros(N * K, np.int8)
+    buf[pos.ravel()] = W.ravel()
+    return buf.tobytes()
+
+
+def half(x):
+    return np.asarray(x, np.float32).astype(np.float16).astype(np.float32)
+
+
+def cubic(z):
+    z = np.float16(z)
+    t = np.clip(z, np.float16(-4.0), np.float16(4.0)).astype(np.float32)
+    u = half(np.float32(-0.055908203125) * np.abs(t) + np.float32(0.447265625))
+    v = half(t * u + np.float32(0.89453125))
+    return half(z.astype(np.float32) * v)
+
+
+def code(x, inv):
+    c = np.asarray(x, np.float32) * np.asarray(inv, np.float32)
+    return np.clip(np.rint(c), -127, 127).astype(np.int16)
+
+
+def rowscale(W):
+    ch = np.abs(W).max(axis=1)
+    return np.where(ch > 0, ch / 127.0, 1.0).astype(np.float32)
+
+
+def rowq(W, s32):
+    return np.clip(np.rint(W / s32.astype(np.float64)[:, None]), -127, 127).astype(np.int8)
+
+
+def main():
+    stage1 = json.loads((S / "CALIBRATION.json").read_text())
+    old_bytes = OLD_PACK.read_bytes()
+    flat16 = np.frombuffer(FP16W.read_bytes(), dtype="<f2")
+    WE = unpack_half(flat16, *W_HALF["WE"]).astype(np.float64)
+    WC = unpack_half(flat16, *W_HALF["WC"]).astype(np.float64)
+    gain = flat16[GAIN_HALF_OFF:GAIN_HALF_OFF + 1024].astype(np.float32).astype(np.float64)
+
+    Xs, Yts = [], []
+    for td in TEACHERS:
+        Xs.append(np.fromfile(td / "dump_block30_out.bin", dtype="<f2")[:M_ROWS * K_X].reshape(M_ROWS, K_X).astype(np.float32))
+        Yts.append(np.fromfile(td / "dump_vit_block31_Y.bin", dtype="<f2")[:M_ROWS * N_Y].reshape(M_ROWS, N_Y).astype(np.float32))
+    Xf = [x.astype(np.float64) for x in Xs]
+    Yf = [y.astype(np.float64) for y in Yts]
+
+    def diag_of(amax, gamma):
+        return np.exp2(np.rint(gamma * np.log2(np.maximum(amax, 1e-8)))).astype(np.float32)
+
+    def fit(train, gamma=1.0, fx=1.0, fa=1.0):
+        AX = np.abs(np.concatenate([Xf[i] for i in train])).max(axis=0)
+        # A edge per-channel absmax must come from the FP16 teacher A of the training frames
+        Atr = np.concatenate([np.fromfile(TEACHERS[i] / "dump_vit_block31_A.bin", dtype="<f2")[:M_ROWS * N_E]
+                              .reshape(M_ROWS, N_E).astype(np.float32) for i in train]).astype(np.float64)
+        AA = np.abs(Atr).max(axis=0)
+        Dx, Da = diag_of(AX, gamma), diag_of(AA, gamma)
+        bx = np.float32(np.max(AX / Dx) / 127.0) * np.float32(fx)
+        ba = np.float32(np.max(AA / Da) / 127.0) * np.float32(fa)
+        WEx, WCx = WE * Dx.astype(np.float64)[None, :], WC * Da.astype(np.float64)[None, :]
+        sWEx, sWCx = rowscale(WEx), rowscale(WCx)
+        return dict(cE=rowq(WEx, sWEx), cC=rowq(WCx, sWCx),
+                    ew=(bx * sWEx).astype(np.float32), ac=(ba * sWCx).astype(np.float32),
+                    invx=(np.float32(1.0) / (bx * Dx)).astype(np.float32),
+                    inva=(np.float32(1.0) / (ba * Da)).astype(np.float32),
+                    bx=bx, ba=ba, Dx=Dx, Da=Da, sWEx=sWEx, sWCx=sWCx)
+
+    def run(st, frames):
+        Ys, sats = [], []
+        for i in frames:
+            qX = code(Xf[i], st["invx"])
+            E = half((qX.astype(np.float64) @ st["cE"].astype(np.float64).T).astype(np.float32) * st["ew"][None, :])
+            A = cubic(E)
+            qA = code(A, st["inva"])
+            lin = (qA.astype(np.float64) @ st["cC"].astype(np.float64).T).astype(np.float32) * st["ac"][None, :]
+            Y = half(gain[None, :] * Xf[i] + lin.astype(np.float64)).astype(np.float32)
+            Ys.append(Y)
+            sats.append(dict(frame=TEACHERS[i].name,
+                             qX_sat=int(np.count_nonzero(np.abs(Xf[i] * st["invx"][None, :]) > 127.0)),
+                             qA_sat=int(np.count_nonzero(np.abs(A * st["inva"][None, :]) > 127.0))))
+        return Ys, sats
+
+    def rel_of(Ys, frames):
+        num = sum(float(np.sum((Ys[k] - Yf[i]) ** 2)) for k, i in enumerate(frames))
+        den = sum(float(np.sum(Yf[i] ** 2)) for i in frames)
+        return float(np.sqrt(num / den))
+
+    out = {}
+    # ---------------- leave-one-frame-out ----------------
+    lofo = []
+    for h in range(3):
+        tr = [i for i in range(3) if i != h]
+        st = fit(tr)
+        Ys, sats = run(st, [h])
+        base = half(gain[None, :] * Xf[h])
+        lofo.append(dict(held_out=TEACHERS[h].name, train=[TEACHERS[i].name for i in tr],
+                         rel_l2=rel_of(Ys, [h]),
+                         residual_only_rel_l2=float(np.linalg.norm((base - Yf[h])) / np.linalg.norm(Yf[h])),
+                         saturation=sats))
+        print("LOFO", lofo[-1]["held_out"], round(lofo[-1]["rel_l2"], 6), flush=True)
+    out["leave_one_frame_out"] = dict(folds=lofo,
+                                      mean_rel_l2=float(np.mean([f["rel_l2"] for f in lofo])),
+                                      note="diagnostic only: the deployed configuration is fitted on all three "
+                                           "frames; a fold is a generalisation check, not a held-out scene")
+    # ---------------- fine search (pooled 3 frames) ----------------
+    grid = []
+    best = None
+    for gamma in (0.6, 0.8, 1.0):
+        for fx in (0.85, 1.0, 1.18):
+            for fa in (0.85, 1.0, 1.18):
+                st = fit([0, 1, 2], gamma=gamma, fx=fx, fa=fa)
+                Ys, sats = run(st, [0, 1, 2])
+                r = rel_of(Ys, [0, 1, 2])
+                grid.append(dict(gamma=gamma, fx=fx, fa=fa, rel_l2=r,
+                                 qX_sat=sum(s["qX_sat"] for s in sats),
+                                 qA_sat=sum(s["qA_sat"] for s in sats)))
+                if best is None or r < best["rel_l2"]:
+                    best = grid[-1]
+        print("gamma", gamma, "best so far", round(best["rel_l2"], 6), best, flush=True)
+    out["fine_grid"] = grid
+    out["in_fit_best"] = best
+    # Deployment choice: the in-fit optimum is fx=fa=0.85 with ~99 saturated qX codes and
+    # ~42 saturated qA codes. The whole risk of this method is a frame whose per-channel
+    # absmax exceeds the fitted one (the 43654 LOFO fold shows exactly that). CHOSEN keeps
+    # the compressed diag (gamma=0.8) but spends no saturation margin.
+    CHOSEN = dict(gamma=0.8, fx=1.02, fa=1.02)
+    out["chosen"] = dict(CHOSEN)
+    head = []
+    for extra in (0.0, 0.02, 0.05):
+        st_h = fit([0, 1, 2], gamma=CHOSEN["gamma"], fx=CHOSEN["fx"] + extra, fa=CHOSEN["fa"] + extra)
+        Yh, sh = run(st_h, [0, 1, 2])
+        head.append(dict(headroom=extra, rel_l2=rel_of(Yh, [0, 1, 2]),
+                         qX_sat=sum(s["qX_sat"] for s in sh), qA_sat=sum(s["qA_sat"] for s in sh)))
+    out["headroom_tradeoff"] = head
+    print("headroom", head, flush=True)
+    best = dict(gamma=CHOSEN["gamma"], fx=CHOSEN["fx"], fa=CHOSEN["fa"],
+                rel_l2=next(h["rel_l2"] for h in head if h["headroom"] == 0.0))
+
+    st = fit([0, 1, 2], gamma=best["gamma"], fx=best["fx"], fa=best["fa"])
+    Ys, sats = run(st, [0, 1, 2])
+    oEW = np.frombuffer(old_bytes[EW_OFF:EW_OFF + 16384], dtype="<f4")
+    oAC = np.frombuffer(old_bytes[AC_OFF:AC_OFF + 4096], dtype="<f4")
+    oWS = np.frombuffer(old_bytes[WS_OFF:WS_OFF + 64], dtype="<f4")
+    p8 = np.frombuffer(old_bytes, np.int8)
+    oE = p8[idx_int8(np.arange(4096)[:, None], np.arange(1024)[None, :], 4096, 1024)]
+    oC = p8[WC8 + idx_int8(np.arange(1024)[:, None], np.arange(4096)[None, :], 1024, 4096)]
+    old_st = dict(cE=oE, cC=oC, ew=oEW, ac=oAC, invx=np.atleast_1d(oWS[8]), inva=np.atleast_1d(oWS[9]))
+    Yo, _ = run(old_st, [0, 1, 2])
+    old_rel = [float(np.linalg.norm(Yo[i] - Yf[i]) / np.linalg.norm(Yf[i])) for i in range(3)]
+    out["per_frame"] = [dict(teacher=TEACHERS[i].name,
+                             new_rel_l2=float(np.linalg.norm(Ys[i] - Yf[i]) / np.linalg.norm(Yf[i])),
+                             old_rel_l2=old_rel[i]) for i in range(3)]
+    out["pooled_new_rel_l2"] = rel_of(Ys, [0, 1, 2])
+    out["pooled_old_rel_l2"] = rel_of(Yo, [0, 1, 2])
+    out["improvement"] = float(1.0 - out["pooled_new_rel_l2"] / out["pooled_old_rel_l2"])
+    out["saturation_final"] = sats
+    out["parameters"] = dict(gamma=best["gamma"], fx=best["fx"], fa=best["fa"],
+                             bx=float(st["bx"]), ba=float(st["ba"]),
+                             sX=float(st["bx"]), sA=float(st["ba"]),
+                             invX=float(np.float32(1.0) / st["bx"]), invA=float(np.float32(1.0) / st["ba"]),
+                             d_x_min=float(st["Dx"].min()), d_x_max=float(st["Dx"].max()),
+                             d_a_min=float(st["Da"].min()), d_a_max=float(st["Da"].max()),
+                             invx_range=[float(st["invx"].min()), float(st["invx"].max())],
+                             inva_range=[float(st["inva"].min()), float(st["inva"].max())])
+
+    # ---------------- final pack ----------------
+    blob = bytearray(old_bytes)
+    blob[WE8:WE8 + 4096 * 1024] = pack_int8(st["cE"], 4096, 1024)
+    blob[WC8:WC8 + 1024 * 4096] = pack_int8(st["cC"], 1024, 4096)
+    ws = np.frombuffer(old_bytes[WS_OFF:WS_OFF + 64], dtype="<f4").copy()
+    ws[3] = st["bx"]
+    ws[4] = st["ba"]
+    ws[8] = float(np.float32(1.0) / st["bx"])
+    ws[9] = float(np.float32(1.0) / st["ba"])
+    blob[WS_OFF:WS_OFF + 64] = ws.astype("<f4").tobytes()
+    blob[EW_OFF:EW_OFF + 16384] = st["ew"].astype("<f4").tobytes()
+    blob[AC_OFF:AC_OFF + 4096] = st["ac"].astype("<f4").tobytes()
+    blob[NEW_X:NEW_X + 4096] = st["invx"].tobytes()
+    blob[NEW_A:NEW_A + 16384] = st["inva"].tobytes()
+    P = S / "PACK"
+    P.mkdir(exist_ok=True)
+    outp = P / "vit_block31_weights.int8.s08.bin"
+    outp.write_bytes(bytes(blob))
+    diff = np.nonzero(np.frombuffer(bytes(blob), np.uint8) != np.frombuffer(old_bytes, np.uint8))[0]
+    out["pack"] = dict(old_path=str(OLD_PACK), old_sha256=sha(old_bytes),
+                       new_path=str(outp), new_sha256=sha(bytes(blob)), bytes=TOTAL,
+                       changed_bytes=int(diff.size),
+                       new_arrays=dict(x_inverse_offset=NEW_X, x_inverse_floats=1024,
+                                       a_inverse_offset=NEW_A, a_inverse_floats=4096,
+                                       free_bytes_after=16777216 - (NEW_A + 16384)),
+                       unchanged="WC/WO FP16 verbatim tail (16777216..25169920), ws[0..2], ws[5], ws[10..12], "
+                                 "ap[1024], wqkv8, aq[3072], wg[2048] all byte-identical")
+    np.savez_compressed(P / "s08-scales.npz", invx=st["invx"], inva=st["inva"], ew=st["ew"],
+                        ac=st["ac"], ws=ws, Dx=st["Dx"], Da=st["Da"])
+    merged = dict(stage1=stage1 if isinstance(stage1, dict) and "V1_current_pack" in stage1 else None, stage2=out,
+                  method="X/A per-channel 2**round(gamma*log2(amax)) diag folded into the K dimension of "
+                         "WE/WC, global steps from max(amax/D)/127, coordinate search on (f_X,f_A) and the "
+                         "diag exponent gamma, objective = FFN output Y vs the FP16 teacher Y",
+                  data="three daytime calibration frames (34189 / 41444 / 43654), 288 live tokens each, "
+                       "common FP16 input (block30_out teacher dump); NOT a held-out scene",
+                  reproduction=f'"$PY" -X utf8 {S}/AUDIT/calibrate_b31_ffn.py  (stage 1)  then  '
+                               f'"$PY" -X utf8 {S}/AUDIT/calibrate_b31_stage2.py  (stage 2 / final pack)')
+    (S / "CALIBRATION.json").write_text(json.dumps(merged, indent=1, default=str) + "\n", encoding="utf-8")
+    print(json.dumps(out["parameters"], indent=1))
+    print(json.dumps(dict(pooled_new=out["pooled_new_rel_l2"], pooled_old=out["pooled_old_rel_l2"],
+                          improvement=out["improvement"], lofo=out["leave_one_frame_out"]["mean_rel_l2"],
+                          pack=out["pack"]["new_sha256"]), indent=1))
+    print("per-frame", json.dumps(out["per_frame"], indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

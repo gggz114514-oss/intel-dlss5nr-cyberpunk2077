@@ -1,0 +1,259 @@
+"""review_loo.py - independent recheck of the static 3x3+bias output-correction study.
+
+Written from scratch (own normal equations, own PSNR loop) so it does not share code with
+analysis/output_correction.py.  Adds the controls the original study did not run
+("3x3 only, no bias", "DC only", "diagonal+bias refit", "off-diagonal zeroed without refit"),
+a per-fold matrix dump, and the fixed-average-matrix variant per arm.
+
+Every number is leave-one-sequence-out: the matrix used on a held-out sequence was fitted on
+the other two sequences only.  The 24 frames remain the development set.
+
+Two arms are supported because the project's best single-frame arm changed:
+  --arm c64  -> real-int8-24/c64-family-static/run-<f>/replayed-network.bin
+  --arm xe   -> S02-f01/runs24/run-<f>/replayed-network.bin   (live arm)
+
+Output: ../REVIEW-LOO-<ARM>.json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(r"@NR_WORKSPACE@")
+BASE = ROOT / "work/dsh-fullnet-static-20261029"
+Q = ROOT / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+OUT = BASE / "S03-tail"
+IW, IH = 1280, 720
+
+ARMS = {
+    "c64": {"dir": Q / "real-int8-24/c64-family-static",
+            "out": "REVIEW-LOO-C64.json", "label": "c64-family-static (v1 arm)"},
+    "xe": {"dir": BASE / "S02-f01/runs24",
+           "out": "REVIEW-LOO-XE.json", "label": "c64 + F01 XE (v2 arm, live)"},
+}
+
+
+def load_planes(path: Path) -> np.ndarray:
+    return np.fromfile(path, dtype="<f4").reshape(2, IH, IW, 4)
+
+
+def psnr(ref: np.ndarray, cur: np.ndarray) -> float:
+    e = ref - cur
+    return float(-10.0 * np.log10(np.mean(e * e)))
+
+
+class Model:
+    """y' = design(y) @ C ; fitted through normal equations, one coefficient per channel."""
+
+    def __init__(self, name: str, design):
+        self.name = name
+        self.design = design
+        self.xtx = None
+        self.xty = None
+        self.n = 0
+
+    def accumulate(self, y: np.ndarray, ref: np.ndarray) -> None:
+        x = self.design(y)
+        if self.xtx is None:
+            self.n = x.shape[1]
+            self.xtx = np.zeros((self.n, self.n))
+            self.xty = np.zeros((self.n, 3))
+        self.xtx += x.T @ x
+        self.xty += x.T @ ref
+
+    def solve(self, xtx=None, xty=None):
+        return np.linalg.lstsq(self.xtx if xtx is None else xtx,
+                               self.xty if xty is None else xty, rcond=1e-12)[0]
+
+    def apply(self, sol, y):
+        return self.design(y) @ sol
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--arm", default="xe", choices=sorted(ARMS))
+    args = ap.parse_args()
+    arm = ARMS[args.arm]
+
+    jobs = json.loads((Q / "real-int8-24/JOBS.json").read_text())
+    frames = []
+    for j in jobs:
+        if j["dump"]:
+            continue
+        f = j["frame"]
+        ref = load_planes(Path(j["reference"]))[0, :, :, :3].astype(np.float64).reshape(-1, 3)
+        y = load_planes(arm["dir"] / f"run-{f}/replayed-network.bin")[0, :, :, :3]
+        frames.append({"frame": f, "seq": j["sequence"], "y": y.astype(np.float64).reshape(-1, 3),
+                       "ref": ref})
+    seqs = sorted({r["seq"] for r in frames})
+    all_y = np.concatenate([r["y"] for r in frames])
+
+    models = [
+        Model("m3b_3x3_plus_bias", lambda y: np.concatenate([y, np.ones((len(y), 1))], 1)),
+        Model("m3_3x3_no_bias", lambda y: y),
+        Model("m1_dc_only", lambda y: np.ones((len(y), 1))),
+    ]
+    for m in models:
+        for r in frames:
+            m.accumulate(r["y"], r["ref"])
+
+    def loo(model: Model) -> dict:
+        out = {"model": model.name, "n_params": model.n, "folds": []}
+        for held in seqs:
+            xtx, xty = model.xtx.copy(), model.xty.copy()
+            for r in frames:
+                if r["seq"] != held:
+                    continue
+                x = model.design(r["y"])
+                xtx -= x.T @ x
+                xty -= x.T @ r["ref"]
+            sol = model.solve(xtx, xty)
+            rows = [r for r in frames if r["seq"] == held]
+            base = float(np.mean([psnr(r["ref"], r["y"]) for r in rows]))
+            corr = float(np.mean([psnr(r["ref"], model.apply(sol, r["y"])) for r in rows]))
+            out["folds"].append({"held_out": held, "n_frames": len(rows),
+                                 "base_mean_db": base, "corrected_mean_db": corr,
+                                 "gain_db": corr - base, "coefficient_matrix": sol.tolist()})
+        avg = np.mean([np.asarray(f["coefficient_matrix"]) for f in out["folds"]], axis=0)
+        per_seq = {}
+        for held in seqs:
+            rows = [r for r in frames if r["seq"] == held]
+            b = float(np.mean([psnr(r["ref"], r["y"]) for r in rows]))
+            c = float(np.mean([psnr(r["ref"], model.apply(avg, r["y"])) for r in rows]))
+            per_seq[held] = {"base_mean_db": b, "corrected_mean_db": c, "gain_db": c - b}
+        base = float(np.mean([psnr(r["ref"], r["y"]) for r in frames]))
+        corr = float(np.mean([psnr(r["ref"], model.apply(avg, r["y"])) for r in frames]))
+        out["fixed_mean_transform"] = {
+            "coefficient_matrix": avg.tolist(), "all_24_base_db": base,
+            "all_24_corrected_db": corr, "all_24_gain_db": corr - base, "per_sequence": per_seq,
+            "mean_of_per_sequence_gain_db": float(np.mean([v["gain_db"] for v in per_seq.values()])),
+            "note": "arithmetic mean of the three LOO fits; never fitted on the sequence it is "
+                    "scored on, but all three fits saw the same 24-frame development set"}
+        sol = model.solve()
+        corr = float(np.mean([psnr(r["ref"], model.apply(sol, r["y"])) for r in frames]))
+        out["full_fit_in_sample"] = {"coefficient_matrix": sol.tolist(), "base_db": base,
+                                     "corrected_db": corr, "gain_db": corr - base}
+        out["mean_fold_gain_db"] = float(np.mean([f["gain_db"] for f in out["folds"]]))
+        return out
+
+    report = {"scope": f"24 frames, candidate arm = {arm['label']} vs captured FP16 "
+                       "network-output.bin, static output colour correction",
+              "arm": args.arm,
+              "convention": "per-frame PSNR over plane 0 RGB (all pixels), peak 1, then the "
+                            "arithmetic mean over the frames of the fold; same as QUALITY-24",
+              "note": "leave-one-SEQUENCE-out.  The three sequences are all daytime street "
+                      "captures of one scene family: this is a sequence holdout, not a scene "
+                      "holdout, so the gains are optimistic for a new scene.",
+              "baseline": {"mean_psnr_db": float(np.mean([psnr(r["ref"], r["y"]) for r in frames])),
+                           "per_frame": [{"frame": r["frame"], "seq": r["seq"],
+                                          "psnr_db": psnr(r["ref"], r["y"])} for r in frames]},
+              "models": {}}
+    for m in models:
+        report["models"][m.name] = loo(m)
+
+    def diag_fit(acc):
+        sol = []
+        for (yy, y1, r1, yr, n) in acc:
+            sol.append(np.linalg.solve(np.array([[yy, y1], [y1, n]]), np.array([yr, r1])))
+        return np.asarray(sol)
+
+    dg = {"model": "md_diag_plus_bias_refit", "n_params": 6, "folds": [],
+          "note": "per-output-channel scale+bias refitted per fold; a strict subset of 3x3+b"}
+    for held in seqs:
+        acc = []
+        for k in range(3):
+            a = [0.0, 0.0, 0.0, 0.0, 0]
+            for r in frames:
+                if r["seq"] == held:
+                    continue
+                a[0] += float((r["y"][:, k] ** 2).sum())
+                a[1] += float(r["y"][:, k].sum())
+                a[2] += float(r["ref"][:, k].sum())
+                a[3] += float((r["y"][:, k] * r["ref"][:, k]).sum())
+                a[4] += len(r["y"])
+            acc.append(tuple(a))
+        sol = diag_fit(acc)
+        rows = [r for r in frames if r["seq"] == held]
+        base = float(np.mean([psnr(r["ref"], r["y"]) for r in rows]))
+        corr = float(np.mean([psnr(r["ref"], r["y"] * sol[:, 0] + sol[:, 1]) for r in rows]))
+        dg["folds"].append({"held_out": held, "base_mean_db": base, "corrected_mean_db": corr,
+                            "gain_db": corr - base, "scale": sol[:, 0].tolist(),
+                            "bias": sol[:, 1].tolist()})
+    dg["mean_fold_gain_db"] = float(np.mean([f["gain_db"] for f in dg["folds"]]))
+    report["models"][dg["model"]] = dg
+
+    C = np.asarray(report["models"]["m3b_3x3_plus_bias"]["fixed_mean_transform"]["coefficient_matrix"])
+    m_eff = C[:3].T.copy()
+    b_eff = C[3].copy()
+    fixed = {}
+
+    def add_fixed(tag, fn, note):
+        per_seq = {}
+        for held in seqs:
+            rows = [r for r in frames if r["seq"] == held]
+            b = float(np.mean([psnr(r["ref"], r["y"]) for r in rows]))
+            c = float(np.mean([psnr(r["ref"], fn(r["y"])) for r in rows]))
+            per_seq[held] = {"base_mean_db": b, "corrected_mean_db": c, "gain_db": c - b}
+        b = float(np.mean([psnr(r["ref"], r["y"]) for r in frames]))
+        c = float(np.mean([psnr(r["ref"], fn(r["y"])) for r in frames]))
+        fixed[tag] = {"all_24_gain_db": c - b, "all_24_corrected_db": c, "per_sequence": per_seq,
+                      "mean_of_per_sequence_gain_db": float(np.mean(
+                          [v["gain_db"] for v in per_seq.values()])), "note": note}
+
+    add_fixed("fixed_m3b", lambda y: y @ C[:3] + b_eff,
+              "the fixed average transform.  y' = [y,1] @ C is the form the store uses, so for a "
+              "row-vector y this is y @ C[:3] + C[3] (equivalently M y + b with M = C[:3].T)")
+    add_fixed("fixed_m3_only", lambda y: y @ C[:3],
+              "fixed average 3x3 with the bias dropped: what the bias alone is worth")
+    add_fixed("fixed_m3b_rows_as_written", lambda y: y @ C[:3].T + b_eff,
+              "diagnostic only: applying the stored 4x3 array as M y + b without transposing")
+    diag_C = np.diag(np.diag(m_eff))
+    add_fixed("fixed_m3b_offdiag_zeroed", lambda y: y @ diag_C + b_eff,
+              "fixed matrix with off-diagonal terms zeroed, bias kept, NOT refitted: the "
+              "'per-channel scale only' control")
+    report["fixed_transforms"] = fixed
+    report["effective_matrix"] = {
+        "note": "OUTPUT-CORRECTION-STUDY.json stores the least-squares coefficient array C of "
+                "y' = [y,1] @ C (4x3, feature-major).  In the conventional column form "
+                "y' = M y + b the matrix is M = C[:3].T.  Using C[:3] un-transposed is a "
+                "different, harmful transform - see fixed_m3b_transposed_WRONG.",
+        "m_eff": m_eff.tolist(), "b": b_eff.tolist(),
+        "m_eff_row_sums": m_eff.sum(axis=1).tolist(),
+        "m_eff_diagonal": np.diag(m_eff).tolist(),
+        "m_eff_offdiag_abs_sum": float(np.abs(m_eff - np.diag(np.diag(m_eff))).sum()),
+    }
+    (OUT / arm["out"]).write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    print(f"arm {args.arm}: baseline mean {report['baseline']['mean_psnr_db']:.6f} dB")
+    for name, res in report["models"].items():
+        print(f"\n== {name}  (LOO mean fold gain {res['mean_fold_gain_db']:+.4f} dB)")
+        for f in res["folds"]:
+            print(f"   {f['held_out']:<28} {f['base_mean_db']:.4f} -> "
+                  f"{f['corrected_mean_db']:.4f}   {f['gain_db']:+.4f}")
+        if "fixed_mean_transform" in res:
+            fm = res["fixed_mean_transform"]
+            print(f"   fixed-mean: 24f {fm['all_24_base_db']:.4f} -> "
+                  f"{fm['all_24_corrected_db']:.4f} ({fm['all_24_gain_db']:+.4f})  "
+                  f"per-seq mean {fm['mean_of_per_sequence_gain_db']:+.4f}")
+            print(f"   coefficients (4x3): "
+                  f"{np.round(np.asarray(fm['coefficient_matrix']), 5).tolist()}")
+            print(f"   in-sample full fit {res['full_fit_in_sample']['gain_db']:+.4f} dB")
+        else:
+            for f in res["folds"]:
+                print(f"   scale {np.round(f['scale'], 5).tolist()} bias "
+                      f"{np.round(f['bias'], 6).tolist()}")
+    print("\n== fixed transforms, no refit")
+    for tag, v in report["fixed_transforms"].items():
+        per = "  ".join(f"{k.replace('day-street-', '')}:{x['gain_db']:+.4f}"
+                        for k, x in v["per_sequence"].items())
+        print(f"   {tag:<30} 24f {v['all_24_gain_db']:+.4f}   {per}")
+    em = report["effective_matrix"]
+    print(f"\neffective M row sums {np.round(em['m_eff_row_sums'], 5).tolist()}  "
+          f"diag {np.round(em['m_eff_diagonal'], 5).tolist()}  b {np.round(em['b'], 6).tolist()}")
+
+
+if __name__ == "__main__":
+    main()

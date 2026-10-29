@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Evidence for the shipped C128 WO INT8 packs (CPU only).
+
+For every C128 output projection the R07 card converted, this decodes the *shipped*
+`c128_b<N>_wo.codes.i8.bin` with the *shipped* `c128_b<N>_wo.sc.f32.bin` using the tile
+layout the candidate kernel actually reads, and checks it against the FP16 weights the
+deployed shader reads from the frozen G3 pack:
+
+  * `dequant_vs_fp16_rel_L2` / `max_abs`  — the pack really is that matrix
+  * `saturation_share`, `zero_channels`   — quantiser sanity
+  * `recomputed_code_diff`                — how far a from-scratch f32 quantiser lands
+                                            (all differences are +-1 at |scaled| ~ 63.5,
+                                            i.e. tie handling, not a wrong matrix)
+
+usage: wo_pack_evidence.py
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gen_c128_wo_packs as G  # noqa: E402
+
+N, K = G.N, G.K
+ni, ki = np.arange(N)[:, None], np.arange(K)[None, :]
+OFF = (ni // 16) * 2048 + (ki // 32) * 512 + (ni % 16) * 32 + (ki % 32)
+
+
+def decode_i8(codes, scales):
+    """element (n,k) of the matrix is codes[OFF[n,k]] — OFF is the tile permutation"""
+    flat = np.frombuffer(codes, np.int8).astype(np.int32)
+    return flat[OFF].astype(np.float32) * scales[:, None]
+
+
+def main():
+    passes = G.parse_plan()
+    out = {"tool": "tools/wo_pack_evidence.py",
+           "note": "shipped packs decoded with the candidate kernel's layout; "
+                   "reference decodes the shipped codes, it does not regenerate them",
+           "tile_layout": "i8[(n//16)*2048 + (k//32)*512 + (n%16)*32 + (k%32)]",
+           "blocks": {}}
+    ok = True
+    for b in G.BLOCKS:
+        info = passes[b]
+        codes = (G.SHIPPED / f"c128_b{b}_wo.codes.i8.bin").read_bytes()
+        sc = np.fromfile(G.SHIPPED / f"c128_b{b}_wo.sc.f32.bin", dtype="<f4")
+        assert codes.__len__() == N * K and sc.size == N
+        pack = np.fromfile(info["pack_path"], dtype="<f2")
+        w = G.decode_w(pack, info["wo"])
+        deq = decode_i8(codes, sc)
+        d = deq - w
+        rel = float(np.sqrt((d ** 2).sum() / (w ** 2).sum()))
+        # from-scratch quantiser for the code-identity record.  The sealed form is
+        #   code = roundEven( half( W * (1/sW) ) )
+        # i.e. the product is rounded to half BEFORE the integer rounding.  With that extra
+        # rounding all nine shipped packs reproduce byte-exactly; without it 60-112 codes
+        # (all +-1, all at |scaled| = 63.499996) differ.  This was found by the
+        # r07-c128-cproducer card after an earlier version of this tool reported the
+        # residual as "unreproducible" - it was reproducible, the form was wrong.
+        amax = np.abs(w).max(axis=1)
+        sW = (np.float32(amax) / np.float32(127.0)).astype(np.float32)
+        inv = np.where(sW > 0, np.float32(1.0) / np.where(sW > 0, sW, np.float32(1.0)),
+                       np.float32(0.0)).astype(np.float32)
+        scaled_plain = w * inv[:, None]
+        q_plain = np.clip(np.rint(scaled_plain), -127.0, 127.0).astype(np.int32)
+        q = np.clip(np.rint(scaled_plain.astype(np.float16).astype(np.float32)),
+                    -127.0, 127.0).astype(np.int32)
+        re = q                                  # both sides are [n][k] matrices
+        shipped_q = np.frombuffer(codes, np.int8).astype(np.int32)[OFF]
+        diff = shipped_q != re
+        diff_plain = shipped_q != q_plain
+        rec = {
+            "pass_name": info["pass_name"], "pack_buffer": info["pack_buffer"],
+            "pack_path": info["pack_path"], "pack_sha256": G.sha(info["pack_path"]),
+            "codes_sha256": G.sha(G.SHIPPED / f"c128_b{b}_wo.codes.i8.bin"),
+            "scales_sha256": G.sha(G.SHIPPED / f"c128_b{b}_wo.sc.f32.bin"),
+            "wo_half_offset": info["wo"], "ars_half_offset": info["ars"],
+            "weight_absmax": float(np.abs(w).max()),
+            "sW_max": float(sc.max()), "sW_min": float(sc.min()),
+            "dequant_vs_fp16_rel_L2": rel,
+            "dequant_vs_fp16_max_abs": float(np.abs(d).max()),
+            "dequant_vs_fp16_snr_db": float(10 * np.log10((w ** 2).sum() / max((d ** 2).sum(), 1e-30))),
+            "saturation_share": float(np.count_nonzero(np.abs(shipped_q) >= 127) / (N * K)),
+            "zero_channels": int(np.count_nonzero(amax == 0)),
+            "recomputed_code_diff": int(diff.sum()),
+            "recomputed_code_diff_share": float(diff.sum() / (N * K)),
+            "recomputed_max_abs_diff": int(np.abs(shipped_q - re).max()),
+            "recomputed_code_diff_without_half_rounding": int(diff_plain.sum()),
+            "sealed_quantiser": "roundEven(half(W*(1/sW)))",
+            "scales_reproduced_exactly": bool(np.array_equal(sW, sc)),
+            "scales_reproduced_exactly_on_live_channels": bool(
+                np.array_equal(sW[amax > 0], sc[amax > 0])),
+            "zero_channel_shipped_scale": [float(x) for x in sc[amax == 0]],
+        }
+        out["blocks"]["block%d" % b] = rec
+        ok = ok and rec["scales_reproduced_exactly"] and rel < 0.02
+        print("block%-3d rel_L2=%.6f snr=%5.1f dB sat=%.4f%% zero_ch=%d "
+              "code_diff=%d scales_exact=%s"
+              % (b, rel, rec["dequant_vs_fp16_snr_db"], 100 * rec["saturation_share"],
+                 rec["zero_channels"], rec["recomputed_code_diff"],
+                 rec["scales_reproduced_exactly"]))
+    out["verdict"] = "PACKS_DECODE_TO_THE_FP16_MATRIX" if ok else "CHECK_FAILED"
+    dst = G.OUT.parent / "evidence"
+    dst.mkdir(parents=True, exist_ok=True)
+    (dst / "WO-PACK-EVIDENCE.json").write_text(
+        json.dumps(out, indent=1, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    print("verdict", out["verdict"])
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,195 @@
+// r18_pre_c128_i8mma.comp -- R18 card candidate for PASS 137 "c3x_pre_c128"
+// (C128 block56-class "pre": 16x128 projection + four-corner blend, canonical
+// publication only).
+//
+// Parent (unchanged everywhere else): candidates/amd-netorg-t3b-20261018/
+// c128-canonical-only-v1/source/c3x_pre_c128.comp, deployed as
+// .../c3x_pre_c128.spv sha256
+// eb82244a26dc9b25f6813b82fcccf03646b75426b9c2afcf409ef003091ed6fd (15,772 B),
+// which is what plan-g3-production.txt PASS 137 binds.  Reproduced byte-identically
+// from the parent source by this card (spv/parent_r18_repro.spv).
+//
+// WHAT CHANGES (all of it)
+//   1. the two FP16 M8N16K16 MMAs -> two INT8 M8N16K32 MMAs (int32 accumulator);
+//      the parent's K16 loop over pc.p5.x is paired into K32 steps and the two
+//      B fragments (n0 group, n0+16 group) keep their pairing;
+//   2. the projection A operand (the parent's shared 16 rows x 256 half gather
+//      tile `nr3_gbuf`) is quantised into a shared INT8 tile with a PER-ROW
+//      absmax and the R17-fixed arithmetic:
+//          inv3    = (m3 > 0) ? 127.0 / m3 : 0.0
+//          code    = int8_t(clamp(roundEven(float(h) * inv3), -127, 127))
+//          rowF    = 1.0 / inv3            <-- R17-FIX-A (dequant = amax/127)
+//      The parent's out-of-bounds zero fill of the gather tile is unchanged, so
+//      an all-out-of-bounds row keeps amax = 0 -> scale 0 -> a zero projection,
+//      which is exactly what the FP16 arm produced for that row;
+//   3. the weights come from the NEW binding 13 offline INT8 pack (r07 tile
+//      convention + per-output-channel f32 scale) instead of the FP16 matrix at
+//      pw[p4.y ...].  Binding 8 stays bound for the two half gain records only;
+//   4. the epilogue dequantises INT32 -> f32 with ONE product (rowF*colF), then
+//      narrows to half with MAT_H exactly where the parent narrowed, and stores
+//      into the parent's own `nr3_gbuf` at the parent's own addresses
+//      (rh*8*128 + cg*32 [+16], stride 128).
+//
+// WHAT DOES NOT CHANGE
+//   * the gather loop, its io_at0 addressing and its oob rule;
+//   * the blend loop verbatim: skip read (binding 9), half gain multiply, the
+//     two `precise` statements, canonical io_at0 store to binding 10 (the
+//     contract seed reader's input is byte-identical);
+//   * the retained-descriptor bindings (11, 12) and all 32 push words.
+//
+// A layout: the A tile is the parent's own [row][channel] shared gather with row
+// stride pc.p5.x = 256, i.e. the int8 tile [row][k] with stride K is a literal
+// re-encoding of the parent's fragment addressing
+//     parent elem (i,j) at  rh*8*K + kc + i*K + j
+// (no stride-16 trap here; R19 is the pass with that trap).
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256) in;
+#include "nb05_swin_c128_common.glsl"
+
+layout(set = 0, binding = 8) buffer Nr3Pack { float16_t pw[]; };
+layout(set = 0, binding = 9) buffer Nr3Skip { float16_t sk[]; };
+layout(set = 0, binding = 10) buffer Nr3BlendOut { float16_t blout[]; };
+layout(set = 0, binding = 11) buffer Nr3ProjIn { float16_t x55[]; };
+// Retained descriptor only, exactly as the parent.
+layout(set = 0, binding = 12) buffer C3X { float16_t xg[]; };
+
+shared float16_t nr3_gbuf[4096u];
+
+// ---- candidate shared additions -------------------------------------------
+// nr3_a  : quantised A tile [16 rows][K=256] int8 = 4096 B
+// nr3_abs: per-row |A| partial maxima (16 lanes per row -> 16 partials/row)
+// nr3_srow: per-row DEQUANT scale (amax/127), consumed by rowF
+shared int8_t nr3_a[4096u];
+shared float  nr3_abs[256u];
+shared float  nr3_srow[16u];
+
+// ---- NEW binding 13: offline INT8 weight pack ------------------------------
+//   0       int8  W[N=128][K=256]  idx = (n/16)*(K/32)*512 + (k/32)*512 + (n%16)*32 + (k%32)
+//   32,768  f32   sW[n] = amax_k|W[n][k]| / 127
+layout(set = 0, binding = 13) buffer Nr3PreW8 {
+    int8_t wq[32768];
+    float  wsc[128];
+};
+
+#define MAT_H coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define I8_A  coopmat<int8_t,   gl_ScopeSubgroup, 8, 32, gl_MatrixUseA>
+#define I8_B  coopmat<int8_t,   gl_ScopeSubgroup, 32, 16, gl_MatrixUseB>
+#define I32_C coopmat<int,      gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define F32_C coopmat<float,    gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+
+// ioport_common.glsl io_at, layout 0 (spatial 4x4 tiles, 16 channels).
+uint nr3_io_at0(uint px, uint py, uint c, uint W, uint C) {
+    uint t = ((py / 4u) * (W / 4u) + px / 4u) * 16u + 4u * (py % 4u) + px % 4u;
+    return ((t / 16u) * (C / 16u) + c / 16u) * 256u + (t % 16u) * 16u + c % 16u;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = tid / 32u;
+    const uint wx = (pc.p1.z != 0) ? uint(pc.p2.x) : gl_WorkGroupID.x;
+    const uint wy = (pc.p1.z != 0) ? uint(pc.p2.y) : gl_WorkGroupID.y;
+    const uint K3 = uint(pc.p5.x);            // 256
+
+    // ---- gather 16 rows x 256 channels (parent's loop, byte-identical) ----
+    {
+        for (uint e = tid; e < 4096u; e += 256u) {
+            const uint p3 = e / pc.p5.x, k3 = e % pc.p5.x;
+            const int cx3 = 4 * int(wx) - 2 + int(p3 % 4u);
+            const int cy3 = 4 * int(wy) + int(p3 / 4u);
+            float16_t v3 = float16_t(0.0);
+            if (cx3 >= 0 && cy3 >= 0 && cx3 < int(pc.p6.z) && cy3 < int(pc.p6.w))
+                v3 = x55[nr3_io_at0(uint(cx3), uint(cy3), k3, uint(pc.p6.z), pc.p5.x)];
+            nr3_gbuf[e] = v3;
+        }
+        barrier();
+
+        // ---- candidate: quantise the gathered tile, per row ------------------
+        // 256 threads / 16 rows = 16 lanes per row, 16 contiguous channels each.
+        const uint qr = tid / 16u;            // row 0..15
+        const uint ql = tid % 16u;            // channel block within the row
+        const uint qb = ql * 16u;
+        float amax = 0.0;
+        for (uint i = 0u; i < 16u; ++i)
+            amax = max(amax, abs(float(nr3_gbuf[qr * K3 + qb + i])));
+        nr3_abs[qr * 16u + ql] = amax;
+        barrier();
+        float m3 = 0.0;
+        for (uint j = 0u; j < 16u; ++j) m3 = max(m3, nr3_abs[qr * 16u + j]);
+        const float inv3 = (m3 > 0.0) ? 127.0 / m3 : 0.0;
+        for (uint i = 0u; i < 16u; ++i) {
+            precise float c3v = float(nr3_gbuf[qr * K3 + qb + i]) * inv3;
+            nr3_a[qr * K3 + qb + i] = int8_t(clamp(roundEven(c3v), -127.0, 127.0));
+        }
+        // R17-FIX-A: the DEQUANT scale, never the quantiser step.
+        if (ql == 0u) nr3_srow[qr] = (inv3 > 0.0) ? (1.0 / inv3) : 0.0;
+        barrier();
+
+        // ---- projection: INT8 M8N16K32, int32 accumulate ---------------------
+        const uint rh = sg >> 2u, cg = sg & 3u;
+        const uint kst = K3 / 32u;            // 8 K32 steps
+        const uint n16s = kst * 512u;         // per-n16 tile stride (= K*16 bytes)
+        const uint wbase = (cg * 32u / 16u) * n16s;
+        I32_C acc0 = I32_C(0), acc1 = I32_C(0);
+        for (uint ki = 0u; ki < kst; ++ki) {
+            I8_A a; I8_B b0, b1;
+            coopMatLoad(a, nr3_a, rh * 8u * K3 + ki * 32u, K3, LROW);
+            coopMatLoad(b0, wq, wbase + ki * 512u, 32u, LCOL);
+            coopMatLoad(b1, wq, wbase + n16s + ki * 512u, 32u, LCOL);
+            acc0 = coopMatMulAdd(a, b0, acc0);
+            acc1 = coopMatMulAdd(a, b1, acc1);
+        }
+        barrier();
+        F32_C rowF;
+        coopMatLoad(rowF, nr3_srow, rh * 8u, 0u, LCOL);   // per-row, stride 0
+        {
+            F32_C colF;
+            coopMatLoad(colF, wsc, cg * 32u, 0u, LROW);   // per-column, stride 0
+            F32_C f = F32_C(acc0);
+            for (uint c = 0u; c < f.length(); ++c)
+                f[c] = f[c] * (rowF[c] * colF[c]);
+            MAT_H h = MAT_H(f);
+            coopMatStore(h, nr3_gbuf, rh * 8u * 128u + cg * 32u, 128u, LROW);
+        }
+        {
+            F32_C colF;
+            coopMatLoad(colF, wsc, cg * 32u + 16u, 0u, LROW);
+            F32_C f = F32_C(acc1);
+            for (uint c = 0u; c < f.length(); ++c)
+                f[c] = f[c] * (rowF[c] * colF[c]);
+            MAT_H h = MAT_H(f);
+            coopMatStore(h, nr3_gbuf, rh * 8u * 128u + cg * 32u + 16u, 128u, LROW);
+        }
+    }
+    barrier();
+
+    // ---- blend: one value per token/channel, published once (canonical only) ----
+    // The parent's loop, unmodified.
+    for (uint i = tid; i < 4096u; i += 256u) {
+        const uint t3 = i / 64u, cp3 = i % 64u, c3 = cp3 * 2u;
+        const uint tg3 = t3, q3 = tg3 >> 4u, s3 = tg3 & 15u;
+        const int tx3 = 2 * int(wx) + pc.p0.z + int(q3 & 1u);
+        const int ty3 = 2 * int(wy) + pc.p0.w + int(q3 >> 1u);
+        const bool oob3 = (tx3 < 0 || ty3 < 0 || tx3 >= int(pc.p0.x) || ty3 >= int(pc.p0.y));
+        if (oob3) continue;   // canonical copy holds no out-of-bounds tiles
+        const uint px3 = uint(4 * tx3 + int(s3 % 4u)), py3 = uint(4 * ty3 + int(s3 / 4u));
+        const uint cx3 = px3 >> 1u, cy3 = py3 >> 1u;
+        const uint ps3 = uint((int(cy3) - 4 * int(wy)) * 4 + (int(cx3) - 4 * int(wx)) + 2);
+        precise f16vec2 main_scaled = f16vec2(nr3_gbuf[ps3 * 128u + c3], nr3_gbuf[ps3 * 128u + c3 + 1u]);
+        if (pc.p5.w == 1u) main_scaled = main_scaled * f16vec2(pw[pc.p5.z + pc.p5.y + c3], pw[pc.p5.z + pc.p5.y + c3 + 1u]);
+        const f16vec2 skip_gain = f16vec2(pw[pc.p5.z + c3], pw[pc.p5.z + c3 + 1u]);
+        const uint sa3 = pc.p4.z + nr3_io_at0(px3, py3, c3, pc.p6.x, pc.p5.y);
+        const f16vec2 skip_input = f16vec2(sk[sa3], sk[sa3 + 1u]);
+        precise f16vec2 skip_v = skip_input * skip_gain;
+        precise f16vec2 value = main_scaled + skip_v;
+        const uint ba3 = nr3_io_at0(px3, py3, c3, pc.p0.x * 4u, pc.p5.y);
+        blout[ba3] = value.x; blout[ba3 + 1u] = value.y;
+    }
+}

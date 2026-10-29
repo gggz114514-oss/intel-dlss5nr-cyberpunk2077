@@ -1,0 +1,92 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,shlex,shutil,collections,re
+D=Path(__file__).resolve().parent;A=D.parent;B=A.parent.parent;R=D/'f05-score-qpair';R.mkdir(exist_ok=True);P=D/'coefficient-reuse-combined';T=D/'f05-owner-concurrency/subgroup-owner-family'
+read=lambda p:json.loads(p.read_text(encoding='utf-8-sig'));sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+def ident(p):return dict(path=str(p),sha256=sha(p))
+def save(p,x):p.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding='utf-8')
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def restore(pm,cm,out):
+ ints={128,130,132,134,135,137,138,139};allnc=set(ST.no_contraction_ids(pm));nc={ST.result_id_of(op,a) for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in allnc and op not in ints};ops={op for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in nc};pr=ST.function_regions(pm);cr=ST.function_regions(cm);assert len(pr)==len(cr);keep=[];checked=0
+ for p,c in zip(pr,cr):
+  ps=[pm.instructions[i] for i in p if pm.instructions[i][0] in ops];cs=[cm.instructions[i] for i in c if cm.instructions[i][0] in ops];assert len(ps)==len(cs)
+  for x,y in zip(ps,cs):
+   assert (x[0],x[3])==(y[0],y[3]);a=ST.result_id_of(x[0],x[1]);b=ST.result_id_of(y[0],y[1]);assert pm.operand_signature(a,3)==cm.operand_signature(b,3);checked+=1
+   if a in nc:keep.append(b)
+ assert len(keep)==len(nc);raw=set(ST.no_contraction_ids(cm));keepint=[ST.result_id_of(op,a) for op,a,_,_ in cm.instructions if op in ints and ST.result_id_of(op,a) in raw];ST.set_no_contraction(cm,keep+keepint,out);return dict(checked=checked,float_NC=len(keep),integer_NC=len(keepint))
+
+
+import struct
+def function_map(m):
+ names={}
+ for op,a,_,_ in m.instructions:
+  if op==5:names[a[0]]=struct.pack('<'+'I'*(len(a)-1),*a[1:]).split(b'\0')[0].decode().split('(')[0]
+ return {names.get(m.instructions[r[0]][1][1],str(m.instructions[r[0]][1][1])):r for r in ST.function_regions(m)}
+def restore_pair(pm,cm,out,C):
+ ints={128,130,132,134,135,137,138,139};nc=set(ST.no_contraction_ids(pm));pr=function_map(pm);cr=function_map(cm);keep=[];report=[]
+ assert set(cr)==(set(pr)-{f'c{C}_score_block'})|{f'c{C}_score_finish',f'c{C}_score_pair'}
+ for name,p in pr.items():
+  cn=f'c{C}_score_finish' if name==f'c{C}_score_block' else name;c=cr[cn]
+  ops={pm.instructions[i][0] for i in p if ST.result_id_of(pm.instructions[i][0],pm.instructions[i][1]) in nc and pm.instructions[i][0] not in ints}
+  ps=[pm.instructions[i] for i in p if pm.instructions[i][0] in ops];cs=[cm.instructions[i] for i in c if cm.instructions[i][0] in ops];assert len(ps)==len(cs),(name,len(ps),len(cs))
+  for x,y in zip(ps,cs):
+   assert (x[0],x[3])==(y[0],y[3]);a=ST.result_id_of(x[0],x[1]);b=ST.result_id_of(y[0],y[1])
+   if name!=f'c{C}_score_block':assert pm.operand_signature(a,3)==cm.operand_signature(b,3),(name,a,b)
+   if a in nc:keep.append(b)
+  report.append(dict(parent_function=name,candidate_function=cn,checked=len(ps),exception='Score acc comes from same K-ordered pair accumulation, transport path changed' if name==f'c{C}_score_block' else None))
+ expected={ST.result_id_of(op,a) for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in nc and op not in ints};assert len(keep)==len(expected)
+ raw=set(ST.no_contraction_ids(cm));ki=[ST.result_id_of(op,a) for op,a,_,_ in cm.instructions if op in ints and ST.result_id_of(op,a) in raw];ST.set_no_contraction(cm,keep+ki,out);return dict(floating_NC=len(keep),functions=report)
+scan=read(D/'CURRENT-CENSUS.json')['rows'];pt=(P/'plan.txt').read_text(encoding='utf-8');planrows=[shlex.split(l) for l in pt.splitlines() if l.startswith('PASS ')];S=R/'family';S.mkdir(exist_ok=True);text=pt;sources=[];proof=[]
+for ordinal,C,rel in [(7,64,'f05-owner-concurrency/c64-subgroup-owner/c64/candidate.comp'),(19,128,'f05-owner-concurrency/subgroup-owner-family/c128/candidate.comp')]:
+ src=Path(scan[ordinal]['source']);parent=Path(planrows[ordinal][3]);selectedsource=D/rel;assert selectedsource.with_suffix('.spv').read_bytes()==parent.read_bytes();d=S/f'c{C}';d.mkdir(exist_ok=True)
+ def compile(label,t):
+  f=d/(label+'.comp');o=d/(label+'.spv');f.write_text(t,encoding='utf-8');run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(src.parent),f,'-o',o]);return o
+ original=selectedsource.read_text(encoding='utf-8-sig');pm=ST.Module(parent);rb=compile('parent-rebuild',original);rm=ST.Module(rb);keep,info=ST.transfer_decoration_pattern_aligned(pm,rm,set());ST.set_no_contraction(rm,keep,rb);assert sha(rb)==sha(parent)
+ start=original.index(f'MAT_H c{C}_score_block(');brace=original.index('{',start);depth=1;end=brace+1
+ while depth:
+  if original[end]=='{':depth+=1
+  elif original[end]=='}':depth-=1
+  end+=1
+ finish_start=original.index('    if (debug) coopMatStore(acc, dbgf',brace)
+ finish=f'MAT_H c{C}_score_finish(MAT_C acc,uint kb,uint qg,uint h) {{\n    const bool debug=pc.p1.w!=0;\n'+original[finish_start:end]
+ pair=f"""
+void c{C}_score_pair(uint kb,uint qg,uint h,out MAT_H p0,out MAT_H p1) {{
+    MAT_C acc0=MAT_C(float16_t(0.0)),acc1=MAT_C(float16_t(0.0));
+    for(uint ki=0u;ki<2u;++ki) {{
+        MAT_B b;coopMatLoad(b,qkv,((gl_SubgroupID/4u)*6144u)+qg*32u+ki*16u,32u,LCOL);
+        MAT_A a;
+        coopMatLoad(a,qkv,((gl_SubgroupID/4u)*6144u)+2048u+kb*32u+ki*16u,32u,LROW);
+        acc0=coopMatMulAdd(a,b,acc0);
+        coopMatLoad(a,qkv,((gl_SubgroupID/4u)*6144u)+2048u+(kb+8u)*32u+ki*16u,32u,LROW);
+        acc1=coopMatMulAdd(a,b,acc1);
+    }}
+    p0=c{C}_score_finish(acc0,kb,qg,h);
+    p1=c{C}_score_finish(acc1,kb+8u,qg,h);
+}}
+"""
+ changed=original[:start]+finish+'\n'+pair+original[end:]
+ for j in range(4):
+  block=f'        MAT_H p{j}0 = c{C}_score_block({16*j}u, qg, h);\n        MAT_H p{j}1 = c{C}_score_block({16*j+8}u, qg, h);'
+  assert changed.count(block)==1
+  changed=changed.replace(block,f'        MAT_H p{j}0,p{j}1;\n        c{C}_score_pair({16*j}u,qg,h,p{j}0,p{j}1);')
+ o=compile('candidate',changed);am=restore_pair(pm,ST.Module(o),o,C);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',o]);ords=[i for i,t in enumerate(planrows) if Path(t[3])==parent];text=text.replace(parent.as_posix(),o.as_posix());sources.append(dict(width=C,ordinal=ordinal,ordinals=ords,parent=ident(parent),parent_rebuilt=ident(rb),source=ident(o.with_suffix('.comp')),candidate=ident(o),arithmetic_alignment=am))
+ for sg in range(8):
+  qg=(sg%4)*16
+  for kb in range(0,64,16):
+   for side in range(2):
+    for ki in range(2):
+     assert (sg//4)*6144+qg*32+ki*16==(sg//4)*6144+0+qg*32+ki*16
+     for row in range(8):
+      for col in range(16):
+       assert 0<=kb+side*8+row<64 and 0<=qg+col<64
+ proof.append(dict(width=C,scope=ords,mapping='Same8SG/head/query owner, same64keysx16queries, pairadjacent8keytiles. Q address dependsqg/ki/head only, notkb. Twoacc each retain ki0 thenki1. Finishsamebias/halfcast/exp; denominator/PVsourceunchanged.',work='PerSG Q-B loads16->8, K-A loads16unchanged,16scoreMMAunchanged. No globalweight/input/QKVprojection changes, no newshuffle/barrier/SLM.',lifetime='One extraFP32acc16B/lane (512B/SG) duringpairK; Q-B onlycurrentki, nofull64keycache. Firstfinish overlapsotheracc; compiler mayaddcopies, native mustverify scratch/realreads. Sourcepayload bound is notGRF allocation.',scope_limit='C256 alreadyhasQ operands hoisted acrossallscoreblocks, unchanged.'))
+plan=S/'plan.txt';plan.write_text(text,encoding='utf-8');cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check']);save(S/'BUILD.json',dict(parent=ident(P/'plan.txt'),plan=ident(plan),sources=sources,CPU=cpu));save(S/'PROOF.json',dict(rows=proof))
+(S/'run').mkdir(exist_ok=True)
+for kind in ['GATES','RESOURCES','NATIVE','ORDINARY']:
+ t=read(T/f'LUNA-{kind}.json');ex=S/(kind.lower()+'-execution');ex.mkdir(exist_ok=True);t['output_root']=str(ex);t['identities']=[v for v in t['identities'] if not v['path'].endswith('.spv')]+[x['candidate'] for x in sources]+[x['parent'] for x in sources]
+ for j in t['jobs']:
+  jp=P/'plan.txt' if kind=='ORDINARY' and j['candidate']=='parent' else plan;j['plan']=ident(jp);j['runner_output']=str(S/'run'/j['id']);ar=j['argv'];ar[ar.index('--plan')+1]=str(jp);ar[ar.index('--out')+1]=j['runner_output']
+  if kind=='NATIVE':ar[ar.index('--output_dir')+1]=str(S/'captures');ar[ar.index('--msg_file')+1]=str(S/'native.log');j['capture_output']=str(S/'captures'/ar[ar.index('--profile_dir')+1])
+ save(S/f'LUNA-{kind}.json',t)
+(S/'execute.ps1').write_text((T/'execute.ps1').read_text(encoding='utf-8').replace('LUNA-F05-SUBGROUP-OWNER-FAMILY','LUNA-F05-QPAIR').replace('F05 owner concurrency','F05 score Q reuse pair'),encoding='utf-8');shutil.copyfile(T/'review_timing.py',S/'review_timing.py');print(cpu)

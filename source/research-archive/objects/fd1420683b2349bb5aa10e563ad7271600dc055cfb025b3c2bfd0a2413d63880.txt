@@ -1,0 +1,76 @@
+n13-vit-attn / F15 ViT attention — RESUME（2026-10-27，CPU-only 交付）
+
+状态：BUILT（候选与 plan 全部构建并通过 CPU 门；**未跑 GPU**，等待主代理串行执行）
+分诊：**B（实现有副作用：每 owner 活值 +24 GRF，预测溢出）**，不是 C/D/E，也还不能判 A。
+  依据：机制本身按卡面要求实现了（一块 K/V 供两个 query 片段），但 owner 必备活值
+  ctx 4→8（+16 GRF）、Q 2→4（+8 GRF），父已 scratch 0 贴着 SIMD32 的 64 GRF 上限，
+  所以本形态预计溢出；scratch>0 时按合同停，不进 ordinary。若 resources 报 scratch=0，
+  再按 ordinary 两臂测整体（那时才可能是 C/D）。
+
+身份（本卡权威）
+  父 SPV      c9971af497d28b7d2ebed4232696b603b1a055b9f7c8f7ad5adbff32536678a2（45 908 B）
+  父重编译    c9971af4… 字节相同（RECIPES.json 的 F15 raw 配方；-I 本卡目录，头文件 sha 已核）
+  候选 SPV    4cd415b0c0e6330945e3e71baecaee896cdbdd89560ec262e8bb5bc7deefa4f6（71 160 B）
+  候选源码    cc2c44d5dae96d13aa08ad0c899cdfc37bea5d3b3016f995577ac5b472e575b9
+  候选 plan   0558f7b304fd0b168971e6f7b13d899d75182764f59cbcad95fc31517b1ee09d
+  基线 plan   a024c3c5…（未改；本卡 plan 只换 8 行 SPV 路径，PASS 行数/缓冲数/pool 字节不变）
+  cpu-check   CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded
+  spv 校验    spv_validate_cpu 通过
+  float_NC    54（父 27，逐条 2×，opcode 多重集逐项 2 倍；见 PROOF.json P5）
+
+已证（CPU，可复核）
+  1. 父字节复现：raw 直连（build/repro96/rebuild.spv = 父 SPV 字节）。
+  2. 几何变换算术中性：只改 local_size/qg/fill stride 的探针 = 父 2878→2872 条 SPIR-V，
+     差异恰好是删掉的未用变量 dg（1 OpVariable + name/store/load + 1 OpSRem + 1 OpIMul），
+     NC 27 不变（build/PROBE-GEOM.json）。所以候选多出来的算术就是被复制的 block B 链。
+  3. 源码级最小 diff：SOURCE-DIFF.patch 只删 18 行（几何 3、PV 闭括号 8、den 交换 2、
+     注释 2、qg/dg 1、local_size 1，其中 fill stride 2 行含在几何内），其余全是新增；
+     block A 就是父的逐行原文（只需要改 B 的名字、+16 列偏移）。
+  4. 映射：A/B/C/CH 四个片段映射一一覆盖（128/256 元素，coord 与 source 互逆）；
+     `nrh_join_rows_to_B` 对 block A 与 block B 都精确把 P[key][query] 放进 PV 的 B 操作数；
+     真实 dispatch（p0.x=288, p0.y=320, grid 5×32×1）288 列各覆盖一次，死块 1 个（列 288..319，
+     与父死 32 列相同）。
+  5. den 树：in-lane 复算（IEEE binary16 RNE）对 A/B 两块都与父文档树逐查询位相同；
+     打包 (mine,mineB) 的一次 shuffleXor 与两次独立交换位相同。
+  6. 生命周期：sk/sv 生产者/最后读者/覆盖者与两个屏障不变；未新增跨 chunk 预取，
+     未新增同步（屏障数、shared 8192、grid、push、binding 全不变）。
+  7. 尾块：padding 谓词只含 key 项；p0.x=288 是 32 的倍数 → A/B 两块同生同灭；
+     仍保留两个独立谓词，B 的 Q 只在 live 时 load，B 的 store/debug/倒数只在该谓词下执行。
+
+未证（需要 GPU，本卡无权）
+  - scratch 是否真的 >0（预测 1.5–3 KB）；Instruction Count 3691→（预测 5400–6400）。
+  - SLM 片段读是否真的按 chunk 减半（父 128 → 64）；DPAS 是否真的每 kb 16。
+  - 端到端时间；以及 −16 KB SLM 读与 +20~28 寄存器谁赢。
+  - join 里 nrh_unpack2 的两条恒等 shuffle 是否已被编译器消掉（下一张卡的前提）。
+
+下一处具体改动（按优先级，均已具名）
+  1) [首选，不加活值] `register_handoff.glsl::nrh_unpack2()` 是恒等（shuffle(p,l^1) 两次）。
+     `nrh_join_rows_to_B` 每分量 3 条 subgroup 操作、其中 2 条恒等 → 每 kb 每 query 块 24 条。
+     先在本卡 native ISA 里确认这 2 条没被消掉；确认后改 1 条，owner 主循环可省 ~15–20%，
+     数学与舍入点不变。代价：需要候选目录自带一份 register_handoff.glsl（本卡已如此做，
+     并有 sha 记录），不能改共享头。
+  2) [全局字节真正减半] workgroup 的 query 跨度 64→128（4 owner × 32 列，local_size 256，
+     grid.x 5→3）：每 query 每 chunk 全局 K/V 128 B→64 B、SLM 读 256 B→128 B、fill 每 query 减半。
+     需要改 plan 的 PASS 字段 gx（5→3），而 `COMMON.rebase_candidate_plan()` 只换 SPV 路径，
+     会把 gx 改回 5 —— 若链头前移必须手工重放 gx；本卡故意不做，避开这个耦合。
+  3) [若 1) 之后仍要压 overflow] 把 B 的 pf 计算挪到 A 的四条 PV 之后（V 片段再读一次），
+     省 4 GRF、缩短 pfA/pfB 同时存活；代价是 V 的 SLM 读不再减半。
+
+未决项（本卡按合同自行判定，不阻塞）
+  - 本卡的“owner:fill 比保持 2:2”意味着同时改了 local_size（256→128）。理由：owner 扩到 32 列后
+    若保留 8 个子组，会把 6/8 wave 停在屏障上（生产性 wave 从 4/8 掉到 2/8），
+    在实测的 1 wave/XVE 状态下等于把机器利用率先砍一半。这项代价已入账（COST-LEDGER added）。
+    若主代理希望“只改 owner、不改线程数”，把 qg 改回 `(sg/2)*32` 且 owner 限定 sg∈{0,2}、
+    local_size 回 256、fill stride 回 256 即可得到 A 臂（预测更慢，不值得占 GPU 时段）。
+  - 真实 dispatch 的 8 个 F15 PASS 全部 p0=(288,320,3,0)、grid=(5,32,1)，所以 tail 代码在本帧
+    不执行；tail 的正确性只有源码级证明。
+  - 本卡的新机制不产生任何跨派发依赖变化：`context` 的写地址集合与父逐列相同。
+
+恢复点
+  重新构建：`@NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe cards/n13-vit-attn/build.py`
+  （父复现 → 候选编译 → spv 校验 → plan → cpu-check → BUILD.json，全 CPU）
+  映射/树复核：同目录 `verify-maps.py`（→ build/MAP-VERIFY.json）
+  几何探针：同目录 `probe-geom.py`（→ build/PROBE-GEOM.json）
+  文件：candidate.comp / candidate.spv / parent-rebuild.spv / plan.txt / BUILD.json /
+        SOURCE-DIFF.patch / ANALYSIS.md / PROOF.json / COST-LEDGER.json /
+        NATIVE-PREDICTION.md / GPU-REQUEST.json

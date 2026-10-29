@@ -1,0 +1,125 @@
+"""n39-f06-c256-slack: build the plans on the current chain head and run --cpu-check.
+
+Plans produced (all 232 PASS lines, only this card's rows touched):
+  plan.txt            16-row package: 15 F06 C256 rows -> candidate.spv,
+                      1 F18 C256 row (ordinal 168) -> candidate-f18.spv,
+                      and the ledger field (plan column 6, `shared`) synced 32768 -> 0
+  plan-f06only.txt    the same but only the 15 F06 rows (attribution subset)
+  plan-padback.txt    the 16-row package with the 15 F06 rows -> candidate-padback.spv
+                      and their ledger field kept at 32768 (the pad-back control arm)
+
+The runner only range-checks the `shared` column (clock_runner.cpp:93, `pass.shared > 49152`
+rejects); it does not allocate from it, so syncing it cannot change the dispatch -- it is the
+L35 "the module is the only authority" fix, written down in the plan as well.
+
+Writes build/plan.json.
+"""
+import json
+import pathlib
+import re
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(CARD.parents[1]))
+import COMMON as K                      # noqa: E402
+
+F06_SPV = ('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+           'fullnet-mechanism-transfer-20261026/f06-scale-fragments/family/c256/candidate.spv')
+F18_SPV = ('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+           'fullnet-mechanism-transfer-20261026/contract-scale-fragments/family/c256/candidate.spv')
+CAND = (CARD / 'candidate.spv').as_posix()
+CAND_F18 = (CARD / 'candidate-f18.spv').as_posix()
+CAND_PAD = (CARD / 'candidate-padback.spv').as_posix()
+SHARED_COL = 5                          # PASS <row> "<name>" "<spv>" <subgroup> <shared> ...
+
+
+def norm(p):
+    return str(p).strip('"').replace('\\', '/')
+
+
+def rewrite(path, base_text, targets, expect):
+    """targets: {spv_path_as_in_plan: (new_spv, new_shared_or_None)} applied to every match."""
+    lines = base_text.splitlines()
+    hits = {}
+    for i, line in enumerate(lines):
+        if not line.startswith('PASS '):
+            continue
+        toks = line.split()
+        spv = norm(toks[3])
+        if spv not in targets:
+            continue
+        new_spv, new_shared = targets[spv]
+        toks[3] = '"%s"' % new_spv
+        if new_shared is not None:
+            toks[SHARED_COL] = str(new_shared)
+        lines[i] = ' '.join(toks)
+        hits[spv] = hits.get(spv, 0) + 1
+    total = sum(hits.values())
+    assert total == expect, 'rewrote %d lines, expected %d (%s)' % (total, expect, hits)
+    path.write_text('\n'.join(lines) + ('\n' if base_text.endswith('\n') else ''), encoding='utf-8')
+    return dict(path=str(path), sha256=K.sha(path), replaced=total, per_source=hits,
+                bytes=path.stat().st_size)
+
+
+def check(path):
+    try:
+        out = K.cpu_check(path)
+        return dict(ok=True, stdout=out.strip()[:4000])
+    except RuntimeError as exc:
+        return dict(ok=False, error=str(exc)[:4000])
+
+
+def main():
+    base, base_sha, _ = K.current_best()
+    text = pathlib.Path(base).read_text(encoding='utf-8-sig')
+    rows = K.pass_lines_of(base)
+    assert len(rows) == 232, len(rows)
+    f06_rows = [r for r in rows if norm(r['spv']) == F06_SPV]
+    f18_rows = [r for r in rows if norm(r['spv']) == F18_SPV]
+    assert len(f06_rows) == 15 and len(f18_rows) == 1
+
+    out = dict(chain_head=dict(path=str(base), sha256=base_sha),
+               baseline_module_workgroup_bytes=dict(f06=32768, f18=32768),
+               rows=dict(f06=[r['ordinal'] for r in f06_rows],
+                         f18=[r['ordinal'] for r in f18_rows],
+                         plan_line_numbers=[r['ordinal'] + 1 for r in f06_rows + f18_rows]),
+               plans={})
+
+    pkg = rewrite(CARD / 'plan.txt', text,
+                  {F06_SPV: (CAND, 0), F18_SPV: (CAND_F18, 0)}, expect=16)
+    pkg['cpu_check'] = check(CARD / 'plan.txt')
+    out['plans']['package16'] = pkg
+
+    f06only = rewrite(CARD / 'plan-f06only.txt', text, {F06_SPV: (CAND, 0)}, expect=15)
+    f06only['cpu_check'] = check(CARD / 'plan-f06only.txt')
+    out['plans']['f06only15'] = f06only
+
+    pad = rewrite(CARD / 'plan-padback.txt', text,
+                  {F06_SPV: (CAND_PAD, 32768), F18_SPV: (CAND_F18, 0)}, expect=16)
+    pad['cpu_check'] = check(CARD / 'plan-padback.txt')
+    out['plans']['padback'] = pad
+
+    for name, rec in out['plans'].items():
+        print('%-11s replaced=%2d  sha=%s  %s' % (name, rec['replaced'], rec['sha256'][:16],
+                                                 'CPU OK' if rec['cpu_check']['ok'] else 'CPU FAIL'))
+        if rec['cpu_check']['ok']:
+            print('    %s' % ' | '.join(rec['cpu_check']['stdout'].splitlines()[-3:]))
+        else:
+            print('    %s' % rec['cpu_check'].get('error', '')[:400])
+    # the plan must differ from the chain head exactly in this card's rows
+    base_lines = pathlib.Path(base).read_text(encoding='utf-8-sig').splitlines()
+    for name, path in (('package16', CARD / 'plan.txt'), ('f06only15', CARD / 'plan-f06only.txt'),
+                       ('padback', CARD / 'plan-padback.txt')):
+        new_lines = path.read_text(encoding='utf-8').splitlines()
+        diff = [i for i, (a, b) in enumerate(zip(base_lines, new_lines)) if a != b]
+        out['plans'][name]['differing_lines'] = len(diff)
+        out['plans'][name]['differing_line_numbers'] = [i + 1 for i in diff]
+        print('    differing lines: %d %s' % (len(diff), [i + 1 for i in diff]))
+    K.write_json(CARD / 'build' / 'plan.json', out)
+    ok = all(r['cpu_check']['ok'] for r in out['plans'].values())
+    print('PLAN', 'CPU_PLAN_OK' if ok else 'CPU_PLAN_FAIL')
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

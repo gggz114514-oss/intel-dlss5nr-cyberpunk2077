@@ -1,0 +1,97 @@
+"""n39-f06-c256-slack: negative control for the address audit.
+
+Six doctored variants of the F06 C256 candidate, each a plausible mistake for this card.  The
+audit must FAIL on every one of them; if any variant passes, the gate is decorative (n37 §9).
+
+  V1 drop the tile base            A load reads `gT[m0*256 + k0]`  -> every workgroup reads tile 0
+  V2 keep a half-size staging       shT[8192] + copy of 8192, A load from shT (wrong half)
+  V3 wrong tile stride              `w * 16384u + ... + 1024u` -> walks out of the tile
+  V4 echo without the tile base     `dbg[...+e] = gT[e]` -> dumps tile 0
+  V5 barrier left behind            array deleted but `barrier()` kept
+  V6 array kept, reads repointed    declaration survives with no readers -> 32768 B still declared
+"""
+import hashlib
+import json
+import pathlib
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(CARD))
+import _addr_audit as AA        # noqa: E402
+
+OUT = CARD / 'build' / 'negcontrol'
+PINNED = pathlib.Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024'
+                      r'/fullnet-continuous-20261027/cards/idt-identity-recipe/evidence/headers/881dff8c5145')
+
+
+def mutate(name, text):
+    """Return the doctored source for variant `name`."""
+    if name == 'V1-drop-tile-base':
+        return text.replace('coopMatLoad(a, gT, w * 16384u + m0 * 256u + k0',
+                            'coopMatLoad(a, gT, m0 * 256u + k0')
+    if name == 'V2-half-staging':
+        parent = (CARD / 'parent.comp').read_text(encoding='utf-8')
+        t = parent.replace('shared float16_t shT[16384];', 'shared float16_t shT[8192];')
+        t = t.replace("""    for (uint e = t_local; e < 16384u; e += 256u)
+        shT[e] = gT[w * 16384u + e];""",
+                      """    for (uint e = t_local; e < 8192u; e += 256u)
+        shT[e] = gT[w * 16384u + e];""")
+        return t
+    if name == 'V3-wrong-tile-stride':
+        return text.replace('w * 16384u + m0 * 256u + k0', 'w * 16384u + 1024u + m0 * 256u + k0')
+    if name == 'V4-echo-no-tile-base':
+        return text.replace('dbg[425984u + e] = gT[w * 16384u + e];',
+                            'dbg[425984u + e] = gT[e];')
+    if name == 'V5-barrier-left':
+        return text.replace('    const uint n0 = (sg % 8u) * 32u;',
+                            '    barrier();\n    const uint n0 = (sg % 8u) * 32u;', 1)
+    if name == 'V6-array-kept-no-reader':
+        parent = (CARD / 'parent.comp').read_text(encoding='utf-8')
+        return parent.replace('coopMatLoad(a, shT, m0 * 256u + k0',
+                              'coopMatLoad(a, gT, w * 16384u + m0 * 256u + k0')
+    raise AssertionError(name)
+
+
+def main():
+    sys.path.insert(0, str(CARD.parents[1]))
+    import COMMON as K                        # noqa: E402
+    OUT.mkdir(parents=True, exist_ok=True)
+    base = (CARD / 'candidate.comp').read_text(encoding='utf-8')
+    out = {}
+    for name in ('V1-drop-tile-base', 'V2-half-staging', 'V3-wrong-tile-stride',
+                 'V4-echo-no-tile-base', 'V5-barrier-left', 'V6-array-kept-no-reader'):
+        src = OUT / ('%s.comp' % name)
+        src.write_text(mutate(name, base), encoding='utf-8')
+        spv = OUT / ('%s.spv' % name)
+        try:
+            K.compile_glsl(src, spv, [PINNED])
+            compiled = True
+        except Exception as exc:                       # a variant that cannot compile is no test
+            compiled = False
+            out[name] = dict(compiled=False, error=str(exc)[:400], verdict='NO TEST')
+            print('%-26s COMPILE FAILED (not counted as a catch)' % name)
+            continue
+        rec = AA.audit(label=name, parent='parent.comp', candidate=str(src),
+                       parent_spv='parent-rebuild.spv', candidate_spv=str(spv),
+                       parent_decl=('shT', AA.TILE), candidate_decl=None, parent_copy=1,
+                       n_a_loads=(2 if name == 'V2-half-staging' else 1),
+                       parent_a_src='shT',
+                       candidate_a_src=('shT' if name == 'V2-half-staging' else 'gT'),
+                       echo=(name != 'V2-half-staging'))
+        rules = sorted({v['rule'] for v in rec['violations']})
+        out[name] = dict(compiled=True, verdict=rec['verdict'], rules=rules,
+                         violations=rec['violations'][:6],
+                         source_sha256=hashlib.sha256(src.read_bytes()).hexdigest(),
+                         spv_sha256=hashlib.sha256(spv.read_bytes()).hexdigest())
+        print('%-26s %-4s rules=%s' % (name, rec['verdict'], rules))
+    caught = sum(1 for v in out.values() if v.get('verdict') == 'FAIL')
+    tested = sum(1 for v in out.values() if v.get('compiled'))
+    (CARD / 'build' / 'audit-negcontrol.json').write_text(json.dumps(
+        dict(variants=out, tested=tested, caught=caught,
+             all_caught=caught == tested and tested == 6), indent=2), encoding='utf-8')
+    print('NEGATIVE CONTROL %d/%d caught' % (caught, tested))
+    return 0 if caught == tested == 6 else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

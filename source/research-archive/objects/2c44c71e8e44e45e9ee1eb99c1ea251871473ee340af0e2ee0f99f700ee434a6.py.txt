@@ -1,0 +1,145 @@
+"""n27-f07 cost decomposition v2 (read-only ISA/SPIR-V; no GPU).
+
+Fixes vs v1: exec mask is parsed from the raw line (IGA prints `op (16|M0) ...`),
+so per-message lanes and bytes are real; op histograms are dumped so the
+sync/barrier taxonomy is explicit; GRF peak excludes non-GRF operands.
+"""
+import json, re, sys
+from pathlib import Path
+from collections import Counter
+
+C = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(C))
+import ISA
+
+CAP = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-mechanism-transfer-20261026/f10-weight-return-separation-20261027/captures/native-f20-pixel-owner/ISA')
+FILES = {
+    17: CAP / 'CS_asm856cbe98196e3550_simd32_0000000000000008_7_orig.asm',
+    35: CAP / 'CS_asm0fbd76f6224128d9_simd32_000000000000000c_11_orig.asm',
+    59: CAP / 'CS_asme90c25508ca6c884_simd32_0000000000000010_15_orig.asm',
+}
+EXEC = re.compile(r'\((\d+)\|M\d+\)')
+MSG = re.compile(r'//\s*wr:(\d+)\+(\d+),\s*rd:(\d+);\s*([^\s]+)')
+SHAPE = re.compile(r'\.d(8|16|32|64)x(\d+)')
+
+
+def lanes(i):
+    m = EXEC.search(i['raw'])
+    return int(m.group(1)) if m else None
+
+
+def msg(i):
+    if not i['comment']:
+        return None
+    m = MSG.search('// ' + i['comment'])
+    return m.group(4) if m else None
+
+
+def msg_bytes(m, ln):
+    if ln is None or m is None:
+        return 0
+    s = SHAPE.search(m)
+    if not s:
+        return 0
+    per_lane = int(s.group(1)) // 8 * int(s.group(2))
+    tot = ln * per_lane
+    return min(tot, 512) if ln >= 16 else tot
+
+
+def analyse(ordinal, path):
+    isa = ISA.parse(path)
+    sends = [i for i in isa if i['op'].startswith('send')]
+    dpas = [i for i in isa if i['op'].startswith('dpas')]
+    movs = [i for i in isa if i['op'].startswith('mov')]
+    ops = Counter(i['op'] for i in isa)
+    lane_hist = Counter(lanes(i) for i in isa)
+    send_lane = Counter(lanes(i) for i in sends)
+    msgs = Counter()
+    by_kind_n = Counter()
+    by_kind_b = Counter()
+    by_lane_bytes = Counter()
+    bar = []
+    for i in sends:
+        m = msg(i)
+        msgs[m] += 1
+        k = (m or 'none').split('.')[0] + '.' + ((m or 'none').split('.')[1] if '.' in (m or '') else '')
+        by_kind_n[k] += 1
+        b = msg_bytes(m, lanes(i))
+        by_kind_b[k] += b
+        by_lane_bytes[str(lanes(i))] += b
+        if m and ('barrier' in m or 'fence' in m):
+            bar.append(dict(addr=hex(i['addr']), msg=m, lanes=lanes(i)))
+    movmix = Counter()
+    for i in movs:
+        t = i['ops'][0].split(':')[-1] if i['ops'] and ':' in i['ops'][0] else '?'
+        movmix[t] += 1
+    # GRF: only real r0..r127 operands; flag anything >=128 separately
+    regs, big = set(), set()
+    for i in isa:
+        for o in i['ops']:
+            for m in re.finditer(r'\br(\d+)', o):
+                v = int(m.group(1))
+                (regs if v < 128 else big).add(v)
+    accs = set()
+    for i in isa:
+        for o in i['ops']:
+            for m in re.finditer(r'\bacc(\d+)', o):
+                accs.add(int(m.group(1)))
+    # labels = basic block entries
+    labels = sum(1 for l in path.read_text(encoding='utf-8-sig', errors='replace').splitlines()
+                 if re.match(r'^L\d+:', l))
+    # dpas exec widths
+    dpas_lane = Counter(lanes(i) for i in dpas)
+    # movs whose source is a send destination window (freshly loaded data repack)
+    send_dst = set()
+    for i in sends:
+        if not i['ops']:
+            continue
+        m = re.match(r'^r(\d+)', i['ops'][0])
+        if not m:
+            continue
+        rd = 1
+        if i['comment']:
+            mm = re.search(r'rd:(\d+)', i['comment'])
+            rd = int(mm.group(1)) if mm else 1
+        for k in range(rd):
+            send_dst.add(int(m.group(1)) + k)
+    repack = sum(1 for i in movs if len(i['ops']) > 1 and re.match(r'^r(\d+)', i['ops'][1])
+                 and int(re.match(r'^r(\d+)', i['ops'][1]).group(1)) in send_dst)
+    return dict(
+        ordinal=ordinal, path=str(path), file_bytes=path.stat().st_size,
+        instructions=len(isa), labels=labels,
+        sends=len(sends), dpas=len(dpas), movs=len(movs),
+        exec_hist_all={str(k): v for k, v in sorted(lane_hist.items(), key=lambda x: (x[0] is None, x[0]))},
+        exec_hist_send={str(k): v for k, v in sorted(send_lane.items(), key=lambda x: (x[0] is None, x[0]))},
+        exec_hist_dpas={str(k): v for k, v in sorted(dpas_lane.items(), key=lambda x: (x[0] is None, x[0]))},
+        op_hist={k: v for k, v in ops.most_common(24)},
+        messages={str(k): v for k, v in msgs.most_common()},
+        msg_count_by_kind=dict(by_kind_n), msg_bytes_by_kind=dict(by_kind_b),
+        msg_bytes_by_exec=dict(by_lane_bytes),
+        msg_bytes_total=sum(by_kind_b.values()),
+        barrier_sites=bar, n_barrier_sites=len(bar),
+        mov_mix=dict(movmix.most_common()),
+        max_r=max(regs) if regs else None, regs_ge128=sorted(big),
+        distinct_r=len(regs), acc_regs=sorted(accs),
+        repack_movs_from_send_dst=repack,
+    )
+
+
+if __name__ == '__main__':
+    out = {str(o): analyse(o, p) for o, p in FILES.items()}
+    (C / 'cards/n27-f07/COST-RAW.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    for o in ('17', '35', '59'):
+        d = out[o]
+        print('== ord', o, Path(d['path']).name, 'file', d['file_bytes'], 'B')
+        print('   inst %d labels %d sends %d dpas %d mov %d max_r %s acc %s regs>=128 %s'
+              % (d['instructions'], d['labels'], d['sends'], d['dpas'], d['movs'],
+                 d['max_r'], d['acc_regs'], d['regs_ge128'][:5]))
+        print('   exec all', d['exec_hist_all'])
+        print('   exec send', d['exec_hist_send'], ' dpas', d['exec_hist_dpas'])
+        print('   msg count by kind', d['msg_count_by_kind'])
+        print('   msg bytes by kind', d['msg_bytes_by_kind'], 'TOTAL', d['msg_bytes_total'])
+        print('   bytes by exec', d['msg_bytes_by_exec'])
+        print('   barrier sites', d['n_barrier_sites'], d['barrier_sites'][:6])
+        print('   mov mix', d['mov_mix'], 'repack', d['repack_movs_from_send_dst'])
+        print('   top ops', list(d['op_hist'].items())[:10])

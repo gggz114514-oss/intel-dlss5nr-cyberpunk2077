@@ -1,0 +1,83 @@
+"""Read-only ISA statistics for the F01 baseline kernel.
+
+Parses an IGA dump (gen asm) and reports opcode/send/DPAS/mov counts and
+per-message byte estimates.  No GPU, no writes outside this card.
+"""
+import re, sys, json, collections
+
+LINE = re.compile(r'^/\* \[(?P<addr>[0-9A-F]+)\]\s+\*/\s*(?P<flags>\([^)]*\))?\s*(?P<op>[a-z][a-z0-9._]*)\s*(?P<rest>.*)$')
+SEND = re.compile(r'//\s*(?P<wr>wr:\S+),\s*(?P<rd>rd:\S+);\s*(?P<desc>.*)$')
+
+
+def parse(path):
+    out = []
+    for ln, line in enumerate(open(path, encoding='utf-8', errors='replace'), 1):
+        line = line.rstrip('\n')
+        m = LINE.match(line)
+        if not m:
+            continue
+        rec = dict(addr=m.group('addr'), flags=(m.group('flags') or ''), op=m.group('op'),
+                   rest=m.group('rest').rstrip(), line=ln, text=line)
+        c = SEND.search(rec['rest'])
+        if c:
+            rec['send'] = dict(wr=c.group('wr'), rd=c.group('rd'), desc=c.group('desc').strip())
+        out.append(rec)
+    return out
+
+
+def main(path):
+    ins = parse(path)
+    by_op = collections.Counter(r['op'] for r in ins)
+    # send classification
+    sends = [r for r in ins if 'send' in r['op']]
+    kinds = collections.Counter()
+    bytes_est = collections.Counter()
+    for r in sends:
+        d = r.get('send', {}).get('desc', '')
+        if not d:
+            kinds['(no desc)'] += 1
+            continue
+        head = d.split('[')[0].strip()
+        kinds[head] += 1
+        # per-lane element width from the ugm shape
+        m = re.search(r'\.d(\d+)(?:x(\d+))?([tfbu])?\.', d)
+        if m:
+            width = int(m.group(1)) // 8
+            n = int(m.group(2) or 1)
+            lanes = 32 if m.group(3) == 't' else 1
+            prefix = 'load' if d.startswith('load') else ('store' if d.startswith('store') else 'other')
+            # transposed forms move xN per lane per 32 lanes / N
+            if m.group(3) == 't':
+                total = width * n * (lanes // n) if n else width * lanes
+            else:
+                total = width * n
+            bytes_est[prefix + ':' + m.group(0).strip('.')] += total
+    dpas = [r for r in ins if r['op'].startswith('dpas')]
+    movs = [r for r in ins if r['op'] == 'mov']
+    mov_dst = collections.Counter()
+    for r in movs:
+        m = re.search(r'-?[a-z]\d+\.\d+<[\d;:]*>:([a-z0-9]+)', r['rest'])
+        mov_dst[m.group(1) if m else '?'] += 1
+    conv = collections.Counter()
+    for r in ins:
+        t = r['text']
+        for pat in (':hf', 'f32to16', 'f16to32', 'rnde', 'rndz', 'mad.hf', 'add.hf', 'mul.hf', 'fma.hf'):
+            if pat in t:
+                conv[pat] += 1
+    res = dict(
+        file=path, n_instructions=len(ins),
+        opcodes=dict(by_op.most_common()),
+        n_send=len(sends), send_kinds=dict(kinds.most_common()),
+        send_bytes_est=dict(bytes_est.most_common()),
+        n_dpas=len(dpas), dpas_shapes=dict(collections.Counter(
+            re.search(r'(dpas[wub]?\.\S+)', r['text']).group(1) if re.search(r'(dpas[wub]?\.\S+)', r['text']) else r['op']
+            for r in dpas).most_common()),
+        n_mov=len(movs), mov_dst_types=dict(mov_dst.most_common()),
+        half_tokens=dict(conv.most_common()),
+        flags_hist=dict(collections.Counter(r['flags'] for r in ins).most_common(8)),
+    )
+    print(json.dumps(res, indent=1))
+
+
+if __name__ == '__main__':
+    main(sys.argv[1])

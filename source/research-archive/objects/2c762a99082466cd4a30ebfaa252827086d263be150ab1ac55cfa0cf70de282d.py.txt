@@ -1,0 +1,66 @@
+from pathlib import Path
+import json,hashlib
+D=Path(__file__).resolve().parent;A=D.parent;B=A.parent.parent
+P=A/'c32-boundary-followup-20261026/f20-pixel-owner'
+ns={'__file__':str(A/'c32-boundary-candidates-20261026/build.py')}
+exec(Path(ns['__file__']).read_text(encoding='utf-8-sig').split('# Before writing candidates:')[0],ns)
+sha=ns['sha'];save=ns['save'];run=ns['run'];build=ns['build'];ident=ns['ident']
+assert sha(P/'plan.txt')=='ce550e7ccbed7e452068cec4ebcc913f177d0af90a0bf094ffc419a3c4bbabb0'
+d=D/'optional-mma';d.mkdir(exist_ok=True);(d/'run').mkdir(exist_ok=True)
+# Exhaustively prove source half-fragment coordinates and unique output writers.
+coords={(sg*8+2*j+l//16,l%16+16*h) for sg in range(8) for l in range(32) for j in range(4) for h in range(2)}
+assert coords=={(r,c) for r in range(64) for c in range(32)}
+writers=[(sg*8+2*j+l//16,l%16) for sg in range(8) for l in range(32) if l%16<4 for j in range(4)]
+assert len(writers)==256 and len(set(writers))==256
+s=(P/'candidate.comp').read_text(encoding='utf-8-sig')
+marker='    // ============ stage 9:'
+i=s.index(marker)
+s=s[:i]+'''    // Optional approximate tail. Retired context debug range, after debug readers.
+    // Read each real weight once per WG; zero-pad unused MMA output columns.
+    for(uint e=t_local;e<512u;e+=256u) {
+        uint k=e/16u,c=e%16u;
+        shArena[6144u+e]=c<4u?wb[17024u+c*32u+k]:float16_t(0.0);
+    }
+    barrier(); // publish padded weight tiles, not O activations
+'''+s[i:]
+s=s.replace('        coopMatStore(half0, shX, m0 * 32u, 32u, LROW);','        if(debug) coopMatStore(half0, shX, m0 * 32u, 32u, LROW);')
+s=s.replace('        coopMatStore(half1, shX, m0 * 32u + 16u, 32u, LROW);','        if(debug) coopMatStore(half1, shX, m0 * 32u + 16u, 32u, LROW);')
+a=s.index('    }\n    barrier(); // stage9 producer')
+b=s.index('    // Debug O continues',a)
+s=s[:a]+'''        // Keep H(O), then change only the final reduction implementation.
+        MAT_C result=MAT_C(0.0);
+        {
+            MAT_A input0;
+            for(int j=0;j<4;++j) input0[j]=half0[j];
+            MAT_B weights0;coopMatLoad(weights0,shArena,6144u,16u,LROW);
+            result=coopMatMulAdd(input0,weights0,result);
+        }
+        {
+            MAT_A input1;
+            for(int j=0;j<4;++j) input1[j]=half1[j];
+            MAT_B weights1;coopMatLoad(weights1,shArena,6400u,16u,LROW);
+            result=coopMatMulAdd(input1,weights1,result);
+        }
+        if((lane&15u)<4u) {
+            for(uint j=0u;j<4u;++j) {
+                uint t=m0+2u*j+(lane>>4u),q=t/16u,r=t%16u;
+                int px=(2*int(wx)+shift+int(q&1u))*4+int(r%4u);
+                int py=(2*int(wy)+pc.p3.w+int(q>>1u))*4+int(r/4u);
+                if(px>=0 && px<1280 && py>=0 && py<720)
+                    residual_out[(uint(py)*1280u+uint(px))*4u+(lane&15u)]=result[j];
+            }
+        }
+    }
+'''+s[b:]
+# The old scalar helper becomes unreachable and glslang omits it. Exclude only
+# its decorations from the transfer reference, leaving all upstream math intact.
+ST=ns['ST'];pm=ST.Module(P/'candidate.spv')
+old_helper={ST.result_id_of(pm.instructions[i][0],pm.instructions[i][1]) for i in ns['region'](pm,'boundary_project')}
+transfer=d/'decoration-reference.spv'
+ST.set_no_contraction(pm,set(ST.no_contraction_ids(pm))-old_helper,transfer)
+spv,info=build(d,'candidate',s,transfer)
+pt=(P/'plan.txt').read_text(encoding='utf-8-sig');assert pt.count((P/'candidate.spv').as_posix())==1
+plan=d/'plan.txt';plan.write_text(pt.replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8')
+cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check'])
+save(d/'PROOF.json',dict(baseline=ident(P/'plan.txt'),source=ident(d/'candidate.comp'),spv=ident(spv),NC=info,cpu=cpu,mapped_half_elements=len(coords),unique_outputs=len(writers),rounding='Original H(O) retained. Final K32 ordered scalar accumulation replaced by K16+K16 MMA; intentionally approximate.',lifetime='shArena[6144:6656] previously debug context; debug readers retire at existing debug barrier before weight publication. Normal path has no live shared context here. No later writes to weight region. O stays within producing SG.',logical_cost_per_WG=dict(removed_O_SLM_write_B=4096,removed_O_SLM_read_B=4096,added_weight_SLM_write_B=1024,added_weight_SLM_read_B=8192,global_real_weight_read_B=256,old_global_weight_sets=2,new_global_weight_sets=1,added_MMA=16,useful_output_columns=4,hardware_output_columns=16,barrier_net=0,shared_allocation_delta=0),register_note='Logical half0+half1=512 B/SG, result=512 B/SG, one B tile=512 B/SG plus A alias/copy; peak physical GRF and scratch unknown. No claim of speedup.'))
+print(cpu)

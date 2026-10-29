@@ -1,0 +1,118 @@
+"""F01 CPU evaluation: feature -> lift -> entry FFN -> Y, against the FP16 teacher.
+
+All numbers here are CPU-local under the *common FP16 feature input* (the captured
+features are the real kernel features).  No GPU is run and no endpoint claim is made.
+"""
+import json
+import sys
+import numpy as np
+import f01_model as M
+
+Q = M.Q
+D24 = M.D24
+FRAMES = [34189, 41444, 43654]
+FEAT = D24 + "/feature-diagnostics/run-%d/features.bin"
+BASE_SCALES = M.BASE + "/f1-ffn-scales.bin"
+
+BASE_SC = np.fromfile(BASE_SCALES, dtype="<f4").astype(np.float32)
+SX0, SE0 = np.float32(BASE_SC[0]), np.float32(BASE_SC[2])
+SWE = (BASE_SC[4:132] / SX0).astype(np.float32)     # per-output weight scales
+SWC = (BASE_SC[132:164] / SE0).astype(np.float32)
+
+
+def scales_vec(sx, se):
+    sc = np.empty(164, np.float32)
+    sc[0] = np.float32(sx)
+    sc[1] = np.float32(1.0) / np.float32(sx)
+    sc[2] = np.float32(se)
+    sc[3] = np.float32(1.0) / np.float32(se)
+    sc[4:132] = (np.float32(sx) * SWE).astype(np.float32)
+    sc[132:164] = (np.float32(se) * SWC).astype(np.float32)
+    return sc
+
+
+def load_features(frame, idx):
+    x = np.fromfile(FEAT % frame, dtype="<f2").reshape(-1, 16)
+    if idx is not None:
+        x = x[idx]
+    return np.ascontiguousarray(x)
+
+
+def teacher_y(x):
+    lift = (x.astype(np.float32) @ M.WLIFT_AS_F32.T).astype(np.float16)
+    e = (lift.astype(np.float32) @ M.WEXP_AS_F32.T).astype(np.float16)
+    act = M.act_vec(e)
+    yc = act.astype(np.float32) @ M.WCON_AS_F32.T
+    seed = (lift.astype(np.float32) * M.RS_AS_F32[None, :].astype(np.float32)).astype(np.float16)
+    return lift, (yc + seed.astype(np.float32)).astype(np.float16)
+
+
+def make_sample(stride=16):
+    xs, ys = {}, {}
+    for fr in FRAMES:
+        x = load_features(fr, None)[::stride]
+        _, y = teacher_y(x)
+        xs[fr], ys[fr] = x, y
+    return xs, ys
+
+
+def run_cfg(xs, cfg):
+    """cfg: dict(d=list16, sf=float, sx=float, se=float). Returns per-frame + pooled err."""
+    d = np.asarray(cfg["d"], np.float32)
+    sf = np.float32(cfg["sf"])
+    qw, sw = M.qmat(M.WLIFT_AS_F32, d)
+    sc = scales_vec(cfg["sx"], cfg["se"])
+    out = {}
+    num = den = 0.0
+    for fr, x in xs.items():
+        lift8 = M.lift_int8(x, d, sf, qw, sw)
+        _, y8, _, _ = M.ffn_int8(lift8, sc)
+        y16 = YS_CACHE[fr]
+        e = y8.astype(np.float64) - y16.astype(np.float64)
+        a = float((e * e).sum()); b = float((y16.astype(np.float64) ** 2).sum())
+        out[fr] = {"relL2": (a / b) ** 0.5, "rmse": float(np.sqrt((e * e).mean()))}
+        num += a; den += b
+    out["pooled"] = {"relL2": (num / den) ** 0.5, "sse": num, "nb": den}
+    return out
+
+
+YS_CACHE = {}
+XS_CACHE = {}
+
+
+def set_caches(xs, ys):
+    global XS_CACHE, YS_CACHE
+    XS_CACHE, YS_CACHE = xs, ys
+
+
+def base_cfg():
+    cal = np.load(D24 + "/lift-equalized/CALIBRATION.npz")
+    return {"d": [float(v) for v in cal["d"]],
+            "sf": float(np.float32(cal["activation_scale"])),
+            "sx": float(SX0), "se": float(SE0)}
+
+
+def minmax_cfg():
+    c = base_cfg()
+    s = np.fromfile(D24 + "/f01-ffn-minmax/scales.bin", dtype="<f4")
+    c["sx"] = float(s[0]); c["se"] = float(s[2])
+    return c
+
+
+def main():
+    stride = int(sys.argv[1]) if len(sys.argv) > 1 else 16
+    xs, ys = make_sample(stride)
+    set_caches(xs, ys)
+    print("sample tokens", {k: len(v) for k, v in xs.items()})
+    res = {}
+    for name, cfg in [("shipped_lift_equalized", base_cfg()), ("f01_ffn_minmax", minmax_cfg())]:
+        r = run_cfg(xs, cfg)
+        res[name] = {"cfg": cfg, "metrics": r}
+        print(name, json.dumps(r, indent=1))
+    # also: old dynamic per-SG lift scale (context arm, not a candidate)
+    # (per-SG scale cannot be a static candidate; reported only for attribution)
+    open("baseline-cpu.json", "w", encoding="utf-8").write(json.dumps(res, indent=2))
+
+
+if __name__ == "__main__":
+    main()

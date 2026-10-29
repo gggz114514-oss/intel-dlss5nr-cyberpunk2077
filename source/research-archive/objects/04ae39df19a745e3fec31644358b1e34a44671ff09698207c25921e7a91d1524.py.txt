@@ -1,0 +1,102 @@
+"""S01: build the block-4 X+E equalised C32 body SPV.
+
+Two builds, byte-identical-parent proof first:
+  parent2.spv   from the untouched c32-equalized-b4 sources -> must equal candidate.spv
+  c32_b4_xe.spv from the E-patched sources (per-E-channel inverse at fsc[324..451])
+
+Only the *activation quantiser of E* changes; the dequant taps stay per output
+channel because the E diagonal is folded into the contract weight bytes.
+"""
+import hashlib
+import shutil
+import subprocess
+import json
+from pathlib import Path
+
+B = Path(r"@NR_WORKSPACE@")
+SRC = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24/c32-equalized-b4"
+HERE = Path(__file__).resolve().parent
+GLSLANG = B / "src/project/tools/glslang-16.5.0/bin/glslang.exe"
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def compile_spv(out_name):
+    cmd = [str(GLSLANG), "-V", "--target-env", "vulkan1.3", "-I" + str(HERE),
+           "-o", str(HERE / out_name), str(HERE / "c32_body1_i8.comp")]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"glslang failed:\n{r.stdout}\n{r.stderr}")
+    return sha(HERE / out_name)
+
+
+for name in ("c32_body1_i8.comp", "c32_i8_common.glsl", "c2_i8_regk32.glsl",
+             "register_handoff.glsl", "base-c2-candidate.comp"):
+    shutil.copy(SRC / name, HERE / name)
+
+plain = compile_spv("parent2.spv")
+ref = sha(SRC / "candidate.spv")
+assert plain == ref, f"parent reproduction failed: {plain} != {ref}"
+print("parent reproduction OK", plain)
+
+# ---- patch 1: per-E-channel quantiser helper ------------------------------
+reg = HERE / "c2_i8_regk32.glsl"
+s = reg.read_text()
+assert "c2_i8_pack_c" not in s
+helper = '''
+// S01: per-E-channel static inverse.  Component i of a CH8x16 fragment owns row
+// 2i + (lane>=16) of the 8-channel group, so the inverse index is
+// FSC_INVE + ebase + 2i + (lane>=16); ebase = 32*step + 8*group.  This is a pure
+// per-channel scale change -- same quantiser expression, same rounding, same clamp.
+uint c2_i8_pack_c(NRH_CH e, uint ebase) {
+    uint o = 0u;
+    for (int i = 0; i < 4; ++i) {
+        uvec2 rc = nrh_coord_CH(uint(i));
+        o |= (uint(int(nr_i8_code(e[i], fsc[324u + ebase + rc.x])) & 0xFF) << (8u * uint(i)));
+    }
+    return o;
+}
+'''
+s = s.replace("#endif\n", helper + "#endif\n")
+assert s.count("c2_i8_pack_c") == 1
+reg.write_text(s)
+
+# ---- patch 2: rewrite the 16 call sites in file order ----------------------
+comp = HERE / "c32_body1_i8.comp"
+text = comp.read_text()
+order = []
+import re
+
+
+def _sub(m):
+    frag = int(m.group(1))
+    k = len(order)
+    grp, within = divmod(k, 4)
+    assert within == frag, (k, frag)
+    ebase = 32 * grp + 8 * frag
+    order.append(dict(call=k, fragment=frag, group=grp, ebase=ebase))
+    return f"c2_i8_pack_c(e{frag}, {ebase}u)"
+
+
+text = re.sub(r"c2_i8_pack\(e([0-3]), c2_inv_e\)", _sub, text)
+assert len(order) == 16, len(order)
+assert "c2_i8_pack(" not in text
+comp.write_text(text)
+
+xe = compile_spv("c32_b4_xe.spv")
+print("E-patched SPV", xe)
+
+(HERE / "BUILD.json").write_text(json.dumps(dict(
+    glslang=str(GLSLANG).replace("\\", "/"),
+    command="-V --target-env vulkan1.3 -I<SOURCE> -o <out> c32_body1_i8.comp",
+    source_dir=str(SRC).replace("\\", "/"),
+    parent2_spv_sha256=plain, candidate_spv_sha256=ref,
+    parent_reproduction_identical=(plain == ref),
+    c32_b4_xe_spv_sha256=xe,
+    e_call_sites=order,
+    patches=["c2_i8_regk32.glsl: +c2_i8_pack_c (per-E-channel inverse fsc[324..451])",
+             "c32_body1_i8.comp: 16 c2_i8_pack(eN, c2_inv_e) -> c2_i8_pack_c(eN, 32*step+8*group)",
+             "c32_i8_common.glsl: unchanged (keeps the X per-channel inverse fsc[292..323])"],
+), indent=2))

@@ -1,0 +1,81 @@
+"""Message accounting for halving the tokens per workgroup in the 32 KB (F06 C256) kernel.
+
+Scaling rule assumed and then checked against the ISA:
+  * staging traffic is proportional to tokens per workgroup, so halving tokens halves the per-WG
+    staging messages while the workgroup count doubles -> TOTAL staging messages unchanged;
+  * everything else in the kernel (weight loads, barriers, prologue/epilogue, stores) is per
+    workgroup, so halving tokens doubles its total.
+The question is which side dominates.
+"""
+import json, sys
+from collections import Counter
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+import ISA
+from audit_card import pass_lines
+
+cur = K.read_json(K.C / 'CURRENT.json')
+recs = pass_lines(Path(cur['best_plan']['path']))
+
+# find the PASSes whose plan line declares 32768 bytes of shared memory
+big = []
+for r in K.rows():
+    toks = recs[r['ordinal']]['line'].split()
+    if toks[-6] == '32768':
+        big.append(dict(ordinal=r['ordinal'], name=r['name'], family=r['family'],
+                        spv=recs[r['ordinal']]['spv'],
+                        gx=int(toks[-3]), gy=int(toks[-2]), gz=int(toks[-1])))
+print('PASSes with 32768 B shared:', len(big))
+fam = Counter(b['family'] for b in big)
+print('families:', dict(fam))
+wgs = sum(b['gx'] * b['gy'] * b['gz'] for b in big)
+print('total workgroups per frame:', wgs)
+
+# classify the kernel's messages from its ISA
+spv = Path(big[0]['spv'])
+index = K.read_json(K.C / 'evidence' / 'NATIVE-INDEX.json')
+by_ord = {}
+def walk(n):
+    if isinstance(n, dict):
+        if 'ordinal' in n and 'baseline_kernel_hash' in n:
+            by_ord.setdefault(int(n['ordinal']), str(n['baseline_kernel_hash'])[:16])
+        for v in n.values():
+            walk(v)
+    elif isinstance(n, list):
+        for v in n:
+            walk(v)
+walk(index)
+want = by_ord.get(big[0]['ordinal'], '')
+asm = None
+for a in (K.C / 'queue').rglob('*.asm'):
+    if want and want in a.name:
+        asm = a
+        break
+print('kernel hash', want, 'isa', asm.name if asm else None)
+if asm:
+    isa = ISA.parse(asm)
+    dest = Counter()
+    for i in isa:
+        if not i['op'].startswith('send'):
+            continue
+        c = (i['comment'] or '')
+        kind = c.split(';')[-1].strip().split('[')[0] if ';' in c else c.strip()
+        dest[kind or i['op']] += 1
+    tot = sum(dest.values())
+    print('\nsend breakdown (per thread), total %d:' % tot)
+    for k, v in dest.most_common(14):
+        print('  %-42s %4d' % (k, v))
+    # staging = slm stores/loads; weights = ugm reads of the weight buffer
+    slm = sum(v for k, v in dest.items() if k.startswith('store.slm') or k.startswith('load.slm'))
+    ugm = sum(v for k, v in dest.items() if k.startswith('load.ugm'))
+    print('\n  slm traffic %d, ugm reads %d, other %d' % (slm, ugm, tot - slm - ugm))
+    print('\nscaling to a halved-token workgroup (2x workgroups):')
+    print('  staging total: unchanged (same bytes)          -> %d x WGs' % slm)
+    print('  per-WG (weights+other): doubles                 -> %d x 2 x WGs' % (tot - slm))
+    old = tot * wgs
+    new = (slm + 2 * (tot - slm)) * wgs
+    print('  total messages/frame: %d -> %d  (%+.1f%%)' % (old, new, 100 * (new - old) / old))
+K.write_json(K.C / 'evidence' / 'F06-C256-TOKEN-HALVING.json',
+             dict(passes=len(big), families=dict(fam), workgroups=wgs,
+                  kernel_hash=want, isa=str(asm) if asm else None))

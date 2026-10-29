@@ -1,0 +1,134 @@
+"""CPU-only audit; all writes stay next to this file. Never imports runner code."""
+import json, hashlib, re, math, statistics, datetime, struct
+from pathlib import Path
+import numpy as np
+
+R=Path('@NR_WORKSPACE@')
+O=Path(__file__).resolve().parent
+W=R/'work/dsh-fp16-same-family-20261023'
+RUN=R/'run/dsh-fp16-same-family-20261023'
+C=R/'candidates/dsh-fp16-same-family-20261023'
+files={}
+def sha(p):
+    p=Path(p); h=hashlib.sha256()
+    with p.open('rb') as f:
+        for chunk in iter(lambda:f.read(8*1024*1024),b''):h.update(chunk)
+    return h.hexdigest()
+def ident(p):
+    p=Path(p); key=p.as_posix()
+    if key not in files:
+        files[key]={'path':key,'exists':p.is_file()}
+        if p.is_file(): files[key].update(sha256=sha(p),bytes=p.stat().st_size)
+    return files[key]
+def read(p):
+    ident(p); b=Path(p).read_bytes()
+    return b.decode('utf-16' if b[:2] in (b'\xff\xfe',b'\xfe\xff') else 'utf-8-sig')
+def js(p):return json.loads(read(p))
+def parse(p):
+    ls=read(p).splitlines(); h=list(map(int,ls[0].split()[1:])); tok=lambda s: re.findall(r'"[^"\n]*"|\S+',s)
+    bs=[tok(s) for s in ls[1:1+h[1]]]; i=1+h[1]; passes=[]
+    for _ in range(h[2]):
+        t=tok(ls[i]); n=int(t[6]);passes.append({'line':i+1,'name':t[2].strip('"'),'head':t,'bind':ls[i+1:i+1+n],'push':ls[i+1+n]});i+=n+2
+    spvs=sorted({x['head'][3].strip('"') for x in passes})
+    inputs=sorted({b[3].strip('"') for b in bs if b[3]!='"-"'})
+    return {'identity':ident(p),'header':ls[0],'pass_count':len(passes),'buffers':bs,'passes':passes,'tail':ls[i:],
+            'spvs':[ident(x) for x in spvs],'inputs':[ident(x) for x in inputs]}
+
+out={'audit_time_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'method':'CPU hashes, byte comparisons, independent statistics; no compile, Vulkan, GPU, lock access or deployment', 'session':js(O/'SESSION.json')}
+for p in [O/'TASK.md',O/'FP16-USER-REPORT.md',O/'INT8-USER-REPORT.txt',R/'AGENTS.md',R/'SOURCE_BINDING.md',R/'src/project/AGENTS.md']:ident(p)
+# Current work manifest is audited without invoking the delivery's verifier.
+manifest=read(W/'MANIFEST.sha256').splitlines(); listed={}; bad=[]
+for line in manifest:
+    if not line.strip():continue
+    h,rel=line.split('  ',1); q=ident(W/rel);listed[rel]=h
+    if q.get('sha256')!=h:bad.append({'relative':rel,'expected':h,'actual':q})
+actual={p.relative_to(W).as_posix() for p in W.rglob('*') if p.is_file() and 'build' not in p.relative_to(W).parts and p.name!='MANIFEST.sha256'}
+out['work_manifest']={'identity':ident(W/'MANIFEST.sha256'),'entries':len(listed),'problems':bad,'unlisted':sorted(actual-set(listed)),'extra':sorted(set(listed)-actual),'scope':'work only, build excluded; candidate/run are not covered'}
+old=js(R/'work/codex-fp16-final-acceptance-20261024/audit-data.json')
+out['plans']=[parse(x['path']) for x in old['plans']]
+parent=out['plans'][0]
+for plan in out['plans'][1:]:
+    pm={x['name']:x for x in parent['passes']};cm={x['name']:x for x in plan['passes']}
+    plan['buffers_equal_parent']=plan['buffers']==parent['buffers']
+    plan['history_equal_parent']=[x for x in plan['tail'] if x.startswith('HISTORY')]==[x for x in parent['tail'] if x.startswith('HISTORY')]
+    plan['removed_passes']=[x for x in pm if x not in cm]
+    drops=[i for i,x in enumerate(parent['passes']) if x['name'] not in cm]
+    pairs=[]
+    for i in drops:
+        before=parent['passes'][i-1];gone=parent['passes'][i]
+        pairs.append({'middle_ordinal':i-1,'contract_ordinal':i,'middle':before['name'],'contract':gone['name'],'contract_binds_subset':set(gone['bind'])<=set(before['bind']),'push_equal':gone['push']==before['push']})
+    plan['fusion_pair_contracts']=pairs
+    oldpol={int(x.split()[1]):x.split() for x in parent['tail'] if x.startswith('POLICY ')}
+    newpol={int(x.split()[1]):x.split() for x in plan['tail'] if x.startswith('POLICY ')}
+    mismatches=[]
+    for idx,t in oldpol.items():
+        expect=t[:]
+        for f in (3,4):expect[f]=str(int(t[f])-sum(d<=int(t[f]) for d in drops))
+        if expect!=newpol[idx]:mismatches.append({'buffer':idx,'expected':expect,'actual':newpol[idx]})
+    plan['policy_ordinal_remap']={'count':len(oldpol),'mismatches':mismatches,'note':'checks ordinal mapping, not an independent proof of every shader lifetime'}
+    plan['changed_passes']=[{'name':n,'parent_head':pm[n]['head'],'child_head':c['head'],'bind_equal':pm[n]['bind']==c['bind'],'push_equal':pm[n]['push']==c['push']} for n,c in cm.items() if pm[n]['head'][2:]!=c['head'][2:] or pm[n]['bind']!=c['bind'] or pm[n]['push']!=c['push']]
+out['runner']=ident(old['runner']['path'])
+out['prior_identity_recheck']=[]
+for plan in old['plans']:
+    for group in ['spvs','inputs']:
+        vals=plan.get(group,{})
+        if isinstance(vals,dict):
+            for p,h in vals.items():out['prior_identity_recheck'].append({'path':p,'old_sha256':h,'current_sha256':ident(p).get('sha256'),'match':ident(p).get('sha256')==h})
+out['statistics']={}
+for key,entry in old['statistics'].items():
+    p=Path(entry['source']);d=js(p); rows=[]
+    for row in d['rows']:
+        rp=Path(row['receipt']);rd=js(rp);s=row['samples_ms'];ss=sorted(s)
+        rows.append({'label':row['label'],'role':row['role'],'samples_ms':s,'n':len(s),'mean':statistics.mean(s),'standard_median':statistics.median(s),'sd':statistics.stdev(s),
+          'receipt':ident(rp),'samples_match_current_receipt':s==rd['gpu_samples_ms'],'output':ident(rp.parent/'frame_out.bin'),
+          'receipt_parameters':{k:rd.get(k) for k in ['status','normal_close','gpu_passes','device','driver_version_raw','warm','reps','nan','inf','allocation_mode','feedback','per_pass_timing','timestamp_scope','timestamp_count_per_frame']}})
+    st={}
+    for metric in ['mean','standard_median']:
+        ds=[rows[a][metric]-rows[b][metric] for a,b in [(0,1),(3,2),(4,5)]];m=statistics.mean(ds);hw=4.302652729911275*statistics.stdev(ds)/math.sqrt(3)
+        st[metric]={'process_pairs':3,'df':2,'differences_parent_minus_child_ms':ds,'mean':m,'ci95':[m-hw,m+hw]}
+    pm=statistics.mean([x['mean'] for x in rows if x['role']=='p']);cm=statistics.mean([x['mean'] for x in rows if x['role']=='c'])
+    out['statistics'][key]={'source':ident(p),'rows':rows,'paired':st,'parent_mean':pm,'candidate_mean':cm,'reduction_pct':100*(pm-cm)/pm,'qualification':'original receipts' if all(x['samples_match_current_receipt'] for x in rows) else 'derived arrays; current receipts overwritten','verdict':'JOINT_IMPROVEMENT' if all(v['ci95'][0]>0 for v in st.values()) else 'NOT_JOINT_IMPROVEMENT'}
+out['execution']={}
+for label in ['combo-d01-d034-v1','combo-d01-d034-s32k11-v1','combo-d01-d034-v1-recheck-20261024','combo-d01-d034-v1-30f','combo-d01-d034-s32k11-v1-30f']:
+    lp=RUN/(label+'.lock-receipt.json')
+    if not lp.is_file():out['execution'][label]={'lock':ident(lp)};continue
+    j=js(lp);jobs=[]
+    for job in j['jobs']:
+        job=dict(job);job.pop('gpu_samples_ms',None)
+        argv=job['argv'];plan=argv[argv.index('--plan')+1];folder=Path(argv[argv.index('--out')+1]);job['current_plan']=ident(plan);job['current_runner_matches']=ident(job['exe']).get('sha256')==job.get('exe_sha256')
+        job['receipt']=ident(folder/'port_network_receipt.json');job['present_outputs']=[ident(f) for f in folder.glob('frame*.bin')]
+        jobs.append(job)
+    out['execution'][label]={'lock':ident(lp),'recorded_plan_sha256':j.get('plan_sha256'),'current_plan_matches':ident(j['plan']).get('sha256')==j.get('plan_sha256'),'jobs':jobs}
+out['four_file_gate_presence']={}
+for label in ['combo-d01-d034-v1','combo-d01-d034-s32k11-v1','combo-d01-d034-v1-recheck-20261024']:
+    out['four_file_gate_presence'][label]=[ident(RUN/(label+suffix)/name) for suffix,name in [('-fixed','port_network_receipt.json'),('-fixed','frame_out.bin'),('-fb2','port_network_receipt.json'),('-fb2','frame_0.bin'),('-fb2','frame_1.bin'),('-fb2','frame_out.bin'),('-parent-fixed','frame_out.bin')]]
+out['feedback30']={}
+for label in ['combo-d01-d034-v1','combo-d01-d034-s32k11-v1']:
+    rows=[]
+    for i in range(30):
+        p=RUN/(label+'-30f-parent')/f'frame_{i}.bin';c=RUN/(label+'-30f-cand')/f'frame_{i}.bin'
+        rows.append({'frame':i,'parent':ident(p),'candidate':ident(c),'byte_equal':p.read_bytes()==c.read_bytes() if p.is_file() and c.is_file() else None})
+    out['feedback30'][label]=rows
+out['native']=[]
+for n in old['native']+[old['d01_native']]:
+    d=js(n['path']);info={'receipt':ident(n['path']),'same_as_prior_audit':ident(n['path']).get('sha256')==n['sha256'],'data':d,'spv_bindings':[]}
+    for p in d['pipelines']:info['spv_bindings'].append({'identity':ident(p['spv']),'bytes_match':ident(p['spv']).get('bytes')==p['spv_bytes'],'in_audited_plans':any(p['spv'].replace('\\','/')==s['path'] for pl in out['plans'] for s in pl['spvs'])})
+    out['native'].append(info)
+bp=Path(old['d16']['body_buffer']['parent_path']);bc=Path(old['d16']['body_buffer']['child_path'])
+a=np.fromfile(bp,dtype='<u2');b=np.fromfile(bc,dtype='<u2');diff=np.flatnonzero(a!=b);first=int(diff[0])
+out['d16']={'body':{'parent':ident(bp),'candidate':ident(bc),'halfs':len(a),'different_bits':len(diff),'first_index':first,'first_parent':float(a.view('<f2')[first]),'first_candidate':float(b.view('<f2')[first])},'outputs':[ident(p) for p in old['d16']['outputs']], 'nc_mapping_previous':old['d16']['nc_check'],'nc_mapping_recomputed_here':False,'conclusion':'FAIL retained; body divergence proved; unique arithmetic cause and bit-exact impossibility not proved'}
+def ncids(p):
+    ident(p);raw=Path(p).read_bytes();w=struct.unpack('<%dI'%(len(raw)//4),raw);i=5;ids=[]
+    while i<len(w):
+        n=w[i]>>16;op=w[i]&65535
+        if op==71 and n>=3 and w[i+2]==42:ids.append(w[i+1])
+        i+=n
+    return ids
+ncp=old['d16']['nc_check'];ps=ncids(ncp['parent']);cs=ncids(ncp['child'])
+out['d16']['nc_current_ids']={'parent_identity':ident(ncp['parent']),'child_identity':ident(ncp['child']),'parent_nc':ps,'child_nc':cs,'prior_mapped_ids_present':all(i in cs for i in ncp['mapped_ids'])}
+for p in [R/'work/codex-fp16-39family-20261022/tools/nc_restore.py',R/'build/gpa-b321-prep/port_network_model_runner.cpp']:ident(p)
+for p in old['sources']:ident(p)
+for p in [C/'d01-k03-v1/IDENTITY-NOTE.md',C/'d034-c64-v1/IDENTITY-NOTE.md',C/'d01-k03-v1/build-receipt.json',C/'d034-c64-v1/nc-restore.json']:ident(p)
+out['files']=list(files.values())
+(O/'fp16-audit.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+print(json.dumps({'manifest':{k:v for k,v in out['work_manifest'].items() if k!='identity'},'plans':[(p['identity']['sha256'],p['pass_count'],len(p['spvs']),len(p['inputs'])) for p in out['plans']], 'statistics':{k:{a:v for a,v in s.items() if a not in ['rows','source']} for k,s in out['statistics'].items()},'feedback':{k:sum(r['byte_equal'] is True for r in v) for k,v in out['feedback30'].items()},'d16':out['d16']['body'],'files':len(files)},ensure_ascii=False,indent=2))

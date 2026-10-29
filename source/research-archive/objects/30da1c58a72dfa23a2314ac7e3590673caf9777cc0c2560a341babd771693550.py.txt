@@ -1,0 +1,146 @@
+"""S05 step 9: root-cause fix -> scale table v2 + gate plans that can actually dump.
+
+Root cause of the two GPU observations:
+  * the gate dumps were invalid: under --pool with dump_alias_disabled=false, a buffer whose
+    POLICY has resident=0 is recycled after its last dispatch, so the end-of-run dump reads
+    somebody else's bytes.  The workspace's own valid-dump precedent sets resident=1 on every
+    dumped buffer (real-int8-24/c64-stage/old.txt: POLICY 30 1 13 15 0 / POLICY 31 1 14 15 0),
+    while the no-dump arm keeps them at 0 (teacher-Y.txt: POLICY 30 0 13 15 0).
+  * the v1 scale table was wrong in exactly one region, sc[912..1039].  The r09 producer's
+    step for channel c is (old step)/... concretely step_c = sX_anchor * old_ds_c / sc912_c
+    with sX_anchor = the bound pack's sc[0] (proven by G2: sc[16:528] == sc[0]*sWe exactly,
+    i.e. the FFN dequantises with sc[0]).  v1 scaled the *producer* by (D*f0) but also moved
+    the FFN's dequant scale to the new sX, leaving a global mismatch factor
+    sX_anchor/(sc[0]_new*f0) = 38.5.  Consequence: every block9 output term shrinks by 1/38.5
+    (FFN and residual alike) -> block9 behaves like a disabled FFN -> the measured -0.08..-0.24 dB.
+  v2 fixes only that region:  sc912_new_c = old_ds_c * sX_anchor / (sc[0]_new * D_c)
+  so that the producer step becomes sc[0]_new * D_c, exactly the step the FFN dequantises with,
+  and so that D = 1 with sc[0]_new = sX_anchor reproduces the bound pack byte-for-byte.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import s05_common as C
+sys.path.insert(0, str(C.B / 'work/dsh-fullnet-static-20261029/tools'))
+import planlib
+
+V1 = C.CARD / 'PACK/c128_b9_scales.f32.bin'
+W = C.CARD / 'PACK/c128_b9_weights.i8.bin'
+V2 = C.CARD / 'PACK/c128_b9_scales_v2.f32.bin'
+data = C.rows()
+buf = data['buffers']
+r1 = C.row_by_name('block9_swin_body_1', data)
+b1 = {int(k): v for k, v in r1['bindings'].items()}
+OLD_S = buf[b1[1][0]]['file']
+sc_old = C.f32(OLD_S)
+sc_v1 = C.f32(V1)
+ver = json.loads((C.CARD / 'evidence/PACK-VERIFY.json').read_text())
+cal = json.loads((C.CARD / 'evidence/CALIBRATION-CPU.json').read_text())
+D = np.array(ver['D'], np.float32)
+sX_anchor = np.float32(sc_old[0])
+ds_old = sc_old[912:1040]
+
+# ---- v2 scale table: only sc[912..1039] changes
+sc_v2 = sc_v1.copy()
+sc_v2[912:1040] = (ds_old * (sX_anchor / np.float32(sc_v1[0])) / D).astype(np.float32)
+V2.write_bytes(sc_v2.astype('<f4').tobytes())
+
+# ---- algebraic identities that the fix must satisfy
+step_old = sX_anchor                                        # bound producer step (uniform)
+step_v2 = (sX_anchor * ds_old / sc_v2[912:1040]).astype(np.float64)   # producer step in X units
+step_model = (np.float64(sc_v2[0]) * D).astype(np.float64)            # FFN dequant step
+degenerate = ((ds_old * (np.float32(sc_old[0]) / np.float32(sc_old[0])) / np.ones(128, np.float32))
+              .astype(np.float32))
+
+# ---- CPU arm under v2 (identical to the calibrated arm: invX = sc[1]/D)
+pk = C.decode_pack(buf[b1[0][0]]['file'], OLD_S, buf[46]['file'], [int(x) for x in r1['push']])
+w8 = C.i8(W).astype(np.int32)
+we8, wm8, wc8 = w8[0:65536].reshape(512, 128), w8[65536:81920].reshape(128, 128), w8[81920:98304].reshape(128, 128)
+Xs, Ys = [], []
+for td in (C.D / 'dump-fp16', C.D / 'teacher-diagnostics/teacher-41444', C.D / 'teacher-diagnostics/teacher-43654'):
+    Xs.append(C.load_x(td / 'dump_block8_out.bin'))
+    Ys.append(C.load_y(td / 'dump_swin_9_Y.bin'))
+rel_v2 = [C.rel(C.ffn_forward(x, we8, wm8, wc8, sc_v2, invX=(np.float32(sc_v2[1]) / D)), y)
+          for x, y in zip(Xs, Ys)]
+# and the arm the GPU actually saw with v1 (producer step = sX_anchor*f0*D, FFN dequant = sc_v1[0])
+rel_v1_shipped = [C.rel(C.ffn_forward(x, we8, wm8, wc8, sc_v1,
+                                      invX=(1.0 / (sX_anchor * np.float32(cal['new']['factors'][0]) * D)).astype(np.float32)), y)
+                  for x, y in zip(Xs, Ys)]
+
+out = dict(
+    card='S05-c128', step='root cause + v2 fix',
+    v1=dict(path=str(V1), bytes=V1.stat().st_size, sha256=C.sha256(V1)),
+    v2=dict(path=str(V2), bytes=V2.stat().st_size, sha256=C.sha256(V2)),
+    weights=dict(path=str(W), bytes=W.stat().st_size, sha256=C.sha256(W),
+                 note='unchanged between v1 and v2'),
+    changed_region='sc[912..1039] only (the r09 producer per-channel composed scale)',
+    formula='sc912_v2_c = sc912_bound_c * sc[0]_bound / (sc[0]_v2 * D_c)',
+    identities=dict(
+        producer_step_v2_equals_ffn_step=dict(
+            max_rel_err=float(np.abs(step_v2 / step_model - 1.0).max()),
+            producer_step_first8=[float(v) for v in step_v2[:8]],
+            ffn_step_first8=[float(v) for v in step_model[:8]]),
+        v1_signal_gain=dict(
+            producer_step_uniform_part=float(sX_anchor * np.float32(cal['new']['factors'][0])),
+            ffn_dequant=float(sc_v1[0]),
+            gain=float(np.float32(sc_v1[0]) / (sX_anchor * np.float32(cal['new']['factors'][0]))),
+            gain_inverse=float(1.0 / (np.float32(sc_v1[0]) / (sX_anchor * np.float32(cal['new']['factors'][0])))),
+            meaning='every block9 output term is multiplied by gain, i.e. the block behaves like a '
+                    'disabled FFN; this is the mechanism behind the measured -0.08..-0.24 dB'),
+        v1_producer_step_first8=[float(v) for v in (sX_anchor * np.float32(cal['new']['factors'][0]) * D)[:8]],
+        degenerate_D1_equals_bound=bool(np.array_equal(degenerate, ds_old.astype(np.float32))),
+        sX_anchor=float(sX_anchor), sX_v2=float(sc_v2[0]),
+    ),
+    cpu_arm=dict(v2_rel_l2_pooled=float(np.sqrt(np.mean(
+                     (C.ffn_forward(np.concatenate(Xs), we8, wm8, wc8, sc_v2, invX=(np.float32(sc_v2[1]) / D))
+                      - np.concatenate(Ys)) ** 2) / np.mean(np.concatenate(Ys) ** 2))),
+                 v2_rel_l2_mean=float(np.mean(rel_v2)), v2_rel_l2=rel_v2,
+                 v1_as_shipped_rel_l2_mean=float(np.mean(rel_v1_shipped)),
+                 v1_as_shipped_rel_l2=rel_v1_shipped,
+                 note='v1_as_shipped is what the GPU ran: the whole block output is attenuated by '
+                      '1/38.5, i.e. relL2 -> 1 as the teacher is large; that is the -0.08..-0.24 dB'),
+)
+
+# ---- plans
+def gate_plan(src, dst, outs):
+    p = planlib.Plan(src)
+    for name in ('block8_out', 'swin_9_M', 'swin_9_Y'):
+        p.set_policy(name, resident=1)
+    text = p.to_text().splitlines()
+    last = max(i for i, l in enumerate(text) if l.startswith('OUTPUT'))
+    n0 = len([l for l in text if l.startswith('OUTPUT')])
+    for k, line in enumerate(outs):
+        text.insert(last + 1 + k, line)
+    head = text[0].split()
+    head[4] = str(n0 + len(outs))
+    text[0] = ' '.join(head)
+    Path(dst).write_text('\n'.join(text) + '\n', encoding='utf-8')
+    q = planlib.Plan(dst)
+    probs = q.validate()
+    assert probs == [], probs
+    return dict(path=str(dst), sha256=planlib.sha256_file(dst), problems=probs, header=q.lines[0],
+                policies={n: [x for x in q.policies if q.buffers[x.buffer].name == n][0].__dict__
+                          for n in ('block8_out', 'swin_9_M', 'swin_9_Y')})
+
+
+OUTS = ['OUTPUT 48 raw "block9_qx.bin"', 'OUTPUT 51 raw "block9_M.bin"', 'OUTPUT 52 raw "block9_Y.bin"']
+# anchor gate: the *bound* pack, valid dumps -> measures the true producer step of the old arm
+anchor_src = C.D / 'c64-family-static/combo-34189.txt'
+a = gate_plan(anchor_src, C.CARD / 'gate-34189-anchor.txt', OUTS)
+# v2 gate: corrected scale table
+v2_plan = planlib.Plan(C.CARD / 'candidate-34189.txt')
+v2_plan.set_buffer('chain_scales', file=V2.as_posix())
+v2_plan.assert_valid()
+v2_plan.write(C.CARD / 'candidate-34189-v2.txt')
+b = gate_plan(C.CARD / 'candidate-34189-v2.txt', C.CARD / 'candidate-34189-v2-gate.txt', OUTS)
+out['plans'] = dict(anchor=a, v2=dict(path=str(C.CARD / 'candidate-34189-v2.txt'),
+                                      sha256=planlib.sha256_file(C.CARD / 'candidate-34189-v2.txt')),
+                    v2_gate=b)
+(C.CARD / 'evidence/V2-FIX.json').write_text(json.dumps(out, indent=2))
+print(json.dumps({k: out[k] for k in ('v2', 'changed_region', 'formula', 'identities', 'cpu_arm')}, indent=2))
+print('anchor plan', a['sha256'], a['header'])
+print('v2 gate  ', b['sha256'], b['header'])

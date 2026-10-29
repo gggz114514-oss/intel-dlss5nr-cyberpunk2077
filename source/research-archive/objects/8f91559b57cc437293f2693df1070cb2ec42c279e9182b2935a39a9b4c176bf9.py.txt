@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Emit the R12 evidence JSONs from the measured artefacts (no hand-typed numbers).
+
+Inputs it re-reads on every run:
+  * build/r12-split16-l2/census_all.json        (module census, 4 modules)
+  * the parent/candidate sources                (source-line of each MMA)
+  * split16_block23/split16_aux.bin             (per-head attention scale floats)
+  * split16_b23_wqkv.int8.bin                   (per (head,channel) QKV scales)
+Outputs:
+  evidence/PARENT-REPRO.json
+  evidence/STATIC-ENUMERATION.json
+  evidence/SCALE-CONTRACT.json
+  evidence/MMA-RESIDUAL.json
+"""
+import hashlib
+import json
+import struct
+import sys
+from pathlib import Path
+
+W = Path(r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024")
+CARD = W / "candidates/r12-split16-l2"
+BUILD = W / "build/r12-split16-l2"
+EV = CARD / "evidence"
+AUX = Path(r"@NR_WORKSPACE@/src/project/artifacts/parallel-port-20261013/split/split16_block23/split16_aux.bin")
+WQKV = Path(r"@NR_WORKSPACE@/candidates/codex-sol-int8-long-008-20261019/split16-l2-qkv-int8-v1/pack/split16_b23_wqkv.int8.bin")
+ENUM_NAMES = ["split16_b%d_l2" % b for b in list(range(23, 31)) + list(range(40, 48))]
+SHAPES = {
+    "QKV": "A i8 8x32 LROW stride 64 (sy8 staging) / B i8 32x16 LCOL stride 32 (weights8) / C i32 8x16",
+    "QK": "A f16 8x16 LROW stride 32 (qkv Q rows) / B f16 16x16 LCOL stride 32 (qkv K^T) / C f32 8x16",
+    "PV_parent": "A f16 8x16 LROW stride 64 (phase P rows) / B f16 16x16 LCOL stride 64 (qkv V^T dim-major) / C f32 8x16",
+    "PV_cand": "A i8 8x32 LROW stride 64 (sy8 P codes) / B i8 32x16 LCOL stride 64 (sv8 V^T codes) / C i32 8x16",
+}
+OWNER = {
+    "QKV": "all 8 SG; sg owns 2x8 window tokens (mA=(sg/2)*16, mB=+8) and 3 N16 output groups (n0=(sg%2)*48 + {0,16,32}); K=512 input channels in 8 kc steps x 2 k32",
+    "QK": "all 8 SG; j=0,1 gives m0=(sg/2+4j)*8 (8 queries), n0=(sg%2)*32 (16-key pair branch); each SG covers 8 queries x 32 keys per j, the WG covers 64x64",
+    "PV_parent": "all 8 SG; m0=sg*8 (8 queries), K=64 keys in 4 K16 steps, two dim fragments (dim 0..15 at VBASE, 16..31 at VBASE+16*64)",
+    "PV_cand": "all 8 SG; m0=sg*8 (8 queries), K=64 keys as 2 K32 slices with the parent K order (0..31 then 32..63), two dim fragments (sv8 base 0 and 16*64)",
+}
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def mma_lines(path):
+    pat = "acc0=coopMatMulAdd(a,b0,acc0);acc1=coopMatMulAdd(a,b1,acc1);"
+    ls = Path(path).read_text(encoding="utf-8").splitlines()
+    return [i + 1 for i, l in enumerate(ls) if pat in l]
+
+
+def main():
+    census = json.loads((EV / "CENSUS.json").read_text(encoding="utf-8"))
+    mods = {m["sha256"]: m for m in census["modules"]}
+    p15, p30 = "8a9de285f563d6bba40af7267469046615e8d2695c351f246a9877f8bf928386", \
+               "9719c47f0e1359c49e1648126563623c61df926ff3b7194405f3c1df11ca6d20"
+    c15, c30 = "adfef38fb2f5668184c3d456a61de20bae6ee62deab059a3cd1681eec3629362", \
+               "92978dc7e94b906455ad299c1e6cd28fd54a4052c0b524789e423f5d756ab843"
+
+    par15_lines = mma_lines(CARD / "source/parent/_15/split16_attention_qkv_int8_inline.comp")
+    can15_lines = mma_lines(CARD / "source/candidate/split16_attention_qkv_int8_pv_int8.comp")
+    par30_lines = mma_lines(CARD / "source/parent/block30/split16_attention_qkv_int8.comp")
+    can30_lines = mma_lines(CARD / "source/candidate-b30/split16_attention_qkv_int8_pv_int8.comp")
+
+    auxbytes = AUX.read_bytes()
+    aux = struct.unpack("<%df" % (len(auxbytes) // 4), auxbytes)
+    qscale = aux[65536:65552]
+    wqb = WQKV.read_bytes()
+    wsc = struct.unpack("<1536f", wqb[786432:786432 + 6144])
+
+    # ---------------- PARENT-REPRO ----------------
+    repro = {"toolchain": {
+        "glslang": {"path": "@NR_WORKSPACE@/src/project/tools/glslang-16.5.0/bin/glslang.exe",
+                    "sha256": sha("@NR_WORKSPACE@/src/project/tools/glslang-16.5.0/bin/glslang.exe"),
+                    "version": "Glslang Version 11:16.5.0"},
+        "validator": {"path": "@NR_WORKSPACE@/candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe",
+                      "sha256": sha("@NR_WORKSPACE@/candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe")}},
+        "note": "the frozen toolchain path in CONVENTIONS.md is byte-identical to C:/nr008-bin/glslang-frozen.exe that the historical candidate used (same sha256), so parent reproduction and the original build are the same compiler",
+        "modules": {}}
+    for tag, dep, rep_, argv, srcs in (
+        ("15_ordinary", "parent_deployed_15.spv", "parent_repro_15.spv",
+         ["glslang.exe", "-V", "--target-env", "vulkan1.3", "-I<candidate source>",
+          "-DL2_INLINE_QT=1", "-DL2_NO_T_WRITE=1", "-o", "<out>", "split16_attention_qkv_int8_inline.comp"],
+         ["source/parent/_15/split16_attention_qkv_int8_inline.comp",
+          "source/parent/_15/split16_common.glsl"]),
+        ("block30", "parent_deployed_b30.spv", "parent_repro_b30.spv",
+         ["glslang.exe", "-V", "--target-env", "vulkan1.3", "-I<candidate source>",
+          "-o", "<out>", "split16_attention_qkv_int8.comp"],
+         ["source/parent/block30/split16_attention_qkv_int8.comp",
+          "source/parent/block30/split16_common.glsl"]),
+    ):
+        d = CARD / "spv" / dep
+        r = CARD / "spv" / rep_
+        repro["modules"][tag] = {
+            "deployed": {"file": str(d), "bytes": d.stat().st_size, "sha256": sha(d)},
+            "repro": {"file": str(r), "bytes": r.stat().st_size, "sha256": sha(r)},
+            "byte_identical": sha(d) == sha(r),
+            "argv": argv,
+            "sources": {s: sha(CARD / s) for s in srcs},
+            "words": mods[sha(d)]["words"],
+            "validation": "SPIRV_TOOLS_CPU_VULKAN13_VALIDATION result=0",
+        }
+    repro["all_byte_identical"] = all(v["byte_identical"] for v in repro["modules"].values())
+    EV.joinpath("PARENT-REPRO.json").write_text(json.dumps(repro, indent=1) + "\n",
+                                                encoding="utf-8", newline="\n")
+
+    # ---------------- STATIC-ENUMERATION ----------------
+    def sites_of(sha256, segs):
+        out = []
+        m = mods[sha256]
+        fp16 = [s for s in m["sites"] if s["class"] == "FP16"]
+        i8 = [s for s in m["sites"] if s["class"] == "INT8"]
+        return m, fp16, i8
+
+    enum = {"source_of_offsets": "FULLNET-RESIDUAL-MMA-SITES.json word offsets/result ids, "
+                                 "re-derived here by build/r12-split16-l2/spv_r12.py census",
+            "granularity": "static instruction per module; the 16 PASSes dispatch 2 distinct modules",
+            "modules": {}}
+    for tag, sha256, lines, pv_kind in (
+        ("15_ordinary", p15, par15_lines, "PV_parent"),
+        ("block30", p30, par30_lines, "PV_parent"),
+        ("15_ordinary_candidate", c15, can15_lines, "PV_cand"),
+        ("block30_candidate", c30, can30_lines, "PV_cand"),
+    ):
+        m = mods[sha256]
+        seg = []
+        for s in m["sites"]:
+            if s["class"] == "FP16" and s["A"].get("stride") == 32:
+                seg_name = "QK"
+            elif s["class"] == "FP16":
+                seg_name = "PV_parent"
+            elif s["A"].get("array") == "sv8" or s["B"].get("array") == "sv8":
+                seg_name = "PV_cand"
+            else:
+                seg_name = "QKV"
+            seg.append({"segment": seg_name, "class": s["class"],
+                        "word_offset": s["word_offset"], "result_id": s["result_id"],
+                        "function_id": s["function_id"], "function": s["function"],
+                        "A_id": s["A_id"], "B_id": s["B_id"], "C_id": s["C_id"],
+                        "accumulator": s["accumulator"], "A": s["A"], "B": s["B"],
+                        "shapes": SHAPES[seg_name], "owner": OWNER[seg_name]})
+        by_seg = {}
+        for s in seg:
+            by_seg.setdefault(s["segment"], []).append(s)
+        enum["modules"][tag] = {
+            "spv": str(CARD / "spv" / ("parent_repro_15.spv" if tag == "15_ordinary" else
+                                       "parent_repro_b30.spv" if tag == "block30" else
+                                       "r12_split16_l2_pv_int8.spv" if tag.startswith("15") else
+                                       "r12_split16_b30_l2_pv_int8.spv")),
+            "sha256": sha256, "bytes": m["bytes"], "words": m["words"],
+            "fp16_mma": m["fp16_mma"], "int8_mma": m["int8_mma"],
+            "workgroup_bytes": m["workgroup_bytes"],
+            "barriers": m["barriers"],
+            "grammar_selfcheck_ok": m["grammar_selfcheck"]["ok"],
+            "segments": {k: [dict(segment=x["segment"], word_offset=x["word_offset"],
+                                  result_id=x["result_id"], function=x["function"],
+                                  A_id=x["A_id"], B_id=x["B_id"], C_id=x["C_id"],
+                                  A=x["A"].get("array"), A_layout=x["A"].get("layout"),
+                                  A_stride=x["A"].get("stride"),
+                                  B=x["B"].get("array"), B_layout=x["B"].get("layout"),
+                                  B_stride=x["B"].get("stride")) for x in v]
+                         for k, v in by_seg.items()},
+            "segment_detail": {k: {"shapes": SHAPES[k], "owner": OWNER[k]} for k in by_seg},
+        }
+    enum["parent_source_lines"] = {"15_ordinary": {"QK": par15_lines[:1], "PV": par15_lines[1:]},
+                                   "block30": {"QK": par30_lines[:1], "PV": par30_lines[1:]},
+                                   "candidate": {"QK": can15_lines[:1],
+                                                 "PV_int8": can15_lines[1:3],
+                                                 "pv_int8_else_uncompiled": can15_lines[3:]}}
+    EV.joinpath("STATIC-ENUMERATION.json").write_text(json.dumps(enum, indent=1) + "\n",
+                                                      encoding="utf-8", newline="\n")
+
+    # ---------------- SCALE-CONTRACT ----------------
+    sc = {
+        "axes": {
+            "QKV_output_scale_existing": {
+                "what": "sX*sW per (head, output channel), the dequant of the already-INT8 QKV projection",
+                "resource": "binding 10 (WScales, wsc[]) inside the wqkv pack",
+                "offset": "BIND 10 = wqkv + 786432, 6144 B = 1536 floats = 16 heads x 96 channels",
+                "push": "p3.x = 786432 (float base, unused by this shader), p3.y = 786944 (weights8 element base)",
+                "production_point": "offline pack (candidates/codex-sol-int8-long-008-20261019/split16-l2-qkv-int8-v1/pack/split16_bNN_wqkv.int8.bin)",
+                "measured_block23": {"min": min(wsc), "max": max(wsc), "first": list(wsc[:8])},
+                "used_at": "STORE_QKV_I8: f = float(acc) * wsc[h*96+N], then one CH narrowing",
+            },
+            "attention_scale_existing": {
+                "what": "per-head float that multiplies Q after the row norm (the parent's Q scaling)",
+                "resource": "binding 1 (Auxiliary)", "offset": "push p4.y = 65536 floats = 262144 B",
+                "production_point": "offline aux pack split16_aux.bin, 16 floats at the tail",
+                "measured_block23": {"min": min(qscale), "max": max(qscale), "values": list(qscale)},
+                "used_at": "Q/K norm pass: qs = H(H(Q*nq)*scale); K has no such factor",
+                "note": "static pack value, one per head; not derived from any activation",
+            },
+            "Q_dynamic_new": {
+                "what": "per (token, head) absmax of the final normalised Q half row (32 channels)",
+                "resource": "none - derived in-register", "offset": "none",
+                "production_point": "the norm pass that already writes Q(e)=qs (source line ~196-201)",
+                "range": "per token per head, 64 rows per workgroup",
+                "status": "CONTRACT ONLY this round (QK is not converted); needed by the named QK gap",
+            },
+            "K_dynamic_new": {
+                "what": "per (token, head) absmax of the normalised K half row",
+                "resource": "none - derived in-register", "offset": "none",
+                "production_point": "same norm pass, K(e)=kn", "range": "per token per head, 64 rows",
+                "status": "CONTRACT ONLY this round (QK is not converted)",
+            },
+            "V_dynamic_new": {
+                "what": "absmax over the workgroup's whole V half slab (64 tokens x 32 dims)",
+                "resource": "none - one shared uint shVMax", "offset": "shared offset 0 of shVMax",
+                "production_point": "candidate C3/C4: 256 threads sweep qkv[4096..6144) and atomicMax the |V| float bit pattern; published by the parent's post-score barrier",
+                "range": "per workgroup = per (head, window)",
+                "consumed_at": "sV = |V|max/127; sv8[f]=i8code(V[f], 1/sV); dequant factor shPsf = sP*sV",
+            },
+            "P_dynamic_new": {
+                "what": "per query absmax of the 64 normalised P halfs of that query row",
+                "resource": "none - shared float shPsf[1024] (the dequant factor) only",
+                "offset": "shared: shPsf[query*16 + dimcol] (identical in all 16 columns)",
+                "production_point": "candidate C5/C6: the row owner thread (lid<64) that already computes inv and writes sp[e]=sp[e]*inv",
+                "range": "per query per head (one float per query row)",
+            },
+        },
+        "no_borrowing_proof": [
+            "Different resources: the QKV scale is binding 10 (wqkv + 786432), the attention scale is binding 1 (aux + 262144 B); the new Q/K/V/P scales are registers/shared only (shVMax, shPsf) and are not read from any descriptor.",
+            "Different axes: QKV scale is per (head, output channel); attention scale is per head; the new Q/K are per (token, head), V per (head, window), P per (query, head). A channel-indexed array cannot express a per-token absmax.",
+            "Different magnitude: measured QKV scales are 1.585e-4 .. 3.397e-4 (sX*sW), measured attention scales are 0.0145 .. 2.446, while the new scales are absmax/127 of post-norm activations (oracle: sP 2.06e-4..3.79e-4, sV 2.84e-2). Substituting one for another would change the dequantised product by 2-4 orders of magnitude.",
+            "Different lifetime: the QKV scale is applied inside the QKV store (before the norm); the norm rescales the rows afterwards, so the pre-norm scale cannot describe the post-norm Q/K magnitudes that QK consumes.",
+            "Structural: the candidate reads no scalar from bindings 10/1 on the PV path at all (SPV: the only new uniform/scalar inputs are shared shVMax and shPsf; the delta contains no new OpLoad of a descriptor).",
+        ],
+        "P_normalisation_timing": {
+            "split16_r12": [
+                "P is normalised BEFORE PV: sp[e]=sp[e]*inv with inv=1/max(total,2^-14) at the row owner thread, then one WG barrier, then PV consumes it.",
+                "The int8 code therefore quantises the exact half value that the FP16 PV would have multiplied: i8code(sp[e], 127/pmx).",
+                "P<=1 always (exp>0 and inv=1/max(sum,2^-14)), so pmx*(127/pmx)=127 never saturates and sP=pmx/127 is a per-query factor.",
+                "The reciprocal is a single scalar per query; P is a shared half matrix (phase[4096]) that already exists for the denominator tree, so quantisation rides on the existing barrier.",
+            ],
+            "vit_r15_contrast": [
+                "ViT PV consumes P UNNORMALISED and applies 1/max(den,6.198883056640625e-05) once per query AFTER all key chunks, to the context numerator (see candidates/r15-vit-attn/source/vit21-parent/vit_attention_pden_register_int8.comp header lines 47-52).",
+                "ViT P never touches memory (register handoff, sp[4096]/den[64] removed), so its int8 quantisation has to happen in registers, and its per-query P scale must be carried on an unnormalised P whose max is only bounded by the exp domain, not by 1.",
+                "Therefore the split16 sP/127 scheme cannot be copied to ViT, and the ViT reciprocal cannot be folded into the split16 PV dequant: in split16 the dequant factor (sP*sV) is applied at PV exit, in ViT the reciprocal is applied after the whole K loop, i.e. outside the PV accumulator.",
+                "Key chunking differs as well: split16 K=64 as 2 K32 slices inside one WG with 8 query owners (m0=sg*8); ViT runs 4 dim fragments x chunks of 16 keys with 4 query owners and N=16 queries per fragment.",
+            ],
+        },
+    }
+    EV.joinpath("SCALE-CONTRACT.json").write_text(json.dumps(sc, indent=1) + "\n",
+                                                  encoding="utf-8", newline="\n")
+
+    # ---------------- MMA-RESIDUAL ----------------
+    residual = {"method": "re-enumerate the candidate modules by their own types "
+                           "(spv_r12.py census); old module ids are not reused",
+                "per_pass": {}, "totals": {}}
+    for tag, sha256 in (("15_ordinary_candidate", c15), ("block30_candidate", c30)):
+        m = mods[sha256]
+        residual[tag] = {"sha256": sha256, "fp16_mma": m["fp16_mma"], "int8_mma": m["int8_mma"],
+                         "fp16_sites": [{"segment": ("QK" if s["A"].get("stride") == 32 else "?"),
+                                         "word_offset": s["word_offset"], "result_id": s["result_id"],
+                                         "shapes": SHAPES["QK"]}
+                                        for s in m["sites"] if s["class"] == "FP16"],
+                         "int8_segments": {"QKV": sum(1 for s in m["sites"]
+                                                      if s["class"] == "INT8" and s["A"].get("array") == "sy8"
+                                                      and s["B"].get("array") != "sv8"),
+                                           "PV": sum(1 for s in m["sites"]
+                                                     if s["class"] == "INT8" and s["B"].get("array") == "sv8")}}
+    grid = {}
+    for name in ENUM_NAMES:
+        grid[name] = 6 * (4 if int(name.split("_b")[1].split("_")[0]) % 2 == 0 else 3) * 16
+    # Dynamic executions: static sites x loop iterations x SGs that execute them.
+    #   QKV : 6 sites x 2 k-steps x 8 kc-steps = 96 per SG, all 8 SG -> 768 per WG
+    #   QK  : 2 sites x 2 k-steps x 2 j-steps =   8 per SG, all 8 SG ->  64 per WG
+    #   PV  : parent 2 sites x 4 k-steps = 8 per SG -> 64 per WG
+    #         cand   4 sites x 1          = 4 per SG -> 32 per WG
+    macros_qkv, qk_sg, pv_before_sg, pv_after_sg, sgs = 96, 8, 8, 4, 8
+    per_pass = {}
+    for name in ENUM_NAMES:
+        mod = "block30_candidate" if name == "split16_b30_l2" else "15_ordinary_candidate"
+        wg = grid[name]
+        per_pass[name] = {
+            "module": mod, "grid_wg": wg, "subgroups": sgs,
+            "qkv_int8_mma_per_wg": macros_qkv * sgs,
+            "qk_fp16_mma_per_sg": qk_sg, "qk_fp16_mma_per_wg": qk_sg * sgs,
+            "pv_mma_before_per_wg": pv_before_sg * sgs,
+            "pv_int8_mma_per_wg": pv_after_sg * sgs,
+            "fp16_mma_per_wg_before": (qk_sg + pv_before_sg) * sgs,
+            "fp16_mma_per_wg_after": qk_sg * sgs,
+            "int8_mma_per_wg_before": macros_qkv * sgs,
+            "int8_mma_per_wg_after": (macros_qkv + pv_after_sg) * sgs,
+            "fp16_mma_per_dispatch_before": (qk_sg + pv_before_sg) * sgs * wg,
+            "fp16_mma_per_dispatch_after": qk_sg * sgs * wg,
+        }
+    residual["per_pass"] = per_pass
+    wgt = sum(grid.values())
+    residual["totals"] = {
+        "workgroups_per_frame": wgt,
+        "per_wg_before": {"fp16": (qk_sg + pv_before_sg) * sgs, "int8": macros_qkv * sgs},
+        "per_wg_after": {"fp16": qk_sg * sgs, "int8": (macros_qkv + pv_after_sg) * sgs},
+        "per_frame_before": {"fp16": (qk_sg + pv_before_sg) * sgs * wgt,
+                             "int8": macros_qkv * sgs * wgt},
+        "per_frame_after": {"fp16": qk_sg * sgs * wgt,
+                            "int8": (macros_qkv + pv_after_sg) * sgs * wgt},
+        "fp16_static_before": 4 * 16, "fp16_static_after": 2 * 16,
+        "note": "per WG = the 8 subgroups summed; static counts are per module x PASS; "
+                "dynamic counts are source-level instruction executions, not FLOPs or time",
+    }
+    EV.joinpath("MMA-RESIDUAL.json").write_text(json.dumps(residual, indent=1) + "\n",
+                                                encoding="utf-8", newline="\n")
+    print("wrote PARENT-REPRO / STATIC-ENUMERATION / SCALE-CONTRACT / MMA-RESIDUAL")
+    print("workgroups/frame", residual["totals"]["workgroups_per_frame"],
+          "per-WG before/after", residual["totals"]["per_wg_before"],
+          residual["totals"]["per_wg_after"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

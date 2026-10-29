@@ -1,0 +1,46 @@
+from pathlib import Path
+import json,hashlib,statistics,shutil
+B=Path('@NR_WORKSPACE@'); A=B/'work/codex-astra-fp16-int8-audit-20261024'; S=A/'fullnet-mechanism-transfer-20261026/f10-qkv-a-consumer-layout-20261027'; O=S/'regression-diagnosis'
+read=lambda p:json.loads(p.read_text(encoding='utf-8-sig'))
+gpu=read(O/'GPU-REVIEW.json'); counters=read(O/'COUNTER-REVIEW.json')
+assert len(gpu['runs'])==16 and len(counters)==12
+banks={arm:[r['sum'] for r in counters if r['id'].startswith('banks-'+arm)] for arm in ['parent','candidate']}
+occ={arm:[r['unweighted_dispatch_mean'] for r in counters if r['id'].startswith('occupancy-'+arm)] for arm in ['parent','candidate']}
+assert all(len(v)==3 for v in banks.values()) and all(len(v)==3 for v in occ.values())
+text=f'''F10退化诊断结果，2026-10-27
+
+基线保持：接受的F08组合cc0b6ad72496c8296d9b3ab312367322ff3c617a70cd8d0566b7c7d979d7c116。
+候选仍为2da01656，未采纳、未部署、未修改优化代码。整个布局方向保持开放。
+原端到端退化：慢0.296073778ms，95%区间慢[0.220676241,0.371471316]ms。
+本轮28个GPU诊断：16个phaseclock（12测量+4同点常量控制），12个单指标硬件采集（bank与occupancy各3父/候选对）。逐帧gold、scratch0既有门保持。所有原始数据保留。
+
+1. 生产端：末次kc迭代混合区间，父三次均值2906.326 cycles，候选3459.619，约+19.0%。父三次范围2838..2966，候选3442..3494。证据支持该观察区间有退化，不能直接映射全网络ms。
+   其静态指令/UGM/SLM消息计数没有增加；循环前prefix114→128，地址payload数两臂均16组。排除“每次生产新增大量整数指令”“凭空新增16组长期地址”这两种描述。
+   每SG每次有效写64字节相同，地址不同4B字由16→32；这是布局几何事实，不是银行冲突结论。
+2. 银行冲突硬件计数（16 F10派发合计，三次）：父{banks['parent']}；候选{banks['candidate']}。
+   整核冲突减少，不支持整核银行冲突增长解释。计数覆盖读写，不能由总数唯一拆出producer写冲突；读侧改善可能掩盖局部写变化。
+3. 消费端：末次kc/k混合区间父均值3450.691，候选3507.653。父范围3237..3826，候选3406..3570，重复存在重叠和反号，不能判为稳定退化。
+   确认多了两级A片段halfword重组；局部mov61→71，但SLM读16→2、静态指令138→119。新增mov≠已证主要耗时。
+4. 寄存器调度：父W1在首条DPAS前发出；候选W1/W2均在W0两条DPAS后发出。候选W0累加器r86..93保存到r126..133后，W2返回才能复用r86..93，具名生命周期冲突成立。
+   硬件线程槽占用率：父三次16派发简单平均{occ['parent']}；候选{occ['candidate']}。完整逐派发数据在COUNTER-REVIEW.json。此数不是GRF分配量，不做占用率加总。
+   三次占用率的派发简单平均约82.02%→83.17%，没有观察到全族平均线程槽占用下降。候选单次ordinal136有低点，原始值保留；不能宣称所有位置都改善。占用率上升也可能是线程等待更久，不等于有效并行提高。
+   因此“寄存器更多导致整体驻留下降”为本轮数据不支持的解释；寄存器物理复用导致的局部依赖仍然存在。实际GRF分配仍未知；max-r不用于推算。
+5. 扰动边界：clock_only四项结果均1，确认读表/终值语义。相同区间常量控制整帧约29.44..30.10ms；测量和控制的单帧差值有噪声，不宣称计时无扰动。两者均不能与warm1 ordinary直接相减。
+   phaseclock只保留最后迭代，绝不乘8或32外推整核，更不把线程累计周期当墙钟。未测到异步完成时刻，producer stop在fence之前不包含完整写排空。
+
+结论：已把“删消息为何不快”分解为真实的读取改善、生产区间退化观察和具名的权重读并行损失。尚未把0.296ms按三者定量分摊，不能声称唯一根因已经证明。
+不因负结果封禁方向，也不因一个新的静态假说继续投放优化候选。
+
+后续对照的执行门（尚未生成/执行新优化代码）：
+A. 保持候选producer、sy布局、A读与重组逐项不变，只把三个权重片段的定义/使用分离，目标解除W2/r86..93回收约束。须native证实W1/W2确实提前、producer与A路径无变化、六累加器K顺序不变、scratch不增；不满足则不可称单变量，不进入计时。只可识别调度代价，不能声称消除了重组。
+B. 不使用“父producer+候选consumer”的伪2×2对照：二者布局不兼容；加转置桥会引入新的工作/屏障，不能当纯生产者效应。
+C. 不用早退producer-only时间直接给原核分摊：删除消费会改变寄存器与调度。也不把整核bank总计误当store-only冲突。
+D. 写侧是否为独立主要瓶颈，目前没有干净的原核内store-only完成观测。需要能保持其余native的受控地址服务对照，或更细硬件事件，才升级因果结论。现有结果支持优先保留读取布局方向、审核其生产代价，而不是继续删无效MMA。
+'''
+(O/'RESULTS.txt').write_text(text,encoding='utf-8')
+for f in ['f10_retirement_diagnosis.py','f10_regression_notes.py','f10_diagnostic_review.py','f10_counter_diagnosis.py','f10_diagnosis_close.py']:
+ shutil.copyfile(Path(f),O/f)
+(O/'STATE.json').write_text(json.dumps(dict(status='DIAGNOSIS_COMPLETED_PARTIAL_CAUSAL_IDENTIFICATION',baseline_unchanged=True,optimization_code_changed=False,gpu_jobs=28,bank_counts=banks,occupancy_unweighted_dispatch_means=occ,unique_root_cause='UNPROVEN',next='Controlled weight-bank separation requires native invariance gate before any performance acceptance.'),indent=2),encoding='utf-8')
+(S/'RESULTS.json').write_text(json.dumps(dict(status='SLOWER_95_IMPLEMENTATION_NOT_ADOPTED_DIRECTION_OPEN',timing=read(S/'TIMING-REVIEW.json'),diagnosis=str(O/'RESULTS.txt'),baseline_unchanged=True,unique_root_cause='UNPROVEN',proven_native_change='W1/W2 issue moves after W0 pair; W2 aliases prior accumulator bank r86..93',bank_conflicts_ratio=1/9,occupancy_decline='not supported by family-average measurements',producer='last iteration interval consistently larger, not end-to-end attribution',consumer='last iteration mixed interval inconclusive'),indent=2),encoding='utf-8')
+files=[dict(path=str(p.relative_to(O)),bytes=p.stat().st_size,sha256=hashlib.sha256(p.read_bytes()).hexdigest()) for p in O.rglob('*') if p.is_file() and p.name!='MANIFEST.json']
+(O/'MANIFEST.json').write_text(json.dumps(files,indent=2),encoding='utf-8');print('recorded',len(files),'files');print('banks',banks,'occupancy',occ)

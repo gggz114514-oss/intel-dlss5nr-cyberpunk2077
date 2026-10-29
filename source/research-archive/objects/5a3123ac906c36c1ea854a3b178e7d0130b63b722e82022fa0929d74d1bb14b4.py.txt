@@ -1,0 +1,143 @@
+"""S06: (a) gate plan with internal dumps, (b) pack tap audit incl. a desync control.
+
+(a) candidate-34189-gate.txt = candidate-34189.txt plus three declared raw OUTPUT
+    dumps (same mechanism S05 used):
+        OUTPUT 533 raw "block15_pack.bin"   -> whole pack, qX at +376,832
+        OUTPUT  94 raw "block15_M.bin"      -> window-major qM
+        OUTPUT  95 raw "block15_Y.bin"      -> window-major Y
+(b) re-reads the shipped and the new pack *from disk* and proves the three scale
+    taps are consistent, with a deliberate desync run as a positive control.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+import c256b15 as L
+
+W = L.W
+sys.path.insert(0, str(W.parent / "tools"))
+import planlib
+
+CAND = W / "candidate-34189.txt"
+GATE = W / "candidate-34189-gate.txt"
+ev = {}
+text = CAND.read_text(encoding="utf-8").splitlines()
+out_lines = [i for i, l in enumerate(text) if l.startswith("OUTPUT")]
+first_policy = next(i for i, l in enumerate(text) if l.startswith("POLICY"))
+assert out_lines and first_policy == max(out_lines) + 1, (out_lines, first_policy)
+ins = ['OUTPUT 533 raw "block15_pack.bin"',
+       'OUTPUT 94 raw "block15_M.bin"',
+       'OUTPUT 95 raw "block15_Y.bin"']
+for k, line in enumerate(ins):
+    text.insert(first_policy + k, line)
+head = text[0].split()
+assert head[0] == "PORT_NETWORK_1" and int(head[4]) == 1, head
+head[4] = str(len(out_lines) + len(ins))
+text[0] = " ".join(head)
+GATE.write_text("\n".join(text) + "\n", encoding="utf-8")
+gp = planlib.Plan(GATE)
+probs = gp.validate()
+assert probs == [], probs
+ev["gate_plan"] = dict(path=str(GATE), sha256=planlib.sha256_file(GATE), header=gp.lines[0],
+                       outputs=[list(o[:3]) for o in gp.outputs], problems=probs,
+                       base=dict(path=str(CAND), sha256=planlib.sha256_file(CAND)),
+                       expected_files={
+                           "block15_pack.bin": dict(bytes=5537792,
+                                                    qx_slice="[376832:1409024]",
+                                                    qx_compare="CPU qX codes of the same producer (evidence/14-taps.json "
+                                                               "carries the CPU qX hash for frame 34189)"),
+                           "block15_M.bin": dict(bytes=2162688, layout="(w*64+t)*256+n window-major",
+                                                 compare="CPU M (evidence/13-ln-metric.json arms)"),
+                           "block15_Y.bin": dict(bytes=2162688, layout="(w*64+t)*256+n window-major",
+                                                 compare="CPU Y for the new pack: relL2 0.015453 (evidence/08)")})
+
+# ---------------------------------------------------------------- tap audit --
+idx, oob = L.window_to_canonical()
+valid = idx >= 0
+NW = L.N_TOK
+We, Wm, Wc, rs = L.decode_weights()
+raw_new = np.fromfile(W / "PACK/c256_b15_int8_qxeq.bin", dtype=np.uint8)
+raw_old = np.fromfile(L.PACK_OLD, dtype=np.uint8)
+diag = np.load(W / "evidence/06-diag.npy")
+
+
+def scalars(raw):
+    s = np.frombuffer(raw[L.SCAL_OFF:L.SCAL_OFF + 128].tobytes(), dtype="<f4")
+    return dict(invX=float(s[0]), invA=float(s[1]), invM=float(s[2]),
+                sX=float(s[3]), sA=float(s[4]), sM=float(s[5]))
+
+
+s_new, s_old = scalars(raw_new), scalars(raw_old)
+ew_n = np.frombuffer(raw_new[L.EW_OFF:L.EW_OFF + 4096].tobytes(), dtype="<f4")
+mw_n = np.frombuffer(raw_new[L.MW_OFF:L.MW_OFF + 1024].tobytes(), dtype="<f4")
+al_n = np.frombuffer(raw_new[L.ALPHA_OFF:L.ALPHA_OFF + 1024].tobytes(), dtype="<f4")
+swm_n = np.frombuffer(raw_new[L.SWM_OFF:L.SWM_OFF + 1024].tobytes(), dtype="<f4")
+swc_n = np.frombuffer(raw_new[L.SWC_OFF:L.SWC_OFF + 1024].tobytes(), dtype="<f4")
+swe_n = np.frombuffer(raw_new[L.SWE_OFF:L.SWE_OFF + 4096].tobytes(), dtype="<f4")
+def rel_of(got, exp):
+    g = got.astype(np.float64); e = exp.astype(np.float64)
+    return float(np.max(np.abs(g - e) / np.maximum(np.abs(e), 1e-30)))
+
+
+mw_exp = (np.float64(s_new["sA"]) * swm_n.astype(np.float64)).astype("<f4")
+al_exp = (np.float64(s_new["sM"]) * swc_n.astype(np.float64)).astype("<f4")
+ew_exp = (np.float64(s_new["sX"]) * swe_n.astype(np.float64)).astype("<f4")
+tap = dict(
+    mw_equals_sA_times_sWm=rel_of(mw_n, mw_exp) < 1e-6, mw_max_rel=rel_of(mw_n, mw_exp),
+    alpha_equals_sM_times_sWc=rel_of(al_n, al_exp) < 1e-6, alpha_max_rel=rel_of(al_n, al_exp),
+    ew_equals_sX_times_sWe=rel_of(ew_n, ew_exp) < 1e-6, ew_max_rel=rel_of(ew_n, ew_exp),
+    invX_times_sX=float(s_new["invX"] * s_new["sX"]),
+    invA_times_sA=float(s_new["invA"] * s_new["sA"]),
+    invM_times_sM=float(s_new["invM"] * s_new["sM"]),
+    sWe_matches_folded_weights=bool(np.allclose(
+        swe_n, (np.abs(We.astype(np.float64) * diag[None, :]).max(axis=1) / 127.0).astype(np.float32), rtol=0, atol=1e-12)),
+    invx_table_matches=rel_of(
+        np.frombuffer(raw_new[L.PAD_OFF:L.PAD_OFF + 1024].tobytes(), dtype="<f4"),
+        (np.float32(1.0 / s_new["sX"]) / diag).astype("<f4")) < 1e-6,
+    invx_table_vs_buildtime_f64=rel_of(
+        np.frombuffer(raw_new[L.PAD_OFF:L.PAD_OFF + 1024].tobytes(), dtype="<f4"),
+        (np.float64(1.0) / np.float64(s_new["invX"]) / diag).astype("<f4")),
+)
+# quantitative sensitivity: how bad would a *desynced* alpha look?
+src = (W / "tools/08_emit.py").read_text(encoding="utf-8-sig").split("arms = {")[0]
+ns = {"__name__": "emit", "__file__": str(W / "tools/08_emit.py")}
+exec(compile(src, "08_emit_head", "exec"), ns)
+run = ns["run"]
+Xc = L.load_x_canonical(L.D / "dump-fp16/dump_block14_out.bin")
+Y = np.fromfile(L.D / "dump-fp16/dump_swin_15_Y.bin", dtype="<f2").reshape(NW, 256).astype(np.float32)
+Xw = np.zeros((NW, 256), dtype=np.float32)
+Xw[valid] = Xc[idx[valid]]
+good = run(raw_new, Xw, True)
+des = raw_new.copy()
+des[L.ALPHA_OFF:L.ALPHA_OFF + 1024] = np.frombuffer(
+    (np.float64(s_old["sM"]) * swc_n.astype(np.float64)).astype("<f4").tobytes(), dtype=np.uint8)
+bad = run(des, Xw, True)
+qbad = des.copy()
+qbad[L.MW_OFF:L.MW_OFF + 1024] = np.frombuffer(
+    (np.float64(s_old["sA"]) * swm_n.astype(np.float64)).astype("<f4").tobytes(), dtype=np.uint8)
+bad2 = run(qbad, Xw, True)
+vY = Y[valid].astype(np.float64)
+
+
+def rl2(y):
+    d = y[valid].astype(np.float64) - vY
+    return float(np.sqrt(np.mean(d * d) / np.mean(vY ** 2)))
+
+
+ev["tap_audit"] = tap
+ev["desync_control"] = dict(
+    note="positive control: the audit must be able to see a broken tap",
+    alpha_with_old_sM=dict(rel_l2=rl2(bad["y"])),
+    alpha_and_mw_with_old_scales=dict(rel_l2=rl2(bad2["y"])),
+    correct=dict(rel_l2=rl2(good["y"])),
+)
+ev["cpu_qx_34189"] = dict(
+    note="CPU qX codes of the new producer for frame 34189, for the gate comparison",
+    sha256=__import__("hashlib").sha256(good["qx"].astype(np.int8).tobytes()).hexdigest(),
+    n=int(good["qx"].size),
+    layout="window-major [4224,256]; canonical order is (tile*8 + c//32)*16*32 + s*32 + c%32")
+(W / "evidence/14-taps.json").write_text(json.dumps(ev, indent=1), encoding="utf-8")
+print(json.dumps(ev, indent=1)[:3000])

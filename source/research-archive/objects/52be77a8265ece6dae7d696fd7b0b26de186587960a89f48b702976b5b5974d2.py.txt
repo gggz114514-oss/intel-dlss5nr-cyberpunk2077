@@ -1,0 +1,92 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys
+R=Path(__file__).resolve().parent;A=R.parent;B=A.parents[1];P=R/'f20-score-owner';T=R/'f20-norm-local-owner';N=R/'f20-norm-full-lane';N.mkdir(exist_ok=True)
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+ return r.stdout
+s=(T/'candidate.comp').read_text(encoding='utf-8-sig');start=s.index('    // ============ stage 5:');end=s.index('    if (debug) {',start)
+new='''    // stage5: two lanes per original norm tree, even/odd c branches.
+    uint norm_lane=gl_SubgroupInvocationID;
+    uint norm_id=norm_lane&15u, norm_parity=norm_lane>>4u;
+    bool norm_isQ=norm_id<8u;
+    uint norm_row=sg*8u+(norm_id&7u);
+    float16_t norm_sq[16];
+    for(uint g=0u;g<4u;++g) for(uint i=0u;i<4u;++i) {
+        uint c=8u*g+2u*i+norm_parity;
+        float16_t v=norm_isQ?NR_Q(norm_row,c):NR_K(norm_row,c);
+        norm_sq[4u*g+i]=v*v;
+    }
+    float16_t norm_s[4];
+    for(uint i=0u;i<4u;++i) {
+        float16_t a=norm_sq[i]+norm_sq[i+8u];
+        float16_t b=norm_sq[i+4u]+norm_sq[i+12u];
+        norm_s[i]=a+b;
+    }
+    float16_t norm_t0=norm_s[0]+norm_s[2];
+    float16_t norm_t1=norm_s[1]+norm_s[3];
+    float16_t norm_partial=norm_t0+norm_t1;
+    uint norm_other_bits=subgroupShuffleXor(packFloat2x16(f16vec2(norm_partial,float16_t(0.0))),16u);
+    float16_t owner_norm=float16_t(0.0);
+    if(norm_lane<16u) {
+        float16_t sum=norm_partial+unpackFloat2x16(norm_other_bits).x;
+        float mx=max(float(sum),float(float16_t(0.000062)));
+        owner_norm=float16_t(inversesqrt(mx));
+    }
+    subgroupBarrier();
+    uint owner_bits=packFloat2x16(f16vec2(owner_norm,float16_t(0.0)));
+    float16_t paired_norm=unpackFloat2x16(subgroupShuffleXor(owner_bits,8u)).x;
+    uint norm_pair=(norm_lane&8u)==0u
+        ?packFloat2x16(f16vec2(owner_norm,paired_norm))
+        :packFloat2x16(f16vec2(paired_norm,owner_norm));
+    // Coefficients Q,K for each row travel together; one broadcast per component.
+    {
+        float16_t scalar0=float16_t(fb[uint(pc.p2.z)]);
+        for(int d=0;d<4;++d) {
+            uint row_local=2u*uint(d)+(norm_lane>>4u);
+            f16vec2 norms=unpackFloat2x16(subgroupShuffle(norm_pair,row_local));
+            precise f16vec2 qr=f16vec2(score_q0[d],score_q1[d])*f16vec2(norms.x);
+            qr=qr*f16vec2(scalar0);
+            score_q0[d]=qr.x;score_q1[d]=qr.y;
+            uint e=2048u+(sg*8u+row_local)*32u+2u*(norm_lane&15u);
+            f16vec2 v=f16vec2(shArena[e],shArena[e+1u]);
+            precise f16vec2 kr=v*f16vec2(norms.y);
+            shArena[e]=kr.x;shArena[e+1u]=kr.y;
+        }
+    }
+'''
+candidate=s[:start]+new+s[end:]
+score=candidate.index('    // ============ stage 6:');a=candidate.index('    {\n        float16_t scalar0=',score);b=candidate.index('        if(debug) {',a)
+candidate=candidate[:a]+'    {\n'+candidate[b:]
+# Symbolic expression trees, not associative sums: every internal node preserved.
+sq=lambda c:('mul',c,c)
+add=lambda x,y:('add',x,y)
+orig_s=[add(add(sq(c),sq(c+16)),add(sq(c+8),sq(c+24))) for c in range(8)]
+t4=[add(orig_s[c],orig_s[c+4]) for c in range(4)]
+original=add(add(t4[0],t4[2]),add(t4[1],t4[3]))
+parts=[]
+for parity in [0,1]:
+ vals=[add(add(sq(2*i+parity),sq(2*i+parity+16)),add(sq(2*i+parity+8),sq(2*i+parity+24))) for i in range(4)]
+ parts.append(add(add(vals[0],vals[2]),add(vals[1],vals[3])))
+assert add(*parts)==original
+assert len({(l&15,8*g+2*i+(l>>4)) for l in range(32) for g in range(4) for i in range(4)})==512
+src=N/'candidate.comp';spv=N/'candidate.spv';src.write_text(candidate,encoding='utf-8')
+run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv])
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+pm=ST.Module(P/'candidate.spv');cm=ST.Module(spv);pattern=N/'parent-pattern-only.spv';ST.set_no_contraction(pm,set(ST.no_contraction_ids(pm))-{1436,1444},pattern)
+ids=cm.id_to_instruction();raw_half2=[rid for rid in ST.no_contraction_ids(cm) if ids[rid][0]==133 and ids.get(ids[rid][1][0],(0,[]))[0]==23];assert len(raw_half2)==5
+keep,info=ST.transfer_decoration_pattern_aligned(ST.Module(pattern),cm,raw_half2);assert len(keep)==8;ST.set_no_contraction(cm,set(keep),spv)
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+plan=N/'plan.txt';plan.write_text((P/'plan.txt').read_text().replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8')
+for kind in ['GATES','NATIVE']:
+ t=json.loads((P/f'LUNA-{kind}.json').read_text().replace('f20-score-owner',N.name));t['identities']=[x for x in t['identities'] if not x['path'].endswith('.spv')]+[ident(spv)]
+ for j in t['jobs']:j['plan']=ident(plan)
+ (N/f'LUNA-{kind}.json').write_text(json.dumps(t,indent=2),encoding='utf-8')
+runner=json.loads((P/'LUNA-GATES.json').read_text())['identities'][0]['path']
+proof=dict(parent=ident(P/'plan.txt'),source_parent=ident(T/'candidate.spv'),source=ident(src),spv=ident(spv),plan=ident(plan),cpu=run([runner,'--plan',plan,'--cpu-check']),shared_bytes=24576,NC=sorted(keep),alignment=info,
+ tree=original,symbolic_tree_equal=True,mapping='norm_id=lane&15, parity=lane>>4. Original s[c] even or odd branches stay wholly on one lane. Pair xor16 joins exactly original t2[0]+t2[1]. 16 norms per SG,512 square leaves unique. Then xor8 pairs Q/K coefficients; rows0..7 hold complete pairs.',
+ costs='All32 lanes run16 squares rather than16 lanes run32. Same scalar square/add count; final sum/inversesqrt on16 lanes. Six shuffle calls/SG: one partial xor16,one Q/K xor8,four coefficient broadcasts versus8 prior. No extra weight reads. Same subgroup barrier and retained K publication barrier.',
+ lifetime='Raw norm array16half/lane vs32 previously; four s vs8, no fresh persistent raw cache. Q16B/lane stays as prior. One packed coefficient carrier is consumed by fused Q/K scale and dies before normalized K publication. Shuffle packing and lane-select costs added; physical allocation must be checked.',
+ rounding='Exact source expression tree; no new scalar norm NC. Driver FMA contraction across rewritten tree remains unproven until gold gate. Partial transfer is packFloat2x16/unpackFloat2x16 bit transport, not numerical conversion. Q/K scaling preserves separate half rounding.',
+ stop='If fixed/fb2 differs, no timing/no retries; preserve failure. Native no-spill then one ordinary/resource batch.')
+(N/'PROOF.json').write_text(json.dumps(proof,indent=2),encoding='utf-8');print(ident(spv))

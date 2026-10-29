@@ -1,0 +1,168 @@
+"""n13b-f13-contract: cost decomposition of the F13 contract ISA (read only).
+
+Reads a GTPin --dump_isa asm file and reports, per basic block:
+  instruction count, DPAS, send messages by kind (wide/narrow/store), mov by width,
+  sync, integer ops, and the branch topology (so loop bodies can be named).
+CPU only. No GPU, no writes outside the card dir.
+"""
+import json
+import re
+import sys
+from collections import Counter, OrderedDict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+import ISA  # campaign-root parser (read-only import)
+
+LABEL = re.compile(r'^L(\d+):\s*$')
+
+
+def width_of(flags, ops):
+    m = re.search(r'\((\d+)\|', flags or '')
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def msg_kind(comment):
+    """Classify a send message comment into a stable key."""
+    if not comment:
+        return 'no-comment'
+    c = comment
+    m = re.search(r';\s*(\S+)', c)
+    tail = m.group(1) if m else c
+    if 'store.ugm' in c:
+        return 'store ' + (re.search(r'store\.ugm\.\S+', c).group(0) if re.search(r'store\.ugm\.\S+', c) else '')
+    if 'load.ugm' in c:
+        base = re.search(r'load\.ugm\.(\S+)', c).group(1)
+        size = re.search(r'\.d(\d+)(x\d+)?', base)
+        return 'load.' + base.split('.a32')[0]
+    return tail
+
+
+def classify(i):
+    op = i['op']
+    if op.startswith('send'):
+        return 'send'
+    if op.startswith('dpas'):
+        return 'dpas'
+    if op.startswith('sync'):
+        return 'sync'
+    if op.startswith('barrier') or op.startswith('fence'):
+        return 'barrier'
+    if op.startswith('mov'):
+        return 'mov%d' % (width_of(i['flags'], i['ops']) or 1)
+    return op
+
+
+def blocks(path):
+    isa = ISA.parse(path)
+    labels = []
+    cur = None
+    out = []
+    for i in isa:
+        pass
+    # second pass over the raw text to attach labels
+    raw = Path(path).read_text(encoding='utf-8-sig', errors='replace').splitlines()
+    lab_at = {}
+    pending = []
+    for line in raw:
+        m = LABEL.match(line.strip())
+        if m:
+            pending.append(int(m.group(1)))
+            continue
+        lm = ISA.LINE.match(line)
+        if lm and pending:
+            addr = int(lm.group('addr'), 16)
+            for p in pending:
+                lab_at[p] = addr
+            pending = []
+    for i in isa:
+        out.append(i)
+    # assign each instruction to the last label with addr <= i.addr
+    ordered = sorted(lab_at.items(), key=lambda kv: kv[1])
+    idx = 0
+    for i in isa:
+        while idx + 1 < len(ordered) and ordered[idx + 1][1] <= i['addr']:
+            idx += 1
+        if ordered and ordered[0][1] <= i['addr']:
+            i['label'] = ordered[idx][0]
+        else:
+            i['label'] = None
+    return isa, lab_at
+
+
+def branch_targets(isa, lab_at):
+    """Backward branches: (from_label, to_label, addr) where target addr < source addr."""
+    out = []
+    for i in isa:
+        if i['op'].startswith('jmpi') or i['op'].startswith('goto') or i['op'].startswith('brd'):
+            for o in i['ops']:
+                m = re.match(r'L(\d+)', o)
+                if m:
+                    t = int(m.group(1))
+                    if t in lab_at and lab_at[t] < i['addr']:
+                        out.append(dict(src_addr=i['addr'], src_label=i['label'],
+                                        dst_label=t, dst_addr=lab_at[t], raw=i['raw'].strip()))
+    return out
+
+
+def summarise(items):
+    c = Counter()
+    msgs = Counter()
+    for i in items:
+        k = classify(i)
+        c[k] += 1
+        if k == 'send':
+            msgs[msg_kind(i['comment'])] += 1
+    return c, msgs
+
+
+def main(path, out_json):
+    isa, lab_at = blocks(path)
+    back = branch_targets(isa, lab_at)
+    labels = sorted(lab_at.items(), key=lambda kv: kv[1])
+    by_label = OrderedDict()
+    for n, addr in labels:
+        by_label[n] = []
+    for i in isa:
+        by_label.setdefault(i['label'], []).append(i)
+    rows = []
+    for n, items in by_label.items():
+        c, msgs = summarise(items)
+        if not items:
+            continue
+        rows.append(dict(label=n, start=lab_at.get(n), end=items[-1]['addr'],
+                         n=len(items), dpas=c.get('dpas', 0), send=c.get('send', 0),
+                         sync=c.get('sync', 0), barrier=c.get('barrier', 0),
+                         mov32=c.get('mov32', 0), mov16=c.get('mov16', 0),
+                         mov8=c.get('mov8', 0), mov1=c.get('mov1', 0),
+                         other_big=dict((k, v) for k, v in c.items()
+                                        if k not in ('dpas', 'send', 'sync', 'barrier',
+                                                     'mov32', 'mov16', 'mov8', 'mov1',
+                                                     'mov', 'mov2', 'mov4')),
+                         msgs=dict(msgs)))
+    tot_c, tot_m = summarise(isa)
+    out = dict(path=str(path), instructions=len(isa), labels=len(labels),
+               backward_branches=back, totals=dict(tot_c), total_messages=dict(tot_m),
+               blocks=rows)
+    Path(out_json).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_json).write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print('instructions', len(isa), 'labels', len(labels))
+    print('backward branches:', len(back))
+    for b in back:
+        print('  L%s(%d) -> L%s(%d)' % (b['src_label'], b['src_addr'], b['dst_label'], b['dst_addr']))
+    print('totals:', dict(tot_c))
+    print('messages:', json.dumps(dict(tot_m), indent=2))
+    print('%6s %6s %6s %5s %5s %5s %6s %5s %5s %4s  msgs' %
+          ('label', 'start', 'end', 'n', 'dpas', 'send', 'sync', 'm32', 'm8', 'jmp'))
+    for r in rows:
+        print('%6s %6d %6d %5d %5d %5d %6d %5d %5d %4d  %s' %
+              (r['label'], r['start'] or 0, r['end'], r['n'], r['dpas'], r['send'],
+               r['sync'], r['mov32'], r['mov8'],
+               sum(v for k, v in r['other_big'].items() if k.startswith('jmp')),
+               json.dumps(r['msgs']) if r['msgs'] else ''))
+
+
+if __name__ == '__main__':
+    main(sys.argv[1], sys.argv[2])

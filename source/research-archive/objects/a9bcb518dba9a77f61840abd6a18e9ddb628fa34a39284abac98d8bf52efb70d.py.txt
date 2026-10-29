@@ -1,0 +1,107 @@
+"""N02: list the OpStore targets/values for the surface buffer (binding 7) in the
+parent and the candidate, and verify the stored channel expressions correspond.
+
+The parent writes 8 scalar floats (two four-channel records x four channels);
+the candidate writes 2 vec4 records.  This script proves that the eight stored
+expressions of the parent are, channel for channel, the components of the two
+candidate records (same expression DAG, only the record assembly differs).
+"""
+import sys, pathlib, json, collections
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST
+from _spv_check import Canon
+
+CARD = pathlib.Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/cards/n02-f20-f21-tail')
+
+
+def binding_variables(m):
+    """variable id -> (descriptor set, binding) from OpDecorate(DescriptorSet=34, Binding=33)."""
+    dec = collections.defaultdict(dict)
+    for op, ops, _, _ in m.instructions:
+        if op == 71 and len(ops) == 3:
+            dec[ops[0]][ops[1]] = ops[2]
+    out = {}
+    for vid, d in dec.items():
+        if 33 in d and 34 in d:
+            out[vid] = (d[34], d[33])
+    return out
+
+
+def var_name(m, vid):
+    for op, ops, _, _ in m.instructions:
+        if op == 5 and len(ops) >= 2 and ops[0] == vid:
+            return ''.join(chr((w >> 0) & 0xff) + chr((w >> 8) & 0xff) + chr((w >> 16) & 0xff) + chr((w >> 24) & 0xff)
+                           for w in ops[1:]).rstrip('\x00')
+    return 'var%d' % vid
+
+
+def surface_stores(m, var):
+    """OpStore whose access-chain base loads `var` (the binding-7 SSBO pointer)."""
+    can = Canon(m)
+    res = []
+    for idx, (op, ops, _, _) in enumerate(m.instructions):
+        if op != 62:
+            continue
+        ptr, val = ops[0], ops[1]
+        pop, pops = m.defining_instruction(ptr)
+        if pop != 65:
+            continue
+        # ops of OpAccessChain: [result type, result id, base, indices...]
+        base = pops[2]
+        bop, bops = m.defining_instruction(base)
+        direct = (bop == 59 and bops[1] == var)          # access chain off the buffer variable
+        loaded = (bop == 61 and bops[2] == var)          # access chain off a loaded pointer
+        if direct or loaded:
+            res.append((idx, ptr, can.c(ptr), can.c(val)))
+    return res
+
+
+def describe(c):
+    """Compact, stable text for a canonical expression."""
+    def go(x):
+        if isinstance(x, tuple):
+            if x and x[0] == 'id':
+                return 'ptr'
+            return '(' + ','.join(go(y) for y in x) + ')'
+        return str(x)
+    return go(c)
+
+
+def main():
+    par = ST.Module(CARD / 'build/parent-raw.spv')
+    cand = ST.Module(CARD / 'candidate.spv')
+    vp = binding_variables(par)
+    vc = binding_variables(cand)
+    out = {}
+    for tag, m, vs in (('parent', par, vp), ('candidate', cand, vc)):
+        s7 = [v for v, b in vs.items() if b == (0, 7)]
+        out[tag + '_binding7_vars'] = [(v, var_name(m, v)) for v in s7]
+    svar_p = [v for v, b in vp.items() if b == (0, 7)][0]
+    svar_c = [v for v, b in vc.items() if b == (0, 7)][0]
+    sp = surface_stores(par, svar_p)
+    sc = surface_stores(cand, svar_c)
+    out['surface_stores_parent'] = [
+        {'instr': i, 'addr': describe(a), 'value': describe(v)} for i, _, a, v in sp]
+    out['surface_stores_candidate'] = [
+        {'instr': i, 'addr': describe(a), 'value': describe(v)} for i, _, a, v in sc]
+    out['counts'] = {'parent': len(sp), 'candidate': len(sc)}
+
+    # ---- channel correspondence -------------------------------------------
+    # parent order: history x,y,z,blend then final x,y,z,alpha (source order)
+    pv = [v for _, _, _, v in sp]
+    cv = [v for _, _, _, v in sc]
+
+    def components(v):
+        if v[0] == 'construct':
+            return list(v[1])
+        return [v]
+
+    out['parent_components'] = [describe(x) for x in pv]
+    out['candidate_components'] = [describe(x) for x in components(cv[0])] + [describe(x) for x in components(cv[1])]
+    out['channels_equal'] = out['parent_components'] == out['candidate_components']
+    print(json.dumps(out, indent=1))
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,130 @@
+"""n34-f19-latency: SPIR-V def-use distance for the 8 OpFDiv (math.inv) sites.
+
+The 16 math.rsqt live inside `full_norm` (2 OpExtInst Inversesqrt, 8 call sites),
+so no source reorder can move them in SPIR-V.  The 8 OpFDiv are in the main
+function and *are* movable by statement order.  This script measures, in module
+order:
+
+  * the index span of the 8 OpFDiv sites (how clustered they are), and
+  * for every OpFDiv: the distance to the first OpFMul that consumes its value,
+    following OpFConvert / OpCompositeConstruct / OpCompositeExtract and
+    OpStore -> (local variable) -> OpLoad / OpAccessChain aliasing.
+
+CPU only.  Usage: python _g_spv_dep.py <spv> [...] ; writes SPV-DEP.json for the
+last argument only when `--json` is given.
+"""
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST  # noqa: E402
+
+OP_FDIV, OP_FMUL, OP_STORE, OP_LOAD, OP_ACCESSCHAIN = 136, 133, 62, 61, 65
+TRANSPARENT = {115, 116, 79, 80, 81, 82, 83, 77, 245, 65, 61}
+
+
+def analyse(path):
+    m = ST.Module(Path(path))
+    ins = m.instructions
+    defined = {}
+    for i, (op, ops, _, _) in enumerate(ins):
+        rid = ST.result_id_of(op, ops)
+        if rid is not None:
+            defined[rid] = i
+
+    # pointer -> base variable (access chains resolve to their base id)
+    base_of = {}
+    for rid, i in defined.items():
+        op, ops = ins[i][0], ins[i][1]
+        if op == OP_ACCESSCHAIN:
+            b = ops[2]
+            base_of[rid] = base_of.get(b, b)
+        elif op in (59,):                       # OpVariable
+            base_of[rid] = rid
+
+    users = defaultdict(list)
+    for i, (op, ops, _, _) in enumerate(ins):
+        for t in ops:
+            if isinstance(t, int) and t in defined and defined[t] < i:
+                users[t].append(i)
+
+    def loads_of(var, depth=0):
+        out = []
+        if depth > 4:
+            return out
+        for u in users.get(var, ()):
+            if ins[u][0] == OP_LOAD:
+                out.append(u)
+            elif ins[u][0] == OP_ACCESSCHAIN:
+                nid = ST.result_id_of(ins[u][0], ins[u][1])
+                out.extend(loads_of(nid, depth + 1))
+        return out
+
+    def consumers(start):
+        """forward cone through transparent ops + local variable stores/loads"""
+        seen = {start}
+        stack = [start]
+        out = []
+        while stack:
+            rid = stack.pop()
+            for u in users.get(rid, ()):
+                op, ops = ins[u][0], ins[u][1]
+                if op == OP_STORE:
+                    var = base_of.get(ops[0], ops[0])
+                    for lu in loads_of(var):
+                        nid = ST.result_id_of(ins[lu][0], ins[lu][1])
+                        if nid and nid not in seen:
+                            seen.add(nid)
+                            stack.append(nid)
+                    continue
+                nid = ST.result_id_of(op, ops)
+                if nid is not None and nid not in seen:
+                    seen.add(nid)
+                    stack.append(nid)
+                out.append((u, op))
+        return out
+
+    fdivs = [i for i, (op, _, _, _) in enumerate(ins) if op == OP_FDIV]
+    sites = []
+    for i in fdivs:
+        rid = ST.result_id_of(ins[i][0], ins[i][1])
+        cons = consumers(rid)
+        muls = [u for u, op in cons if op == OP_FMUL]
+        sites.append(dict(idx=i, first_mul=min(muls) if muls else None,
+                          gap=(min(muls) - i) if muls else None,
+                          n_mul_consumers=len(muls)))
+    gaps = [s['gap'] for s in sites if s['gap'] is not None]
+    return dict(path=str(path),
+                sha256=__import__('hashlib').sha256(Path(path).read_bytes()).hexdigest(),
+                instructions=len(ins), fdiv=[s['idx'] for s in sites],
+                span=(max(fdivs) - min(fdivs)) if fdivs else None,
+                sites=sites, gaps=gaps,
+                min_gap=min(gaps) if gaps else None,
+                max_gap=max(gaps) if gaps else None)
+
+
+if __name__ == '__main__':
+    args = []
+    skip = False
+    for a in sys.argv[1:]:
+        if skip:
+            skip = False
+            continue
+        if a == '--json':
+            skip = True
+            continue
+        if not a.startswith('--'):
+            args.append(a)
+    out = {}
+    for a in args:
+        r = analyse(a)
+        out[Path(a).name] = r
+        print('%-26s instr %5d  OpFDiv %s  span %s  gaps %s (min %s max %s)'
+              % (Path(a).name, r['instructions'], r['fdiv'], r['span'], r['gaps'],
+                 r['min_gap'], r['max_gap']))
+    if '--json' in sys.argv:
+        dst = sys.argv[sys.argv.index('--json') + 1]
+        Path(dst).write_text(json.dumps(out, indent=1), encoding='utf-8')
+        print('wrote', dst)

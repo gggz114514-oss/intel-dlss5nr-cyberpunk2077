@@ -1,0 +1,145 @@
+"""Machine census of the F02 body ISA at the CURRENT CHAIN HEAD capture.
+
+Input : queue/n10-f10-next/native/captures/native-native-base/ISA
+        (the newest 40-pipeline capture in this campaign; the F02 group bytes are
+         4c034a53..., identical to the chain head plan's rows for ordinals
+         1,2,3,4,227,228,229 -- BUILD.json.chain_head_rows)
+Output: isa-message-census.json
+
+CPU only, read-only on the capture.
+"""
+import sys, json, collections
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+CARD = Path(__file__).parent
+sys.path.insert(0, str(CARD))
+import isaparse as P
+
+CAPTURE = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+               'fullnet-continuous-20261027/queue/n10-f10-next/native/captures/'
+               'native-native-base/ISA')
+
+# message mnemonic -> bytes moved by ONE issue (calibrated on three fragments of
+# independently known size in this family: NRH_B 16x16 half = 512 B -> d64x64t,
+# NRH_CH 8x16 half contiguous = 256 B -> d32x64t, one f32 row of 16 = 64 B -> d32x16t)
+ELEM = {'d8': 1, 'd16': 2, 'd32': 4, 'd64': 8}
+
+
+def payload(msg, lanes=None):
+    """Bytes moved by ONE issue.
+
+    For uniform messages (1 lane, the overwhelmingly common case in this kernel)
+    the mnemonic product is the payload: d32x16t = 16 x 4 B = 64 B.  For a
+    divergent block message the per-lane payload is multiplied by the execution
+    width (measured case: store.slm.d32x4 executed (16|M0) writes 4 dwords per
+    lane for 16 lanes = 256 B, which is exactly one NRH_CH fragment).
+    """
+    import re
+    m = re.search(r'\.(d\d+)x(\d+)t?\b', msg)
+    if not m:
+        return None
+    eb = ELEM.get(m.group(1))
+    if eb is None:
+        return None
+    per_lane = eb * int(m.group(2))
+    return per_lane if not lanes or lanes == 1 else per_lane * lanes
+
+
+def classify(msg):
+    if 'store' in msg:
+        return 'debug-store' if 'store.ugm' in msg else 'slm-store'
+    if 'load.slm' in msg:
+        return 'slm-load'
+    if 'fence' in msg:
+        return 'fence'
+    return 'ugm-load'
+
+
+def census(path):
+    isa = P.parse(path)
+    rows = []
+    for i in isa:
+        if not i['op'].startswith('send'):
+            continue
+        msg = P.msg_of(i)
+        lanes = P.lane_width(i)
+        rows.append(dict(op=i['op'], msg=msg, rd=P.rd_of(i), addr=i['addr'],
+                         lanes=lanes, kind=classify(msg),
+                         bytes=payload(msg, lanes)))
+    return isa, rows
+
+
+NATIVE_HASH = '7a38a17947f21ae6'   # stable per-shader native hash in the ISA filename;
+                                   # the same hash n01b's independent capture recorded for
+                                   # the chain-head F02 bytes (cards/n01b-f02-load-side/RESULTS.json)
+
+
+def main():
+    files = sorted(CAPTURE.glob('*.asm'))
+    scored = []
+    for f in files:
+        isa = P.parse(f)
+        dpas = sum(1 for i in isa if i['op'].startswith('dpas'))
+        scored.append((f, len(isa), dpas, NATIVE_HASH in f.name))
+    target = [t for t in scored if t[3]]
+    other_128 = [{'file': t[0].name, 'instructions': t[1]} for t in scored
+                 if t[2] == 128 and not t[3]]
+    out = {'capture': str(CAPTURE),
+           'selection_rule': 'native hash %s in the ISA file name (the identity the '
+                             'chain-head F02 SPV 4c034a53... compiles to; the same hash '
+                             'n01b captured independently) AND dpas.8x8 == 128' % NATIVE_HASH,
+           'files': [t[0].name for t in target],
+           'signature_of_selected': [{'file': t[0].name, 'instructions': t[1],
+                                      'dpas': t[2]} for t in target],
+           'excluded_kernels_with_128_dpas': other_128,
+           'file_sha256': {}, 'per_file': {}}
+    import hashlib
+    agg = None
+    for f, _instr, _dpas, _hit in target:
+        isa, rows = census(f)
+        out['file_sha256'][f.name] = hashlib.sha256(f.read_bytes()).hexdigest()
+        forms = collections.Counter((r['op'], r['kind'], r['lanes'], r['rd'], r['msg'])
+                                   for r in rows)
+        per = {'instructions': len(isa),
+               'dpas': sum(1 for i in isa if i['op'].startswith('dpas')),
+               'sync_bar': sum(1 for i in isa if i['op'] == 'sync.bar'),
+               'forms': [{'op': k[0], 'kind': k[1], 'lanes': k[2], 'rd': k[3],
+                          'msg': k[4], 'count': v, 'bytes_each': payload(k[4], k[2]),
+                          'bytes_total': (payload(k[4], k[2]) or 0) * v}
+                         for k, v in sorted(forms.items(), key=lambda x: -x[1])]}
+        per['send_total'] = sum(1 for i in isa if i['op'].startswith('send'))
+        per['send_ugm'] = sum(1 for i in isa if i['op'] == 'send.ugm')
+        per['send_slm'] = sum(1 for i in isa if i['op'] == 'send.slm')
+        out['per_file'][f.name] = per
+        agg = agg or per
+    # executed-path accounting (debug == 0 in production: pc.p0.z != 0 guards all
+    # coopMatStore(dbg) sites, which is exactly the store.ugm.d32x8t form)
+    if agg:
+        ex = [r for r in agg['forms'] if not (r['kind'] == 'debug-store')]
+        dbg = [r for r in agg['forms'] if r['kind'] == 'debug-store']
+        bias = [r for r in agg['forms'] if r['msg'].startswith('load.ugm.d32x16t.a32')]
+        out['executed_path'] = {
+            'debug_store_messages': sum(r['count'] for r in dbg),
+            'executed_messages_total': sum(r['count'] for r in ex),
+            'executed_ugm_messages': sum(r['count'] for r in ex if r['op'] == 'send.ugm'),
+            'executed_ugm_bytes': sum(r['bytes_total'] for r in ex if r['op'] == 'send.ugm'),
+            'bias_messages': sum(r['count'] for r in bias),
+            'bias_bytes': sum(r['bytes_total'] for r in bias),
+            'bias_share_of_executed_ugm_messages':
+                sum(r['count'] for r in bias) / max(1, sum(r['count'] for r in ex
+                                                           if r['op'] == 'send.ugm')),
+            'bias_share_of_executed_ugm_bytes':
+                sum(r['bytes_total'] for r in bias) / max(1, sum(r['bytes_total'] for r in ex
+                                                                 if r['op'] == 'send.ugm')),
+        }
+    (CARD / 'isa-message-census.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print('files:', out['files'])
+    for name, per in out['per_file'].items():
+        print(name, 'instr', per['instructions'], 'dpas', per['dpas'],
+              'sync.bar', per['sync_bar'], 'send', per['send_total'])
+    print('executed path:', json.dumps(out.get('executed_path', {}), indent=1))
+
+
+if __name__ == '__main__':
+    main()

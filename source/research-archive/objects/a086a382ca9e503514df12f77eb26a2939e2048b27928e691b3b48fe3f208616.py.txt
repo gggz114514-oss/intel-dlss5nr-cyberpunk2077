@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""s37fn2: the s37-fnorm fragment-norm rewrite WITHOUT the added `precise`
+qualifiers, matching the parent's precision contract.
+
+Root cause (established 2026-10-24 by WG0 staged dumps + CPU re-simulation):
+the parent's scalar norm has NO NoContraction on its mul/add ops, so the
+driver JIT fuses v*v + sq into single-rounding FMA ('first'-fusion pattern,
+128/128 rows reproduced on WG0). The sealed candidate cfa357ac added
+`precise` (33 NoContraction), forcing two-rounding — 5/128 rows' tot differ
+1-2 ULP -> 52 normalized-K halfs at 1 ULP -> gate FAIL. Tree restructuring
+itself is sound; raw Q/K and normalized Q are bitwise identical on WG0.
+
+s37fn2 = s37-fnorm source with `precise ` stripped from the norm block only.
+diag2 = s37fn2 + the diag1 debug writes (for the WG0 pre-check).
+"""
+import hashlib
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+WS = Path(r"@NR_WORKSPACE@")
+CAND_SRC = WS / "work/zcode-fp16-fullnet-handoff-20261024/candidates/s37-fnorm/source/s37_fold_body_r1a.comp"
+OUT = WS / "work/zcode-fp16-hotspot-r2-20261024/s37fn2"
+INC = CAND_SRC.parent
+COMPILER = WS / "src/project/tools/glslang-16.5.0/bin/glslang.exe"
+VALIDATOR = WS / "candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe"
+
+# norm-block precise sites (from the sealed candidate source)
+NORM_OPEN = "        if (region < 2u) {\n            precise float16_t z0[4], z1[4];"
+SITES = [
+    "            precise float16_t z0[4], z1[4];",
+    "            precise float16_t sv[4] = {float16_t(0),float16_t(0),float16_t(0),float16_t(0)};",
+    "            precise float16_t t4v[4], t2v[4], tv[4];",
+    "            precise float16_t tot[4] = {tq01.x, tq01.y, tq23.x, tq23.y};",
+    "                precise float16_t nf = float16_t(inversesqrt(",
+    "                    precise float16_t sc = float16_t(fb[uint(pc.p2.z)]);",
+]
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def strip_precise(txt):
+    n = 0
+    for s in SITES:
+        assert txt.count(s) == 1, s
+        txt = txt.replace(s, s.replace("precise ", "", 1))
+        n += 1
+    return txt, n
+
+
+def compile_one(src, out_spv, label):
+    r = subprocess.run([str(COMPILER), "-V", "--target-env", "vulkan1.3",
+                        "-I" + str(INC), "-o", str(out_spv), str(src)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(label, "COMPILE FAIL:\n", r.stderr[-2000:])
+        sys.exit(1)
+    v = subprocess.run([str(VALIDATOR), str(out_spv)], capture_output=True, text=True)
+    ok = "result=0" in (v.stdout + v.stderr)
+    print(label, sha(out_spv)[:16], "validate", "OK" if ok else "FAIL")
+    return ok
+
+
+def main():
+    (OUT / "source").mkdir(parents=True, exist_ok=True)
+    (OUT / "spv").mkdir(exist_ok=True)
+    for f in INC.iterdir():
+        if f.suffix in (".comp", ".glsl"):
+            shutil.copy2(f, OUT / "source" / f.name)
+
+    base = CAND_SRC.read_text(encoding="utf-8")
+    s37fn2, n1 = strip_precise(base)
+    p2 = OUT / "source" / "s37_fold_body_r1a.comp"
+    p2.write_text(s37fn2, encoding="utf-8")
+    compile_one(p2, OUT / "spv" / "s37fn2.spv", "s37fn2:")
+
+    # diag2: diag1 debug edits applied on the s37fn2 base
+    sys.path.insert(0, str(WS / "work/zcode-fp16-hotspot-r2-20261024"))
+    import build_diag_identities as D
+    txt = s37fn2
+    C_TOT2 = D.C_TOT.replace("precise ", "", 1)
+    C_TOT_DIAG2 = D.C_TOT_DIAG.replace("precise ", "", 1)
+    C_SCALE_TAIL2 = D.C_SCALE_TAIL.replace("precise ", "", 1)
+    C_SCALE_TAIL_DIAG2 = D.C_SCALE_TAIL_DIAG.replace("precise ", "", 1)
+    assert txt.count(C_TOT2) == 1, "tot anchor"
+    txt = txt.replace(C_TOT2, C_TOT_DIAG2)
+    assert txt.count(C_SCALE_TAIL2) == 1, "scale anchor"
+    txt = txt.replace(C_SCALE_TAIL2, C_SCALE_TAIL_DIAG2)
+    pd = OUT / "source" / "s37fn2_diag2.comp"
+    pd.write_text(txt, encoding="utf-8")
+    compile_one(pd, OUT / "spv" / "s37fn2_diag2.spv", "s37fn2_diag2:")
+
+    # plans: full 232 gate plan for s37fn2 (SPV swap only) + wg0 diag2 plan
+    D01 = WS / "candidates/dsh-fp16-same-family-20261023/combo-d01-d034-s32k11-v1/plan-combo-d01-d034-s32k11-v1.txt"
+    base_plan = Path(D01).read_text(encoding="utf-8").replace("\r\n", "\n").split("\n")
+    for target, spv, debug, grid in (
+            (OUT / "plan-s37fn2-232.txt", OUT / "spv/s37fn2.spv", False, None),
+            (OUT / "plan-s37fn2-diag2-wg0.txt", OUT / "spv/s37fn2_diag2.spv", True, True)):
+        lines = list(base_plan)
+        h = lines[0].split()
+        done = 0
+        for i, ln in enumerate(lines):
+            if ln.startswith('PASS 151 "s37_fold_body_r1a_v1"'):
+                w = ln.split()
+                w[3] = str(spv).replace("\\", "/")
+                if grid:
+                    assert w[-3:] == ["169", "97", "1"]
+                    w[-3:] = ["1", "1", "1"]
+                lines[i] = " ".join(w)
+                done += 1
+            elif ln.startswith("PUSH ") and done == 1 and debug:
+                w = ln.split()
+                assert len(w) == 33
+                w[3] = "1"
+                lines[i] = " ".join(w)
+                done += 1
+        if debug:
+            # add OUTPUT for the debug buffer (header no: 1 -> 2)
+            h = lines[0].split()
+            assert h[4] == "1"
+            h[4] = "2"
+            lines[0] = " ".join(h)
+            oi = next(i for i, l in enumerate(lines) if l.startswith("OUTPUT "))
+            lines.insert(oi + 1, 'OUTPUT 482 raw "dump_ioport_70_ioport_body_debug.bin"')
+        assert done == (2 if debug else 1), done
+        Path(target).write_text("\n".join(lines), encoding="utf-8")
+        print(Path(target).name, hashlib.sha256(Path(target).read_bytes()).hexdigest()[:16])
+
+
+if __name__ == "__main__":
+    main()

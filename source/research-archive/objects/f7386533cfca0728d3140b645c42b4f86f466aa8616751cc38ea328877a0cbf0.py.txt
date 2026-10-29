@@ -1,0 +1,73 @@
+from pathlib import Path
+import json,hashlib,shlex,re
+import numpy as np
+R=Path('@NR_WORKSPACE@');O=R/'work/codex-astra-fp16-int8-audit-20261024'
+def ident(p):
+ b=p.read_bytes();return dict(path=p.as_posix(),sha256=hashlib.sha256(b).hexdigest(),bytes=len(b))
+def tiled(t,c,C):return ((t//16)*(C//16)+c//16)*256+(t%16)*16+c%16
+# Transposed M8N16: physical matrix row is channel; col is token.
+old=set();new=set();writers=0
+for wx in range(33):
+ for wy in range(8):
+  for sg in range(4):
+   for dt,dn in [(0,0),(16,0),(0,8),(16,8)]:
+    t0=wx*32+dt;n0=wy*64+sg*16+dn
+    for lane in range(32):
+     for ci in range(4):
+      e=lane+32*ci;old.add(tiled(t0+e//8,n0+e%8,512))
+      row=2*ci+lane//16;col=lane%16
+      new.add(tiled(t0+col,n0+row,512));writers+=1
+assert old==new and len(new)==writers==1056*512
+# Per-fragment pool. Only parity-even lanes emit two means per fragment.
+rng=np.random.default_rng(20261024);x=rng.uniform(-8,8,(8,2,2,8,16)).astype(np.float16)
+def pool(v):return np.float16(np.float16(np.float16(v[0]+v[1])+np.float16(v[2]+v[3]))*np.float16(.25))
+pooled={};reference={}
+for sg in range(8):
+ for sy in range(2):
+  for side in range(2):
+   for ch in range(16):
+    for dx in range(2):
+     rows=[2*dx,2*dx+1,2*dx+4,2*dx+5]
+     v=x[sg,sy,side,:,ch]
+     local=[v[2*ci] for ci in range(4)];partner=[v[2*ci+1] for ci in range(4)]
+     got=[local[dx],partner[dx],local[dx+2],partner[dx+2]]
+     assert all(a.tobytes()==b.tobytes() for a,b in zip(got,v[rows]))
+     ly=2*sy+(sg>>1&1);lx=2*(sg>>2)+dx;kk=(sg&1)*32+side*16+ch
+     address=(4*ly+lx)*64+kk
+     assert address not in pooled
+     pooled[address]=pool(got).tobytes();reference[address]=pool(v[rows]).tobytes()
+assert pooled==reference and set(pooled)==set(range(1024))
+plan=R/'candidates/int8-coverage-v2-20261020/plan-g3-production.txt'
+passes=[]
+for line in plan.read_text().splitlines():
+ p=shlex.split(line)
+ if not p:continue
+ if p[0]=='PASS':passes.append(dict(name=p[2],module=p[3],bind={},grid=list(map(int,p[-3:]))))
+ elif p[0]=='BIND':passes[-1]['bind'][int(p[1])]=list(map(int,p[2:]))
+ elif p[0]=='PUSH':passes[-1]['push']=list(map(int,p[1:]))
+byname={p['name']:p for p in passes};edges=[]
+for b in range(31,38):
+ prod=byname[f'vit_block{b}_projection'];cons=byname[f'vit_block{b+1}_ffn_qx_producer'];expand=byname[f'vit_block{b+1}_ffn_expand']
+ assert prod['bind'][3]==cons['bind'][2]
+ assert cons['bind'][4]==expand['bind'][4]
+ assert cons['bind'][0]==expand['bind'][0]
+ edges.append(dict(producer=prod['name'],consumer=expand['name'],deleted_scan=cons['name'],half_edge=prod['bind'][3],next_hidden=cons['bind'][4],next_weight_pack=cons['bind'][0],original_projection_binding4=prod['bind'][4],scale='next pack ws[8], not current pack',status='current plan logical binding match only; X5 repair and pooled allocation lifetime must precede merge'))
+# Exact projection producer coverage, including tail m=256..287.
+addresses=[]
+for wx in range(3):
+ for ny in range(32):
+  for sg in range(8):
+   for group in range(2):
+    m=wx*128+sg*8+group*64
+    if m>=288:continue
+    for side in range(2):
+     for lane in range(32):
+      for ci in range(4):addresses.append(1179648+(m+2*ci+lane//16)*1024+ny*32+side*16+lane%16)
+assert len(addresses)==len(set(addresses))==288*1024
+assert min(addresses)==1179648 and max(addresses)+1==1474560
+qx=set(range(1179648,1474560));qy=set(range(1474560,1769472));qa=set(range(1179648))
+assert not qx&qy and not qx&qa
+sources=[plan,R/'candidates/int8-coverage-v2-20261020/A/source/l3/split16_projection_l3_qx.comp',R/'candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-qkv-v2/source/vit_nb04_mpair.glsl',R/'candidates/codex-sol-int8-long-008-20261019/vit-alpha-v1/source/vit_nb04_qx_producer.comp',R/'candidates/amd-netorg-acceleration-workbuddy-20261016/f3-c64-fused-half-patch-v1/source/fused_c64_body_ds.comp',R/'candidates/zcode-int8-full-20261020/B/source/b30_l3_int8.comp']
+result=dict(scope='CPU source/coordinate/half-tree and logical-plan research, no compiler/native/GPU',transposed_l3=dict(elements=writers,mismatches=0,formula='token=T0+(lane&15); channel=N0+2*ci+(lane>>4)',removed_shared_bytes=1024,removed_logical_shared_write_and_read_bytes_each_per_WG=4096,removed_subgroup_barrier_executions_per_WG=32),C64_pool=dict(elements=1024,bit_mismatches=0,unique_mean_addresses=1024,packed_shuffles_per_fragment=2,fragments_per_SG=4,removed_pair_bytes=8192,combined_with_F07_D_shared_bytes=2048,half_fragment_lifetime='one fragment at a time; other original accumulators remain live; no new four-half array'),vit_edges=edges,vit_qx_domain=dict(elements=294912,mismatches=0,range=[1179648,1474560],no_overlap_with_qA_qY=True,half_reads_removed_bytes_all7=7*288*1024*2,quantized_writes='unchanged',half_output='retained for next contract residual'),ffn_fusion_constraints=dict(logical_accumulator_bytes_per_lane_M8_N1024_SG32=1024,logical_accumulator_bytes_per_lane_M8_N32_SG32=32,duplicated_expand_factor_if_independent_N32_fusions=32,scope='same token tile and complete output domain; logical payload only, not native GRF allocation; cross-SG sharing changes model'),sources=[ident(p) for p in sources])
+(O/'REMAINING-EDGE-LIFETIME-PROOF.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
+print(json.dumps({k:v for k,v in result.items() if k not in ['sources','vit_edges']}));print('verified edges',len(edges))

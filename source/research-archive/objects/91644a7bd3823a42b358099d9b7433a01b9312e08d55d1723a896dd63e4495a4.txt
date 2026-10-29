@@ -1,0 +1,120 @@
+n12b-f14-scale  RESUME —— F14：Q scale 系数 hoist 出 group 循环（2026-10-27）
+============================================================================
+
+## 1. 状态
+
+**BUILT / AWAITING-GPU**（本卡未运行 GPU、未取锁、未部署；未改基线 plan / CURRENT.json / COMMON.py /
+其他卡目录；只写 cards/n12b-f14-scale/）
+
+| 产物 | sha256 | 备注 |
+|---|---|---|
+| candidate.comp | 92e0457c0c875a4e514902b1031e6a3116a8921d830eaffe3cd0d1b3af9e1ee1 | 8304 B |
+| candidate.spv | 362e31015eac9c708fcf7e27d86165883ea276da64d981c4278f1da0a4f84176 | 18384 B，4596 words，spv_validate_cpu result=0 |
+| delta-base.spv（立即父） | d008f8fefca9e8fa881713302bb45fab4c23a5d4c8258a4b1cbca07e8577e4c7 | n12 候选，raw 重编译字节相同 |
+| parent-rebuild.spv（基线身份） | 72e2df7c7b1e542f375f5c7c2bdc572433a08c5f1a1a0d706026efa54b9a1e87 | 与 F14 基线 SPV 字节相同 |
+| plan.txt | 82be522e88fbb85906617c820360436b7db1e626e0360f929f61fc687bc22c82 | 168006 B，3510 行；8 行 PASS（1516/1571/1626/1681/1736/1791/1846/1901） |
+| SOURCE-DIFF.patch | d834faa123cb2cfe2cd6b4446ab4e8627f51e680323fb119d29936bead30ecd6 | 4 hunks；父→候选 round-trip 通过 |
+| cpu-check | `CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded` | 与链头 plan 逐字相同 |
+
+* plan 的父 = **构建时的当前接受链头** `accepted/n06b-f06-c64-20261027/plan.txt`（`7ad5b99d…`）；
+  `COMMON.make_plan(..., parent_plan=链头, spv_shas={72e2…})` 断言 **replaced == 8**，
+  其余 3502 行逐字不变（`evidence/PLAN.json`）。构建期间链头从 `pkg-vit-16pass`（`58449908…`）
+  前移到 `n06b-f06-c64`（`7ad5b99d…`），本卡 plan 已按新链头重建；若之后又前移，主代理
+  `COMMON.rebase_candidate_plan()` 即可，仍是同样 8 行、同一候选 SPV。
+* 八行同名：`vit_block31_qkv … vit_block38_qkv`（ordinal 95/100/105/110/115/120/125/130）。
+* `float_NC_checked = 7`（基线 7 / 立即父 7 / 候选 7；multiset 一一对应）。
+* 六问、映射与边界枚举、证据索引：`ANALYSIS.md` / `PROOF.json` / `evidence/*.json`。
+* 卡目录里另有 3 个 `_tmp_*.py`（17:08–17:11 的预探查脚本，不是本卡构建链的一部分）与
+  `AUDIT-main.json`（`audit_card.py` 的审计输出），均保留未动。
+* `audit_card.py n12b-f14-scale` → **ACCEPTED**（`problems=[]`、`notes=[]`；parent 字节复现通过、
+  candidate 身份一致、plan_scope=chain-head 8 行、plan sha 一致、float_NC_checked=7）。
+
+## 2. 改了什么（一句话）
+
+`scales[pc.p2.z+(n0%1024u)/32u]` 从 `for(group)` 内的 Q 分支**提到 group 循环之前读一次**，
+两个 group 共用同一个 half 值；表达式、`float16_t` 转换、每 group 8 个 `vq_scale_q`、
+norm 树、K 序、写域、Q/K/V 分支全部逐字不动。
+
+依据：驱动把两迭代 group 循环展开，父里同一个标量读出现两次（基线 ISA `0x17390`/`0x18950`，
+n12 父 `0x16F40`/`0x18190`），中间隔着 group 0 的 qkv store，无法 CSE；读的地址 `p2.z+gy`
+只依赖 workgroup id，不依赖循环内任何值；`Scales` 三臂 `OpStore` 均为 0，且 plan 里
+Scales（binding 1，128 B）与 QKV（binding 6，1.77 MB）是不同 pool buffer。
+
+## 3. 已证 / 未证
+
+已证（CPU，可复核）：
+
+1. 三重字节身份：基线源 raw 重编译 = 基线 SPV `72e2…`；n12 源 raw 重编译 = `d008…`；
+   候选 = `362e…`，validate result=0（`evidence/{PARENT-REBUILD,DELTA-BASE,CANDIDATE-BUILD}.json`）。
+2. 映射：生产 884,736 = 288 token × 3072 channel，重复写 0、行外写 0、padding 0；
+   F15 读集完全相同；每个 Q 元素的系数下标 = `n/32`（每 head 一个因子，一一覆盖）。
+   `evidence/INDEX-PROOF.json`
+3. 系数读的位置与值：
+   * SPIR-V：三臂各 **1 条** Scales `OpLoad`；父在 group 循环内（header 329/371），
+     候选在 **preheader**（无 enclosing loop），守卫 `n0<1024` 与父内层守卫同一条比较；
+   * 地址表达式 `OpIAdd(load(p2.z), OpUDiv(OpUMod(n0,1024),32))` **结构完全相同**；
+   * 定义 store 从循环内移到 preheader（+1 个 0.0 初始化 store）；8 个消费者读仍在循环体；
+   * body opcode 只 +9：`+OpBranch +OpBranchConditional +2 OpLabel +OpSelectionMerge
+     +OpULessThan +OpStore +OpLoad`，FP/矩阵/调用 opcode 一条没动。
+   `evidence/{SCALE-LOAD,SPV-SUMMARY,SPV-STATICS}.json`、`evidence/SPV-DIFF.txt`
+4. NoContraction 7→7 一一对应；callee 序列 26 个调用完全相同（树/倒数/8 次缩放顺序不变）。
+5. ISA（当前批次、只读引用）：父与 n12 父都是 **2** 个标量系数站点，各带 1 个 `flat[A+0x48]`、
+   1 个 add、1 个 shl、1 个 conv、8 个 mul 消费；head 寄存器由 prolog `and gy,31` 给出。
+   `evidence/ISA-STATS.json`
+6. plan / cpu-check / validate 三件套通过。
+
+未证（需要 GPU，交主代理）：
+
+- 新捕获里标量系数站点是否真的 2→1、`send.ugm` 是否 1224→1222、是否一个 half 值被 16 条乘法消费。
+- 8 个 F14 dispatch 的 GpuTime 方向；F14 包（n12 + 本卡）的 ordinary 是否可分辨。
+- 候选 scratch 是否仍为 0、max_r 是否仍 ≤127（本改动让 1 个 half 跨 group 0 的 store 块存活）。
+
+## 4. 下一处具体代码改动
+
+**若落 A 类（站点仍 2，驱动把读沉回第二份）**：
+
+1. 先确认不是 plan/身份问题（8 行是否都指向 `362e…`、新捕获的 SPV sha 是否等于候选）。
+2. 把守卫收紧成 `if(n0<1024u && mA<pc.p0.x)`（`mA<p0.x` 是"至少一个 group 存活"的充要条件），
+   删掉 128 次无效读；对硬判据 1 无影响，但能排除"无效读被驱动当成两份"的可能。
+3. 再把读移到 `main` 最前面（K 循环之前）试一版：系数只依赖 workgroup id，语义允许；
+   代价是 half 值跨整个 K 循环存活（1 GRF word），可能触发 B 类，需要看 max_r/scratch。
+4. 若仍是 2 站点，停在本卡记 **A（实现未落地）**，不推广成"方向无效"；**不做**
+   "把 scale 预乘进 inv" 这种改动——half 乘法不满足结合律，`(z*a)*s ≠ z*(a*s)` 会改舍入点，
+   属于合同禁止的数学改动（除非另写逐位证明，默认拒绝）。
+
+**若落 B 类（站点落地但 max_r/spill/mov 变差）**：先用 §4.2 的 `mA<pc.p0.x` 收紧守卫，
+再把 read 放在第一次 `MH()` 收窄之后、第一次 store 之前（仍是循环外，lifetime 更短）；
+仍不行则退回父（2 站点）并记 B。
+
+**若落地且门过（C/D）**：本卡不再加改动；F14 包按 D 记（n12 单点已 INDISTINCT，
+本卡只是在一个 7,498 条指令的 kernel 里再删 7 条），不推广成方向禁令。
+
+## 5. 恢复点 / 复现命令（全部 CPU）
+
+```
+PY=@NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe
+CARD=@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/cards/n12b-f14-scale
+%PY% %CARD%\stage.py              # 头文件 pin + 基线/立即父字节复现 + 候选构建 + validate
+%PY% %CARD%\analyse_spv.py        # statics / NC / 系数读块位置 / 局部 carrier / 归一化 diff
+%PY% %CARD%\make_plan.py          # 链头上 8 行替换 + replaced==8 断言 + cpu-check
+%PY% %CARD%\tools\isa_stats.py    # 只读 ISA 记账（queue/n12-vit-qkv/native/captures）
+%PY% %CARD%\tools\proof_index.py  # 映射/写集/系数/载入次数枚举 -> evidence/INDEX-PROOF.json
+%PY% %CARD%\tools\make_diff.py    # SOURCE-DIFF.patch + round-trip
+%PY% %CARD%\emit_json.py          # BUILD / PROOF / COST-LEDGER / GPU-REQUEST
+%PY% %CARD%\..\..\audit_card.py n12b-f14-scale
+```
+
+## 6. 未决项（按合同自行推断，不停等主代理）
+
+1. 本卡候选**内含 n12 的改动**（删掉它就不是 F14 包成员的合法状态）；因此 cand 臂测的是
+   "n12 + 本卡"两面。两面 native 签名不重叠，可在同一份 ISA 里分别确认；毫秒不可拆。
+2. 动态读次数的单位是"每 (gx,gy,sg,group) 实例一次标量读"；这是按 SPIR-V/源码语义计数，
+   不是按硬件 issue 槽计数。硬件上它是 1-lane send，实际吞吐影响远小于静态条数。
+3. `evidence/ISA-STATS.json` 引用的是 n12 批次的捕获（plan 是当时链头的 rebase 版）；
+   按合同 §8.7 只作方向参照，**新捕获才是权威**。
+4. 128 次无效读（两个 group 都被跳过、系数值 dead）是真实新增成本；它读的是 128 B 只读 buffer，
+   不产生写、不改变数值。若主代理认为不可接受，可按 §4 的保守备选加 `mA<pc.p0.x` 守卫。
+5. V 段 workgroup（n0≥2048，96 里的 32 个）不执行 norm、也不读系数；静态 ISA 无法按
+   workgroup 分解，只能靠整体计时看。
+6. `plan.txt` 的 8 行替换与 `COMMON.rebase_candidate_plan()` 的输出一致（同一链头、同一
+   `spv_sha256_baseline`），主代理直接 `submit_card.py` 即可，不需要我再生成 rebase 版。

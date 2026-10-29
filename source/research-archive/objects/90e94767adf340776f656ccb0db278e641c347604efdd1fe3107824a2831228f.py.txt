@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Build the s37-fnorm diagnostic identities (diagnosis only, never candidates).
+
+parent_diag: D01 parent s37 source + debug dumps of the RAW Q/K rows and the
+per-row half total `sum` (the scalar tree's tot). Everything else verbatim.
+
+s37fn_diag1: s37-fnorm candidate source + debug dumps written from the
+FRAGMENTS: raw Q/K before normalization, per-row chain total, and the
+normalized/scaled Q/K at the parent's existing debug-contract addresses
+(dbg[10240..]/dbg[12288..]). Math untouched.
+
+Debug layout in ioport_70_ioport_body_debug (25088 halfs):
+  [0..127]      tot per row   (Q rows 0..63 at [0..63], K rows at [64..127])
+  [128..2175]   raw Q  (r*32+c)
+  [2176..4223]  raw K  (r*32+c)
+  [10240..12287] normalized Q (parent contract, existing / diag1 fragment-side)
+  [12288..14335] normalized K
+Both diags are gated on pc.p0.z (push[2]); plans set push[2]=1 for pass 151.
+"""
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+WS = Path(r"@NR_WORKSPACE@")
+PARENT_SRC = WS / "candidates/zcode-fp16-four-hotspots-20261020/s37-context-a-v1/source/s37_fold_body_r1a.comp"
+CAND_SRC = WS / "work/zcode-fp16-fullnet-handoff-20261024/candidates/s37-fnorm/source/s37_fold_body_r1a.comp"
+D01_PLAN = WS / "candidates/dsh-fp16-same-family-20261023/combo-d01-d034-s32k11-v1/plan-combo-d01-d034-s32k11-v1.txt"
+SFN_PLAN = WS / "work/zcode-fp16-fullnet-handoff-20261024/candidates/s37-fnorm/plan-s37fnorm-232.txt"
+OUT = WS / "work/zcode-fp16-hotspot-r2-20261024/s37fn-diag"
+COMPILER = WS / "src/project/tools/glslang-16.5.0/bin/glslang.exe"
+VALIDATOR = WS / "candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe"
+INC = PARENT_SRC.parent
+
+# ---- parent stage-5 anchors ----
+P_SQ_LOOP = """        float16_t sq[32];
+        for (uint c = 0u; c < 32u; ++c) {
+            float16_t v = isQ ? NR_Q(t, c) : NR_K(t, c);
+            sq[c] = v * v;
+        }"""
+P_SQ_LOOP_DIAG = """        float16_t sq[32];
+        for (uint c = 0u; c < 32u; ++c) {
+            float16_t v = isQ ? NR_Q(t, c) : NR_K(t, c);
+            sq[c] = v * v;
+            if (debug) {
+                if (isQ) dbg[128u + t * 32u + c] = v;
+                else     dbg[2176u + t * 32u + c] = v;
+            }
+        }"""
+P_SUM = """        float16_t sum = t2[0] + t2[1];"""
+P_SUM_DIAG = """        float16_t sum = t2[0] + t2[1];
+        if (debug) dbg[t + (isQ ? 0u : 64u)] = sum;"""
+
+# ---- candidate norm-block anchors (diag1) ----
+# raw + tot right after the broadcast, before half0/half1 are overwritten
+C_TOT = """            precise float16_t tot[4] = {tq01.x, tq01.y, tq23.x, tq23.y};
+            for (uint ci = 0u; ci < 4u; ++ci) {"""
+C_TOT_DIAG = """            precise float16_t tot[4] = {tq01.x, tq01.y, tq23.x, tq23.y};
+            if (debug) {
+                uint dbase_raw = (region == 0u) ? 128u : 2176u;
+                for (uint ci = 0u; ci < 4u; ++ci) {
+                    uint rr = (lane >> 4u) + 2u * ci;
+                    uint ch = lane & 15u;
+                    dbg[dbase_raw + (m0 + rr) * 32u + ch] = half0[ci];
+                    dbg[dbase_raw + (m0 + rr) * 32u + ch + 16u] = half1[ci];
+                    if ((lane & 15u) == 0u)
+                        dbg[(region == 0u ? 0u : 64u) + m0 + rr] = tot[ci];
+                }
+            }
+            for (uint ci = 0u; ci < 4u; ++ci) {"""
+# normalized writes appended inside the same ci loop, after the scale block
+C_SCALE_TAIL = """                if (region == 0u) {
+                    precise float16_t sc = float16_t(fb[uint(pc.p2.z)]);
+                    half0[ci] = half0[ci] * sc;
+                    half1[ci] = half1[ci] * sc;
+                }
+            }
+        }"""
+C_SCALE_TAIL_DIAG = """                if (region == 0u) {
+                    precise float16_t sc = float16_t(fb[uint(pc.p2.z)]);
+                    half0[ci] = half0[ci] * sc;
+                    half1[ci] = half1[ci] * sc;
+                }
+                if (debug) {
+                    uint dbase_n = (region == 0u) ? 10240u : 12288u;
+                    uint rr = (lane >> 4u) + 2u * ci;
+                    uint ch = lane & 15u;
+                    dbg[dbase_n + (m0 + rr) * 32u + ch] = half0[ci];
+                    dbg[dbase_n + (m0 + rr) * 32u + ch + 16u] = half1[ci];
+                }
+            }
+        }"""
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def compile_one(src_path, out_spv, label):
+    r = subprocess.run([str(COMPILER), "-V", "--target-env", "vulkan1.3",
+                        "-I" + str(INC), "-o", str(out_spv), str(src_path)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"{label} COMPILE FAIL:\n{r.stderr[-2500:]}")
+        sys.exit(1)
+    v = subprocess.run([str(VALIDATOR), str(out_spv)], capture_output=True, text=True)
+    ok = "result=0" in (v.stdout + v.stderr)
+    print(f"{label}: spv={sha(out_spv)[:16]} validate={'OK' if ok else 'FAIL'}")
+    return ok
+
+
+def make_plan(src_plan, dst_plan, spv_path):
+    txt = Path(src_plan).read_text(encoding="utf-8").replace("\r\n", "\n")
+    lines = txt.split("\n")
+    changed = 0
+    for i, ln in enumerate(lines):
+        if ln.startswith("PASS 151 \"s37_fold_body_r1a_v1\""):
+            parts = ln.split()
+            parts[3] = str(spv_path).replace("\\", "/")
+            # push[2] is the 3rd value on the PUSH line that follows this
+            # PASS's PUSH line; flip it after we see it.
+            for j in range(i + 1, min(i + 10, len(lines))):
+                if lines[j].startswith("PUSH "):
+                    w = lines[j].split()
+                    assert len(w) == 33, len(w)  # PUSH + 32 words
+                    w[3] = "1"  # w[0]='PUSH', w[1]=push[0], w[2]=push[1], w[3]=push[2]=debug
+                    lines[j] = " ".join(w)
+                    changed += 1
+                    break
+            lines[i] = " ".join(parts)
+            changed += 1
+    assert changed == 2, changed
+    Path(dst_plan).write_text("\n".join(lines), encoding="utf-8")
+    return sha(dst_plan)
+
+
+def main():
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "source").mkdir(exist_ok=True)
+    (OUT / "spv").mkdir(exist_ok=True)
+    for f in INC.iterdir():
+        if f.suffix in (".comp", ".glsl"):
+            shutil.copy2(f, OUT / "source" / f.name)
+
+    # --- parent_diag ---
+    ptxt = PARENT_SRC.read_text(encoding="utf-8")
+    assert ptxt.count(P_SQ_LOOP) == 1
+    ptxt = ptxt.replace(P_SQ_LOOP, P_SQ_LOOP_DIAG)
+    assert ptxt.count(P_SUM) == 1
+    ptxt = ptxt.replace(P_SUM, P_SUM_DIAG)
+    pd = OUT / "source" / "s37_parent_diag.comp"
+    pd.write_text(ptxt, encoding="utf-8")
+    compile_one(pd, OUT / "spv" / "s37_parent_diag.spv", "parent_diag")
+
+    # --- s37fn_diag1 ---
+    ctxt = CAND_SRC.read_text(encoding="utf-8")
+    assert ctxt.count(C_TOT) == 1, "tot anchor"
+    ctxt = ctxt.replace(C_TOT, C_TOT_DIAG)
+    assert ctxt.count(C_SCALE_TAIL) == 1, "scale anchor"
+    ctxt = ctxt.replace(C_SCALE_TAIL, C_SCALE_TAIL_DIAG)
+    cd = OUT / "source" / "s37fn_diag1.comp"
+    cd.write_text(ctxt, encoding="utf-8")
+    compile_one(cd, OUT / "spv" / "s37fn_diag1.spv", "s37fn_diag1")
+
+    # --- plans (debug on for pass 151 only) ---
+    h1 = make_plan(D01_PLAN, OUT / "plan-parent-diag-232.txt",
+                   OUT / "spv" / "s37_parent_diag.spv")
+    h2 = make_plan(SFN_PLAN, OUT / "plan-s37fn-diag1-232.txt",
+                   OUT / "spv" / "s37fn_diag1.spv")
+    print("plan parent-diag:", h1[:16])
+    print("plan s37fn-diag1:", h2[:16])
+
+    # sanity: diag plans differ from their bases ONLY in the s37 SPV line + push word
+    for base, diag in ((D01_PLAN, OUT / "plan-parent-diag-232.txt"),
+                       (SFN_PLAN, OUT / "plan-s37fn-diag1-232.txt")):
+        a = Path(base).read_text(encoding="utf-8").replace("\r\n", "\n").split("\n")
+        b = Path(diag).read_text(encoding="utf-8").replace("\r\n", "\n").split("\n")
+        assert len(a) == len(b)
+        diffs = [(i, x, y) for i, (x, y) in enumerate(zip(a, b)) if x != y]
+        print(Path(diag).name, "diff lines:", [(i, x.split()[0]) for i, x, y in diffs])
+
+
+if __name__ == "__main__":
+    main()

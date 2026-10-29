@@ -1,0 +1,452 @@
+"""Shared harness for the 2026-10-27 full-backend continuous campaign.
+
+Single source of truth for:
+  - fixed identity paths (workspace, baseline plan, toolchain)
+  - SHA/identity helpers
+  - SPIR-V compile + parent-byte reproduction (glslang + decoration transfer + NoContraction)
+  - plan generation from the current accepted baseline plan (replace one SPV path)
+  - CPU plan check, SPV validation
+  - LUNA manifest generation (gates / native / resources / ordinary) and execution
+
+No GPU work happens here; GPU runs only through execute_manifest.ps1 under the
+unique lock, one job at a time.
+"""
+from pathlib import Path
+import json, hashlib, subprocess, sys, shutil
+
+# ---------------------------------------------------------------- identity
+W = Path('@NR_WORKSPACE@')
+A = W / 'work/codex-astra-fp16-int8-audit-20261024'
+D = A / 'fullnet-mechanism-transfer-20261026'
+C = A / 'fullnet-continuous-20261027'          # campaign root (this directory)
+HANDOFF = Path('@NR_USER_HOME@/Documents/Codex/2026-10-24/nr-fp16-int8-astra-audit-20261024/handoff/dsh-fullnet-20261027')
+
+BASELINE = D / 'f10-weight-return-separation-20261027' / 'plan.txt'
+BASELINE_SHA = 'a024c3c5aa1d1432ab3f0591bf03a897880d86be2c99d6de1e1492a2a7b2befe'
+PRIOR = D / 'f08-register-chain-20261027' / 'plan.txt'
+PRIOR_SHA = 'cc0b6ad72496c8296d9b3ab312367322ff3c617a70cd8d0566b7c7d979d7c116'
+
+GLSLANG = W / 'src/project/tools/glslang-16.5.0/bin/glslang.exe'
+SPV_TOOLS = W / 'build/zcode-fp16-compute-backend-20261021/scripts'
+VALIDATE = W / 'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'
+RUNNER = A / 'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe'
+GTPIN = W / 'tools/gtpin-5.0.0/Profilers/Bin/gtpin.exe'
+NATIVEMAP = A / 'phase-diagnosis-20261025/native-map-build/Release/nativemap.dll'
+ZPROF = W / 'work/zcode-combo1-profile-20261025/build/port_network_driver_profile_zprof.exe'
+LOCK = Path('@NR_GPU_WORKSPACE@/artifacts/parallel-port-20261013/GPU.lock')
+GPU_WS = W
+
+FIXED_GOLD = '1755e9c2fadba97f08cb5b02b7a4294cde3675379bdec75352287505f7e129d6'
+# gates fb2: warm0 / reps2 / feedback / save-frames -> final frame gold
+FB2_GATE_GOLD = '9c3e511e97a5879247bc2965792c96dd62928dddfd85a48bbf25af1e807d3536'
+# ordinary: warm1 / reps30 / feedback -> final frame gold (differs from the gate's)
+ORDINARY_GOLD = '2b63d4ba1967eebcda61698d538963f59bccaf6d690ef8168f1695a46c5d658d'
+FB2_LAST_GOLD = ORDINARY_GOLD
+
+sys.path.insert(0, str(SPV_TOOLS))
+import spv_tools_local as ST
+
+# ---------------------------------------------------------------- helpers
+def read_json(p):
+    return json.loads(Path(p).read_text(encoding='utf-8-sig'))
+
+def write_json(p, obj):
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(obj, indent=2), encoding='utf-8')
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+def ident(p):
+    p = Path(p)
+    return dict(path=str(p), sha256=sha(p))
+
+def run(argv, cwd=None):
+    r = subprocess.run(list(map(str, argv)), capture_output=True, text=True,
+                       encoding='utf-8', errors='replace', cwd=cwd)
+    if r.returncode != 0:
+        raise RuntimeError('command failed: %s\n%s\n%s' % (argv, r.stdout, r.stderr))
+    return r.stdout
+
+# ---------------------------------------------------------------- rows
+def rows():
+    """Authoritative 232 rows of the current accepted baseline plan."""
+    return read_json(HANDOFF / 'CURRENT-232-ROWS.json')
+
+def row_by_ordinal(n):
+    for r in rows():
+        if r['ordinal'] == n:
+            return r
+    raise KeyError(n)
+
+def rows_for_family(fam):
+    return [r for r in rows() if r['family'] == fam]
+
+def unique_shaders(rs=None):
+    """[(spv, source, sha, [ordinals])] deduped by spv sha."""
+    rs = rs if rs is not None else rows()
+    out = {}
+    for r in rs:
+        out.setdefault(r['spv_sha256'], dict(spv=r['spv'], source=r['source'],
+                                             spv_sha256=r['spv_sha256'],
+                                             source_sha256=r['source_sha256'],
+                                             family=r['family'], name=r['name'],
+                                             ordinals=[]))
+        out[r['spv_sha256']]['ordinals'].append(r['ordinal'])
+    return list(out.values())
+
+# ---------------------------------------------------------------- build
+def compile_glsl(comp_path, spv_path, include_dirs=(), defines=()):
+    argv = [GLSLANG, '-V', '--target-env', 'vulkan1.3']
+    for d in defines:
+        argv.append('-D' + str(d))
+    for d in include_dirs:
+        argv.append('-I' + str(d))
+    argv += [comp_path, '-o', spv_path]
+    run(argv)
+    return spv_path
+
+_CENSUS = None
+
+def census():
+    global _CENSUS
+    if _CENSUS is None:
+        _CENSUS = read_json(D / 'CURRENT-CENSUS.json')
+    return _CENSUS
+
+def include_dir_for(ordinal):
+    """Directory that holds the .glsl headers of a site.
+
+    The campaign candidates keep only candidate.comp in their own dir; the
+    headers live next to the historical site source recorded by the census.
+    """
+    try:
+        return Path(census()['rows'][ordinal]['source']).parent
+    except Exception:
+        return Path(row_by_ordinal(ordinal)['source']).parent
+
+_INC_INDEX = None
+
+def include_index():
+    """name -> [dirs] for every .glsl/.h header under the workspace (cached)."""
+    global _INC_INDEX
+    cache = C / 'evidence' / 'GLSL-INDEX.json'
+    if _INC_INDEX is None:
+        if cache.exists():
+            _INC_INDEX = read_json(cache)
+        else:
+            idx = {}
+            for p in W.rglob('*.glsl'):
+                idx.setdefault(p.name, []).append(str(p.parent))
+            for p in W.rglob('*.h'):
+                idx.setdefault(p.name, []).append(str(p.parent))
+            _INC_INDEX = idx
+            write_json(cache, idx)
+    return _INC_INDEX
+
+def include_dirs_for(ordinal, comp_path):
+    """Include dirs for compiling a site: candidate dir, census site dir, then every
+    workspace dir holding a same-named header (reproduction mismatch detects a wrong pick)."""
+    comp_path = Path(comp_path)
+    dirs = [comp_path.parent, include_dir_for(ordinal)]
+    text = comp_path.read_text(encoding='utf-8-sig', errors='replace')
+    names = [l.split('"')[1] for l in text.splitlines() if l.strip().startswith('#include "')]
+    idx = include_index()
+    for n in names:
+        if any((d / n).exists() for d in dirs if d.exists()):
+            continue
+        for d in idx.get(n, []):
+            p = Path(d)
+            if p not in dirs:
+                dirs.append(p)
+    out = []
+    for d in dirs:
+        if d not in out and d.exists():
+            out.append(d)
+    return out
+
+def reproduce_current(ordinal, outdir):
+    """Reproduce the *current baseline* SPV of `ordinal` from its source bytes.
+
+    Tries plain compile, then NoContraction-pattern transfer from the recorded
+    parent (card-local parent-rebuild.spv preferred, else RECIPE-MAP parent).
+    """
+    row = row_by_ordinal(ordinal)
+    outdir = Path(outdir); outdir.mkdir(parents=True, exist_ok=True)
+    src = Path(row['source']); target = Path(row['spv'])
+    raw = outdir / 'raw.spv'
+    compile_glsl(src, raw, include_dirs_for(ordinal, src))
+    res = dict(ordinal=ordinal, family=row['family'], name=row['name'],
+               source=str(src), target=str(target),
+               source_sha256=sha(src), target_sha256=sha(target),
+               raw_sha256=sha(raw), raw_match=sha(raw) == row['spv_sha256'])
+    if res['raw_match']:
+        shutil.copyfile(raw, outdir / 'rebuild.spv')
+        res['recipe'] = 'raw'
+        return res
+    parent = Path(src).parent / 'parent-rebuild.spv'
+    if not parent.exists():
+        rec = read_json(C / 'evidence' / 'RECIPE-MAP.json')['shaders'].get(row['spv_sha256'])
+        parent = Path(rec['recipes'][0]['parent']) if rec and rec['recipes'] else None
+    res['parent'] = str(parent) if parent else None
+    if not parent or not Path(parent).exists():
+        res['recipe'] = 'no-parent'
+        return res
+    pm = ST.Module(Path(parent)); rm = ST.Module(raw)
+    keep, info = ST.transfer_decoration_pattern_aligned(pm, rm, set())
+    fixed = outdir / 'decorated.spv'
+    ST.set_no_contraction(rm, keep, fixed)
+    res['decorated_sha256'] = sha(fixed)
+    res['decorated_match'] = res['decorated_sha256'] == row['spv_sha256']
+    res['nc_count'] = len(keep)
+    res['nc_parent'] = len(ST.no_contraction_ids(pm))
+    res['recipe'] = 'decorated' if res['decorated_match'] else 'no-match'
+    if res['decorated_match']:
+        shutil.copyfile(fixed, outdir / 'rebuild.spv')
+    return res
+
+def reproduce_parent(row, outdir, include_extra=()):
+    """Compile row['source'] and try to reproduce row['spv'] bytes.
+
+    Returns dict with raw_match / decorated_match and the produced files.
+    """
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    src = Path(row['source'])
+    target = Path(row['spv'])
+    incs = [src.parent] + [Path(x) for x in include_extra]
+    raw = outdir / 'rebuild-raw.spv'
+    compile_glsl(src, raw, incs)
+    res = dict(ordinal=row['ordinal'], family=row['family'], name=row['name'],
+               source=str(src), target=str(target),
+               source_sha256=sha(src), target_sha256=sha(target),
+               raw_sha256=sha(raw), raw_match=sha(raw) == row['spv_sha256'])
+    if res['raw_match']:
+        shutil.copyfile(raw, outdir / 'rebuild.spv')
+        return res
+    pm = ST.Module(target)
+    rm = ST.Module(raw)
+    keep, info = ST.transfer_decoration_pattern_aligned(pm, rm, set())
+    fixed = outdir / 'rebuild-decorated.spv'
+    ST.set_no_contraction(rm, keep, fixed)
+    res['decorated_sha256'] = sha(fixed)
+    res['decorated_match'] = sha(fixed) == row['spv_sha256']
+    res['decoration_info'] = {k: info[k] for k in (
+        'functions_mapped', 'child_functions_without_parent_counterpart',
+        'parent_decorations_total', 'child_own_decorations_outside_pattern')}
+    res['nc_count'] = len(keep)
+    if res['decorated_match']:
+        shutil.copyfile(fixed, outdir / 'rebuild.spv')
+    return res
+
+def make_plan(candidate_spv, out_plan, parent_plan=BASELINE, spv_shas=(), expect_passes=True):
+    """Replace the baseline SPV path(s) of one shader group with a candidate SPV.
+
+    `spv_shas` selects which baseline SPV files are replaced (usually one shader
+    group, e.g. all C128 F05 passes).  Default: replace the whole baseline, which
+    is only meaningful for a full-network candidate.
+    """
+    text = Path(parent_plan).read_text(encoding='utf-8-sig')
+    paths = []
+    for r in rows():
+        if spv_shas and r['spv_sha256'] not in spv_shas:
+            continue
+        p = Path(r['spv']).as_posix()
+        if p not in paths:
+            paths.append(p)
+    replaced = 0
+    for p in sorted(paths, key=len, reverse=True):
+        n = text.count(p)
+        if n:
+            text = text.replace(p, Path(candidate_spv).as_posix())
+            replaced += n
+    assert replaced > 0, 'no baseline SPV path found in parent plan'
+    out_plan = Path(out_plan)
+    out_plan.parent.mkdir(parents=True, exist_ok=True)
+    out_plan.write_text(text, encoding='utf-8')
+    if expect_passes:
+        want = len([r for r in rows() if (not spv_shas or r['spv_sha256'] in spv_shas)])
+        assert replaced == want, 'replaced %d passes, expected %d' % (replaced, want)
+    return replaced
+
+def pass_lines_of(plan):
+    """[{ordinal, name, spv, line}] for a plan file (ordinal = index of the PASS line)."""
+    import re as _re
+    out = []
+    for l in Path(plan).read_text(encoding='utf-8-sig').splitlines():
+        if not l.startswith('PASS '):
+            continue
+        q = _re.findall(r'"([^"]*)"', l)
+        name, spv = (q[0], q[1]) if len(q) == 2 else (l.split()[2], l.split()[3])
+        out.append(dict(ordinal=len(out), name=name, spv=spv, line=l))
+    return out
+
+
+def rebase_by_ordinals(card_id, out_plan=None, carry_fields=True):
+    """Rebuild a card's plan on the chain head by replacing the SPV of its PASS ordinals.
+
+    Necessary when the card's parent SPV is itself an adopted candidate (not a handoff
+    row), which is the normal case for follow-up cards such as n09c (parent = n09b's spv).
+    """
+    d = C / 'cards' / card_id
+    req = read_json(d / 'GPU-REQUEST.json')
+    ords = (req.get('shader_group') or {}).get('pass_ordinals') or []
+    assert ords, 'GPU-REQUEST has no shader_group.pass_ordinals'
+    base, base_sha, chain = current_best()
+    raw = Path(base).read_text(encoding='utf-8-sig')
+    lines = raw.splitlines()
+    recs = pass_lines_of(base)
+    assert len(recs) == 232, len(recs)
+    per_ord = None
+    reb = req.get('rebase') or {}
+    if reb.get('mode') == 'per_ordinal':
+        raw_map = req.get('spv_per_ordinal') or {}
+        per_ord = {}
+        for k, v in raw_map.items():
+            spv = v.get('candidate_spv') if isinstance(v, dict) else v
+            assert spv, ('per_ordinal entry without candidate_spv', k)
+            per_ord[int(k)] = Path(spv).as_posix()
+        missing = [o for o in ords if o not in per_ord]
+        assert not missing, ('per_ordinal missing ordinals', missing)
+    cand = (d / 'candidate.spv').as_posix()
+    carried = []
+
+    def _norm(s):
+        return str(s).strip('"').replace('\\', '/').rstrip('/')
+
+    for o in ords:
+        r = recs[o]
+        idx = next((i for i, l in enumerate(lines) if l == r['line']), None)
+        assert idx is not None, ('line not found', o)
+        head_toks = r['line'].split()
+        head_spv = _norm(r['spv'])
+        spv_idx = next((i for i, t in enumerate(head_toks) if _norm(t) == head_spv), None)
+        card_line = None
+        card_spv = None
+        if carry_fields:
+            card_plan = d / 'plan.txt'
+            if card_plan.exists():
+                cp = pass_lines_of(card_plan)
+                if len(cp) == 232:
+                    card_line = cp[o]['line']
+                    card_spv = _norm(cp[o]['spv'])
+        new_toks = list(head_toks)
+        edits = 0
+        if card_line is not None and card_spv is not None:
+            card_toks = card_line.split()
+            if len(card_toks) == len(head_toks):
+                for i, (a, b) in enumerate(zip(head_toks, card_toks)):
+                    if a == b or _norm(b) == card_spv:
+                        continue          # unchanged, or this token is the SPV itself
+                    new_toks[i] = b
+                    edits += 1
+        this_cand = per_ord[o] if per_ord else cand
+        if spv_idx is not None:
+            q = '"' if head_toks[spv_idx].startswith('"') else ''
+            new_toks[spv_idx] = q + this_cand + q
+        elif edits == 0:
+            replaced = r['line'].replace(r['spv'], cand, 1)
+            assert replaced != r['line'], ('spv not replaced', o, r['spv'])
+            lines[idx] = replaced
+            continue
+        else:
+            raise AssertionError(('spv token not located but fields edited', o))
+        lines[idx] = ' '.join(new_toks)
+        carried.append(dict(ordinal=o, edits=edits))
+    out_plan = Path(out_plan) if out_plan else (C / 'queue' / card_id / 'plan-rebased.txt')
+    out_plan.parent.mkdir(parents=True, exist_ok=True)
+    out_plan.write_text('\n'.join(lines) + ('\n' if raw.endswith('\n') else ''), encoding='utf-8')
+    return out_plan, sha(out_plan), len(ords), dict(baseline=str(base), baseline_sha=base_sha,
+                                                    field_carried=carried)
+
+
+def cpu_check(plan):
+    return run([RUNNER, '--plan', plan, '--cpu-check'])
+
+def validate_spv(spv):
+    run([VALIDATE, spv])
+
+# ---------------------------------------------------------------- LUNA jobs
+def gate_job(jid, plan_path, plan_sha, out, mode, candidate):
+    if mode == 'fixed':
+        argv = [RUNNER, '--plan', str(plan_path), '--out', str(out), '--pool',
+                '--warm', '0', '--reps', '1']
+    elif mode == 'fb2':
+        argv = [RUNNER, '--plan', str(plan_path), '--out', str(out), '--pool',
+                '--warm', '0', '--reps', '2', '--feedback', '--save-frames']
+    else:
+        raise ValueError(mode)
+    job = dict(id=jid, candidate=candidate, mode=mode,
+               plan=dict(path=str(plan_path), sha256=plan_sha),
+               argv=[str(x) for x in argv], runner_output=str(out))
+    if mode == 'fixed':
+        job['expected_fixed_frame_out'] = FIXED_GOLD
+        job['expected_frame0'] = FIXED_GOLD
+    else:
+        job['expected_fixed_frame_out'] = FB2_GATE_GOLD
+        job['expected_frame0'] = FIXED_GOLD
+    return job
+
+def native_job(jid, plan_path, plan_sha, out, captures, log, candidate):
+    prof = 'native-' + jid
+    argv = [GTPIN, '-t', str(NATIVEMAP), '--dump_isa', '--profile_dir', prof,
+            '--output_dir', str(captures), '--msg_file', str(log), '--msgon', 'all',
+            '--', RUNNER, '--plan', str(plan_path), '--out', str(out), '--pool',
+            '--warm', '0', '--reps', '1']
+    return dict(id=jid, plan=dict(path=str(plan_path), sha256=plan_sha),
+                argv=[str(x) for x in argv], runner_output=str(out),
+                capture_output=str(Path(captures) / prof),
+                expected_fixed_frame_out=FIXED_GOLD, candidate=candidate)
+
+def resources_job(jid, plan_path, plan_sha, out, candidate, pair=0):
+    argv = [ZPROF, '--plan', str(plan_path), '--out', str(out), '--pool',
+            '--warm', '0', '--reps', '1', '--metrics', 'GpuTime']
+    return dict(id=jid, pair=pair, candidate=candidate,
+                plan=dict(path=str(plan_path), sha256=plan_sha),
+                runner_output=str(out), argv=[str(x) for x in argv],
+                expected_frame_out=FIXED_GOLD, metric_group='resource_only',
+                expected_hardware_passes=1, expected_metrics=['GpuTime'])
+
+def ordinary_job(jid, plan_path, plan_sha, out, candidate, pair, reps=30):
+    argv = [RUNNER, '--plan', str(plan_path), '--out', str(out), '--pool',
+            '--warm', '1', '--reps', str(reps), '--feedback']
+    return dict(id=jid, pair=pair, candidate=candidate,
+                plan=dict(path=str(plan_path), sha256=plan_sha),
+                runner_output=str(out), argv=[str(x) for x in argv],
+                expected_frame_out=FB2_LAST_GOLD)
+
+def write_manifest(path, kind, jobs, identities, output_root, rules):
+    write_json(path, dict(working_directory=str(GPU_WS), output_root=str(output_root),
+                          identities=identities, jobs=jobs, rules=rules))
+    return path
+
+# ---------------------------------------------------------------- accepted chain
+def current_best():
+    """(plan_path, plan_sha, chain) of the newest accepted baseline.
+
+    CURRENT.json is written only after a candidate passed gates + native/resource
+    review + a same-batch ordinary win. The handoff pointer is never modified.
+    """
+    f = C / 'CURRENT.json'
+    if f.exists():
+        d = read_json(f)
+        return Path(d['best_plan']['path']), d['best_plan']['sha256'], d.get('chain', [])
+    return BASELINE, BASELINE_SHA, []
+
+def rebase_candidate_plan(card_id, out_plan=None):
+    """Rewrite a card's plan on top of the newest accepted baseline.
+
+    Only the card's own shader group (GPU-REQUEST.shader_group.spv_sha256_baseline)
+    is replaced, so the candidate keeps every already-accepted change and the
+    measurement isolates this card's delta against the current chain head.
+    """
+    d = C / 'cards' / card_id
+    req = read_json(d / 'GPU-REQUEST.json')
+    shas = set((req.get('shader_group') or {}).get('spv_sha256_baseline') or [])
+    assert shas, 'GPU-REQUEST has no shader_group.spv_sha256_baseline'
+    base, base_sha, _ = current_best()
+    out_plan = Path(out_plan) if out_plan else (C / 'queue' / card_id / 'plan-rebased.txt')
+    out_plan.parent.mkdir(parents=True, exist_ok=True)
+    n = make_plan(d / 'candidate.spv', out_plan, parent_plan=base, spv_shas=shas)
+    return out_plan, sha(out_plan), n, dict(baseline=str(base), baseline_sha=base_sha)

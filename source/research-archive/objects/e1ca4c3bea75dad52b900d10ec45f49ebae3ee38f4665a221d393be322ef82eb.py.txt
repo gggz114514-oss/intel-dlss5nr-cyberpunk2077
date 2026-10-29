@@ -1,0 +1,225 @@
+"""n26-f08-order: minimal read-only SPIR-V scanner (no GPU, no toolchain).
+
+Purpose: produce the instrumentation needed for part A of the card --
+every mechanism that could introduce an order dependence in the F08 l0
+kernel, with a hard SPIR-V witness (or an explicit "absent").
+
+Reports per module:
+  * opcode histogram (numeric, with names for the ones that matter)
+  * every global variable + DescriptorSet/Binding decoration
+  * every OpStore / OpLoad with its root storage object (binding or BuiltIn)
+  * barriers / atomics / group-non-uniform / cooperative-matrix counts
+  * which BuiltIn decorations are actually *read* (OpLoad) vs merely decorated
+"""
+import json
+import struct
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+NAMES = {
+    5: 'OpName', 6: 'OpMemberName', 11: 'OpExtInstImport', 12: 'OpExtInst',
+    15: 'OpTypeVoid', 16: 'OpString', 17: 'OpLine', 19: 'OpTypeInt', 20: 'OpTypeFloat',
+    21: 'OpTypeVector', 22: 'OpTypeMatrix', 23: 'OpTypeImage', 28: 'OpTypeBool',
+    32: 'OpTypePointer', 33: 'OpTypeFunction', 41: 'OpConstantTrue', 42: 'OpConstantFalse',
+    43: 'OpConstant', 44: 'OpConstantComposite', 45: 'OpConstantSampler',
+    48: 'OpSpecConstantOp', 54: 'OpFunction', 55: 'OpFunctionParameter',
+    56: 'OpFunctionEnd', 57: 'OpFunctionCall', 59: 'OpVariable', 61: 'OpLoad',
+    62: 'OpStore', 63: 'OpCopyMemory', 65: 'OpAccessChain',
+    66: 'OpInBoundsAccessChain', 67: 'OpPtrAccessChain', 71: 'OpDecorate',
+    72: 'OpMemberDecorate', 79: 'OpCompositeConstruct', 80: 'OpCompositeExtract',
+    81: 'OpCompositeInsert', 84: 'OpSampledImage', 86: 'OpImageSampleImplicitLod',
+    87: 'OpImageSampleExplicitLod', 99: 'OpImageWrite',
+    124: 'OpBitcast', 126: 'OpSNegate', 128: 'OpIAdd', 129: 'OpFAdd', 130: 'OpISub',
+    131: 'OpFSub', 132: 'OpIMul', 133: 'OpFMul', 134: 'OpUDiv', 135: 'OpSDiv',
+    136: 'OpFDiv', 137: 'OpUMod', 138: 'OpSRem', 139: 'OpSMod',
+    140: 'OpFRem', 141: 'OpFMod', 144: 'OpVectorTimesMatrix',
+    169: 'OpSelect', 194: 'OpShiftRightLogical', 195: 'OpShiftRightArithmetic',
+    196: 'OpShiftLeftLogical', 199: 'OpBitwiseAnd', 200: 'OpBitwiseOr',
+    201: 'OpBitwiseXor', 224: 'OpControlBarrier', 225: 'OpMemoryBarrier',
+    227: 'OpAtomicLoad', 228: 'OpAtomicStore', 229: 'OpAtomicExchange',
+    230: 'OpAtomicCompareExchange', 231: 'OpAtomicCompareExchangeWeak',
+    232: 'OpAtomicIIncrement', 233: 'OpAtomicIDecrement', 234: 'OpAtomicIAdd',
+    235: 'OpAtomicISub', 236: 'OpAtomicSMin', 237: 'OpAtomicUMin', 238: 'OpAtomicSMax',
+    239: 'OpAtomicUMax', 240: 'OpAtomicAnd', 241: 'OpAtomicOr', 242: 'OpAtomicXor',
+    246: 'OpLoopMerge', 247: 'OpSelectionMerge', 248: 'OpLabel', 249: 'OpBranch',
+    250: 'OpBranchConditional', 251: 'OpSwitch', 252: 'OpKill', 253: 'OpReturn',
+    254: 'OpReturnValue', 255: 'OpUnreachable',
+    318: 'OpAtomicFlagTestAndSet', 319: 'OpAtomicFlagClear', 320: 'OpAtomicLoad',
+    321: 'OpAtomicStore',
+    4421: 'OpSubgroupBallotKHR', 4428: 'OpGroupNonUniformBallot',
+    # KHR cooperative-matrix opcodes, calibrated in OPCODE-CALIBRATION.json by
+    # pointer position: 4457 takes the pointer at operand 2 (load), 4458 at
+    # operand 0 (store), 4459 takes three matrix values (mul-add), 4460 is
+    # length.  Do not renumber from memory.
+    4457: 'OpCooperativeMatrixLoadKHR', 4458: 'OpCooperativeMatrixStoreKHR',
+    4459: 'OpCooperativeMatrixMulAddKHR', 4460: 'OpCooperativeMatrixLengthKHR',
+    4445: 'OpGroupNonUniformQuadBroadcast',
+}
+
+# SPIR-V BuiltIn decoration values (subset that matters here)
+BUILTINS = {
+    # Only the three values that actually occur in the F08 module are labelled;
+    # they were read back from glslang's own OpName decorations, not guessed.
+    26: 'WorkgroupId(gl_WorkGroupID)', 40: 'SubgroupId(gl_SubgroupID)',
+    41: 'SubgroupLocalInvocationId(gl_SubgroupInvocationID)',
+}
+STORAGE = {0: 'UniformConstant', 1: 'Input', 2: 'Uniform', 3: 'Output',
+           4: 'Workgroup', 5: 'CrossWorkgroup', 6: 'Private', 7: 'Function',
+           8: 'Generic', 9: 'PushConstant', 10: 'AtomicCounter',
+           11: 'Image', 12: 'StorageBuffer'}
+DECOR = {11: 'BuiltIn', 33: 'Binding', 34: 'DescriptorSet', 42: 'NoContraction',
+         1: 'Block', 3: 'RowMajor', 4: 'ColMajor'}
+
+ATOMICS = set(range(227, 241)) | {318, 319, 320, 321}
+BARRIERS = {224: 'OpControlBarrier', 225: 'OpMemoryBarrier'}
+GROUPNU = {op for op in range(333, 367)} | {4421, 4428, 4445}
+
+
+class Module:
+    def __init__(self, path):
+        self.path = str(path)
+        data = Path(path).read_bytes()
+        self.word_count = len(data) // 4
+        self.words = list(struct.unpack('<%dI' % (len(data) // 4), data))
+        assert self.words[0] == 0x07230203, path
+        self.bound = self.words[3]
+        self.ins = []            # (opcode, operands, index, wordcount)
+        i = 5
+        while i < len(self.words):
+            w = self.words[i]
+            op, count = w & 0xFFFF, w >> 16
+            self.ins.append((op, self.words[i + 1:i + count], i, count))
+            i += count
+        self.hist = {}
+        for op, _, _, _ in self.ins:
+            self.hist[op] = self.hist.get(op, 0) + 1
+        # result id -> (opcode, operands)
+        self.rid = {}
+        for op, ops, _, _ in self.ins:
+            if not ops:
+                continue
+            if op in (5, 6, 16, 17):
+                continue
+            # for most instructions the result id is operand 1 (operand 0 = type)
+            if op in (32, 33):           # types: result is operand 0
+                self.rid[ops[0]] = (op, ops)
+            elif op in (54, 248, 59, 11, 19, 20, 21, 28, 43, 41, 42, 44):
+                self.rid[ops[0]] = (op, ops)
+            elif len(ops) >= 2:
+                self.rid[ops[1]] = (op, ops)
+        # decorations
+        self.bind = {}      # id -> (set, binding)
+        self.builtin = {}   # id -> builtin
+        self.storage = {}   # id -> storage class (variables)
+        self.var_type = {}
+        self.names = {}
+        self.decor_all = {}  # id -> list of (decoration, ops)
+        for op, ops, _, _ in self.ins:
+            if op == 5 and len(ops) >= 2:
+                self.names[ops[0]] = self._str(ops[1:])
+            elif op == 71 and len(ops) >= 2:
+                tgt, dec = ops[0], ops[1]
+                self.decor_all.setdefault(tgt, []).append((dec, ops[2:]))
+                if dec == 11 and len(ops) >= 3:
+                    self.builtin[tgt] = ops[2]
+                elif dec == 33 and len(ops) >= 3:
+                    self.bind.setdefault(tgt, [None, None])[1] = ops[2]
+                elif dec == 34 and len(ops) >= 3:
+                    self.bind.setdefault(tgt, [None, None])[0] = ops[2]
+            elif op == 59 and len(ops) >= 3:
+                self.storage[ops[1]] = ops[2]
+
+    def _str(self, words):
+        b = b''
+        for w in words:
+            b += struct.pack('<I', w)
+        return b.split(b'\0')[0].decode('utf-8', 'replace')
+
+    def root(self, ptr_id, depth=0):
+        """Walk OpAccessChain / OpLoad pointers back to the root id."""
+        if depth > 32:
+            return None
+        node = self.rid.get(ptr_id)
+        if node is None:
+            return ptr_id
+        op, ops = node
+        if op in (65, 66, 67):
+            return self.root(ops[2], depth + 1)       # base pointer
+        if op == 61:                                   # OpLoad of a pointer value
+            return self.root(ops[1], depth + 1)
+        return ptr_id
+
+    def obj_of(self, ptr_id):
+        r = self.root(ptr_id)
+        if r in self.storage:
+            s = self.storage[r]
+            b = self.bind.get(r, [None, None])
+            bi = self.builtin.get(r)
+            return {'kind': 'variable', 'id': r, 'name': self.names.get(r, ''),
+                    'storage': STORAGE.get(s, str(s)), 'set': b[0], 'binding': b[1],
+                    'builtin': BUILTINS.get(bi, bi) if bi is not None else None}
+        return {'kind': 'other', 'id': r}
+
+    def access_log(self):
+        stores, loads = [], []
+        for op, ops, idx, cnt in self.ins:
+            if op == 62:      # OpStore ptr value
+                stores.append(self.obj_of(ops[0]))
+            elif op == 61:    # OpLoad type result ptr
+                loads.append(self.obj_of(ops[2] if len(ops) > 2 else ops[-1]))
+        return stores, loads
+
+
+def scan(path):
+    m = Module(path)
+    stores, loads = m.access_log()
+    hist = {NAMES.get(k, 'Op#%d' % k): v for k, v in sorted(m.hist.items())}
+
+    def agg(entries):
+        out = {}
+        for e in entries:
+            key = (e['kind'], e.get('name'), e.get('storage'), e.get('set'),
+                   e.get('binding'), e.get('builtin'))
+            out[str(key)] = out.get(str(key), 0) + 1
+        return out
+
+    info = {
+        'path': m.path,
+        'words': m.word_count,
+        'instructions': len(m.ins),
+        'id_bound': m.bound,
+        'histogram': hist,
+        'atomics': {NAMES.get(op, 'Op#%d' % op): n for op, n in m.hist.items() if op in ATOMICS},
+        'barriers': {NAMES.get(op, 'Op#%d' % op): n for op, n in m.hist.items() if op in BARRIERS},
+        'group_non_uniform': {NAMES.get(op, 'Op#%d' % op): n for op, n in m.hist.items() if op in GROUPNU},
+        'cooperative_matrix': {NAMES.get(op, 'Op#%d' % op): n for op, n in m.hist.items() if 4450 <= op <= 4460},
+        'variables': [
+            {'id': vid, 'name': m.names.get(vid, ''), 'storage': STORAGE.get(sc, sc),
+             'set': m.bind.get(vid, [None, None])[0], 'binding': m.bind.get(vid, [None, None])[1],
+             'builtin': BUILTINS.get(m.builtin.get(vid), m.builtin.get(vid))}
+            for vid, sc in sorted(m.storage.items())
+        ],
+        'stores_by_object': agg(stores),
+        'loads_by_object': agg(loads),
+        'store_count': len(stores),
+        'load_count': len(loads),
+        'builtin_decorated_but_not_read': sorted(
+            BUILTINS.get(b, b) for b in set(m.builtin.values())
+            if not any(l.get('builtin') == BUILTINS.get(b, b) for l in loads)),
+    }
+    return info
+
+
+def main(argv):
+    out = {}
+    for p in argv[1:]:
+        out[Path(p).name] = scan(p)
+    print(json.dumps(out, indent=1, sort_keys=False))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
+

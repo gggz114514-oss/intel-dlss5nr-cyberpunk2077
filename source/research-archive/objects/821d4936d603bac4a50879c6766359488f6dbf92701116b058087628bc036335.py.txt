@@ -1,0 +1,90 @@
+from pathlib import Path
+import json,hashlib,struct,itertools,subprocess,random
+D=Path(__file__).resolve().parent;A=D.parent;B=A.parent.parent;P=A/'c32-boundary-followup-20261026/f20-pixel-owner'
+(D/'run').mkdir(exist_ok=True);(D/'execution').mkdir(exist_ok=True)
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+save=lambda p,x:p.write_text(json.dumps(x,indent=2),encoding='utf-8')
+assert sha(P/'plan.txt')=='ce550e7ccbed7e452068cec4ebcc913f177d0af90a0bf094ffc419a3c4bbabb0'
+f32=lambda x:struct.unpack('<f',struct.pack('<f',x))[0]
+cases=[]
+for pos in [(0,1,2),(0,7,15),(14,15,16),(15,16,17),(0,16,31),(28,29,31)]:
+ for perm in itertools.permutations([0,1,2]):
+  av=[0.0]*32;bv=[0.0]*32
+  for index,t in zip(pos,perm):av[index]=[1.,2**-13,-1.][t];bv[index]=[1.,2**-13,1.][t]
+  cases.append(dict(kind='cancellation',positions=pos,permutation=perm,a=av,b=bv))
+rawA=[];rawB=[];expected=[]
+for case in cases:
+ aa=[x*2.**(row-3) for row in range(8) for x in case['a']]
+ bb=[case['b'][k]*2.**(col-1) if col<4 else 0. for k in range(32) for col in range(16)]
+ rawA+=aa;rawB+=bb
+ for row in range(8):
+  for col in range(16):
+   acc=0.
+   for k in range(32):acc=f32(acc+f32(aa[row*32+k]*bb[k*16+col]))
+   expected.append(acc)
+(D/'input-a.bin').write_bytes(struct.pack('<%de'%len(rawA),*rawA));(D/'input-b.bin').write_bytes(struct.pack('<%de'%len(rawB),*rawB));(D/'ordered-reference.bin').write_bytes(struct.pack('<%df'%len(expected),*expected))
+s='''#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x=32) in;
+layout(set=0,binding=0,std430) readonly buffer AB {float16_t av[];};
+layout(set=0,binding=1,std430) readonly buffer BB {float16_t bv[];};
+layout(set=0,binding=2,std430) buffer OB {float result[];};
+#define MA coopmat<float16_t,gl_ScopeSubgroup,8,16,gl_MatrixUseA>
+#define MB coopmat<float16_t,gl_ScopeSubgroup,16,16,gl_MatrixUseB>
+#define MC coopmat<float,gl_ScopeSubgroup,8,16,gl_MatrixUseAccumulator>
+void main(){
+ uint test=gl_WorkGroupID.x,ab=test*256u,bb=test*512u,ob=test*256u;
+ MC acc=MC(0.0);
+ for(uint k=0;k<32u;k+=16u){
+  MA a;MB b;
+  coopMatLoad(a,av,ab+k,32u,gl_CooperativeMatrixLayoutRowMajor);
+  coopMatLoad(b,bv,bb+k*16u,16u,gl_CooperativeMatrixLayoutRowMajor);
+  acc=coopMatMulAdd(a,b,acc);
+ }
+ coopMatStore(acc,result,ob,16u,gl_CooperativeMatrixLayoutRowMajor);
+ for(uint e=gl_LocalInvocationID.x;e<128u;e+=32u){
+  uint row=e/16u,col=e%16u;
+  precise float sum=0.0;
+  for(uint k=0;k<32u;++k){
+   precise float product=float(av[ab+row*32u+k])*float(bv[bb+k*16u+col]);
+   sum=sum+product;
+  }
+  result[ob+128u+e]=sum;
+ }
+}
+'''
+(D/'rounding-probe.comp').write_text(s,encoding='utf-8');spv=D/'rounding-probe.spv'
+compiler=B/'src/project/tools/glslang-16.5.0/bin/glslang.exe';validator=B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+buildlog=run([compiler,'-V','--target-env','vulkan1.3',D/'rounding-probe.comp','-o',spv])+run([validator,spv]);(D/'build.log').write_text(buildlog,encoding='utf-8')
+n=len(cases);size=n*256*4
+plan=D/'plan.txt';plan.write_text(f'''PORT_NETWORK_1 1 3 1 1
+BUFFER "A" {len(rawA)*2} "{(D/'input-a.bin').as_posix()}"
+BUFFER "B" {len(rawB)*2} "{(D/'input-b.bin').as_posix()}"
+BUFFER "comparison" {size} "-"
+PASS 0 "ordered-vs-two-K16-rounding" "{spv.as_posix()}" 32 0 3 0 {n} 1 1
+BIND 0 0 0 {len(rawA)*2}
+BIND 1 1 0 {len(rawB)*2}
+BIND 2 2 0 {size}
+PUSH
+OUTPUT 2 raw "comparison.bin"
+''',encoding='utf-8')
+exe=B/'candidates/register-handoff-20261016/fragment-map/runner-002/g0_probe_runner.exe';cpu=run([exe,'--plan',plan,'--cpu-check'])
+# Scope proof: all64 rows and4 outputs, exactly one owner; baseline crossSG ownership cannot shuffle.
+mapping=[]
+for sg in range(8):
+ elements={(sg*8+2*j+lane//16,lane%16+16*h) for lane in range(32) for j in range(4) for h in range(2)}
+ assert elements=={(r,c) for r in range(sg*8,sg*8+8) for c in range(32)}
+ mapping.append(dict(producer_sg=sg,rows=list(range(sg*8,sg*8+8)),baseline_consumer_sg=sg//4))
+save(D/'PROOF.json',dict(baseline_sha256=sha(P/'plan.txt'),mapping=mapping,arithmetic_cases=cases,cpu_check=cpu,purpose='Arithmetic proof only, not fusion optimization/performance. Same half A/B products, C=f32. Scalar GPU NoContraction compared to CPU sequential float32; matrix compared independently. 12 padded output columns zero. No original network changed.',owner_constraint='8 producer SG each8rows vs2 consumers each32rows. Registers cannot cross existing subgroup boundary. Keeping8SG direct consumption requires4x weight-set consumers unless sharing through another memory handoff. Keeping2SG requires moving upstream ownership; PV/score register state currently8SG.'))
+ident=lambda p:dict(path=str(p),sha256=sha(p))
+dest=D/'run/rounding';save(D/'LUNA-ROUNDING.json',dict(working_directory=str(B),output_root=str(D/'execution'),identities=[ident(x) for x in [exe,spv,D/'input-a.bin',D/'input-b.bin']],jobs=[dict(id='rounding',plan=ident(plan),argv=[str(exe),'--plan',str(plan),'--out',str(dest),'--warm','0','--reps','1'],runner_output=str(dest))],rules=['Arithmetic experiment only; no frame gold. Require normal receipt,1pass and comparison.bin; main compares GPU scalar/matrix to CPU bits. Exclusive GPU lock, serial, no retries.']))
+wrapper=(A/'f20-tail-diagnosis-20261026/execute-pilot.ps1').read_text(encoding='utf-8-sig')
+wrapper=wrapper.replace('LUNA-F20-TAIL-PC-20261026','LUNA-F20-FUSION-ROUNDING-20261026').replace('Main authorized frozen native-PC pilot; fixed warm1/reps10','Main authorized one arithmetic proof dispatch, no optimization')
+wrapper=wrapper.replace("$frameGood=($fh -eq $job.expected_fixed_frame_out)","$frameGood=(Test-Path (Join-Path $out 'comparison.bin'))")
+wrapper=wrapper.replace('frame_out missing or not gold','comparison.bin missing').replace('frame_matches_gold=','comparison_present=').replace('gold_frame=','comparison_present=')
+(D/'execute-rounding.ps1').write_text(wrapper,encoding='utf-8')
+print('CPU_READY',n,'cases;',cpu.strip())

@@ -1,0 +1,61 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,shlex
+import numpy as np
+R=Path(__file__).resolve().parent;A=R.parent;B=A.parents[1];P=R/'f20-score-owner';T=R/'f20-den-late-approx';N=R/'f20-baked-exp-approx';N.mkdir(exist_ok=True)
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+ return r.stdout
+plantext=(P/'plan.txt').read_text();bufferlines=[l for l in plantext.splitlines() if l.startswith('BUFFER ')];line=bufferlines[481];bp=Path(shlex.split(line)[3]);data=bp.read_bytes();assert len(data)==16400
+arr=np.frombuffer(data,dtype='<f4');assert np.isfinite(arr).all()
+# f32 inputs times exactly represented dyadic coefficient fit in binary64;
+# round the baked result once to f32. Remaining four floats are unchanged.
+baked=(arr[:4096].astype(np.float64)*0.044921875+1.30078125).astype('<f4')
+pack=N/'baked_aux.f32.bin';pack.write_bytes(baked.tobytes()+data[16384:]);assert pack.read_bytes()[16384:]==data[16384:]
+assert [l for l in plantext.splitlines() if l.startswith('BIND ') and shlex.split(l)[2]=='481']==['BIND 1 481 0 16400']
+s=(P/'candidate.comp').read_text(encoding='utf-8-sig');pos=s.index('// token coordinates')
+s=s[:pos]+'''// APPROXIMATION: offline bias FMA; removes bias add and incoming-logit half rounding.
+float16_t nr_exp_baked(float score, float baked_bias) {
+    float16_t y=clamp(float16_t(fma(score,0.044921875,baked_bias)),
+                        float16_t(1.03125),float16_t(1.5693359375));
+    uint h=packHalf2x16(vec2(float(y),0.0)) & 0xffffu;
+    return float16_t(unpackHalf2x16((h & 0x03ffu)<<5u).x);
+}
+
+'''+s[pos:]
+for i in [0,1]:
+ old=f'''            for (int component = 0; component < acc{i}.length(); ++component) {{
+                precise float biased = acc{i}[component] + bias[component];
+                acc{i}[component] = biased;
+            }}
+            MAT_H half_score = MAT_H(acc{i});
+            for (int component = 0; component < half_score.length(); ++component)
+                half_score[component] = nr_exp_h(half_score[component]);'''
+ new=f'''            MAT_H half_score = MAT_H(float16_t(0.0));
+            for (int component = 0; component < half_score.length(); ++component)
+                half_score[component] = nr_exp_baked(acc{i}[component],bias[component]);'''
+ assert s.count(old)==1;s=s.replace(old,new)
+src=N/'candidate.comp';spv=N/'candidate.spv';src.write_text(s)
+run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv])
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+pm=ST.Module(P/'candidate.spv');cm=ST.Module(spv)
+ids=pm.id_to_instruction();removed=[]
+for rid in ST.no_contraction_ids(pm):
+ op,args=ids[rid]
+ if op==129 and ids[args[0]]==(22,[args[0],32]):removed.append(rid)
+assert removed==[1634,1718]  # Only scalar f32 bias adds; fold/scale are f16vec2.
+pattern=N/'parent-decoration-pattern-only.spv'
+ST.set_no_contraction(pm,set(ST.no_contraction_ids(pm))-set(removed),pattern)
+keep,info=ST.transfer_decoration_pattern_aligned(ST.Module(pattern),cm,[])
+assert len(keep)==5,(keep,info);ST.set_no_contraction(cm,set(keep),spv)
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+pt=plantext.replace((P/'candidate.spv').as_posix(),spv.as_posix());pt=pt.replace(line,f'BUFFER "ioport_70_ioport_body_aux" 16400 "{pack.as_posix()}"');plan=N/'plan.txt';plan.write_text(pt)
+quality=json.loads((T/'LUNA-QUALITY.json').read_text().replace('f20-den-late-approx','f20-baked-exp-approx'));quality['jobs']=[j for j in quality['jobs'] if j['candidate']=='candidate'];quality['jobs'][0]['plan']=ident(plan);quality['identities']=[v for v in quality['identities'] if not v['path'].endswith('.spv')]+[ident(spv),ident(pack)]
+quality['parent_reference_data']=str(T/'run/quality-parent');quality['rules']=['One approximation measurement warm0/reps16 feedback save-frames; compare candidate to existing latest-score-owner parent quality frames, not gold. Check bytes/finite/232passes/normal_close. Unique lock serial, errors stop, no repeats.']
+(N/'LUNA-QUALITY.json').write_text(json.dumps(quality,indent=2))
+native=json.loads((T/'LUNA-NATIVE.json').read_text().replace('f20-den-late-approx','f20-baked-exp-approx'));native['jobs'][0]['plan']=ident(plan);native['identities']=[v for v in native['identities'] if not v['path'].endswith('.spv')]+[ident(spv),ident(pack)];(N/'LUNA-NATIVE.json').write_text(json.dumps(native,indent=2))
+runner=Path(quality['identities'][0]['path'])
+(N/'CANDIDATE.json').write_text(json.dumps(dict(source=ident(src),spv=ident(spv),pack=ident(pack),pack_parent=ident(bp),plan=ident(plan),parent=ident(P/'plan.txt'),cpu=run([runner,'--plan',plan,'--cpu-check']),approximation='F32 FMA(score,a,baked_bias) then half, instead of H(score+bias) then half FMA(a,b). Den remains exact parent. No probability clamp removed.',NC_count=5,NC_removed='Only the two bias add sites that no longer exist',alignment=info,scope='4096 bias floats changed in resource481, only F20 binds it. Head scale/trailing16B identical. Weight matrices and all other resources unchanged.'),indent=2))
+review=(T/'review_quality.py').read_text();review=review.replace("paths=[N/'run'/('quality-'+arm)/f'frame_{i}.bin' for arm in ['parent','candidate']]","paths=[N.parent/'f20-den-late-approx/run/quality-parent'/f'frame_{i}.bin',N/'run/quality-candidate'/f'frame_{i}.bin']")
+(N/'review_quality.py').write_text(review)
+print(ident(spv))

@@ -1,0 +1,67 @@
+"""Basis test: which computed quantity actually spans the GPU contract output?"""
+import sys
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+info = L.block_bindings(L.D / "c32-minmax/local-b4.txt", ordinal=4)
+x_flat = np.fromfile(info["input"], dtype="<f2")
+gpu = np.fromfile(L.D / "c32-minmax/local-b4/replayed-network.bin", dtype="<f2")
+wb = np.fromfile(info["wb"], dtype="<f2")
+we, wc = L.load_w8(info["w8"])
+fsc = L.load_fsc(info["fsc"])
+rs = wb[info["rs_base"] + 8:info["rs_base"] + 40].astype(np.float16)
+
+rng = np.random.default_rng(5)
+tiles = np.sort(rng.choice(168 * 96, size=600, replace=False))
+TT, CC = np.meshgrid(tiles, np.arange(16), indexing="ij")
+TT = TT.ravel(); CC = CC.ravel()
+base = TT * 512 + CC * 16
+ref = np.empty((32, TT.size), np.float16)
+for c in range(32):
+    off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+    ref[c] = gpu[base + off]
+ref = ref.astype(np.float64)
+x = L.gather(x_flat, TT, CC)
+seed = L.widen(L.to_half(x * rs[:, None]))
+xq = L.code8_ch(x, np.full(32, np.float32(fsc[1])))
+acc = np.rint(we.astype(np.float64) @ xq.astype(np.float64)).astype(np.int32)
+e_pre = acc.astype(np.float32) * fsc[4:132][:, None]
+a_h = L.act_h(L.to_half(e_pre))
+eq = L.code8_ch(a_h, np.full(128, np.float32(fsc[3])))
+
+
+def fit(basis, target, label):
+    B = np.vstack(basis).astype(np.float64)
+    A, *_ = np.linalg.lstsq(B.T, target.T, rcond=None)
+    r = float(np.linalg.norm(target.T - B.T @ A) / np.linalg.norm(target))
+    print(f"  {label:34s} rank<={B.shape[0]:4d}  resid={r:.5f}")
+    return r
+
+
+print("objective = Y_gpu - seed  (contract only)")
+tgt = ref - seed
+fit([eq], tgt, "eq = act(E_pre) int8 codes (128)")
+fit([L.widen(a_h)], tgt, "act(E_pre) float (128)")
+fit([e_pre], tgt, "E_pre float (128)")
+fit([x], tgt, "X half (32)")
+fit([e_pre, x], tgt, "E_pre + X (160)")
+fit([eq, x], tgt, "eq + X (160)")
+print("objective = Y_gpu")
+fit([eq, seed], ref, "eq + seed (160)")
+fit([eq, x, seed], ref, "eq + X + seed (192)")
+print("objective = Y_gpu - 0 (seed inside)")
+fit([eq], ref, "eq only vs Y (128)")
+print("teacher cross-check: objective = teacher - seed")
+teach = np.empty((32, TT.size), np.float16)
+tflat = np.fromfile(L.D / "dump-fp16/dump_skip4.bin", dtype="<f2")
+for c in range(32):
+    off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+    teach[c] = tflat[base + off]
+teach = teach.astype(np.float64)
+fit([e_pre], teach - seed, "E_pre float (128)")
+fit([x], teach - seed, "X half (32)")
+print("norms: |Y_gpu|=%.3f |seed|=%.3f |contract_target|=%.3f" %
+      (np.linalg.norm(ref), np.linalg.norm(seed), np.linalg.norm(tgt)))

@@ -1,0 +1,300 @@
+"""n37-f10-arena-shrink: static address audit of every shared-memory access.
+
+This is the gate n36 had to add after its E-class failure, adapted to F10.  F10 has no
+per-head section stride, so the equivalent failure mode has the same shape but different
+literals: the arena length, the three plane bases and the two staging-window bases are
+independent constants that must move together.  If one keeps its old value the access does
+**not** fault, it silently reads a different plane -- Workgroup bytes, spv_validate, parent
+byte reproduction, coopmat/NC multisets all stay green and only the gold frame goes red.
+
+Checks per arm, on every `smem[...]` and every `coopMat*(...,smem,OFFSET,...)` site:
+  I1  resolved plane bases Q = QKV_OFF+QBASE, K = +KBASE, V = +VBASE equal the independent
+      geometry model and are pairwise disjoint inside the arena
+  I2  the *raw* plane literal of every handoff store equals the declared macro (the V store
+      hard-codes `+4096u` instead of VBASE, which is exactly n36's bug shape), and no other
+      literal >= 1024 inside an offset expression falls outside that family's allowed set
+  I3  the staging window pair: `uint abase=INIT` and `abase=INIT-abase` agree, the pair is
+      {INIT, 0} with INIT == one full staged slice, and the windows fit the arena
+  I4  per-family maximum half index (computed from the raw literal, not from the macro) is
+      < declared length, and max+1 == declared length (tight: no slack, no overshoot)
+  I5  family completeness (16 staging stores, 2 staging A loads, 2 Q scalars, 2 K scalars,
+      1 echo, 2 Q^T loads, 2 K loads, 16 PV loads, 2 QKV store branches) and the dead
+      SCORE_SIDE macro is still definition-only (it would address a P window at base 0,
+      i.e. inside Q in the candidate -- it must never be expanded)
+  I6  the compiled module agrees with the source: exactly one Workgroup variable and
+      Workgroup bytes == 2 * declared length
+  I7  the handoff address function is unchanged between the arms modulo one constant shift
+      (the same (token, channel) / (dim, key) lands in the same slot of the same plane)
+
+Exit 0 only when I1..I7 hold.  Writes build/addr-audit.json.  _audit_negcontrol.py proves
+the gate fails on five doctored variants.
+"""
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST          # noqa: E402
+
+CARD = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(CARD))
+import _lifetime as L                 # noqa: E402  (the independent geometry model)
+
+ARMS = {
+    'parent': dict(source=CARD.parent / 'n10-f10-next/candidate.comp',
+                   spv=CARD / 'parent-rebuild.spv'),
+    'candidate': dict(source=CARD / 'candidate.comp', spv=CARD / 'candidate.spv'),
+}
+
+DEF = re.compile(r'#define\s+(QKV_OFF|QBASE|KBASE|VBASE|STAGE_OFF)\s+(\d+)u')
+ARENA = re.compile(r'shared\s+float16_t\s+smem\[(\d+)\]')
+
+
+def sha(p):
+    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+
+
+def split_args(s):
+    """Top-level comma split of a call argument list."""
+    depth, cur, out = 0, '', []
+    for ch in s:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            out.append(cur)
+            cur = ''
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur)
+    return out
+
+
+def offset_expr(line):
+    """The address expression of the first shared-memory access on this line."""
+    m = re.search(r'coopMat(?:Load|Store)\s*\(', line)
+    if m:
+        depth, i = 1, m.end()
+        while i < len(line) and depth:
+            if line[i] == '(':
+                depth += 1
+            elif line[i] == ')':
+                depth -= 1
+            i += 1
+        args = split_args(line[m.end():i - 1])
+        for j, a in enumerate(args):
+            if re.fullmatch(r'\s*smem\s*', a):
+                return args[j + 1]
+        return None
+    m = re.search(r'smem\[([^\]]*)\]', line)
+    return m.group(1) if m else None
+
+
+def parse(text):
+    consts = {k: int(v) for k, v in DEF.findall(text)}
+    m = ARENA.search(text)
+    assert m, 'no shared smem[] declaration'
+    consts['SMEM'] = int(m.group(1))
+    return consts
+
+
+def families():
+    """One record per access family.
+
+    base      which resolved address the family starts from ('Q'/'K'/'V'/'ECHO'/'WINMAX')
+    maxoff    footprint maximum, from the layout formula (independent of the source text)
+    pattern   how the site is found in the source
+    expect    expected number of source sites
+    allowed   literals >= 1024 that may legitimately appear in the offset expression
+    handoff   name of the macro the *raw* plane literal must equal (or None)
+    """
+    return [
+        dict(label='staging store (16 per thread per slice)', base='WINMAX',
+             maxoff=L.SLICE - 1, pattern=r'#define STAGE\(A,V,O\)', expect=1,
+             allowed=[0, 4096], handoff=None),
+        dict(label='staging A load a0/a1', base='WINMAX', maxoff=L.SLICE - 1,
+             pattern=r'coopMatLoad\(a[01],smem,abase\+', expect=2, allowed=[128],
+             handoff=None),
+        dict(label='Q scalar (norm in place)', base='Q', maxoff=L.PLANE - 1,
+             pattern=r'#define Q\(E\)', expect=1, allowed=[], handoff=None),
+        dict(label='K scalar (norm in place)', base='K', maxoff=L.PLANE - 1,
+             pattern=r'#define K\(E\)', expect=1, allowed=[], handoff=None),
+        dict(label='debug raw echo (v_raw over 6144 half)', base='ECHO', maxoff=6142,
+             pattern=r'float\(smem\[QKV_OFF\+v_raw', expect=1, allowed=[], handoff=None),
+        dict(label='score Q^T B operand bq0/bq1', base='Q',
+             maxoff=48 * 32 + 16 + 15 * 32 + 15, pattern=r'coopMatLoad\(bq[01],smem,',
+             expect=2, allowed=[32, 16], handoff=None),
+        dict(label='score K A operand (8 blocks x 2)', base='K',
+             maxoff=56 * 32 + 16 + 7 * 32 + 15, pattern=r'coopMatLoad\(a,smem,QKV_OFF\+KBASE',
+             expect=2, allowed=[32, 16], handoff=None),
+        dict(label='PV V^T A operand (4 x 4 sites)', base='V',
+             maxoff=24 * 64 + 48 + 7 * 64 + 15, pattern=r'coopMatLoad\(a,smem,QKV_OFF\+VBASE',
+             expect=16, allowed=[64, 48, 32, 16, 8], handoff=None),
+        dict(label='STORE_QKV Q/K branch', base='K',
+             maxoff=56 * 32 + 16 + 7 * 32 + 15,
+             pattern=r'coopMatStore\(value,smem,QKV_OFF\+\(column/32u\)', expect=1,
+             allowed=[2048, 64, 32], handoff='KBASE'),
+        dict(label='STORE_QKV V branch', base='V', maxoff=16 * 64 + 56 + 15 * 64 + 7,
+             pattern=r'coopMatStore\(value,smem,QKV_OFF\+(\d+)u\+\(column-64u\)', expect=1,
+             allowed=[4096, 64], handoff='VBASE'),
+    ]
+
+
+def resolve_init(text, c):
+    m = re.search(r'uint abase\s*=\s*([A-Za-z_0-9]+)\s*;', text)
+    assert m, 'no `uint abase=` initialiser'
+    tok = m.group(1)
+    return c[tok] if tok in c else int(tok.rstrip('u'))
+
+
+def audit(arm, source=None, spv=None, model_key=None):
+    """Audit one arm.  `source`/`spv`/`model_key` exist so the negative-control script can
+    push a doctored source through exactly the same checks."""
+    src = pathlib.Path(source) if source else ARMS[arm]['source']
+    spvp = pathlib.Path(spv) if spv else ARMS[arm]['spv']
+    text = src.read_text(encoding='utf-8')
+    lines = text.splitlines()
+    c = parse(text)
+    q, k, v = (c['QKV_OFF'] + c['QBASE'], c['QKV_OFF'] + c['KBASE'],
+               c['QKV_OFF'] + c['VBASE'])
+    init = resolve_init(text, c)
+    win = sorted({init, 0})
+    base_of = dict(Q=q, K=k, V=v, ECHO=c['QKV_OFF'], WINMAX=max(win))
+    bad, rows = [], []
+
+    # I1 ------------------------------------------------------------------
+    model = L.ARMS[model_key or arm]
+    if (q, k, v) != (model['Q'], model['K'], model['V']):
+        bad.append(dict(rule='I1', why='resolved planes %s != model %s'
+                        % ((q, k, v), (model['Q'], model['K'], model['V']))))
+    if not (q + L.PLANE <= k and k + L.PLANE <= v and v + L.PLANE <= c['SMEM']):
+        bad.append(dict(rule='I1', why='planes overlap or leave the arena: Q=%d K=%d V=%d '
+                        'arena=%d' % (q, k, v, c['SMEM'])))
+
+    # I2/I4/I5 ------------------------------------------------------------
+    for f in families():
+        label = f['label']
+        sites = [ln for ln, line in enumerate(lines, 1)
+                 if re.search(f['pattern'], line) and not line.lstrip().startswith('//')]
+        off, lits, plane_lit = '', [], None
+        if sites:
+            line = lines[sites[0] - 1]
+            off = offset_expr(line) or ''
+            lits = [int(x) for x in re.findall(r'(?<![\w.])(\d+)u', off)]
+            if f['handoff']:
+                plane_lit = next((x for x in lits if x >= 1024), None)
+                want = c[f['handoff']]
+                if plane_lit != want:
+                    bad.append(dict(rule='I2', family=label,
+                                    why='raw plane literal %s != %s (%d)'
+                                        % (plane_lit, f['handoff'], want),
+                                    text=off.strip()[:110]))
+            for x in lits:
+                if x >= 1024 and x not in f['allowed'] and x not in (q, k, v, c['SMEM'],
+                                                                     c['QKV_OFF']):
+                    bad.append(dict(rule='I2', family=label,
+                                    why='literal %du not in the allowed set %s'
+                                        % (x, f['allowed']), text=off.strip()[:110]))
+        if len(sites) != f['expect']:
+            bad.append(dict(rule='I5', family=label, why='%d sites, expected %d'
+                            % (len(sites), f['expect'])))
+        # the maximum is taken from the RAW literal when the store writes it literally
+        base = base_of[f['base']]
+        if f['handoff'] and plane_lit is not None:
+            base = c['QKV_OFF'] + plane_lit
+        rec = dict(label=label, base=base, max_index=base + f['maxoff'],
+                   max_offset=f['maxoff'], sites=sites, expected_sites=f['expect'],
+                   handoff_macro=f['handoff'], raw_plane_literal=plane_lit,
+                   offset_expr=' '.join(off.split())[:120],
+                   literals_ge_1024=[x for x in lits if x >= 1024],
+                   allowed_literals=sorted(f['allowed']))
+        if rec['max_index'] >= c['SMEM']:
+            bad.append(dict(rule='I4', family=label, why='max index %d >= arena %d'
+                            % (rec['max_index'], c['SMEM'])))
+        rows.append(rec)
+    tight = max(rows, key=lambda r: r['max_index'])
+    if tight['max_index'] + 1 != c['SMEM']:
+        bad.append(dict(rule='I4', why='max index %d + 1 != declared %d (slack or overshoot)'
+                        % (tight['max_index'], c['SMEM'])))
+
+    # I3 ------------------------------------------------------------------
+    m = re.search(r'abase\s*=\s*([A-Za-z_0-9]+)\s*-\s*abase\s*;', text)
+    tog = None
+    if not m:
+        bad.append(dict(rule='I3', why='no `abase=<X>-abase` toggle'))
+    else:
+        tok = m.group(1)
+        tog = c[tok] if tok in c else int(tok.rstrip('u'))
+    if tog is not None and tog != init:
+        bad.append(dict(rule='I3', why='toggle literal %s != init %s' % (tog, init)))
+    if win != [0, init] or init != L.SLICE:
+        bad.append(dict(rule='I3', why='window pair %s is not {0, one staged slice %d}'
+                        % (win, L.SLICE)))
+    if max(win) + L.SLICE > c['SMEM']:
+        bad.append(dict(rule='I3', why='window %d + slice %d > arena %d'
+                        % (max(win), L.SLICE, c['SMEM'])))
+
+    # I5 macro guard ------------------------------------------------------
+    if text.count('SCORE_SIDE(') != 1:
+        bad.append(dict(rule='I5', why='SCORE_SIDE is expanded (%d occurrences); its stores '
+                        'would land in a P window at base %d'
+                        % (text.count('SCORE_SIDE('), c['QKV_OFF'])))
+    if '#define sp smem' not in text:
+        bad.append(dict(rule='I5', why='the dead `sp` alias disappeared; re-check the diff'))
+
+    # I6 ------------------------------------------------------------------
+    mod = ST.Module(spvp)
+    st = mod.storage_bytes()
+    wg = st.get('Workgroup', {})
+    if wg.get('bytes') != 2 * c['SMEM'] or wg.get('count') != 1:
+        bad.append(dict(rule='I6', why='module Workgroup %s B in %s vars vs source smem[%d]'
+                        % (wg.get('bytes'), wg.get('count'), c['SMEM'])))
+
+    return dict(arm=arm,
+                source=dict(path=str(src), sha256=sha(src)),
+                spv=dict(path=str(spvp), sha256=sha(spvp)),
+                consts=c, planes=dict(Q=q, K=k, V=v), windows=win,
+                arena_halves=c['SMEM'], arena_bytes=2 * c['SMEM'],
+                module_workgroup_bytes=wg.get('bytes'),
+                module_workgroup_vars=wg.get('count'),
+                families=rows, tightest_family=tight['label'],
+                max_index=tight['max_index'],
+                violations=bad, verdict='PASS' if not bad else 'FAIL')
+
+
+def main():
+    out, ok = {}, True
+    for arm in ('parent', 'candidate'):
+        rec = audit(arm)
+        out[arm] = rec
+        ok = ok and rec['verdict'] == 'PASS'
+        print('%-9s %-4s arena=%d B module_workgroup=%d B (%s var) max_index=%d via %s'
+              % (arm, rec['verdict'], rec['arena_bytes'], rec['module_workgroup_bytes'],
+                 rec['module_workgroup_vars'], rec['max_index'], rec['tightest_family']))
+        for f in rec['families']:
+            print('   %-42s base=%5d max=%5d sites=%2d lit=%s %s'
+                  % (f['label'], f['base'], f['max_index'], len(f['sites']),
+                     f['raw_plane_literal'],
+                     'ok' if f['max_index'] < rec['arena_halves'] else 'OVERFLOW'))
+        for x in rec['violations']:
+            print('   VIOLATION %-3s %s | %s' % (x['rule'], x['why'], x.get('text', '')[:80]))
+    p, cn = out['parent'], out['candidate']
+    shift = {pl: p['planes'][pl] - cn['planes'][pl] for pl in ('Q', 'K', 'V')}
+    out['plane_shift'] = dict(parent_minus_candidate=shift,
+                              uniform=len(set(shift.values())) == 1,
+                              value=shift['Q'],
+                              note='each plane keeps its internal layout; the base moves by '
+                                   'the same constant, so every element keeps its slot')
+    ok = ok and out['plane_shift']['uniform']
+    print('plane shift parent-candidate:', shift, 'uniform=', out['plane_shift']['uniform'])
+    (CARD / 'build/addr-audit.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print('ADDRESS AUDIT', 'PASS' if ok else 'FAIL')
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

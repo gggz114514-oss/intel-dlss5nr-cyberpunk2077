@@ -1,0 +1,303 @@
+"""Build card n28's candidate for F20 / ord 230.
+
+Parent: f20-coarse-owner-20261026/candidate.comp (spv 215aca67...), the chain-head row of
+ord 230 in accepted/n27-f07-20261027/plan.txt.
+
+Candidate: the stage-11 pixel-owner tail is re-owned to the subgroup that produced the rows
+it reads (rows 8*sg..8*sg+7, one output channel per lane) and the stage9->tail workgroup
+barrier is removed.  Nothing else changes.
+
+Steps: compile -> NoContraction transfer (45 IDs, same recorded decoration parent) ->
+SPIR-V validation -> structural census (barriers 16 -> 15, shared vars identical, FP op
+multiset of the tail) -> plan on the chain head (one line) -> cpu_check -> BUILD.json.
+
+CPU only: no Vulkan device is touched.
+"""
+import sys, json, struct, subprocess, collections, shutil
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding='utf-8')
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+import COMMON as K
+import spv_tools_local as ST
+
+CARD = Path('cards/n28-f20-barrier-alu')
+OUT = CARD / 'build'
+OUT.mkdir(parents=True, exist_ok=True)
+
+row = K.row_by_ordinal(230)
+PARENT_SRC = Path(row['source'])
+PARENT_SPV = Path(row['spv'])
+REC = K.read_json(Path('evidence/RECIPES.json'))[row['spv_sha256']]
+PINNED = Path(REC['compile']['pinned_include_dir'])
+DEC_PARENT = Path(REC['decoration_parent'])
+
+CAND_SRC = CARD / 'candidate.comp'
+CAND_SPV = CARD / 'candidate.spv'
+
+OPS = {224: 'OpControlBarrier', 4457: 'OpCooperativeMatrixLoadKHR',
+       4458: 'OpCooperativeMatrixStoreKHR', 4459: 'OpCooperativeMatrixMulAddKHR',
+       59: 'OpVariable', 61: 'OpLoad', 62: 'OpStore', 132: 'OpIMul', 128: 'OpIAdd',
+       129: 'OpFAdd', 133: 'OpFMul', 46: 'OpFMA?', 259: 'OpFma?', 81: 'OpCompositeExtract',
+       80: 'OpCompositeConstruct', 79: 'OpVectorShuffle', 194: 'OpShiftRightLogical',
+       196: 'OpShiftLeftLogical', 199: 'OpBitwiseAnd', 197: 'OpBitwiseOr',
+       134: 'OpUDiv', 137: 'OpUMod'}
+
+
+def census(spv):
+    b = Path(spv).read_bytes()
+    w = list(struct.unpack('<%dI' % (len(b) // 4), b))
+    i, hist, blocks, funcs = 5, collections.Counter(), 0, 0
+    barriers, consts = [], {}
+    while i < len(w):
+        wc = w[i] >> 16
+        op = w[i] & 0xFFFF
+        hist[op] += 1
+        if op == 43:                                     # OpConstant
+            consts[w[i + 2]] = w[i + 3]
+        elif op == 224:
+            barriers.append(tuple(w[i + 1:i + wc]))
+        elif op == 248:
+            blocks += 1
+        elif op == 54:
+            funcs += 1
+        i += wc
+    # the scope / memory-semantics operands are ids of OpConstant instructions here, so the
+    # comparison that matters is on the resolved values (execution scope, memory scope,
+    # semantics), not on the ids.
+    resolved = sorted({tuple(consts.get(x, 'id?') for x in bar) for bar in barriers})
+    return dict(words=len(w), bytes=len(b), funcs=funcs, blocks=blocks,
+                barriers=len(barriers),
+                barrier_scopes=[[int(x) for x in t] for t in resolved],
+                hist={OPS.get(k, str(k)): v for k, v in hist.items() if k in OPS})
+
+
+def wg_vars(spv):
+    """Workgroup variables with their element counts (shared memory footprint)."""
+    b = Path(spv).read_bytes()
+    w = list(struct.unpack('<%dI' % (len(b) // 4), b))
+    i, insts = 5, []
+    while i < len(w):
+        wc = w[i] >> 16
+        insts.append((w[i] & 0xFFFF, list(w[i + 1:i + wc])))
+        i += wc
+    consts = {o[1]: o[2] for op, o in insts if op == 43}
+    arrays = {o[0]: (o[1], consts.get(o[2])) for op, o in insts if op == 28}
+    out = []
+    for op, o in insts:
+        if op == 59 and o[2] == 4:
+            base, t = o[1], o[0]
+            ptr = None
+            for op2, o2 in insts:
+                if op2 == 32 and o2[0] == t:       # OpTypePointer result==var type
+                    ptr = o2[2]
+            elem, n = arrays.get(ptr, (ptr, '?'))
+            out.append(dict(id=base, array_len=n, elem_type=elem))
+    return out
+
+
+# ---------------------------------------------------------------- 1. compile
+raw = OUT / 'candidate-raw.spv'
+K.compile_glsl(CAND_SRC, raw, [PINNED])
+
+# ---------------------------------------------------------------- 2. NC transfer
+#
+# Same policy as the campaign recipe (transfer the recorded decoration parent's
+# NoContraction pattern), with one difference that the candidate forces: the parent's
+# `boundary_project()` function no longer exists (the tail fold is inlined per channel), so
+# the parent function that carries 16 of the 45 decorations has no counterpart.  The
+# campaign helper asserts on that case, so the alignment is done here with the same
+# difflib + operand-signature procedure and the vanished function is *recorded* instead of
+# asserted.  The child's own `precise`-derived decorations inside the new tail are kept on
+# top, so every FP operation of the live tail is NoContraction, exactly as all 16 FP
+# operations of the parent's tail function were.
+import difflib
+
+pm = ST.Module(DEC_PARENT)
+rm = ST.Module(raw)
+
+
+def tolerant_transfer(parent, child):
+    pregions = ST.function_regions(parent)
+    cregions = ST.function_regions(child)
+    p_skel = {i: [(parent.instructions[x][0], parent.instructions[x][3]) for x in r]
+              for i, r in enumerate(pregions)}
+    c_skel = {i: [(child.instructions[x][0], child.instructions[x][3]) for x in r]
+              for i, r in enumerate(cregions)}
+    keep, used, mapping, vanished = set(), set(), [], []
+    for pi, preg in enumerate(pregions):
+        pattern = ST.decoration_pattern(parent, preg)
+        if not pattern:
+            continue
+        want, best = p_skel[pi], None
+        for ci, have in c_skel.items():
+            if ci in used or not have:
+                continue
+            blocks = difflib.SequenceMatcher(None, want, have, autojunk=False).get_matching_blocks()
+            pos = {}
+            for b in blocks:
+                for k in range(b.size):
+                    pos[b.a + k] = b.b + k
+            if not all(p in pos for p in pattern):
+                continue
+            matched = sum(b.size for b in blocks)
+            if best is None or matched > best[0]:
+                best = (matched, ci, pos)
+        if best is None:
+            vanished.append(dict(parent_function_index=pi, instructions=len(want),
+                                 decorations=len(pattern)))
+            continue
+        matched, target, pos = best
+        used.add(target)
+        creg = cregions[target]
+        for p in sorted(pattern):
+            pidx, cidx = preg[p], creg[pos[p]]
+            pop, pops = parent.instructions[pidx][0], parent.instructions[pidx][1]
+            cop, cops = child.instructions[cidx][0], child.instructions[cidx][1]
+            assert pop == cop, (pidx, cidx, pop, cop)
+            assert parent.instructions[pidx][3] == child.instructions[cidx][3]
+            prid = ST.result_id_of(pop, pops)
+            crid = ST.result_id_of(cop, cops)
+            assert prid is not None and crid is not None
+            assert parent.operand_signature(prid, 3) == child.operand_signature(crid, 3), \
+                ('mapped instruction differs', pi, p)
+            keep.add(crid)
+        mapping.append(dict(parent_function_index=pi, child_function_index=target,
+                            parent_instructions=len(want),
+                            child_instructions=len(c_skel[target]),
+                            matched_instructions=matched, pattern_size=len(pattern)))
+    own = set(ST.no_contraction_ids(child))
+    extra = own - keep
+    # The campaign recipe discards glslang's own `precise` decorations wherever the recorded
+    # pattern does not cover them (that is how the parent's 45 are produced).  The candidate
+    # must keep exactly the decorations of the *new tail code*, because the parent's tail
+    # function was 16/16 NoContraction: every FP multiply and add of that fold must stay
+    # non-contractible.  The tail is the last code of main, so its operations are the last
+    # FMul / FAdd of function 0.
+    main_region = cregions[0]
+    own_in_main = []
+    for x in main_region:
+        op, ops = child.instructions[x][0], child.instructions[x][1]
+        rid = ST.result_id_of(op, ops)
+        if op in (133, 129) and rid in extra:
+            own_in_main.append((x, op, rid))
+    own_in_main.sort()
+    tail_ops = own_in_main[-2:]
+    assert sorted(op for _, op, _ in tail_ops) == [129, 133], tail_ops
+    keep |= {rid for _, _, rid in tail_ops}
+    extra_ops = collections.Counter(op for _, op, _ in tail_ops)
+    record_extra = dict(extra_ops)
+    info = dict(alignment='longest-matching-blocks with operand-signature verification',
+                functions_mapped=len(mapping), mapping=mapping,
+                parent_functions_without_child_counterpart=vanished,
+                new_tail_decorations=[dict(instruction_index=x, opcode=op)
+                                      for x, op, _ in tail_ops],
+                discarded_child_own_decorations=[dict(instruction_index=x, opcode=op)
+                                                 for x, op, rid in own_in_main[:-2]],
+                new_tail_decorations_ops=record_extra,
+                parent_decorations_total=len(ST.no_contraction_ids(parent)),
+                child_decorations_total=len(keep))
+    return sorted(keep), info
+
+
+keep, info = tolerant_transfer(pm, rm)
+ST.set_no_contraction(rm, keep, CAND_SPV)
+print('NC: %d mapped from %d parent functions + %d new tail ops (%s) = %d total'
+      % (info['child_decorations_total'] - sum(info['new_tail_decorations_ops'].values()),
+         info['functions_mapped'], sum(info['new_tail_decorations_ops'].values()),
+         info['new_tail_decorations_ops'], info['child_decorations_total']))
+print('NC: parent functions without counterpart:',
+      info['parent_functions_without_child_counterpart'])
+
+# ---------------------------------------------------------------- 3. validate
+val = {}
+for tag, p in (('candidate', CAND_SPV), ('parent', PARENT_SPV)):
+    r = subprocess.run([str(K.VALIDATE), str(p)], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    val[tag] = dict(returncode=r.returncode, stdout=r.stdout.strip()[:300],
+                    stderr=r.stderr.strip()[:300])
+    print('validate %-10s rc=%d %s' % (tag, r.returncode, r.stdout.strip()[:80]))
+
+# ---------------------------------------------------------------- 4. census
+cp = census(CAND_SPV)
+pp = census(PARENT_SPV)
+print('\nbarriers   parent %d -> candidate %d' % (pp['barriers'], cp['barriers']))
+print('words      parent %d -> candidate %d' % (pp['words'], cp['words']))
+print('funcs/blocks parent %d/%d -> candidate %d/%d'
+      % (pp['funcs'], pp['blocks'], cp['funcs'], cp['blocks']))
+print('barrier scope/semantics identical:', pp['barrier_scopes'] == cp['barrier_scopes'], pp['barrier_scopes'], cp['barrier_scopes'])
+shared = dict(parent=wg_vars(PARENT_SPV), candidate=wg_vars(CAND_SPV))
+print('workgroup vars parent %s' % (shared['parent'],))
+print('workgroup vars cand   %s' % (shared['candidate'],))
+keys = ('OpCooperativeMatrixMulAddKHR', 'OpCooperativeMatrixLoadKHR',
+        'OpCooperativeMatrixStoreKHR', 'OpFMul', 'OpFAdd', 'OpIAdd', 'OpIMul')
+print('\n%-34s %8s %8s' % ('opcode', 'parent', 'cand'))
+for k in keys:
+    print('%-34s %8s %8s' % (k, pp['hist'].get(k, 0), cp['hist'].get(k, 0)))
+print('all opcode counts:', json.dumps(dict(sorted(cp['hist'].items())), ensure_ascii=False))
+
+# ---------------------------------------------------------------- 5. plan
+HEAD = K.current_best()
+head_plan, head_sha = Path(HEAD[0]), HEAD[1]
+text = head_plan.read_text(encoding='utf-8-sig')
+old_path = PARENT_SPV.as_posix()
+n_occ = text.count(old_path)
+assert n_occ == 1, ('expected exactly one ord-230 row in the chain head, found %d' % n_occ)
+CAND_ABS = CAND_SPV.resolve().as_posix()
+new_text = text.replace(old_path, CAND_ABS)
+(OUT / 'plan-parent-head.txt').write_text(text, encoding='utf-8')
+plan = CARD / 'plan.txt'
+plan.write_text(new_text, encoding='utf-8')
+changed = [i + 1 for i, (a, b) in enumerate(zip(text.splitlines(), new_text.splitlines()))
+           if a != b]
+print('\nplan: chain head %s (sha %s..)' % (head_plan.name, head_sha[:12]))
+print('plan: %d line(s) changed, line %s' % (len(changed), changed))
+
+cpu = subprocess.run([str(K.RUNNER), '--plan', str(plan), '--cpu-check'],
+                     capture_output=True, text=True, encoding='utf-8', errors='replace')
+print('cpu_check rc=%d %s' % (cpu.returncode, cpu.stdout.strip()[:200]))
+cpu_head = subprocess.run([str(K.RUNNER), '--plan', str(head_plan), '--cpu-check'],
+                          capture_output=True, text=True, encoding='utf-8', errors='replace')
+
+# ---------------------------------------------------------------- 6. BUILD.json
+build = dict(
+    card='n28-f20-barrier-alu', family='F20', ordinal=230, gpu_used=False, deployed=False,
+    parent=dict(source=K.ident(PARENT_SRC), spv=K.ident(PARENT_SPV),
+                decoration_parent=K.ident(DEC_PARENT),
+                recipe=dict(entry=row['spv_sha256'], verified=REC.get('verified'),
+                            include_dirs=[str(PINNED)],
+                            nc='transfer_decoration_pattern_aligned(decoration_parent -> child), keep_ids=empty')),
+    parent_rebuild=dict(source=K.ident(CARD / 'build/parent-rebuild.spv'),
+                        sha_match_parent=K.sha(CARD / 'build/parent-rebuild.spv') == row['spv_sha256'],
+                        raw=K.ident(CARD / 'build/raw.spv'),
+                        note='byte reproduction of the parent SPV from its source with the recorded recipe'),
+    candidate_source=dict(path=str(CAND_SRC), sha256=K.sha(CAND_SRC), bytes=CAND_SRC.stat().st_size,
+                          only_site='ord 230 stage-11 tail (src lines 585-603) + the workgroup barrier that preceded it'),
+    candidate=dict(path=str(CAND_SPV), sha256=K.sha(CAND_SPV), bytes=CAND_SPV.stat().st_size,
+                   raw=K.ident(raw), nc_count=len(keep),
+                   nc_parent=len(ST.no_contraction_ids(pm)), nc_info=info),
+    float_NC_checked=len(keep),
+    float_NC_note=('the same 45 NoContraction decorations are transferred from the recorded '
+                   'decoration parent onto the same FP instructions; the candidate keeps every '
+                   'parent FP expression (only the tail ownership and one barrier change)'),
+    spv_validate=val,
+    structural_census=dict(parent=pp, candidate=cp,
+                           barriers_parent=pp['barriers'], barriers_candidate=cp['barriers'],
+                           workgroup_vars=shared,
+                           note='OpCooperativeMatrixMulAddKHR and the shared allocation are '
+                                'unchanged; exactly one OpControlBarrier disappears'),
+    plan=dict(path=str(plan), sha256=K.sha(plan), line_count=len(new_text.splitlines()),
+              changed_lines=changed, parent_plan=dict(path=str(head_plan), sha256=head_sha),
+              chain_head=HEAD[2][-1]['label'] if HEAD[2] else None,
+              old_spv=old_path, new_spv=CAND_ABS,
+              occurrences_of_old_path=n_occ),
+    cpu_check=dict(returncode=cpu.returncode, stdout=cpu.stdout.strip()[:400],
+                   stderr=cpu.stderr.strip()[:400],
+                   parent_head_returncode=cpu_head.returncode,
+                   parent_head_stdout=cpu_head.stdout.strip()[:400],
+                   identical_to_chain_head=cpu.stdout.strip() == cpu_head.stdout.strip()),
+    toolchain=dict(glslang=K.ident(K.GLSLANG), validator=K.ident(K.VALIDATE),
+                   runner=K.ident(K.RUNNER), python=sys.version.split()[0]),
+)
+K.write_json(CARD / 'BUILD.json', build)
+print('\nwrote BUILD.json  candidate sha', build['candidate']['sha256'])

@@ -1,0 +1,52 @@
+from pathlib import Path
+import json,hashlib
+import numpy as np
+R=Path('@NR_WORKSPACE@');O=R/'work/codex-astra-fp16-int8-audit-20261024'
+mp=R/'candidates/dsh-int8-same-family-20261023/abi-probe/evidence/I8-ABI-MEASURED.json'
+m=json.loads(mp.read_text());maps={k:{tuple(a):tuple(b) for a,b in v['lane_comp']} for k,v in m['maps'].items()}
+old={};new={}
+for sg in range(8):
+ for t in range(sg//2*16,sg//2*16+16):
+  for c in range((sg%2)*48,(sg%2)*48+48):old[t,c]=sg
+ for t in range(sg*8,sg*8+8):
+  for c in range(96):new[t,c]=sg
+assert set(old)==set(new) and len(new)==6144
+splitK=sum(old[t,32]!=old[t,48] for t in range(64));assert splitK==64
+assert all(len({new[t,c] for c in range(96)})==1 for t in range(64))
+# Exact norm32 tree vs fragment-owner pair plus 8/4/2/1 tree, finite samples.
+rng=np.random.default_rng(20261024);z=rng.uniform(-2,2,(64,32)).astype(np.float16);sq=(z*z).astype(np.float16)
+s=((sq[:,:8]+sq[:,16:24]).astype(np.float16)+(sq[:,8:16]+sq[:,24:32]).astype(np.float16)).astype(np.float16)
+u=(s[:,:4]+s[:,4:]).astype(np.float16);v=(u[:,:2]+u[:,2:]).astype(np.float16);ref=(v[:,0]+v[:,1]).astype(np.float16)
+x=(sq[:,:16]+sq[:,16:]).astype(np.float16)
+for step in [8,4,2,1]:x[:,:step]=(x[:,:step]+x[:,step:2*step]).astype(np.float16)
+assert np.array_equal(ref.view(np.uint16),x[:,0].view(np.uint16))
+# INT8 P^T32x16 register join: reuse measured B/CH, now role-labelled key/query.
+p=rng.integers(0,128,(64,16),dtype=np.int32);V=rng.integers(-127,128,(32,64),dtype=np.int32);got=np.zeros((32,16),np.int32)
+for kb in [0,32]:
+ words={}
+ for frag in range(4):
+  for lane in range(32):
+   word=0
+   for ci in range(4):
+    r,c=maps['CH'][lane,ci];word|=(int(p[kb+frag*8+r,c])&255)<<(8*ci)
+   words[frag,lane]=word
+ rebuilt=np.zeros((32,16),np.int32)
+ for (lane,ci),(r,c) in maps['B'].items():
+  frag=ci>>2;sl=(lane>>2)+16*(lane&1)+8*(ci&1);byte=2*((ci>>1)&1)+((lane>>1)&1)
+  val=(words[frag,sl]>>(8*byte))&255
+  rebuilt[r,c]=val if val<128 else val-256
+ assert np.array_equal(rebuilt,p[kb:kb+32]);got+=V[:,kb:kb+32]@rebuilt
+assert np.array_equal(got,V@p)
+# I-PC9 direct epilogue same 64x32 coordinates per WG; external window transform unchanged.
+oldout=[];newout=[]
+for sg in range(8):
+ for side in range(2):
+  for lane in range(32):
+   for ci in range(4):
+    e=lane+32*ci;oldout.append((sg*8+e//16,side*16+e%16));newout.append((sg*8+2*ci+lane//16,side*16+lane%16))
+assert oldout==newout and len(set(newout))==2048
+sources=['candidates/int8-coverage-v2-20261020/A/source/l2/split16_attention_qkv_int8_inline.comp','candidates/zcode-fp16-four-hotspots-20261020/s22-register-p-v1/source/s22_register_p.comp','candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-qkv-v2/source/vit_attention_pden_register_int8.comp','candidates/zcode-fp16-compute-backend-20261021/b-t04-vit-chunk-split-v1/source/vit_attention_pden_register.comp']
+def ident(p):
+ p=R/p;b=p.read_bytes();return dict(path=p.as_posix(),sha256=hashlib.sha256(b).hexdigest(),bytes=len(b))
+r=dict(scope='CPU coordinate/finite-half norm-tree/INT8 integer-stage proof; no shader/native/GPU validation',qkv_owner=dict(elements=6144,old_K_rows_split_across_SGs=splitK,new_all96_columns_single_owner=True,accumulator_fragments_per_SG_before_after=[6,6],accumulator_logical_bytes_per_lane=96,A_loads_per_K_before_after=[2,1],B_loads_per_K_before_after=[3,6],QK_half_shared_roundtrip_write_read_bytes_removed_each=8192),norm32=dict(rows=64,half_tree_bit_mismatches=0,rsqrt='not tested, preserve original'),P_to_B=dict(B_slots_per_K32=512,K32_steps=2,integer_output_components=512,integer_mismatches=0,packed_shuffle_sources_per_lane_per_K32=8,map_record_sha256=hashlib.sha256(mp.read_bytes()).hexdigest(),int32_abs_bounds=dict(QK_K32=32*127**2,PV_K64=64*127**2,PV_K320=320*127**2),scale_condition='one compatible factor over accumulated K; distinct per-chunk scale needs explicitly different dequant schedule'),l2_epilogue=dict(elements=2048,address_mismatches=0,shared_roundtrip_bytes_each=4096,SG_barrier_invocations_removed=32,shared_declaration_savings=0),vit_barriers=dict(chunks=5,publication=5,retirement_before_next_fill=4,old_total=10,new_total=9,all8positions_WGs=8*5*32,removed_WG_executions=1280,condition='WG-uniform successor exists; no shared reader after loop; do not remove interchunk retirement'),sources=[ident(p) for p in sources])
+(O/'ATTENTION-CHAIN-CPU-PROOF.json').write_text(json.dumps(r,indent=2),encoding='utf-8');print(json.dumps({k:v for k,v in r.items() if k!='sources'}))

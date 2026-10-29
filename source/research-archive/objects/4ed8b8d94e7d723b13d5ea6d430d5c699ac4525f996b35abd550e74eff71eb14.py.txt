@@ -1,0 +1,177 @@
+"""S12 slice step 3: channel-range diagnostics + weighted per-output-channel scale search.
+
+Q1 is a single-frame X equaliser useless here, or was the search broken?
+   -> per-input-channel dynamic-range spread (max and RMS), per-weight-column
+      spread, and the kurtosis of the A tile, all over the kernel's written domain.
+Q2 can the per-output-channel weight scale be improved offline?
+   -> the deployed pack uses sW[n] = amax_k|W[n,k]|/127, which minimises the
+      UNWEIGHTED weight error.  The error that reaches Y is weighted by each input
+      channel's activation magnitude, so grid-search sW[n] = c*amax_k|W[n,k]|/127
+      on sum_k (dW[n,k]*sigma_k)^2.
+"""
+import json
+import numpy as np
+
+D_ = r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+CAND = r"@NR_WORKSPACE@/work/dsh-int8-fullnet-impl-20261024/candidates/r07-c256-wo-merged"
+PACK = r"@NR_WORKSPACE@/candidates/amd-map-20261015/round4-integrated/candidate/packs/swin_15_weights.fp16.bin"
+WORK = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S12-proj/_work"
+
+NW, NT, NC = 66, 64, 256
+TX, TY, GX = 21, 12, 11
+WO, ARS = 0, 98304
+
+pack = np.fromfile(PACK, dtype=np.float16).astype(np.float32)
+T = np.fromfile(f"{D_}/dump-fp16/dump_swin_15_T.bin", dtype=np.float16).astype(np.float32).reshape(NW, NT, NC)
+Y = np.fromfile(f"{D_}/dump-fp16/dump_swin_15_Y.bin", dtype=np.float16).astype(np.float32).reshape(NW, NT, NC)
+Wq_raw = np.fromfile(f"{CAND}/packs/c256_b15_wo.codes.i8.bin", dtype=np.int8)
+Wsc = np.fromfile(f"{CAND}/packs/c256_b15_wo.sc.f32.bin", dtype=np.float32)
+Wf = pack[WO: WO + NC * NC].reshape(NC, NC)
+f_ar = pack[ARS: ARS + NC]
+_n, _k = np.arange(NC)[:, None], np.arange(NC)[None, :]
+widx = ((_n // 16) * 8 * 512 + (_k // 32) * 512 + (_n % 16) * 32 + (_k % 32))
+W8 = Wq_raw[widx].astype(np.float32)
+
+# written-domain token mask, per window (oob depends on the token only)
+tt = np.repeat(np.arange(NT), NC)
+wmask = np.zeros((NW, NT, NC), dtype=bool)
+keep_t = np.zeros((NW, NT), dtype=bool)
+for wx in range(GX):
+    for wy in range(TY // 2):
+        w = wy * GX + wx
+        q, s = tt >> 4, tt & 15
+        tx, ty = 2 * wx + (q & 1), 2 * wy + (q >> 1)
+        kt = ~((tx < 0) | (ty < 0) | (tx >= TX) | (ty >= TY))
+        keep_t[w] = kt.reshape(NT, NC).all(axis=1)
+        wmask[w] = kt.reshape(NT, NC)
+
+# streaming per-channel statistics over the written elements only
+s1 = np.zeros(NC, np.float64)
+s2 = np.zeros(NC, np.float64)
+amax_k = np.zeros(NC, np.float64)
+kurt_num = np.zeros(NC, np.float64)
+n_tok = 0
+for w in range(NW):
+    blk = T[w][keep_t[w]]                     # (n_kept, 256)
+    n_tok += blk.shape[0]
+    s1 += blk.sum(axis=0, dtype=np.float64)
+    s2 += (blk.astype(np.float64) ** 2).sum(axis=0)
+    amax_k = np.maximum(amax_k, np.abs(blk).max(axis=0))
+mean_k = s1 / n_tok
+var_k = s2 / n_tok - mean_k ** 2
+rms_k = np.sqrt(np.maximum(var_k, 1e-30))
+for w in range(NW):
+    blk = T[w][keep_t[w]]
+    kurt_num += (((blk - mean_k) / rms_k) ** 4).sum(axis=0)
+kurt = kurt_num / n_tok - 3.0
+
+Yhat = np.einsum("wtk,nk->wtn", T, Wf) + Y * f_ar[None, None, :]
+res = Y * f_ar[None, None, :]
+Ynorm = float(np.linalg.norm(Yhat[wmask]))
+out = {"diagnostics": {
+    "n_written_rows": int(n_tok),
+    "A_channel_amax_spread_octaves": float(np.log2(amax_k.max() / amax_k.min())),
+    "A_channel_rms_spread_octaves": float(np.log2(rms_k.max() / rms_k.min())),
+    "A_kurtosis_mean": float(kurt.mean()),
+    "A_kurtosis_max": float(kurt.max()),
+    "window_amax_min": float(min(np.abs(T[w]).max() for w in range(NW))),
+    "window_amax_max": float(max(np.abs(T[w]).max() for w in range(NW))),
+}}
+gam_rms = np.sqrt((Wf ** 2).mean(axis=0))
+gam_amax = np.abs(Wf).max(axis=0)
+out["diagnostics"]["W_column_rms_spread_octaves"] = float(np.log2(gam_rms.max() / gam_rms.min()))
+out["diagnostics"]["W_column_amax_spread_octaves"] = float(np.log2(gam_amax.max() / gam_amax.min()))
+rowamax = np.abs(Wf).max(axis=1)
+out["diagnostics"]["n_output_channels_all_zero"] = int((rowamax == 0).sum())
+out["diagnostics"]["output_channel_amax_spread_octaves"] = float(
+    np.log2(rowamax[rowamax > 0].max() / rowamax[rowamax > 0].min()))
+
+eq = {}
+for nm, base in (("rms", rms_k), ("amax", amax_k)):
+    r = base / np.exp(np.mean(np.log(base)))
+    Dk = np.exp2(np.round(np.log2(r)))
+    eq[nm] = Dk
+    out["diagnostics"][f"D_{nm}_distinct"] = int(len(np.unique(Dk)))
+    out["diagnostics"][f"D_{nm}_min_max"] = [float(Dk.min()), float(Dk.max())]
+
+
+def q_r(x):
+    return np.clip(np.rint(x), -127.0, 127.0)
+
+
+def rel(armY):
+    return float(np.linalg.norm((armY - Yhat)[wmask]) / Ynorm)
+
+
+def weighted_scale_search(Weq, sigma, grid=61, lo=0.5, hi=1.25):
+    amaxn = np.abs(Weq).max(axis=1)
+    base = np.where(amaxn > 0, amaxn / 127.0, 1e-30)
+    w2 = (np.asarray(sigma, np.float64) ** 2)[None, :]
+    best_s = base.copy()
+    best_e = np.full(Weq.shape[0], np.inf)
+    for c in np.linspace(lo, hi, grid):
+        s = base * c
+        q = np.clip(np.rint(Weq / s[:, None]), -127, 127)
+        dw = q * s[:, None] - Weq
+        e = (dw.astype(np.float64) ** 2 * w2).sum(axis=1)
+        better = e < best_e
+        best_e = np.where(better, e, best_e)
+        best_s = np.where(better, s, best_s)
+    return best_s, best_e
+
+
+def arm(codesA, sA, sW, Weq):
+    Yq = np.einsum("wtk,nk->wtn", codesA, q_r(Weq / sW[:, None]).astype(np.float32))
+    return Yq * (sW[None, None, :] * sA[:, None, None]) + res
+
+
+def a_quant(X):
+    cA = np.empty_like(X)
+    sA = np.empty(NW, np.float32)
+    for w in range(NW):
+        m = float(np.abs(X[w]).max())
+        sA[w] = m / 127.0 if m > 0 else 0.0
+        cA[w] = q_r(X[w] * (127.0 / m if m > 0 else 0.0))
+    return cA, sA
+
+
+cA_old, sA_old = a_quant(T)
+out["OLD"] = {"relL2": rel(np.einsum("wtk,nk->wtn", cA_old, W8) *
+                           (Wsc[None, None, :] * sA_old[:, None, None]) + res)}
+
+sW1, _ = weighted_scale_search(Wf, rms_k)
+out["NEW_scale_only"] = {
+    "relL2": rel(arm(cA_old, sA_old, sW1, Wf)),
+    "mean_scale_ratio_vs_amax_over_127": float(np.mean(sW1 / np.maximum(rowamax / 127.0, 1e-30))),
+    "n_channels_ratio_outside_1e-3": int((np.abs(sW1 / np.maximum(rowamax / 127.0, 1e-30) - 1) > 1e-3).sum()),
+}
+
+best = None
+for nm, Dk in eq.items():
+    Xeq = T / Dk[None, None, :]
+    Weq = Wf * Dk[None, :]
+    cA, sA = a_quant(Xeq)
+    sW, _ = weighted_scale_search(Weq, rms_k / Dk)
+    r = rel(arm(cA, sA, sW, Weq))
+    out[f"NEW_eq_{nm}"] = {"relL2": r, "D_distinct": int(len(np.unique(Dk)))}
+    if best is None or r < best[1]:
+        best = (nm, r, Dk, sW, cA, sA, Weq, Xeq)
+
+nm, r, Dk, sW, cA, sA, Weq, Xeq = best
+out["best"] = nm
+out["best_relL2"] = r
+
+# static per-tensor A scale variant (pure-static option for the same pack)
+mglob = float(np.abs(Xeq).max())
+cAs = q_r(Xeq * (127.0 / mglob))
+Yst = np.einsum("wtk,nk->wtn", cAs, q_r(Weq / sW[:, None]).astype(np.float32))
+Yst = Yst * (sW[None, None, :] * (mglob / 127.0)) + res
+out["NEW_static_A"] = {"relL2": rel(Yst), "static_A_scale": mglob / 127.0,
+                       "saturated_frac": float((np.abs(cAs) >= 127).mean())}
+
+print(json.dumps(out, indent=1))
+np.save(f"{WORK}/best_cW.npy", q_r(Weq / sW[:, None]).astype(np.int8))
+np.save(f"{WORK}/best_sW.npy", sW.astype(np.float32))
+np.save(f"{WORK}/best_D.npy", Dk.astype(np.float32))
+json.dump(out, open(f"{WORK}/slice3.json", "w", encoding="utf-8"), indent=1)
+

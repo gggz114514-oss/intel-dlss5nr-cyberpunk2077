@@ -1,0 +1,572 @@
+"""SPIR-V analysis for n12b-f14-scale.
+
+Compares three modules:
+  baseline    parent-rebuild.spv      (v2 source, 72e2df7c..., current plan identity)
+  delta-base  delta-base.spv          (n12-vit-qkv candidate, d008f8fe..., this diff's parent)
+  candidate   candidate.spv
+
+Produces evidence/SPV-STATICS.json, evidence/NC-MAP.json, evidence/SCALE-LOAD.json
+and evidence/SPV-DIFF.txt (normalized disassembly diff delta-base -> candidate).
+
+CPU only.  No GPU.
+"""
+import difflib
+import json
+import struct
+import sys
+from collections import Counter
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent
+CAMPAIGN = CARD.parent.parent
+sys.path.insert(0, str(CAMPAIGN))
+sys.path.insert(0, r'@NR_WORKSPACE@/build/dhs-netorg-long-20261018/T3')
+import COMMON as K          # noqa: E402
+import spv_probe as S       # noqa: E402
+
+EVID = CARD / 'evidence'
+EVID.mkdir(exist_ok=True)
+
+ARMS = {
+    'baseline': CARD / 'parent-rebuild.spv',
+    'delta_base': CARD / 'delta-base.spv',
+    'candidate': CARD / 'candidate.spv',
+}
+SCALES_BINDING = 1
+QKV_BINDING = 6
+
+# opcodes whose presence/absence is part of the contract
+WATCH = {
+    12: 'OpExtInst', 57: 'OpFunctionCall', 59: 'OpVariable', 61: 'OpLoad',
+    62: 'OpStore', 65: 'OpAccessChain', 66: 'OpInBoundsAccessChain',
+    71: 'OpDecorate', 124: 'OpBitcast', 128: 'OpIAdd', 129: 'OpFAdd',
+    131: 'OpFSub', 132: 'OpIMul', 133: 'OpFMul', 134: 'OpUDiv',
+    197: 'OpBitwiseAnd', 194: 'OpBitwiseOr', 199: 'OpBitFieldSExtract',
+    200: 'OpBitFieldUExtract', 245: 'OpPhi', 246: 'OpLoopMerge',
+    247: 'OpSelectionMerge', 248: 'OpLabel', 249: 'OpBranch',
+    250: 'OpBranchConditional', 253: 'OpReturn', 254: 'OpReturnValue',
+    327: 'OpSelect', 340: 'OpGroupNonUniformElect', 345: 'OpGroupNonUniformShuffle',
+    346: 'OpGroupNonUniformShuffleXor', 347: 'OpGroupNonUniformShuffleUp',
+    348: 'OpGroupNonUniformShuffleDown', 224: 'OpControlBarrier',
+    225: 'OpMemoryBarrier', 4457: 'OpCooperativeMatrixLoadKHR',
+    4458: 'OpCooperativeMatrixStoreKHR', 4459: 'OpCooperativeMatrixMulAddKHR',
+}
+
+
+def name(op):
+    return WATCH.get(op) or S.OP.get(op) or ('op%d' % op)
+
+
+def arm_statics(path):
+    m = K.ST.Module(Path(path))
+    c = Counter()
+    for op, ops, _, _ in m.instructions:
+        c[op] += 1
+    regions = S.functions = None
+    # function bodies
+    funcs, cur = [], None
+    for op, ops, _, _ in m.instructions:
+        if op == 54:
+            cur = [op]
+            funcs.append(cur)
+            continue
+        if cur is not None:
+            cur.append(op)
+        if op == 56:
+            cur = None
+    body = Counter()
+    for f in funcs:
+        for op in f:
+            body[op] += 1
+    nc = sorted(K.ST.no_contraction_ids(m))
+    nc_sites = []
+    for cid in nc:
+        op, ops = m.defining_instruction(cid)
+        nc_sites.append(dict(result_id=cid, opcode=op, opcode_name=name(op),
+                             signature=m.operand_signature(cid)))
+    return dict(
+        path=str(path), sha256=K.sha(path), bytes=Path(path).stat().st_size,
+        words=len(m.words), instruction_count=len(m.instructions),
+        function_count=len(funcs), body_instruction_count=sum(body.values()),
+        opcodes_total={str(k): v for k, v in sorted(c.items())},
+        opcodes_body={str(k): v for k, v in sorted(body.items())},
+        opcodes_body_named={name(k): v for k, v in sorted(body.items())},
+        opcodes_total_named={name(k): v for k, v in sorted(c.items())},
+        no_contraction=dict(count=len(nc), ids=nc, sites=nc_sites,
+                            signature_multiset=sorted(
+                                '%s|%s' % (s['opcode_name'], s['signature']) for s in nc_sites)),
+        ext_inst_fma_sites=len(m.ext_inst_fma_ordinals()),
+        coopmat=dict(
+            load=c.get(4457, 0), store=c.get(4458, 0), muladd=c.get(4459, 0),
+            type=c.get(4456, 0)),
+        barriers=dict(control=c.get(224, 0), memory=c.get(225, 0)),
+        group_ops={name(k): c[k] for k in sorted(c)
+                   if name(k).startswith('OpGroupNonUniform')},
+    )
+
+
+# ---------------------------------------------------------------- layout defs
+def scales_var(M):
+    hits = S.var_for_binding(M, SCALES_BINDING)
+    return hits
+
+
+def loops_of(M):
+    """[(header_block_id, merge_block_id, continue_block_id, header_index)]"""
+    out = []
+    for bi, b in enumerate(M['blocks']):
+        for inst in b['insts']:
+            if inst.op == 246:      # OpLoopMerge merge continue ...
+                out.append(dict(header=b['id'], merge=inst.ops[0], cont=inst.ops[1],
+                                block_index=bi))
+    return out
+
+
+def block_succ(b):
+    last = b['insts'][-1]
+    if last.op == 249:
+        return [last.ops[0]]
+    if last.op == 250:
+        return [last.ops[1], last.ops[2]]
+    if last.op == 251:
+        return [x for x in last.ops[1::2] if x]
+    return []
+
+
+def loop_body_blocks(M, loop):
+    by = {b['id']: b for b in M['blocks']}
+    seen, stack = set(), [loop['header']]
+    while stack:
+        x = stack.pop()
+        if x in seen or x == loop['merge'] or x not in by:
+            continue
+        seen.add(x)
+        stack.extend(block_succ(by[x]))
+    seen.discard(loop['header'])
+    return seen
+
+
+def block_order(M):
+    return {b['id']: i for i, b in enumerate(M['blocks'])}
+
+
+def load_sites(M):
+    svars = scales_var(M)
+    assert len(svars) == 1, 'Scales binding 1 variables: %s' % svars
+    svar = svars[0]
+    ptrs, loads, stores = set(), [], []
+    for b in M['blocks']:
+        for inst in b['insts']:
+            if inst.op in (65, 66, 67):
+                origin, chain = S.ptr_origin(M, inst.id) if hasattr(inst, 'id') else (None, [])
+                if origin is None:
+                    origin, _ = S.ptr_origin(M, inst.ops[1])
+                if origin == svar:
+                    ptrs.add(inst.ops[1])
+    for b in M['blocks']:
+        for inst in b['insts']:
+            if inst.op == 61:
+                origin, chain = S.ptr_origin(M, inst.ops[2])
+                if origin == svar:
+                    loads.append((b['id'], inst, chain))
+            if inst.op == 62:
+                origin, chain = S.ptr_origin(M, inst.ops[0])
+                if origin == svar:
+                    stores.append((b['id'], inst, chain))
+    return svar, ptrs, loads, stores
+
+
+def expr_norm(M, vid, budget=24):
+    """Normalized address expression: opcode names + constants, ids erased."""
+    inst = M['by_id'].get(vid)
+    if inst is None:
+        return ('id?',)
+    c = S.const_of(M, vid)
+    if c is not None:
+        return ('const', c)
+    if budget <= 0:
+        return ('deep', inst.name)
+    return tuple([inst.name] + [expr_norm(M, x, budget - 1) for x in inst.ops[2:]])
+
+
+def expr_render(t, budget=90):
+    s = str(t)
+    return s if len(s) <= budget else s[:budget] + '...'
+
+
+def to_jsonable(t):
+    if isinstance(t, tuple):
+        return [to_jsonable(x) for x in t]
+    return t
+
+
+def condition_expr(M, header_block_id):
+    by = {b['id']: b for b in M['blocks']}
+    b = by.get(header_block_id)
+    if not b:
+        return None
+    for inst in b['insts']:
+        if inst.op == 250:
+            return to_jsonable(expr_norm(M, inst.ops[0]))
+    return None
+
+
+def scale_site_report(tag, path):
+    M = S.build(S.parse(str(path)))
+    loops = loops_of(M)
+    body = {L['header']: loop_body_blocks(M, L) for L in loops}
+    order = block_order(M)
+    svar, ptrs, loads, stores = load_sites(M)
+    # identify loops by the constants in their header block and by content
+    by = {b['id']: b for b in M['blocks']}
+    loop_info = []
+    for L in loops:
+        hb = by[L['header']]
+        consts = sorted({S.const_of(M, x) for i in hb['insts'] for x in i.ops
+                         if S.const_of(M, x) is not None})
+        ops = Counter(name(i.op) for b in M['blocks'] if b['id'] in body[L['header']]
+                      for i in b['insts'])
+        loop_info.append(dict(header=L['header'], merge=L['merge'],
+                              header_block_index=L['block_index'],
+                              header_consts=consts,
+                              body_blocks=len(body[L['header']]),
+                              body_ops={k: ops[k] for k in ('OpCooperativeMatrixMulAddKHR',
+                                                            'OpCooperativeMatrixStoreKHR',
+                                                            'OpFunctionCall', 'OpLoad')},
+                              contains_coopmat_muladd=ops.get('OpCooperativeMatrixMulAddKHR', 0),
+                              contains_coopmat_store=ops.get('OpCooperativeMatrixStoreKHR', 0)))
+    sites = []
+    for bid, inst, chain in loads:
+        origin_var, _ = (None, None)
+        enclosing = []
+        for L in loops:
+            if bid in body[L['header']]:
+                enclosing.append(dict(header=L['header'], merge=L['merge'],
+                                      header_index=L['block_index']))
+        # index operand of the innermost access chain, normalized
+        expr = None
+        if chain:
+            expr = expr_norm(M, chain[0].ops[-1]) if len(chain[0].ops) > 3 else None
+        sites.append(dict(
+            block=bid, block_index=order[bid],
+            function=M['blocks'][order[bid]]['func'],
+            guards=[dict(header=g['header'], truthy=g['truthy'],
+                         condition=condition_expr(M, g['header']))
+                    for g in S.block_guards(M, bid)],
+            enclosing_loops=enclosing,
+            in_loop=bool(enclosing),
+            pointer_chain_consts=[[S.const_of(M, x) for x in c.ops[3:]] for c in chain],
+            index_expr=to_jsonable(expr) if expr else None,
+            index_expr_text=expr_render(expr) if expr else None,
+            result_type=S.const_of(M, inst.ops[0]),
+        ))
+    return dict(
+        tag=tag, path=str(path), sha256=K.sha(path),
+        scales_var=svar,
+        scales_stores=len(stores),
+        scales_loads=len(loads),
+        access_chain_ops=Counter(name(M['by_id'][p].op) for p in ptrs if p in M['by_id']),
+        sites=sites, loops=loop_info,
+    )
+
+
+# ---------------------------------------------------------------- normalized dump
+def operand_kind(M, x):
+    """Renumbering-free operand class: constants keep their value, variables keep
+    their binding, types keep their kind, every other result id collapses to '.'."""
+    c = S.const_of(M, x)
+    if c is not None:
+        return '#%d' % c
+    if x in M['variables']:
+        b = [d[1] for d in M['decos'].get(x, []) if d[0] == 33]
+        return '@b%s' % (b[0] if b else '-')
+    t = M['types'].get(x)
+    if t is not None:
+        return 'ty:%s' % t.get('kind')
+    return '.'
+
+
+def kind_disasm(M):
+    out = []
+    for inst in M['insts']:
+        if inst.op in (71, 72):          # decorations: compared through NC-MAP instead
+            continue
+        out.append('%s %s' % (name(inst.op),
+                              ' '.join(operand_kind(M, x) for x in inst.ops)))
+    return out
+
+
+def main_blocks(M):
+    """[(block ordinal, size, terminator, opcode counts)] of the entry function."""
+    main_id = None
+    for inst in M['insts']:
+        if inst.op == 15:                # OpEntryPoint ExecutionModel function ...
+            main_id = inst.ops[1]
+            break
+    blocks = []
+    for bi, b in enumerate(M['blocks']):
+        if b['func'] != main_id:
+            continue
+        ops = Counter(name(i.op) for i in b['insts'])
+        term = name(b['insts'][-1].op)
+        blocks.append(dict(index=bi, size=len(b['insts']), terminator=term,
+                           ops={k: ops[k] for k in sorted(ops)},
+                           loads=[i.ops[1] for i in b['insts'] if i.op == 61]))
+    return main_id, blocks
+
+
+def block_map(M):
+    """Compact one-line signature per block of the entry function."""
+    main_id, blocks = main_blocks(M)
+    out = []
+    for k, b in enumerate(blocks):
+        ops = b['ops']
+        key = ','.join('%s:%d' % (o.replace('Op', ''), n) for o, n in ops.items())
+        out.append('B%02d %-22s %s' % (k, b['terminator'], key))
+    return out
+
+
+def local_f16_var_loads(M):
+    """The hoisted coefficient carrier: a Function-storage f16 scalar named `scale`."""
+    out = []
+    for vid, storage in M['variables'].items():
+        if storage != 7 or M['names'].get(vid) != 'scale':
+            continue
+        loads = []
+        for b in M['blocks']:
+            n = sum(1 for inst in b['insts'] if inst.op == 61
+                    and S.ptr_origin(M, inst.ops[2])[0] == vid)
+            if n:
+                loads.append(dict(block=b['id'], count=n,
+                                  guards=[dict(header=g['header'], truthy=g['truthy'],
+                                               condition=condition_expr(M, g['header']))
+                                          for g in S.block_guards(M, b['id'])]))
+        stores = []
+        for b in M['blocks']:
+            n = sum(1 for inst in b['insts'] if inst.op == 62
+                    and S.ptr_origin(M, inst.ops[0])[0] == vid)
+            if n:
+                stores.append(dict(block=b['id'], count=n))
+        out.append(dict(var=vid, name='scale', storage=storage, loads=loads, stores=stores))
+    return out
+
+
+def dominance(M, def_block, use_block):
+    """Is def_block in every path from entry to use_block?  Simple iterative dominators."""
+    by = {b['id']: b for b in M['blocks']}
+    ids = [b['id'] for b in M['blocks']]
+    succ = {i: block_succ(by[i]) for i in ids}
+    preds = {i: [] for i in ids}
+    for a, ss in succ.items():
+        for b in ss:
+            if b in preds:
+                preds[b].append(a)
+    entry = ids[0]
+    dom = {i: set(ids) for i in ids}
+    dom[entry] = {entry}
+    changed = True
+    while changed:
+        changed = False
+        for i in ids:
+            if i == entry:
+                continue
+            ps = [dom[p] for p in preds[i] if p in dom]
+            new = ({i} | set.intersection(*ps)) if ps else {i}
+            if new != dom[i]:
+                dom[i] = new
+                changed = True
+    return dict(dominates=def_block in dom.get(use_block, set()),
+                def_block=def_block, use_block=use_block,
+                def_dominators=sorted(dom.get(def_block, set())),
+                use_dominators=sorted(dom.get(use_block, set())))
+
+
+def main():
+    statics = {tag: arm_statics(p) for tag, p in ARMS.items()}
+    K.write_json(EVID / 'SPV-STATICS.json', statics)
+
+    # NC one-to-one: baseline vs candidate (same recipe identity) and delta-base vs candidate
+    nc = {
+        'baseline': statics['baseline']['no_contraction'],
+        'delta_base': statics['delta_base']['no_contraction'],
+        'candidate': statics['candidate']['no_contraction'],
+    }
+    nc['one_to_one_baseline_vs_candidate'] = (
+        nc['baseline']['signature_multiset'] == nc['candidate']['signature_multiset'])
+    nc['one_to_one_delta_vs_candidate'] = (
+        nc['delta_base']['signature_multiset'] == nc['candidate']['signature_multiset'])
+    nc['float_NC_checked'] = nc['candidate']['count']
+    K.write_json(EVID / 'NC-MAP.json', nc)
+
+    # scales load placement
+    sites = {tag: scale_site_report(tag, p) for tag, p in ARMS.items()}
+    K.write_json(EVID / 'SCALE-LOAD.json', sites)
+
+    # the hoisted coefficient carrier (function-local f16 named `scale`); glslang
+    # materialises the local in both arms -- the difference is where its defining
+    # store and the buffer read sit
+    mc0 = S.build(S.parse(str(ARMS['candidate'])))
+    md0 = S.build(S.parse(str(ARMS['delta_base'])))
+    local = dict(candidate=local_f16_var_loads(mc0), delta_base=local_f16_var_loads(md0))
+    for tag, M in (('candidate', mc0), ('delta_base', md0)):
+        loops = loops_of(M)
+        for v in local[tag]:
+            for l in v['loads']:
+                l['enclosing_loops'] = [L['header'] for L in loops
+                                        if l['block'] in loop_body_blocks(M, L)]
+                l['in_loop'] = bool(l['enclosing_loops'])
+    # The candidate's value store must reach the consumers.  Pure CFG dominance does
+    # NOT hold (the in-loop consumer sits under a *second* selection with the same
+    # uniform predicate), so the argument is predicate correlation: both guards are
+    # the same `n0 < 1024` comparison on a value that is never re-stored, hence any
+    # execution of the consumer implies the preheader load/store executed.
+    cand_carrier = local['candidate'][0]
+    value_store_blocks = [s['block'] for s in cand_carrier['stores']
+                          if s['block'] == sites['candidate']['sites'][0]['block']]
+    assert len(value_store_blocks) == 1
+    pre_guard = sites['candidate']['sites'][0]['guards'][0]
+    cons_guards = cand_carrier['loads'][0]['guards']
+    pre_cond = pre_guard['condition']
+    matching = [g for g in cons_guards if g['condition'] == pre_cond]
+    assert matching, (pre_cond, cons_guards)
+    n0_vars = [vid for vid, st in mc0['variables'].items()
+               if st == 7 and mc0['names'].get(vid) == 'n0']
+    n0_stores = []
+    for vid in n0_vars:
+        for b in mc0['blocks']:
+            for inst in b['insts']:
+                if inst.op == 62 and S.ptr_origin(mc0, inst.ops[0])[0] == vid:
+                    n0_stores.append(b['id'])
+    order = block_order(mc0)
+    n0_stable = all(order[b] < order[sites['candidate']['sites'][0]['block']]
+                    for b in n0_stores) if n0_stores else True
+    dominance_check = dict(
+        cf_dominance=dominance(mc0, value_store_blocks[0],
+                               cand_carrier['loads'][0]['block'])['dominates'],
+        cf_dominance_note='block 332 does not statically dominate 494 because the consumer '
+                          'also sits under a second selection with the same uniform predicate',
+        value_store_block=value_store_blocks[0],
+        init_store_blocks=[s['block'] for s in cand_carrier['stores']
+                           if s['block'] != value_store_blocks[0]],
+        consumer_block=cand_carrier['loads'][0]['block'],
+        consumer_guards=[dict(header=g['header'], condition=g['condition'])
+                         for g in cons_guards],
+        preheader_guard=dict(header=pre_guard['header'], condition=pre_cond),
+        guard_conditions_identical=True,
+        n0_vars=n0_vars, n0_store_blocks=n0_stores, n0_stable_before_guard=n0_stable,
+        statement='both the preheader load and the in-loop consumers are guarded by the same '
+                  'n0<1024 comparison; n0 is written only in the prologue before the guard, so '
+                  'whenever a consumer executes, the preheader load and its store have executed',
+    )
+    assert n0_stable, n0_stores
+
+    # normalized diff delta-base -> candidate (operand classes, ids erased)
+    md = S.build(S.parse(str(ARMS['delta_base'])))
+    mc = S.build(S.parse(str(ARMS['candidate'])))
+    dl = kind_disasm(md)
+    cl = kind_disasm(mc)
+    diff = list(difflib.unified_diff(dl, cl, fromfile='delta-base.spv', tofile='candidate.spv',
+                                     n=3, lineterm=''))
+    bm_d = block_map(md)
+    bm_c = block_map(mc)
+    bmap_diff = list(difflib.unified_diff(bm_d, bm_c, fromfile='delta-base main blocks',
+                                          tofile='candidate main blocks', n=2, lineterm=''))
+    (EVID / 'SPV-DIFF.txt').write_text(
+        '# block map diff (entry function)\n' + '\n'.join(bmap_diff) +
+        '\n\n# instruction diff (ids erased: #const, @binding, ty:kind, .)\n' + '\n'.join(diff) + '\n',
+        encoding='utf-8')
+    added = [l for l in diff if l.startswith('+') and not l.startswith('+++')]
+    removed = [l for l in diff if l.startswith('-') and not l.startswith('---')]
+
+    # callee sequence inside the group loop (must be unchanged)
+    def call_seq(M):
+        out = []
+        for b in M['blocks']:
+            for i in b['insts']:
+                if i.op == 57:
+                    out.append(M['names'].get(i.ops[2], '?'))
+        return out
+    calls = dict(delta_base=call_seq(md), candidate=call_seq(mc))
+
+    summary = dict(
+        schema='n12b-f14-scale/spv/v1',
+        arms={t: dict(sha256=v['sha256'], words=v['words'], bytes=v['bytes'],
+                      instructions=v['instruction_count'],
+                      body=v['body_instruction_count'],
+                      nc=v['no_contraction']['count']) for t, v in statics.items()},
+        nc=nc,
+        scales=sites,
+        address_expr=dict(
+            baseline=sites['baseline']['sites'][0]['index_expr'],
+            delta_base=sites['delta_base']['sites'][0]['index_expr'],
+            candidate=sites['candidate']['sites'][0]['index_expr'],
+            identical_delta_vs_candidate=(
+                sites['delta_base']['sites'][0]['index_expr'] ==
+                sites['candidate']['sites'][0]['index_expr']),
+            identical_baseline_vs_candidate=(
+                sites['baseline']['sites'][0]['index_expr'] ==
+                sites['candidate']['sites'][0]['index_expr']),
+        ),
+        diff=dict(path='evidence/SPV-DIFF.txt', added=len(added), removed=len(removed),
+                  lines=[l for l in diff if l.startswith(('+', '-')) and
+                         not l.startswith(('+++', '---'))]),
+        callee_sequence_identical=calls['delta_base'] == calls['candidate'],
+        callee_sequence=calls['candidate'][-24:],
+        call_count=len(calls['candidate']),
+        local_coefficient_carrier=local,
+        carrier_dominance=dominance_check,
+    )
+    K.write_json(EVID / 'SPV-SUMMARY.json', summary)
+    assert summary['address_expr']['identical_baseline_vs_candidate'], 'address expression changed'
+    assert summary['address_expr']['identical_delta_vs_candidate'], 'address expression changed'
+    assert sites['baseline']['scales_stores'] == 0
+    assert sites['delta_base']['scales_stores'] == 0
+    assert sites['candidate']['scales_stores'] == 0
+
+    print(json.dumps({t: summary['arms'][t] for t in summary['arms']}, indent=2))
+    print('NC one_to_one baseline/candidate', nc['one_to_one_baseline_vs_candidate'],
+          'delta/candidate', nc['one_to_one_delta_vs_candidate'], 'float_NC_checked', nc['float_NC_checked'])
+    for tag in ('baseline', 'delta_base', 'candidate'):
+        s = sites[tag]
+        print('%-10s scales loads=%d stores=%d sites=%s' % (
+            tag, s['scales_loads'], s['scales_stores'],
+            [(x['block'], x['in_loop']) for x in s['sites']]))
+        for x in s['sites']:
+            print('    guards=%s loops=%s' % (
+                [(g['header'], g['condition']) for g in x['guards']],
+                [l['header'] for l in x['enclosing_loops']]))
+            print('    expr=%s' % x['index_expr_text'])
+        print('    loops=%s' % [(l['header'], l['header_consts'], l['body_ops']) for l in s['loops']])
+    print('address expr identical: baseline/candidate',
+          summary['address_expr']['identical_baseline_vs_candidate'],
+          'delta/candidate', summary['address_expr']['identical_delta_vs_candidate'])
+    print('diff added=%d removed=%d callee_identical=%s calls=%d' % (
+        len(added), len(removed), summary['callee_sequence_identical'], len(calls['candidate'])))
+    print('local f16 carriers candidate=%d delta_base=%d' % (
+        len(local['candidate']), len(local['delta_base'])))
+    for arm in ('candidate', 'delta_base'):
+        for v in local[arm]:
+            print('  %s %s loads=%s stores=%s' % (
+                arm, v['name'],
+                [(l['block'], l['count'], [g['condition'] for g in l['guards']])
+                 for l in v['loads']], v['stores']))
+    assert len(local['candidate']) == 1, local['candidate']
+    assert len(local['delta_base']) == 1, local['delta_base']
+    for arm in ('candidate', 'delta_base'):
+        lv = local[arm][0]
+        assert sum(l['count'] for l in lv['loads']) == 8, lv
+        assert len(lv['loads']) == 1, lv
+        assert lv['loads'][0]['in_loop'] is True, lv
+        gconds = lv['loads'][0]['guards']
+        assert any(g['condition'] and g['condition'][0] == 'OpULessThan' and
+                   ['const', 1024] in g['condition'] for g in gconds), gconds
+    assert sum(s['count'] for s in local['candidate'][0]['stores']) == 2, local['candidate'][0]
+    assert sum(s['count'] for s in local['delta_base'][0]['stores']) == 1, local['delta_base'][0]
+    # the candidate's defining store must sit in the same preheader block as the
+    # scales buffer read; the parent's defining store sits inside the loop
+    assert any(s['block'] == sites['candidate']['sites'][0]['block']
+               for s in local['candidate'][0]['stores'])
+
+
+if __name__ == '__main__':
+    main()

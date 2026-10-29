@@ -1,0 +1,366 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x=256) in;
+// vit-v1 INT8 attention (d119): ONLY the context epilogue below changes.
+// VIT_T8: `context` becomes an int8 view, VIT_W8: the weight binding also carries the
+// resident scale section (ws[5] = sT). QKV / `sk`,`sv` / score MMA / PV / den tree are
+// untouched FP16 - attention QK/PV in INT8 is v1_forbidden F3.
+#define VIT_W8 1
+#define VIT_A8 0
+#define VIT_T8 1
+#include "vit_common.glsl"
+#include "register_handoff.glsl"
+
+// ---------------------------------------------------------------------------
+// QK8+PV8 (card r12-r15-split16-vit): the attention QK and PV matrix multiplies are
+// i8 x i8 -> i32.  Everything the parent guarantees about *where* normalisation,
+// exponentials, the denominator, the padding and the reciprocal happen is untouched:
+// P still enters PV unnormalised and the reciprocal is still applied once per query
+// after the last key chunk.  Scales (all in-kernel, no new binding, no push word):
+//   sQ  per workgroup   absmax over this WG's 64 query tokens x 32 head dims / 127
+//   sK  per (WG, chunk) absmax over the chunk's 64 key tokens x 32 head dims / 127
+//   sV  per (WG, chunk) absmax over the chunk's 64 value tokens x 32 head dims / 127
+//   sP  per (query, chunk) absmax over the chunk's 64 P halfs for that query / 127
+// Every scale is constant along the K (reduction) axis of the MMA it dequantises, so a
+// scalar (sQ*sK) or a column-broadcast table (sV*sP[query]) is exact, not an
+// approximation of a rank-1 term.
+// ---------------------------------------------------------------------------
+
+// M19 ViT P/den register handoff, distinguished from the failed
+// direct-complete package (slow 33.68%) and built on the retained-KV parent
+// (S29, 8 sites): the proven sk/sv caches, the Q fragment reuse across key
+// chunks and the whole launch/dispatch/push/binding ABI are kept unchanged.
+//
+// What is removed: the sp[4096] P shared bridge and the den[64] shared cell
+// (16512 -> 8192 shared bytes). P never touches memory; the denominator is
+// reduced in-lane from the P fragments.
+//
+// Ownership merge (the one structural change): P for a 16-query block was
+// consumed by BOTH SGs of a pair (dims dg=0..15 and 16..31 of the context).
+// Registers cannot share across SGs, so the score SG now computes the P
+// fragments and the FULL 32-dim context (ctx0..ctx3); the partner SG only
+// helps fill sk/sv and retires through the same barriers. PV MMA count per
+// chunk is unchanged (4 dim fragments x 4 key pairs); score MMA count is
+// unchanged; sk/sv fill work is unchanged.
+//
+// Preserved contracts, verified line-by-line against the parent:
+//   - S^T = K.Q^T orientation and both score MMAs per 8-key block.
+//   - MC->MH narrowing before exp; vit_exp per half component.
+//   - The original 64-key half den tree: per query, part[d] = j-sequential
+//     sum of (P[16j+d]+P[16j+d+8]); even=((p0+p2)+p4)+p6; odd likewise;
+//     total=even+odd; den += total per key chunk. On the sealed CH map a
+//     lane holds one query column and one key parity, and ph0[ci]+ph1[ci]
+//     IS the original (d,d+8) pair, so the tree is reproduced in-lane with
+//     one shuffleXor(16) exchange of the odd partial.
+//   - Padding keys keep their exp(0) contribution inside the den tree and
+//     are zeroed in the P fragment only after den, exactly like the parent's
+//     post-den sp zeroing; the pad subtraction (p0.y-p0.x)*vit_exp(0) and
+//     the reciprocal 1/max(den,6.198883056640625e-05) stay once per query
+//     AFTER all chunks, applied to the context numerator (PV order intact:
+//     P is unnormalized into PV; reciprocal position unchanged).
+//   - Debug: lg (fp32, dbgf) and ph (half, dbg, AFTER exp like the parent) at
+//     the parent addresses via component stores; den/inv debug at the parent
+//     per-query address qg+lane with the parent's per-query liveness gate.
+//
+// v2 fixes vs v1 (GPU numeric gate FAIL 2bc68965/cb1617c4, both deterministic):
+//   1. inverse fragment fetch source lane (lane%16)*2 -> lane%16 (the only
+//      numeric root cause; 30/32 lanes fetched a wrong or dead-lane inverse).
+//   2. den/inv debug address qg+(lane>>1) -> qg+lane + per-query gate.
+//   3. debug exponentials stored before exp -> stored after exp (parent order).
+// The den tree, the padding exp(0) handling and nrh_join_rows_to_B were
+// verified elementwise against the parent on the sealed maps and are untouched.
+//
+// v3 (M05 merge) vs v2: ONLY the exponent transform form changes. The scalar
+// vit_exp loop over ph0/ph1 in the score loop is replaced by four paired
+// vit_exp2(f16vec2) calls per kb step (merged from
+// c5-alusupply/vit-attention-m05-expair-v1; vit_exp2 added to vit_common.glsl
+// verbatim). This resolves the pass conflict with the C5 M05 candidate (both
+// replace the same 8 vit-attention passes; the final composite can take one
+// core only). Everything else is byte-identical to v2:
+//   - 64-key original half den tree (part[c], even/odd, shuffleXor(16));
+//   - padding exp(0) subtraction stays a SCALAR vit_exp(0.0) once per query
+//     after all chunks (line "precise float16_t pad=...");
+//   - den tree order and the v2 inverse fragment lane mapping (lane%16);
+//   - nrh_join_rows_to_B, PV order, debug order (ph stored AFTER exp), ABI.
+// Bit identity of the paired form is re-derived for the v2 lane layout in
+// vit_common.glsl and the merge report; the paired transform is elementwise
+// per half component, so the sealed CH map (row=l/16+2*ci, col=l%16) does not
+// affect the per-element result.
+//
+// Barrier budget: parent 5 WG barriers per 64-key chunk + 2 extra; here 2 per
+// chunk (sk/sv publication, sk/sv WAR retirement) and none at the end.
+#define MH coopmat<float16_t,gl_ScopeSubgroup,8,16,gl_MatrixUseAccumulator>
+
+// Retained proven K/V cache (parent contract); sp[4096] and den[64] are gone.
+shared float16_t sk[2048],sv[2048];
+// QK8/PV8 operands.  sk8/sv8 hold the current 64-key chunk's K/V codes, q8 holds this
+// workgroup's 64 query codes (written once), p8 holds the chunk's P codes for all 64
+// queries (each score SG owns its own 16 columns, so no cross-SG P sharing exists).
+shared int8_t sk8[2048],sv8[2048],q8[2048],p8[4096];
+// PV8 dequant table: shPmf[(sg/2)*128 + r*16 + col] = sV*sP[col], identical on all 8
+// dim rows; one 8x16 float tile per score SG, loaded by address (no lane map assumed).
+shared float shPmf[512];
+shared uint shQMax,shKMax,shVMax;
+
+void main() {
+    uint tid=gl_LocalInvocationID.x,sg=gl_SubgroupID,lane=gl_SubgroupInvocationID;
+    uint q0=gl_WorkGroupID.x*64u,h=gl_WorkGroupID.y;
+    uint qg=(sg/2u)*16u,dg=(sg%2u)*16u;
+    bool score_owner=(sg%2u)==0u;
+    // Q fragments: B operands, loaded once per score SG, reused across every
+    // key chunk (the retained-KV contract; also the M19 Q/scale reuse basis).
+    // QK8: Q is staged once per workgroup as int8 codes (64 queries x 32 dims), which
+    // replaces the two f16 B fragments the parent re-read from qkv inside every score
+    // MMA.  All 256 threads run the two passes (the barriers below are workgroup-wide).
+    if(tid==0u) shQMax=0u;
+    barrier();
+    float qmx=0.0;
+    for(uint e=tid;e<2048u;e+=256u) {
+        uint t=q0+e/32u,d=h*32u+e%32u;
+        float16_t v=(t<pc.p0.x)?qkv[pc.p6.x+t*3072u+d]:float16_t(0.0);
+        qmx=max(qmx,abs(float(v)));
+    }
+    atomicMax(shQMax,floatBitsToUint(qmx));
+    barrier();
+    const float sQ=(shQMax==0u)?1.0:(uintBitsToFloat(shQMax)*(1.0/127.0));
+    for(uint e=tid;e<2048u;e+=256u) {
+        uint t=q0+e/32u,d=h*32u+e%32u;
+        float16_t v=(t<pc.p0.x)?qkv[pc.p6.x+t*3072u+d]:float16_t(0.0);
+        q8[e]=int8_t(vit_code(float(v),1.0/sQ));
+    }
+    barrier();
+    // Full 32-dim context on the score SG (see ownership merge above).
+    MC ctx0=MC(0.0),ctx1=MC(0.0),ctx2=MC(0.0),ctx3=MC(0.0);
+    // In-lane denominator: query qg+(lane>>1), key parity lane/16; only even
+    // lanes carry the authoritative total after the odd-partial exchange.
+    float16_t den=float16_t(0.0);
+    for(uint j0=0u;j0<pc.p0.y;j0+=64u) {
+        // sk/sv cache fill: unchanged addresses, unchanged zero padding.  The two
+        // chunk absmax publishers ride the same pass (one atomic per thread).
+        if(tid==0u) { shKMax=0u; shVMax=0u; }
+        barrier();
+        float kmx=0.0,vmx=0.0;
+        for(uint e=tid;e<2048u;e+=256u) {
+            uint t=j0+e/32u,d=h*32u+e%32u;
+            float16_t kv=t<pc.p0.x ? qkv[pc.p6.x+t*3072u+1024u+d] : float16_t(0.0);
+            float16_t vv=t<pc.p0.x ? qkv[pc.p6.x+t*3072u+2048u+d] : float16_t(0.0);
+            sk[e]=kv;sv[e]=vv;
+            kmx=max(kmx,abs(float(kv)));vmx=max(vmx,abs(float(vv)));
+        }
+        atomicMax(shKMax,floatBitsToUint(kmx));
+        atomicMax(shVMax,floatBitsToUint(vmx));
+        barrier();
+        // QK8/PV8: one quantiser pass for the chunk, from the just-published scales.
+        const float sK=(shKMax==0u)?1.0:(uintBitsToFloat(shKMax)*(1.0/127.0));
+        const float sV=(shVMax==0u)?1.0:(uintBitsToFloat(shVMax)*(1.0/127.0));
+        const float sQK=sQ*sK;
+        for(uint e=tid;e<2048u;e+=256u) {
+            sk8[e]=int8_t(vit_code(float(sk[e]),1.0/sK));
+            sv8[e]=int8_t(vit_code(float(sv[e]),1.0/sV));
+        }
+        barrier();
+        if(score_owner) {
+            // Four 16-key blocks; each block = two 8-key score fragments.
+            // part[c] is the parent's part[d] for d = lane/16 + 2c; the first
+            // pair is assigned directly (no zero add), exactly like the tree.
+            precise float16_t part[4];
+            // PV8: P is quantised once per (query, chunk), so this chunk's P fragments
+            // are held per lane until the 64-key max is known:
+            // [block][0..3] = ph0 components, [block][4..7] = ph1 components.
+            float16_t pcache[4][8];
+            float pmx=0.0;
+            bool first=true;
+            MB8 qf;
+            coopMatLoad(qf,q8,qg*32u,32u,CM);
+            for(uint kb=0u;kb<64u;kb+=16u) {
+                uint blk=kb>>4u;
+                // QK8: one int8 MMA per 8-key fragment (A = K codes 8x32, B = Q codes
+                // 32x16, K=32 = the whole head dim) replaces the parent's two f16 K16
+                // MMAs for the same fragment.  Orientation S^T = K.Q^T is unchanged.
+                AC8 lg0=AC8(0),lg1=AC8(0);
+                {
+                    MA8 kf;
+                    coopMatLoad(kf,sk8,kb*32u,32u,RM);
+                    lg0=coopMatMulAdd(kf,qf,lg0);
+                    coopMatLoad(kf,sk8,(kb+8u)*32u,32u,RM);
+                    lg1=coopMatMulAdd(kf,qf,lg1);
+                }
+                // One FP32 dequant by sQ*sK, then the parent's MC->MH narrowing.
+                MF8 f0=MF8(lg0),f1=MF8(lg1);
+                for(uint ci=0u;ci<f0.length();++ci) { f0[ci]=f0[ci]*sQK;f1[ci]=f1[ci]*sQK; }
+                MH ph0=MH(f0),ph1=MH(f1);
+                // Debug logits: same addresses/shape, now the dequantised f32 score
+                // (the parent stored the raw f32 accumulator; documented deviation).
+                if(pc.p0.w!=0u && q0+qg<pc.p0.x) {
+                    uint at=(h*pc.p0.x+q0+qg)*pc.p0.y+j0+kb;
+                    for(uint ci=0u;ci<lg0.length();++ci) {
+                        uvec2 rc=nrh_coord_C(ci);
+                        dbgf[pc.p6.z/2u+pc.p3.z+at+rc.y*pc.p0.y+rc.x]=f0[ci];
+                        dbgf[pc.p6.z/2u+pc.p3.z+at+8u+rc.y*pc.p0.y+rc.x]=f1[ci];
+                    }
+                }
+                // M05 paired exponent transform: verbatim, elementwise per half.
+                {f16vec2 e01=vit_exp2(f16vec2(ph0[0],ph0[1]));ph0[0]=e01.x;ph0[1]=e01.y;
+                 f16vec2 e23=vit_exp2(f16vec2(ph0[2],ph0[3]));ph0[2]=e23.x;ph0[3]=e23.y;
+                 f16vec2 f01=vit_exp2(f16vec2(ph1[0],ph1[1]));ph1[0]=f01.x;ph1[1]=f01.y;
+                 f16vec2 f23=vit_exp2(f16vec2(ph1[2],ph1[3]));ph1[2]=f23.x;ph1[3]=f23.y;}
+                if(pc.p0.w!=0u && q0+qg<pc.p0.x) {
+                    uint at=(h*pc.p0.x+q0+qg)*pc.p0.y+j0+kb;
+                    for(uint ci=0u;ci<ph0.length();++ci) {
+                        uvec2 rc=nrh_coord_CH(ci);
+                        dbg[pc.p6.z+pc.p3.w+at+rc.y*pc.p0.y+rc.x]=ph0[ci];
+                        dbg[pc.p6.z+pc.p3.w+at+8u+rc.y*pc.p0.y+rc.x]=ph1[ci];
+                    }
+                }
+                // Denominator: this 16-key block contributes, per query and key parity
+                // d, the original pair (P[kb+d]+P[kb+8+d]) - verbatim.
+                for(uint ci=0u;ci<4u;++ci) {
+                    precise float16_t pair=ph0[ci]+ph1[ci];
+                    part[ci]=first ? pair : part[ci]+pair;
+                }
+                first=false;
+                // Padding keys: keep exp(0) inside den, zero only the P fragment, verbatim.
+                for(uint ci=0u;ci<ph0.length();++ci) {
+                    if(j0+kb+lane/16u+2u*ci>=pc.p0.x) ph0[ci]=float16_t(0.0);
+                    if(j0+kb+8u+lane/16u+2u*ci>=pc.p0.x) ph1[ci]=float16_t(0.0);
+                }
+                // PV8: cache this block's P instead of joining it into a register B
+                // operand - the code cannot be formed before the 64-key max is known.
+                for(uint ci=0u;ci<4u;++ci) {
+                    pcache[blk][ci]=ph0[ci];
+                    pcache[blk][4u+ci]=ph1[ci];
+                    pmx=max(pmx,max(abs(float(ph0[ci])),abs(float(ph1[ci]))));
+                }
+            }
+            // Original even/odd tree: this lane's parity partials are
+            // part[0..3] for d = lane/16 + 2c; exchange the other parity's
+            // total once and add, even first.
+            precise float16_t mine=((part[0]+part[1])+part[2])+part[3];
+            f16vec2 ex=unpackFloat2x16(subgroupShuffleXor(packFloat2x16(f16vec2(mine,mine)),16u));
+            precise float16_t total=(lane/16u==0u) ? mine+ex.x : ex.x+mine;
+            if(lane/16u==0u) den=den+total;
+            // PV8 staging: per (query, chunk) P scale.  A lane holds one query column
+            // and one key parity, so the parity exchange over lane^16 closes the max
+            // over the block's 8 key rows; the 4 blocks were accumulated in pmx.
+            float pmx_all=max(pmx,uintBitsToFloat(subgroupShuffleXor(floatBitsToUint(pmx),16u)));
+            float pinv=(pmx_all>0.0)?(127.0/pmx_all):0.0;
+            float pstep=(pmx_all>0.0)?(pmx_all*(1.0/127.0)):1.0;
+            for(uint blk=0u;blk<4u;++blk) {
+                uint base=lane/16u,c=lane%16u;
+                for(uint ci=0u;ci<4u;++ci) {
+                    uint r=base+2u*ci;
+                    p8[(blk*16u+r)*64u+qg+c]=int8_t(vit_code(float(pcache[blk][ci]),pinv));
+                    p8[(blk*16u+8u+r)*64u+qg+c]=int8_t(vit_code(float(pcache[blk][4u+ci]),pinv));
+                }
+            }
+            if(lane<16u)
+                for(uint r=0u;r<8u;++r) shPmf[(sg/2u)*128u+r*16u+lane]=sV*pstep;
+            // PV writer and reader are the same subgroup (this SG's 16 query columns).
+            subgroupMemoryBarrierShared();subgroupBarrier();
+            // PV8: C[8 dims x 16 queries] = V^T codes (8x32) x P codes (32x16); K=64 as
+            // two K32 slices in the parent's key order (keys 0..31 then 32..63), one
+            // (sV*sP) dequant per slice, accumulated into the parent's f32 context.
+            MF8 sfm; coopMatLoad(sfm,shPmf,(sg/2u)*128u,16u,RM);
+            for(uint g=0u;g<2u;++g) {
+                MB8 pb;
+                coopMatLoad(pb,p8,32u*g*64u+qg,64u,RM);
+                for(uint f=0u;f<4u;++f) {
+                    MA8 va;
+                    coopMatLoad(va,sv8,(32u*g)*32u+f*8u,32u,CM);
+                    AC8 acc=coopMatMulAdd(va,pb,AC8(0));
+                    MF8 d=MF8(acc);
+                    for(uint ci=0u;ci<d.length();++ci) d[ci]=d[ci]*sfm[ci];
+                    if(f==0u) { for(uint ci=0u;ci<d.length();++ci) ctx0[ci]=ctx0[ci]+d[ci]; }
+                    else if(f==1u) { for(uint ci=0u;ci<d.length();++ci) ctx1[ci]=ctx1[ci]+d[ci]; }
+                    else if(f==2u) { for(uint ci=0u;ci<d.length();++ci) ctx2[ci]=ctx2[ci]+d[ci]; }
+                    else { for(uint ci=0u;ci<d.length();++ci) ctx3[ci]=ctx3[ci]+d[ci]; }
+                }
+            }
+        }
+        // WAR: next chunk's sk/sv fill must wait for this chunk's reads.
+        barrier();
+    }
+    if(score_owner && q0+qg<pc.p0.x) {
+        // Once per query: padding subtraction, original reciprocal, debug.
+        // Lane l<16 holds query qg+l (sealed CH col = l%16), so the debug
+        // address is qg+lane, gated per query exactly like the parent's
+        // q0+tid<pc.p0.x (v1 wrote qg+(lane>>1): 16 lanes onto 8 colliding
+        // addresses, queries 8..15 never written).
+        if(lane/16u==0u) {
+            precise float16_t pad=float16_t(float(pc.p0.y-pc.p0.x)*float(vit_exp(float16_t(0.0))));
+            den=den-pad;
+            precise float16_t inv=float16_t(1.0/max(float(den),6.198883056640625e-05));
+            uint at=h*pc.p0.x+q0+qg+lane;
+            if(pc.p0.w!=0u && q0+qg+lane<pc.p0.x) { dbg[pc.p6.z+pc.p4.x+at]=den; dbg[pc.p6.z+pc.p4.z+at]=inv; }
+            den=inv;
+        }
+        // Inverse as an MH fragment: comp ci of lane l must be inv[qg+l%16]
+        // (the parent coopMatLoad(den,qg,0,RM) column map). On the sealed CH
+        // map col = lane%16, so lane m (m<16) holds query qg+m's reciprocal
+        // and the source lane is exactly lane%16 (v1 fetched (lane%16)*2,
+        // which reads query 2m for m<8 and a den==0 dead lane -> inv=16132
+        // for m>=8; 30 of 32 lanes were wrong).
+        uint inv_bits=packFloat2x16(f16vec2(den,den));
+        f16vec2 iw=unpackFloat2x16(subgroupShuffle(inv_bits,lane%16u));
+        MH inverse;
+        for(uint ci=0u;ci<inverse.length();++ci) inverse[ci]=iw.x;
+        MH num0=MH(ctx0),num1=MH(ctx1),num2=MH(ctx2),num3=MH(ctx3);
+        if(pc.p0.w!=0u) {
+            uint at=pc.p6.z+pc.p4.y+(q0+qg)*1024u+h*32u;
+            for(uint ci=0u;ci<num0.length();++ci) {
+                uvec2 rc=nrh_coord_CH(ci);
+                dbg[at+rc.y*1024u+0u+rc.x]=num0[ci];
+                dbg[at+rc.y*1024u+8u+rc.x]=num1[ci];
+                dbg[at+rc.y*1024u+16u+rc.x]=num2[ci];
+                dbg[at+rc.y*1024u+24u+rc.x]=num3[ci];
+            }
+        }
+        precise MH out0=num0*inverse;
+        precise MH out1=num1*inverse;
+        precise MH out2=num2*inverse;
+        precise MH out3=num3*inverse;
+        uint at=pc.p6.y+(q0+qg)*1024u+h*32u;
+        // vit-v1 INT8 epilogue: the four FP16 stores above become one requant +
+        // int8 store per fragment. Elementwise MH(8x16 acc) -> MF8 -> vit_code ->
+        // MQ8(8x16 int8 acc): identical shape/use, so the lane map cancels and no
+        // B580 map assumption enters. `context` is an int8 VIEW of the very same
+        // buffer/offset/byte-count (vit_common.glsl VIT_T8); addresses at/at+8/16/24
+        // and stride 1024 keep their numeric value because every base in push p6 is 0
+        // and the element step is 1 byte on both sides of this rewrite.
+        // Scale: invT = ws[10] (127/absmax; resident, packed with the block weights; the push word 30
+        // transport of the spec is NOT usable here: the plan delta for this candidate is
+        // restricted to the four PASS rows, so the PUSH rows must stay byte-identical).
+        float invT=ws[10];
+        {
+            MF8 f=MF8(out0);
+            for(uint ci=0u;ci<f.length();++ci)f[ci]=vit_code(f[ci],invT);
+            MQ8 q=MQ8(f);
+            coopMatStore(q,context,at,1024u,CM);
+        }
+        {
+            MF8 f=MF8(out1);
+            for(uint ci=0u;ci<f.length();++ci)f[ci]=vit_code(f[ci],invT);
+            MQ8 q=MQ8(f);
+            coopMatStore(q,context,at+8u,1024u,CM);
+        }
+        {
+            MF8 f=MF8(out2);
+            for(uint ci=0u;ci<f.length();++ci)f[ci]=vit_code(f[ci],invT);
+            MQ8 q=MQ8(f);
+            coopMatStore(q,context,at+16u,1024u,CM);
+        }
+        {
+            MF8 f=MF8(out3);
+            for(uint ci=0u;ci<f.length();++ci)f[ci]=vit_code(f[ci],invT);
+            MQ8 q=MQ8(f);
+            coopMatStore(q,context,at+24u,1024u,CM);
+        }
+    }
+}

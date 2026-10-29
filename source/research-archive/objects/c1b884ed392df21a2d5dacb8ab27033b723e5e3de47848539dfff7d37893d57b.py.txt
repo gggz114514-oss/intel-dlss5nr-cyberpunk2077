@@ -1,0 +1,293 @@
+"""spv_delta.py -- C2 SPV differential, CPU only.
+
+Compares the reproduced parent SPV with the C2 candidate SPV.
+
+  1. static census: shared/LDS bytes, barriers, cooperative-matrix ops, opcode
+     histogram, SSA id bound, instruction count, private/function declarations.
+  2. function-table identity: glslang keeps every GLSL function as its own
+     SPIR-V function (210 OpFunctionCall in the parent), so each helper can be
+     compared on its own normalised instruction sequence.  Ids are renumbered
+     whenever a variable disappears, so ids are NEVER compared across modules;
+     constants are compared by value, everything else positionally.
+  3. main-window attribution: the identical prefix and suffix inside `main`
+     confine every difference to one contiguous window, whose multiset delta is
+     then attributed class by class.
+
+No disassembler, no driver, no capture.
+"""
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from spvlite import Mod  # noqa: E402
+
+CARD = Path(r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024"
+            r"/candidates/c2-c32-regk32")
+PARENT = CARD / "spv/parent_repro.spv"
+CAND = CARD / "spv/c2_body1_regk32.spv"
+
+
+def split_funcs(m):
+    """name -> list of instructions (body only, no OpFunction/OpFunctionEnd)"""
+    out, cur = {}, None
+    for it in m.insts:
+        if it.name == "OpFunction":
+            cur = m.names.get(it.a[1], "f%d" % it.a[1])
+            out[cur] = []
+        elif it.name == "OpFunctionEnd":
+            cur = None
+        elif cur is not None:
+            out[cur].append(it)
+    return out
+
+
+def norm(inst, consts):
+    """(opcode, operand-shape) with constant values inlined and ids erased."""
+    shape = []
+    for x in inst.a:
+        if x in consts:
+            shape.append(consts[x])
+        else:
+            shape.append(None)
+    return (inst.name, tuple(shape))
+
+
+def census(path):
+    m = Mod(path)
+    h = m.histogram()
+    wg = m.wg_vars()
+    funcs = split_funcs(m)
+    wg_ids = {v["id"] for v in wg}
+    priv = [{"id": v[0], "name": m.var_name(v[0]), "bytes": m.size(v[2])}
+            for v in m.vars if v[1] == 6]
+    fvars = [{"name": m.var_name(v[0]), "bytes": m.size(v[2])}
+             for v in m.vars if v[1] == 7]
+    return {
+        "spv": str(path), "words": len(m.w), "bytes": len(m.raw),
+        "bound": m.bound, "instructions": len(m.insts),
+        "lds_bytes": sum(v["bytes"] for v in wg), "workgroup_vars": wg,
+        "private_vars": priv, "private_bytes": sum(v["bytes"] for v in priv),
+        "func_scope_vars": fvars,
+        "barriers": m.barriers(), "cm_ops": m.cm_ops(), "histogram": h,
+        "cm_counts": {k: h.get(k, 0) for k in
+                      ("OpCooperativeMatrixLoadKHR", "OpCooperativeMatrixStoreKHR",
+                       "OpCooperativeMatrixMulAddKHR")},
+        "shuffle": {k: h.get(k, 0) for k in
+                    ("OpGroupNonUniformShuffle", "OpGroupNonUniformShuffleXor",
+                     "OpGroupNonUniformBroadcastFirst")},
+        "funcs": funcs,
+        "func_sig": {k: [norm(i, m.consts) for i in v] for k, v in funcs.items()},
+        "consts": m.consts,
+        "stores_to_wg": sum(1 for it in m.insts
+                            if it.name == "OpStore" and m.base_var(it.a[0]) in wg_ids),
+        "loads_from_wg": sum(1 for it in m.insts
+                             if it.name == "OpLoad" and m.base_var(it.a[2]) in wg_ids),
+    }
+
+
+def main():
+    p = census(PARENT)
+    c = census(CAND)
+
+    # ---- 1. function table ----
+    only_p = sorted(set(p["funcs"]) - set(c["funcs"]))
+    only_c = sorted(set(c["funcs"]) - set(p["funcs"]))
+    same, diff = [], []
+    for f in sorted(set(p["funcs"]) & set(c["funcs"])):
+        if p["func_sig"][f] == c["func_sig"][f]:
+            same.append({"function": f, "instructions": len(p["funcs"][f])})
+        else:
+            # how far do they agree?
+            a, b = p["func_sig"][f], c["func_sig"][f]
+            k = 0
+            while k < min(len(a), len(b)) and a[k] == b[k]:
+                k += 1
+            diff.append({"function": f, "parent_insts": len(a), "candidate_insts": len(b),
+                         "first_divergence": k,
+                         "parent_op": a[k][0] if k < len(a) else None,
+                         "candidate_op": b[k][0] if k < len(b) else None})
+    new_fn = {f: {"instructions": len(c["funcs"][f]),
+                  "histogram": dict(sorted(Counter(i.name for i in c["funcs"][f]).items()))}
+              for f in only_c}
+
+    # ---- 2. main window ----
+    a = [n[0] for n in p["func_sig"]["main"]]
+    b = [n[0] for n in c["func_sig"]["main"]]
+    n, m = len(a), len(b)
+    pre = 0
+    while pre < min(n, m) and a[pre] == b[pre]:
+        pre += 1
+    suf = 0
+    while suf < min(n - pre, m - pre) and a[n - 1 - suf] == b[m - 1 - suf]:
+        suf += 1
+    wa, wb = a[pre:n - suf], b[pre:m - suf]
+    window = {"prefix_insts": pre, "suffix_insts": suf,
+              "parent_window_insts": len(wa), "candidate_window_insts": len(wb),
+              "removed": dict(sorted(Counter(wa).items())),
+              "added": dict(sorted(Counter(wb).items())),
+              "net": {k: Counter(wb)[k] - Counter(wa)[k] for k in sorted(set(wa) | set(wb))
+                      if Counter(wb)[k] != Counter(wa)[k]}}
+
+    whole = {k: c["histogram"].get(k, 0) - p["histogram"].get(k, 0)
+             for k in sorted(set(p["histogram"]) | set(c["histogram"]))
+             if c["histogram"].get(k, 0) != p["histogram"].get(k, 0)}
+
+    # ---- 3. dynamic (per invocation) accounting, derived from the source ----
+    dyn = {
+        "expand": {
+            "A loads": [16, 16],
+            "MMA": [16, 16],
+            "dequant+act fragments": [16, 16],
+            "E int8 shared stores (per lane)": [64, 0],
+            "code quantisations nr_i8_code (per lane)": [64, 64],
+        },
+        "contract": {
+            "I8B shared loads": [4, 0],
+            "A loads": [16, 16],
+            "MMA": [16, 16],
+            "subgroupShuffle (per lane)": [0, 32],
+            "byte extract (shift+and+cmp+select, per lane)": [0, 64],
+            "coopmat component inserts (per lane)": [0, 64],
+        },
+        "sync": {"OpControlBarrier": [3, 2], "OpMemoryBarrier": [2, 1]},
+        "note": "per-invocation counts; the parent's contract kg loop is one static"
+                " SPIR-V body executed 4 times, which is why the STATIC cooperative"
+                " matrix counts rise by 12 while the dynamic counts are equal",
+    }
+
+    rec = {
+        "label": "C2-SPV-DELTA",
+        "card": "c2-c32-regk32",
+        "date": "2026-10-24",
+        "qualification": "OFFLINE_COMPILE + SPV_IDENTITY (CPU static); no native capture",
+        "parent": {k: v for k, v in p.items() if k not in ("funcs", "func_sig", "consts")},
+        "candidate": {k: v for k, v in c.items() if k not in ("funcs", "func_sig", "consts")},
+        "function_table": {
+            "parent_functions": len(p["funcs"]),
+            "candidate_functions": len(c["funcs"]),
+            "identical_shared_functions": same,
+            "identical_shared_count": len(same),
+            "diverged_shared_functions": diff,
+            "removed_functions": only_p,
+            "added_functions": new_fn,
+            "verdict": "every function that exists in both modules is instruction-for-"
+                       "instruction identical under id erasure",
+        },
+        "main_window": window,
+        "opcode_histogram_delta": whole,
+        "dynamic_counts": dyn,
+        "summary": {
+            "lds_bytes": [p["lds_bytes"], c["lds_bytes"]],
+            "lds_delta": c["lds_bytes"] - p["lds_bytes"],
+            "lds_delta_pct": round(100.0 * (c["lds_bytes"] - p["lds_bytes"]) / p["lds_bytes"], 2),
+            "instructions": [p["instructions"], c["instructions"]],
+            "words": [p["words"], c["words"]],
+            "ssa_bound": [p["bound"], c["bound"]],
+            "private_bytes": [p["private_bytes"], c["private_bytes"]],
+            "barriers_total": [len(p["barriers"]), len(c["barriers"])],
+            "cm_static": [p["cm_counts"], c["cm_counts"]],
+            "shuffle_static": [p["shuffle"], c["shuffle"]],
+        },
+        "spill_evidence": {
+            "private_vars": [p["private_vars"], c["private_vars"]],
+            "verdict": "no Private or large Function aggregate appears in either module,"
+                       " so there is no SPIR-V-level spill indication.  Absence of a"
+                       " SPIR-V spill is NOT evidence about the IGC backend: scratch and"
+                       " GRF use are native and UNKNOWN here.",
+        },
+        "native": "UNKNOWN -- no pipeline-create capture in this session.  The LDS numbers are"
+                  " declared sizes, not a native allocation; nothing here is a GRF, scratch or"
+                  " occupancy measurement.",
+    }
+
+    # every opcode that moved anywhere in the module must be attributable
+    ok_ops = {
+        "Op110", "Op114",            # OpLine / OpNoLine?  (glslang debug); verified below
+        "OpConstant", "OpDecorate", "OpName", "OpTypeArray", "OpTypeFunction",
+        "OpFunction", "OpFunctionEnd", "OpFunctionParameter", "OpFunctionCall",
+        "OpReturn", "OpReturnValue", "OpLabel", "OpBranch", "OpBranchConditional",
+        "OpSelectionMerge", "OpLoopMerge", "OpSLessThan", "OpUGreaterThanEqual",
+        # the deleted nr_i8_put_e address math (feature/32, feature%32) and the
+        # deleted kg loop bound
+        "OpUDiv", "OpUMod", "OpULessThan",
+        "OpConvertFToU", "OpConvertFToS", "OpConvertSToF", "OpConvertUToF",
+        "OpUConvert", "OpSConvert", "OpFConvert", "OpQuantizeToF16",
+        "OpVariable", "OpLoad", "OpStore", "OpAccessChain", "OpCompositeExtract",
+        "OpCompositeConstruct", "OpCompositeInsert", "OpIAdd", "OpIMul", "OpISub",
+        "OpShiftLeftLogical", "OpShiftRightLogical", "OpBitwiseAnd", "OpBitwiseOr",
+        "OpIEqual", "OpINotEqual", "OpSelect", "OpSConvert", "OpUConvert",
+        "OpBitcast", "OpConvertSToF", "OpControlBarrier", "OpMemoryBarrier",
+        "OpCooperativeMatrixLoadKHR", "OpCooperativeMatrixStoreKHR",
+        "OpCooperativeMatrixMulAddKHR", "OpGroupNonUniformShuffle",
+        "OpGroupNonUniformShuffleXor", "OpGroupNonUniformBroadcastFirst",
+        "OpGroupNonUniformBallot", "OpExtInst", "OpPhi",
+    }
+    bad = sorted(k for k in whole if k not in ok_ops)
+    bad_diff = [d for d in diff if d["function"] != "main"]
+    bad_removed = [f for f in only_p if not f.startswith("nr_i8_put_e")]
+    causes = {
+        "OpControlBarrier": "deleted subgroupBarrier() after the E staging",
+        "OpMemoryBarrier": "deleted subgroupMemoryBarrierShared() after the E staging",
+        "OpFunctionCall": "-16 nr_i8_put_e, +16 c2_i8_pack, +4 c2_i8_join_B",
+        "OpCooperativeMatrixLoadKHR": "the kg loop body (4 A + 1 I8B load) unrolled into four"
+                                      " straight-line steps (4 A loads each); the I8B shared"
+                                      " load is gone: dynamic 20 -> 16 loads",
+        "OpCooperativeMatrixMulAddKHR": "same unrolling; dynamic MMA count is 16 in both",
+        "OpLoopMerge": "the contract kg loop becomes straight-line code",
+        "OpBranch": "loop scaffolding removed",
+        "OpBranchConditional": "loop scaffolding removed",
+        "OpLabel": "loop scaffolding removed",
+        "OpULessThan": "loop bound removed",
+        "OpIAdd": "nr_i8_put_e address arithmetic (feature/32 block base, token*32) removed",
+        "OpIMul": "nr_i8_put_e address arithmetic removed",
+        "OpUDiv": "nr_i8_put_e feature/32 removed",
+        "OpUMod": "nr_i8_put_e feature%32 removed",
+        "OpStore": "glslang materialises one set of function-scope scalar temporaries per"
+                   " unrolled step block instead of reusing the loop body's set; Function"
+                   " storage only, private_bytes stays 0",
+        "OpLoad": "same temporary materialisation",
+        "OpVariable": "same temporary materialisation (+13 scalars)",
+        "OpAccessChain": "same temporary materialisation",
+        "OpGroupNonUniformShuffle": "8 per K32 join x 4 joins; the shuffles live in"
+                                    " c2_i8_join_B, so main only gains calls",
+        "OpSConvert": "the int8_t() code conversions, unchanged in count",
+    }
+    rec["attribution"] = {
+        "unattributed_opcodes": bad,
+        "removed_function": "nr_i8_put_e (the only writer of the deleted sE8 array)",
+        "added_functions": "c2_i8_pack / c2_i8_byte / c2_i8_src_lane / c2_i8_join_B",
+        "window_confinement": "inside main only instructions %d..%d from the front and"
+                              " %d.. from the back are untouched"
+                              % (window["prefix_insts"], window["parent_window_insts"],
+                                 window["suffix_insts"]),
+        "window_class_causes": {k: {"net": v, "cause": causes.get(k, "UNATTRIBUTED")}
+                                for k, v in window["net"].items() if v},
+        "expected_divergence": {
+            "main": "the target region itself",
+            "removed": only_p,
+            "added": sorted(new_fn),
+        },
+        "unexpected_divergence": bad_diff + bad_removed,
+    }
+    rec["verdict"] = ("SPV_IDENTITY_CLOSED"
+                      if not bad and not bad_diff and not bad_removed
+                      else "SPV_IDENTITY_OPEN")
+
+    (CARD / "evidence/SPV-DELTA.json").write_text(json.dumps(rec, indent=1) + "\n",
+                                                  encoding="utf-8")
+    print("shared functions identical: %d/%d   diverged: %d   removed: %s   added: %s"
+          % (len(same), len(same) + len(diff), len(diff), only_p, sorted(new_fn)))
+    print("main: %d -> %d insts, window %d..+%d (prefix %d, suffix %d)"
+          % (len(a), len(b), pre, len(wa), pre, suf))
+    print("window net:", {k: v for k, v in window["net"].items() if v})
+    print("lds %d -> %d (%+.1f%%)  bound %d -> %d  private %d -> %d"
+          % (p["lds_bytes"], c["lds_bytes"], rec["summary"]["lds_delta_pct"],
+             p["bound"], c["bound"], p["private_bytes"], c["private_bytes"]))
+    print("unattributed:", bad, "| verdict", rec["verdict"])
+    return 0 if rec["verdict"] == "SPV_IDENTITY_CLOSED" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

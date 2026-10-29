@@ -1,0 +1,117 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,re,shlex
+B=Path('@NR_WORKSPACE@');A=B/'work/codex-astra-fp16-int8-audit-20261024';R=Path(__file__).resolve().parent
+P=A/'c32-stream-balanced-20261025/f20-score-owner';INC=B/'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1/source'
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def ident(p):return dict(path=str(p.resolve()),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def read(p):return json.loads(p.read_text(encoding='utf-8-sig'))
+def save(p,x):p.write_text(json.dumps(x,indent=2),encoding='utf-8')
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,encoding='utf-8',errors='replace');assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+def region(m,name):
+ names={}
+ for op,ops,*_ in m.instructions:
+  if op==5:names[ops[0]]=b''.join(int(w).to_bytes(4,'little') for w in ops[1:]).split(bytes([0]))[0].decode()
+ fid=next(k for k,v in names.items() if v.startswith(name+'('))
+ return next(r for r in ST.function_regions(m) if m.instructions[r[0]][1][1]==fid)
+def rids(m,reg):return {ST.result_id_of(m.instructions[i][0],m.instructions[i][1]) for i in reg}
+def vmuls(m):
+ ids=m.id_to_instruction();return {rid for rid in ST.no_contraction_ids(m) if ids[rid][0]==133 and ids.get(ids[rid][1][0],(0,[]))[0]==23}
+def manifests(d,plan,spvs):
+ for kind in ['GATES','NATIVE','RESOURCES','ORDINARY']:
+  t=read(P/f'LUNA-{kind}.json');t['output_root']=str(d);t['identities']=[x for x in t['identities'] if not x['path'].endswith('.spv')]+[ident(p) for p in spvs]
+  if kind=='ORDINARY':
+   proto=t['jobs'][0];jobs=[]
+   for pair,order in enumerate([['parent','candidate'],['candidate','parent'],['parent','candidate']]):
+    for arm in order:
+     j=json.loads(json.dumps(proto));j.update(id=f'ordinary-{pair}-{arm}',pair=pair,candidate=arm);jobs.append(j)
+   t['jobs']=jobs
+  for j in t['jobs']:
+   if kind!='ORDINARY':j['id']=kind.lower()+'-'+d.name+('-'+j['mode'] if kind=='GATES' else '')
+   jp=P/'plan.txt' if kind=='ORDINARY' and j['candidate']=='parent' else plan
+   j['plan']=ident(jp);j['runner_output']=str(d/'run'/j['id']);a=j['argv'];a[a.index('--plan')+1]=str(jp);a[a.index('--out')+1]=j['runner_output']
+   if kind=='NATIVE':
+    a[a.index('--profile_dir')+1]=j['id'];a[a.index('--output_dir')+1]=str(d/'captures');a[a.index('--msg_file')+1]=str(d/'native.log');j['capture_output']=str(d/'captures'/j['id'])
+  t['rules']=['GPU execution requires explicit main authorization per stage. Gates then native; main reviews before resources/ordinary. Unique lock serial, fresh outputs, all samples, no retries after nongold.']
+  save(d/f'LUNA-{kind}.json',t)
+families=[('body',A/'c32-feed-owner-20261025/kv-tile'),('f01',A/'c32-entry-chain-20261025/f01-residual'),('f2',A/'c32-entry-chain-20261025/f2-direct')]
+mode=sys.argv[1]
+if mode=='root':targets=[('root-'+name,p,'root') for name,p in families]
+elif mode=='pairs':targets=[('f20-row-pairs',A/'c32-main-c02-20261026/direct-norm','pairs')]
+elif mode=='remaining':targets=[('body-pv-den-overlap',families[0][1],'pv'),('body-act-contract-overlap',families[0][1],'act'),('f01-feature-packed',families[1][1],'features')]
+else:raise ValueError(mode)
+for name,parent,kind in targets:
+ d=R/name;d.mkdir(parents=True,exist_ok=True);(d/'run').mkdir(exist_ok=True)
+ s=(parent/'candidate.comp').read_text(encoding='utf-8-sig');pm=ST.Module(parent/'candidate.spv')
+ if kind=='root':
+  start=s.index('f16vec2 full_norm(');end=s.index('{',start);depth=1;end+=1
+  while depth:
+   depth+=(s[end]=='{')-(s[end]=='}');end+=1
+  h=s[start:end]
+  for mask in [8,4,2,1]:
+   old=f'bool lower=(col&{mask}u)==0u; q=(lower?q:peer.x)+(lower?peer.x:q); k=(lower?k:peer.y)+(lower?peer.y:k);'
+   assert h.count(old)==1;h=h.replace(old,'q=q+peer.x; k=k+peer.y;')
+  h=h.replace('return f16vec2(', 'f16vec2 root=unpackFloat2x16(subgroupShuffle(packFloat2x16(f16vec2(q,k)),gl_SubgroupInvocationID&16u));q=root.x;k=root.y;\nreturn f16vec2(',1)
+  s=s[:start]+h+s[end:]
+  original=[('leaf',i) for i in range(16)];candidate=original[:]
+  for mask in [8,4,2,1]:
+   original=[('add',original[i&~mask],original[i|mask]) for i in range(16)]
+   candidate=[('add',candidate[i],candidate[i^mask]) for i in range(16)]
+  assert all(x==candidate[0] for x in original)
+  mechanism='Only root lane contributes the final norm sum; dead intermediate upper branches may reverse operands, but consumed root tree is symbolically identical. Broadcast root once. Squares/c15FMA/max/rsqrt/half scaling unchanged. Remove16 scalar select expressions per full_norm call; add one packed root shuffle. No shared/barrier/weight changes.'
+ elif kind=='pairs':
+  a=s.index('        if(region<2u) {');b=s.index('        coopMatStore(half0',a)
+  block='        if(region<2u) {\n            float16_t sc=float16_t(fb[uint(pc.p2.z)]);\n'
+  for ci in [0,2]:
+   block+='            {\n                f16vec2 n=full_norm(half0['+str(ci)+'],half1['+str(ci)+'],half0['+str(ci+1)+'],half1['+str(ci+1)+']);\n'
+   for idx,coef in [(ci,'x'),(ci+1,'y')]:
+    block+='                {\n                    precise f16vec2 scaled=f16vec2(half0['+str(idx)+'],half1['+str(idx)+'])*f16vec2(n.'+coef+');\n                    if(region==0u) scaled=scaled*f16vec2(sc);\n                    half0['+str(idx)+']=scaled.x;half1['+str(idx)+']=scaled.y;\n                }\n'
+   block+='            }\n'
+  block+='        }\n';s=s[:a]+block+s[b:]
+  mechanism='Pair independent component rows (0,1) and (2,3) in the two half channels of the accepted full_norm. Four duplicate-input calls become two useful dual-tree calls per Q/K projection. Ordered trees and scale narrowing unchanged; XOR exchanges32->16 per WG/SG projection sequence at source. No additional persistent fragments: half0/1 already hold all4 components. Both outputs used; no Q/K weight duplication.'
+ elif kind=='pv':
+  anchor='if(debug) coopMatStore(p03,dbg,14336u+(t0+0u)*64u+48u,64u,LROW);'
+  assert s.count(anchor)==1
+  # Move one already-ready full M8x16 PV MMA ahead of the other M8 tile's den.
+  s=s.replace(anchor,anchor+'\nNRH_C tc00=NRH_C(0.0);\nNRH_B pv_early_b;coopMatLoad(pv_early_b,shV,0u,16u,LROW);\n{NRH_A ready=nrh_to_A(p00);tc00=coopMatMulAdd(ready,pv_early_b,tc00);}')
+  assert s.count('NRH_C tc00=NRH_C(0.0);')==2
+  pos=s.index('NRH_C tc00=NRH_C(0.0);',s.index('NRH_C tc00=NRH_C(0.0);')+1);s=s[:pos]+s[pos:].replace('NRH_C tc00=NRH_C(0.0);\n','',1)
+  old='NRH_B b;coopMatLoad(b,shV,0u,16u,LROW);\ntc00=coopMatMulAdd(a0,b,tc00);\ntc10=coopMatMulAdd(a1,b,tc10);';assert s.count(old)==1;s=s.replace(old,'tc10=coopMatMulAdd(a1,pv_early_b,tc10);')
+  mechanism='C04/C05: first M8 tile is fully normalized before second tile den. Move its first PV MMA before second den, retain the exact existing V tile for its second reader. All denominator trees and each PV accumulator K sequence unchanged. Zero extra V loads/weight reads/barriers/shuffles; extra logical live tc00(16B/lane)+B(16B/lane) across second den. Driver scratch/native scheduling decides admissibility; no claim of exposed-time overlap from source alone.'
+ elif kind=='act':
+  for k in range(8):
+   old=f'{{\nNRH_B w; coopMatLoad(w,wb,uint(pc.p1.y)+{k*256}u,16u,LROW);\nny00=coopMatMulAdd(ea0,w,ny00); ny10=coopMatMulAdd(ea1,w,ny10);\n}}';assert s.count(old)==1
+   anchor=f'if(debug) coopMatStore(e1,dbg,t0*128u+{1024+k*16}u,128u,LROW);';assert s.count(anchor)==1
+   s=s.replace(anchor,anchor+f'\nNRH_B early_w;coopMatLoad(early_w,wb,uint(pc.p1.y)+{k*256}u,16u,LROW);\nny00=coopMatMulAdd(ea0,early_w,ny00);')
+   s=s.replace(old,'ny10=coopMatMulAdd(ea1,early_w,ny10);')
+  mechanism='C06: narrow second expand accumulator before loading the first contract weight. Consume ready first-row activation in ny00 before second-row activation. Same weight reused by ny10 afterwards; no duplicate load or extra accumulator, original K order unchanged. One16B/lane B tile spans four second-row activation evaluations. Native must show a changed issue order; scratch must stay zero.'
+ elif kind=='features':
+  old='float values[16]=float[16](0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,\n                               0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);';assert s.count(old)==1
+  s=s.replace(old,'uint packed[8]=uint[8](0u,0u,0u,0u,0u,0u,0u,0u);')
+  start=s.index('        values[0]=noise.x;');end=s.index('    }',start)
+  vals=['noise.x','noise.y','noise.z','nrf_ctl(6)','float(cn.x)','float(cn.y)','float(cn.z)','float(hn.x)','float(hn.y)','float(hn.z)','nrf_ctl(0)','nrf_ctl(1)','nrf_ctl(2)','nrf_ctl(3)','nrf_ctl(4)','0.0']
+  new=''.join(f'        packed[{i}]=packFloat2x16(f16vec2(float16_t({vals[2*i]}),float16_t({vals[2*i+1]})));\n' for i in range(8));s=s[:start]+new+s[end:]
+  for i in range(8):
+   old=f'uint u{i}=packFloat2x16(f16vec2(float16_t(values[{2*i}]),float16_t(values[{2*i+1}])));';assert s.count(old)==1;s=s.replace(old,f'uint u{i}=packed[{i}];')
+  assert 'values[' not in s
+  mechanism='C07: feature producer transports8 packed half pairs across lane<16 join instead of16 f32 values. Identical per-feature f32 expression then half rounding; no arithmetic consumes values between old store and old packing. Exact B source lane=l/2 and parity unchanged. Logical join payload64->32B/lane; shResidual preserved. Native may already perform this narrowing, so measure actual difference rather than claiming physical savings.'
+ src=d/'candidate.comp';spv=d/'candidate.spv';src.write_text(s,encoding='utf-8');run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(INC),src,'-o',spv]);cm=ST.Module(spv)
+ if kind=='root':
+  pn=rids(pm,region(pm,'full_norm'))&set(ST.no_contraction_ids(pm))
+  cn={ST.result_id_of(cm.instructions[i][0],cm.instructions[i][1]) for i in region(cm,'full_norm') if cm.instructions[i][0] in (129,133) or (cm.instructions[i][0]==12 and cm.instructions[i][1][3]==50)}
+  assert len(pn)==len(cn)==16
+  # All16 original helper FP nodes remain, in order; only add inputs change as proved above.
+  ops=lambda m,ns:[(op,ops[3] if op==12 else None) for op,ops,*_ in m.instructions if ST.result_id_of(op,ops) in ns]
+  assert ops(pm,pn)==ops(cm,cn)
+  filtered=d/'unaffected-pattern.spv';ST.set_no_contraction(pm,set(ST.no_contraction_ids(pm))-pn,filtered);keep,info=ST.transfer_decoration_pattern_aligned(ST.Module(filtered),cm,cn)
+ elif kind=='pairs':
+  filtered=d/'unaffected-pattern.spv';ST.set_no_contraction(pm,set(ST.no_contraction_ids(pm))-vmuls(pm),filtered);keep,info=ST.transfer_decoration_pattern_aligned(ST.Module(filtered),cm,vmuls(cm))
+ else:
+  keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[]);assert len(keep)==len(ST.no_contraction_ids(pm))
+ ST.set_no_contraction(cm,keep,spv);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+ text=(P/'plan.txt').read_text(encoding='utf-8-sig');old=(P/'candidate.spv').as_posix() if kind=='pairs' else (parent/'candidate.spv').as_posix();assert text.count(old)==(7 if parent==families[0][1] else 1)
+ plan=d/'plan.txt';plan.write_text(text.replace(old,spv.as_posix()),encoding='utf-8');manifests(d,plan,[spv])
+ runner=Path(read(d/'LUNA-GATES.json')['identities'][0]['path']);cpu=run([runner,'--plan',plan,'--cpu-check'])
+ passrows=[shlex.split(x) for x in text.splitlines() if x.startswith('PASS ')];stats=read(P/'run/resource-score-owner/pipeline-statistics.json');indices=[i for i,x in enumerate(passrows) if x[3]==old]
+ save(d/'PROOF.json',dict(parent=ident(parent/'candidate.spv'),baseline=ident(P/'plan.txt'),source=ident(src),spv=ident(spv),plan=ident(plan),mechanism=mechanism,NC=info,cpu=cpu,pass_indices=indices,pipeline_indices=sorted({stats['pass_pipeline_indices'][i] for i in indices}),shared_bytes=24576 if kind=='pairs' else None))
+ print(name,ident(spv)['sha256'])

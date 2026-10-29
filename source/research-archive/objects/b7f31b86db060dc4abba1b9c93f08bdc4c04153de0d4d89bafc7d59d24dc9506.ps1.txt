@@ -1,0 +1,75 @@
+param(
+  [int]$StartFrame = 34192,
+  [int]$EndFrame = 34196
+)
+$ErrorActionPreference = 'Stop'
+$B = '@NR_WORKSPACE@'
+$W = "$B/work/dsh-fullnet-static-20261029"
+$root = "$W/S13-quality/runs-static01"
+$stage = "$W/S13-quality/staged-live"
+$py = "$B/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/tool-env/Scripts/python.exe"
+$feedback = "$W/S13-quality/feedback_plan.py"
+$runner = "$B/work/codex-astra-fp16-int8-audit-20261024/phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe"
+$head = "$B/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24/c64-family-static/run-34189"
+$lock = '@NR_GPU_WORKSPACE@/artifacts/parallel-port-20261013/GPU.lock'
+$raw = "$W/gpu/raw-logs"
+New-Item -ItemType Directory -Force -Path $raw | Out-Null
+
+$active = @(Get-Process | Where-Object { $_.ProcessName -match 'Cyberpunk|REDlauncher|port_network|profile_zprof|gtpin|clock_runner|clock_query|capture_gpu' })
+if ($active.Count) { throw ('Active game/GPU process: ' + (($active | ForEach-Object { $_.ProcessName + ' PID ' + $_.Id }) -join ', ')) }
+$before = Get-Content $lock -Raw | ConvertFrom-Json
+if ($before.state -ne 'FINISHED') { throw ('GPU lock not FINISHED: ' + $before.owner) }
+$deadline = (Get-Date).AddSeconds(60)
+$stream = $null
+while ($true) {
+  try { $stream = [IO.File]::Open($lock, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None); break }
+  catch { if ((Get-Date) -gt $deadline) { throw }; Start-Sleep -Milliseconds 500 }
+}
+function SaveLock($obj) {
+  $b = [Text.Encoding]::UTF8.GetBytes(($obj | ConvertTo-Json -Depth 20))
+  $stream.Position = 0; $stream.SetLength(0); $stream.Write($b, 0, $b.Length); $stream.Flush()
+}
+$state = [ordered]@{
+  owner = 'DSH-FEEDBACK-CHAIN-20261029'; holder_pid = $PID; gpu_pid = $null; cwd = $B; argv = @()
+  started_utc = [DateTime]::UtcNow.ToString('o'); state = 'RUNNING'
+  authorization = 'User authorized in DSH session on 2026-10-29 19:5x Asia/Tokyo; exclusive lock protocol, no game concurrent'
+  previous_owner = $before.owner; previous_state = $before.state
+  chain = "feedback $StartFrame..$EndFrame"
+}
+$results = @()
+try {
+  SaveLock $state
+  for ($f = $StartFrame; $f -le $EndFrame; $f++) {
+    $plan = "$root/plan-$f.txt"
+    if (!(Test-Path $plan)) {
+      & $py -X utf8 $feedback chain --sequence day-street-static-formal-01 --frames 34189-34196 --run-root $root --stage-dir $stage --head-run $head --head-output-name replayed-network.bin | Out-Null
+      if ($LASTEXITCODE -ne 0 -or !(Test-Path $plan)) { throw "chain build failed for $f" }
+    }
+    $out = "$root/run-$f"
+    if (Test-Path $out) { throw "out exists: $out" }
+    $state.current_job = "feedback-$f"; $state.started_utc = [DateTime]::UtcNow.ToString('o')
+    $state.argv = @($runner, '--plan', $plan, '--out', $out, '--pool', '--warm', '0', '--reps', '1')
+    SaveLock $state
+    & $runner --plan $plan --out $out --pool --warm 0 --reps 1 1> "$raw/feedback-$f.stdout.txt" 2> "$raw/feedback-$f.stderr.txt"
+    $exit = $LASTEXITCODE
+    $file = "$out/feedback-network.bin"
+    $sha = $null
+    if (Test-Path $file) { $sha = (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant() }
+    $results += [ordered]@{ frame = $f; plan = $plan; out = $out; exit_code = $exit; output_sha256 = $sha }
+    $state.gpu_pid = $null; $state.last_job = "feedback-$f"; $state.last_job_status = if ($sha) { 'MEASURED' } else { 'FAIL' }
+    SaveLock $state
+    if ($exit -ne 0 -or !$sha) { throw "feedback run failed for $f (exit $exit)" }
+    Write-Output "feedback $f ok $sha"
+  }
+  $state.state = 'FINISHED'; $state.exit_code = 0; $state.finished_utc = [DateTime]::UtcNow.ToString('o')
+  SaveLock $state
+  [IO.File]::WriteAllText("$root/FEEDBACK-CHAIN-RESULTS.json", ($results | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+}
+catch {
+  $state.state = 'FINISHED'; $state.exit_code = 1; $state.finished_utc = [DateTime]::UtcNow.ToString('o'); $state.failure = $_.Exception.Message
+  try { SaveLock $state } catch {}
+  throw
+}
+finally {
+  if ($stream) { $stream.Dispose(); $stream = $null }
+}

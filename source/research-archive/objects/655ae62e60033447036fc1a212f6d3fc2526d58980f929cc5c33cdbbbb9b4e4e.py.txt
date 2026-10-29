@@ -1,0 +1,130 @@
+"""Composition of the QKV-window live set at its peak (CPU only).
+
+Adds, on top of regs2.py: for the peak instruction, tag every live GRF by the role of its
+most recent definition (acc / weight-return / A-row-return / message header / scalar+address).
+That split is what BUDGET.md needs: 12 accumulators (96 GRF) can only be paid for by the
+non-accumulator 59 GRF, and only the weight-return part of it is elastic.
+"""
+import json
+from pathlib import Path
+import importlib.util
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('regs2', HERE / 'regs2.py')
+regs2 = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(regs2)
+
+OUT = HERE
+
+
+def composition(ins, du, live, peak_idx, qkv_acc_bases):
+    accset = set()
+    for b in qkv_acc_bases:
+        accset |= set(range(b, b + 8))
+    tags = {}
+    for g in sorted(live):
+        role = None
+        if g in accset:
+            role = 'acc_qkv'
+        else:
+            # most recent def at or before the peak
+            for i in range(peak_idx, -1, -1):
+                de = du[i][0]
+                if g in de:
+                    op = ins[i]['op']
+                    cm = ins[i]['comment']
+                    if op.startswith('send'):
+                        if 'd32x8t' in cm:
+                            role = 'a_row_return'
+                        elif 'load.ugm.d32x8' in cm:
+                            role = 'weight_return'
+                        elif 'load.ugm' in cm:
+                            role = 'other_load_return'
+                        else:
+                            role = 'send_other'
+                    elif op.startswith('dpas'):
+                        role = 'dpas_dst_other'
+                    else:
+                        role = 'scalar_or_dst'
+                    break
+            if role is None:
+                # never defined before the peak: an argument/descriptor read
+                role = 'arg_or_param'
+        tags[g] = role
+    counts = {}
+    for g, r in tags.items():
+        counts[r] = counts.get(r, 0) + 1
+    groups = {}
+    for g, r in tags.items():
+        groups.setdefault(r, []).append(g)
+    return counts, groups
+
+
+def run(tag, path, qkv_groups_hint):
+    ins = regs2.parse(path)
+    du = [regs2.defuse(d) for d in ins]
+    n = len(ins)
+    live = [set() for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        de, us, _ = du[i]
+        live[i] = us | (live[i + 1] - de)
+    # QKV acc bases = bases of the first DPAS group with 6 bases 8 apart
+    bases = None
+    first = None
+    for i, d in enumerate(ins):
+        if not d['op'].startswith('dpas'):
+            continue
+        b = int(regs2.RTOK.search(regs2.ops_of(d)[0]).group(1))
+        if first is None:
+            first = b
+        # collect bases of the first 6 dpas
+        if i < 0:
+            pass
+    # simply take the six bases seen in the first 6 dpas
+    six = []
+    for d in ins:
+        if d['op'].startswith('dpas'):
+            b = int(regs2.RTOK.search(regs2.ops_of(d)[0]).group(1))
+            if b not in six:
+                six.append(b)
+            if len(six) == 6:
+                break
+    # QKV window: first weight send .. last DPAS that uses one of the six
+    def is_w(d):
+        return 'load.ugm.d32x8' in d['comment'] and 'd32x8t' not in d['comment']
+    w = [i for i, d in enumerate(ins) if is_w(d)]
+    qkv_dp = []
+    for i, d in enumerate(ins):
+        if d['op'].startswith('dpas'):
+            b = int(regs2.RTOK.search(regs2.ops_of(d)[0]).group(1))
+            if b in six:
+                qkv_dp.append(i)
+    lo, hi = min(w), max(qkv_dp)
+    peak = max(range(lo, hi + 1), key=lambda i: len(live[i]))
+    counts, groups = composition(ins, du, live[peak], peak, six)
+    return dict(tag=tag, qkv_acc_bases=six, window=[hex(ins[lo]['pc']), hex(ins[hi]['pc'])],
+                peak_pc=hex(ins[peak]['pc']), peak_n=len(live[peak]),
+                composition=counts,
+                registers=groups,
+                region=dict(weight_sends=sum(1 for i in range(lo, hi + 1) if is_w(ins[i])),
+                            a_row_sends=sum(1 for i in range(lo, hi + 1) if 'd32x8t' in ins[i]['comment']),
+                            dpas=sum(1 for i in range(lo, hi + 1) if ins[i]['op'].startswith('dpas'))))
+
+
+def main():
+    out = {}
+    for tag, p in regs2.TARGETS.items():
+        out[tag] = run(tag, p, None)
+    (OUT / 'regs-comp.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    for tag, r in out.items():
+        print('==', tag)
+        print('  QKV acc bases', r['qkv_acc_bases'], 'window', r['window'],
+              'region', r['region'])
+        print('  peak @%s n=%d' % (r['peak_pc'], r['peak_n']))
+        print('  composition:', json.dumps(r['composition'], sort_keys=True))
+        for k, v in sorted(r['registers'].items()):
+            print('   %-20s %s' % (k, v))
+
+
+if __name__ == '__main__':
+    main()

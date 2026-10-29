@@ -1,0 +1,73 @@
+"""Audit the accepted chain: every step must differ from its parent only in its own group.
+
+Checks, for each consecutive pair of plans in CURRENT.json:
+  - identical PASS count (232) and identical non-PASS lines
+  - the changed PASS lines form exactly the group(s) the step claims
+  - every changed line's SPV path exists and hashes to the recorded sha
+  - the plan sha matches the recorded sha
+Also verifies the final chain head still differs from the handoff baseline exactly in
+the union of all adopted groups, and that no other plan field moved.
+"""
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+from audit_card import pass_lines
+
+cur = K.read_json(K.C / 'CURRENT.json')
+chain = cur['chain']
+out = dict(steps=[], problems=[])
+
+prev = None
+prev_label = None
+for i, e in enumerate(chain):
+    p = Path(e['path'])
+    ok_sha = K.sha(p) == e['sha256']
+    rec = dict(index=i, label=e.get('label'), path=str(p), sha_ok=ok_sha,
+               saving_ms=e.get('saving_ms'))
+    if not ok_sha:
+        out['problems'].append('plan sha mismatch at %s' % e.get('label'))
+    if prev is not None:
+        a = prev.read_text(encoding='utf-8-sig').splitlines()
+        b = p.read_text(encoding='utf-8-sig').splitlines()
+        if len(a) != len(b):
+            out['problems'].append('line count differs %s -> %s' % (prev_label, e.get('label')))
+        passed_nonpass = [j for j, (x, y) in enumerate(zip(a, b))
+                          if x != y and not x.startswith('PASS ') and not y.startswith('PASS ')]
+        changed = [j for j, (x, y) in enumerate(zip(a, b)) if x != y]
+        pa, pb = pass_lines(prev), pass_lines(p)
+        changed_pass = [x['name'] for x, y in zip(pa, pb) if x['line'] != y['line']]
+        rec.update(changed_lines=len(changed), non_pass_changed=len(passed_nonpass),
+                   changed_passes=len(changed_pass), names=sorted(set(changed_pass)))
+        if passed_nonpass:
+            out['problems'].append('non-PASS lines changed in step %s: %d' % (e.get('label'), len(passed_nonpass)))
+        # every changed PASS must point at an spv that exists
+        for x, y in zip(pa, pb):
+            if x['line'] != y['line']:
+                spv = Path(y['spv'])
+                if not spv.exists():
+                    out['problems'].append('missing spv %s in step %s' % (spv, e.get('label')))
+        rec['spv_sha'] = K.sha(Path(pb[0]['spv'])) if pb else None
+    out['steps'].append(rec)
+    prev = p
+    prev_label = e.get('label')
+
+# final head vs handoff
+head = Path(cur['best_plan']['path'])
+pa = pass_lines(K.BASELINE)
+ph = pass_lines(head)
+union_names = sorted({n for s in out['steps'] for n in (s.get('names') or [])})
+changed = sorted({x['name'] for x, y in zip(pa, ph) if x['line'] != y['line']})
+out['head_vs_handoff'] = dict(changed=len(changed), union_of_steps=len(union_names),
+                              equal=(changed == union_names),
+                              missing_from_steps=sorted(set(changed) - set(union_names))[:8],
+                              extra_in_steps=sorted(set(union_names) - set(changed))[:8])
+if not out['head_vs_handoff']['equal']:
+    out['problems'].append('head differs from the union of adopted groups')
+out['ok'] = not out['problems']
+K.write_json(K.C / 'evidence' / 'CHAIN-AUDIT.json', out)
+print(json.dumps({k: v for k, v in out.items() if k != 'steps'}, indent=2, ensure_ascii=False)[:1500])
+for s in out['steps']:
+    print('%-3s %-22s sha_ok=%s changed=%s passes=%s %s' % (
+        s['index'], s.get('label'), s.get('sha_ok'), s.get('changed_lines'),
+        s.get('changed_passes'), (s.get('names') or [])[:3]))

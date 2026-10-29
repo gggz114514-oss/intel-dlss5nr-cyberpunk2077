@@ -1,0 +1,42 @@
+import json,hashlib,subprocess,shlex,sys,re
+from pathlib import Path
+D=Path(__file__).resolve().parent;B=Path('@NR_WORKSPACE@');R=D/'remaining-attention';R.mkdir(exist_ok=True)
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def ident(p):return {'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+plan=B/'work/zcode-fp16-fullnet-handoff-20261024/candidates/combo1-gates-passed/plan-combo1-232.txt';lines=plan.read_text(encoding='utf-8-sig').splitlines();indices=[i for i,l in enumerate(lines) if l.startswith('PASS ')];head=lines[0].split();nb=int(head[2]);no=int(head[4]);exe=D/'direct-clock-build/Release/clock_runner.exe'
+base=B/'work/zcode-fp16-fullnet-handoff-20261024/candidates'
+specs=[('f10',62,base/'f10p-s22-pblock/source/s22_register_p.comp','#if ROW_OWNER','// ---- four query-block owners:'),('f05c64',7,base/'f01-f02-f05-f21/f05-c64-join-t3-v1/source/b3_20_c64_ownership_fp16.comp','MAT_H q0=MAT_H(accQ0),q1=MAT_H(accQ1);','// Q/K are normalized'),('f05c128',19,base/'f01-f02-f05-f21/f05-c128-join-t3-v1/source/c128_attention_ownership_fp16.comp','MAT_H q0=MAT_H(accQ0),q1=MAT_H(accQ1);','// Q/K are normalized'),('f05c256',37,base/'f01-f02-f05-f21/f05-c256-join-t3-v1/source/b3_06_swin_c256_fp16.comp','MAT_H q0=MAT_H(accQ0),q1=MAT_H(accQ1);','// Q/K are normalized')]
+meta=[];out=json.loads((D/'LUNA-C32-CLOSURE-JOBS.json').read_text(encoding='utf-8-sig'));out['jobs']=[];out['identities']=[ident(exe)]
+for label,ordinal,source,m1,m2 in specs:
+ folder=R/label;folder.mkdir(exist_ok=True);tokens=shlex.split(lines[indices[ordinal]]);parent=Path(tokens[3]);pm=ST.Module(parent);original=source.read_text(encoding='utf-8-sig');gx,gy,gz=map(int,tokens[-3:]);size=gx*gy*gz*8*16
+ def compile(src,dst):
+  p=subprocess.run([str(B/'src/project/tools/glslang-16.5.0/bin/glslang.exe'),'-V','--target-env','vulkan1.3','-I'+str(source.parent),str(src),'-o',str(dst)],capture_output=True,text=True);assert p.returncode==0,p.stdout+p.stderr
+  cm=ST.Module(dst);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[]);assert len(keep)==len(ST.no_contraction_ids(pm));ST.set_no_contraction(cm,keep,dst)
+  p=subprocess.run([str(B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'),str(dst)],capture_output=True,text=True);assert p.returncode==0,p.stdout+p.stderr
+ compile(source,folder/'parent-rebuilt.spv');assert ident(parent)['sha256']==ident(folder/'parent-rebuilt.spv')['sha256'],label+' parent mismatch'
+ for arm,a,b in [('whole','entry','exit'),('null','entry','entry'),('projection','entry',m1),('norm-publish',m1,m2),('attention',m2,'exit')]:
+  s=original.replace('#version 450','#version 450\n#extension GL_ARB_shader_clock : require');s=s.replace('void main() {','uvec2 nrClockStart,nrClockEnd;\nvoid nr_original_main() {');assert 'void nr_original_main()' in s
+  for marker,var in [(a,'nrClockStart'),(b,'nrClockEnd')]:
+   if marker not in ['entry','exit']:assert s.count(marker)==1,(label,marker);s=s.replace(marker,var+'=clock2x32ARB();\n'+marker)
+  entry=('nrClockStart=clock2x32ARB();' if a=='entry' else '')+('nrClockEnd=clock2x32ARB();' if b=='entry' else '')
+  end='nrClockEnd=clock2x32ARB();' if b=='exit' else ''
+  s+='\nlayout(set=0,binding=15,std430) buffer ClockProbe { uint clockWords[]; };\nvoid main(){'+entry+'nr_original_main();'+end+'''uint wi=(gl_WorkGroupID.z*gl_NumWorkGroups.y+gl_WorkGroupID.y)*gl_NumWorkGroups.x+gl_WorkGroupID.x;
+if((wi%16u)==0u && gl_SubgroupInvocationID==0u){uint r=(wi*8u+gl_SubgroupID)*4u;clockWords[r]=nrClockStart.x;clockWords[r+1u]=nrClockStart.y;clockWords[r+2u]=nrClockEnd.x;clockWords[r+3u]=nrClockEnd.y;}}
+'''
+  src=folder/(arm+'.comp');dst=folder/(arm+'.spv');src.write_text(s,encoding='utf-8');compile(src,dst);out['identities'].append(ident(dst))
+ plans={}
+ for arm in ['control','whole','null','projection','norm-publish','attention']:
+  o=lines.copy();h=head.copy();h[2]=str(nb+1);h[4]=str(no+1);o[0]=' '.join(h);t=tokens.copy();t[6]=str(int(t[6])+1)
+  if arm!='control':t[3]=(folder/(arm+'.spv')).as_posix()
+  idx=indices[ordinal];o[idx]=' '.join(t[:2]+[json.dumps(t[2]),json.dumps(t[3])]+t[4:]);o.insert(idx+1,f'BIND 15 {nb} 0 {size}');o.insert(next(i for i,l in enumerate(o) if l.startswith('POLICY ')),f'OUTPUT {nb} raw "clock.bin"');o.append(f'POLICY {nb} 1 1 232 1');o.insert(nb+1,f'BUFFER "phase_clock" {size} "-"');p=folder/('plan-'+arm+'.txt');p.write_text('\n'.join(o)+'\n',encoding='utf-8');plans[arm]=ident(p)
+  check=subprocess.run([str(exe),'--plan',str(p),'--cpu-check'],capture_output=True,text=True);assert check.returncode==0,check.stdout+check.stderr
+ meta.append({'label':label,'ordinal':ordinal,'grid':[gx,gy,gz],'sg':8,'sample':'linear WG modulo16==0, all heads','source':ident(source),'parent':ident(parent),'boundaries':[m1,m2],'plans':plans})
+ for rep in range(3):
+  arms=list(plans)
+  if rep%2:arms.reverse()
+  for arm in arms:
+   job=f'remaining-{label}-r{rep}-{arm}';dest=D/'run'/job
+   out['jobs'].append({'id':job,'plan':plans[arm],'argv':[str(exe),'--plan',plans[arm]['path'],'--out',str(dest),'--pool','--warm','1','--reps','10','--per-pass-timing'],'runner_output':str(dest),'expected_fixed_frame_out':'1755e9c2fadba97f08cb5b02b7a4294cde3675379bdec75352287505f7e129d6'})
+ print(label,'parent exact; 5 probes validated; 6 plans CPU_OK')
+(R/'PREPARATION.json').write_text(json.dumps(meta,indent=2),encoding='utf-8');out['rules']=['Execute exact 72 jobs serial with unique GPU lock; verify all identities. Any nongold, error, missing clock/receipt stops all remaining.','No analysis or extra experiments. Preserve full output. New batch-specific RESULTS/STATUS, never overwrite old batch.'];out['status']='REMAINING_ATTENTION_COARSE_DIAGNOSIS_NO_OPTIMIZATION';(D/'LUNA-REMAINING-ATTENTION-JOBS.json').write_text(json.dumps(out,indent=2),encoding='utf-8')
+

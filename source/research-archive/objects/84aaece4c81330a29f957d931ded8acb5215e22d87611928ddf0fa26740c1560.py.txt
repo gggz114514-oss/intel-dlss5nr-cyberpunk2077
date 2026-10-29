@@ -1,0 +1,39 @@
+from pathlib import Path
+import json,hashlib,subprocess,shlex,sys,shutil,collections
+D=Path(__file__).resolve().parent;A=D.parent;B=A.parent.parent;P=A/'f20-coarse-owner-20261026';S=D/'f05-local-inverse';S.mkdir(exist_ok=True)
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+def ident(p):return dict(path=str(p),sha256=sha(p))
+def save(p,x):p.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding='utf-8')
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+census=json.loads((D/'CURRENT-CENSUS.json').read_text(encoding='utf-8-sig'));pt=(P/'plan.txt').read_text(encoding='utf-8-sig');sources=[]
+for C,idx in [(64,7),(128,19),(256,37)]:
+ row=census['rows'][idx];src=Path(row['source']);parent=Path(row['spv']);text=src.read_text(encoding='utf-8-sig');d=S/f'c{C}';d.mkdir(exist_ok=True)
+ def compile(label,t):
+  f=d/(label+'.comp');o=d/(label+'.spv');f.write_text(t,encoding='utf-8');run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(src.parent),f,'-o',o]);return o
+ pm=ST.Module(parent);rb=compile('parent-rebuild',text);rm=ST.Module(rb);keep,info=ST.transfer_decoration_pattern_aligned(pm,rm,set());ST.set_no_contraction(rm,keep,rb);assert sha(rb)==sha(parent),(C,'source identity mismatch')
+ anchor='        f16vec2 iv = unpackFloat2x16(subgroupShuffle(packFloat2x16(f16vec2(inv, inv)), lane & 15u));\n';assert text.count(anchor)==1
+ assert '(lane / 16u == 0u) ? mine + ex.x : ex.x + mine' in text
+ cand=text.replace(anchor,'        // Both halves compute identically ordered low+high sum and identical inverse.\n').replace('float16_t ivq = iv.x;','float16_t ivq = inv;')
+ out=compile('candidate',cand);cm=ST.Module(out);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,set());ST.set_no_contraction(cm,keep,out);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',out])
+ co=lambda m:collections.Counter(op for op,o,*_ in m.instructions)
+ old,new=co(pm),co(ST.Module(out));assert old[345]-new[345]==1,(C,old[345],new[345])
+ selected=[r['ordinal'] for r in census['rows'] if r['sha256']==row['sha256']];pt=pt.replace(parent.as_posix(),out.as_posix());sources.append(dict(width=C,source=ident(src),parent=ident(parent),rebuild=ident(rb),candidate=ident(out),ordinals=selected,OpGroupNonUniformShuffle=[old[345],new[345]],NC=[len(ST.no_contraction_ids(pm)),len(keep)]))
+# Symbolic expression proof for all lanes; operands in the sum have the same order.
+for lane in range(32):
+ mine=lane;other=lane^16;operands=(mine,other) if lane<16 else (other,mine)
+ owner=lane&15;assert operands==(owner,owner+16)
+plan=S/'plan.txt';plan.write_text(pt);cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check'])
+save(S/'BUILD.json',dict(plan=ident(plan),parent=ident(P/'plan.txt'),CPU=cpu,sources=sources))
+save(S/'PROOF.json',dict(mapping='For l<16: s_l=half(mine_l+mine_l+16). For l+16: s=half(ex_low+mine_high), same operand identities and order; hence identical max/divide/half inv. All32 lanes active within sg<4 branch. inv_l=inv_l+16, so shuffle(inv,l&15) selects the already-local value.',change='Only remove redundant inverse broadcast/pack/unpack; denominator shuffleXor, all reductions, reciprocal computation, half scale and MMA order untouched. No added loads/SLM/barrier/weights or source values.',lifetime='iv vector and remote producer dependency removed. inv arithmetic retained in both halves; do not combine with owner-only reciprocal without separate proof.',scope='Three current F05 shaders,36dispatches; raw parent source rebuilt byte-identically after restoring parent decorations. Sources already register P, ledger corrected.',native='Must inspect codegen: backend may independently optimize redundant lane values; static SPV one shuffle deletion is not speed claim.'))
+(S/'run').mkdir(exist_ok=True)
+for kind in ['GATES','NATIVE','RESOURCES','ORDINARY']:
+ t=json.loads((P/f'LUNA-{kind}.json').read_text(encoding='utf-8-sig'));ex=S/(kind.lower()+'-execution');ex.mkdir(exist_ok=True);t['output_root']=str(ex);t['identities']=[v for v in t['identities'] if not v['path'].endswith('.spv')]+[v['candidate'] for v in sources]+[v['parent'] for v in sources]
+ for j in t['jobs']:
+  jp=P/'plan.txt' if kind=='ORDINARY' and j['candidate']=='parent' else plan
+  j['plan']=ident(jp);j['runner_output']=str(S/'run'/j['id']);ar=j['argv'];ar[ar.index('--plan')+1]=str(jp);ar[ar.index('--out')+1]=j['runner_output']
+  if kind=='NATIVE':ar[ar.index('--output_dir')+1]=str(S/'captures');ar[ar.index('--msg_file')+1]=str(S/'native.log');j['capture_output']=str(S/'captures'/ar[ar.index('--profile_dir')+1])
+ save(S/f'LUNA-{kind}.json',t)
+exe=(D/'combined/execute.ps1').read_text(encoding='utf-8-sig').replace('LUNA-FULLNET-MECHANISM-COMBO-20261026','LUNA-F05-LOCAL-INVERSE-20261026');(S/'execute.ps1').write_text(exe);shutil.copyfile(D/'combined/review_timing.py',S/'review_timing.py');print(cpu);print([(v['width'],len(v['ordinals']),v['OpGroupNonUniformShuffle']) for v in sources])
+

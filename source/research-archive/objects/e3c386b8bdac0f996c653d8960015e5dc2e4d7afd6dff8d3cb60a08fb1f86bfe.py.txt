@@ -1,0 +1,173 @@
+"""F01 (lift + entry FFN) CPU model, bit-faithful to the Vulkan GLSL contract.
+
+Contract sources (read-only):
+  corrected-20261029/source/c32_f1_i8_body.comp  lines 169-173 (act), 1675-1705 (lift)
+  int8-coverage-v2-20261020/C/tools/ref_c32.py   expand/contract/seed/dequant semantics
+  int8-coverage-v2-20261020/C/tools/build_c32_packs.py  FP16 pack layout
+
+Arithmetic rules kept explicit:
+  * feature/lift/seed/activation are half; every op is rounded to half once
+  * int8 dot is exact int32 (K=16 real + 16 zero padding)
+  * dequant is one float32 multiply by (weight_scale * activation_scale), then one half cast
+  * activation uses the in-shader fused half fma sequence
+  * FF16 teacher: FP32 accumulation over the full K, one half cast (validated bit-exact on
+    a captured FP16 WG by the corrected-20261029 F01 attribution)
+"""
+import numpy as np
+
+B = r"@NR_WORKSPACE@"
+PACK = B + "/candidates/amd-map-20261015/s1-integrated/candidate/packs/ioport_0_ioport_pack.fp16.bin"
+BASE = (B + "/work/codex-astra-fp16-int8-audit-20261024/int8-v15-offline-20261028/"
+        "corrected-20261029/assets")
+Q = B + "/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D24 = Q + "/real-int8-24"
+
+# ---- FP16 pack layout (halves) ------------------------------------------------
+WLIFT_HALF = 8192     # 32 x 16
+WEXP_HALF = 0         # 128 x 32
+WCON_HALF = 4096      # 32 x 128
+RS_HALF = 17280 + 8   # 32
+
+
+def f32(x):
+    return np.float32(x)
+
+
+def h16(x):
+    return np.float16(x)
+
+
+def rne_clamp127(v):
+    r = np.rint(v)
+    return np.clip(r, -127, 127)
+
+
+def act_h(x):
+    """float16_t nr_act_h(float16_t x): clamp + two fused half fmas + one mul."""
+    x = np.float16(x)
+    t = np.float16(min(4.0, max(-4.0, float(x))))
+    u = np.float16(np.float32(-0.055908203125) * abs(np.float32(t)) + np.float32(0.447265625))
+    v = np.float16(np.float32(t) * np.float32(u) + np.float32(0.89453125))
+    return np.float16(np.float32(x) * np.float32(v))
+
+
+def act_vec(x):
+    """Vectorised act_h. Fused half fma is emulated in float64 then cast once to half."""
+    x = np.asarray(x, np.float16)
+    t = np.clip(x, np.float16(-4.0), np.float16(4.0)).astype(np.float64)
+    u = (-0.055908203125 * np.abs(t) + 0.447265625).astype(np.float16)
+    v = (t * u.astype(np.float64) + 0.89453125).astype(np.float16)
+    return (x.astype(np.float64) * v.astype(np.float64)).astype(np.float16)
+
+
+def load_fp16_pack():
+    v = np.fromfile(PACK, dtype="<f2")
+    Wl = np.empty((32, 16), np.float32)
+    for c in range(32):
+        g, m = c // 8, c % 8
+        Wl[c] = v[WLIFT_HALF + g * 128 + m * 16: WLIFT_HALF + g * 128 + m * 16 + 16]
+    We = np.empty((128, 32), np.float32)
+    for f in range(128):
+        for k in range(32):
+            We[f, k] = v[WEXP_HALF + (f // 16) * 512 + ((f % 16) // 8) * 128
+                         + (k // 16) * 256 + (f % 8) * 16 + (k % 16)]
+    Wc = np.empty((32, 128), np.float32)
+    for o in range(32):
+        for e in range(128):
+            Wc[o, e] = v[WCON_HALF + (o // 16) * 2048 + (e // 16) * 256
+                         + ((o % 16) // 8) * 128 + (o % 8) * 16 + (e % 16)]
+    rs = v[RS_HALF:RS_HALF + 32]
+    return Wl, We, Wc, rs
+
+
+def qmat(W, d=None):
+    """Per-output-channel symmetric int8 codes. d folds the activation diagonal."""
+    Wt = W if d is None else (W * d[None, :])
+    wt = Wt.astype(np.float32)
+    sw = np.maximum(np.abs(wt).max(axis=1) / np.float32(127.0), np.float32(1e-12))
+    qw = rne_clamp127(wt / sw[:, None]).astype(np.int32)
+    return qw, sw.astype(np.float32)
+
+
+def lift_fp16(x):
+    """x: (N,16) half. FP32 accumulate, one half cast."""
+    acc = x.astype(np.float32) @ WLIFT_AS_F32.T
+    return acc.astype(np.float16)
+
+
+def lift_int8(x, d, sf, qw, sw):
+    """x: (N,16) half. Two f32 multiplies before RNE, exact int32 dot, one f32 mul + half cast.
+
+    d: per-feature diagonal (positive), sf: float32 static scale, invD/invF as the shader."""
+    invd = (np.float32(1.0) / np.float32(d)).astype(np.float32)
+    invf = np.float32(1.0) / np.float32(sf)
+    scaled = (x.astype(np.float32) * invd[None, :]).astype(np.float32)
+    code = (scaled * invf).astype(np.float32)
+    qa = rne_clamp127(code).astype(np.int32)
+    acc = qa @ qw.T
+    mult = (sw.astype(np.float32) * np.float32(sf)).astype(np.float32)
+    return (acc.astype(np.float32) * mult[None, :]).astype(np.float16)
+
+
+def ffn_teacher(x, Wl, We, Wc, rs):
+    """FP16 chain: lift -> expand -> act -> contract + half seed."""
+    lift = (x.astype(np.float32) @ Wl.T).astype(np.float16)
+    e = (lift.astype(np.float32) @ We.T).astype(np.float16)
+    act = act_vec(e)
+    yc = act.astype(np.float32) @ Wc.T
+    seed = (lift.astype(np.float32) * rs[None, :].astype(np.float32)).astype(np.float16)
+    return lift, act, (yc + seed.astype(np.float32)).astype(np.float16)
+
+
+def ffn_int8(lift, sc):
+    """Ref.stage semantics on a batch. sc = 164 float32 scales (as in f1-ffn-scales.bin)."""
+    sc = np.asarray(sc, np.float32)
+    sx, invx, se, inve = [np.float32(v) for v in sc[:4]]
+    mult_e = sc[4:132]
+    mult_c = sc[132:164]
+    qx = rne_clamp127((lift.astype(np.float32) * invx).astype(np.float32)).astype(np.int32)
+    acc_e = qx @ WEXP_AS_I8.T                       # int32 (N,128)
+    e = (acc_e.astype(np.float32) * mult_e[None, :]).astype(np.float16)
+    e = act_vec(e)
+    qe = rne_clamp127((e.astype(np.float32) * inve).astype(np.float32)).astype(np.int32)
+    acc_c = qe @ WCON_AS_I8.T                       # int32 (N,32)
+    seed = (lift.astype(np.float32) * RS_AS_F32[None, :]).astype(np.float16)
+    y = (acc_c.astype(np.float32) * mult_c[None, :] + seed.astype(np.float32)).astype(np.float16)
+    return e, y, qx, qe
+
+
+def load_int8_assets(weights_path=None, scales_path=None):
+    w = np.fromfile(weights_path or (BASE + "/f1-weights.bin"), dtype=np.int8).astype(np.int32)
+    sc = np.fromfile(scales_path or (BASE + "/f1-ffn-scales.bin"), dtype="<f4")
+    return w, sc
+
+
+def w_e(w, f, k):
+    return w[(f // 8) * 1024 + k * 32 + (f % 8)]
+
+
+def w_c(w, o, e):
+    return w[16384 + ((o // 8) * 4 + e // 32) * 1024 + (e % 32) * 32 + (o % 8)]
+
+
+WLIFT_AS_F32, WEXP_AS_F32, WCON_AS_F32, RS_AS_F32 = load_fp16_pack()
+# int32 copies of the current FFN codes (independent of the pack layout helpers above)
+_W0, _SC0 = load_int8_assets()
+WEXP_AS_I8 = np.array([[w_e(_W0, f, k) for k in range(32)] for f in range(128)], np.int32)
+WCON_AS_I8 = np.array([[w_c(_W0, o, e) for e in range(128)] for o in range(32)], np.int32)
+
+
+def lift_weight_codes_from_fp16(d, sf):
+    qw, sw = qmat(WLIFT_AS_F32, d)
+    return qw, sw
+
+
+def current_lift_assets():
+    """D and sF that the shipped lift-equalized candidate compiled in."""
+    import json
+    cal = np.load(D24 + "/lift-equalized/CALIBRATION.npz")
+    d = cal["d"].astype(np.float32)
+    sa = np.float32(cal["activation_scale"])
+    qw = cal["weight_codes"].astype(np.int32)
+    sw = cal["weight_scale"].astype(np.float32)
+    return d, sa, qw, sw

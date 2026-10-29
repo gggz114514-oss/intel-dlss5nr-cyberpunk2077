@@ -1,0 +1,337 @@
+"""Build TAIL-CONTRACT.json for S03 (F2 / F20-block70 / block39 projection+blend).
+
+Everything is assembled from files that already exist: the two plans, the SPV scans in
+../evidence, and the candidate sources.  Hashes and buffer extents are recomputed here so
+the contract cannot drift from the artefacts.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029/S03-tail"
+EV = W / "evidence"
+
+
+def sha(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for c in iter(lambda: f.read(1 << 20), b""):
+            h.update(c)
+    return h.hexdigest()
+
+
+scan = json.loads((EV / "spv-plan-scan.json").read_text(encoding="utf-8"))
+stats = json.loads((EV / "tail-output-stats-24.json").read_text(encoding="utf-8"))["summary"]
+
+
+def row(plan: str, ordinal: int) -> dict:
+    for r in scan["plans"][plan]["rows"]:
+        if r["ordinal"] == ordinal:
+            return r
+    raise KeyError((plan, ordinal))
+
+
+def brief(plan: str, ordinal: int) -> dict:
+    r = row(plan, ordinal)
+    return {
+        "plan": plan,
+        "ordinal": r["ordinal"],
+        "name": r["name"],
+        "pass_group": r["pass_group"],
+        "spv": r["spv"],
+        "spv_sha256": r["measures"]["sha256"],
+        "measured_dtype": r["measured"],
+        "int8_mma": r["measures"]["int8_mma"],
+        "fp16_mma": r["measures"]["fp16_mma"],
+        "int_dots": r["measures"]["int_dots"],
+        "ext_inst": r["measures"]["ext_inst"],
+        "has_127": r["measures"]["has_127"],
+        "has_inv127": r["measures"]["has_inv127"],
+        "pass_geometry": {
+            "tokens": r["grid"],
+            "local_size_x": r["grid"][0],
+            "shared_bytes": r["grid"][1],
+            "n_bindings": r["grid"][2],
+            "wavefront_hint": r["grid"][3],
+            "workgroups": r["grid"][4:7],
+        },
+        "bindings": [{"binding": b["binding"], "buffer": b["buffer"], "bytes": b["bytes"],
+                      "buffer_bytes": b["buffer_bytes"], "file": b["file"]} for b in r["binds"]],
+        "push": r["push"],
+    }
+
+INT8 = "int8_candidate_combo34189"
+FP16 = "fp16_incumbent"
+PLAN_SHA = {k: scan["plans"][k]["sha256"] for k in (INT8, FP16)}
+
+contract = {
+    "schema": "dsh-s03-tail-contract/1",
+    "card": "S03 F2 与 F20/block70 尾部",
+    "generated_by": "work/dsh-fullnet-static-20261029/S03-tail/_work/build_tail_contract.py",
+    "scope": {
+        "what_this_is": ("A stage-by-stage contract for the tail the INT8 candidate actually runs, aligned to the "
+                         "incumbent FP16 tail by buffer + math stage (never by PASS name), with the quantisation "
+                         "points, the final 32->4 exit and the colour/alpha/history float boundaries."),
+        "what_this_is_not": ("Not a candidate, not a GPU result, not a quality claim. No plan, weight, scale or "
+                             "game file was modified. The incumbent FP16 plan and the INT8 candidate plan were read "
+                             "only; both SHA256 values are recorded below and were unchanged at the end of the card."),
+        "plans": {
+            "int8_candidate": {"path": scan["plans"][INT8]["path"], "sha256": PLAN_SHA[INT8],
+                               "header": scan["plans"][INT8]["header"], "dispatches": scan["plans"][INT8]["dispatches"]},
+            "fp16_incumbent": {"path": scan["plans"][FP16]["path"], "sha256": PLAN_SHA[FP16],
+                               "header": scan["plans"][FP16]["header"], "dispatches": scan["plans"][FP16]["dispatches"]},
+        },
+        "frame_model": {
+            "output_surfaces": "2 x 720 x 1280 x 4 fp32 little-endian (29,491,200 B)",
+            "plane_0": "final display RGBA (the only plane QUALITY-24 scores; RGB scored, A ignored)",
+            "plane_1": "history surface: mixed RGB (pre base re-anchor) + blend weight",
+            "float_offsets_in_push": {"plane_0_base": 0, "history_base": 3686400,
+                                      "input_history_in_post_bin": 3686420,
+                                      "input_motion_in_post_bin": 7372820,
+                                      "input_depth_in_post_bin": 9216020},
+            "post_bin_layout": ("[base RGBA fp32 1280x720x4][20-float control block][history RGBA 1280x720x4]"
+                                "[motion 2/px][depth 1/px] = 40,550,480 B"),
+        },
+    },
+
+    # ------------------------------------------------------------------ F2 ----
+    "stages": [
+        {
+            "id": "F2.c32_block66",
+            "math_stages": ["entry projection C64->C32 (ProjIn=block65_out, ioport pack gains)",
+                            "residual add with skip4", "FFN expand", "act (half MpCubicSilu)", "contract",
+                            "norm", "QKV", "QK score", "exp/den", "PV context", "WO output projection"],
+            "int8": dict(brief(INT8, 281), extra={
+                "stage_math_note": ("single fused dispatch; 53 INT8 cooperative MMAs (M8 N16 K32) cover every matrix "
+                                    "stage of the C32 Swin block. Weights come from FOUR different packs: "
+                                    "C32I8Weights 32768 B + C32I8Scales 656 B (b7/b8, shared with the C32 body1 family) "
+                                    "and C32I8BodyWeights 51200 B + C32I8BodyScales 640 B (b9/b10, this card)."),
+                "quant_points": [{"operand": "A/X", "granularity": "in-kernel per-token/per-tile amax",
+                                  "evidence": "c32_i8_common.glsl L18-27: 'This card has no static activation scale at all'"},
+                                 {"operand": "B/W", "granularity": "static per-output-channel",
+                                  "evidence": "c32_i8_common.glsl L19 sW[n]=amax_k|W[n,k]|/127 from the pack"}],
+                "residual": "reads skip4 (16,515,072 B) and adds it inside the fused block",
+                "output": "block66_out 16,515,072 B (half 84x48-token arena); debug swin_66_debug 50,176 B",
+            }),
+            "fp16_counterpart": dict(brief(FP16, 226), extra={
+                "stage_math_note": ("same name, same 32x84x48 geometry, same push ABI (32/32 words identical), but the "
+                                    "weights are read from HalfBuf (swin_66_weights 33,296 B fp16) instead of the four "
+                                    "INT8 packs; 129 FP16 cooperative MMAs replace 53 INT8 ones because K is consumed "
+                                    "in K16 steps instead of K32."),
+                "output": "block66_out 16,515,072 B",
+            }),
+            "alignment": {
+                "verdict": "SAME STAGE, dtype really changed",
+                "same_bindings": "bindings 0..6 identical in name, extent and order",
+                "added_bindings_int8": "7..10 (INT8 weight/scale packs)",
+                "push_identical": True,
+                "bit_width_note": ("53 vs 129 MMA is a K16->K32 merge, not a missing stage; stage count is unchanged. "
+                                   "Do not read the MMA count as a stage count."),
+                "quantisation_allowed": ("after the C64->C32 projection and after the skip4 residual add; the value "
+                                         "that gets quantised is (projected + skip4), and it is quantised inside the "
+                                         "F2 kernel with a per-token dynamic amax."),
+            },
+        },
+
+        # ---------------------------------------------------------------- F20 ---
+        {
+            "id": "F20.fold_postblend",
+            "math_stages": ["2x2 upsampling of the coarse 672x384 block69_out",
+                            "per-output-channel 'main scale' from the ioport pack (p7.x flag)",
+                            "per-channel skip gain times skip0 taps",
+                            "half add (precise) written as f16vec2"],
+            "int8": dict(brief(INT8, 285), extra={
+                "stage_math_note": ("pure FP16/FP32 blend kernel: 0 cooperative matrices, 0 int dots, no 127 constant, "
+                                    "no FAbs/FMix (no in-kernel amax). All arithmetic is f16 (reused_s3_pair.comp L21-50: "
+                                    "precise f16vec2 main_scaled + skip_v)."),
+                "source": str(B / "candidates/amd-map-20261015/s3-io-tail-transport/f22-postblend/reused_s3_pair.comp"),
+                "push_decode": {
+                    "p0": "IW=672 IH=384 OW=1344 OH=768",
+                    "p1": "K=32 N=32 weight_half=0 gain_half=17664",
+                    "p2": "src_layout=0 dst_layout=0 skip_layout=0 skip_W=1344",
+                    "p3": "skip_H=768 tmp_layout=0 valid_W=0 valid_H=0",
+                    "p7": "aux0=1 -> main path IS multiplied by the pack's per-channel model scale",
+                },
+                "write_domain": "ioport_70_ioport_blended 66,060,288 B = 1344x768x32 halfs; "
+                                "4 taps x 672 x 384 x 16 pairs = 16,515,072 f16vec2 writes = 33,030,144 halfs = full buffer",
+                "quant_points": "NONE. This is the float boundary: the blend/skip sum is defined here, in f16.",
+            }),
+            "fp16_counterpart": {
+                "verdict": "FUSED INTO s37 - there is no separate postblend dispatch in the FP16 plan",
+                "evidence": ("s37 candidate.comp declares 'Coarse' (binding 2 = block69_out 672x384) and 'SkipBuf' "
+                             "(binding 5 = skip0 1344x768) and its push p4=(17664,17696,1,0) enables the same fold: "
+                             "17664 = postblend p1.w (skip gain half), 17696 = postblend p1.w+p1.y (main scale half), "
+                             "and p7.xy=(672,384) = the coarse grid."),
+                "push_word_match": {"fp16_s37_words_16_18": ["17664", "17696", "1"],
+                                    "int8_b70_words_16_18": ["0", "0", "0"],
+                                    "meaning": "fold disabled in the INT8 body because the fold is a separate dispatch"},
+            },
+        },
+        {
+            "id": "F20.body_b70",
+            "math_stages": ["stage1 expand (4x INT8 K32)", "act", "stage3 contract (2x)", "stage4 QKV (2x)",
+                            "stage5/5b half norm", "stage6 score (2x)", "stage7 half exp + 64-key den",
+                            "stage8 context (2x)", "stage9 WO output projection (2x)"],
+            "int8": dict(brief(INT8, 286), extra={
+                "stage_math_note": ("12 INT8 cooperative MMAs (M8 N16 K32). Source header claims '14' - the binary and "
+                                    "the source's own 12 coopMatMulAdd calls both say 12; see TAIL-RISKS R8."),
+                "source": str(B / "work/dsh-int8-fullnet-impl-20261024/candidates/c32-f1-f2-b70/source/c32_lifetime_b70_i8.comp"),
+                "quant_points": [
+                    {"operand": "X (expand A)", "granularity": "per 8-token subgroup tile", "source_line": "L161-181, L259"},
+                    {"operand": "E (contract A)", "granularity": "per 8-token subgroup tile", "source_line": "L328"},
+                    {"operand": "Y (QKV A)", "granularity": "per 8-token group", "source_line": "L394-405"},
+                    {"operand": "Q (score A)", "granularity": "per 8-token group", "source_line": "L499"},
+                    {"operand": "K (score B)", "granularity": "ONE scalar over 64 keys x 32 dims", "source_line": "L506"},
+                    {"operand": "P (PV A)", "granularity": "per 8-token group", "source_line": "L599"},
+                    {"operand": "V (PV B)", "granularity": "ONE scalar over 64 keys x 32 channels", "source_line": "L601"},
+                    {"operand": "Ctx (stage9 A)", "granularity": "per 8-token group", "source_line": "L646"},
+                ],
+                "all_dynamic": ("every one of these is s = amax/127 computed inside the kernel from the very tile it "
+                                "quantises; the source says so explicitly (L24-27). There is no calibrated static "
+                                "activation scale anywhere in this dispatch."),
+                "residual": "the FP32 seeds H(X)*rs and H(Y)*ars (b0/b1 pack offsets via p2.xy) are added after the "
+                            "int32 accumulate, before the single half narrow - this is the residual/feedback branch",
+                "output": "ioport_70_ioport_body 66,060,288 B as float16_t (32 channels at 1344x768)",
+            }),
+            "fp16_counterpart": dict(brief(FP16, 230), extra={
+                "stage_math_note": ("16 FP16 cooperative MMAs (M8 N16 K16). Output buffer is declared 'float "
+                                    "residual_out[]' (fp32) and is 14,745,600 B = 3,686,400 floats = 4 floats per "
+                                    "1280x720 pixel: this kernel already performs the final 32->4 exit projection and "
+                                    "writes [residual R,G,B, blend logit]."),
+                "source": str(B / "work/codex-astra-fp16-int8-audit-20261024/f20-coarse-owner-20261026/candidate.comp"),
+                "output": "ioport_70_ioport_body 14,745,600 B fp32 (4 floats/px at 1280x720)",
+            }),
+            "alignment": {
+                "verdict": "STAGE BOUNDARY MOVED - NOT the same decomposition",
+                "what_moved": ("the 32->4 exit projection. FP16: inside s37, cooperative fp16 MMA, output fp32 vec4/px. "
+                               "INT8: NOT in b70 (it writes a 32-channel half feature map) but in the separate surfaces "
+                               "kernel, as scalar fp16 multiplies with fp32 accumulation."),
+                "shared": ["push words 0..15 identical", "grid 169x97x1 identical", "local size 32 identical",
+                           "pack/aux/debug bindings identical", "postblend+body together replace s37's fold+body",
+                           "final 32->4 exit"],
+                "not_shared": ["output dtype (fp32 vec4 vs fp16 32ch)", "output extent (14,745,600 vs 66,060,288 B)",
+                               "shared memory (29,184 vs 42,568 B)", "where the fold happens",
+                               "whether the exit projection is an MMA or a scalar loop"],
+                "quantisation_allowed": ("never before the postblend: the quantised value is the half blend output, "
+                                         "i.e. quantisation starts at b70's stage 1 read of ImageIn. The fold, the skip "
+                                         "gain, the main scale and their sum must stay f16/FP32."),
+            },
+        },
+        {
+            "id": "F20.exit_32_to_4",
+            "math_stages": ["(INT8 only) 32->4 projection, fp16 operands x fp32 scalar accumulate, 4 output rows",
+                            "base = post.bin RGBA at p7.x",
+                            "rgb = clamp(base.rgb + residual.rgb*0.25, 0, 1)",
+                            "if ctl(8)!=0: hist = history5((uv+motion)*scale); blend = clamp(sigmoid(residual.w)*clamp(ctl(19)*tmp[p7.w],0,1)); rgb = mix(rgb,hist,blend)",
+                            "write history plane first (mixed rgb + blend)",
+                            "rgb = clamp(fma(min(ctl(7),1), rgb-base.rgb, base.rgb),0,1)",
+                            "if ctl(7)>1: luma-ratio local tone amp",
+                            "write display plane: rgb + alpha (base.a if p5.w bit0 else 1.0)"],
+            "int8": dict(brief(INT8, 287), extra={
+                "stage_math_note": ("0 cooperative matrices, but this is NOT a no-matrix kernel: the 32->4 exit "
+                                    "projection is a scalar fp16 dot product with FP32 accumulation, 32 iterations x 4 "
+                                    "rows per pixel (paired_reads_surface.comp L16-33). 921,600 px x 128 MACs."),
+                "source": str(B / "candidates/amd-map-20261015/s3-io-tail-transport/f27-surfaces/paired_reads_surface.comp"),
+                "projection": {"rows": 4, "row_meaning": "0..2 residual R,G,B; row 3 blend logit",
+                               "weights": "ioport_70_ioport_pack halfs at p1.z=17024, 32 halfs per row",
+                               "operand_dtype": "fp16 x fp16 -> fp32 accumulate (scalar, not MMA)"},
+                "quant_points": "NONE in the kernel; its input is the half body from b70",
+                "alpha": ("surface[i*4+3] = (p5.w & 1) ? base.a : 1.0. The current plan pushes p5.w=0, so alpha is the "
+                          "constant 1.0; measured max|dA| over 24 frames = 0.0."),
+                "history": ("written BEFORE the final base re-anchor, so the history surface carries the mixed value. "
+                            "Measured: plane 0 and plane 1 RGB are bit-identical on 99.5-99.9% of pixels, so the "
+                            "displayed frame IS the fed-back frame."),
+            }),
+            "fp16_counterpart": dict(brief(FP16, 231), extra={
+                "stage_math_note": ("same ABI and byte-identical push as the INT8 exit, but FeaturePairs is 'float "
+                                    "residual_in[]' and the whole 32->4 projection is absent (tail.comp L15-17 just "
+                                    "loads four floats and adds base + 0.25*residual). Everything else - base, 0.25 "
+                                    "gain, sigmoid blend, history5 sampling, ordering, alpha rule - is line-for-line "
+                                    "the same as the INT8 exit."),
+                "source": str(B / "work/codex-astra-fp16-int8-audit-20261024/c32-boundary-candidates-20261026/f20-four-output/tail.comp"),
+            }),
+            "alignment": {
+                "verdict": "SAME OUTPUT CONTRACT, DIFFERENT INPUT CONTRACT",
+                "identical": ["32-word push", "descriptor semantics 0/1/2/5/7", "ext-inst census",
+                              "blend/history/alpha code path", "output 29,491,200 B"],
+                "different": ["binary (sha b7720b... vs b49ee2...)", "FeaturePairs element type",
+                              "presence of the 32->4 dot"],
+                "float_boundaries_that_must_stay_float": [
+                    "base.rgb from post.bin (fp32 image, never quantised)",
+                    "residual*0.25 in fp32",
+                    "sigmoid and clamp of the blend weight",
+                    "history5 five-tap cubic resample in fp32",
+                    "mix() and both clamps",
+                    "alpha (base copy or constant 1.0)",
+                ],
+            },
+        },
+
+        # ------------------------------------------------------- block39 proj ---
+        {
+            "id": "proj.block39",
+            "math_stages": ["cross-family projection ViT->split16 (24x12 grid)", "pre-projection INT8 weights "
+                            "(PreW8 526,336 B)", "blend with skip30_l3", "write block39_out"],
+            "int8": dict(brief(INT8, 167), extra={
+                "stage_math_note": ("2 INT8 cooperative MMAs. Name carries no INT8 marker at all yet the kernel is "
+                                    "genuinely INT8 with its own int8 weight pack: this is the mirror case of the "
+                                    "'name says INT8' heuristic."),
+                "quant_points": [{"operand": "A (context)", "granularity": "1 in-kernel amax site (FAbs 1, FMix 2, 127, RoundEven 1) "
+                                                                        "-> dynamic, uncalibrated"},
+                                 {"operand": "B (weights)", "granularity": "static per-output-channel"}],
+                "residual": "skip30_l3 (1,179,648 B) read and blended",
+                "note": "flat 1,179,648 B in/out is the split16 family shape; block38_out in is 589,824 B "
+                        "(the ViT->split16 width doubling happens inside this dispatch)",
+            }),
+            "fp16_counterpart": {"verdict": "NOT SCANNED in this card",
+                                 "note": "the incumbent plan's block39 pass has a different name/ordinal; left to S12"},
+            "alignment": {"verdict": "INT8 despite the neutral name", "action": "register as a real INT8 matrix edge"},
+        },
+    ],
+
+    # ------------------------------------------------------- global answers ---
+    "answers": {
+        "where_quantisation_is_allowed": [
+            "F2: only after the C64->C32 projection and after the skip4 residual add, and only inside the F2 kernel's own dynamic amax.",
+            "F20: only after the postblend (fold + skip gain + main scale + half add). The half blend output is the first value that may be quantised, and b70's stage-1 read is exactly that point.",
+            "F20 exit: never. base, residual*0.25, sigmoid(blend), history5, mix and clamp are float and must stay float.",
+            "History and alpha are outputs of the exit kernel, not inputs to any quantiser in this plan.",
+        ],
+        "colour_alpha_float_boundary": {
+            "colour": "RGB is reconstructed as clamp(base + 0.25*residual) then optionally mixed with history; the only quantised contribution is the residual, which arrives already dequantised in fp32.",
+            "alpha": "never generated by the network: it is either the base image alpha (p5.w bit0) or the constant 1.0. With the current push it is the constant 1.0, so alpha error is structurally 0.",
+            "measured": stats["alpha"],
+        },
+        "history_semantics": {
+            "input": "post.bin history surface at float offset 3,686,420 (the captured FP16 history for every one of the 24 frames).",
+            "output": "frame_out plane 1 at float offset 3,686,400, carrying the mixed RGB and the blend weight.",
+            "measured_equality_with_display": "plane0 vs plane1 RGB identical on 99.5%+ of pixels; mean |diff| < 4e-6",
+            "implication": "autonomous feedback would inject exactly the error that is on screen; the 24-frame metric never scores this plane.",
+        },
+        "dynamic_scale_positions_upgraded_from_unknown": {
+            "F2 f2c32_block66_fused": "DYNAMIC (source states 'no static activation scale at all'); ledger said UNKNOWN",
+            "F20 ioport_block70_1": "DYNAMIC at 8 explicit operands (X,E,Y,Q,K,P,V,Ctx); ledger said UNKNOWN",
+            "proj t3_b39_project_blend": "DYNAMIC, 1 site (FAbs/FMix/127/RoundEven in the SPV); ledger said UNKNOWN",
+            "consequence": ("the 'pure static' claim is further from closed than DYNAMIC-SCALE-REMAINDERS=190 suggests: "
+                            "these three dispatches are not exceptions to be proven later, they are known-dynamic now."),
+        },
+        "fp16_matrix_audit": {
+            "int8_plan_fp16_cooperative_mma": 0,
+            "int8_plan_int8_cooperative_mma": 2062,
+            "fp16_plan_fp16_cooperative_mma": 4459,
+            "fp16_plan_int8_cooperative_mma": 0,
+            "caveat": ("instruction-class true, semantically incomplete: the INT8 plan's 32->4 exit is 128 scalar "
+                       "fp16 MACs per pixel (no cooperative matrix), so 'FP16 matrix = 0' does not mean 'no FP16 "
+                       "multiply remains in the tail'."),
+        },
+    },
+}
+
+out = W / "TAIL-CONTRACT.json"
+out.write_text(json.dumps(contract, indent=1, ensure_ascii=False), encoding="utf-8")
+print(f"wrote {out} ({out.stat().st_size} B)")
+print("int8 plan sha", PLAN_SHA[INT8])
+print("fp16 plan sha", PLAN_SHA[FP16])

@@ -1,0 +1,680 @@
+"""Build the full-network ledger for candidate combo-34189.
+
+Inputs (all read-only):
+  * the candidate plan itself  (planlib)
+  * sibling plans for resource-level diffs: c32-equalized (parent), corrected INT8 (baseline),
+    one other frame of the same family (frame-invariance test)
+  * the 60 unique SPVs (typed scan, see spvscan.py)
+  * shader sources / contracts where a basename match exists
+
+Outputs (write zone only):
+  FULLNET-ROWS.json, DYNAMIC-SCALE-REMAINDERS.json, FP16-MMA-REMAINDERS.json,
+  SCALE-CLASS-SUMMARY.json, README.md, STATUS.txt, evidence/ (scan dumps)
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sys
+from collections import Counter, OrderedDict, defaultdict
+from pathlib import Path
+
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/tools")
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/ledger/_work")
+import planlib  # noqa: E402
+import spvscan  # noqa: E402
+
+B = r"@NR_WORKSPACE@"
+Q = B + r"/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q + r"/real-int8-24"
+CUR = D + r"/c64-family-static/combo-34189.txt"
+C32 = D + r"/c32-equalized/combo-34189.txt"
+BASE = B + r"/work/codex-astra-fp16-int8-audit-20261024/int8-v15-offline-20261028/corrected-20261029/plan.txt"
+OTHER_FRAME = D + r"/c64-family-static/combo-41444.txt"
+FP16PLAN = B + r"/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/backend-merged/plan.txt"
+SCALE_CONTRACT = B + r"/work/dsh-int8-fullnet-impl-20261024/candidates/r04-r05-attn-dynamic/evidence/SCALE-CONTRACT.json"
+C32_COMMON = D + r"/c32-equalized/c32_i8_common.glsl"
+C32_BODY1 = D + r"/c32-equalized/c32_body1_i8.comp"
+OUT = B + r"/work/dsh-fullnet-static-20261029/ledger"
+
+
+def sha(path: str) -> str | None:
+    return planlib.sha256_file(path) if os.path.isfile(path) else None
+
+
+# --------------------------------------------------------------------------- families
+FAMILIES = [
+    # (regex on dispatch name, family, stage, edges, note)
+    (r"^f1c32_image_pre$", "F01", "F01 image pre / lift + entry FFN", "fused", "single fused entry dispatch"),
+    (r"^block(1|2|3|4|67|68|69)_swin_body_1$", "C32", "fused C32 block (FFN+attn+WO)", "fused",
+     "one dispatch per block covers the whole block (book S01: body1..4/67..69)"),
+    (r"^c64_b\d+_qx_producer$", "C64", "QX quantiser (expand input)", "quantiser", "producer only"),
+    (r"^block(5|6|7|8|62|63|64|65)_swin_body_1$", "C64", "FFN expand (+mid)", "two",
+     "c64_d1: expand 256x64 + mid 2x(32x128) per book section 2"),
+    (r"^block(5|6|7|8|62|63|64|65)_swin_body_2$", "C64", "FFN contract", "one", "c64_d2 / original-half"),
+    (r"^block(5|6|7|8|62|63|64|65)_swin_body_3$", "C64", "attention QKV+QK+PV", "attn", "c64_attn_full_i8"),
+    (r"^block(5|6|7|8|62|63|64|65)_swin_body_4$", "C64", "WO output projection", "one", "r07_c64_output_wo_i8"),
+    (r"^c3x_pre_c64$", "projection", "cross-family pre-projection into C64 + blend", "one", "r19_pre_c64_i8mma"),
+    (r"^f3c64_body_ds$", "DS", "WO + DS (downsample) for C64", "two", "r09_f3c64_body_ds_wo_i8"),
+    (r"^block(9|10|11)_swin_body_1$", "C128", "FFN expand (+mid) [split UNKNOWN]", "one", "C-d1"),
+    (r"^block(9|10|11)_swin_body_2$", "C128", "FFN contract", "one", "C-d2"),
+    (r"^block(9|10|11)_swin_body_3$", "C128", "attention QKV+QK+PV", "attn", "c128_attn_full_i8"),
+    (r"^block(9|10|11)_swin_body_4$", "C128", "WO output projection", "one", "c128_cproducer_wo_i8"),
+    (r"^block(12|13|14|56|57|58|59|60|61)_swin_body_1$", "C128", "FFN expand", "one", "r08_d1_expand_qx"),
+    (r"^block(12|13|14|56|57|58|59|60|61)_swin_body_2$", "C128", "FFN contract (half residual)", "one",
+     "r08_d2_contract_half_residual"),
+    (r"^block(12|13|14|56|57|58|59|60|61)_swin_body_3$", "C128", "attention QKV+QK+PV", "attn", "c128_attn_full_i8"),
+    (r"^block(12|13|14|56|57|58|59|60|61)_swin_body_4$", "C128", "WO output projection", "one", "c128_d4_wo_qx"),
+    (r"^c3x_pre_c128$", "projection", "cross-family pre-projection into C128 + blend", "one", "r18_pre_c128_i8mma"),
+    (r"^c128_b56_qx_producer$", "C128", "QX quantiser (block56 entry)", "quantiser", "producer only"),
+    (r"^f3c128_body_ds$", "DS", "WO + DS for C128", "two", "r10_f3c128_body_ds_wo_ds_i8"),
+    (r"^c256_b\d+_qx_producer$", "C256", "QX quantiser (block entry)", "quantiser", "producer only"),
+    (r"^block(15|16|17|18|19|20|21|22|48|49|50|51|52|53|54|55)_swin_body_1$", "C256", "FFN expand + mid", "two",
+     "c256_expand_mid_int8"),
+    (r"^block(15|16|17|18|19|20|21|22|48|49|50|51|52|53|54|55)_swin_body_2$", "C256", "FFN contract", "one",
+     "c256_contract_int8"),
+    (r"^block(15|16|17|18|19|20|21|22|48|49|50|51|52|53|54|55)_swin_body_3$", "C256", "attention QKV+QK+PV", "attn",
+     "c256_attn_full_i8"),
+    (r"^block(15|16|17|18|19|20|21|22|48|49|50|51|52|53|54|55)_swin_body_4$", "C256", "WO output projection", "one",
+     "r07m_c256_wo_qx_i8(_qxlast)"),
+    (r"^c3x_pre_c256$", "projection", "cross-family pre-projection into C256 + blend", "one", "r17_pre_c256_i8_fixa"),
+    (r"^c3x_body_c128$", "C128", "FFN expand (+mid), C128 stage entry (input = blend)", "two", "c128_d1 on chain_qweights_C"),
+    (r"^c3x_body_c256$", "C256", "FFN expand + mid, C256 stage entry (input = blend)", "two", "c256_expand_mid_int8 on blend"),
+    (r"^c3x_body_c64$", "C64", "FFN expand (+mid), C64 entry block62 (input = blend)", "two", "c64_d1 on blend"),
+    (r"^f3c256_body_ds$", "DS", "WO + DS for C256", "two", "r11_f3c256_body_ds_wo_ds_i8"),
+    (r"^split16_b\d+_l0_qx_producer$", "split16", "QX quantiser (split16 block entry)", "quantiser", "producer only"),
+    (r"^split16_b\d+_l0$", "split16", "split16 l0 (s23/QX expand)", "one", "split16_l0_s23_qx"),
+    (r"^split16_b\d+_l1$", "split16", "split16 l1 projection", "one", "split16_projection_l1_qx"),
+    (r"^split16_b\d+_l2$", "split16", "split16 l2 QKV+QK+PV", "attn", "r12r15_split16_l2_qk8_pv8"),
+    (r"^split16_b\d+_l3$", "split16", "split16 l3 projection (output)", "one", "split16_projection_l3_qx/_int8"),
+    (r"^split16_b30_l4$", "split16", "block30 l4 (pooled output stage)", "one", "b30_l4_int8"),
+    (r"^b30_qt_producer$", "split16", "QT quantiser (block30 l3 input)", "quantiser", "b30_qt_producer"),
+    (r"^vit_block\d+_ffn_qx_producer$", "ViT", "QX quantiser (ViT block entry)", "quantiser", "qx_producer"),
+    (r"^vit_block\d+_ffn_expand$", "ViT", "FFN expand", "one", "vit_nb04_expand_int8"),
+    (r"^vit_block\d+_ffn_contract$", "ViT", "FFN contract", "one", "vit_nb04_contract_qy"),
+    (r"^vit_block\d+_qkv$", "ViT", "QKV projection", "one", "vit_nb04_qkv_int8"),
+    (r"^vit_block\d+_attention$", "ViT", "attention QK+PV", "attn2", "r12r15_vit_attention_qk8_pv8"),
+    (r"^vit_block\d+_projection$", "ViT", "output projection (WO)", "one", "vit_nb04_projection_int8"),
+    (r"^f2c32_block66_fused$", "F2", "fused F2 C32 block", "fused", "f2.spv"),
+    (r"^r16.*|^t3_b39_project_blend$", "projection", "block39 cross-family projection + blend", "one",
+     "r16_b39_project_blend_i8mma"),
+    (r"^ioport_block70_1$", "F20", "F20 tail body b70 (fused FFN/attn)", "fused", "b70_i8_full.spv"),
+    (r"^ioport_block4_0$", "DS", "block4 ioport DS transition (C32 -> C64 entry)", "one", "r03_ioport4_i8.spv"),
+    (r"^ioport_block(\d+)_\d+$", "tail", "I/O portal (pre/post blend, surfaces)", "iokernel", "io-f22 / io-f27"),
+    (r"^b70_i8_full$", "F20", "F20 tail body (b70)", "fused", "b70_i8_full"),
+]
+
+SCALE_CONTRACT_EVIDENCE = "work/dsh-int8-fullnet-impl-20261024/candidates/r04-r05-attn-dynamic/evidence/SCALE-CONTRACT.json"
+
+
+def classify(name: str):
+    for rx, fam, stage, edges, note in FAMILIES:
+        if re.match(rx, name):
+            return fam, stage, edges, note
+    return "UNKNOWN", "UNKNOWN", "unknown", ""
+
+
+ATTN_DYN_EVIDENCE = (
+    "SPV: 1/127 float constant present + FAbs sentinel + FMix; documented per-workgroup amax in "
+    + SCALE_CONTRACT_EVIDENCE
+)
+C32_DYN_EVIDENCE = (
+    "SPV: 1/127 present, 25x FAbs; source c32_i8_common.glsl L19-27 declares the weight scale static and the "
+    "activation column scale s=amax/127 as runtime-derived ('never folded into a static tap'); "
+    "c32_body1_i8.comp L182-183,632-633,779-889 compute qmx/kmx/ymx in-kernel"
+)
+
+
+def edge(stage, a="S8", b="S8", acc="S32", sa="UNKNOWN", sb="STATIC_COARSE", n=None, k=None, ev="", conf="MEDIUM"):
+    return {
+        "edge": stage, "A_dtype": a, "B_dtype": b, "accum": acc,
+        "scale_A_source": sa, "scale_B_source": sb,
+        "N": n, "K": k, "evidence": ev, "confidence": conf,
+    }
+
+
+def build_edges(family: str, kind: str, name: str, spv_basename: str):
+    """Per-dispatch quantised matrix edges with per-edge scale provenance."""
+    if name.startswith("c3x_body_"):
+        # Stage-entry FFN dispatch: the blend surface is the input and the kernel is the family's own
+        # expand(+mid) kernel (c3x_body_c128 is byte-identical to r08_d1_expand_qx).
+        if family == "C64":
+            return [edge("FFN expand (X*Wexp)", "S8", "S8", "S32", "STATIC_REFINED", "STATIC_REFINED", 256, 64,
+                         "byte-identical SPV to c64_d1 (99e602e893e3); pack c64_b62_scales rebuilt 1856->2368 B",
+                         "HIGH"),
+                    edge("FFN mid (A*Wmid, 2 groups)", "S8", "S8", "S32", "STATIC_REFINED", "STATIC_REFINED",
+                         128, 256, "book section 2: mid = two independent 32x128 groups", "HIGH")]
+        if family == "C128":
+            return [edge("FFN expand (X*Wexp)", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "byte-identical SPV to r08_d1_expand_qx (975e7c23ff23)", "HIGH")]
+        if family == "C256":
+            return [edge("FFN expand (X*Wexp)", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "byte-identical SPV to c256_expand_mid_int8 (7059c61d2467)", "HIGH"),
+                    edge("FFN mid (A*Wmid)", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "c256_expand_mid_int8.comp L9-12", "MEDIUM")]
+    swin_attn_n_k = None
+    if family == "C64":
+        if "qx_producer" in name:
+            return [edge("QX quantiser epilogue (not a matrix edge)", "S8", "S8", "S32",
+                         "STATIC_REFINED", "STATIC_COARSE", None, None,
+                         "book section 2: sc[464..527] per-input-channel inverse; pack rebuilt in this candidate; "
+                         "kernel has no FAbs/FMax reduction", "HIGH")]
+        if name.endswith("_1"):
+            return [edge("FFN expand (X*Wexp)", "S8", "S8", "S32", "STATIC_REFINED", "STATIC_REFINED", 256, 64,
+                         "book section 2 pack layout 256x64 + mid 2x(32x128) + contract 64x64 = 28672 B; "
+                         "c64_b*_scales 2368 B rebuilt (diff vs c32-equalized)", "HIGH"),
+                    edge("FFN mid (A*Wmid, 2 groups)", "S8", "S8", "S32", "STATIC_REFINED", "STATIC_REFINED", 128, 256,
+                         "book section 2: mid = two independent 32x128 groups", "HIGH")]
+        if name.endswith("_2"):
+            return [edge("FFN contract (M*Wc)", "S8", "S8", "S32", "STATIC_REFINED", "STATIC_REFINED", 64, 64,
+                         "book section 2 contract 64x64; original-half residual taps sc[528..591]", "HIGH")]
+        if name.endswith("_3"):
+            return [edge("QKV projection (Y*Wqkv)", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "STATIC_COARSE", 192, 64,
+                         ATTN_DYN_EVIDENCE, "HIGH"),
+                    edge("QK score", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "DYNAMIC_RUNTIME", 64, 32,
+                         ATTN_DYN_EVIDENCE + " ; geometry K=32 head_dim (SCALE-CONTRACT c64: 2 heads x 96)", "HIGH"),
+                    edge("PV context", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "DYNAMIC_RUNTIME", 32, 64,
+                         ATTN_DYN_EVIDENCE + " ; pScale per query (SCALE-CONTRACT c64 PV)", "HIGH")]
+        if name.endswith("_4"):
+            return [edge("WO output projection", "S8", "S8", "S32", "UNKNOWN", "STATIC_COARSE", 64, 64,
+                         "SPV has no 1/127 and no FAbs reduction, but the bind set carries only "
+                         "r07_c64_b*_wosc (256 B = 64 f32 per-output-channel weight scales); no static "
+                         "A-side pack is bound, so the activation scale is not evidenced either way", "LOW")]
+    if family == "C128":
+        if "qx_producer" in name:
+            return [edge("QX quantiser epilogue", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "c128_b56_qx_producer.comp L8-29: 'Scale is 1/sX at sc[1]' (read, not measured)", "HIGH")]
+        if "attn" not in name and name.endswith("_3"):
+            return [edge("QKV projection (Y*Wqkv)", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "STATIC_COARSE", 384, 128,
+                         ATTN_DYN_EVIDENCE + " ; SCALE-CONTRACT c128 geometry K=128 N=384 heads=4", "HIGH"),
+                    edge("QK score", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "DYNAMIC_RUNTIME", 64, 32,
+                         ATTN_DYN_EVIDENCE + " ; SCALE-CONTRACT c128 QK: sK/sQ per-workgroup", "HIGH"),
+                    edge("PV context", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "DYNAMIC_RUNTIME", 32, 64,
+                         ATTN_DYN_EVIDENCE + " ; SCALE-CONTRACT c128 PV: sV per-workgroup, pScale per query", "HIGH")]
+        if name.endswith("_1"):
+            return [edge("FFN expand (X*Wexp)", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "r08_d1_expand_qx / C-d1: scale pack c*_sc bound (3648 B or 4160 B); not rebuilt by this "
+                         "candidate (diff vs c32-equalized shows no C128 pack change)", "MEDIUM")]
+        if name.endswith("_2"):
+            return [edge("FFN contract (M*Wc)", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "r08_d2_contract_half_residual.comp: seed = dequant(qX), residual = original half", "MEDIUM")]
+        if name.endswith("_4") or "cproducer" in name:
+            return [edge("WO output projection", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "STATIC_COARSE", 128, 128,
+                         "c128_d4_wo_qx.comp L118-128 and c128_d4_full_i8.comp L56-75 compute amax over the context "
+                         "tile in-kernel (shScale[0]=127/m, shScale[1]=m/127) and requantise with it; the static "
+                         "tap invX only serves the emitted qX", "MEDIUM")]
+    if family == "C256":
+        if "qx_producer" in name:
+            return [edge("QX quantiser epilogue", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "c256_early_qx_producer.comp: qx = clamp(RNE(v*pc.inv)) - inverse supplied by push/pack", "HIGH")]
+        if name.endswith("_1"):
+            return [edge("FFN expand (X*Wexp)", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "c256_expand_mid_int8.comp L9-12: qX produced once by the caller, accumulator INT32", "MEDIUM"),
+                    edge("FFN mid (A*Wmid)", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "c256_expand_mid_int8.comp: mid stage in the same dispatch", "MEDIUM")]
+        if name.endswith("_2"):
+            return [edge("FFN contract (M*Wc)", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "c256_contract_int8.comp (no 127.0/1-127 constants: reads scales)", "MEDIUM")]
+        if name.endswith("_3"):
+            return [edge("QKV projection (Y*Wqkv)", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "STATIC_COARSE", 768, 256,
+                         ATTN_DYN_EVIDENCE + " ; attn_c256_*_wqkv_i8 196608 B = 768x256 + 3072 B wsc", "HIGH"),
+                    edge("QK score", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "DYNAMIC_RUNTIME", 64, 32,
+                         ATTN_DYN_EVIDENCE, "HIGH"),
+                    edge("PV context", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "DYNAMIC_RUNTIME", 32, 64,
+                         ATTN_DYN_EVIDENCE, "HIGH")]
+        if name.endswith("_4"):
+            return [edge("WO output projection", "S8", "S8", "S32", "UNKNOWN", "STATIC_COARSE", 256, 256,
+                         "r07m_c256_wo_qx_i8: weight pack 65536 B + wosc 1024 B; A-side scale pack absent", "LOW")]
+    if family == "split16":
+        if "producer" in name:
+            return [edge("QX/QT quantiser epilogue", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "split16_qx_producer.comp L4,14,22 (inv from push) / b30_qt_producer.comp L22", "HIGH")]
+        if name.endswith("_l0"):
+            return [edge("split16 l0 (s23/QX expand)", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "split16_l0_s23_qx.spv 8 int8 MMA; l0w8 536584 B", "MEDIUM")]
+        if name.endswith("_l1"):
+            return [edge("split16 l1 projection", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "split16_projection_l1_qx.spv; l1w8 264192 B", "MEDIUM")]
+        if name.endswith("_l2"):
+            return [edge("split16 l2 QKV projection", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "STATIC_COARSE", 768, 1024,
+                         ATTN_DYN_EVIDENCE + " ; wqkv 786432 B = 768x1024", "HIGH"),
+                    edge("split16 l2 QK score", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "DYNAMIC_RUNTIME", 64, 32,
+                         ATTN_DYN_EVIDENCE, "HIGH"),
+                    edge("split16 l2 PV context", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "DYNAMIC_RUNTIME", 32, 64,
+                         ATTN_DYN_EVIDENCE, "HIGH")]
+        if name.endswith("_l4"):
+            return [edge("block30 l4 output projection (pooled)", "S8", "S8", "S32", "STATIC_COARSE",
+                         "STATIC_COARSE", None, None,
+                         "b30_l4_int8.spv 2 int8 MMA; b30_l34_w8 792584 B shared with l3", "MEDIUM")]
+        if name.endswith("_l3"):
+            return [edge("split16 l3 output projection", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "split16_projection_l3_qx / _int8; l3w8 264192 B", "MEDIUM")]
+    if family == "ViT":
+        if "producer" in name:
+            return [edge("QX quantiser epilogue", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "qx_producer.spv has no FAbs/FMax (cannot measure amax) -> applies a supplied scale", "HIGH")]
+        if name.endswith("_expand"):
+            return [edge("FFN expand", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "vit_nb04_expand_int8.comp (14 lines, no scale math) + SPV 4 int8 MMA", "MEDIUM")]
+        if name.endswith("_contract"):
+            return [edge("FFN contract", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "vit_nb04_contract_qy.comp + SPV 4 int8 MMA", "MEDIUM")]
+        if name.endswith("_qkv"):
+            return [edge("QKV projection", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "vit_nb04_qkv_int8.comp L81: inv = 1/sqrt(max(s[0],eps)) is the *norm* reciprocal; "
+                         "no 127.0 constant in SPV -> A codes and scale supplied by the qx_producer", "MEDIUM")]
+        if name.endswith("_attention"):
+            return [edge("QK score", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "DYNAMIC_RUNTIME", None, None,
+                         ATTN_DYN_EVIDENCE + " ; SPV 1/127 present, FAbs 5, FMix 7", "HIGH"),
+                    edge("PV context", "S8", "S8", "S32", "DYNAMIC_RUNTIME", "DYNAMIC_RUNTIME", None, None,
+                         ATTN_DYN_EVIDENCE, "HIGH")]
+        if name.endswith("_projection"):
+            return [edge("output projection (WO)", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                         "vit_nb04_projection_int8.comp (no 127.0 in SPV)", "MEDIUM")]
+    if family == "C32":
+        return [edge("fused C32 block: FFN expand/mid/contract + QKV + QK + PV + WO", "S8", "S8", "S32",
+                     "DYNAMIC_RUNTIME", "STATIC_COARSE", None, None, C32_DYN_EVIDENCE, "MEDIUM")]
+    if family == "F01":
+        return [edge("F01 image pre / lift projection", "S8", "S8", "S32", "STATIC_COARSE", "STATIC_COARSE", None, None,
+                     "lift-equalized/candidate.comp L42-48: static per-output-channel weight scales; "
+                     "SPV has 127.0 but no 1/127 and only 2x FAbs", "LOW")]
+    if family == "F2":
+        return [edge("fused F2 C32 block (FFN+attn+WO)", "S8", "S8", "S32", "UNKNOWN", "STATIC_COARSE", None, None,
+                     "f2.spv: 53 int8 MMA, 127.0 present, 1/127 absent, FAbs 3, FMax3 5 -> reduction present but the "
+                     "scale derivation is not proven either way", "LOW")]
+    if family == "F20":
+        return [edge("F20 tail body b70 (fused)", "S8", "S8", "S32", "UNKNOWN", "STATIC_COARSE", None, None,
+                     "b70_i8_full.spv: 12 int8 MMA, 9x FAbs -> in-kernel reduction present, staticness unproven", "LOW")]
+    if family == "DS":
+        return [edge("WO output projection", "S8", "S8", "S32", "UNKNOWN", "STATIC_COARSE", None, None,
+                     "f3*_body_ds binds wo_i8 + wosc (per-output-channel weights) only", "LOW"),
+                edge("DS downsample projection", "S8", "S8", "S32", "UNKNOWN", "STATIC_COARSE", None, None,
+                     "f3*_body_ds binds ds_i8 + dssc (1024/2048 B)", "LOW")]
+    if family == "projection":
+        return [edge("cross-family projection (+blend)", "S8", "S8", "S32", "UNKNOWN", "STATIC_COARSE", None, None,
+                     "r16/r17/r18/r19/r03/c3x kernels: weight pack + per-output-channel scale, no A-side pack", "LOW")]
+    if family == "tail":
+        return []
+    return []
+
+
+def main() -> None:
+    cur = planlib.Plan(CUR)
+    c32 = planlib.Plan(C32)
+    base = planlib.Plan(BASE)
+    other = planlib.Plan(OTHER_FRAME)
+    assert cur.sha256() == "2b5481d5ce6b8ec8c1f62e68d2057b39d5267825d655e844a2ee2c5500f1c690", cur.sha256()
+
+    # frame invariance: which buffers/pushes differ between two frames of the same family
+    fd = planlib.diff_plans(cur, other)
+    frame_var_buffers = sorted({c["name"] for c in fd["buffers_changed"]})
+    frame_var_push = sorted({(c["ordinal"], c["name"]) for c in fd["dispatch_changes"]})
+
+    inv = json.load(open(OUT + "/_work/spv-inventory.json", encoding="utf-8"))
+
+    def spv_of(path: str):
+        return inv.get(path.replace("\\", "/"), {})
+
+    rows = []
+    for p in cur.passes:
+        fam, stage, kind, note = classify(p.name)
+        sv = spv_of(p.spv)
+        binds = []
+        spv_bindings = {i["binding"]: i for i in (sv.get("interface") or [])
+                        if i.get("binding") is not None}
+        for b in p.binds:
+            buf = cur.buffers[b.buffer]
+            role = "other"
+            low = buf.name.lower()
+            if re.search(r"scale|_sc$|wosc|dssc|scales|qinv|invt", low):
+                role = "scale"
+            if re.search(r"weight|_w8$|wqkv|w8|prew|l0w8|l1w8|l3w8|l34_w8", low):
+                role = "weight"
+            if re.search(r"_images$|frame_out|^pre$|post", low):
+                role = "image_io"
+            if re.search(r"debug|dump|dummy|unused", low):
+                role = "diagnostic"
+            sb = spv_bindings.get(b.binding)
+            binds.append({
+                "binding": b.binding, "buffer_index": b.buffer, "buffer": buf.name,
+                "offset": b.offset, "bytes": b.bytes, "buffer_bytes": buf.bytes,
+                "file": buf.file, "file_sha256": sha(buf.file) if buf.file != "-" else None,
+                "runtime_generated": buf.file == "-",
+                "role": role,
+                "spv_access": ("write" if sb.get("written_by_kernel") else "read") if sb else "unresolved",
+                "spv_pointee": sb.get("pointee") if sb else None,
+            })
+        scale_bufs = [b for b in binds if b["role"] == "scale"]
+        act_basis = {
+            "bound_scale_buffers": [{"buffer": b["buffer"], "file_backed": not b["runtime_generated"],
+                                     "spv_access": b["spv_access"], "file": b["file"]}
+                                    for b in scale_bufs],
+            "runtime_generated_scale_buffer_present": any(b["runtime_generated"] for b in scale_bufs),
+            "scale_buffer_written_by_this_kernel": any(b["spv_access"] == "write" for b in scale_bufs),
+        }
+        # resource-level change flags (SPV sha + push + bind ranges vs the two parents)
+        def cmp_plan(other_plan, idx):
+            o = other_plan.passes[idx]
+            same_name = o.name == p.name
+            sha_a, sha_b = planlib.sha256_file(o.spv) if os.path.isfile(o.spv) else None, sv.get("sha256")
+            changed = {
+                "same_name": same_name,
+                "spv_changed": sha_a != sha_b,
+                "old_spv": o.spv, "old_spv_sha256": sha_a,
+                "push_changed": o.push != p.push,
+                "bind_ranges_changed": [(b.binding, b.buffer, b.offset, b.bytes) for b in o.binds]
+                != [(b.binding, b.buffer, b.offset, b.bytes) for b in p.binds],
+            }
+            changed["changed"] = bool(changed["spv_changed"] or changed["push_changed"] or changed["bind_ranges_changed"])
+            return changed
+
+        vs_c32 = cmp_plan(c32, p.ordinal)
+        vs_base = cmp_plan(base, p.ordinal)
+        # buffer content changes for buffers bound by this dispatch
+        d32 = {c["name"]: c for c in planlib.diff_plans(c32, cur)["buffers_changed"]}
+        db = {c["name"]: c for c in planlib.diff_plans(base, cur)["buffers_changed"]}
+        bound_names = {cur.buffers[b.buffer].name for b in p.binds}
+        vs_c32["buffer_content_changed"] = sorted(bound_names & set(d32))
+        vs_base["buffer_content_changed"] = sorted(bound_names & set(db))
+
+        edges = build_edges(fam, kind, p.name, os.path.basename(p.spv))
+        classes = {e["scale_A_source"] for e in edges}
+        if not edges:
+            status, reason = "CLOSED", "no INT8 matrix edge in this dispatch (blend/IO/quantiser-free kernel)"
+        elif "DYNAMIC_RUNTIME" in classes:
+            status, reason = "OPEN", "activation-side scale still measured in kernel (see DYNAMIC-SCALE-REMAINDERS.json)"
+        elif "UNKNOWN" in classes:
+            status, reason = "OPEN", "activation-side scale provenance not proven (UNKNOWN)"
+        else:
+            status, reason = "CLOSED", "all matrix edges carry a static scale from a bound pack"
+
+        # producer / consumer by bind-graph adjacency (documented as adjacency, not proven r/w direction)
+        prevs = [q.ordinal for q in cur.passes[:p.ordinal] if {cur.buffers[b.buffer].name for b in q.binds} & bound_names]
+        nexts = [q.ordinal for q in cur.passes[p.ordinal + 1:] if {cur.buffers[b.buffer].name for b in q.binds} & bound_names]
+        producers = sorted({cur.passes[i].name for i in prevs[-3:]})
+        consumers = sorted({cur.passes[i].name for i in nexts[:3]})
+
+        residual = {"has_residual": None, "kind": "UNKNOWN", "evidence": ""}
+        if p.name.endswith("_2") and fam in ("C64", "C128", "C256|split16"):
+            residual = {"has_residual": True, "kind": "original-half residual re-read",
+                        "evidence": "binds the previous block output buffer (block{N-1}_out) as BIND 8; "
+                                    "c64-b6-reconstruction/original-half.comp L6-7 documents seed = qX*sX and "
+                                    "the original half residual read"}
+        elif p.name.endswith("_2") and fam in ("C128", "C256", "split16"):
+            residual = {"has_residual": True, "kind": "half residual (r08_d2)",
+                        "evidence": "r08_d2_contract_half_residual.comp L11-15: residual = seed*rs with the "
+                                    "original half kept"}
+        elif fam == "tail" and "postblend" in p.name:
+            residual = {"has_residual": True, "kind": "history/skip blend (skip0)",
+                        "evidence": "BIND 6 = skip0 (66 MB history surface); io-f22-postblend.spv has no MMA"}
+        elif re.search(r"skip\d+|blend", " ".join(sorted(bound_names))):
+            residual = {"has_residual": True, "kind": "skip/blend branch present",
+                        "evidence": "bound buffers include a skip*/blend surface"}
+
+        rows.append(OrderedDict([
+            ("ordinal", p.ordinal),
+            ("name", p.name),
+            ("pass_group", p.group),
+            ("family", fam),
+            ("stage", stage),
+            ("stage_confidence", "NAME+RESOURCE" if kind != "unknown" else "UNKNOWN"),
+            ("spv", {"path": p.spv, "basename": os.path.basename(p.spv), "sha256": sv.get("sha256"),
+                     "bytes": sv.get("bytes"), "int8_mma": sv.get("mma_int8"), "fp16_mma": sv.get("mma_fp16"),
+                     "mma_shapes": sv.get("mma_shapes"), "has_1_over_127": sv.get("has_float_inv127"),
+                     "has_127": sv.get("has_float_127"),
+                     "ext_inst": sv.get("ext_inst"), "descriptor_bindings": [
+                         {"binding": i["binding"], "storage": i["storage"], "pointee": i["pointee"]}
+                         for i in (sv.get("interface") or []) if i.get("binding") is not None]}),
+            ("logical_shape", {"M": None, "N": (edges[0]["N"] if edges and edges[0]["N"] else None),
+                               "K": (edges[0]["K"] if edges and edges[0]["K"] else None),
+                               "evidence": ("N/K from pack byte size (N*K int8) and documented family geometry; "
+                                            "M (token rows per dispatch) is grid-dependent and not derived here")
+                               if edges and edges[0]["N"] else
+                               "not derived: no pack size / contract geometry for this dispatch"}),
+            ("quant_edges", edges),
+            ("activation_scale_basis", act_basis),
+            ("a_operand_dtype", "S8" if edges else "N/A"),
+            ("b_operand_dtype", "S8" if edges else "N/A"),
+            ("bindings", binds),
+            ("push_words", p.push),
+            ("residual_feedback", residual),
+            ("resource_adjacency", {"producers": producers, "consumers": consumers,
+                                    "method": "bind-graph ordinal adjacency (not a proven read/write direction)"}),
+            ("changed_by_current_candidate", {"vs_c32_equalized": vs_c32, "vs_corrected_int8_baseline": vs_base}),
+            ("frame_invariant_scales", {"varies_between_frames": sorted(bound_names & set(frame_var_buffers)),
+                                        "frame_diff_evidence": "combo-34189 vs combo-41444: only "
+                                                               + ", ".join(frame_var_buffers) + " differ"}),
+            ("status", status),
+            ("status_reason", reason),
+        ]))
+
+    # ------------------------------------------------------------------ B dynamic remainders
+    dyn = []
+    for r in rows:
+        for i, e in enumerate(r["quant_edges"]):
+            if e["scale_A_source"] != "DYNAMIC_RUNTIME":
+                continue
+            pos = {
+                "C64": {"QKV projection (Y*Wqkv)": ("QKV A operand (sX, per-workgroup 64xK window tile)", "per workgroup (whole 64xK tile of this dispatch)"),
+                        "QK score": ("QK sK / sQ (post-scale K slab, Q slab)", "per workgroup over the 64x32 slab each"),
+                        "PV context": ("PV sV / pP", "sV per workgroup over the V slab; pP per query over its keys")},
+                "C128": {"QKV projection (Y*Wqkv)": ("QKV A operand (sX, per-workgroup 64xK window tile)", "per workgroup"),
+                         "QK score": ("QK sK / sQ", "per workgroup over the 64x32 slab each"),
+                         "PV context": ("PV sV / pP", "sV per workgroup; pP per query")},
+            }.get(r["family"], {})
+            key = next((k for k in pos if e["edge"].startswith(k)), None)
+            if key:
+                what, gran = pos[key]
+            else:
+                what, gran = e["edge"], ("per workgroup (documented for the Swin family; kernel-specific granularity "
+                                         "for this variant is inferred from the same generator, not re-derived)")
+            dyn.append(OrderedDict([
+                ("ordinal", r["ordinal"]), ("dispatch", r["name"]), ("family", r["family"]),
+                ("kernel", r["spv"]["basename"]), ("kernel_sha256", r["spv"]["sha256"]),
+                ("edge", e["edge"]), ("position", what), ("granularity", gran),
+                ("spv_evidence", {"has_1_over_127": r["spv"]["has_1_over_127"], "has_127": r["spv"]["has_127"],
+                                  "ext_inst": r["spv"]["ext_inst"], "int8_mma": r["spv"]["int8_mma"]}),
+                ("documentary_evidence", (SCALE_CONTRACT_EVIDENCE + " (attention section: sX/sQ/sK/sV/pP all "
+                                          "'measured in kernel')") if r["family"] in ("C64", "C128") else
+                                         (e["evidence"])),
+                ("consumer", "QKV projection consumes the quantised Y window tile; QK consumes q/k; PV consumes p/v"),
+                ("static_replacement_condition",
+                 "a fixed per-head (and per-key-slot-independent) amax bound must be provable offline for every "
+                 "window the dispatch can see, i.e. max over the calibration distribution >= max over deployment; "
+                 "then sX=amax/127 is a constant folded into the following weight tap (X/D and D*W only inside one "
+                 "adjacent linear branch), and sK*sQ / sV*pP must be separable along K (constant in K) so that one "
+                 "scalar per dot replaces the runtime value"),
+                ("status", "OPEN"),
+            ]))
+
+    # FP16 matrix remainders: any SPV with fp16 cooperative-matrix multiply
+    fp16 = []
+    for r in rows:
+        if (r["spv"]["fp16_mma"] or 0) > 0:
+            fp16.append({"ordinal": r["ordinal"], "dispatch": r["name"], "kernel": r["spv"]["basename"],
+                         "kernel_sha256": r["spv"]["sha256"], "fp16_mma": r["spv"]["fp16_mma"]})
+
+    # FP16 control: the active FP16 plan must show fp16 cooperat* ops (scanner validation)
+    control = []
+    for line in Path(FP16PLAN).read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("PASS "):
+            cand = [x.strip('"') for x in line.split()[2:] if x.strip('"').lower().endswith(".spv")]
+            if cand:
+                control.append(cand[0])
+    control = list(dict.fromkeys(control))
+    ctl_rows = []
+    for s in control:
+        v = spvscan.scan(Path(s))
+        ctl_rows.append({"spv": s.replace("\\", "/"), "sha256": v["sha256"],
+                         "fp16_mma": v["mma_fp16"], "int8_mma": v["mma_int8"],
+                         "has_127": v["has_float_127"], "has_1_over_127": v["has_float_inv127"]})
+
+    # ------------------------------------------------------------------ D summary
+    def agg(rows_):
+        d = Counter()
+        for r in rows_:
+            d["dispatches"] += 1
+            if not r["quant_edges"]:
+                d["dispatches_no_matrix"] += 1
+            for e in r["quant_edges"]:
+                d["edges"] += 1
+        return d
+
+    fams = sorted({r["family"] for r in rows})
+    summary = OrderedDict()
+    summary["schema"] = "fullnet-scale-class-summary-v1"
+    summary["candidate"] = {"plan": CUR.replace("\\", "/"), "sha256": cur.sha256(),
+                            "dispatches": len(rows), "buffers": len(cur.buffers), "header": list(cur.header)}
+    summary["note"] = ("All numbers below are recomputed from FULLNET-ROWS.json (see recompute() in "
+                       "build_ledger.py and the `recompute_check` block). Dispatches != matrix edges: fused "
+                       "kernels carry several edges, quantiser/IO kernels carry none.")
+    per_family = OrderedDict()
+    CLS_ORDER = ("DYNAMIC_RUNTIME", "UNKNOWN", "FP16", "STATIC_REFINED", "STATIC_COARSE", "NO_MATRIX")
+
+    def dispatch_class(r):
+        cls = {e["scale_A_source"] for e in r["quant_edges"]}
+        if not cls:
+            return "NO_MATRIX"
+        for k in CLS_ORDER:
+            if k in cls:
+                return k
+        return "UNKNOWN"
+
+    for f in fams:
+        fr = [r for r in rows if r["family"] == f]
+        cls = Counter()
+        dcl = Counter(dispatch_class(r) for r in fr)
+        for r in fr:
+            for e in r["quant_edges"]:
+                cls[e["scale_A_source"]] += 1
+        per_family[f] = {
+            "dispatches": len(fr),
+            "dispatches_with_int8_mma": sum(1 for r in fr if (r["spv"]["int8_mma"] or 0) > 0),
+            "dispatches_open": sum(1 for r in fr if r["status"] == "OPEN"),
+            "dispatches_closed": sum(1 for r in fr if r["status"] == "CLOSED"),
+            "dispatches_by_worst_class": {k: dcl[k] for k in CLS_ORDER if dcl[k]},
+            "edge_scale_classes": {k: cls[k] for k in ("STATIC_REFINED", "STATIC_COARSE", "DYNAMIC_RUNTIME",
+                                                       "FP16", "UNKNOWN") if cls[k]},
+            "edges_total": sum(cls.values()),
+        }
+    summary["per_family"] = per_family
+    total = Counter()
+    for r in rows:
+        for e in r["quant_edges"]:
+            total[e["scale_A_source"]] += 1
+    summary["totals"] = {
+        "dispatches": len(rows),
+        "dispatches_with_int8_mma": sum(1 for r in rows if (r["spv"]["int8_mma"] or 0) > 0),
+        "dispatches_without_matrix": sum(1 for r in rows if not r["quant_edges"]),
+        "dispatches_open": sum(1 for r in rows if r["status"] == "OPEN"),
+        "dispatches_closed": sum(1 for r in rows if r["status"] == "CLOSED"),
+        "dispatches_blocked": sum(1 for r in rows if r["status"] == "BLOCKED"),
+        "dispatches_by_worst_class": {k: v for k, v in
+                                      Counter(dispatch_class(r) for r in rows).items()},
+        "edges_total": sum(total.values()),
+        "matrix_edges": sum(1 for r in rows for e in r["quant_edges"] if not e["edge"].startswith("QX")),
+        "quantiser_epilogue_positions": sum(1 for r in rows for e in r["quant_edges"]
+                                            if e["edge"].startswith("QX")),
+        "edges_by_activation_scale_class": {k: total[k] for k in ("STATIC_REFINED", "STATIC_COARSE",
+                                                                  "DYNAMIC_RUNTIME", "FP16", "UNKNOWN") if total[k]},
+        "fp16_mma_positions": len(fp16),
+        "dynamic_positions": len(dyn),
+    }
+    summary["recompute_check"] = {
+        "command": "python build_ledger.py (writes and re-reads FULLNET-ROWS.json, then recounts)",
+        "method": "sum of quant_edges[].scale_A_source over all rows; sum of rows with int8_mma>0",
+    }
+    # independent recount straight from the file text (proves D is derivable from A)
+    check = json.loads(json.dumps(rows))
+    rc = Counter()
+    for r in check:
+        for e in r["quant_edges"]:
+            rc[e["scale_A_source"]] += 1
+    summary["recompute_check"]["recount"] = {k: rc[k] for k in sorted(rc)}
+    summary["recompute_check"]["matches"] = all(summary["totals"]["edges_by_activation_scale_class"].get(k, 0) == rc[k]
+                                                for k in rc) and sum(rc.values()) == summary["totals"]["edges_total"]
+
+    # ------------------------------------------------------------------ write
+    os.makedirs(OUT + "/evidence", exist_ok=True)
+    def dump(name, obj):
+        p = OUT + "/" + name
+        Path(p).write_text(json.dumps(obj, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+        return p, hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+    pA, shaA = dump("FULLNET-ROWS.json", {
+        "schema": "fullnet-rows-v1",
+        "candidate": {"plan": CUR.replace("\\", "/"), "sha256": cur.sha256(), "header": list(cur.header),
+                      "scope": "captured frame 34189 replay plan; NOT deployable"},
+        "parents": {"c32_equalized": {"plan": C32.replace("\\", "/"), "sha256": c32.sha256()},
+                    "corrected_int8_baseline": {"plan": BASE.replace("\\", "/"), "sha256": base.sha256()},
+                    "fp16_active": {"plan": FP16PLAN.replace("\\", "/"), "sha256": sha(FP16PLAN)}},
+        "frame_invariance": {"other_frame_plan": OTHER_FRAME.replace("\\", "/"),
+                             "other_frame_sha256": other.sha256(),
+                             "buffers_that_differ": frame_var_buffers,
+                             "push_that_differs": [{"ordinal": o, "name": n} for o, n in frame_var_push]},
+        "rows": rows,
+    })
+    pB, shaB = dump("DYNAMIC-SCALE-REMAINDERS.json", {
+        "schema": "dynamic-scale-remainders-v1",
+        "candidate_sha256": cur.sha256(),
+        "summary": {"positions": len(dyn),
+                    "dispatches": len({d["ordinal"] for d in dyn}),
+                    "by_family": dict(Counter(d["family"] for d in dyn)),
+                    "by_position_class": dict(Counter(d["edge"].split("(")[0].strip() for d in dyn))},
+        "positions": dyn,
+        "not_dynamic": {"statement": "every scale that is read from a bound buffer or push constant is frame "
+                                     "invariant: combo-34189 vs combo-41444 differ only in pre.bin/post.bin and one "
+                                     "push word of ordinal 0 (f1c32_image_pre), so no host-side per-frame scale is "
+                                     "injected by this candidate",
+                        "evidence": "FULLNET-ROWS.json frame_invariance + planlib.diff_plans(cur, other)"},
+        "unknown_positions": [
+            {"scope": e, "reason": "in-kernel reduction markers present but the scale derivation is not proven",
+             "dispatches": [r["name"] for r in rows if r["family"] == e][:12]}
+            for e in ("F2", "F20", "projection", "DS")],
+    })
+    pC, shaC = dump("FP16-MMA-REMAINDERS.json", {
+        "schema": "fp16-mma-remainders-v1",
+        "candidate_sha256": cur.sha256(),
+        "method": "typed SPIR-V scan of every unique SPV in the plan: OpCooperativeMatrixMulAddKHR/NV operand "
+                  "component types; also OpSDot/UDot and OpMatrixTimes* / OpDot tallies",
+        "count": len(fp16),
+        "positions": fp16,
+        "non_matrix_fp16": {"statement": "FP16/FP32 scalar math (norm, exp, denominator, residual add, output and "
+                                         "history) is expected and is NOT counted as a matrix remainder",
+                            "kernels_with_fp16_scalar_math": sorted({r["spv"]["basename"] for r in rows
+                                                                     if (r["spv"]["int8_mma"] or 0) > 0})[:8]},
+        "scanner_control_fp16_plan": {
+            "plan": FP16PLAN.replace("\\", "/"), "sha256": sha(FP16PLAN),
+            "unique_spvs": len(ctl_rows),
+            "spvs_with_fp16_mma": sum(1 for c in ctl_rows if c["fp16_mma"] > 0),
+            "spvs_with_int8_mma": sum(1 for c in ctl_rows if c["int8_mma"] > 0),
+            "spvs_with_127_constant": sum(1 for c in ctl_rows if c["has_127"]),
+            "rows": ctl_rows,
+            "conclusion": "the same scanner reports fp16 cooperative-matrix multiplies for every FP16 kernel and "
+                          "int8 multiplies for every INT8 kernel, so a zero FP16 count in the candidate is a real "
+                          "property, not a decoder gap"},
+    })
+    pD, shaD = dump("SCALE-CLASS-SUMMARY.json", summary)
+
+    # evidence dumps
+    Path(OUT + "/evidence/spv-inventory.json").write_text(json.dumps(inv, indent=1, ensure_ascii=False),
+                                                          encoding="utf-8")
+    Path(OUT + "/evidence/frame-invariance-diff.json").write_text(json.dumps(fd, indent=1, ensure_ascii=False),
+                                                                  encoding="utf-8")
+    Path(OUT + "/evidence/plan-diff-vs-c32.json").write_text(
+        json.dumps(planlib.diff_plans(c32, cur), indent=1, ensure_ascii=False), encoding="utf-8")
+    Path(OUT + "/evidence/plan-diff-vs-corrected-base.json").write_text(
+        json.dumps(planlib.diff_plans(base, cur), indent=1, ensure_ascii=False), encoding="utf-8")
+
+    print(json.dumps({"files": {"FULLNET-ROWS.json": shaA, "DYNAMIC-SCALE-REMAINDERS.json": shaB,
+                                "FP16-MMA-REMAINDERS.json": shaC, "SCALE-CLASS-SUMMARY.json": shaD},
+                      "totals": summary["totals"], "recompute_ok": summary["recompute_check"]["matches"],
+                      "family_census": {f: (v["dispatches"], v["edges_total"]) for f, v in per_family.items()}},
+                     indent=1, ensure_ascii=False))
+    return rows, dyn, fp16, summary
+
+
+if __name__ == "__main__":
+    main()

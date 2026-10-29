@@ -1,0 +1,155 @@
+"""Fold-shape verification for n24 (CPU only).
+
+For the two PASSes it prints, straight from the SPIR-V:
+  * every cooperative-matrix load (4457) / store (4458) whose pointer comes from
+    the gM descriptor (binding 5): the row stride constant and a readable form
+    of the byte-offset expression;
+so the intended change (stride 128 -> 16, k term 16*ki -> 128*ki on the
+consumer, 32*g -> 256*g on the producer) can be checked without trusting the
+source, and everything else can be seen to be untouched.
+"""
+import json
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent
+sys.path.insert(0, str(CARD))
+import spv_access as S
+
+OP_CONST = 43
+OP_IADD = 128
+OP_IMUL = 132
+OP_SHL = 196 if False else 112       # OpShiftLeftLogical = 196? keep ints below
+OP_UDIV = 134
+OP_LOAD = 61
+OP_ACCESS = (65, 67)
+OP_VAR = 59
+OP_CM_LOAD = 4457
+OP_CM_STORE = 4458
+
+
+def consts(ops):
+    out = {}
+    for op, a in ops:
+        if op == OP_CONST and len(a) >= 3:
+            out[a[1]] = a[2]
+    return out
+
+
+def defs(ops):
+    d = {}
+    for op, a in ops:
+        if op in (OP_VAR, OP_LOAD, OP_CM_LOAD) and len(a) >= 2:
+            d[a[1]] = (op, a)
+        elif op in OP_ACCESS and len(a) >= 2:
+            d[a[1]] = (op, a)
+        elif op in (OP_IADD, OP_IMUL, OP_UDIV, 112, 194, 195, 105, 115) and len(a) >= 2:
+            d[a[1]] = (op, a)
+    return d
+
+
+def expr(ops, d, c, rid, depth=0):
+    if depth > 12:
+        return '…'
+    if rid in c:
+        return str(c[rid])
+    if rid not in d:
+        return 'id%d' % rid
+    op, a = d[rid]
+    if op == OP_VAR:
+        return 'var(%d)' % rid
+    if op == OP_LOAD:
+        return 'L(%s)' % expr(ops, d, c, a[2], depth + 1)
+    if op in OP_ACCESS:
+        return '%s%s' % (expr(ops, d, c, a[2], depth + 1),
+                         ''.join('[' + expr(ops, d, c, i, depth + 1) + ']' for i in a[3:]))
+    if op == OP_IADD:
+        return '(%s + %s)' % (expr(ops, d, c, a[2], depth + 1), expr(ops, d, c, a[3], depth + 1))
+    if op == OP_IMUL:
+        return '(%s * %s)' % (expr(ops, d, c, a[2], depth + 1), expr(ops, d, c, a[3], depth + 1))
+    if op == OP_UDIV:
+        return '(%s / %s)' % (expr(ops, d, c, a[2], depth + 1), expr(ops, d, c, a[3], depth + 1))
+    if op == 112:
+        return '(%s << %s)' % (expr(ops, d, c, a[2], depth + 1), expr(ops, d, c, a[3], depth + 1))
+    if op == 105:
+        return 'bitcast(%s)' % expr(ops, d, c, a[2], depth + 1)
+    if op == 115:
+        return 'cm(%s)' % expr(ops, d, c, a[2], depth + 1)
+    return 'op%d#%d' % (op, rid)
+
+
+def report(path, binding):
+    ops = S.parse(path)
+    used, desc, fun = S.analyse(path)
+    # provenance again (same code path) to select pointers of this binding
+    prov = {}
+    var_store = {}
+    key = (0, binding)
+    for v, k in desc.items():
+        prov[v] = frozenset([k])
+    changed, rounds = True, 0
+    while changed and rounds < 40:
+        changed = False
+        rounds += 1
+        for op, a in ops:
+            if op in OP_ACCESS or op == 70:
+                if len(a) >= 3 and a[2] in prov:
+                    n = prov.get(a[1], frozenset()) | prov[a[2]]
+                    if n != prov.get(a[1], frozenset()):
+                        prov[a[1]] = n
+                        changed = True
+            elif op == 83 and len(a) >= 2 and a[1] in prov:
+                n = prov.get(a[0], frozenset()) | prov[a[1]]
+                if n != prov.get(a[0], frozenset()):
+                    prov[a[0]] = n
+                    changed = True
+            elif op == OP_LOAD and len(a) >= 3 and a[2] in var_store:
+                n = prov.get(a[1], frozenset()) | var_store[a[2]]
+                if n != prov.get(a[1], frozenset()):
+                    prov[a[1]] = n
+                    changed = True
+            elif op == 62 and len(a) >= 2 and a[1] in prov:
+                n = var_store.get(a[0], frozenset()) | prov[a[1]]
+                if n != var_store.get(a[0], frozenset()):
+                    var_store[a[0]] = n
+                    changed = True
+    d, c = defs(ops), consts(ops)
+    rows = []
+    for op, a in ops:
+        # operand layout (glslang 16.5.0, verified with probe/probe.comp):
+        #   OpCooperativeMatrixLoadKHR  = type result pointer colMajor stride layout [mem]
+        #   OpCooperativeMatrixStoreKHR =        pointer object colMajor stride layout [mem]
+        if op == OP_CM_LOAD and len(a) >= 6 and key in prov.get(a[2], ()):
+            rows.append({'kind': 'cmload', 'result_type': a[0], 'result': a[1],
+                         'pointer_expr': expr(ops, d, c, a[2]),
+                         'col_major': c.get(a[3], 'id%s' % a[3]),
+                         'stride': c.get(a[4], 'id%s' % a[4]),
+                         'layout': c.get(a[5], 'id%s' % a[5])})
+        elif op == OP_CM_STORE and len(a) >= 5 and key in prov.get(a[0], ()):
+            rows.append({'kind': 'cmstore', 'object': a[1],
+                         'pointer_expr': expr(ops, d, c, a[0]),
+                         'col_major': c.get(a[2], 'id%s' % a[2]),
+                         'stride': c.get(a[3], 'id%s' % a[3]),
+                         'layout': c.get(a[4], 'id%s' % a[4])})
+    return rows
+
+
+def main():
+    card = CARD
+    targets = [('ord_193_parent', card / 'parent-rebuild-193.spv', 5),
+               ('ord_193_candidate', card / 'candidate-193.spv', 5),
+               ('ord_194_parent', card / 'parent-rebuild-194.spv', 5),
+               ('ord_194_candidate', card / 'candidate-194.spv', 5)]
+    out = {}
+    for name, p, b in targets:
+        rows = report(p, b)
+        out[name] = rows
+        print('===', name, '(%s, binding %d)' % (p.name, b))
+        for r in rows:
+            print('  ', r['kind'], 'stride=%s' % r['stride'], 'layout=id%s' % r['layout'])
+            print('      ', r['pointer_expr'])
+    (card / 'fold-shape.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+
+
+if __name__ == '__main__':
+    main()

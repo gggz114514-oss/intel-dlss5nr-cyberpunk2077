@@ -1,0 +1,122 @@
+"""SPIR-V control-flow + decoration comparison for n11-vit-ffn (CPU only).
+
+Answers, for parent and candidate:
+  * how many OpBranchConditional / OpSelectionMerge sit inside the K loop that
+    carries the cooperative-matrix multiply-add (i.e. the per-iteration guards)
+  * the NoContraction decoration set (decoration 44) - exact ids
+  * the cooperative-matrix load/store/muladd census and their order
+"""
+import json, struct, sys, collections
+from pathlib import Path
+
+OP_LABEL = 248
+OP_BRANCH = 249
+OP_BRANCH_COND = 250
+OP_PHI = 245
+OP_LOOP_MERGE = 246
+OP_SELECT_MERGE = 247
+OP_DECORATE = 71
+OP_COOP_LOAD = 4457
+OP_COOP_MULADD = 4459
+OP_COOP_STORE = 4458
+OP_CONST = 43
+
+
+def load(path):
+    data = Path(path).read_bytes()
+    w = list(struct.unpack('<%dI' % (len(data) // 4), data))
+    assert w[0] == 0x07230203
+    i, out = 5, []
+    while i < len(w):
+        op, n = w[i] & 0xFFFF, w[i] >> 16
+        out.append((op, w[i + 1:i + n], i))
+        i += n
+    return w, out
+
+
+def analyse(path):
+    w, ins = load(path)
+    # string/name maps for readable targets
+    decorations = collections.defaultdict(list)
+    for op, a, off in ins:
+        if op == OP_DECORATE and len(a) >= 2:
+            decorations[a[0]].append(a[1])
+    nc = sorted({t for t, ds in decorations.items() if 44 in ds})
+
+    # blocks
+    blocks = []       # [(label_id, [ops])]
+    cur = None
+    for op, a, off in ins:
+        if op == OP_LABEL:
+            cur = (a[0], [])
+            blocks.append(cur)
+        elif cur is not None:
+            cur[1].append((op, a))
+    bidx = {b[0]: k for k, b in enumerate(blocks)}
+
+    # successors
+    succ = {}
+    for lid, ops in blocks:
+        s = []
+        for op, a in ops:
+            if op == OP_BRANCH:
+                s.append(a[0])
+            elif op == OP_BRANCH_COND:
+                s += [a[1], a[2]]
+        succ[lid] = s
+
+    # loops: OpLoopMerge in a block -> (merge, continue); body = blocks reachable
+    # from the header that can reach the continue/merge without leaving
+    loops = []
+    for lid, ops in blocks:
+        for op, a in ops:
+            if op == OP_LOOP_MERGE:
+                loops.append((lid, a[0], a[1]))
+
+    def reach(start, stop=None):
+        seen, work = set(), [start]
+        while work:
+            x = work.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            for y in succ.get(x, []):
+                if y not in seen:
+                    work.append(y)
+        return seen
+
+    out_loops = []
+    for header, merge, cont in loops:
+        # natural loop body = reachable from the header, minus everything that is
+        # only reachable after leaving the loop through its merge block.
+        body = reach(header) - reach(merge)
+        cm = collections.Counter()
+        for lid, ops in blocks:
+            if lid not in body:
+                continue
+            for op, a in ops:
+                cm[op] += 1
+        out_loops.append(dict(header=header, merge=merge, cont=cont,
+                              blocks=len(body),
+                              branch=cm[OP_BRANCH], branch_cond=cm[OP_BRANCH_COND],
+                              selection_merge=cm[OP_SELECT_MERGE],
+                              coop_load=cm[OP_COOP_LOAD], coop_muladd=cm[OP_COOP_MULADD],
+                              coop_store=cm[OP_COOP_STORE], phi=cm[OP_PHI]))
+    total = collections.Counter()
+    for op, a, off in ins:
+        total[op] += 1
+    return dict(path=str(path), words=len(w), bytes=Path(path).read_bytes().__len__(),
+                no_contraction_ids=nc, no_contraction_count=len(nc),
+                decoration_kinds=sorted({d for ds in decorations.values() for d in ds}),
+                loops=out_loops,
+                totals=dict(branch=total[OP_BRANCH], branch_cond=total[OP_BRANCH_COND],
+                            selection_merge=total[OP_SELECT_MERGE],
+                            loop_merge=total[OP_LOOP_MERGE], phi=total[OP_PHI],
+                            coop_load=total[OP_COOP_LOAD],
+                            coop_muladd=total[OP_COOP_MULADD],
+                            coop_store=total[OP_COOP_STORE]))
+
+
+if __name__ == '__main__':
+    print(json.dumps([analyse(p) for p in sys.argv[1:]], indent=1))
+

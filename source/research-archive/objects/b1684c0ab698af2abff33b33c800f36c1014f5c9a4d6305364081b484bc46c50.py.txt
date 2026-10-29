@@ -1,0 +1,162 @@
+"""receipt.py - build receipt + source diff for the B1 card (no GPU, no driver).
+
+Writes
+  candidates/b1-c32-xe-reuse/build-receipt.json   argv, input/output sha256, rc, time
+  candidates/b1-c32-xe-reuse/SOURCE-DIFF.txt      unified diff parent -> candidate
+
+usage: python receipt.py
+"""
+import difflib
+import hashlib
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+W = CARD.parent.parent          # .../work/dsh-xmx-handoff-validation-20261024
+ROOT = W.parent.parent          # .../vulkan (the business root, read only)
+GLSLANG = ROOT / "src" / "project" / "tools" / "glslang-16.5.0" / "bin" / "glslang.exe"
+VALIDATOR = (ROOT / "candidates" / "amd-map-20261015" / "s4-final-output-fusion-fix"
+             / "production-repair" / "spv_validate_cpu.exe")
+RUNNER = ROOT / "build" / "gpa-b321-prep" / "port_network_model_runner.exe"
+
+
+def sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def main():
+    parent_spv_deployed = (ROOT / "candidates" / "int8-coverage-v2-20261020" / "C"
+                           / "c32-i8-debug-eact-v1" / "spv" / "c32_body1_i8.spv")
+    repro = CARD / "spv" / "parent_repro.spv"
+    cand = CARD / "spv" / "b1_body1_xe.spv"
+    src_p = CARD / "source" / "parent"
+    src_c = CARD / "source" / "candidate"
+    tz = timezone(timedelta(hours=9))
+    now = datetime.now(tz).isoformat(timespec="seconds")
+
+    def argv_compile(srcdir, out):
+        # exactly what was executed; the tools dir is the CWD
+        return [str(GLSLANG).replace("/", "\\"), "-V", "--target-env", "vulkan1.3",
+                "-I" + str(srcdir).replace("/", "\\"), "-o",
+                str(out).replace("/", "\\"), "c32_body1_i8.comp"]
+
+    val = subprocess.run([str(VALIDATOR), str(repro)], capture_output=True, text=True)
+    val_c = subprocess.run([str(VALIDATOR), str(cand)], capture_output=True, text=True)
+    rec = {
+        "card": "b1-c32-xe-reuse",
+        "purpose": "INT8 C32 body1: merge sX8[2048] into each subgroup's 2048 B sE8 slot",
+        "time_jst": now,
+        "compiler": {"path": str(GLSLANG).replace("/", "\\"),
+                     "sha256": sha(GLSLANG),
+                     "version": "glslang 16.5.0 (tools/glslang-16.5.0)"},
+        "validator": {"path": str(VALIDATOR).replace("/", "\\"),
+                      "sha256": sha(VALIDATOR)},
+        "cwd": str(src_c).replace("/", "\\"),
+        "builds": [
+            {"label": "parent_repro",
+             "intent": "identity check: the verbatim parent source must reproduce the "
+                       "deployed parent SPV byte for byte",
+             "argv": argv_compile(src_p, repro),
+             "cwd": str(src_p).replace("/", "\\"),
+             "inputs": {str((src_p / "c32_body1_i8.comp")).replace("/", "\\"):
+                        sha(src_p / "c32_body1_i8.comp"),
+                        str((src_p / "c32_i8_common.glsl")).replace("/", "\\"):
+                        sha(src_p / "c32_i8_common.glsl"),
+                        str((src_p / "register_handoff.glsl")).replace("/", "\\"):
+                        sha(src_p / "register_handoff.glsl")},
+             "output": {"path": str(repro).replace("/", "\\"), "sha256": sha(repro),
+                        "bytes": repro.stat().st_size},
+             "rc": 0,
+             "identity": {
+                 "deployed_parent_spv": str(parent_spv_deployed).replace("/", "\\"),
+                 "deployed_parent_spv_sha256": sha(parent_spv_deployed),
+                 "deployed_parent_spv_bytes": parent_spv_deployed.stat().st_size,
+                 "byte_identical": sha(repro) == sha(parent_spv_deployed) and
+                                   repro.stat().st_size ==
+                                   parent_spv_deployed.stat().st_size},
+             "validate_cpu": {
+                 "argv": [str(VALIDATOR), str(repro)],
+                 "stdout": val.stdout.strip(), "rc": val.returncode,
+                 "result_zero": "result=0" in val.stdout}},
+            {"label": "b1_body1_xe",
+             "intent": "the candidate: sX8 deleted, X in the first 512 B of the sE8 slot, "
+                       "one added subgroupBarrier() after the single X read",
+             "argv": argv_compile(src_c, cand),
+             "cwd": str(src_c).replace("/", "\\"),
+             "inputs": {str((src_c / "c32_body1_i8.comp")).replace("/", "\\"):
+                        sha(src_c / "c32_body1_i8.comp"),
+                        str((src_c / "c32_i8_common.glsl")).replace("/", "\\"):
+                        sha(src_c / "c32_i8_common.glsl"),
+                        str((src_c / "register_handoff.glsl")).replace("/", "\\"):
+                        sha(src_c / "register_handoff.glsl")},
+             "output": {"path": str(cand).replace("/", "\\"), "sha256": sha(cand),
+                        "bytes": cand.stat().st_size},
+             "rc": 0,
+             "validate_cpu": {
+                 "argv": [str(VALIDATOR), str(cand)],
+                 "stdout": val_c.stdout.strip(), "rc": val_c.returncode,
+                 "result_zero": "result=0" in val_c.stdout}},
+        ],
+        "replay": {
+            "parent": "cd %s && %s -V --target-env vulkan1.3 -I%s -o %s c32_body1_i8.comp"
+                      % (src_p, GLSLANG, src_p, repro),
+            "candidate": "cd %s && %s -V --target-env vulkan1.3 -I%s -o %s c32_body1_i8.comp"
+                         % (src_c, GLSLANG, src_c, cand),
+            "validate": "%s <spv>   # must print result=0" % VALIDATOR,
+        },
+        "plan": {
+            "parent": str((ROOT / "candidates" / "int8-coverage-v2-20261020" / "C"
+                           / "c32-i8-debug-eact-v1" / "plans"
+                           / "plan-c32-i8-diag-b1-eact.txt")).replace("/", "\\"),
+            "parent_sha256": sha(ROOT / "candidates" / "int8-coverage-v2-20261020"
+                                 / "C" / "c32-i8-debug-eact-v1" / "plans"
+                                 / "plan-c32-i8-diag-b1-eact.txt"),
+            "candidate": str(CARD / "plan-b1-xe-323.txt").replace("/", "\\"),
+            "candidate_sha256": sha(CARD / "plan-b1-xe-323.txt"),
+            "deltas": [{
+                "line": 636, "field": "PASS 1 block1_swin_body_1",
+                "old": '".../c32-i8-debug-eact-v1/spv/c32_body1_i8.spv" 32 18432 7 32 84 48 1',
+                "new": '".../candidates/b1-c32-xe-reuse/spv/b1_body1_xe.spv" 32 16384 7 32 84 48 1',
+                "reason": "spv path -> the candidate module; declared shared bytes "
+                          "18432 -> 16384 because sX8[2048] is gone (the arrays are "
+                          "declared, not natively measured)",
+                "n_deltas": 1}],
+            "lint": {"parent_problems": 0, "candidate_problems": 0,
+                     "tool": "work/dsh-int8-same-family-20261023/tools/plan_lint.py"}},
+        "runner": {"path": str(RUNNER).replace("/", "\\"), "sha256": sha(RUNNER),
+                   "bytes": RUNNER.stat().st_size,
+                   "note": "listed for run/jobs.json; NOT executed by this card"},
+        "gpu": "none. No device, pipeline, runner, GPU.lock or game was touched. "
+               "All qualifications are CPU_STRUCT / OFFLINE_COMPILE / SPV_IDENTITY.",
+    }
+    (CARD / "build-receipt.json").write_text(json.dumps(rec, indent=1) + "\n",
+                                             encoding="utf-8")
+
+    # ---- source diff -------------------------------------------------------
+    out = []
+    for f in ("c32_body1_i8.comp", "c32_i8_common.glsl", "register_handoff.glsl"):
+        a = (src_p / f).read_text(encoding="utf-8").splitlines(True)
+        b = (src_c / f).read_text(encoding="utf-8").splitlines(True)
+        if a == b:
+            out.append("--- %s: IDENTICAL (verbatim copy)\n" % f)
+            continue
+        out.extend(difflib.unified_diff(a, b, fromfile="parent/" + f,
+                                       tofile="candidate/" + f, n=3))
+    (CARD / "SOURCE-DIFF.txt").write_text("".join(out), encoding="utf-8")
+    print("wrote build-receipt.json and SOURCE-DIFF.txt")
+    print("parent_repro identical:", rec["builds"][0]["identity"]["byte_identical"])
+    print("candidate sha256:", rec["builds"][1]["output"]["sha256"])
+    print("validate parent:", rec["builds"][0]["validate_cpu"]["result_zero"],
+          " candidate:", rec["builds"][1]["validate_cpu"]["result_zero"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

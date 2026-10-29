@@ -1,0 +1,133 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,shlex,struct
+N=Path(__file__).resolve().parent;P=N.parent/'c32-owner-layout-20261025';B=Path('@NR_WORKSPACE@');S=B/'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1/source'
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def ident(p):return {'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+def run(a):
+ p=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert p.returncode==0,p.stdout+p.stderr;return p.stdout
+def add(a,b):return ('HADD',a,b)
+# Symbolic ordered trees, including the feature31 fused square and the zero den seed.
+def leaf(i):return ('square',i)
+n=[('FMA_SQUARE',31,leaf(15)) if i==15 else add(leaf(i),leaf(i+16)) for i in range(16)]
+for step in [8,4,2,1]:n=[add(n[i&~step],n[i|step]) for i in range(16)]
+part=[]
+for parity in [0,1]:
+ x=[add(add(leaf(2*c+parity),leaf(16+2*c+parity)),('FMA_SQUARE',31,leaf(15)) if c==3 and parity==1 else add(leaf(8+2*c+parity),leaf(24+2*c+parity))) for c in range(4)]
+ part.append(add(add(x[0],x[2]),add(x[1],x[3])))
+assert all(x==add(*part) for x in n)
+den=[]
+for k in range(8):
+ d='zero'
+ for g in range(4):d=add(d,add(('p',k+16*g),('p',k+8+16*g)))
+ den.append(d)
+parent_den=add(add(add(den[0],den[2]),add(den[4],den[6])),add(add(den[1],den[3]),add(den[5],den[7])))
+for step in [2,4,1]:den=[add(den[i&~step],den[i|step]) for i in range(8)]
+assert all(x==parent_den for x in den)
+old=(P/'candidate.comp').read_text(encoding='utf-8-sig');helpers=old[:old.index('// Measured CH ownership')]
+helpers+='''
+f16vec2 full_norm(float16_t qlo,float16_t qhi,float16_t klo,float16_t khi) {
+ uint col=gl_SubgroupInvocationID&15u;
+ precise float16_t qs=qlo*qlo, ks=klo*klo;
+ precise float16_t qh=qhi*qhi, kh=khi*khi;
+ precise float16_t q=qs+qh, k=ks+kh;
+ if(col==15u) {q=fma(qhi,qhi,qs);k=fma(khi,khi,ks);}
+'''
+for step in [8,4,2,1]:helpers+=f'''{{f16vec2 peer=unpackFloat2x16(subgroupShuffleXor(packFloat2x16(f16vec2(q,k)),{step}u)); bool lower=(col&{step}u)==0u; q=(lower?q:peer.x)+(lower?peer.x:q); k=(lower?k:peer.y)+(lower?peer.y:k);}}
+'''
+helpers+='return f16vec2(float16_t(inversesqrt(max(float(q),float(float16_t(0.000062))))),float16_t(inversesqrt(max(float(k),float(float16_t(0.000062))))));}\n'
+prefix=old[old.index('void main() {'):old.index('    NRH_CH y0 =')];lines=[helpers,prefix]
+for name in ['y','q']:
+ for t in range(2):
+  for f in range(2):lines += [f'NRH_CH {name}{t}{f}=NRH_CH(float16_t(0));']
+lines += ['if(sg<4u) {',old[old.index('NRH_A xa00;'):old.index('nr_transpose16(nrh_narrow(ny00)')]]
+for t in range(2):
+ for f in range(2):
+  lines += [f'y{t}{f}=nrh_narrow(ny{t}{f});',f'if(debug) coopMatStore(y{t}{f},dbg,8192u+(t0+{t*8}u)*32u+{f*16}u,32u,LROW);',f'NRH_A ya{t}{f}=nrh_to_A(y{t}{f});']
+for name in ['k','v']:
+ for t in range(2):
+  for f in range(2):lines += [f'NRH_CH {name}{t}{f};']
+for ni,name in enumerate(['q','k','v']):
+ lines += ['{']
+ for t in range(2):
+  for f in range(2):lines += [f'NRH_C z{t}{f}=NRH_C(0.0);']
+ for k in range(2):
+  for f in range(2):
+   lines += ['{',f'NRH_B w;coopMatLoad(w,wb,uint(pc.p1.z)+{ni*1024+f*512+k*256}u,16u,LROW);']
+   for t in range(2):lines += [f'z{t}{f}=coopMatMulAdd(ya{t}{k},w,z{t}{f});']
+   lines += ['}']
+ for t in range(2):
+  for f in range(2):lines += [f'{name}{t}{f}=nrh_narrow(z{t}{f});']
+ lines += ['}']
+lines+=['float16_t headscale=float16_t(fb[uint(pc.p2.z)]);']
+for t in range(2):
+ for c in range(4):
+  lines+=['{',f'f16vec2 n=full_norm(q{t}0[{c}],q{t}1[{c}],k{t}0[{c}],k{t}1[{c}]);']
+  for f in range(2):lines += [f'precise float16_t qr{f}=q{t}{f}[{c}]*n.x;qr{f}=qr{f}*headscale;q{t}{f}[{c}]=qr{f};k{t}{f}[{c}]=k{t}{f}[{c}]*n.y;']
+  lines += ['}']
+ for f in range(2):
+  lines += [f'coopMatStore(k{t}{f},shK,{f*1024}u+t0+{t*8}u,64u,LCOL);',f'coopMatStore(v{t}{f},shV,(t0+{t*8}u)*32u+{f*16}u,32u,LROW);']
+  for name,offset in [('q',10240),('k',12288)]:lines += [f'if(debug) coopMatStore({name}{t}{f},dbg,{offset}u+(t0+{t*8}u)*32u+{f*16}u,32u,LROW);']
+lines += ['}','barrier();','if(sg<4u) {']
+for t in range(2):
+ for f in range(2):lines += [f'NRH_A qa{t}{f}=nrh_to_A(q{t}{f});']
+for t in range(2):
+ for g in range(4):
+  lines += [f'NRH_CH p{t}{g};','{','NRH_C sc=NRH_C(0.0);']
+  for k in range(2):lines += ['{',f'NRH_B b;coopMatLoad(b,shK,{k*1024+g*16}u,64u,LROW);',f'sc=coopMatMulAdd(qa{t}{k},b,sc);','}']
+  lines += [f'NRH_C bias;coopMatLoad(bias,fb,uint(pc.p2.w)+(t0+{t*8}u)*64u+{g*16}u,64u,LROW);']
+  for c in range(4):lines += [f'precise float biased{c}=sc[{c}]+bias[{c}];sc[{c}]=biased{c};']
+  lines += [f'p{t}{g}=nrh_narrow(sc);']
+  for c in [0,2]:lines += [f'{{f16vec2 e=nr_exp_h2(f16vec2(p{t}{g}[{c}],p{t}{g}[{c+1}]));p{t}{g}[{c}]=e.x;p{t}{g}[{c+1}]=e.y;}}']
+  lines += ['}']
+# Den: pair keys k,k+8 within each16-key group, then add groups sequentially from zero.
+for t in range(2):
+ for c in [0,2]:
+  lines += ['{','precise f16vec2 d=f16vec2(float16_t(0));']
+  for g in range(4):lines += ['{',f'f16vec2 x=f16vec2(p{t}{g}[{c}],p{t}{g}[{c+1}]);', 'f16vec2 peer=unpackFloat2x16(subgroupShuffleXor(packFloat2x16(x),8u));','bool lower=(lane&8u)==0u;precise f16vec2 pair=(lower?x:peer)+(lower?peer:x);d=d+pair;','}']
+  for step in [2,4,1]:lines += ['{',f'f16vec2 peer=unpackFloat2x16(subgroupShuffleXor(packFloat2x16(d),{step}u));bool lower=(lane&{step}u)==0u;d=(lower?d:peer)+(lower?peer:d);','}']
+  lines += ['f16vec2 inv=f16vec2(float16_t(1.0/max(float(d.x),6.103515625e-05)),float16_t(1.0/max(float(d.y),6.103515625e-05)));']
+  for g in range(4):lines += [f'p{t}{g}[{c}]=p{t}{g}[{c}]*inv.x;p{t}{g}[{c+1}]=p{t}{g}[{c+1}]*inv.y;']
+  lines += ['}']
+ for g in range(4):lines += [f'if(debug) coopMatStore(p{t}{g},dbg,14336u+(t0+{t*8}u)*64u+{g*16}u,64u,LROW);']
+for t in range(2):
+ for f in range(2):lines += [f'NRH_C tc{t}{f}=NRH_C(0.0);']
+for g in range(4):
+ lines += ['{']
+ for t in range(2):lines += [f'NRH_A a{t}=nrh_to_A(p{t}{g});']
+ for f in range(2):
+  lines += ['{',f'NRH_B b;coopMatLoad(b,shV,{g*512+f*16}u,32u,LROW);']
+  for t in range(2):lines += [f'tc{t}{f}=coopMatMulAdd(a{t},b,tc{t}{f});']
+  lines += ['}']
+ lines += ['}']
+for t in range(2):
+ for f in range(2):lines += [f'NRH_CH ctx{t}{f}=nrh_narrow(tc{t}{f});',f'if(debug) coopMatStore(ctx{t}{f},dbg,18432u+(t0+{t*8}u)*32u+{f*16}u,32u,LROW);',f'NRH_A ca{t}{f}=nrh_to_A(ctx{t}{f});',f'NRH_C oc{t}{f};', '{',f'NRH_CH scale;coopMatLoad(scale,wb,uint(pc.p2.y)+{f*16}u,0u,LROW);oc{t}{f}=nrh_widen_exact(y{t}{f}*scale);','}']
+for k in range(2):
+ for f in range(2):
+  lines += ['{',f'NRH_B w;coopMatLoad(w,wb,uint(pc.p1.w)+{f*512+k*256}u,16u,LROW);']
+  for t in range(2):
+   lines += [f'oc{t}{f}=coopMatMulAdd(ca{t}{k},w,oc{t}{f});']
+   if k==1:lines += [f'NRH_CH o{t}=nrh_narrow(oc{t}{f});',f'if(debug) coopMatStore(o{t},dbg,20480u+(t0+{t*8}u)*32u+{f*16}u,32u,LROW);',f'if(!tok_oob_u) coopMatStore(o{t},imgout,tok_base+{t*128+f*256}u,16u,LROW);']
+  lines += ['}']
+lines += ['}','}'];src=N/'candidate.comp';src.write_text('\n'.join(lines),encoding='utf-8');dst=N/'candidate.spv';run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(S),src,'-o',dst]);cm=ST.Module(dst);nc=ST.no_contraction_ids(cm);fma_ids={i for i in nc if cm.defining_instruction(i)[0]==12};ST.set_no_contraction(cm,set(nc)-fma_ids,dst);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',dst])
+lines=(P/'plan.txt').read_text(encoding='utf-8-sig').splitlines();buf=[];passes=[]
+for i,l in enumerate(lines):
+ p=shlex.split(l)
+ if not p:continue
+ if p[0]=='BUFFER':buf.append((i,p))
+ if p[0]=='PASS':passes.append({'line':i,'p':p,'binds':[]})
+ if p[0]=='BIND':passes[-1]['binds'].append(p)
+ if p[0]=='PUSH':passes[-1]['push']=list(map(int,p[1:]))
+packs=[];orders={1,2,3,4,227,228,229}
+for order in sorted(orders):
+ p=passes[order];binding=next(b for b in p['binds'] if b[1]=='0');resource=int(binding[2]);assert int(binding[3])==0;assert all(j in orders for j,q in enumerate(passes) if any(int(x[2])==resource for x in q['binds']));bi,bp=buf[resource];origin=Path(bp[3]);raw=origin.read_bytes();data=list(struct.unpack('<'+'H'*(len(raw)//2),raw));touched=set()
+ for off,size in [(p['push'][6],3072),(p['push'][7],1024)]:
+  assert off+size<=len(data)
+  for base in range(off,off+size,256):
+   tile=data[base:base+256];data[base:base+256]=[tile[c*16+r] for r in range(16) for c in range(16)];touched.update(range(base,base+256))
+ assert len(touched)==4096;pack=N/f'weights-{resource}.bin';pack.write_bytes(struct.pack('<'+'H'*len(data),*data));assert all(raw[2*i:2*i+2]==pack.read_bytes()[2*i:2*i+2] for i in range(len(data)) if i not in touched)
+ lines[bi]=lines[bi].replace(bp[3],pack.as_posix());lines[p['line']]=lines[p['line']].replace(p['p'][3],dst.as_posix());packs.append({'parent':ident(origin),'candidate':ident(pack),'order':order,'qkv_offset':p['push'][6],'output_offset':p['push'][7]})
+plan=N/'plan.txt';plan.write_text('\n'.join(lines)+'\n',encoding='utf-8');runner=N.parent/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe';(N/'CPU-CHECK.txt').write_text(run([runner,'--plan',plan,'--cpu-check']));meta={'baseline':ident(P/'plan.txt'),'plan':ident(plan),'spv':ident(dst),'source':ident(src),'packs':packs,'norm_tree_equal':True,'den_tree_equal':True,'nc_count':len(nc)-len(fma_ids),'nc_fma_removed':sorted(fma_ids),'slm_bytes':8192,'mma_static':sum(op[0]==4459 for op in ST.Module(dst).instructions)};(N/'CANDIDATE.json').write_text(json.dumps(meta,indent=2))
+t=json.loads((P/'LUNA-GATES.json').read_text());t['output_root']=str(N);t['identities']=[ident(runner),ident(dst)]+[x['candidate'] for x in packs];(N/'run').mkdir(exist_ok=True)
+for j in t['jobs']:
+ j['id']='gate-fullchain-'+j['mode'];j['candidate']='fullchain';j['plan']=ident(plan);j['runner_output']=str(N/'run'/j['id']);j['argv'][2]=str(plan);j['argv'][4]=j['runner_output']
+(N/'LUNA-GATES.json').write_text(json.dumps(t,indent=2));print(meta['mma_static'],meta['nc_count'],ident(dst))

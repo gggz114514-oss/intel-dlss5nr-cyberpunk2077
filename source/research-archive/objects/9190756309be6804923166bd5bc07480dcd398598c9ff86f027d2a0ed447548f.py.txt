@@ -1,0 +1,203 @@
+"""S05 C128 shared helpers: load the bound resource table, teacher dumps, pack decoders.
+
+All paths are read-only outside this card directory.  Written by the S05-c128 card.
+"""
+from pathlib import Path
+import hashlib
+import json
+import numpy as np
+
+B = Path('@NR_WORKSPACE@')
+Q = B / 'work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029'
+D = Q / 'real-int8-24'
+CARD = B / 'work/dsh-fullnet-static-20261029/S05-c128'
+ROWS = Q / 'dsh-static-handoff/CURRENT-ROWS.json'
+
+# block9 geometry, all from the bound plan push constants (row 25/26/27 of CURRENT-ROWS.json)
+WIN_X = 21          # window columns  (p1.x of every block9 row)
+WIN_Y = 12          # window rows     (p1.y)
+TILE_X = 42         # 4x4 tile columns (p0.x)
+TILE_Y = 24         # 4x4 tile rows    (p0.y)
+TOK = WIN_X * WIN_Y * 64      # 16128 tokens
+CH = 128            # C128 channels
+
+
+def rows():
+    return json.loads(ROWS.read_text())
+
+
+def buffers():
+    return rows()['buffers']
+
+
+def row_by_name(name, data=None):
+    data = data or rows()
+    return next(r for r in data['rows'] if r['name'] == name)
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def file_meta(path):
+    p = Path(path)
+    return dict(path=str(p).replace('\\', '/'), bytes=p.stat().st_size, sha256=sha256(p))
+
+
+def f16(path):
+    return np.fromfile(path, dtype='<f2').astype(np.float32)
+
+
+def f32(path):
+    return np.fromfile(path, dtype='<f4')
+
+
+def i8(path):
+    return np.fromfile(path, dtype='i1')
+
+
+def half(x):
+    return np.asarray(x, np.float32).astype(np.float16).astype(np.float32)
+
+
+def code(x):
+    """RNE rounding, symmetric int8 clamp: the family quantiser (rounded_code)."""
+    return np.clip(np.rint(x), -127.0, 127.0)
+
+
+def blocked(a, nrow, ncol):
+    """Gather a (nrow,ncol) matrix out of the 16x16-blocked FP16 pack form.
+
+    pack_off + ((n//16)*(ncol//16) + k//16)*256 + (n%16)*16 + k%16
+    (f34-k64 / r09 header: "the bound pass-25 kernel loads the 16x16 blocked form").
+    """
+    a = np.asarray(a, np.float32)
+    out = np.empty((nrow, ncol), np.float32)
+    for n in range(nrow):
+        for k in range(ncol):
+            out[n, k] = a[((n // 16) * (ncol // 16) + k // 16) * 256 + (n % 16) * 16 + k % 16]
+    return out
+
+
+def act(x):
+    """The family activation, executed in half exactly as pilot_common::act."""
+    x = np.asarray(x, np.float32)
+    t = half(np.clip(x, -4.0, 4.0))
+    u = half(np.float64(-0.055908203125) * np.abs(t.astype(np.float64))
+             + np.float64(np.float16(0.447265625)))
+    v = half(t.astype(np.float64) * u.astype(np.float64) + np.float64(np.float16(0.89453125)))
+    return half(x * v)
+
+
+# ------------------------------------------------------------------ pack decode
+def blocked(a, nrow, ncol):
+    """Gather a (nrow,ncol) matrix out of the 16x16-blocked FP16 pack form."""
+    a = np.asarray(a, np.float32)
+    n = np.arange(nrow)
+    k = np.arange(ncol)
+    idx = (((n[:, None] // 16) * (ncol // 16) + (k[None, :] // 16)) * 256
+           + (n[:, None] % 16) * 16 + (k[None, :] % 16))
+    return a[idx]
+
+
+def decode_pack(weight_path, scale_path, fp16_path, push):
+    """Decode the C128 FFN pack: int8 codes, per-output-channel scales, FP16 parent."""
+    we_off, wm_off, wc_off, wq_off, rs_off = push[12], push[13], push[14], push[15], push[17]
+    w8 = i8(weight_path).astype(np.int32)
+    sc = f32(scale_path)
+    wp = f16(fp16_path)
+    return dict(
+        we8=w8[0:65536].reshape(512, 128),
+        wm8=w8[65536:81920].reshape(128, 128),
+        wc8=w8[81920:98304].reshape(128, 128),
+        ds8=w8[98304:106496],
+        sc=sc,
+        we=blocked(wp[we_off:we_off + 32 * 8 * 256], 512, 128),
+        wm=wp[wm_off:wm_off + 128 * 128].reshape(128, 128),
+        wc=blocked(wp[wc_off:wc_off + 8 * 8 * 256], 128, 128),
+        rs=wp[rs_off:rs_off + 128],
+    )
+
+
+def ffn_forward(X, we8, wm8, wc8, sc, invX=None, residual_half=False):
+    """Block9 C128 FFN == build_batch.py::build_scales' chain, in the shader's order.
+
+    X      (T,128)  FFN input (teacher half values)
+    invX   (128,)   the qX producer's effective per-channel multiplier.
+                    D == 1 -> sc[1] (invSX); the bound pack composes it inside
+                    sc[912+c] against the DS int32 accumulator, which is not
+                    observable from the FP16 teacher, so the teacher arm uses invSX.
+    returns (T,128) float32 holding the half Y
+
+    Integer dots are exact in float32: |sum| <= 128*127*127 = 2_064_128 < 2^24.
+    """
+    invA, invM = np.float32(sc[2]), np.float32(sc[3])
+    eScale, mScale, cScale, rScale = sc[16:528], sc[528:656], sc[656:784], sc[784:912]
+    if invX is None:
+        invX = np.full(128, np.float32(sc[1]), np.float32)
+    qX = code(X.astype(np.float32) * np.asarray(invX, np.float32)[None, :])
+    de = np.rint(qX @ we8.astype(np.float32).T).astype(np.int32)
+    h = half(de.astype(np.float32) * eScale[None, :])
+    a = act(h)
+    qa = code(a * invA)
+    mo = np.empty((X.shape[0], 128), np.float32)
+    for g in range(4):
+        mo[:, g * 32:(g + 1) * 32] = qa[:, g * 128:(g + 1) * 128] @ wm8[g * 32:(g + 1) * 32].astype(np.float32).T
+    mid = np.rint(mo).astype(np.int32).astype(np.float32) * mScale[None, :]
+    qm = code(mid * invM)
+    dc = np.rint(qm @ wc8.astype(np.float32).T).astype(np.int32)
+    seed = X if residual_half else qX
+    return half(dc.astype(np.float32) * cScale[None, :] + seed.astype(np.float32) * rScale[None, :])
+
+
+def img_half_addr(t, c, wx, wy):
+    """pilot_common::input_addr for the C128 image-half layout (shift 0)."""
+    q = t >> 4
+    s = t & 15
+    tx = 2 * wx + (q & 1)
+    ty = 2 * wy + ((q >> 1) & 1)
+    return ((ty * TILE_X + tx) * 8 + (c // 16)) * 256 + s * 16 + (c % 16)
+
+
+def m8_addr(m, c):
+    """pilot_common::m8_addr, the 64x128 int8 M / qX staging tile."""
+    return ((m >> 3) * 128 + c) * 8 + (m & 7)
+
+
+def load_x(path):
+    """(16128,128) FP16 teacher X from the image-half dump, token-major result.
+
+    Address = ((ty*42+tx)*8 + c//16)*256 + slot*16 + c%16, verified against
+    build_batch.py::windowize (raw.reshape(gy,gx,8,16,16) is the same layout).
+    """
+    raw = f16(path)
+    assert raw.size == TILE_X * TILE_Y * 8 * 256, raw.size
+    w = np.arange(WIN_X * WIN_Y)
+    m = np.arange(64)
+    c = np.arange(CH)
+    wx = (w % WIN_X)[:, None]
+    wy = (w // WIN_X)[:, None]
+    q = m >> 4
+    s = m & 15
+    tx = 2 * wx + (q & 1)[None, :]
+    ty = 2 * wy + ((q >> 1) & 1)[None, :]
+    addr = ((((ty * TILE_X + tx) * 8)[:, :, None] + (c // 16)[None, None, :]) * 256
+            + s[None, :, None] * 16 + (c % 16)[None, None, :])
+    return raw[addr].reshape(TOK, CH)
+
+
+def load_y(path):
+    """(16128,128) FP16 teacher Y, token-major (w*64+m)*128+n."""
+    raw = f16(path)
+    assert raw.size == TOK * CH, raw.size
+    return raw.reshape(TOK, CH)
+
+
+def rel(root, ref):
+    root = np.asarray(root, np.float32)
+    ref = np.asarray(ref, np.float32)
+    return float(np.linalg.norm(root - ref) / np.linalg.norm(ref))

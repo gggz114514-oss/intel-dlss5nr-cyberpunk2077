@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Identify the exact sealed quantiser of the shipped C128 WO packs.
+
+The shipped codes differ from a naive f32-reciprocal quantiser only at scaled values of
+exactly +-63.5 (round-half-even vs. a value that lands 4e-6 below the tie), which means
+the original used a wider intermediate.  This enumerates candidate arithmetic and reports
+which one reproduces every shipped file byte for byte.
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gen_c128_wo_packs as G  # noqa: E402
+
+N, K = G.N, G.K
+ni, ki = np.arange(N)[:, None], np.arange(K)[None, :]
+OFF = ((ni // 16) * 2048 + (ki // 32) * 512 + (ni % 16) * 32 + (ki % 32)).ravel()
+
+VARIANTS = {}
+
+
+def variant(name):
+    def deco(fn):
+        VARIANTS[name] = fn
+        return fn
+    return deco
+
+
+@variant("f32_recip_mul")
+def _(w, sW):
+    inv = (np.float32(1.0) / sW).astype(np.float32)
+    return np.rint(w.astype(np.float32) * inv[:, None])
+
+
+@variant("f32_div")
+def _(w, sW):
+    return np.rint(w.astype(np.float32) / sW[:, None])
+
+
+@variant("f64_div_f32s")
+def _(w, sW):
+    return np.rint(w.astype(np.float64) / sW.astype(np.float64)[:, None])
+
+
+@variant("f64_recip_mul")
+def _(w, sW):
+    inv = 1.0 / sW.astype(np.float64)
+    return np.rint(w.astype(np.float64) * inv[:, None])
+
+
+@variant("f64_div_f64s")
+def _(w, sW):
+    amax = np.abs(w).max(axis=1)
+    s = np.where(amax > 0, amax / 127.0, 1.0)
+    return np.rint(w / s[:, None])
+
+
+def codes_of(q):
+    i8 = np.zeros(N * K, np.int8)
+    i8[OFF] = np.clip(q, -127, 127).astype(np.int8).ravel()
+    return i8.tobytes()
+
+
+def main():
+    passes = G.parse_plan()
+    res = {}
+    for b in G.BLOCKS:
+        info = passes[b]
+        pack = np.fromfile(info["pack_path"], dtype="<f2")
+        w = G.decode_w(pack, info["wo"])
+        amax = np.abs(w).max(axis=1)
+        sW = np.where(amax > 0, np.float32(amax) / np.float32(127.0),
+                      np.float32(1.0)).astype(np.float32)
+        shipped = (G.SHIPPED / f"c128_b{b}_wo.codes.i8.bin").read_bytes()
+        sc_shipped = (G.SHIPPED / f"c128_b{b}_wo.sc.f32.bin").read_bytes()
+        row = {}
+        for name, fn in VARIANTS.items():
+            row[name] = (codes_of(fn(w, sW)) == shipped)
+        row["scales_f32_amax_over_127"] = (sW.tobytes() == sc_shipped)
+        row["scales_f64_amax_over_127"] = (
+            (np.abs(w).max(axis=1) / 127.0).astype(np.float32).tobytes() == sc_shipped)
+        res[b] = row
+        print("block%-3d %s" % (b, {k: v for k, v in row.items() if not v} or "ALL MATCH"))
+    # which variant matches all blocks
+    for name in VARIANTS:
+        print("%-22s matches %d/9 blocks" % (name, sum(res[b][name] for b in G.BLOCKS)))
+    print("scales f32 :", sum(res[b]["scales_f32_amax_over_127"] for b in G.BLOCKS), "/9")
+    print("scales f64 :", sum(res[b]["scales_f64_amax_over_127"] for b in G.BLOCKS), "/9")
+
+
+if __name__ == "__main__":
+    main()

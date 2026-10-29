@@ -1,0 +1,133 @@
+"""n12b-f14-scale stage: header pins, baseline rebuild, delta-base rebuild, candidate build.
+
+CPU only: glslang 16.5.0 + spv_validate_cpu.  No Vulkan device, no GPU lock, no deploy.
+
+Identity chain:
+  baseline row SPV 72e2df7c...  <- raw compile of the v2 source (RECIPES F14 mode=raw)
+  delta base         d008f8fe...  <- raw compile of cards/n12-vit-qkv/candidate.comp
+  candidate          candidate.spv <- raw compile of this card's candidate.comp
+"""
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent
+CAMPAIGN = CARD.parent.parent
+sys.path.insert(0, str(CAMPAIGN))
+import COMMON as K  # noqa: E402
+
+EVID = CARD / 'evidence'
+EVID.mkdir(exist_ok=True)
+
+FAMILY = 'F14'
+ORDINALS = [95, 100, 105, 110, 115, 120, 125, 130]
+RANK = {o: i for i, o in enumerate(ORDINALS)}
+
+V2 = Path('@NR_WORKSPACE@/candidates')
+SRC_DIR = V2 / 'zcode-fp16-b5-global-expansion-20261020/vit-qkv-norm-owner-v2/source'
+BASE_SRC = SRC_DIR / 'b3_04_vit_qkv_norm_owner.comp'
+BASE_SRC_SHA = '2c6a19937d020d2525e20d6f372fec29aa792626e5710c59b9ecf82343602346'
+BASE_SPV = V2 / 'zcode-fp16-b5-global-expansion-20261020/vit-qkv-norm-owner-v2/spv/vit_qkv_norm_owner_v2.spv'
+BASE_SPV_SHA = '72e2df7c7b1e542f375f5c7c2bdc572433a08c5f1a1a0d706026efa54b9a1e87'
+
+N12 = CAMPAIGN / 'cards' / 'n12-vit-qkv'
+DELTA_SRC = N12 / 'candidate.comp'
+DELTA_SRC_SHA = 'b3c6e215f947cafd66b5f7880ab35b2725ee9499ec36bbd344b63ba543e89004'
+DELTA_SPV = N12 / 'candidate.spv'
+DELTA_SPV_SHA = 'd008f8fefca9e8fa881713302bb45fab4c23a5d4c8258a4b1cbca07e8577e4c7'
+
+HEADER_PINS = {
+    'b3_04_vit_common.glsl': '9716fcedf60a73b56f6a2fbda2cc8bfd72dc87dd639175fbb2bc8deeefb1060c',
+    'vit_qkv_norm_owner_handoff.glsl': 'bd27a14a0a5c59880a9115b3a3d708a9bbc544e72324299e834c1395f1472240',
+}
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def run(argv):
+    r = subprocess.run([str(a) for a in argv], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    return r.returncode, (r.stdout or '').replace('\r\n', '\n'), (r.stderr or '').replace('\r\n', '\n')
+
+
+def glslang(src, out, includes):
+    argv = [K.GLSLANG, '-V', '--target-env', 'vulkan1.3']
+    for d in includes:
+        argv.append('-I' + str(d))
+    argv += [str(src), '-o', str(out)]
+    rc, so, se = run(argv)
+    if rc != 0:
+        raise SystemExit('glslang failed (%d)\n%s\n%s' % (rc, so, se))
+    return [str(a) for a in argv], se
+
+
+def validate(spv):
+    rc, so, se = run([K.VALIDATE, str(spv)])
+    return dict(rc=rc, stdout=so.strip(), stderr=se.strip())
+
+
+def stage_headers():
+    out = {}
+    for name, pin in HEADER_PINS.items():
+        s = SRC_DIR / name
+        got = sha(s)
+        assert got == pin, 'header pin mismatch %s %s != %s' % (name, got, pin)
+        d = CARD / name
+        if not d.exists() or sha(d) != pin:
+            shutil.copyfile(s, d)
+        out[name] = dict(path=str(d), sha256=sha(d), pin=pin, pin_ok=sha(d) == pin,
+                         origin=str(s), bytes=d.stat().st_size)
+    return out
+
+
+def build(src, out, includes):
+    argv, se = glslang(src, out, includes)
+    return dict(argv=argv, glslang_stderr=se.strip(), path=str(out), sha256=sha(out),
+                bytes=out.stat().st_size, words=out.stat().st_size // 4)
+
+
+def main():
+    hdr = stage_headers()
+    K.write_json(EVID / 'HEADERS.json', hdr)
+
+    # 1. baseline identity: v2 source -> current baseline row SPV (raw compile)
+    assert sha(BASE_SRC) == BASE_SRC_SHA
+    assert sha(BASE_SPV) == BASE_SPV_SHA
+    pr = build(BASE_SRC, CARD / 'parent-rebuild.spv', [SRC_DIR])
+    pr.update(target=str(BASE_SPV), target_sha256=BASE_SPV_SHA,
+              byte_match=pr['sha256'] == BASE_SPV_SHA, recipe='raw (RECIPES.json F14: mode=raw, nc_count=7)')
+    K.write_json(EVID / 'PARENT-REBUILD.json', pr)
+    print('baseline rebuild %s match=%s' % (pr['sha256'], pr['byte_match']))
+
+    # 2. delta base: n12 candidate source -> n12 candidate SPV (this diff's parent)
+    assert sha(DELTA_SRC) == DELTA_SRC_SHA
+    assert sha(DELTA_SPV) == DELTA_SPV_SHA
+    db = build(DELTA_SRC, CARD / 'delta-base.spv', [CARD])
+    db.update(source=str(DELTA_SRC), source_sha256=DELTA_SRC_SHA,
+              target=str(DELTA_SPV), target_sha256=DELTA_SPV_SHA,
+              byte_match=db['sha256'] == DELTA_SPV_SHA,
+              note='immediate parent of this card: the n12-vit-qkv F14 candidate')
+    K.write_json(EVID / 'DELTA-BASE.json', db)
+    print('delta-base rebuild %s match=%s' % (db['sha256'], db['byte_match']))
+
+    # 3. candidate
+    cb = build(CARD / 'candidate.comp', CARD / 'candidate.spv', [CARD])
+    cb['source'] = str(CARD / 'candidate.comp')
+    cb['source_sha256'] = sha(CARD / 'candidate.comp')
+    cb['validate'] = validate(CARD / 'candidate.spv')
+    cb['baseline_validate'] = validate(CARD / 'parent-rebuild.spv')
+    cb['delta_base_validate'] = validate(CARD / 'delta-base.spv')
+    K.write_json(EVID / 'CANDIDATE-BUILD.json', cb)
+    print('candidate %s bytes=%d validate rc=%d' % (cb['sha256'], cb['bytes'], cb['validate']['rc']))
+    assert cb['validate']['rc'] == 0
+    assert pr['byte_match'] and db['byte_match']
+    assert cb['sha256'] not in (BASE_SPV_SHA, DELTA_SPV_SHA)
+
+
+if __name__ == '__main__':
+    main()

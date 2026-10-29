@@ -1,0 +1,98 @@
+"""Read back the GPU runs that appeared in this card directory and write GPU-MEASURED.json.
+
+The runs were not executed by this card (no GPU, no GPU.lock).  They are the concurrent
+main-executor jobs; identity is checked against the parent mean and against the 3-frame plans.
+"""
+import hashlib
+import json
+import numpy as np
+
+B = r"@NR_WORKSPACE@"
+Q = (B + "/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029")
+D = Q + "/real-int8-24"
+S = B + "/work/dsh-fullnet-static-20261029/S02-f01"
+
+jobs = {j["frame"]: j for j in json.load(open(D + "/JOBS.json", encoding="utf-8"))
+        if "reference" in j}
+
+
+def score(path, ref):
+    x = np.fromfile(path, dtype="<f4").reshape(ref.shape)
+    assert np.isfinite(x).all(), path
+    e = x[0, :, :, :3].astype(np.float64) - ref[0, :, :, :3].astype(np.float64)
+    mse = float((e * e).mean())
+    return {"psnr_db": float(-10 * np.log10(mse)), "mse": mse,
+            "mae": float(np.abs(e).mean()), "max_abs": float(np.abs(e).max()),
+            "sha256": hashlib.sha256(open(path, "rb").read()).hexdigest()}
+
+
+def main():
+    rows = []
+    for fr in sorted(jobs):
+        ref = np.fromfile(jobs[fr]["reference"], dtype="<f4").reshape(2, 720, 1280, 4)
+        parent = score(D + f"/c64-family-static/run-{fr}/replayed-network.bin", ref)
+        xe = score(S + f"/runs24/run-{fr}/replayed-network.bin", ref)
+        rows.append({"frame": fr, "parent": parent, "xe": xe,
+                     "delta_db": xe["psnr_db"] - parent["psnr_db"]})
+    mean = lambda k: float(np.mean([r["xe"][k] for r in rows]))
+    pm = float(np.mean([r["parent"]["psnr_db"] for r in rows]))
+    xm = mean("psnr_db")
+    deltas = [r["delta_db"] for r in rows]
+    # 3-frame xed arm (negative result)
+    xed = []
+    for fr in (34189, 41444, 43654):
+        ref = np.fromfile(jobs[fr]["reference"], dtype="<f4").reshape(2, 720, 1280, 4)
+        a = score(D + f"/c64-family-static/run-{fr}/replayed-network.bin", ref)
+        b = score(S + f"/runs/xed-{fr}/replayed-network.bin", ref)
+        xed.append({"frame": fr, "parent_psnr": a["psnr_db"], "xed_psnr": b["psnr_db"],
+                    "delta_db": b["psnr_db"] - a["psnr_db"]})
+    out = {
+        "status": "MEASURED_BY_MAIN_EXECUTOR_CONCURRENTLY_IN_THIS_DIRECTORY",
+        "card_executed_gpu": False,
+        "card_touched_gpu_lock": False,
+        "how": "the runs/ and runs24/ directories and the candidate-xe-<frame>.txt plans appeared in "
+               "S02-f01 during this session, written by the concurrent main executor (timestamps "
+               "20:27:59-20:29:0x). This card only read them back and scored them.",
+        "identity_checks": {
+            "parent_24frame_mean_recomputed": pm,
+            "parent_24frame_mean_recorded_in_CONTRACT": 29.608838,
+            "parent_mean_matches": abs(pm - 29.608838) < 1e-6,
+            "runs24_34189_equals_runs_xe_34189": open(S + "/runs24/run-34189/replayed-network.bin", "rb").read()
+                                                  == open(S + "/runs/xe-34189/replayed-network.bin", "rb").read(),
+            "candidate_xe_34190_binds": "S02-f01/PACK/f1-ffn-scales.bin",
+            "candidate_34189_sha256": "5c971f5a4ed5a59e67209d14504ea4131a396430db646bb2c7970a12b7a18dd8",
+        },
+        "metric": "application RGB (frame 0, channels 0..2), peak 1, reference = dataset/<seq>/<split>-<frame>/network-output.bin, "
+                  "same convention as measure_static_24.py",
+        "xe_24frame": {
+            "frames": len(rows),
+            "parent_mean_psnr": pm,
+            "xe_mean_psnr": xm,
+            "mean_delta_db": xm - pm,
+            "min_delta_db": min(deltas), "max_delta_db": max(deltas),
+            "improved_frames": sum(d > 0 for d in deltas),
+            "worst_frame": rows[int(np.argmin(deltas))]["frame"],
+            "pooled_rmse_xe": float(np.sqrt(np.mean([r["xe"]["mse"] for r in rows]))),
+            "pooled_rmse_parent": float(np.sqrt(np.mean([r["parent"]["mse"] for r in rows]))),
+            "rows": rows,
+        },
+        "xed_3frame_negative": {
+            "rows": xed,
+            "mean_delta_db": float(np.mean([r["delta_db"] for r in xed])),
+            "reason": "the non-pow2 lift D improves 43654 and 41444 but degrades 34189; net 3-frame gain "
+                      "is smaller than the XE-only arm. Not recommended.",
+        },
+        "caveats": [
+            "the receipts record normal_close, nan=0, inf=0, 288 gpu passes, but not the plan path; "
+            "the identity checks above are the evidence that these runs used this card's pack",
+            "24 frames are still the same 3 scenes used for calibration; not an independent-scene holdout",
+            "no autonomous INT8 feedback, no independent scene, no picture acceptance",
+        ],
+    }
+    open(S + "/GPU-MEASURED.json", "w", encoding="utf-8").write(json.dumps(out, indent=2))
+    print(json.dumps({k: v for k, v in out["xe_24frame"].items() if k != "rows"}, indent=1))
+    print(json.dumps(out["xed_3frame_negative"], indent=1))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,62 @@
+import json,hashlib,subprocess,sys,re,shlex
+from pathlib import Path
+B=Path('@NR_WORKSPACE@');D=B/'work/codex-astra-fp16-int8-audit-20261024/phase-diagnosis-20261025';R=B/'work/codex-astra-fp16-int8-audit-20261024/bridge-optimization-20261025';sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+ident=lambda p:{'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+parentplan=B/'work/zcode-fp16-fullnet-handoff-20261024/candidates/combo1-gates-passed/plan-combo1-232.txt';lines=parentplan.read_text(encoding='utf-8-sig').splitlines();passes=[(i,shlex.split(l)) for i,l in enumerate(lines) if l.startswith('PASS ')];runner=D/'direct-clock-build/Release/clock_runner.exe';meta=[]
+specs=[('c32-act2',B/'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1/source/c32_register.comp',1),('f20-scale2',B/'candidates/zcode-fp16-four-hotspots-20261020/s37-context-a-v1/source/s37_fold_body_r1a.comp',230)]
+for label,src,ordinal in specs:
+ folder=R/label;folder.mkdir(exist_ok=True);original=src.read_text(encoding='utf-8-sig');parent=Path(passes[ordinal][1][3]);pm=ST.Module(parent)
+ def compile(source,dest):
+  p=subprocess.run([str(B/'src/project/tools/glslang-16.5.0/bin/glslang.exe'),'-V','--target-env','vulkan1.3','-I'+str(src.parent),str(source),'-o',str(dest)],capture_output=True,text=True);assert p.returncode==0,p.stdout+p.stderr
+  cm=ST.Module(dest);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[]);assert len(keep)==len(ST.no_contraction_ids(pm));ST.set_no_contraction(cm,keep,dest);p=subprocess.run([str(B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'),str(dest)],capture_output=True,text=True);assert p.returncode==0,p.stdout+p.stderr
+  return info
+ compile(src,folder/'parent-rebuilt.spv');assert ident(parent)['sha256']==ident(folder/'parent-rebuilt.spv')['sha256'],label
+ if label=='c32-act2':
+  helper='''// Componentwise half arithmetic: same clamp, two fma nodes, final half multiply.
+f16vec2 nr_act_h2(f16vec2 x) {
+    f16vec2 t = clamp(x, f16vec2(float16_t(-4.0)), f16vec2(float16_t(4.0)));
+    f16vec2 u = fma(f16vec2(float16_t(-0.055908203125)), abs(t), f16vec2(float16_t(0.447265625)));
+    return x * fma(t, u, f16vec2(float16_t(0.89453125)));
+}
+'''
+  s=original.replace('// half swin exp',helper+'\n// half swin exp',1);count=0
+  for v in ['e0','e1']:
+   pattern='\n'.join('            '+v+f'[{k}] = nr_act_h({v}[{k}]);' for k in range(4))
+   replacement='\n'.join('            { f16vec2 a = nr_act_h2(f16vec2('+v+f'[{k}], {v}[{k+1}])); {v}[{k}]=a.x; {v}[{k+1}]=a.y; }}' for k in [0,2]);count+=s.count(pattern);s=s.replace(pattern,replacement)
+  assert count==16,count
+  proof={'changed_blocks':16,'activation_elements':64,'old_scalar_calls':64,'new_pair_calls':32,'operations_per_element':'unchanged clamp -> abs -> half fma -> half fma -> half mul','matrix_accumulation_order':'unchanged','transport_helper':'unchanged','extra_shared_bytes':0,'extra_barriers':0}
+ else:
+  start=original.index('        for (uint e = t_local; e < 4096u; e += 256u) {',original.index('// ============ stage 5b:'));end=original.index('\n    }\n    if (debug)',start)
+  old=original[start:end];s=original[:start]+'''        // Each lane processes two adjacent channels with the original two half rounds.
+        for (uint e = 2u*t_local; e < 4096u; e += 512u) {
+            bool isQ = e < 2048u;
+            uint m = (e % 2048u) / 32u, c = e % 32u;
+            float16_t n = shNorm[(isQ ? 0u : 64u) + m];
+            f16vec2 v = isQ ? f16vec2(NR_Q(m,c),NR_Q(m,c+1u)) : f16vec2(NR_K(m,c),NR_K(m,c+1u));
+            f16vec2 r = v * f16vec2(n);
+            if (isQ) r = r * f16vec2(scalar0);
+            if (isQ) { NR_Q(m,c)=r.x; NR_Q(m,c+1u)=r.y; }
+            else { NR_K(m,c)=r.x; NR_K(m,c+1u)=r.y; }
+        }'''+original[end:]
+  seen=[]
+  for lane in range(256):
+   for e in range(2*lane,4096,512):
+    assert e%32<=30 and e%2==0
+    for q in [e,e+1]:assert q//32==e//32;seen.append(q)
+  assert sorted(seen)==list(range(4096))
+  proof={'all_4096_elements_exactly_once':True,'norm_source_per_element':'same row, Q/K boundary cannot be crossed by pair','old_iterations_per_lane':16,'new_iterations_per_lane':8,'old_logical_norm_reads':4096,'new_logical_norm_reads':2048,'value_reads_and_writes_each':4096,'normal_norm_tree':'byte-for-byte unchanged source','rounding':'r=H(v*n); Q only r=H(r*scalar0), unchanged','extra_shared_bytes':0,'extra_barriers':0}
+ outsrc=folder/'candidate.comp';outsrc.write_text(s,encoding='utf-8');info=compile(outsrc,folder/'candidate.spv');out=lines.copy();orders=[]
+ for order,(i,t) in enumerate(passes):
+  if Path(t[3])==parent:out[i]=lines[i].replace(t[3],(folder/'candidate.spv').as_posix());orders.append(order)
+ assert orders
+ plan=folder/'plan.txt';plan.write_text('\n'.join(out)+'\n',encoding='utf-8');p=subprocess.run([str(runner),'--plan',str(plan),'--cpu-check'],capture_output=True,text=True);assert p.returncode==0,p.stdout+p.stderr
+ m={'label':label,'source':ident(src),'candidate_source':ident(outsrc),'parent':ident(parent),'candidate':ident(folder/'candidate.spv'),'plan':ident(plan),'orders':orders,'proof':proof,'nc_mapping':info,'cpu_check':p.stdout};meta.append(m);print(label,orders,'ready')
+(R/'CANDIDATES.json').write_text(json.dumps(meta,indent=2),encoding='utf-8')
+# Fixed and feedback gates only; timing is released after native/codegen inspection.
+task={'working_directory':str(B),'output_root':str(R),'identities':[ident(runner)]+[m['candidate'] for m in meta],'jobs':[],'rules':['Only exact jobs, serial unique GPU lock; no exploration. On a numeric failure preserve result, skip remaining jobs for that candidate, continue other independent candidate. On device/runner error stop whole queue.','Fixed warm0 reps1. Feedback warm0 reps2 saveframes; check frame0=fixed gold and frame1=fb2 gold. Never treat warmup or single frame as performance.']}
+for label,plan in [('parent',ident(parentplan))]+[(m['label'],m['plan']) for m in meta]:
+ for mode in ['fixed','fb2']:
+  job='gate-'+label+'-'+mode;dest=R/'run'/job;av=[str(runner),'--plan',plan['path'],'--out',str(dest),'--pool','--warm','0','--reps','1' if mode=='fixed' else '2']
+  if mode=='fb2':av+=['--feedback','--save-frames']
+  task['jobs'].append({'id':job,'candidate':label,'mode':mode,'plan':plan,'argv':av,'runner_output':str(dest),'expected_fixed_frame_out':'1755e9c2fadba97f08cb5b02b7a4294cde3675379bdec75352287505f7e129d6' if mode=='fixed' else '9c3e511e97a5879247bc2965792c96dd62928dddfd85a48bbf25af1e807d3536','expected_frame0':'1755e9c2fadba97f08cb5b02b7a4294cde3675379bdec75352287505f7e129d6'})
+(R/'LUNA-BRIDGE-GATES.json').write_text(json.dumps(task,indent=2))

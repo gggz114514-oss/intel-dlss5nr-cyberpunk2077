@@ -1,0 +1,440 @@
+"""n02d-f02-bias-wide build: parent byte reproduction -> candidate -> NC alignment
+-> SPV validation -> plan on the CURRENT CHAIN HEAD -> CPU gates.
+
+CPU only.  Never loads Vulkan, never takes the GPU lock, never deploys, never
+touches the baseline plan / pointer JSON / COMMON.py / other card directories.
+
+Identity chain (CONTRACT 2 + 8.3 + 8.4):
+  parent source  c32-rest-20261026/body-pv-den-overlap/candidate.comp (75e3474d...)
+  parent SPV     4c034a532ce60f5fa608d1ce67f6368819c052c3d5268eb51f7f680ea83aaf10
+                  (7 PASS: ordinals 1,2,3,4,227,228,229 -- verified to still be the
+                   chain-head SPV for those ordinals, see BUILD.json.chain_head_rows)
+  recipe         evidence/RECIPES.json[4c034a53]: pinned header register_handoff.glsl
+                  sha 1c4c7489... + NoContraction pattern from c32-feed-owner-20261025/kv-tile
+  chain head     accepted/restore-n10-f10-next-20261027/plan.txt (719f100b...)
+
+The mechanism under test: replace the 8 `coopMatLoad(bias,fb,...,64u,LROW)` row
+gathers (64 uniform 64 B messages) with two 8x64 f32 accumulator band reads
+(contiguous 2048 B each -> 8 messages of 512 B, or 16 of 256 B).
+"""
+import json
+import sys
+import hashlib
+import subprocess
+import shutil
+import collections
+from pathlib import Path
+
+CARD = Path(__file__).parent
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(CARD.parent.parent))
+sys.path.insert(0, str(CARD))
+import COMMON as K          # noqa: E402
+import gen_candidate as G   # noqa: E402
+
+CAND_SRC = CARD / 'candidate.comp'
+CAND_SPV = CARD / 'candidate.spv'
+PROBE_SRC = CARD / 'probe.comp'
+PROBE_SPV = CARD / 'probe.spv'
+PARENT_REBUILD = CARD / 'parent-rebuild.spv'
+PLAN = CARD / 'plan.txt'
+PROBE_PLAN = CARD / 'probe-plan.txt'
+BUILD = CARD / 'BUILD.json'
+
+PARENT_SHA = '4c034a532ce60f5fa608d1ce67f6368819c052c3d5268eb51f7f680ea83aaf10'
+PARENT_SRC = G.PARENT_SRC
+PARENT_SPV = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                  'c32-rest-20261026/body-pv-den-overlap/candidate.spv')
+ORDINALS = [1, 2, 3, 4, 227, 228, 229]
+REC = K.read_json(K.C / 'cards' / 'idt-identity-recipe' / 'RECIPES.json')[PARENT_SHA]
+PINNED = Path(REC['compile']['pinned_include_dir'])
+ORIGIN = Path(REC['compile']['include_dirs'][0])
+DECO_PARENT = Path(REC['decoration_parent'])
+
+FLOAT_ARITH = {129: 'OpFAdd', 131: 'OpFSub', 133: 'OpFMul', 136: 'OpFDiv', 12: 'OpExtInst'}
+INT_CTRL = {128: 'OpIAdd', 130: 'OpISub', 132: 'OpIMul', 134: 'OpUDiv', 135: 'OpSDiv',
+            137: 'OpUMod', 138: 'OpSRem', 139: 'OpSMod'}
+NAMED = {4457: 'OpCooperativeMatrixLoadKHR', 4458: 'OpCooperativeMatrixStoreKHR',
+         4459: 'OpCooperativeMatrixMulAddKHR', 224: 'OpControlBarrier',
+         61: 'OpLoad', 62: 'OpStore', 59: 'OpVariable', 65: 'OpAccessChain'}
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def compile_to(src, out):
+    out.parent.mkdir(parents=True, exist_ok=True)
+    K.compile_glsl(src, out, [PINNED, ORIGIN, Path(src).parent])
+    return out
+
+
+def nc_campaign(raw, out, parent):
+    rm = K.ST.Module(raw)
+    pm_ = K.ST.Module(parent)
+    keep, info = K.ST.transfer_decoration_pattern_aligned(pm_, rm, set())
+    K.ST.set_no_contraction(rm, keep, out)
+    return keep, info
+
+
+def fp_census(m):
+    c = collections.Counter()
+    for op, ops, _, _ in m.instructions:
+        if op in (129, 131, 133, 136):
+            c[FLOAT_ARITH[op]] += 1
+        elif op == 12 and len(ops) >= 5 and ops[3] == 50:
+            c['Fma'] += 1
+        elif op == 115:
+            c['OpFConvert'] += 1
+    return dict(c)
+
+
+def named_census(m):
+    c = collections.Counter(op for op, _, _, _ in m.instructions)
+    return {NAMED[k]: c.get(k, 0) for k in NAMED}
+
+
+def opcode_census(m):
+    return dict(collections.Counter(op for op, _, _, _ in m.instructions))
+
+
+def int_ctrl(m):
+    return dict(collections.Counter(INT_CTRL[op] for op, _, _, _ in m.instructions if op in INT_CTRL))
+
+
+def shape_census(path):
+    """Cooperative-matrix shape census straight from the module words.
+
+    OpCooperativeMatrixLoadKHR operands: result type, result, pointer,
+    [memory layout], stride, [memory access].  Strides are constant ids here, so the
+    memory stride of every load is resolved and reported.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('n02d_spv_scan', CARD / 'spv_scan.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    inst = mod.parse(path)
+    mtypes, consts = {}, {}
+    loads, muladds, stores = [], 0, 0
+    for op, a in inst:
+        if op == 4456:
+            mtypes[a[0]] = dict(component=a[1], scope=a[2], rows=a[3], cols=a[4], use=a[5])
+        elif op == 43:
+            consts[a[1]] = a[2] if len(a) > 2 else None
+        elif op == 31:
+            consts[a[1]] = 0
+        elif op == 4457:
+            stride_id = a[4] if len(a) > 4 else None
+            loads.append(dict(type=a[0], ptr=a[2], stride=consts.get(stride_id)))
+        elif op == 4458:
+            stores += 1
+        elif op == 4459:
+            muladds += 1
+
+    USE = {0: 'A', 1: 'B', 2: 'ACC'}
+
+    def shape(t):
+        e = mtypes[t]
+        # rows/cols/use arrive as constant ids in glslang 16.5.0 output
+        rows = consts.get(e['rows'], e['rows'])
+        cols = consts.get(e['cols'], e['cols'])
+        use = consts.get(e['use'], e['use'])
+        return (rows, cols, USE.get(use, use))
+
+    by_shape = collections.Counter((str(shape(l['type'])), l['stride']) for l in loads)
+    return dict(muladds=muladds, stores=stores, loads=len(loads),
+                loads_by_shape_and_stride={'%s stride=%s' % k: v for k, v in by_shape.items()},
+                matrix_types={'%s' % (str(shape(t)),): v for t, v in mtypes.items()})
+
+
+def function_names(module):
+    names = {}
+    for op, ops, _, _ in module.instructions:
+        if op == 5 and len(ops) >= 2:
+            raw = b''.join(int(w).to_bytes(4, 'little') for w in ops[1:])
+            names[ops[0]] = raw.split(b'\x00')[0].decode('utf-8', 'replace')
+    out = []
+    for reg in K.ST.function_regions(module):
+        rid = None
+        for idx in reg:
+            op, ops, _, _ = module.instructions[idx]
+            if op == 54:
+                rid = K.ST.result_id_of(op, ops)
+                break
+        out.append(names.get(rid, '<anon>'))
+    return out
+
+
+def fp_map(module):
+    nc = set(K.ST.no_contraction_ids(module))
+    out = {}
+    for fname, reg in zip(function_names(module), K.ST.function_regions(module)):
+        seq = []
+        for idx in reg:
+            op, ops, _, _ = module.instructions[idx]
+            rid = K.ST.result_id_of(op, ops)
+            if op in FLOAT_ARITH:
+                if op == 12:
+                    if len(ops) >= 5 and ops[3] == 50:
+                        seq.append(('Fma', rid in nc))
+                else:
+                    seq.append((FLOAT_ARITH[op], rid in nc))
+        out.setdefault(fname, []).extend(seq)
+    return out
+
+
+def bias_add_pairs(module):
+    """Ordered (left operand component index, right operand component index) of every
+    f32 add whose operands are both cooperative-matrix component accesses.
+
+    This is the operand-level alignment evidence that CONTRACT section 2 asks for:
+    the generic ordinal transfer only fingerprints the *result* opcode (its depth-2
+    signature of an OpFAdd result is ('op', 129)), so the pairing of the bias
+    operand is proven here instead, explicitly.
+    """
+    out = []
+
+    def comp_index(rid):
+        op, ops = module.defining_instruction(rid)
+        if op != 61 or len(ops) < 3:          # OpLoad
+            return None
+        aop, aops = module.defining_instruction(ops[2])
+        if aop != 65 or len(aops) < 4:        # OpAccessChain
+            return None
+        cop, cops = module.defining_instruction(aops[3])
+        if cop != 43:                         # OpConstant
+            return None
+        return cops[2]
+
+    for op, ops, _, _ in module.instructions:
+        if op != 129:
+            continue
+        a, bb = comp_index(ops[2]), comp_index(ops[3])
+        if a is None or bb is None:
+            continue
+        out.append((a, bb))
+    return out
+
+
+def main():
+    CARD.mkdir(parents=True, exist_ok=True)
+    head_plan, head_sha, _chain = K.current_best()
+    build = {'card': 'n02d-f02-bias-wide', 'family': 'F02',
+             'gpu': 'NONE in this card (CPU only: glslang + IR census + spv_validate_cpu '
+                    '+ clock_runner --cpu-check). The GPU arms are requested in GPU-REQUEST.json.',
+             'parent_spv': {'path': str(PARENT_SPV), 'sha256': PARENT_SHA},
+             'chain_head': {'plan': str(head_plan), 'sha256': head_sha,
+                            'sha_ok': sha(head_plan) == head_sha},
+             'handoff_baseline_plan_sha256': K.BASELINE_SHA,
+             'identity_recipe': {'source': str(PARENT_SRC),
+                                 'source_sha256': sha(PARENT_SRC),
+                                 'pinned_include_dir': str(PINNED),
+                                 'include_dirs': [str(ORIGIN)], 'defines': [],
+                                 'header_pin_sha256': sha(PINNED / 'register_handoff.glsl'),
+                                 'decoration_parent': str(DECO_PARENT),
+                                 'decoration_parent_sha256': sha(DECO_PARENT)}}
+    assert sha(PARENT_SRC) == G.PARENT_SRC_SHA
+
+    # ---- 1. parent byte reproduction -------------------------------------
+    praw = compile_to(PARENT_SRC, CARD / 'parent-raw.spv')
+    rec = {'source': str(PARENT_SRC), 'source_sha256': sha(PARENT_SRC),
+           'raw_sha256': sha(praw), 'raw_match': sha(praw) == PARENT_SHA}
+    if rec['raw_match']:
+        shutil.copyfile(praw, PARENT_REBUILD)
+        rec['recipe'] = 'raw'
+    else:
+        keep, info = nc_campaign(praw, PARENT_REBUILD, DECO_PARENT)
+        rec['recipe'] = 'decoration-parent'
+        rec['nc_from'] = str(DECO_PARENT)
+        rec['nc_from_sha256'] = sha(DECO_PARENT)
+        rec['nc_count'] = len(keep)
+        rec['nc_parent'] = len(K.ST.no_contraction_ids(K.ST.Module(DECO_PARENT)))
+        rec['nc_info'] = {k: info[k] for k in ('functions_mapped', 'parent_decorations_total',
+                                               'child_functions_without_parent_counterpart')}
+    rec['rebuild_sha256'] = sha(PARENT_REBUILD)
+    rec['byte_match'] = rec['rebuild_sha256'] == PARENT_SHA
+    rec['target'] = str(PARENT_SPV)
+    rec['target_sha256'] = sha(PARENT_SPV)
+    build['parent'] = rec
+    build['parent_rebuild'] = {'path': str(PARENT_REBUILD), 'sha256': sha(PARENT_REBUILD)}
+    assert rec['byte_match'], 'parent byte reproduction failed: %r' % rec
+    print('[1] parent rebuild == %s (recipe %s)' % (PARENT_SHA[:12], rec['recipe']))
+    pm = K.ST.Module(PARENT_REBUILD)
+
+    # ---- 2. source generation (candidate.comp / probe.comp) --------------
+    build['generated'] = dict(candidate=G.generate_candidate(), probe=G.generate_probe())
+
+    # ---- 3. candidate -----------------------------------------------------
+    craw = compile_to(CAND_SRC, CARD / 'candidate-raw.spv')
+    import nc_transfer
+    build['candidate'] = {}
+    try:
+        keep, info = nc_transfer.transfer(PARENT_REBUILD, craw, CAND_SPV)
+        build['candidate']['nc_method'] = 'ordinal (per function, per float opcode class)'
+    except AssertionError as exc:
+        build['candidate']['nc_strict_failure'] = str(exc)
+        keep, info = nc_transfer.transfer_relaxed(PARENT_REBUILD, craw, CAND_SPV)
+        build['candidate']['nc_method'] = ('ordinal, relaxed only on the component index of '
+                                          'an access-chain operand of an f32 add')
+    cm = K.ST.Module(CAND_SPV)
+    build['candidate'].update({
+        'source': str(CAND_SRC), 'source_sha256': sha(CAND_SRC),
+        'raw_sha256': sha(craw), 'spv': str(CAND_SPV), 'spv_sha256': sha(CAND_SPV),
+        'nc_count': len(keep), 'nc_parent': len(K.ST.no_contraction_ids(pm)),
+        'nc_transfer_rows': info.get('rows')})
+    build['candidate_spv'] = {'path': str(CAND_SPV), 'sha256': sha(CAND_SPV)}
+    print('[3] candidate %s' % build['candidate']['spv_sha256'])
+
+    # ---- 4. float NoContraction one-to-one + opcode census ----------------
+    pfm, cfm = fp_map(pm), fp_map(cm)
+    rows, nc_checked, total_p, total_c = [], 0, 0, 0
+    ok = True
+    for fname in sorted(set(pfm) | set(cfm)):
+        p, c = pfm.get(fname, []), cfm.get(fname, [])
+        np_, nc_ = sum(1 for _, d in p if d), sum(1 for _, d in c if d)
+        total_p += len(p)
+        total_c += len(c)
+        nc_checked += min(np_, nc_)
+        same = ([x[0] for x in p] == [x[0] for x in c] and [x[1] for x in p] == [x[1] for x in c])
+        ok = ok and same
+        rows.append({'function': fname, 'parent_float_sites': len(p),
+                     'candidate_float_sites': len(c), 'parent_nc': np_,
+                     'candidate_nc': nc_, 'identical': same})
+    build['float_NC_alignment'] = {
+        'method': 'function-name keyed ordered (float opcode, NC flag) sequence',
+        'float_NC_checked': nc_checked, 'parent_float_sites': total_p,
+        'candidate_float_sites': total_c, 'all_functions_identical': ok, 'functions': rows}
+    build['integer_NC_opcodes'] = {'opcodes': INT_CTRL, 'parent': int_ctrl(pm),
+                                   'candidate': int_ctrl(cm),
+                                   'identical': int_ctrl(pm) == int_ctrl(cm)}
+    build['fp_census'] = {'parent': fp_census(pm), 'candidate': fp_census(cm)}
+    pc, cc = opcode_census(pm), opcode_census(cm)
+    build['opcode_census'] = {'parent_total': sum(pc.values()),
+                              'candidate_total': sum(cc.values()),
+                              'named_parent': named_census(pm), 'named_candidate': named_census(cm),
+                              'changed': {str(k): [pc.get(k, 0), cc.get(k, 0)]
+                                          for k in sorted(set(pc) | set(cc))
+                                          if pc.get(k, 0) != cc.get(k, 0)}}
+    build['shape_census'] = {'parent': shape_census(PARENT_REBUILD),
+                             'candidate': shape_census(CAND_SPV)}
+
+    # ---- 4b. bias-add operand pairing (the NC/rounding evidence that the coarse
+    # ordinal fingerprint of an f32 add cannot carry) -----------------------
+    ppairs, cpairs = bias_add_pairs(pm), bias_add_pairs(cm)
+    build['bias_add_operand_pairs'] = {
+        'parent': ppairs, 'candidate': cpairs,
+        'parent_count': len(ppairs), 'candidate_count': len(cpairs),
+        'left_operand_unchanged': [p[0] for p in ppairs] == [c[0] for c in cpairs],
+        'right_operand_rule': 'candidate right index = 4*colblock + component of the same '
+                              'site (adds are emitted block-major, half-inner: index '
+                              'i -> colblock i//8, component i%4); parent right index = '
+                              'component (site-local 8x16 frame)',
+        'right_operand_matches_4b_plus_c': all(
+            c[1] == 4 * (i // 8) + (i % 4) for i, c in enumerate(cpairs)),
+        'left_operand_matches_component': all(c[0] == i % 4 for i, c in enumerate(cpairs)),
+        'parent_right_operand_matches_component': all(p[1] == p[0] for p in ppairs),
+        'same_count': len(ppairs) == len(cpairs) == 32}
+    print('[4b] bias f32 adds parent=%d candidate=%d left unchanged=%s 4b+c=%s'
+          % (len(ppairs), len(cpairs), build['bias_add_operand_pairs']['left_operand_unchanged'],
+             build['bias_add_operand_pairs']['right_operand_matches_4b_plus_c']))
+    print('[4] float NC checked=%d identical=%s; coop loads %s -> %s'
+          % (nc_checked, ok, build['opcode_census']['named_parent']['OpCooperativeMatrixLoadKHR'],
+             build['opcode_census']['named_candidate']['OpCooperativeMatrixLoadKHR']))
+    print('    loads by shape parent   ', build['shape_census']['parent']['loads_by_shape_and_stride'])
+    print('    loads by shape candidate', build['shape_census']['candidate']['loads_by_shape_and_stride'])
+    print('    muladds %d -> %d' % (build['shape_census']['parent']['muladds'],
+                                    build['shape_census']['candidate']['muladds']))
+
+    # ---- 5. probe artifact (separate SPV, never in a timed plan) ---------
+    prw = compile_to(PROBE_SRC, CARD / 'probe-raw.spv')
+    keep_p, info_p = nc_transfer.transfer_relaxed(PARENT_REBUILD, prw, PROBE_SPV)
+    build['probe'] = {'source': str(PROBE_SRC), 'source_sha256': sha(PROBE_SRC),
+                      'spv': str(PROBE_SPV), 'spv_sha256': sha(PROBE_SPV),
+                      'nc_count': len(keep_p), 'purpose':
+                          'if(debug) lane-map probe for the 8x64 accumulator band; '
+                          'ran with --dump-intermediates, never timed, never gated'}
+    print('[5] probe %s' % build['probe']['spv_sha256'])
+
+    # ---- 6. SPV validation (candidate + probe + parent rebuild) ----------
+    val = {}
+    for name, p in (('candidate', CAND_SPV), ('probe', PROBE_SPV), ('parent_rebuild', PARENT_REBUILD)):
+        r = subprocess.run([str(K.VALIDATE), str(p)], capture_output=True, text=True,
+                           encoding='utf-8', errors='replace')
+        val[name] = {'path': str(p), 'returncode': r.returncode,
+                     'stdout': r.stdout.strip(), 'stderr': r.stderr.strip()}
+        print('[6] spv_validate_cpu %-14s rc=%d' % (name, r.returncode))
+    build['spv_validate_cpu'] = val
+
+    # ---- 7. plan on the CURRENT CHAIN HEAD; replaced must be 7 ----------
+    repl = K.make_plan(CAND_SPV, PLAN, parent_plan=head_plan,
+                       spv_shas={PARENT_SHA}, expect_passes=True)
+    build['plan'] = {
+        'parent_plan': str(head_plan), 'parent_plan_sha256': sha(head_plan),
+        'parent_plan_sha_expected': head_sha, 'plan': str(PLAN), 'plan_sha256': sha(PLAN),
+        'passes_replaced': repl, 'passes_expected': len(ORDINALS),
+        'replaced_spv_sha256': [PARENT_SHA], 'replaced_ordinals': ORDINALS,
+        'chain_head_sha_ok': sha(head_plan) == head_sha,
+        'buffer_count_and_pool_unchanged': None}
+    assert repl == len(ORDINALS), 'replaced %d != %d' % (repl, len(ORDINALS))
+    # prove the plan differs from the chain head on exactly those 7 lines and nothing else
+    head_lines = Path(head_plan).read_text(encoding='utf-8-sig').splitlines()
+    plan_lines = PLAN.read_text(encoding='utf-8-sig').splitlines()
+    diff_lines = [i for i, (x, y) in enumerate(zip(head_lines, plan_lines)) if x != y]
+    build['plan']['line_count'] = [len(head_lines), len(plan_lines)]
+    build['plan']['differing_line_indices'] = diff_lines
+    build['plan']['differing_line_passes'] = [plan_lines[i].split()[1] for i in diff_lines]
+    build['plan']['only_this_group'] = len(diff_lines) == len(ORDINALS) and len(head_lines) == len(plan_lines)
+    print('[7] plan written %s replaced=%d differing_lines=%s'
+          % (sha(PLAN)[:12], repl, build['plan']['differing_line_passes']))
+
+    # ---- 8. CPU gates ----------------------------------------------------
+    ck = subprocess.run([str(K.RUNNER), '--plan', str(PLAN), '--cpu-check'],
+                        capture_output=True, text=True, encoding='utf-8', errors='replace')
+    base_ck = subprocess.run([str(K.RUNNER), '--plan', str(head_plan), '--cpu-check'],
+                             capture_output=True, text=True, encoding='utf-8', errors='replace')
+    build['cpu_check'] = {'argv': [str(K.RUNNER), '--plan', str(PLAN), '--cpu-check'],
+                          'returncode': ck.returncode, 'stdout': ck.stdout.strip(),
+                          'stderr': ck.stderr.strip()}
+    build['cpu_check_chain_head'] = {'argv': [str(K.RUNNER), '--plan', str(head_plan), '--cpu-check'],
+                                     'returncode': base_ck.returncode,
+                                     'stdout': base_ck.stdout.strip()}
+    build['cpu_check_identical_to_chain_head'] = (ck.stdout.strip() == base_ck.stdout.strip())
+    build['plan']['buffer_count_and_pool_unchanged'] = build['cpu_check_identical_to_chain_head']
+    print('[8] cpu-check rc=%d :: %s' % (ck.returncode, ck.stdout.strip()[:200]))
+
+    # ---- 9. probe plan (same 7 rows -> probe.spv, never timed) -----------
+    rp = K.make_plan(PROBE_SPV, PROBE_PLAN, parent_plan=head_plan,
+                     spv_shas={PARENT_SHA}, expect_passes=True)
+    pk = subprocess.run([str(K.RUNNER), '--plan', str(PROBE_PLAN), '--cpu-check'],
+                        capture_output=True, text=True, encoding='utf-8', errors='replace')
+    build['probe_plan'] = {'plan': str(PROBE_PLAN), 'plan_sha256': sha(PROBE_PLAN),
+                           'passes_replaced': rp, 'cpu_check_returncode': pk.returncode,
+                           'cpu_check_stdout': pk.stdout.strip(),
+                           'arm': 'clock_runner --plan probe-plan.txt --out <fresh> --pool '
+                                  '--warm 0 --reps 1 --dump-intermediates'}
+    print('[9] probe plan %s cpu-check rc=%d' % (sha(PROBE_PLAN)[:12], pk.returncode))
+
+    good = (rec.get('byte_match') and ok and val['candidate']['returncode'] == 0
+            and val['probe']['returncode'] == 0 and ck.returncode == 0
+            and repl == len(ORDINALS) and pk.returncode == 0)
+    build['status'] = 'AWAITING-GPU' if good else 'BLOCKED'
+    build['status_reason'] = (
+        'Mechanism implemented and CPU-verified; the 8x64 accumulator lane map is NOT '
+        'measured yet, so no numeric (E) or native (A) verdict is claimed for this card. '
+        'GPU step 1 is the probe arm (probe-plan.txt + --dump-intermediates), GPU step 2 '
+        'is the native capture of the candidate arm, GPU step 3 the gates/ordinary arms.')
+    build['verdict_policy'] = {
+        'lane_map_unmeasured': 'candidate.comp encodes hypothesis H1 (band component 4*b+c == '
+                               'site b component c). If probe_read.py returns H1, the adds are a '
+                               'pure register rename and the candidate is numerically exact by '
+                               'construction; any other within-lane permutation is a one-line fix '
+                               'in NRH_C64_AT; a lane-dependent map kills the mechanism (C/BLOCKED).',
+        'A_class': 'load.ugm.d32x16t does NOT drop -> implementation did not land',
+        'E_class': 'gates fixed/fb2 differ -> first difference is the bias element map',
+    }
+    K.write_json(BUILD, build)
+    print('[10] BUILD.json written; status', build['status'])
+
+
+if __name__ == '__main__':
+    main()

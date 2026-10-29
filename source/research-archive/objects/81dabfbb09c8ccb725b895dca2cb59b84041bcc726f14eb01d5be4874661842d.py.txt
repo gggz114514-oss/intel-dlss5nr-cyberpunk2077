@@ -1,0 +1,415 @@
+"""n08-f08-wg-map proof: SPIR-V immediate-level diff + mapping enumeration.
+
+Writes PROOF.json inside the card directory only.  No GPU.
+"""
+import sys, json
+from pathlib import Path
+
+CAMPAIGN = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(CAMPAIGN))
+import COMMON as K
+
+CARD = CAMPAIGN / 'cards' / 'n08-f08-wg-map'
+D = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-mechanism-transfer-20261026')
+PARENT_SPV = D / 'f08-register-chain-20261027' / 'candidate.spv'
+CAND_SPV = CARD / 'candidate.spv'
+
+NAMES = {12: 'OpExtInst', 43: 'OpConstant', 61: 'OpLoad', 65: 'OpAccessChain',
+         81: 'OpCompositeExtract', 128: 'OpIAdd', 129: 'OpFAdd', 130: 'OpISub',
+         131: 'OpFSub', 132: 'OpIMul', 133: 'OpFMul', 134: 'OpUDiv', 135: 'OpSDiv',
+         136: 'OpFDiv', 137: 'OpUMod', 138: 'OpSRem', 139: 'OpSMod', 4457: 'OpCooperativeMatrixMulAddKHR',
+         79: 'OpShiftLeftLogical', 80: 'OpBitwiseOr'}
+
+T = 1056          # tokens of the F08 C512 layer (plan gx=66 x 16 tokens, proven below)
+G = 8             # groups (plan gy=2 x 4 groups)
+SG = 8            # subgroups per workgroup (local_size_x=256)
+NT = T // 8       # token-8 tiles
+PARENT_GRID = (66, 2, 1)
+CAND_GRID = (33, 4, 1)
+
+
+def tiled(token, c, C):
+    return ((token // 16) * (C // 16) + c // 16) * 256 + (token % 16) * 16 + c % 16
+
+
+# ---------------------------------------------------------------- SPIR-V diff
+def normalized(m):
+    """Opcode + operand stream with result ids replaced by 'id' and constant ids
+    replaced by their literal value, so renumbering cannot masquerade as a change."""
+    const = {}
+    for op, ops, _, _ in m.instructions:
+        if op == 43:                       # OpConstant type result value
+            const[ops[1]] = ops[2]
+        elif op == 44:                     # OpConstantComposite type result ...
+            const[ops[1]] = tuple(const.get(x, ('raw', x)) for x in ops[2:])
+    results = set()
+    skip_result_first = {2, 3, 4, 5, 6, 8, 14, 15, 16, 17, 71, 72, 73, 74, 75, 77}
+    for op, ops, _, _ in m.instructions:
+        if not ops or op in skip_result_first:
+            continue
+        if K.ST.result_id_of(op, ops) is not None:
+            results.add(ops[0] if op in K.ST.RESULT_AT_ZERO_OPS else ops[1])
+    out = []
+    for op, ops, _, _ in m.instructions:
+        if op == 43:
+            out.append((op, ('const', ops[1] if False else None, ops[2])))
+            continue
+        toks = []
+        for o in ops:
+            if o in const and not isinstance(const[o], tuple):
+                toks.append(('c', const[o]))
+            elif o in results:
+                toks.append('id')
+            else:
+                toks.append(('lit', o))
+        out.append((op, tuple(toks)))
+    return out, const
+
+
+def instr_diff(pa, pb):
+    a = K.ST.Module(Path(pa))
+    b = K.ST.Module(Path(pb))
+    assert len(a.instructions) == len(b.instructions), (len(a.instructions), len(b.instructions))
+    na, ca = normalized(a)
+    nb, cb = normalized(b)
+    assert [x[0] for x in na] == [x[0] for x in nb], 'opcode sequence differs'
+    diffs = []
+    for idx, ((opa, ta), (opb, tb)) in enumerate(zip(na, nb)):
+        if ta != tb:
+            diffs.append({'index': idx, 'opcode': opa, 'name': NAMES.get(opa, 'op%d' % opa),
+                          'parent_normalized': list(ta), 'candidate_normalized': list(tb)})
+    # which literal constants were introduced / removed
+    changed_consts = []
+    for idx, d in enumerate(diffs):
+        pass
+    return diffs, len(a.instructions), len(a.words)
+
+
+# ---------------------------------------------------------------- mappings
+def parent_sg(wgx, wgy, sg):
+    token = wgx * 16 + (sg % 2) * 8
+    return token, wgy * 4 + sg // 2
+
+
+def cand_sg(wgx, wgy, sg):
+    token = wgx * 32 + (sg % 4) * 8
+    return token, wgy * 2 + sg // 4
+
+
+def enumerate_map(fn, grid):
+    gx, gy, gz = grid
+    out = {}
+    for y in range(gy):
+        for x in range(gx):
+            for sg in range(SG):
+                token, g = fn(x, y, sg)
+                out[(x, y, sg)] = (token, g)
+    return out
+
+
+def check_bijection(mapping, grid, label):
+    pairs = list(mapping.values())
+    uniq = set(pairs)
+    expect = {(t, g) for t in range(0, T, 8) for g in range(G)}
+    missing = sorted(expect - uniq)
+    extra = sorted(uniq - expect)
+    dup = len(pairs) - len(uniq)
+    return {'label': label, 'grid': list(grid),
+            'workgroups': grid[0] * grid[1] * grid[2],
+            'sg_slots': len(pairs),
+            'distinct_token8_group_pairs': len(uniq),
+            'expected_pairs': len(expect),
+            'duplicate_assignments': dup,
+            'missing_pairs': [list(m) for m in missing],
+            'extra_pairs': [list(m) for m in extra],
+            'max_token': max(t for t, g in pairs),
+            'min_token': min(t for t, g in pairs),
+            'groups_seen': sorted({g for t, g in pairs}),
+            'bijection_ok': not missing and not extra and dup == 0}
+
+
+def wg_row(fn, x, y):
+    return [(sg,) + fn(x, y, sg) for sg in range(SG)]
+
+
+def wg_weight_slabs(fn, x, y):
+    groups = sorted({fn(x, y, sg)[1] for sg in range(SG)})
+    return groups
+
+
+# half-element offsets of the three weight stages for one group
+def slab_offsets(g, push):
+    p2x, p2y, p2z = push
+    stage1 = [(p2x + g * 32768 + k * 16 + off) for k in range(32) for off in (0, 8192, 16384, 24576)]
+    # covered element ranges, not every load base
+    return {'stage1_halfs': [p2x + g * 32768, p2x + (g + 1) * 32768],
+            'expand_halfs': [p2y + g * 16384, p2y + (g + 1) * 16384],
+            'contract_halfs': [p2z + g * 16384, p2z + (g + 1) * 16384]}
+
+
+def main():
+    push = (0, 262144, 393216)   # pc.p2 from plan.txt PUSH of the F08 passes
+    diffs, n_instr, n_words = instr_diff(PARENT_SPV, CAND_SPV)
+
+    pmap = enumerate_map(parent_sg, PARENT_GRID)
+    cmap = enumerate_map(cand_sg, CAND_GRID)
+    pj = check_bijection(pmap, PARENT_GRID, 'parent')
+    cj = check_bijection(cmap, CAND_GRID, 'candidate')
+
+    # ---- output element coverage: every (token,channel) written exactly once
+    def write_offsets(mapping):
+        offsets = set()
+        dup = 0
+        total = 0
+        for (x, y, sg), (token, g) in mapping.items():
+            for t in range(4):
+                base = tiled(token, g * 64 + t * 16, 512)
+                for r in range(8):
+                    for c in range(16):
+                        off = base + r * 16 + c
+                        total += 1
+                        if off in offsets:
+                            dup += 1
+                        offsets.add(off)
+        return offsets, dup, total
+
+    p_off, p_dup, p_tot = write_offsets(pmap)
+    c_off, c_dup, c_tot = write_offsets(cmap)
+    expect_off = {tiled(t, c, 512) for t in range(T) for c in range(512)}
+
+    # ---- A (input) read footprint per workgroup
+    def wg_inputs(mapping, grid):
+        gx, gy, gz = grid
+        wg = {}
+        for y in range(gy):
+            for x in range(gx):
+                toks = sorted({mapping[(x, y, sg)][0] for sg in range(SG)})
+                wg[(x, y)] = {'token8_tiles': [t // 8 for t in toks], 'tokens': toks,
+                              'groups': sorted({mapping[(x, y, sg)][1] for sg in range(SG)})}
+        return wg
+
+    p_wg = wg_inputs(pmap, PARENT_GRID)
+    c_wg = wg_inputs(cmap, CAND_GRID)
+
+    def wg_bytes(wg):
+        tiles = len(wg[list(wg)[0]]['tokens'])           # token-8 tiles per WG
+        tokens = tiles * 8
+        groups = len(wg[list(wg)[0]]['groups'])
+        return {'token8_tiles_per_wg': tiles,
+                'tokens_per_wg': tokens,
+                'groups_per_wg': groups,
+                'sg_per_group_per_wg': SG // groups,
+                'input_halfs_per_wg': tokens * 512,
+                'input_bytes_per_wg': tokens * 512 * 2,
+                'weight_halfs_per_wg': groups * 65536,
+                'weight_bytes_per_wg': groups * 65536 * 2,
+                'total_footprint_bytes_per_wg': tokens * 512 * 2 + groups * 65536 * 2}
+
+    pb = wg_bytes(p_wg)
+    cb = wg_bytes(c_wg)
+
+    # weight slab sets per WG
+    def slab_sets(wg):
+        out = []
+        for (x, y), v in sorted(wg.items()):
+            out.append({'wg': [x, y], 'groups': v['groups'],
+                        'weight_bytes': len(v['groups']) * 65536 * 2,
+                        'slabs': {str(g): slab_offsets(g, push) for g in v['groups']}})
+        return out
+
+    # ---- per-group aggregate request counts (must be equal)
+    def per_group_sg(mapping):
+        c = {g: 0 for g in range(G)}
+        for (x, y, sg), (token, g) in mapping.items():
+            c[g] += 1
+        return c
+
+    def wgs_per_group(wg):
+        c = {g: 0 for g in range(G)}
+        for (x, y), v in wg.items():
+            for g in v['groups']:
+                c[g] += 1
+        return c
+
+    proof = {
+        'card': 'n08-f08-wg-map',
+        'identity': {'parent_spv': K.ident(PARENT_SPV), 'candidate_spv': K.ident(CAND_SPV),
+                     'parent_rebuild_spv': K.ident(CARD / 'parent-rebuild.spv'),
+                     'plan': K.ident(CARD / 'plan.txt')},
+        'grid_and_shape': {
+            'tokens_total': T, 'token8_tiles': NT, 'groups_total': G,
+            'subgroups_per_workgroup': SG,
+            'parent_grid': list(PARENT_GRID), 'parent_workgroups': PARENT_GRID[0] * PARENT_GRID[1],
+            'candidate_grid': list(CAND_GRID), 'candidate_workgroups': CAND_GRID[0] * CAND_GRID[1],
+            'workgroups_delta': CAND_GRID[0] * CAND_GRID[1] - PARENT_GRID[0] * PARENT_GRID[1],
+            'sg_slots_per_pass': SG * PARENT_GRID[0] * PARENT_GRID[1],
+            'tail': {'tokens_divisible_by_16(parent)': T % 16 == 0,
+                     'tokens_divisible_by_32(candidate)': T % 32 == 0,
+                     'groups_divisible_by_4(parent)': G % 4 == 0,
+                     'groups_divisible_by_2(candidate)': G % 2 == 0,
+                     'parent_requires_guard': T % 16 != 0 or G % 4 != 0,
+                     'candidate_requires_guard': T % 32 != 0 or G % 2 != 0},
+        },
+        'mapping_rule': {
+            'parent': 'token = WGID.x*16 + (sg%2)*8 ; g = WGID.y*4 + sg/2 ; grid (66,2,1)',
+            'candidate': 'token = WGID.x*32 + (sg%4)*8 ; g = WGID.y*2 + sg/4 ; grid (33,4,1)',
+            'token8_tile_index': 'tau = token/8',
+            'parent_pairs': 'tau in {2x,2x+1}, g in {4y..4y+3}',
+            'candidate_pairs': 'tau in {4u..4u+3}, g in {2v,2v+1}',
+        },
+        'bijection_parent': pj,
+        'bijection_candidate': cj,
+        'output_coverage': {
+            'parent': {'distinct_output_halfs': len(p_off), 'duplicate_writes': p_dup,
+                       'total_writes': p_tot, 'equals_full_tiled_set': p_off == expect_off,
+                       'full_set_size': len(expect_off)},
+            'candidate': {'distinct_output_halfs': len(c_off), 'duplicate_writes': c_dup,
+                          'total_writes': c_tot, 'equals_full_tiled_set': c_off == expect_off,
+                          'full_set_size': len(expect_off)},
+            'parent_and_candidate_write_sets_equal': p_off == c_off,
+        },
+        'per_workgroup_footprint': {
+            'parent': pb, 'candidate': cb,
+            'input_bytes_ratio': cb['input_bytes_per_wg'] / pb['input_bytes_per_wg'],
+            'weight_bytes_ratio': cb['weight_bytes_per_wg'] / pb['weight_bytes_per_wg'],
+        },
+        'per_group_request_counts': {
+            'sg_per_group_parent': per_group_sg(pmap),
+            'sg_per_group_candidate': per_group_sg(cmap),
+            'sg_per_group_equal': per_group_sg(pmap) == per_group_sg(cmap),
+            'wg_per_group_parent': wgs_per_group(p_wg),
+            'wg_per_group_candidate': wgs_per_group(c_wg),
+        },
+        'weight_slab_plan': {
+            'push_constants_p2': {'stage1_base_halves': push[0], 'expand_base_halves': push[1],
+                                  'contract_base_halves': push[2]},
+            'halves_per_group': {'stage1': 32768, 'expand': 16384, 'contract': 16384},
+            'bytes_per_group': 131072,
+            'bytes_all_groups': 1048576,
+            'note': 'stage1 64KiB + expand 32KiB + contract 32KiB per group; per-WG set is 4 slabs (parent) or 2 slabs (candidate)',
+        },
+        'weight_request_accounting': {
+            'btile_loads_per_sg': {'stage1': 128, 'expand': 64, 'contract': 64, 'total': 256},
+            'btile_bytes': 512,
+            'weight_request_bytes_per_sg': 131072,
+            'weight_request_bytes_per_wg': 8 * 131072,
+            'atile_loads_per_sg': 32,
+            'atile_bytes': 256,
+            'input_request_bytes_per_sg': 8192,
+            'input_request_bytes_per_wg': 8 * 8192,
+            'parent': {'distinct_weight_bytes_per_wg': pb['weight_bytes_per_wg'],
+                       'intra_wg_weight_reuse': 8 * 131072 / pb['weight_bytes_per_wg'],
+                       'distinct_input_bytes_per_wg': pb['input_bytes_per_wg'],
+                       'intra_wg_input_reuse': 8 * 8192 / pb['input_bytes_per_wg']},
+            'candidate': {'distinct_weight_bytes_per_wg': cb['weight_bytes_per_wg'],
+                          'intra_wg_weight_reuse': 8 * 131072 / cb['weight_bytes_per_wg'],
+                          'distinct_input_bytes_per_wg': cb['input_bytes_per_wg'],
+                          'intra_wg_input_reuse': 8 * 8192 / cb['input_bytes_per_wg']},
+            'grid_totals_unchanged': {
+                'weight_request_bytes_per_pass': 132 * 8 * 131072,
+                'input_request_bytes_per_pass': 132 * 8 * 8192,
+                'distinct_weight_bytes_per_pass': 8 * 131072,
+            },
+        },
+        'changed_workgroup_accounting': {
+            'workgroups_parent': 132, 'workgroups_candidate': 132, 'delta': 0,
+            'workgroups_with_changed_membership': 132,
+            'reason': 'a parent WG holds 2 token8 tiles x 4 groups, a candidate WG holds 4 token8 tiles x 2 groups; no WG keeps the same membership set',
+            'wg_slab_incidences_parent': 132 * 4,
+            'wg_slab_incidences_candidate': 132 * 2,
+            'workgroups_touching_one_group_slab_parent': 66,
+            'workgroups_touching_one_group_slab_candidate': 33,
+            'sg_touching_one_group_slab_parent': 132,
+            'sg_touching_one_group_slab_candidate': 132,
+        },
+        'pass_coverage': [{'ordinal': o, 'plan_row': K.row_by_ordinal(o)['pass_label'],
+                           'name': K.row_by_ordinal(o)['name'],
+                           'spv': K.row_by_ordinal(o)['spv'],
+                           'grid_parent': K.row_by_ordinal(o)['grid'],
+                           'grid_candidate': ['33', '4', '1']}
+                          for o in [60, 64, 68, 72, 76, 80, 84, 88, 134, 138, 142, 146, 150, 154, 158, 162]],
+        'workgroup_membership': {
+            'parent_wgs': [
+                {'wg': [x, y], 'groups': p_wg[(x, y)]['groups'],
+                 'token8_tiles': p_wg[(x, y)]['token8_tiles'], 'tokens': [p_wg[(x, y)]['tokens'][0],
+                                                                        p_wg[(x, y)]['tokens'][-1] + 7]}
+                for y in range(PARENT_GRID[1]) for x in range(PARENT_GRID[0])],
+            'candidate_wgs': [
+                {'wg': [x, y], 'groups': c_wg[(x, y)]['groups'],
+                 'token8_tiles': c_wg[(x, y)]['token8_tiles'], 'tokens': [c_wg[(x, y)]['tokens'][0],
+                                                                        c_wg[(x, y)]['tokens'][-1] + 7]}
+                for y in range(CAND_GRID[1]) for x in range(CAND_GRID[0])],
+        },
+        'pipeline_geometry': {
+            'parent': {'groups_per_wg': 4, 'sg_per_group_per_wg': 2, 'token_span_per_wg': 16,
+                       'workgroups_per_group_slab': wgs_per_group(p_wg)[0]},
+            'candidate': {'groups_per_wg': 2, 'sg_per_group_per_wg': 4, 'token_span_per_wg': 32,
+                          'workgroups_per_group_slab': wgs_per_group(c_wg)[0]},
+            'unchanged': ['workgroups per pass', 'subgroups per pass', 'sg tile M=8,N=64,K=512',
+                          'B tile loads per SG', 'A tile loads per SG', 'DPAS ops per SG',
+                          'K accumulation order', 'half rounding points', 'scratch', 'SLM'],
+        },
+        'spirv_identity': {
+            'instructions_parent': n_instr, 'instructions_candidate': n_instr,
+            'words_parent': n_words, 'words_candidate': n_words,
+            'differing_instructions': len(diffs),
+            'differences': diffs,
+            'note': 'same opcode at every ordinal; only integer immediate operands differ',
+        },
+        'numeric_argument': {
+            'per_sg_instruction_sequence': 'identical opcode at every ordinal (see spirv_identity); only integer immediates differ',
+            'output_ownership': 'each (token,channel16 tile) owned by exactly one SG in both mappings (bijection + disjoint write sets)',
+            'reductions': 'none across SGs/WGs on the normal path; no atomics; no shared-memory exchange between SGs (debugTile is per-SG at sg*128 and the debug guard is 0)',
+            'k_order': 'per output acc: k = 0,16,...,496 in source order, 4 accs per group; expand: hidden blocks 0..7 of 32 with K=64; contract: hidden blocks of 32 with K=256; unchanged source lines',
+            'expected_result': 'bit-identical frame output; GPU gold gate still mandatory for driver/JIT effects',
+        },
+        'rounding_and_k_order': {
+            'stage1': {'accs': 4, 'k_steps': 32, 'k_step': 16, 'k_total': 512, 'order': 'ascending 0..496',
+                       'rounding': 'f32 accumulate, then MH() half narrowing of each of the 4 accs (RNE)',
+                       'source_lines': 'candidate.comp 27-37'},
+            'expand': {'accs': 2, 'blocks': 8, 'block_width': 32, 'k_steps_per_block': 4, 'k_per_step': 16, 'k_total': 64,
+                       'order': 'hidden block 0..7; inside a block the four 16-wide K slices a0..a3 in order',
+                       'rounding': 'f32 accumulate per acc, then MH() narrowing, then activation() in f16 with precise (no contraction)',
+                       'activation': 'clamp(-4,4); fma(-0.055908203125, |t|, 0.447265625); fma(t, u, 0.89453125); x*v',
+                       'source_lines': 'candidate.comp 46-71'},
+            'contract': {'accs': 4, 'blocks': 8, 'block_width': 32, 'k_steps_per_block': 2, 'k_per_step': 16, 'k_total': 256,
+                         'order': 'hidden block 0..7; within a block va then vb (two 16-wide K slices), 2 steps per block; 8 blocks x 2 steps x 16 K = 256 K total',
+                         'rounding': 'f32 accumulate over 256 K, then MH() narrowing, then coopMatStore of half',
+                         'source_lines': 'candidate.comp 66-77'},
+            'invariant': 'no reduction tree, no exp/reciprocal, no per-lane reduction exists in this shader; the whole K order and every half narrowing point is the parent instruction sequence (identical opcode stream)',
+            'unchanged_between_parent_and_candidate': True,
+        },
+        'lifetime_and_retirement': {
+            'rule': 'per-SG register lifetimes are unchanged because the instruction stream is identical at every ordinal; no cross-SG lifetime exists (no atomics, no SLM exchange on the normal path)',
+            'values': [
+                {'value': 'a (A fragment)', 'producer': 'coopMatLoad in the k loop', 'last_consumer': 'the four coopMatMulAdd of that k step', 'killer': 'next k iteration coopMatLoad', 'conflict': 'WAR inside one SG'},
+                {'value': 'b0,b1 (stage1 B)', 'producer': 'coopMatLoad', 'last_consumer': 'the two MMA of that segment', 'killer': 'the next segment load', 'conflict': 'WAR inside one SG'},
+                {'value': 'r0..r3 (stage1 acc)', 'producer': '32 k steps', 'last_consumer': 'MH() narrowing', 'killer': 'none', 'conflict': 'RAW chain, K order fixed'},
+                {'value': 'h0..h3 / a0..a3', 'producer': 'MH()', 'last_consumer': 'expand steps 0..3 of every hidden block', 'killer': 'none', 'conflict': 'longest live value in the kernel (8 hidden blocks)'},
+                {'value': 'e0,e1 (expand acc)', 'producer': '4 EXPAND_STEP', 'last_consumer': 'MH() + activation()', 'killer': 'next hidden block reset', 'conflict': 'RAW then WAR across blocks'},
+                {'value': 'v0,v1 / va,vb', 'producer': 'activation()', 'last_consumer': 'contract steps of that block', 'killer': 'next hidden block', 'conflict': 'RAW'},
+                {'value': 'o0..o3 (contract acc)', 'producer': '8 hidden blocks x 2 steps', 'last_consumer': 'MH() then coopMatStore', 'killer': 'none', 'conflict': 'RAW chain over 256 K'},
+            ],
+            'retirement': {
+                'output_writes': 'each gf element is written by exactly one SG exactly once per pass (verified: 540672 writes = 540672 distinct elements)',
+                'pass_level_raw': 'the next dispatch reads gf after the existing runner pipeline barrier; this card changes no barrier and no binding',
+                'aliasing': 'no new alias: bindings (BIND 0..9) and PUSH are byte-identical to the baseline plan lines',
+                'debug_writes': 'pc.p5.x = 0 in every one of the 16 PASS push blocks, so debug_half() is not executed; even if enabled it is per-SG private at debugTile[sg*128]',
+            },
+            'workgroup_membership_change_is_not_a_lifetime_change': 'the same (token,channel) owners produce the same values; only which WG hosts an owner changes, and no value crosses a WG boundary',
+        },
+        'shape_confirmation_from_push_constants': {
+            'push_p0': {'width': 44, 'height': 24, 'padded_tokens': 1152, 'spatial_tokens': 1056},
+            'note': 'the shader reads only pc.p2 (weight bases) and pc.p5 (debug); p0.x*p0.y = 1056 = the dispatched token count (66 x 16), so the token domain is fully covered and p0.z=1152 is not used by this shader',
+            'push_p2': {'stage1_base_halves': push[0], 'expand_base_halves': push[1], 'contract_base_halves': push[2]},
+        },
+    }
+    K.write_json(CARD / 'PROOF.json', proof)
+    print(json.dumps({k: proof[k] for k in ('grid_and_shape', 'bijection_parent', 'bijection_candidate',
+                                            'output_coverage', 'per_workgroup_footprint',
+                                            'per_group_request_counts', 'pipeline_geometry',
+                                            'spirv_identity')}, indent=1)[:6000])
+
+
+if __name__ == '__main__':
+    main()

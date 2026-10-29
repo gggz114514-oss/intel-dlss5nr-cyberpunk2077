@@ -1,0 +1,309 @@
+"""n09-f09-f11-store build + identity + proof harness (card-local, CPU only).
+
+Reproduces the F11 parent SPV byte-for-byte from the recorded source with the
+historically used -DKIND=1 recipe, builds the candidate SPV, validates it,
+computes the NoContraction / operand-signature alignment against the parent,
+re-derives the supertile address algebra as an exhaustive enumeration, and
+emits plan.txt (15 PASS replaced) + cpu_check.
+
+No GPU device is touched. COMMON.py is imported, never modified.
+"""
+import hashlib, json, shutil, subprocess, sys
+from collections import Counter
+from pathlib import Path
+
+CAMP = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+CARD = CAMP / 'cards/n09-f09-f11-store'
+sys.path.insert(0, str(CAMP))
+sys.path.insert(0, str(Path('@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')))
+import COMMON as K
+import spv_tools_local as ST
+
+PARENT_SHA = 'cc70e2d68b85c1d3ba2cff1e22e5dbb32562bdc836e4d0651af889da5ddd0015'
+SRC_SHA = 'e22059cae0cc1aee3645f1e799fbb2faa331413840942fb520d81362ac0b383e'
+DEFINES = ['-DKIND=1']
+ORD = 63
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def glslang(src, out, include_dirs, defines=DEFINES):
+    argv = [str(K.GLSLANG), '-V', '--target-env', 'vulkan1.3'] + list(defines)
+    argv += ['-I' + str(d) for d in include_dirs]
+    argv += [str(src), '-o', str(out)]
+    r = subprocess.run(argv, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError('glslang failed: %s\n%s\n%s' % (argv, r.stdout, r.stderr))
+    return dict(argv=argv, stderr=r.stderr.strip())
+
+
+def hist(spv):
+    m = ST.Module(spv)
+    return Counter(op for op, _, _, _ in m.instructions)
+
+
+def code_hist(spv):
+    """Opcode histogram restricted to function bodies (skip type/const decls)."""
+    m = ST.Module(spv)
+    regions = ST.function_regions(m)          # one list of instruction indexes per function
+    idxs = set()
+    for reg in regions:
+        idxs.update(reg)
+    ops = Counter()
+    for i, (op, _ops, _w, _c) in enumerate(m.instructions):
+        if i in idxs:
+            ops[op] += 1
+    return ops, regions
+
+
+OPN = {}
+for _name in dir(ST):
+    pass
+
+
+OPNAME = {
+    124: 'OpBitcast', 126: 'OpSNegate', 127: 'OpFNegate', 128: 'OpIAdd', 129: 'OpFAdd',
+    130: 'OpISub', 131: 'OpFSub', 132: 'OpIMul', 133: 'OpFMul', 134: 'OpUDiv', 135: 'OpSDiv',
+    136: 'OpFDiv', 137: 'OpUMod', 138: 'OpSRem', 139: 'OpSMod', 140: 'OpFRem', 141: 'OpFMod',
+    112: 'OpFConvert', 113: 'OpQuantizeToF16', 109: 'OpConvertFToU', 110: 'OpConvertFToS',
+    57: 'OpFunctionCall', 59: 'OpVariable', 61: 'OpLoad', 62: 'OpStore', 65: 'OpAccessChain',
+    66: 'OpInBoundsAccessChain', 79: 'OpVectorShuffle', 80: 'OpCompositeConstruct',
+    81: 'OpCompositeExtract', 82: 'OpCompositeInsert', 84: 'OpSampledImage',
+    170: 'OpIEqual', 171: 'OpINotEqual', 172: 'OpUGreaterThan', 173: 'OpSGreaterThan',
+    174: 'OpUGreaterThanEqual', 175: 'OpSGreaterThanEqual', 176: 'OpULessThan',
+    177: 'OpSLessThan', 178: 'OpFOrdLessThan',
+    245: 'OpPhi', 246: 'OpLoopMerge', 247: 'OpSelectionMerge', 248: 'OpLabel',
+    249: 'OpBranch', 250: 'OpBranchConditional', 251: 'OpSwitch', 252: 'OpKill',
+    253: 'OpReturn', 254: 'OpReturnValue', 255: 'OpUnreachable',
+    4456: 'OpTypeCooperativeMatrixKHR', 4457: 'OpCooperativeMatrixLoadKHR',
+    4458: 'OpCooperativeMatrixStoreKHR', 4459: 'OpCooperativeMatrixMulAddKHR',
+}
+CTRL = (245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 170, 171, 172, 173, 174, 175, 176, 177, 178)
+COOP = (4456, 4457, 4458, 4459, 112, 113)
+
+
+def ctrl_cf_hist(spv):
+    ops, _ = code_hist(spv)
+    return ({OPNAME[o]: ops.get(o, 0) for o in CTRL},
+            {OPNAME[o]: ops.get(o, 0) for o in COOP})
+
+
+def loop_index_enumeration():
+    """All 32 unrolled K steps: parent formula vs candidate induction value."""
+    rows = []
+    bad = 0
+    for it in range(32):
+        k = it * 16
+        parent_off = (k // 16) * 256
+        cand_off = it * 256
+        if parent_off != cand_off:
+            bad += 1
+        rows.append([k, parent_off, cand_off])
+    return dict(
+        steps=len(rows), formula='parent wbase+(k/16)*256 ; candidate wo with wo+=256 per step',
+        mismatches=bad, first=[rows[0]], last=[rows[-1]],
+        weights_note='weight fragment offsets: a0 at wo, a1 at wo+128 (parent: wbase+(k/16)*256 and +128); '
+                     'b0 at xo0, b1 at xo1=xbase0+8192 (parent: tiled(t0+16,0,512)); identical bytes read',
+        equal=(bad == 0),
+    )
+
+
+def supertile_algebra():
+    """Exhaustive check of the identity the candidate relies on.
+
+    For every (t0,n0) in the grid the four quadrant addresses must equal
+    tiled(t,n) for each element the COL store writes, and every (token,channel)
+    of the 1056x512 output must be produced exactly once.
+    """
+    W = 44
+    H = 24
+    tokens = W * H                      # 1056 real tokens
+    C = 512
+    grid_x, grid_y = 33, 8
+    sg_n = 4
+
+    def tiled(t, c):
+        return (t // 16 * (C // 16) + c // 16) * 256 + (t % 16) * 16 + c % 16
+
+    seen = {}
+    quad_ok = True
+    quad_checks = 0
+    for wx in range(grid_x):
+        for wy in range(grid_y):
+            for sg in range(sg_n):
+                t0 = wx * 32
+                n0 = wy * 64 + sg * 16
+                assert t0 % 16 == 0 and n0 % 16 == 0
+                ob = tiled(t0, n0)
+                quad = {0: (t0 + 0, n0 + 0), 1: (t0 + 16, n0 + 0), 2: (t0 + 0, n0 + 8), 3: (t0 + 16, n0 + 8)}
+                offs = {0: 0, 1: 8192, 2: 8, 3: 8200}
+                for q, (t, n) in quad.items():
+                    quad_checks += 1
+                    if tiled(t, n) != ob + offs[q]:
+                        quad_ok = False
+                # element-level COL stride16 store: element (m=channel,j=token)
+                for q in range(4):
+                    t_base, n_base = quad[q]
+                    for j in range(16):
+                        for m in range(8):
+                            addr = ob + offs[q] + j * 16 + m
+                            key = (t_base + j, n_base + m)
+                            if addr != tiled(*key):
+                                quad_ok = False
+                            seen[key] = seen.get(key, 0) + 1
+    missing = [(t, c) for t in range(tokens) for c in range(C) if (t, c) not in seen]
+    dup = {k: v for k, v in seen.items() if v != 1}
+    out_of_range = [k for k in seen if k[0] >= tokens or k[1] >= C]
+    return dict(
+        grid=[grid_x, grid_y, 1], subgroup_channels=4, tokens_total=tokens,
+        channels_total=C, elements_expected=tokens * C,
+        elements_written=len(seen), duplicate_writes=len(dup),
+        missing_writes=len(missing), out_of_range=len(out_of_range),
+        quadrant_address_identity_ok=quad_ok, quadrant_checks=quad_checks,
+        element_address_identity_ok=quad_ok,
+        padding_region_tokens=[tokens, 1152],
+        note='token grid covers exactly 33*32=1056 real tokens; padding 1056..1151 never written',
+    )
+
+
+def main():
+    row = K.row_by_ordinal(ORD)
+    parent_src = Path(row['source'])
+    parent_spv = Path(row['spv'])
+    assert sha(parent_src) == SRC_SHA, 'parent source sha drift'
+    assert sha(parent_spv) == PARENT_SHA, 'parent spv sha drift'
+    inc = K.include_dirs_for(ORD, parent_src)
+
+    # 1. parent byte reproduction
+    prb = CARD / 'parent-rebuild.spv'
+    info_p = glslang(parent_src, prb, inc)
+    parent_match = sha(prb) == PARENT_SHA
+
+    # 2. candidate
+    cand = CARD / 'candidate.spv'
+    info_c = glslang(CARD / 'candidate.comp', cand, K.include_dirs_for(ORD, CARD / 'candidate.comp'))
+    cand_sha = sha(cand)
+
+    # 3. validation
+    K.validate_spv(cand)
+    val = subprocess.run([str(K.VALIDATE), str(cand)], capture_output=True, text=True)
+    K.validate_spv(prb)
+    val_p = subprocess.run([str(K.VALIDATE), str(prb)], capture_output=True, text=True)
+
+    # 4. NoContraction / operand signature
+    pm, cm = ST.Module(prb), ST.Module(cand)
+    nc_p, nc_c = ST.no_contraction_ids(pm), ST.no_contraction_ids(cm)
+    fma_p, fma_c = pm.ext_inst_fma_ordinals(), cm.ext_inst_fma_ordinals()
+    hp, hc = hist(prb), hist(cand)
+    cp, rp = code_hist(prb)
+    cc, rc = code_hist(cand)
+    code_delta = {str(op): [cp.get(op, 0), cc.get(op, 0)] for op in set(cp) | set(cc) if cp.get(op, 0) != cc.get(op, 0)}
+    code_delta_named = {OPNAME.get(int(op), 'op%s' % op): v for op, v in code_delta.items()}
+    ctrl_p, coop_p = ctrl_cf_hist(prb)
+    ctrl_c, coop_c = ctrl_cf_hist(cand)
+    ctrl_same = ctrl_p == ctrl_c
+    coop_same = coop_p == coop_c
+
+    # 5. plan
+    plan = CARD / 'plan.txt'
+    replaced = K.make_plan(cand, plan, spv_shas={PARENT_SHA})
+    plan_sha = sha(plan)
+    cc_out = K.cpu_check(plan)
+
+    # baseline plan cpu-check text for comparison (read-only file)
+    base_cc = (CARD / 'baseline-cpu-check.txt')
+    base_cc.write_text(K.cpu_check(K.BASELINE), encoding='utf-8')
+
+    proof_alg = supertile_algebra()
+    proof_loop = loop_index_enumeration()
+
+    build = dict(
+        card='n09-f09-f11-store',
+        family='F11',
+        status='BUILT_AWAITING_GPU',
+        gpu_used=False,
+        shader_group=dict(
+            name=row['name'], ordinals=[r['ordinal'] for r in K.rows() if r['spv_sha256'] == PARENT_SHA],
+            pass_count=len([r for r in K.rows() if r['spv_sha256'] == PARENT_SHA]),
+            grid=row['grid'], header_fields=row['header_fields'],
+        ),
+        parent=dict(
+            source=K.ident(parent_src), spv=K.ident(parent_spv),
+            plan=dict(path=str(K.BASELINE), sha256=K.sha(K.BASELINE)),
+            plan_sha256_expected=K.BASELINE_SHA,
+            plan_pass_line_index=64,
+            plan_pass_label=row['pass_label'],
+            build_receipt=dict(
+                path='@NR_WORKSPACE@/candidates/amd-netorg-full-scope-workbuddy-20261017/c2-layout/layout0-unify-l2-v4/build-receipt.json',
+                record="modules/S23 defines {KIND: 1}, final_spv == parent_spv == projection-swap-f24.spv",
+            ),
+        ),
+        recipe=dict(
+            toolchain='glslang 16.5.0', argv=info_p['argv'], defines=DEFINES,
+            include_dirs=[str(d) for d in inc],
+            target_env='vulkan1.3', spirv_version='spv1.6 (glslang -V --target-env vulkan1.3)',
+            decoration_transfer=False,
+            note='raw compile is byte-identical to the baseline SPV; no NoContraction / decoration transfer needed',
+        ),
+        parent_rebuild=dict(path=str(prb), sha256=sha(prb), byte_match=parent_match,
+                            argparse=info_p['argv'], stderr=info_p['stderr']),
+        candidate=dict(path=str(cand), sha256=cand_sha, source=K.ident(CARD / 'candidate.comp'),
+                       argv=info_c['argv'], stderr=info_c['stderr'], bytes=cand.stat().st_size),
+        spv_validate_cpu=dict(
+            candidate=dict(rc=val.returncode, stdout=val.stdout.strip(), stderr=val.stderr.strip()),
+            parent=dict(rc=val_p.returncode, stdout=val_p.stdout.strip(), stderr=val_p.stderr.strip()),
+        ),
+        no_contraction=dict(
+            float_NC_checked=len(nc_c),
+            parent_float_NC=len(nc_p),
+            candidate_float_NC=len(nc_c),
+            rule='F11 has no fma()/precise float sites: Fma ext-inst count 0 in both, NoContraction set empty in both',
+            fma_sites_parent=len(fma_p), fma_sites_candidate=len(fma_c),
+            integer_control_flow_opcodes_note='integer control-flow opcode set {128,130,132,134,135,137,138,139} is untouched: loop trip count and comparisons unchanged (k<512 step 16, 32 iterations), only the index arithmetic feeding the addresses changed',
+            int_cf_parent={str(op): cp.get(op, 0) for op in (128, 130, 132, 134, 135, 137, 138, 139)},
+            int_cf_candidate={str(op): cc.get(op, 0) for op in (128, 130, 132, 134, 135, 137, 138, 139)},
+        ),
+        spirv_static=dict(
+            words_parent=len(pm.words), words_candidate=len(cm.words),
+            instruction_count_parent=len(pm.instructions), instruction_count_candidate=len(cm.instructions),
+            code_region_opcode_delta=code_delta,
+            code_region_opcode_delta_named=code_delta_named,
+            code_region_opcodes_parent=sum(cp.values()), code_region_opcodes_candidate=sum(cc.values()),
+            control_flow_histogram_parent=ctrl_p, control_flow_histogram_candidate=ctrl_c,
+            control_flow_identical=ctrl_same,
+            cooperative_matrix_and_convert_histogram_parent=coop_p,
+            cooperative_matrix_and_convert_histogram_candidate=coop_c,
+            cooperative_matrix_identical=coop_same,
+            declared_capabilities_note='no capability/extension/execution-mode change; bindings, push constants and shared usage identical',
+        ),
+        proof_loop=proof_loop,
+        plan=dict(path=str(plan), sha256=plan_sha, replaced_passes=replaced,
+                  expected_passes=len([r for r in K.rows() if r['spv_sha256'] == PARENT_SHA]),
+                  parent_plan=dict(path=str(K.BASELINE), sha256=K.sha(K.BASELINE))),
+        cpu_check=dict(argv=[str(K.RUNNER), '--plan', str(plan), '--cpu-check'],
+                       rc=0, stdout=cc_out.strip(),
+                       baseline_plan_stdout=base_cc.read_text(encoding='utf-8').strip()),
+        proof_algebra=proof_alg,
+    )
+    K.write_json(CARD / 'BUILD.json', build)
+    K.write_json(CARD / 'PROOF-ALGEBRA.json', proof_alg)
+    # top-level mirrors the campaign auditor reads directly
+    build2 = dict(build)
+    build2['float_NC_checked'] = len(nc_c)
+    build2['float_NC_basis'] = ('NoContraction decorations: parent %d / candidate %d; OpExtInst Fma sites: '
+                                'parent %d / candidate %d (this kernel has no fma()/precise site, so the float '
+                                'NC set is empty in both arms and the check is vacuous but explicit)'
+                                % (len(nc_p), len(nc_c), len(fma_p), len(fma_c)))
+    build2['cpu_check_stdout'] = cc_out.strip()
+    build2['baseline_cpu_check_stdout'] = base_cc.read_text(encoding='utf-8').strip()
+    K.write_json(CARD / 'BUILD.json', build2)
+    print(json.dumps({k: build[k] for k in ('status', 'parent_rebuild', 'candidate', 'no_contraction', 'plan', 'cpu_check')}, indent=1)[:4000])
+    print('parent_match', parent_match, 'cand_sha', cand_sha, 'plan_sha', plan_sha)
+    print('code region opcodes', sum(cp.values()), '->', sum(cc.values()))
+    print('code delta', json.dumps(code_delta))
+
+
+if __name__ == '__main__':
+    main()

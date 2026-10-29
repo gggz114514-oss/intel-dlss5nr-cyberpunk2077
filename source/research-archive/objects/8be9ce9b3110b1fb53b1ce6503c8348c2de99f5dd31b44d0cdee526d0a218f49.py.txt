@@ -1,0 +1,567 @@
+"""n38-f20-arena-shrink: per-plane SLM lifetime table, retireable windows, byte budget.
+
+Read-only analysis + machine-checked counts.  No GPU, no deployment.
+
+F20 = ord 230 `s37_fold_body_r1a_v1`, source `f20-coarse-owner-20261026/candidate.comp`
+(sha 3e0879b3...), SPV 215aca67..., chain head sha 215aca67... (GROUPS.md: F20 chain head
+== baseline sha, so the parent of this card is the handoff row itself).
+
+Outputs
+  build/lifetime.json : declarations (source text + parent SPIR-V, variable by variable),
+                        the site table (every site pinned to a source line by an anchor that
+                        must be present), per-site per-SG element footprints, the value-window
+                        timeline per arm, and the RAW / WAR / WAW enumeration with
+                        same-owner / cross-owner counts plus the named closer of every pair.
+  stdout              : the human summary that SLM-LIFETIME.md quotes.
+
+Method
+  Every shared-memory access in the module is enumerated from the source text and its
+  footprint is computed as a set of flat element indices per subgroup (8 subgroups of 32
+  lanes, local_size_x = 256).  A pair (producer, consumer) is a hazard when the two sites
+  touch the same physical array element; `same_owner` counts (sg, sg') with sg == sg',
+  `cross_owner` counts sg != sg'.  A cross-owner hazard is legal only when a barrier or a
+  payload dependency closes it; every closer is named in CLOSERS, keyed by the exact
+  (writer_site, reader_site) pair, and its source anchor is asserted to exist, so a stale
+  table cannot silently pass.
+
+  Hazards are enumerated inside each value window (RAW) and between adjacent value windows
+  of the same physical array (WAR/WAW), because that is exactly the set of orderings the
+  hardware has to observe.
+"""
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+W = pathlib.Path(r'@NR_WORKSPACE@')
+sys.path.insert(0, str(W / 'build/zcode-fp16-compute-backend-20261021/scripts'))
+import spv_tools_local as ST          # noqa: E402
+
+PARENT_SRC = W / 'work/codex-astra-fp16-int8-audit-20261024/f20-coarse-owner-20261026/candidate.comp'
+PARENT_SPV = W / 'work/codex-astra-fp16-int8-audit-20261024/f20-coarse-owner-20261026/candidate.spv'
+PARENT_SRC_SHA = '3e0879b37a7f7a8a49b70fd7d6bc771eebd184b3233506e892442678db5672d4'
+PARENT_SPV_SHA = '215aca679aaa2d5c36329ae45514efadae221ef4e8631121388b25052a7f7e32'
+NSG = 8                      # local_size_x 256 / 32
+
+PLANE = {
+    'vX': dict(name='X (stage-0 fold output)', rows=64, cols=32, stride=32, halves=2048),
+    'vY': dict(name='Y (stage-3 contract output)', rows=64, cols=32, stride=32, halves=2048),
+    'vO': dict(name='O (stage-9 projection output)', rows=64, cols=32, stride=32, halves=2048),
+    'vM': dict(name='M (stage-1 expand output)', rows=64, cols=128, stride=128, halves=8192),
+    'vQ': dict(name='Q plane', rows=64, cols=32, stride=32, halves=2048),
+    'vK': dict(name='K plane', rows=64, cols=32, stride=32, halves=2048),
+    'vV': dict(name='V plane', rows=64, cols=32, stride=32, halves=2048),
+    'vC': dict(name='CTX plane (debug only)', rows=64, cols=32, stride=32, halves=2048),
+}
+ARENA_PLANE_BASE = {'vQ': 0, 'vK': 2048, 'vV': 4096, 'vC': 6144}
+
+ALL_ROWS = list(range(64))
+ALL_COLS = list(range(32))
+
+
+def rows(spec, sg):
+    return spec(sg) if callable(spec) else spec
+
+
+def rows_eight(sg):
+    return [8 * sg + i for i in range(8)]
+
+
+def rows_expand(sg):
+    """stage 1: mA = (sg/4 + 4r)*8, mB = mA + 16, r = 0,1."""
+    out = []
+    for r in (0, 1):
+        mA = (sg // 4 + 4 * r) * 8
+        out += [mA + i for i in range(8)]
+        out += [mA + 16 + i for i in range(8)]
+    return out
+
+
+def rows_split(sg):
+    """tail: t = sg*32 + lane -> rows 0..31 for sg 0, 32..63 for sg 1, nothing else."""
+    return [32 * sg + i for i in range(32)] if sg < 2 else []
+
+
+def cols_expand(sg):
+    return [(sg % 4) * 32 + i for i in range(32)]
+
+
+def foot(value, sg, rowset, colset):
+    p = PLANE[value]
+    base = ARENA_PLANE_BASE.get(value, 0)
+    cols = colset(sg) if callable(colset) else colset
+    return {(base + r * p['stride'] + c) for r in rowset for c in cols}
+
+
+# ---------------------------------------------------------------- site table
+# arm: 'both' | 'parent' | 'candidate'.  Every site must have its `anchor` text on one of
+# its `lines` (1-based) in that arm's source, else the table is stale -> hard failure.
+SITES = [
+    dict(id='s0-fold-W', stage='0 fold', value='vX', array='shX', kind='W', owner='sg',
+         rows=rows_eight, cols=ALL_COLS, lines=[211, 212], arm='both',
+         anchor=['shX[t*32u+c]=value.x', 'shX[t*32u+c+1u]=value.y'],
+         note='fold: t = q*16+s with q = t_local>>6 = sg>>1, so SG sg writes rows '
+              '8sg..8sg+7; c = (t_local&15)*2 covers all 32 columns'),
+    dict(id='dbgX-R', stage='0 debug', value='vX', array='shX', kind='R', owner='all',
+         rows=ALL_ROWS, cols=ALL_COLS, lines=[217], arm='both',
+         anchor=['dbg[22528u + e] = shX[e]'], debug=True,
+         note='debug-only cross-SG echo of X'),
+    dict(id='s1-expand-R', stage='1 expand', value='vX', array='shX', kind='R', owner='sg',
+         rows=rows_expand, cols=ALL_COLS, lines=[243, 248], arm='both',
+         anchor=['coopMatLoad(a, shX, mA * 32u + k0, 32u, LROW)',
+                 'coopMatLoad(a, shX, mB * 32u + k0, 32u, LROW)'],
+         note='four subgroups share each row block (sg/4) -> the cross-SG reader of X'),
+    dict(id='s3-seed-R', stage='3 contract', value='vX', array='shX', kind='R', owner='sg',
+         rows=rows_eight, cols=ALL_COLS, lines=[293, 302], arm='both',
+         anchor=['coopMatLoad(seed, shX, m0 * 32u + 0u, 32u, LROW)',
+                 'coopMatLoad(seed, shX, m0 * 32u + 16u, 32u, LROW)'],
+         note='seed rows 8sg..8sg+7 = exactly the rows SG sg wrote at stage 0'),
+    dict(id='s3-Y-W', stage='3 contract', value='vY', array=None, kind='W', owner='sg',
+         rows=rows_eight, cols=ALL_COLS, lines=[322, 329], arm='both',
+         array_by_arm=dict(parent='shY', candidate='shX'),
+         anchor_by_arm=dict(parent=['coopMatStore(half0, shY, m0 * 32u, 32u, LROW);',
+                                    'coopMatStore(half1, shY, m0 * 32u + 16u, 32u, LROW);'],
+                            candidate=['coopMatStore(half0, shX, m0 * 32u, 32u, LROW);',
+                                       'coopMatStore(half1, shX, m0 * 32u + 16u, 32u, LROW);']),
+         note='the retired plane: the offset expression is character-identical, only the '
+              'array identifier changes'),
+    dict(id='dbgY-R', stage='3 debug', value='vY', array=None, kind='R', owner='all',
+         rows=ALL_ROWS, cols=ALL_COLS, lines=[333], arm='both',
+         array_by_arm=dict(parent='shY', candidate='shX'),
+         anchor_by_arm=dict(parent=['dbg[8192u + e] = shY[e];'],
+                            candidate=['dbg[8192u + e] = shX[e];']),
+         debug=True, note='debug-only cross-SG echo of Y, fenced by the barriers at 332/336'),
+    dict(id='s9-seed-R', stage='9 projection', value='vY', array=None, kind='R', owner='sg',
+         rows=rows_eight, cols=ALL_COLS, lines=[534, 543], arm='both',
+         array_by_arm=dict(parent='shY', candidate='shX'),
+         anchor_by_arm=dict(parent=['coopMatLoad(seed, shY, m0 * 32u + 0u, 32u, LROW);',
+                                    'coopMatLoad(seed, shY, m0 * 32u + 16u, 32u, LROW);'],
+                            candidate=['coopMatLoad(seed, shX, m0 * 32u + 0u, 32u, LROW);',
+                                       'coopMatLoad(seed, shX, m0 * 32u + 16u, 32u, LROW);']),
+         note='same subgroup, same rows as the stage-3 writer'),
+    dict(id='s9-O-W', stage='9 projection', value='vO', array='shX', kind='W', owner='sg',
+         rows=rows_eight, cols=ALL_COLS, lines=[576, 581], arm='both',
+         anchor=['coopMatStore(half0, shX, m0 * 32u, 32u, LROW);',
+                 'coopMatStore(half1, shX, m0 * 32u + 16u, 32u, LROW);'],
+         note='O staging; the store payload descends from the Y seed load'),
+    dict(id='tail-R', stage='tail', value='vO', array='shX', kind='R', owner='sg',
+         rows=rows_split, cols=ALL_COLS, lines=[145, 592], arm='both',
+         anchor=['f16vec2 input_pair=f16vec2(shX[row*32u+c],shX[row*32u+c+1u]);',
+                 'vec4 value=boundary_project(t);'],
+         note='the pixel tail (sg<2) reads all 64 rows -> cross-owner'),
+    dict(id='dbgO-R', stage='tail debug', value='vO', array='shX', kind='R', owner='all',
+         rows=ALL_ROWS, cols=ALL_COLS, lines=[602], arm='both',
+         anchor=['dbg[20480u + e] = shX[e];'], debug=True,
+         note='debug-only echo of O'),
+    # ---- A block: identical in both arms, listed so that the budget is complete ----
+    dict(id='s1-M-W', stage='1 expand', value='vM', array='shArena', kind='W', owner='sg',
+         rows=rows_expand, cols=cols_expand, lines=[258, 265, 272, 279], arm='both',
+         anchor=['coopMatStore(half_result, shArena, mA * 128u + n0, 128u, LROW);',
+                 'coopMatStore(half_result, shArena, mA * 128u + n0 + 16u, 128u, LROW);',
+                 'coopMatStore(half_result, shArena, mB * 128u + n0, 128u, LROW);',
+                 'coopMatStore(half_result, shArena, mB * 128u + n0 + 16u, 128u, LROW);'],
+         note='expand output M[64][128]; every element written exactly once'),
+    dict(id='s3-M-R', stage='3 contract', value='vM', array='shArena', kind='R', owner='sg',
+         rows=rows_eight, cols=list(range(128)), lines=[310], arm='both',
+         anchor=['coopMatLoad(a, shArena, m0 * 128u + k0, 128u, LROW);  // shared A'],
+         note='every subgroup reads its own 8 rows x all 128 columns = the whole block'),
+    dict(id='s4-QKV-W', stage='4 QKV', value='vQ', array='shArena', kind='W', owner='sg',
+         rows=rows_eight, cols=ALL_COLS, lines=[386, 387], arm='both',
+         anchor=['coopMatStore(half0, shArena, region*2048u+m0*32u,32u,LROW);',
+                 'coopMatStore(half1, shArena, region*2048u+m0*32u+16u,32u,LROW);'],
+         extra_planes=['vK', 'vV'],
+         note='region 0/1/2 = Q/K/V planes; one plane per step of the j loop'),
+    dict(id='dbgQK-R', stage='4 debug', value='vQ', array='shArena', kind='R', owner='all',
+         rows=ALL_ROWS, cols=ALL_COLS, lines=[392, 393], arm='both',
+         anchor=['dbg[10240u + e] = NR_Q(e / 32u, e % 32u);',
+                 'dbg[12288u + e] = NR_K(e / 32u, e % 32u);'],
+         extra_planes=['vK'], debug=True, note='debug-only cross-SG echo of Q and K'),
+    dict(id='s6-Q-R', stage='6 score', value='vQ', array='shArena', kind='R', owner='sg',
+         rows=rows_eight, cols=ALL_COLS, lines=[403, 404], arm='both',
+         anchor=['coopMatLoad(score_q0,shArena,sg*8u*32u,32u,LROW);',
+                 'coopMatLoad(score_q1,shArena,sg*8u*32u+16u,32u,LROW);'],
+         note='own rows only -> intra-owner'),
+    dict(id='s6-K-R', stage='6 score', value='vK', array='shArena', kind='R', owner='all',
+         rows=ALL_ROWS, cols=ALL_COLS, lines=[413, 414], arm='both',
+         anchor=['MAT_B b0; coopMatLoad(b0, shArena, 2048u + n0 * 32u + k0, 32u, LCOL);  // K^T',
+                 'MAT_B b1; coopMatLoad(b1, shArena, 2048u + (n0 + 16u) * 32u + k0, 32u, LCOL);'],
+         note='K^T: every subgroup reads the whole plane (all 64 keys)'),
+    dict(id='s8-V-R', stage='8 context', value='vV', array='shArena', kind='R', owner='all',
+         rows=ALL_ROWS, cols=ALL_COLS, lines=[508, 509], arm='both',
+         anchor=['MAT_B b0; coopMatLoad(b0, shArena, 4096u + k0 * 32u + 0u, 32u, LROW);',
+                 'MAT_B b1; coopMatLoad(b1, shArena, 4096u + k0 * 32u + 16u, 32u, LROW);'],
+         note='V: every subgroup reads all 64 rows'),
+    dict(id='s8-C-W', stage='8 context', value='vC', array='shArena', kind='W', owner='sg',
+         rows=rows_eight, cols=ALL_COLS, lines=[514, 516], arm='both',
+         anchor=['if (debug) coopMatStore(ctx_half0, shArena, 6144u + m0 * 32u, 32u, LROW);',
+                 'if (debug) coopMatStore(ctx_half1, shArena, 6144u + m0 * 32u + 16u, 32u, LROW);'],
+         debug=True, note='the CTX plane is written only inside `if (debug)`'),
+    dict(id='dbgC-R', stage='8 debug', value='vC', array='shArena', kind='R', owner='all',
+         rows=ALL_ROWS, cols=ALL_COLS, lines=[520], arm='both',
+         anchor=['dbg[18432u + e] = NR_CTX(e / 32u, e % 32u);'], debug=True,
+         note='debug-only cross-SG echo of CTX'),
+]
+
+# value windows per physical array, in source order.  RAW is enumerated inside a window,
+# WAR/WAW between adjacent windows.
+WINDOWS = {
+    'parent': [('shX', 'vX'), ('shY', 'vY'), ('shX', 'vO'),
+               ('shArena', 'vM'), ('shArena', 'vQ/K/V/CTX')],
+    'candidate': [('shX', 'vX'), ('shX', 'vY'), ('shX', 'vO'),
+                  ('shArena', 'vM'), ('shArena', 'vQ/K/V/CTX')],
+}
+WINDOW_VALUES = {('shX', 'vX'): ['vX'], ('shX', 'vY'): ['vY'], ('shX', 'vO'): ['vO'],
+                 ('shY', 'vY'): ['vY'], ('shArena', 'vM'): ['vM'],
+                 ('shArena', 'vQ/K/V/CTX'): ['vQ', 'vK', 'vV', 'vC']}
+
+B215 = '    barrier();\n    if (debug) {'
+B282 = 'barrier(); // Original publication to contract.'
+B332 = '        barrier();\n        for (uint e = t_local; e < 2048u; e += 256u) dbg[8192u + e]'
+B336 = '    barrier();\n\n    // ============ stage 4'
+B390 = '    if (debug) {\n        barrier();\n        for (uint e = t_local; e < 2048u; e += 256u) dbg[10240u + e]'
+B519 = '    if (debug) {\n        barrier();\n        for (uint e = t_local; e < 2048u; e += 256u) dbg[18432u + e]'
+B586 = 'barrier(); // stage9 producer rows cross SG boundaries before pixel-owner tail.'
+
+# closer of every enumerated pair, keyed by the exact (writer_site, reader_site).
+CLOSERS = {
+    ('s0-fold-W', 's1-expand-R'): dict(kind='barrier', at='src 215',
+                                       what='X publication, stage 0 -> stage 1', anchor=B215),
+    ('s0-fold-W', 'dbgX-R'): dict(kind='barrier', at='src 215 (+225/227)',
+                                  what='X publication before the debug echo', anchor=B215),
+    ('s0-fold-W', 's3-seed-R'): dict(kind='owner-disjoint', at='none',
+                                     what='SG sg writes rows 8sg..8sg+7 at stage 0 and reads the '
+                                          'same rows as the stage-3 seed: cross-owner 0',
+                                     anchor=''),
+    ('s3-Y-W', 'dbgY-R'): dict(kind='barrier', at='src 332',
+                               what='barrier inside the debug block, before the Y echo', anchor=B332),
+    ('s3-Y-W', 's9-seed-R'): dict(kind='owner-disjoint', at='none',
+                                  what='SG sg writes rows 8sg..8sg+7 at stage 3 and reads the same '
+                                       'rows as the stage-9 seed: cross-owner 0',
+                                  anchor=''),
+    ('s9-O-W', 'tail-R'): dict(kind='barrier', at='src 586',
+                               what='O publication to the 2-SG pixel tail', anchor=B586),
+    ('s9-O-W', 'dbgO-R'): dict(kind='barrier', at='src 586',
+                               what='O publication before the debug echo', anchor=B586),
+    ('s1-M-W', 's3-M-R'): dict(kind='barrier', at='src 282',
+                               what='M publication, expand -> contract (unchanged)', anchor=B282),
+    ('s4-QKV-W', 's6-K-R'): dict(kind='barrier', at='src 396',
+                                 what='K^T publication, stage 4 -> score (unchanged)', anchor=B336),
+    ('s4-QKV-W', 's6-Q-R'): dict(kind='owner-disjoint', at='none',
+                                 what='Q rows 8sg..8sg+7 are written and read by the same subgroup '
+                                      '(cross-owner 0), exactly as n30 measured', anchor=''),
+    ('s4-QKV-W', 's8-V-R'): dict(kind='barrier', at='src 396',
+                                 what='V publication, stage 4 -> context (unchanged)', anchor=B336),
+    ('s4-QKV-W', 'dbgQK-R'): dict(kind='barrier', at='src 390/394',
+                                  what='debug echo of Q/K fenced (unchanged)', anchor=B390),
+    ('s8-C-W', 'dbgC-R'): dict(kind='barrier', at='src 519',
+                               what='debug echo of CTX fenced (unchanged)', anchor=B519),
+    # WAR / WAW between adjacent windows
+    ('s3-Y-W', 's3-seed-R'): dict(kind='payload-dependency',
+                                  at='stage 3, same subgroup, same rows',
+                                  what='the Y store payload is MAT_H(acc0/acc1), built from the seed '
+                                       'this subgroup just loaded, so the load has retired before the '
+                                       'store can issue; rows are owner-disjoint across subgroups',
+                                  anchor=''),
+    ('s3-Y-W', 's1-expand-R'): dict(kind='barrier', at='src 282',
+                                    what='the cross-owner part of the same WAR: SG sg reads rows '
+                                         '8*(sg/4)+.. as X at stage 1, and every such read is before '
+                                         'the stage-1 -> stage-3 barrier that precedes the Y store',
+                                    anchor=B282),
+    ('s3-Y-W', 'dbgX-R'): dict(kind='barrier', at='src 215/225/227/282',
+                               what='the debug echo of X is 4 barriers before the Y store', anchor=B215),
+    ('s9-O-W', 's9-seed-R'): dict(kind='payload-dependency',
+                                  at='stage 9, same subgroup, same rows',
+                                  what='the O store payload is MAT_H(acc0/acc1) seeded from the Y load '
+                                       'of the same subgroup, so the load has retired before the store',
+                                  anchor=''),
+    ('s9-O-W', 'dbgY-R'): dict(kind='barrier', at='src 334/336',
+                               what='the debug echo of Y is 3 barriers before the O store', anchor=B336),
+    ('s9-O-W', 's0-fold-W'): dict(kind='owner-disjoint', at='none',
+                                  what='both write rows 8sg..8sg+7 of the same subgroup; '
+                                       'cross-owner 0 (and 5 barriers in between)',
+                                  anchor=''),
+    ('s3-Y-W', 's0-fold-W'): dict(kind='owner-disjoint', at='none',
+                                  what='both write rows 8sg..8sg+7 of the same subgroup; '
+                                       'cross-owner 0', anchor=''),
+    ('s9-O-W', 's3-Y-W'): dict(kind='owner-disjoint', at='none',
+                               what='both write rows 8sg..8sg+7 of the same subgroup; '
+                                    'cross-owner 0', anchor=''),
+    ('s9-O-W', 's1-expand-R'): dict(kind='barrier', at='src 282/336',
+                                    what='every X read is before the barrier at 336, the O store is '
+                                         'after it (program order + 2 barriers)', anchor=B336),
+    ('s9-O-W', 's3-seed-R'): dict(kind='barrier', at='src 336',
+                                  what='the last X seed read is before the barrier at 336; '
+                                       'the O store is at stage 9', anchor=B336),
+    ('s4-QKV-W', 's3-M-R'): dict(kind='barrier', at='src 336',
+                                 what='the stage-3 A reads -> stage-4 Q/K/V writes WAR '
+                                      '(n30 territory, unchanged in this card)', anchor=B336),
+    ('s4-QKV-W', 's1-M-W'): dict(kind='barrier', at='src 282/336',
+                                 what='M write -> Q/K/V write (WAW on the same arena), '
+                                      'closed by the barriers at 282 and 336', anchor=B336),
+    ('s8-C-W', 's3-M-R'): dict(kind='debug-only', at='src 336 (+ the `if (debug)` guard)',
+                               what='the CTX plane lies inside the M address range, but its store '
+                                    'executes only when debug != 0 and is 3 barriers after the last '
+                                    'M read; in a normal run nothing is written',
+                               anchor='if (debug) coopMatStore(ctx_half0'),
+    ('s8-C-W', 's1-M-W'): dict(kind='debug-only', at='src 282/336 (+ the `if (debug)` guard)',
+                               what='same as above, WAW side; debug-only and barrier-separated',
+                               anchor='if (debug) coopMatStore(ctx_half0'),
+}
+
+DECL = re.compile(r'shared\s+float16_t\s+(\w+)\s*\[\s*(\d+)\s*\]')
+
+
+def sha(p):
+    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+
+
+def declarations(text):
+    out = {}
+    for m in DECL.finditer(text):
+        out[m.group(1)] = dict(halves=int(m.group(2)), bytes=int(m.group(2)) * 2,
+                               line=text[:m.start()].count('\n') + 1)
+    return out
+
+
+def check_anchors(text, arm):
+    lines = text.splitlines()
+    bad = []
+    for s in SITES:
+        if s['arm'] not in ('both', arm):
+            continue
+        anchors = (s.get('anchor_by_arm') or {}).get(arm) or s['anchor']
+        for a, ln in zip(anchors, s['lines']):
+            ok = (0 < ln <= len(lines)) and (a in lines[ln - 1])
+            if not ok:
+                bad.append(dict(site=s['id'], line=ln, expected=a,
+                                actual=(lines[ln - 1].strip()[:100]
+                                        if 0 < ln <= len(lines) else '')))
+    return bad
+
+
+def arm_sites(arm):
+    out = []
+    for s in SITES:
+        if s['arm'] not in ('both', arm):
+            continue
+        arr = (s.get('array_by_arm') or {}).get(arm) or s.get('array')
+        vals = [s['value']] + list(s.get('extra_planes') or [])
+        fps = {sg: set() for sg in range(NSG)}
+        for v in vals:
+            for sg in range(NSG):
+                fps[sg] |= foot(v, sg, rows(s['rows'], sg), s['cols'])
+        out.append(dict(id=s['id'], stage=s['stage'], kind=s['kind'], value=s['value'],
+                        extra_planes=list(s.get('extra_planes') or []), array=arr,
+                        owner=s['owner'], debug=bool(s.get('debug')), lines=s['lines'],
+                        note=s['note'],
+                        footprint_per_sg={sg: len(fps[sg]) for sg in range(NSG)},
+                        footprint_total=sum(len(f) for f in fps.values()),
+                        distinct_elements=len(set().union(*fps.values())),
+                        _fps=fps))
+    return out
+
+
+def pair_counts(w, r):
+    """(same_owner, cross_owner, distinct) over all (writer sg, reader sg) pairs."""
+    if w['array'] != r['array']:
+        return None
+    same = cross = 0
+    union = set()
+    pairs = []
+    for a in range(NSG):
+        for b in range(NSG):
+            inter = w['_fps'][a] & r['_fps'][b]
+            if not inter:
+                continue
+            union |= inter
+            if a == b:
+                same += len(inter)
+            else:
+                cross += len(inter)
+                pairs.append([a, b])
+    if not union:
+        return None
+    return dict(writer_site=w['id'], reader_site=r['id'], array=w['array'],
+                writer_stage=w['stage'], reader_stage=r['stage'],
+                same_owner=same, cross_owner=cross, distinct=len(union),
+                cross_owner_sg_pairs=pairs)
+
+
+def run_arm(arm):
+    sites = arm_sites(arm)
+    rows_out, missing = [], []
+    for (arr, wname) in WINDOWS[arm]:
+        vals = WINDOW_VALUES[(arr, wname)]
+        inside = [s for s in sites if s['array'] == arr and s['value'] in vals]
+        for w in [s for s in inside if s['kind'] == 'W']:
+            for r in [s for s in inside if s['kind'] == 'R']:
+                pc = pair_counts(w, r)
+                if pc is None:
+                    continue
+                pc.update(window='%s/%s' % (arr, wname), relation='RAW',
+                          closer=CLOSERS.get((w['id'], r['id'])))
+                rows_out.append(pc)
+    for a, b in zip(WINDOWS[arm], WINDOWS[arm][1:]):
+        (arr1, w1), (arr2, w2) = a, b
+        if arr1 != arr2:
+            continue
+        s1 = [s for s in sites if s['array'] == arr1 and s['value'] in WINDOW_VALUES[(arr1, w1)]]
+        s2 = [s for s in sites if s['array'] == arr2 and s['value'] in WINDOW_VALUES[(arr2, w2)]]
+        for r in [s for s in s1 if s['kind'] == 'R']:
+            for w in [s for s in s2 if s['kind'] == 'W']:
+                pc = pair_counts(w, r)
+                if pc is None:
+                    continue
+                pc.update(window='%s: %s -> %s' % (arr1, w1, w2), relation='WAR',
+                          closer=CLOSERS.get((w['id'], r['id'])))
+                rows_out.append(pc)
+        for w1s in [s for s in s1 if s['kind'] == 'W']:
+            for w2s in [s for s in s2 if s['kind'] == 'W']:
+                pc = pair_counts(w2s, w1s)
+                if pc is None:
+                    continue
+                pc.update(window='%s: %s -> %s' % (arr1, w1, w2), relation='WAW',
+                          closer=CLOSERS.get((w2s['id'], w1s['id'])))
+                rows_out.append(pc)
+    for r in rows_out:
+        if r['closer'] is None:
+            missing.append((r['writer_site'], r['reader_site'], r['relation']))
+    assert not missing, ('closers not declared', arm, missing)
+    for s in sites:
+        s.pop('_fps')
+    return sites, rows_out
+
+
+def main():
+    parent_text = PARENT_SRC.read_text(encoding='utf-8-sig')
+    arms = {'parent': dict(src=PARENT_SRC, text=parent_text, sha=sha(PARENT_SRC))}
+    cand_src = CARD / 'candidate.comp'
+    if cand_src.exists():
+        arms['candidate'] = dict(src=cand_src, text=cand_src.read_text(encoding='utf-8-sig'),
+                                 sha=sha(cand_src))
+
+    res = dict(card='n38-f20-arena-shrink', family='F20', ordinal=230, nsubgroups=NSG,
+               gpu_used=False,
+               parent=dict(source=str(PARENT_SRC), source_sha256=sha(PARENT_SRC),
+                           source_sha_expected=PARENT_SRC_SHA,
+                           spv=str(PARENT_SPV), spv_sha256=sha(PARENT_SPV),
+                           spv_sha_expected=PARENT_SPV_SHA))
+    assert res['parent']['source_sha256'] == PARENT_SRC_SHA
+    assert res['parent']['spv_sha256'] == PARENT_SPV_SHA
+
+    # ---- parent SPIR-V: Workgroup storage, variable by variable ----------------
+    pm = ST.Module(PARENT_SPV)
+    by_id = pm.id_to_instruction()
+    wg = []
+    for op, ops, _, _ in pm.instructions:
+        if op == 59 and ops[2] == 4:
+            ptr_ops = by_id[ops[0]][1]
+            wg.append(dict(name=pm.name_of(ops[1]), bytes=pm.type_size_bytes(ptr_ops[2])))
+    res['parent_spv_workgroup'] = dict(variables=wg,
+                                       total_bytes=sum(v['bytes'] for v in wg),
+                                       storage_bytes=pm.storage_bytes()['Workgroup'])
+    assert res['parent_spv_workgroup']['total_bytes'] == 24576
+
+    out, hazards = {}, {}
+    for arm, rec in arms.items():
+        decl = declarations(rec['text'])
+        bad = check_anchors(rec['text'], arm)
+        sites, hz = run_arm(arm)
+        out[arm] = dict(source=str(rec['src']), source_sha256=rec['sha'],
+                        declarations=decl,
+                        declared_bytes=sum(d['bytes'] for d in decl.values()),
+                        anchor_failures=bad, sites=sites,
+                        barrier_calls=rec['text'].count('barrier();'))
+        hazards[arm] = hz
+        txt = rec['text']
+        for h in hz:
+            a = h['closer'].get('anchor') or ''
+            if a:
+                assert a in txt, ('closer anchor missing', arm, h['writer_site'],
+                                  h['reader_site'], a[:60])
+    res['arms'] = out
+    res['hazards'] = hazards
+
+    # ---- the aliased plane: prove the offset expression is character-identical --
+    # The candidate carries a longer header, so the comparison is by content, not by line:
+    # every parent line that mentions the retired array, with `shY` renamed to `shX`, must
+    # appear verbatim in the candidate.  (The order-insensitive multiset form of the same
+    # statement is rule I2 of _addr_audit.py.)
+    aliased = []
+    if 'candidate' in arms:
+        plines = parent_text.splitlines()
+        clines = arms['candidate']['text'].splitlines()
+        for ln, l in enumerate(plines, 1):
+            if 'shY' not in l:
+                continue
+            if l.lstrip().startswith('shared '):
+                # the declaration is REMOVED, not renamed: the whole point of the card
+                aliased.append(dict(parent_line=ln, parent=l.strip(), kind='declaration',
+                                    candidate_has_declaration=any(
+                                        'shared float16_t shY' in c for c in clines),
+                                    equal_after_rename=not any(
+                                        'shared float16_t shY' in c for c in clines)))
+                continue
+            renamed = l.replace('shY', 'shX')
+            hits = [i + 1 for i, c in enumerate(clines) if c == renamed]
+            aliased.append(dict(parent_line=ln, parent=l.strip(), kind='access',
+                                renamed=renamed.strip(), candidate_lines=hits,
+                                found=bool(hits), equal_after_rename=bool(hits)))
+        assert aliased and all(a['equal_after_rename'] for a in aliased), \
+            'aliased line not identical: %s' % [a for a in aliased if not a['equal_after_rename']]
+        assert sum(1 for a in aliased if a['kind'] == 'access') == 5, aliased
+    res['aliased_plane_lines'] = aliased
+
+    # ---- byte budget ----------------------------------------------------------
+    budget = {arm: dict(arrays=out[arm]['declarations'],
+                        total_bytes=out[arm]['declared_bytes']) for arm in arms}
+    for p in (65536, 69632, 73727):
+        budget.setdefault('residency', {})['P=%d' % p] = {
+            arm: p // budget[arm]['total_bytes'] for arm in arms}
+    if 'candidate' in arms:
+        budget['delta_bytes'] = budget['candidate']['total_bytes'] - budget['parent']['total_bytes']
+        budget['saving_pct'] = round(100.0 * -budget['delta_bytes'] / budget['parent']['total_bytes'], 2)
+    res['byte_budget'] = budget
+    res['occupancy_threshold'] = dict(
+        pool_bracket='P in [65536, 73728)  (n36 two-probe bracket: F05 24576->2 / 49152->1 and '
+                     'F06 32768->2 / 49152->1; evidence/OCCUPANCY-ELASTICITY*.json)',
+        max_bytes_for_three=65536 // 3,
+        parent_bytes=budget['parent']['total_bytes'],
+        parent_residency=65536 // budget['parent']['total_bytes'],
+        candidate_bytes=budget.get('candidate', {}).get('total_bytes'),
+        candidate_residency=(65536 // budget['candidate']['total_bytes']
+                             if 'candidate' in arms else None),
+        note='24576 is the SPIR-V and captured-ISA truth; the plan ledger field says 29184 = '
+             '24576 + 4608 (stale, see n30 STAGE-BLOCK-MATRIX.md 1.1)')
+    if 'candidate' in arms:
+        assert budget['candidate']['total_bytes'] <= res['occupancy_threshold']['max_bytes_for_three']
+
+    (CARD / 'build').mkdir(exist_ok=True)
+    (CARD / 'build/lifetime.json').write_text(json.dumps(res, indent=1), encoding='utf-8')
+
+    print('parent declarations:', {k: (v['halves'], v['bytes'])
+                                   for k, v in out['parent']['declarations'].items()})
+    print('parent declared bytes:', out['parent']['declared_bytes'],
+          '| SPIR-V Workgroup:', res['parent_spv_workgroup']['total_bytes'],
+          '| variables:', [(v['name'], v['bytes']) for v in wg])
+    if 'candidate' in arms:
+        print('candidate declarations:', {k: (v['halves'], v['bytes'])
+                                          for k, v in out['candidate']['declarations'].items()})
+        print('candidate declared bytes:', out['candidate']['declared_bytes'],
+              'delta', budget['delta_bytes'], 'saving %', budget['saving_pct'])
+        print('aliased lines identical after rename:',
+              all(a['equal_after_rename'] for a in aliased))
+    print('anchor failures:', {a: out[a]['anchor_failures'] for a in arms})
+    print('residency:', json.dumps(budget['residency']))
+    for arm in arms:
+        print('-' * 26, 'hazards', arm)
+        for h in hazards[arm]:
+            print('%-11s -> %-11s %-4s %-26s same=%-5d cross=%-5d %-18s %s' %
+                  (h['writer_site'], h['reader_site'], h['relation'], h['window'],
+                   h['same_owner'], h['cross_owner'], h['closer']['kind'], h['closer'].get('at')))
+
+
+if __name__ == '__main__':
+    main()

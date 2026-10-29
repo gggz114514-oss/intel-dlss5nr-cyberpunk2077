@@ -1,0 +1,112 @@
+n10b-f10-pipeline · F10 C512 QKV/attention：kc 供料环的软件流水（stage(w_{i+1}) 提到 consume(w_i) 之前）
+状态：BUILT / AWAITING-GPU（无 GPU 工作、无部署、未改基线 plan/CURRENT.json/COMMON.py/其他卡目录）
+日期：2026-10-27
+
+=====================================================================
+1. 身份
+=====================================================================
+父（只读，现役链头 n10-f10-next）
+  plan  719f100b5210249f315094b24160ecfd5b2fb707afb9a3543e1beec61d3f3f49
+  SPV   228dee8a437dd0827c4c7bc770707e645c753d493252fdda0907283889a9eb0e   (105060 B)
+  src   ff2ffde62e44e11c3a5e4eff16e45160695b602b7c19a6e86f91757241b39c71
+        （cards/n10-f10-next/，本卡只读引用；上一级基线 a024c3c5… 未动）
+本卡候选（全部在本目录）
+  source  candidate.comp        8f8c6a589613540fe8ad927c0a1c387e0d9b2d50495da1f4dd293d93d886e856
+  spv     candidate.spv         9afa852679d057540771df5c4a2c4260db942f649598770293d478acc63cbe44  (105508 B)
+  plan    plan.txt              2343827ab054adf36b15b451f56a8040e34afd9e09d0510767699eb9c58a59a3
+  parent  parent-rebuild.spv    228dee8a437dd0827c4c7bc770707e645c753d493252fdda0907283889a9eb0e（字节复现）
+  其它：ANALYSIS.md / PROOF.json / SOURCE-DIFF.patch / BUILD.json / COST-LEDGER.json /
+        NATIVE-PREDICTION.md / GPU-REQUEST.json / LOOP-BARRIERS.json / build_n10b.py
+
+=====================================================================
+2. 改了什么（一个 hunk，只在 QKV kc 环，只动整数/控制）
+=====================================================================
+把 n10 的双窗口从「一次一个」改成生产者/消费者环，循环 8 → 9 次：
+  父 (n10) : per slice  stage(w_i) -> barrier -> consume(w_i) -> flip
+  本卡     : per iter   [i>0] barrier -> [i<8] stage(w_i) -> [i>0] consume(w_{i-1}) -> flip
+于是下一次的 16 条全局读在本次 24 条 DPAS 之前发出；必须等这些读完成的 barrier 落到 DPAS 之后
+（父里它夹在 staging 的 SLM 写与首 DPAS 之间）。
+索引只有两句（PROOF.json S1 逐位求值）：abase 每迭代翻转一次；consume 窗口 = QKV_OFF-abase（= 上一 slice 的窗口）；
+kc 在 consume guard 内 +64（consume 的 slice 顺序仍是 0..7）。
+未改：三块独立 B 返回区、每 k-step 3 次权重读、六条 DPAS 顺序、任何浮点语句、
+16 次输入读/16 次 SLM 写/2 次 A 片段读、shared 20480、grid 6×3×16、lane 活跃度、barrier 次数（每 WG 8，模块 4）。
+
+=====================================================================
+3. 已证（CPU 侧，全部可复算；build_n10b.py 一把跑完）
+=====================================================================
+- 父字节复现：glslang 16.5.0 -V --target-env vulkan1.3 + 站点 include → 与父 SPV 逐字节相同。
+- 候选 spv_validate_cpu：result=0 words=26377。
+- NC：父 85 个 NC（{129:47,133:36,136:1,137:1}）按 NC opcode 序列逐位配对；配对集合 == 候选自身装饰集合；
+  multiset 相等；重发射字节不变。浮点站点 87 条 operand signature 全等（0 处不一致）。
+- 映射：staged 4096 单元双射；16384 个 A 片段地址（8 SG × 2 窗口 × 2 M8 × 4 K16 × 8×16）还原同一 (r,k)。
+- 环索引：S1 表（迭代 → stage 窗口 / consume 窗口 / kc），每个 slice 的 stage 窗口 == consume 窗口，consume 序 = 0..7。
+- hazard：RAW 8 / WAR 6 / WAW 6，每对「中间 barrier 数」= 1，且与父**逐项相同**（identical_separation=true）；
+  每 WG barrier 执行数 8 = 8（L4）。
+- handoff：末 slice 7 落在 [0,4096)（与 [4096,10240) 不重叠），STORE_QKV 前 1 个 barrier（迭代 8）——与 n10 同。
+- 计划：只替换 16 个 F10 PASS；232 PASS 保持；只有 16 行不同且恰是 ordinal 62/66/70/74/78/82/86/90/136/140/144/148/152/156/160/164；
+  clock_runner --cpu-check：`CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded`。
+- 静态：OpControlBarrier 4→4、OpCooperativeMatrixMulAddKHR 38→38、coopMatLoad 47→47、coopMatStore 48→48；
+  模块 6513→6546 指令（+0.51%），26265→26377 words，105060→105508 B；
+  kc 环体 own 397→424（+27，全是 3 个 guard 的 compare/branch/label/phi），含嵌套 558→585；
+  环体 barrier 的 own 偏移 384→13（**这就是本卡的全部内容**），首 DPAS own 偏移 515→537。
+
+=====================================================================
+4. 未证（必须有 GPU 才能回答）
+=====================================================================
+- P5：环体 barrier 是否真的落在 staging send 之前（父：在其后）。
+- P6：16 条 staging SLM store 是否沉到 DPAS 之后（强形式；不成立不算失败）。
+- P1：三块 B 是否仍分离且都在首 DPAS 前（硬）。
+- P2：scratch 是否仍为 0（硬门）；环体是否无新增内存/DPAS 消息。
+- P3/P4：静态 sync.bar 是否仍 4、send 是否仍 566。
+- 整体是否更快（本卡不测；主代理串行执行）。
+
+=====================================================================
+5. 分诊（无 GPU 结果前的预判 + 具名触发条件）
+=====================================================================
+预判 **D（INDISTINCT）风险最高**：本卡不删任何工作，只把 8 次 WG rendezvous 从 store→DPAS 边上挪走，
+同时确定性地多了 +4.5% 动态整数/控制指令（估 +375 条/WG）。两者量级都小，且按 LESSONS L12，
+被其他驻留 WG 遮住的 rendezvous 不会显出帧时。
+- 若 P5 不成立 ⇒ **A 实现未落地**（不是方法无效）。
+- 若 scratch>0 ⇒ **B**，硬门，立刻回退（不测）。
+- 若 P1 不成立（权重 send 落到首 DPAS 后 / 返回区重叠 / 多第 4 次读）⇒ **B**，停。
+- 若 P3/P4 变差（sync.bar 5 且动态 9；send > 566）⇒ **B**。
+- 若 P1/P3/P4/P5 全对而 ordinary 平 ⇒ **D**，按合同成包，**不写成方向禁令**。
+- 数值失败（不应发生：R1/R2 逐条相等）⇒ **E**，先定位首差阶段。
+
+=====================================================================
+6. 下一处具体代码改动（已定，两条，各自带停止条件）
+=====================================================================
+(6a) 若 native 显示 P5 成立但 P6 不成立（16 条 staging SLM store 仍在 DPAS 之前）：
+     把 STAGE 显式拆成「16 条 load → 16 个 half 局部数组 → DPAS → 16 条 store」，让 store 无法被排在 DPAS 之前。
+     寄存器预算（先算后写，n05c/n05d 的先例）：16 个 half = 16 GRF；若与三块 B(24 GRF)+6 acc(24 GRF)+A(8 GRF)+地址(~12)
+     叠加超过 128，则改用 packFloat2x16 折成 8 个 u32（8 GRF，代价 +16 条 bit 操作），或只提前 8 条（半流水）。
+     停止条件：scratch>0 或环体增量 > 60 条 ⇒ 回退，记为「强形式的寄存器预算不足」，不再换写法重跑。
+(6b) 若 native 显示 P4 = 582（+16，说明 i=0 的 stage 被剥离复制）：
+     保持 9 次迭代不变，把两个 guard 用同一谓词合成一个块（barrier 与 stage 共用 `i>0` 的逆谓词），
+     让 IGC 没有可剥离的入口；再测 P4 是否回到 566。停止条件：两次仍 >566 ⇒ 记「本工具链不支持无复制的前导素化」，
+     不再为这一步花 GPU。
+(6c) 若 P5 也不成立（barrier 被沉到 stage 之后）：直接做 6a 的显式拆分；不要先改 guard 结构。
+
+=====================================================================
+7. 执行偏差与未决项（如实记录）
+=====================================================================
+1. **P2 的字面口径不可达**：CARD 要求「kc 环体指令数下降或持平」，但本卡不删工作，环体必然 +27 own（guard 机制）。
+   已把 P2 改成「增量全是整数控制 + 无新增内存/DPAS 消息 + scratch 0 + 增量 ≤ 40 条 ISA」，并写进
+   NATIVE-PREDICTION.md §2。**请主代理确认此口径**；若不接受，则本卡按 CARD 字面即为 B 类，需换机制（不是换写法）。
+2. 9 次迭代的 i=0/i=8 各有一个 guard 被跳过：动态 stage/consume 次数仍各 8（与父相同），静态环体更大。
+   若 IGC 做循环剥离，静态 send 会变多（P4 直接否）——只能由 native 回答。
+3. scratch/GRF 无法在 CPU 侧测量，按硬门处理。
+4. 本卡没有重跑任何历史候选（不是 F05 双 A、不是源顺序、不是六/四权重族、不是 subgroup 边界、不是「F10 继续加 B」）。
+5. plan 没有走 COMMON.rebase_by_ordinals（它会写 queue/<card> 目录，越界）；本脚本自实现等价逻辑并加了更严的断言
+   （父 SPV 路径出现 16 次、替换后仍 232 PASS、diff 行数 == 16 且 pass ordinal 恰为那 16 个）。
+   cpu-check / spv_validate / glslang 与 COMMON.py 同款二进制。
+
+=====================================================================
+8. 恢复点（下一位执行者从这里开始）
+=====================================================================
+1) 读 GPU-REQUEST.json，按 base/cand 两臂跑 gates(fixed) → gates(fb2) → native → resources → ordinary
+   （6 组交替、30 样本/臂、全留、配对 t(df=5)；fixed 末帧 1755e9c2…、fb2 末帧 9c3e511e…、ordinary 末帧 2b63d4ba…，三套不混用）。
+2) 用 NATIVE-PREDICTION.md 逐条判 P1/P5/P6/P2/P3/P4/P7；P1 或 P2 不过就立刻停，不看时间。
+3) 若 native 全对：写 RESULTS 四层（源码意图→native→数值/资源→整体计时），分诊 A/B/C/D。
+4) 若时间平/负：按 §6 的 6a/6b/6c 选一条做下一版（同一个卡目录，新名字，不覆盖本版产物）。
+5) 本目录所有产物保留原名，不覆盖历史证据；基线 plan/CURRENT.json 由主代理维护，本卡未动。

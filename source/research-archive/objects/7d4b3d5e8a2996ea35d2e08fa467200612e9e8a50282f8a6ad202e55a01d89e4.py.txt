@@ -1,0 +1,201 @@
+"""N15 narrow-read census scanner v3 (read-only over ISA .asm captures; no GPU).
+
+v3 adds the ALU "per-half/byte assembly" signatures:
+  strideB   - byte/word typed register moves with a source region stride >= 2
+              (de-interleave: one element out of every N bytes)  e.g. r6.0<1>:b r176.0<4;1,0>:b
+  shl16     - shift by 16 on a 32-bit register (half-slot placement)
+  mask16    - and-mask with 0xFFFF / 0xFFFF0000
+  packpair  - shl16 followed within 3 instructions by or/add into a merged dword
+
+Usage: python scan_narrow.py all | ordinal | FAMILY ...
+Writes _scan/<ordinal>.json (no instruction dump in json).
+"""
+import json, os, re, sys
+from collections import Counter, defaultdict
+
+CARD = os.path.dirname(os.path.abspath(__file__))
+EVID = os.path.join(os.path.dirname(os.path.dirname(CARD)), "evidence")
+IDX = json.load(open(os.path.join(EVID, "NATIVE-INDEX.json"), encoding="utf-8"))
+COV = {r["ordinal"]: r for r in IDX["coverage"]}
+H2F = json.load(open(os.path.join(CARD, "_hash2asm.json"), encoding="utf-8"))
+
+LINE_RE = re.compile(r"^/\* \[([0-9A-Fa-f]+)\]\s+\*/\s*(.*)$")
+TYPE_RE = re.compile(r":(u?[whbdq][^<]*|u?hf|f|df|v)$")
+REGION_RE = re.compile(r"<(\d+);(\d+),(\d+)>")
+
+
+def parse_line(body):
+    cmt = ""
+    if "//" in body:
+        body, cmt = body.split("//", 1)
+        cmt = cmt.strip()
+    toks = body.split()
+    pred = []
+    while toks and re.match(r"^\((W|~?f[0-9.]+)\)$", toks[0]):
+        pred.append(toks.pop(0))
+    if not toks:
+        return None
+    mnem = toks[0]
+    toks = toks[1:]
+    size = None
+    if toks and re.match(r"^\(\d+\|", toks[0]):
+        size = toks.pop(0)
+    return {"pred": " ".join(pred), "mnem": mnem, "size": size,
+            "operands": toks, "cmt": cmt}
+
+
+def op_kind(tok):
+    m = re.search(r":(u?[whbdq]|u?hf|f|df|v)$", tok)
+    typ = m.group(1) if m else None
+    core = re.split(r"<|:", tok)[0]
+    if re.match(r"^(-?0x[0-9A-Fa-f]+|-?\d+)$", core):
+        return "imm", typ
+    if re.match(r"^(r|n)?[0-9]+(\.[0-9]+)?$", core) or re.match(r"^(a\d|cr\d|null|ce\d|sr\d)", core):
+        return "reg", typ
+    return "other", typ
+
+
+HALF_I = {"w", "uw"}
+BYTE_I = {"b", "ub"}
+HF = {"hf"}
+MASK16 = {"0xFFFF", "0xffff", "0xFFFF0000", "0xffff0000", "0x0000FFFF", "0xffff0000"}
+
+
+def scan(path):
+    n = 0
+    mnem = Counter()
+    msg = Counter()
+    msg_at = defaultdict(list)
+    narrow = Counter()
+    narrow_at = defaultdict(list)
+    half_int = Counter()
+    half_int_at = defaultdict(list)
+    hf = Counter()
+    strideB = Counter()
+    strideB_at = defaultdict(list)
+    shl16 = []
+    mask16 = []
+    packpair = []
+    recent_shl = []
+    dpas = 0
+    for raw in open(path, encoding="utf-8", errors="replace"):
+        m = LINE_RE.match(raw)
+        if not m:
+            continue
+        addr = m.group(1)
+        p = parse_line(m.group(2))
+        if not p:
+            continue
+        n += 1
+        mnem[p["mnem"]] += 1
+        if p["mnem"].startswith("dpas"):
+            dpas += 1
+        c = p["cmt"]
+        mm = re.search(r"(load|store)\.ugm\.([A-Za-z0-9]+)", c)
+        if mm:
+            key = mm.group(1) + "ugm." + mm.group(2)
+            msg[key] += 1
+            if len(msg_at[key]) < 80:
+                msg_at[key].append(addr)
+            if re.match(r"^d(8|16|32)(u(8|16|32))?$", mm.group(2)):
+                narrow[key] += 1
+                if len(narrow_at[key]) < 80:
+                    narrow_at[key].append(addr)
+        kinds = [(op_kind(t), t) for t in p["operands"]]
+        regtypes = {k[1] for k, t in kinds if k[0] == "reg" and k[1]}
+        if regtypes & HALF_I:
+            half_int[p["mnem"]] += 1
+            if len(half_int_at[p["mnem"]]) < 30:
+                half_int_at[p["mnem"]].append(addr)
+        if regtypes & HF:
+            hf[p["mnem"]] += 1
+        # de-interleave signature: typed b/w reg move with source region stride >=2
+        if p["mnem"] in ("mov", "add", "sel", "or", "and") and (regtypes & (BYTE_I | HALF_I | {"hf"})):
+            srcs = [t for k, t in kinds[1:]]
+            for t in srcs:
+                rm = REGION_RE.search(t)
+                if rm and int(rm.group(1)) >= 2:
+                    key = p["mnem"] + ":" + (",".join(sorted(regtypes)))
+                    strideB[key] += 1
+                    if len(strideB_at[key]) < 30:
+                        strideB_at[key].append(addr)
+                    break
+        # shl 16 / mask16 / pack pairs
+        if p["mnem"] in ("shl", "shr", "asr"):
+            imms = [t for k, t in kinds if k[0] == "imm"]
+            if imms and re.split(r":", imms[0])[0] in ("16", "0x10"):
+                shl16.append(addr)
+                recent_shl.append(addr)
+                if len(recent_shl) > 6:
+                    recent_shl.pop(0)
+        if p["mnem"] in ("and", "or", "add", "add3", "xor"):
+            for k, t in kinds:
+                if k[0] != "imm":
+                    continue
+                core = re.split(r":", t)[0]
+                if core in MASK16:
+                    mask16.append(addr)
+                    if recent_shl:
+                        packpair.append(recent_shl[-1] + "->" + addr)
+            if p["mnem"] in ("or", "add") and recent_shl:
+                # merge right after a 16-shift with a reg source
+                if any(k[0] == "reg" for k, t in kinds[1:]):
+                    last = recent_shl[-1]
+                    if last and int(addr, 16) - int(last, 16) <= 0x40:
+                        packpair.append(last + "->" + addr)
+    return {
+        "path": path, "n_instr": n, "dpas": dpas,
+        "mnem": dict(mnem.most_common(20)),
+        "messages": dict(msg.most_common()),
+        "message_sites": {k: v[:40] for k, v in msg_at.items()},
+        "narrow_messages": dict(narrow.most_common()),
+        "narrow_sites": {k: v[:40] for k, v in narrow_at.items()},
+        "half_int_ops": dict(half_int.most_common(20)),
+        "half_int_sites": {k: v[:12] for k, v in half_int_at.items()},
+        "hf_ops": dict(hf.most_common(12)),
+        "stride_ops": dict(strideB.most_common(12)),
+        "stride_sites": {k: v[:12] for k, v in strideB_at.items()},
+        "shl16": {"n": len(shl16), "sites": shl16[:30]},
+        "mask16": {"n": len(mask16), "sites": mask16[:30]},
+        "packpair": {"n": len(packpair), "sites": packpair[:30]},
+    }
+
+
+def resolve(ordinal):
+    h = COV[ordinal]["baseline_kernel_hash"]
+    for c in (H2F.get(str(ordinal)) or []):
+        if os.path.exists(c):
+            return h, c
+    return h, None
+
+
+def main():
+    args = sys.argv[1:] or ["all"]
+    ords = []
+    if "all" in args:
+        ords = sorted(COV)
+    for a in args:
+        if re.match(r"^F\d+$", a.upper()):
+            ords += sorted(r["ordinal"] for r in COV.values() if r["family"] == a.upper())
+        elif a.isdigit():
+            ords.append(int(a))
+    out = os.path.join(CARD, "_scan")
+    os.makedirs(out, exist_ok=True)
+    for o in ords:
+        h, p = resolve(o)
+        if not p:
+            print(o, "NO_ISA")
+            continue
+        s = scan(p)
+        s.update({"ordinal": o, "family": COV[o]["family"], "name": COV[o]["name"],
+                  "kernel_hash": h, "baseline_spv": COV[o]["baseline_spv"],
+                  "baseline_spv_sha256": COV[o]["baseline_spv_sha256"]})
+        json.dump(s, open(os.path.join(out, "%03d.json" % o), "w"), indent=1)
+        print("%3d %-4s %-24s n=%5d narrow=%-3d halfint=%-4d stride=%-3d shl16=%-3d pair=%-3d" % (
+            o, s["family"], s["name"], s["n_instr"],
+            sum(s["narrow_messages"].values()), sum(s["half_int_ops"].values()),
+            sum(s["stride_ops"].values()), s["shl16"]["n"], s["packpair"]["n"]))
+
+
+if __name__ == "__main__":
+    main()

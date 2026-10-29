@@ -1,0 +1,288 @@
+"""n09b-f09-sx-stage self-check.  CPU only: no Vulkan device, no GPU lock, no deployment.
+
+Checks (contract §2 "build identity trio"):
+  1. parent byte reproduction: parent-rebuild.spv is byte-identical to the baseline
+     group SPV (compare-object AND sha256), plus the compile is re-derived from the
+     frozen parent source into ./_build/sc-parent.spv and compared again.
+  2. candidate.spv passes spv_validate_cpu; parent-rebuild.spv too.
+  3. plan.txt differs from the baseline plan on exactly the group's PASS lines
+     (16 of them) and on nothing else.
+  4. `clock_runner --cpu-check` on the candidate plan prints the same CPU_PLAN_OK
+     line as the baseline plan (152 rows / 232 passes / 502 buffers).
+
+It also re-derives, independently of PROOF.json, the (token,channel) address
+equality that the candidate relies on, and re-reads the SPIR-V to confirm the
+workgroup variable / barrier are gone and the cooperative-matrix opcode counts
+are unchanged.
+
+Writes only inside this card directory: SELFCHECK.json, plus a `selfcheck`
+member merged into BUILD.json (existing members are kept verbatim).
+
+Run:
+  @NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe selfcheck.py
+"""
+from pathlib import Path
+import json, sys, subprocess, hashlib
+
+CARD = Path(__file__).resolve().parent
+sys.path.insert(0, str(CARD.parent.parent))
+import COMMON as K
+
+PARENT_SPV = Path('@NR_WORKSPACE@/candidates/zcode-fp16-b5-global-expansion-20261020/'
+                  'split16-s21-seed-direct-v1/spv/split16_s21_seed_direct.spv')
+PARENT_SRC = Path('@NR_WORKSPACE@/candidates/zcode-fp16-b5-global-expansion-20261020/'
+                  'split16-s21-seed-direct-v1/source/split16_projection_fp16.comp')
+GROUP_SHA = '59d3aa071de24bf738a8fc893b1b28c6036b5ab272398e936b67782361a1687c'
+ORDINALS = [61, 65, 69, 73, 77, 81, 85, 89, 135, 139, 143, 147, 151, 155, 159, 163]
+NAMES = ['split16_b23_l1', 'split16_b24_l1', 'split16_b25_l1', 'split16_b26_l1',
+         'split16_b27_l1', 'split16_b28_l1', 'split16_b29_l1', 'split16_b30_l1',
+         'split16_b40_l1', 'split16_b41_l1', 'split16_b42_l1', 'split16_b43_l1',
+         'split16_b44_l1', 'split16_b45_l1', 'split16_b46_l1', 'split16_b47_l1']
+EXPECT_CPU = 'CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded'
+
+BUILD = CARD / '_build'
+BUILD.mkdir(exist_ok=True)
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+# ---------------------------------------------------------------- 1 parent bytes
+def check_parent_bytes():
+    rebuilt = CARD / 'parent-rebuild.spv'
+    a = rebuilt.read_bytes()
+    b = PARENT_SPV.read_bytes()
+    first_diff = None
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            first_diff = i
+            break
+    res = dict(rebuilt=str(rebuilt), rebuilt_sha256=sha(rebuilt), rebuilt_bytes=len(a),
+               baseline_spv=str(PARENT_SPV), baseline_sha256=sha(PARENT_SPV), baseline_bytes=len(b),
+               same_length=len(a) == len(b), first_differing_byte=first_diff,
+               byte_identical=(a == b), sha_matches_recorded=(sha(rebuilt) == GROUP_SHA))
+    # re-derive from the frozen source with the recorded recipe (raw, one include dir)
+    out = BUILD / 'sc-parent.spv'
+    K.compile_glsl(PARENT_SRC, out, [PARENT_SRC.parent])
+    res['recipe'] = 'raw; glslang -V --target-env vulkan1.3 -I<parent source dir>'
+    res['rederived_sha256'] = sha(out)
+    res['rederived_matches'] = res['rederived_sha256'] == GROUP_SHA
+    res['pass'] = (res['byte_identical'] and res['sha_matches_recorded']
+                   and res['rederived_matches'])
+    return res
+
+
+# ---------------------------------------------------------------- 2 validation
+def run_tool(argv):
+    r = subprocess.run([str(x) for x in argv], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    return dict(argv=[str(x) for x in argv], returncode=r.returncode,
+                stdout=(r.stdout or '').strip(), stderr=(r.stderr or '').strip())
+
+
+def check_validate():
+    cand = run_tool([K.VALIDATE, CARD / 'candidate.spv'])
+    par = run_tool([K.VALIDATE, CARD / 'parent-rebuild.spv'])
+    return dict(candidate=dict(result=cand['returncode'], output=cand['stdout'] or cand['stderr']),
+                parent=dict(result=par['returncode'], output=par['stdout'] or par['stderr']),
+                candidate_ok=(cand['returncode'] == 0),
+                parent_ok=(par['returncode'] == 0),
+                tool=str(K.VALIDATE),
+                pass_=(cand['returncode'] == 0 and par['returncode'] == 0),
+                **{'pass': (cand['returncode'] == 0 and par['returncode'] == 0)})
+
+
+# ---------------------------------------------------------------- 3 plan diff
+def check_plan():
+    base = K.BASELINE.read_text(encoding='utf-8-sig').splitlines()
+    cand = (CARD / 'plan.txt').read_text(encoding='utf-8-sig').splitlines()
+    res = dict(baseline_plan=str(K.BASELINE), baseline_sha256=sha(K.BASELINE),
+               candidate_plan=str(CARD / 'plan.txt'), candidate_sha256=sha(CARD / 'plan.txt'),
+               baseline_sha_matches_contract=(sha(K.BASELINE) == K.BASELINE_SHA),
+               baseline_lines=len(base), candidate_lines=len(cand),
+               same_line_count=(len(base) == len(cand)))
+    if not res['same_line_count']:
+        res['pass'] = False
+        return res
+    changed = [i for i in range(len(base)) if base[i] != cand[i]]
+    rows = []
+    ok = True
+    seen = []
+    cand_spv = (CARD / 'candidate.spv').as_posix()
+    parent_spv = PARENT_SPV.as_posix()
+    for i in changed:
+        bt, ct = base[i].split(), cand[i].split()
+        row = dict(line=i + 1, pass_label=bt[1], name=bt[2].strip('"'),
+                   baseline=base[i], candidate=cand[i])
+        row_ok = (len(bt) == len(ct) and bt[0] == 'PASS' and bt[1] == ct[1]
+                  and bt[2] == ct[2]
+                  and bt[3].strip('"') == parent_spv
+                  and ct[3].strip('"') == cand_spv
+                  and bt[4:] == ct[4:])
+        row['only_spv_path_differs'] = row_ok
+        if not row_ok:
+            ok = False
+        seen.append((int(bt[1]), bt[2].strip('"')))
+        rows.append(row)
+    by_row = {int(r['pass_label']): r for r in K.rows() if r['spv_sha256'] == GROUP_SHA}
+    want_labels = sorted(by_row)
+    res['changed_lines'] = len(changed)
+    res['changed_line_numbers'] = [r['line'] for r in rows]
+    res['rows'] = rows
+    res['replaced_passes'] = len(changed)
+    res['replaced_pass_labels'] = [b[0] for b in sorted(seen)]
+    res['replaced_pass_names'] = [b[1] for b in sorted(seen)]
+    res['expected_pass_labels'] = want_labels
+    res['expected_ordinals'] = [by_row[lab]['ordinal'] for lab in want_labels]
+    res['ordinals_for_replaced_rows'] = [by_row[lab]['ordinal'] for lab in sorted(b[0] for b in seen)
+                                         if lab in by_row]
+    res['pass_labels_match_group'] = sorted(b[0] for b in sorted(seen)) == want_labels
+    res['names_match_group'] = [b[1] for b in sorted(seen)] == [by_row[lab]['name'] for lab in want_labels]
+    res['only_this_group_replaced'] = ok
+    res['unchanged_lines'] = len(base) - len(changed)
+    res['pass'] = (ok and len(changed) == 16 and res['pass_labels_match_group']
+                   and res['names_match_group'])
+    return res
+
+
+# ---------------------------------------------------------------- 4 cpu-check
+def check_cpu():
+    base = K.cpu_check(K.BASELINE).strip()
+    cand = K.cpu_check(CARD / 'plan.txt').strip()
+    return dict(baseline=base, candidate=cand, identical=(base == cand),
+                matches_contract_line=(cand == EXPECT_CPU),
+                expected=EXPECT_CPU, mode='clock_runner --plan <p> --cpu-check (CPU only; '
+                                          'reports "no Vulkan loaded")',
+                pass_=(cand == EXPECT_CPU and base == EXPECT_CPU),
+                **{'pass': (cand == EXPECT_CPU and base == EXPECT_CPU)})
+
+
+# ---------------------------------------------------------------- address algebra
+def tiled(token, c, cap):
+    return ((token // 16) * (cap // 16) + c // 16) * 256 + (token % 16) * 16 + (c % 16)
+
+
+def check_addresses():
+    """Re-derive the staging/direct address equality for every (token,channel)."""
+    tokens, channels = 1056, 512
+    bad_direct = bad_slot = 0
+    pairs = 0
+    per_wg = {}
+    for gx in range(66):
+        for sg in range(8):
+            m0 = sg // 4 * 8
+            for k in range(0, 512, 16):
+                q = k // 16
+                abase = tiled(gx * 16 + m0, 0, channels)
+                for r in range(8):
+                    for cc in range(16):
+                        tok = gx * 16 + m0 + r
+                        ch = k + cc
+                        direct = abase + q * 256 + r * 16 + cc           # candidate
+                        stage_area = tiled(tok, ch, channels)           # parent, after staging
+                        # parent consumer slot in sx[] (stride 512, row-major)
+                        slot = m0 * 512 + k + r * 512 + cc
+                        # staging producer: sx[e] with e = t*512 + c
+                        stage_slot = (tok - gx * 16) * 512 + ch
+                        pairs += 1
+                        if direct != stage_area:
+                            bad_direct += 1
+                        if slot != stage_slot:
+                            bad_slot += 1
+                        per_wg.setdefault(gx, set()).add(direct)
+    distinct = len(set().union(*per_wg.values()))
+    return dict(pairs=pairs, direct_address_mismatches=bad_direct,
+                staging_slot_mismatches=bad_slot,
+                direct_addresses_distinct=distinct,
+                buffer_extent_halves=540672,
+                extent_equals_pairs=(distinct == 540672),
+                tokens=tokens, channels=channels,
+                pass_=(bad_direct == 0 and bad_slot == 0 and distinct == 540672),
+                **{'pass': (bad_direct == 0 and bad_slot == 0 and distinct == 540672)})
+
+
+# ---------------------------------------------------------------- SPIR-V re-read
+def check_spirv():
+    sys.path.insert(0, str(K.SPV_TOOLS))
+    import spv_tools_local as ST
+    out = {}
+    for tag, path in (('parent', CARD / 'parent-rebuild.spv'),
+                      ('candidate', CARD / 'candidate.spv')):
+        m = ST.Module(path)
+        from collections import Counter
+        hist = Counter(op for op, _, _, _ in m.instructions)
+        wg = [ops for op, ops, _, _ in m.instructions if op == 59 and len(ops) > 2 and ops[2] == 4]
+        out[tag] = dict(sha256=sha(path), instructions=len(m.instructions),
+                        workgroup_variables=len(wg),
+                        control_barriers=hist.get(224, 0),
+                        memory_barriers=hist.get(225, 0),
+                        coop_load=hist.get(4457, 0), coop_store=hist.get(4458, 0),
+                        coop_muladd=hist.get(4459, 0),
+                        float_ops={k: hist.get(k, 0) for k in (129, 131, 133, 136, 140, 141)},
+                        ext_inst=hist.get(12, 0))
+    out['delta'] = dict(instructions=out['candidate']['instructions'] - out['parent']['instructions'],
+                        workgroup_variables=out['candidate']['workgroup_variables'] - out['parent']['workgroup_variables'],
+                        control_barriers=out['candidate']['control_barriers'] - out['parent']['control_barriers'],
+                        coop_load=out['candidate']['coop_load'] - out['parent']['coop_load'],
+                        coop_store=out['candidate']['coop_store'] - out['parent']['coop_store'],
+                        coop_muladd=out['candidate']['coop_muladd'] - out['parent']['coop_muladd'])
+    out['pass'] = (out['parent']['workgroup_variables'] == 1
+                   and out['parent']['control_barriers'] == 1
+                   and out['candidate']['workgroup_variables'] == 0
+                   and out['candidate']['control_barriers'] == 0
+                   and out['candidate']['memory_barriers'] == 0
+                   and out['delta']['coop_load'] == 0
+                   and out['delta']['coop_store'] == 0
+                   and out['delta']['coop_muladd'] == 0
+                   and out['parent']['float_ops'] == out['candidate']['float_ops'])
+    return out
+
+
+def main():
+    res = dict(card='n09b-f09-sx-stage',
+               generated_by='cards/n09b-f09-sx-stage/selfcheck.py',
+               gpu='none: no Vulkan device, no GPU lock, no deployment; --cpu-check only',
+               python=sys.executable)
+    res['parent_bytes'] = check_parent_bytes()
+    res['spv_validate'] = check_validate()
+    res['plan_diff'] = check_plan()
+    res['cpu_check'] = check_cpu()
+    res['address_algebra'] = check_addresses()
+    res['spirv'] = check_spirv()
+    res['shas'] = dict(candidate_spv=sha(CARD / 'candidate.spv'),
+                       candidate_comp=sha(CARD / 'candidate.comp'),
+                       parent_rebuild=sha(CARD / 'parent-rebuild.spv'),
+                       plan=sha(CARD / 'plan.txt'))
+    res['pass'] = all(res[k]['pass'] for k in
+                      ('parent_bytes', 'spv_validate', 'plan_diff', 'cpu_check',
+                       'address_algebra', 'spirv'))
+
+    # --- merge into BUILD.json without touching existing members
+    bj = K.read_json(CARD / 'BUILD.json')
+    keep = list(bj.keys())
+    bj['selfcheck'] = res
+    K.write_json(CARD / 'BUILD.json', bj)
+    K.write_json(CARD / 'SELFCHECK.json', res)
+    print(json.dumps(dict(
+        pass_=res['pass'],
+        parent_byte_identical=res['parent_bytes']['byte_identical'],
+        parent_rederived=res['parent_bytes']['rederived_matches'],
+        validate=(res['spv_validate']['candidate']['result'],
+                  res['spv_validate']['parent']['result']),
+        plan_changed_lines=res['plan_diff']['changed_lines'],
+        plan_ordinals_ok=res['plan_diff']['pass_labels_match_group'],
+        plan_sha=res['plan_diff']['candidate_sha256'],
+        cpu=res['cpu_check']['candidate'],
+        cpu_identical=res['cpu_check']['identical'],
+        addr=dict(pairs=res['address_algebra']['pairs'],
+                  bad=res['address_algebra']['direct_address_mismatches'],
+                  distinct=res['address_algebra']['direct_addresses_distinct']),
+        spirv=res['spirv']['delta'],
+        build_json_keys_before=keep,
+        build_json_keys_after=list(bj.keys()),
+    ), indent=2))
+
+
+if __name__ == '__main__':
+    main()

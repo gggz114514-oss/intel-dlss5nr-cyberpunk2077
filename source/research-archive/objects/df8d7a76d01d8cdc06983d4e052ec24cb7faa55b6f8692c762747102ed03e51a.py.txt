@@ -1,0 +1,79 @@
+"""Merge the accepted chain into a self-contained backend drop and describe it.
+
+What it produces under backend-merged/:
+  plan.txt        byte-identical copy of the accepted chain head (paths unchanged on purpose:
+                  the runner keys pipelines by spv path, so rewriting them would change the
+                  pipeline creation order and therefore the thing we measured)
+  MANIFEST.json   every PASS row that differs from the handoff baseline: ordinal, name, family,
+                  the spv it dispatches, that spv's sha256, and which chain step introduced it
+  SPV-LIST.json   the distinct SPVs the merged plan depends on, with shas and sizes
+  README.md       what changed, per family, and where the timing evidence lives
+"""
+import json, sys
+from collections import defaultdict
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+from audit_card import pass_lines
+
+out = K.C / 'backend-merged'
+out.mkdir(exist_ok=True)
+cur = K.read_json(K.C / 'CURRENT.json')
+head = Path(cur['best_plan']['path'])
+base_rows = K.rows()
+
+# which step introduced each changed row
+owner = {}
+for i, e in enumerate(cur['chain']):
+    p = Path(e['path'])
+    if not p.exists():
+        continue
+    for r in pass_lines(p):
+        owner.setdefault(Path(r['spv']).as_posix(), i)
+
+head_recs = pass_lines(head)
+changed = []
+spvs = {}
+for r in base_rows:
+    h = head_recs[r['ordinal']]
+    same = Path(h['spv']).as_posix() == Path(r['spv']).as_posix()
+    sp = Path(h['spv'])
+    if sp.exists():
+        spvs[sp.as_posix()] = dict(sha256=K.sha(sp), bytes=sp.stat().st_size)
+    if not same:
+        changed.append(dict(ordinal=r['ordinal'], name=r['name'], family=r['family'],
+                            spv=sp.as_posix(), spv_sha256=spvs.get(sp.as_posix(), {}).get('sha256'),
+                            introduced_by=cur['chain'][owner.get(sp.as_posix(), 0)].get('label')))
+
+by_fam = defaultdict(int)
+for c in changed:
+    by_fam[c['family']] += 1
+
+(out / 'plan.txt').write_text(head.read_text(encoding='utf-8-sig'), encoding='utf-8')
+assert K.sha(out / 'plan.txt') == K.sha(head)
+K.write_json(out / 'MANIFEST.json', dict(
+    head=dict(path=str(head), sha256=K.sha(head)),
+    handoff=dict(path=str(K.BASELINE), sha256=K.BASELINE_SHA),
+    changed_rows=len(changed), changed_per_family=dict(sorted(by_fam.items())),
+    chain=[dict(label=e.get('label'), path=e['path'], sha256=e['sha256'],
+                saving_ms=e.get('saving_ms'), kind=e.get('kind', 'adopt')) for e in cur['chain']],
+    rows=changed))
+K.write_json(out / 'SPV-LIST.json', dict(distinct=len(spvs), spvs=spvs))
+
+lines = ['# 融合后的后端（chain head %s）' % K.sha(head)[:12], '',
+         '- 计划：`plan.txt`（与接受链头**逐字节相同**；故意不改 SPV 路径，因为 runner 的 pipeline key '
+         '含路径，重写会改变 pipeline 创建顺序，也就改变了我们测到的东西）', '',
+         '| 项 | 值 |', '|---|---|',
+         '| 相对 handoff 改变的 PASS 行 | **%d** |' % len(changed),
+         '| 涉及族 | %s |' % '、'.join('%s %d' % (f, n) for f, n in sorted(by_fam.items())),
+         '| 依赖的不同 SPV | %d |' % len(spvs),
+         '| 链上步骤 | %d（采纳 %d + 消融/恢复各 1） |' % (
+             len(cur['chain']), sum(1 for e in cur['chain'] if not e.get('kind'))),
+         '', '逐行明细见 `MANIFEST.json`，SPV 清单与 sha 见 `SPV-LIST.json`。', '',
+         '## 计时口径', '',
+         '所有数字都是**同批配对**（6 组交替或 6 个 ABC 全排列，30 样本/臂，全部保留，不剔尖峰），',
+         '端到端数字取 handoff 基线与本计划的直接 A/B；单点增量之和不可作为端到端收益。', '']
+(out / 'README.md').write_text('\n'.join(lines), encoding='utf-8')
+print('merged rows', len(changed), 'per family', dict(sorted(by_fam.items())))
+print('distinct spv', len(spvs))
+print('plan sha', K.sha(out / 'plan.txt'))

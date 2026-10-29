@@ -1,0 +1,101 @@
+// Block30 l3 INT8 (B line).  Independent contract: B30-L3-CONTRACT.json.
+// A = qT (T quantised once by the b30_qt_producer pass), B = W8 l3 weights,
+// INT8xINT8 -> INT32.  Dequant f32*(sT*sW3[n]), add the original half seed
+// (Y*gain) as f32, one half narrowing, then the parent's skip store and the
+// unchanged pool half tree.  The parent seeded the FP32 accumulator before the
+// K loop; an INT32 accumulator cannot be seeded, so this candidate's declared
+// order is post-accumulation seed add (recorded in the contract).  No runtime
+// max reduction; 1/sT is static in the pack.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x=256) in;
+#include "b30_l34_common.glsl"
+shared int8_t sx8[8192];
+shared float scratch[1024];
+uint token_at(uint s) { return spatial_token(gl_WorkGroupID.x,s); }
+
+void main() {
+    uint lid=gl_LocalInvocationID.x,sg=lid/32u,lane=lid%32u,ng=gl_WorkGroupID.y;
+    // qPool/pool are resident in the diagnostic plan; the parent POLICY clear is
+    // skipped for resident buffers.  Zero the 24 padding tokens (Px=22,23) here
+    // before any valid pool write; the addresses are disjoint from the writes.
+    uint gtid=(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*gl_WorkGroupSize.x+lid;
+    if(gtid<12288u) {
+        // padding raster positions Px=22,23 (24 pixels x 512 channels), not the
+        // last 24 pool tokens: block-major tokens are interleaved.
+        uint pid=gtid/512u,c=gtid%512u;
+        uint Px=22u+pid%2u,Py=pid/2u;
+        uint tok=((Py/4u)*uint(pc.p7.x/4u)+Px/4u)*16u+4u*(Py%4u)+Px%4u;
+        uint a=tiled(tok,c,512u);
+        gp[a]=float16_t(0); qp[a]=int8_t(0);
+    }
+    for(uint e=lid;e<8192u;e+=256u) {
+        uint t=token_at(e/512u),c=e%512u;
+        sx8[e]=qt[tiled(t,c,512u)];
+    }
+    barrier();
+    uint m0=sg/4u*8u,n0=(sg%4u)*32u,base=ng*128u+n0;
+    CA acc0=CA(0),acc1=CA(0);
+    for(uint k=0u;k<512u;k+=32u) {
+        CIA a;CIB b0,b1;
+        coopMatLoad(a,sx8,m0*512u+k,512u,ROW);
+        coopMatLoad(b0,w3,w8_tile(base,k),32u,COL);
+        coopMatLoad(b1,w3,w8_tile(base+16u,k),32u,COL);
+        acc0=coopMatMulAdd(a,b0,acc0);acc1=coopMatMulAdd(a,b1,acc1);
+    }
+    for(uint side=0u;side<2u;side++) {
+        // original seed: half(Y)*half(gain), staged to f32 exactly as the parent
+        for(uint e=lane;e<128u;e+=32u) {
+            uint t=token_at(m0+e/16u),c=base+side*16u+e%16u;
+            precise float16_t seed=gy[tiled(t,c,512u)]*weights[uint(pc.p3.w)+c];
+            scratch[sg*128u+e]=float(seed);
+        }
+        subgroupMemoryBarrierShared();subgroupBarrier();
+        CF sd; coopMatLoad(sd,scratch,sg*128u,16u,ROW);
+        CF f; if(side==0u) f=CF(acc0); else f=CF(acc1);
+        precise CF s; coopMatLoad(s,wsc3,base+16u*side,0u,ROW);
+        f=f*s;
+        f=f+sd;
+        MH h=MH(f);
+        coopMatStore(h,go,tiled(token_at(m0),base+16u*side,512u),16u,ROW);
+        uint lv=gl_SubgroupInvocationID;
+        uint q0=subgroupShuffle(packFloat2x16(f16vec2(h[0],h[2])),lv^16u);
+        uint q1=subgroupShuffle(packFloat2x16(f16vec2(h[1],h[3])),lv^16u);
+        if(lv<16u) {
+            f16vec2 o0=unpackFloat2x16(q0),o1=unpackFloat2x16(q1);
+            const uint c=base+16u*side+(lv&15u);
+            const uint tx=gl_WorkGroupID.x%uint(pc.p0.x/4u);
+            const uint ty=gl_WorkGroupID.x/uint(pc.p0.x/4u);
+            {
+                precise float16_t a=h[0]+o0.x;
+                precise float16_t bb=h[2]+o0.y;
+                precise float16_t sum=a+bb;
+                uint p=2u*(m0/8u);
+                uint Px=tx*2u+p%2u,Py=ty*2u+p/2u;
+                uint tok=((Py/4u)*uint(pc.p7.x/4u)+Px/4u)*16u+4u*(Py%4u)+Px%4u;
+                float16_t v=sum*float16_t(0.25);
+                gp[tiled(tok,c,512u)]=v;
+                qp[tiled(tok,c,512u)]=q_half(v,invs[1]);
+            }
+            {
+                precise float16_t a=h[1]+o1.x;
+                precise float16_t bb=h[3]+o1.y;
+                precise float16_t sum=a+bb;
+                uint p=2u*(m0/8u)+1u;
+                uint Px=tx*2u+p%2u,Py=ty*2u+p/2u;
+                uint tok=((Py/4u)*uint(pc.p7.x/4u)+Px/4u)*16u+4u*(Py%4u)+Px%4u;
+                float16_t v=sum*float16_t(0.25);
+                gp[tiled(tok,c,512u)]=v;
+                qp[tiled(tok,c,512u)]=q_half(v,invs[1]);
+            }
+        }
+        subgroupMemoryBarrierShared();subgroupBarrier();
+    }
+}

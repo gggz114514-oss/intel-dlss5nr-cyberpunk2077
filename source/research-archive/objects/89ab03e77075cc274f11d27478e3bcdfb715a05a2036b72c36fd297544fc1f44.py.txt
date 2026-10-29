@@ -1,0 +1,153 @@
+"""n18b-f01-gather: entry-region message ledger with the *measured* lane width,
+plus the cost model of the two sharing schemes the card proposes.
+
+Inputs (read-only): the two ISA captures, the chain-head plan's PASS 0 header.
+Output: tools/region-ledger.json
+
+Ledger facts taken from the ISA itself (not from a source-level assumption):
+  - the entry region is the divergent region entered at 0x390 after
+    `cmp (lt) lane,16` and closed at the join target (isa-mask-proof.json),
+  - it contains 80 messages, of which 73 are scalar `load.ugm.d32` gathers,
+  - the gathers carry 16 lane addresses each (region mask), i.e. 64 B payload.
+
+The two sharing schemes:
+  S1 "one owner reads, the others take the value from registers" (intra-SG):
+     requires the 16 lanes of one SG to need the same pixels - they do not
+     (lane_map.py: 16 distinct pixels per SG, bijective onto a 4x4 quadrant).
+  S2 "one owner reads, the others take it from SLM" (cross-SG):
+     requires >=2 SGs to need the same pixels - they do not (the four
+     quadrants are pairwise disjoint), and SLM has 0 B of headroom.
+"""
+import json, re, sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(CARD / 'tools'))
+import isa_mask_proof as M
+
+PLAN = CARD.parents[1] / 'accepted' / 'n18-f01-entry-20261027' / 'plan.txt'
+ISA = M.FILES['current_head_54249010bf7e593b']
+
+
+def msg_class(comment):
+    m = re.search(r';\s*([a-z0-9_.\[\]]+?)(?:\.a(?:32|64))?', comment)
+    kind = 'send'
+    if 'load.ugm' in comment:
+        kind = 'load.ugm'
+    elif 'store.ugm' in comment:
+        kind = 'store.ugm'
+    elif 'load.slm' in comment:
+        kind = 'load.slm'
+    elif 'store.slm' in comment:
+        kind = 'store.slm'
+    elif 'fence.slm' in comment:
+        kind = 'fence.slm'
+    elif 'fence.ugm' in comment:
+        kind = 'fence.ugm'
+    elif 'signal barrier' in comment:
+        kind = 'signal barrier'
+    elif 'end of thread' in comment:
+        kind = 'eot'
+    m2 = re.search(r'(load|store)\.(ugm|slm)\.([a-z0-9]+)', comment)
+    detail = m2.group(0) if m2 else kind
+    return kind, detail
+
+
+def main():
+    ins = M.parse(ISA)
+    proof = json.loads((CARD / 'tools' / 'isa-mask-proof.json').read_text(encoding='utf-8'))
+    reg = proof['files']['current_head_54249010bf7e593b']['region']
+    start, end = reg['entry_offset'], reg['end_offset']
+
+    table = {}
+    for i in ins:
+        if i['op'] not in ('send.ugm', 'send.slm', 'send.gtwy') or not (start < i['offset'] < end):
+            continue
+        comment = i['text'].split('//')[-1] if '//' in i['text'] else ''
+        kind, detail = msg_class(comment)
+        table.setdefault(detail, 0)
+        table[detail] += 1
+
+    plan_head = [l for l in PLAN.read_text(encoding='utf-8-sig').splitlines() if l.startswith('PASS 0 ')][0]
+    fields = plan_head.split()
+    header = dict(local_size=int(fields[4]), shared_bytes=int(fields[5]),
+                  grid=[int(fields[8]), int(fields[9]), int(fields[10])],
+                  raw_header=' '.join(fields[4:11]))
+
+    gather_msgs = table.get('load.ugm.d32', 0)
+    lanes = 16
+    wgs = header['grid'][0] * header['grid'][1]
+    bytes_lane_program = gather_msgs * lanes * 4
+    out = {
+        "card": "n18b-f01-gather",
+        "plan_pass0_header": header,
+        "region": {"entry": hex(start), "end": hex(end),
+                   "instructions": reg['instructions'], "messages": reg['sends']},
+        "messages_by_type": dict(sorted(table.items(), key=lambda kv: -kv[1])),
+        "gather_ledger": {
+            "messages": gather_msgs,
+            "active_lanes": lanes,
+            "payload_bytes_per_message": lanes * 4,
+            "bytes_per_lane_program": bytes_lane_program,
+            "bytes_per_wg": bytes_lane_program * 4,
+            "bytes_per_dispatch": bytes_lane_program * 4 * wgs,
+            "MB_per_dispatch": bytes_lane_program * 4 * wgs / 1e6,
+            "n18_claimed_bytes_per_lane_program": gather_msgs * 32 * 4,
+            "n18_claimed_MB_per_dispatch": gather_msgs * 32 * 4 * 4 * wgs / 1e6,
+            "phantom_MB_per_dispatch": gather_msgs * 16 * 4 * 4 * wgs / 1e6,
+            "lane_utilisation_of_region": lanes / 32.0,
+        },
+        "slm_budget": {
+            "plan_shared_bytes": header['shared_bytes'],
+            "source_declaration": {"shK": 2048 * 2, "shV": 2048 * 2, "shResidual": 512 * 2,
+                                   "total": (2048 + 2048 + 512) * 2},
+            "headroom_bytes": header['shared_bytes'] - (2048 + 2048 + 512) * 2,
+            "exact_match": header['shared_bytes'] == (2048 + 2048 + 512) * 2,
+        },
+        "sharing_models": {
+            "S1_intra_sg_register_broadcast": {
+                "shared_values_available": 0,
+                "reason": "each of the 16 active lanes of one SG reads a different pixel "
+                          "(lane_map.py: bijection onto the 4x4 quadrant); nothing to broadcast",
+                "cost_if_forced": "16 shuffles per value group + no saved message",
+                "verdict": "strict loss",
+            },
+            "S2_cross_sg_slm_broadcast": {
+                "shared_values_available": 0,
+                "reason": "the four SGs' active pixel sets are pairwise disjoint "
+                          "(q=0 cols0-3/rows0-3, q=1 cols4-7/rows0-3, q=2 cols0-3/rows4-7, "
+                          "q=3 cols4-7/rows4-7), so an owner/consumer relation does not exist",
+                "hypothetical_best_case": {
+                    "owners": 2, "consumers": 2,
+                    "messages_saved": 2 * gather_msgs,
+                    "messages_added": gather_msgs + 2 * gather_msgs,
+                    "barriers_added": 2,
+                    "barrier_kind": "workgroup OpControlBarrier + OpMemoryBarrier(WorkgroupMemory); "
+                                    "today only subgroupMemoryBarrierShared()+subgroupBarrier() exist",
+                    "slm_needed_bytes": gather_msgs * 16 * 4,
+                    "slm_headroom_bytes": header['shared_bytes'] - (2048 + 2048 + 512) * 2,
+                    "verdict": "net +%d messages, +2 workgroup barriers, and the SLM "
+                               "footprint does not fit at all" % (gather_msgs + 2 * gather_msgs - 2 * gather_msgs),
+                },
+                "verdict": "infeasible (no shared values) and unaffordable (0 B SLM headroom)",
+            },
+        },
+        "width_merge_note": {
+            "statement": "The only remaining way to lower the gather *message* count is per-pixel "
+                         "width (3 channel messages -> 1 wider read), not de-duplication. That is a "
+                         "different mechanism (n18 option c) and is not built by this card.",
+            "line_traffic_argument": "pixel stride is 4 floats = 16 B, so one 16-lane channel gather "
+                                     "already touches 4 x 64 B lines (4 rows x 64 B); a 16-B per-lane "
+                                     "read touches the same 4 lines, so a width merge cannot increase "
+                                     "cache-line traffic - only request bytes (+33%) change.",
+        },
+    }
+    (CARD / 'tools' / 'region-ledger.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print(json.dumps(out['messages_by_type'], indent=1))
+    print(json.dumps(out['region'], indent=1))
+    print(json.dumps(out['gather_ledger'], indent=1))
+    print(json.dumps(out['slm_budget'], indent=1))
+
+
+if __name__ == '__main__':
+    main()

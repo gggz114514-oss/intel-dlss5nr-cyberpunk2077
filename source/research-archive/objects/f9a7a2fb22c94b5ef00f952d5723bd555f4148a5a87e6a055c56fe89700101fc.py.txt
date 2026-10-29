@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Apply the R12 PV-INT8 change set (C1..C8) to a split16 l2 source file.
+
+The same eight edits apply to both module identities of R12:
+  * the 15 ordinary positions (`split16_attention_qkv_int8_inline.comp`, prod build with
+    -DL2_INLINE_QT=1 -DL2_NO_T_WRITE=1),
+  * block30 (`split16_attention_qkv_int8.comp`, no macros: it still writes the half T
+    that its own l3 consumes).
+They differ only in the PV-exit tail, which this change set does not touch.
+
+Every anchor must occur exactly once; the script fails loudly otherwise, so an
+unexpected source drift cannot silently produce a partial patch.
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+EDITS = [
+    ("C1", """shared int8_t sy8[4096];
+#define sy phase
+#define sp phase
+#if !ROW_OWNER
+shared float16_t sn[256]; // Only the ticket's A_ONLY attribution path.
+#endif
+// PV uses the retired Q prefix as its standard half bridge; P stays live.
+// Q[0..1024) is dead after the score WG barrier, V remains at [4096..6144).
+uint v_raw(uint e) { return e<4096u ? e : 4096u+((e-4096u)%32u)*64u+(e-4096u)/32u; }
+uint wq_tile(uint r,uint k) { return uint(pc.p3.y)+((r/16u)*32u+k/16u)*256u; }
+""",
+     """shared int8_t sy8[4096];
+#define sy phase
+#define sp phase
+#if !ROW_OWNER
+shared float16_t sn[256]; // Only the ticket's A_ONLY attribution path.
+#endif
+// R12-C1 PV int8 operands. All three live only between the post-score barrier and PV:
+//   sv8[2048]   V as int8, same ch-major addressing as qkv[4096..): sv8[dim*64+key]
+//   shPsf[1024] per-query dequant sP*sV broadcast over 16 dim columns (row = query)
+//   shVMax      |V| bit-pattern max of this workgroup's head slab (absmax publisher)
+// sy8 is the P int8 tile: the QKV staging is dead once the QKV loop ends, so the
+// [64 query][64 key] probability codes reuse it with the parent's stride 64.
+shared int8_t sv8[2048];
+shared float shPsf[1024];
+shared uint shVMax;
+// PV uses the retired Q prefix as its standard half bridge; P stays live.
+// Q[0..1024) is dead after the score WG barrier, V remains at [4096..6144).
+uint v_raw(uint e) { return e<4096u ? e : 4096u+((e-4096u)%32u)*64u+(e-4096u)/32u; }
+uint wq_tile(uint r,uint k) { return uint(pc.p3.y)+((r/16u)*32u+k/16u)*256u; }
+// R12-C2 one quantisation per element, identical arithmetic to the measured adapter
+// (R04 i8code): one FP32 scale of the exact half value, one roundEven, one clamp.
+int i8code(float16_t v,float invs) {
+    precise float scaled=float(v)*invs;
+    return int(clamp(roundEven(scaled),-127.0,127.0));
+}
+"""),
+    ("C3", """    uint w=wy*uint(pc.p1.x)+wx;
+""",
+     """    uint w=wy*uint(pc.p1.x)+wx;
+    // R12-C3 shVMax is initialised before any reader exists; the parent's post-QKV
+    // barrier publishes it, so the V absmax costs no extra synchronisation.
+    if(lid==0u) shVMax=0u;
+"""),
+    ("C4", """#endif
+    barrier();
+    for(uint j=0u;j<2u;j++) {
+""",
+     """#endif
+    barrier();
+    // R12-C4 V absmax for this head slab (64 tokens x 32 dims = 2048 half). All 256
+    // threads sweep the exact linear qkv index, so sv8[f] and qkv[4096+f] stay the
+    // same element. Published by the parent's post-score barrier; no new barrier.
+    // abs(half) -> float is exact, so the uint bit pattern orders like |V|.
+    for(uint f=lid;f<2048u;f+=256u)
+        atomicMax(shVMax,floatBitsToUint(abs(float(VBUF[VBASE+f]))));
+    for(uint j=0u;j<2u;j++) {
+"""),
+    ("C5-C7", """    barrier();
+    if(lid<64u) {
+        float16_t part[8];""",
+     """    barrier();
+    // R12-C5 dynamic scales for PV, read/derived in this phase only:
+    //   sV per workgroup = per (head, window): |V|max/127 over the 2048 V halfs
+    //   sP per query (row owner thread): max of the 64 normalised P halfs /127
+    // The P half values are the parent's exact H(P*inv); the int8 code is one
+    // roundEven of that same half value, so PV never sees a different P input.
+    const float sV=(shVMax==0u)?1.0:(uintBitsToFloat(shVMax)*(1.0/127.0));
+    const float sVinv=1.0/sV;
+    if(lid<64u) {
+        float16_t part[8];"""),
+    ("C6", """#if ROW_OWNER
+        float16_t inv=float16_t(1.0/max(float(total),6.103515625e-05));
+        for(uint c=0u;c<64u;c++) {
+            uint e=lid*64u+c;
+            sp[e]=sp[e]*inv;
+            if(pc.p5.x!=0) dbg[ldbg(3u,w,h,e)]=float(sp[e]);
+        }
+#else""",
+     """#if ROW_OWNER
+        float16_t inv=float16_t(1.0/max(float(total),6.103515625e-05));
+        float16_t pmx=float16_t(0.0);
+        for(uint c=0u;c<64u;c++) {
+            uint e=lid*64u+c;
+            sp[e]=sp[e]*inv;
+            pmx=max(pmx,sp[e]);
+            if(pc.p5.x!=0) dbg[ldbg(3u,w,h,e)]=float(sp[e]);
+        }
+        // R12-C6 per-query probability code: P<=1 always (inv=1/max(sum,2^-14)), so
+        // pmx*(127/pmx)=127 never saturates; pmx==0 degenerates to all-zero codes.
+        precise float pScale=(pmx>float16_t(0.0))?(float(pmx)*(1.0/127.0)):0.0;
+        const float pInv=(pmx>float16_t(0.0))?(127.0/float(pmx)):0.0;
+        for(uint c=0u;c<64u;c++) sy8[lid*64u+c]=int8_t(i8code(sp[lid*64u+c],pInv));
+        for(uint c=0u;c<16u;c++) shPsf[lid*16u+c]=pScale*sV;
+#else"""),
+    ("C7", """#endif
+    barrier();
+    uint m0=sg*8u;
+    MC acc0=MC(0.0),acc1=MC(0.0);
+    for(uint k=0u;k<64u;k+=16u) {
+        MA a;MB b0,b1;
+        coopMatLoad(a,sp,m0*64u+k,64u,ROW);
+        coopMatLoad(b0,VBUF,VBASE+k,64u,COL);
+        coopMatLoad(b1,VBUF,VBASE+16u*64u+k,64u,COL);
+        acc0=coopMatMulAdd(a,b0,acc0);acc1=coopMatMulAdd(a,b1,acc1);
+    }
+    for(uint side=0u;side<2u;side++) {
+        if(side==0u) { CH narrowed=CH(acc0); coopMatStore(narrowed,qkv,sg*128u,16u,ROW); }
+        else { CH narrowed=CH(acc1); coopMatStore(narrowed,qkv,sg*128u,16u,ROW); }
+""",
+     """#endif
+    // R12-C7 V -> int8 once, in this phase; sv8[f] and qkv[4096+f] are the same
+    // linear dim*64+token index, so this is a stride-1 copy with no bank conflict.
+    for(uint f=lid;f<2048u;f+=256u) sv8[f]=int8_t(i8code(VBUF[VBASE+f],sVinv));
+    barrier();
+    uint m0=sg*8u;
+#if ROW_OWNER
+    // R12-C8 PV = P_int8(8q x K32) x V_int8(K32 x 16d), K64 as two K32 slices in the
+    // parent's K order (keys 0..31 then 32..63) sharing one (sP,sV) pair, so both
+    // slices stay the same mathematical quantity in one int32 accumulator.
+    CA acc0=CA(0),acc1=CA(0);
+    {
+        CIA a;CIB b0,b1;
+        coopMatLoad(a,sy8,m0*64u,64u,ROW);
+        coopMatLoad(b0,sv8,0u,64u,COL);
+        coopMatLoad(b1,sv8,16u*64u,64u,COL);
+        acc0=coopMatMulAdd(a,b0,acc0);acc1=coopMatMulAdd(a,b1,acc1);
+    }
+    {
+        CIA a;CIB b0,b1;
+        coopMatLoad(a,sy8,m0*64u+32u,64u,ROW);
+        coopMatLoad(b0,sv8,32u,64u,COL);
+        coopMatLoad(b1,sv8,16u*64u+32u,64u,COL);
+        acc0=coopMatMulAdd(a,b0,acc0);acc1=coopMatMulAdd(a,b1,acc1);
+    }
+    // Dequant sV*sP(query) once in FP32. shPsf holds the per-query factor broadcast
+    // over the 16 dim columns, so the row scale is carried by the load address and no
+    // lane/component map is assumed. One MC->MH narrowing, exactly like the parent.
+    CF sfm; coopMatLoad(sfm,shPsf,m0*16u,16u,ROW);
+#else
+    MC acc0=MC(0.0),acc1=MC(0.0);
+    for(uint k=0u;k<64u;k+=16u) {
+        MA a;MB b0,b1;
+        coopMatLoad(a,sp,m0*64u+k,64u,ROW);
+        coopMatLoad(b0,VBUF,VBASE+k,64u,COL);
+        coopMatLoad(b1,VBUF,VBASE+16u*64u+k,64u,COL);
+        acc0=coopMatMulAdd(a,b0,acc0);acc1=coopMatMulAdd(a,b1,acc1);
+    }
+#endif
+    for(uint side=0u;side<2u;side++) {
+#if ROW_OWNER
+        if(side==0u) { CH narrowed=CH(CF(acc0)*sfm); coopMatStore(narrowed,qkv,sg*128u,16u,ROW); }
+        else { CH narrowed=CH(CF(acc1)*sfm); coopMatStore(narrowed,qkv,sg*128u,16u,ROW); }
+#else
+        if(side==0u) { CH narrowed=CH(acc0); coopMatStore(narrowed,qkv,sg*128u,16u,ROW); }
+        else { CH narrowed=CH(acc1); coopMatStore(narrowed,qkv,sg*128u,16u,ROW); }
+#endif
+"""),
+]
+
+
+def apply(src_text):
+    text = src_text
+    applied = []
+    for cid, old, new in EDITS:
+        n = text.count(old)
+        if n != 1:
+            raise SystemExit("anchor %s occurs %d times (expected 1)" % (cid, n))
+        text = text.replace(old, new)
+        applied.append({"id": cid, "anchor_lines": old.count("\n"),
+                        "added_lines": new.count("\n")})
+    return text, applied
+
+
+def main(argv):
+    src, dst, rep = argv[0], argv[1], argv[2]
+    raw = Path(src).read_bytes()
+    text = raw.decode("utf-8")
+    crlf = "\r\n" in text
+    lf = text.replace("\r\n", "\n")
+    out, applied = apply(lf)
+    if crlf:
+        out = out.replace("\n", "\r\n")
+    Path(dst).write_bytes(out.encode("utf-8"))
+    rec = {"source": src, "source_sha256": hashlib.sha256(raw).hexdigest(),
+           "source_line_endings": "CRLF" if crlf else "LF",
+           "candidate": dst, "candidate_sha256": hashlib.sha256(out.encode("utf-8")).hexdigest(),
+           "source_lines": lf.count("\n") + (0 if lf.endswith("\n") else 1),
+           "candidate_lines": out.count("\r\n" if crlf else "\n") + (0 if out.endswith("\n") else 1),
+           "edits": applied, "edit_count": len(applied),
+           "removed_lines": sum(e["anchor_lines"] for e in applied),
+           "added_lines": sum(e["added_lines"] for e in applied)}
+    Path(rep).write_text(json.dumps(rec, indent=1) + "\n", encoding="utf-8", newline="\n")
+    print("applied", len(applied), "edits ->", dst, rec["candidate_sha256"][:16])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

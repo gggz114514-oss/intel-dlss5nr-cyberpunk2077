@@ -1,0 +1,135 @@
+"""S03-tail audit step 1: plan-wide SPV dtype re-verification (independent of ledger).
+
+For both the incumbent FP16 plan and the current INT8 candidate:
+  * enumerate every dispatch (0-based ordinal + name + SPV SHA),
+  * scan every distinct SPV with spvscan (cooperative-matrix component types),
+  * classify each dispatch by measured matrix dtype (INT8 / FP16 / MIXED / none),
+  * classify by *name* heuristic (i8/int8/qx/i8mma markers),
+  * emit the disagreements, which are exactly the "name says INT8 but the kernel is
+    something else (or the other way round)" positions the card asks about.
+
+Writes only into S03-tail/evidence.
+"""
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import planparse  # noqa: E402
+import spvscan  # noqa: E402
+
+B = Path("@NR_WORKSPACE@")
+PLANS = {
+    "fp16_incumbent": B / "work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/backend-merged/plan.txt",
+    "int8_candidate_combo34189": B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24/c64-family-static/combo-34189.txt",
+}
+
+INT8_NAME = re.compile(r"(i8|int8|_qx|qx_|i8mma)", re.I)
+
+
+def classify(s: dict) -> str:
+    if "error" in s:
+        return "ERROR"
+    if s["mma_int8"] and not s["mma_fp16"]:
+        return "INT8"
+    if s["mma_fp16"] and not s["mma_int8"]:
+        return "FP16"
+    if s["mma_int8"] and s["mma_fp16"]:
+        return "MIXED"
+    if s["int_dots"]:
+        return "INT_DOT"
+    return "NO_MATRIX"
+
+
+def main() -> None:
+    out = {"plans": {}, "spv_cache": {}}
+    cache: dict[str, dict] = {}
+    for plan_key, plan_path in PLANS.items():
+        plan = planparse.load(plan_path)
+        rows = []
+        for p in plan.passes:
+            key = str(Path(p.spv)).replace("\\", "/")
+            if key not in cache:
+                try:
+                    cache[key] = spvscan.scan(Path(key))
+                except Exception as exc:  # noqa: BLE001
+                    cache[key] = {"error": f"{type(exc).__name__}: {exc}"}
+            s = cache[key]
+            measured = classify(s)
+            meas = {} if "error" in s else {
+                "int8_mma": s["mma_int8"], "fp16_mma": s["mma_fp16"],
+                "other_mma": s["mma_other"], "int_dots": s["int_dots"],
+                "sha256": s["sha256"], "bytes": s["bytes"],
+                "has_127": s["has_float_127"], "has_inv127": s["has_float_inv127"],
+                "ext_inst": s["ext_inst"],
+            }
+            binds = []
+            for b in p.binds:
+                buf = plan.buffers[b["buffer"]] if b["buffer"] < len(plan.buffers) else None
+                binds.append({
+                    "binding": b["binding"], "buffer_index": b["buffer"],
+                    "buffer": buf.name if buf else "?",
+                    "offset": b["offset"], "bytes": b["bytes"],
+                    "buffer_bytes": buf.bytes if buf else None,
+                    "file": buf.file if buf else None,
+                })
+            rows.append({
+                "ordinal": p.ordinal, "name": p.name, "pass_group": p.group,
+                "spv": key, "measured": measured, "measures": meas,
+                "name_says_int8": bool(INT8_NAME.search(p.name)),
+                "grid": p.grid, "binds": binds, "push": p.push,
+            })
+        out["plans"][plan_key] = {
+            "path": str(plan_path).replace("\\", "/"),
+            "sha256": plan.sha256,
+            "header": plan.header,
+            "dispatches": len(rows),
+            "distinct_spv": len({r["spv"] for r in rows}),
+            "unparsed": plan.unparsed[:20],
+            "rows": rows,
+        }
+    out["spv_cache"] = cache
+
+    disagree = []
+    for plan_key, pdata in out["plans"].items():
+        for r in pdata["rows"]:
+            m = r["measured"]
+            if r["name_says_int8"] and m not in ("INT8",):
+                disagree.append({"plan": plan_key, "ordinal": r["ordinal"], "name": r["name"],
+                                 "measured": m, "spv": r["spv"],
+                                 "spv_sha256": r["measures"].get("sha256"),
+                                 "reason": "name marks INT8 but SPV has no INT8 cooperative matrix"})
+            if (not r["name_says_int8"]) and m == "INT8":
+                disagree.append({"plan": plan_key, "ordinal": r["ordinal"], "name": r["name"],
+                                 "measured": m, "spv": r["spv"],
+                                 "spv_sha256": r["measures"].get("sha256"),
+                                 "reason": "name has no INT8 marker but the SPV is INT8 cooperative matrix"})
+    out["name_vs_measured_disagreements"] = disagree
+
+    dest = HERE.parent / "evidence" / "spv-plan-scan.json"
+    dest.write_text(json.dumps(out, indent=1, ensure_ascii=False), encoding="utf-8")
+
+    for plan_key, pdata in out["plans"].items():
+        kinds: dict[str, int] = {}
+        for r in pdata["rows"]:
+            kinds[r["measured"]] = kinds.get(r["measured"], 0) + 1
+        print(f"[{plan_key}] sha={pdata['sha256'][:16]} header={pdata['header']} "
+              f"dispatches={pdata['dispatches']} distinct_spv={pdata['distinct_spv']} "
+              f"unparsed={len(pdata['unparsed'])}")
+        print(f"    dtype census: {kinds}")
+        print(f"    totals int8 MMA={sum(r['measures'].get('int8_mma',0) for r in pdata['rows'])} "
+              f"fp16 MMA={sum(r['measures'].get('fp16_mma',0) for r in pdata['rows'])} "
+              f"int dots={sum(r['measures'].get('int_dots',0) for r in pdata['rows'])}")
+    print(f"name-vs-measured disagreements: {len(disagree)}")
+    for d in disagree:
+        print(f"  {d['plan']:>26} #{d['ordinal']:>3} {d['name']:<30} measured={d['measured']:<9} "
+              f"sha={(d['spv_sha256'] or '?')[:16]}  ({d['reason']})")
+    print(f"wrote {dest} ({dest.stat().st_size} B)")
+
+
+if __name__ == "__main__":
+    main()

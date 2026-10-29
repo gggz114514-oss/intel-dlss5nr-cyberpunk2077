@@ -1,0 +1,89 @@
+"""Classify the half-width register-move idioms in an ISA capture (read-only).
+
+Idioms (Intel Xe ISA, 32-lane):
+  UNPACK_DW : mov (32|M0) rD.0<1>:ud  rS.N<2;1,0>:uw   take every other word of a
+              packed dword vector and place it one-per-dword (widening placeholder)
+  UNPACK_WW : mov (32|M0) rD.0<1>:uw  rS.N<2;1,0>:uw   same but keeps word lanes
+  PACK_W    : mov (32|M0) rD.0<2>:uw  rS.N<32;16,1>:uw  interleave 16+16 words into
+              every other slot of a dword vector (VNNI packing)
+  BYTE_G    : mov ...:b/ub with source region stride >= 4  (byte de-interleave)
+  QADDR     : shl on :q (64-bit address assembly, NOT data packing)
+Usage: python classify_idioms.py ordinal [ordinal ...]
+"""
+import json, os, re, sys
+from collections import Counter, defaultdict
+
+CARD = os.path.dirname(os.path.abspath(__file__))
+EVID = os.path.join(os.path.dirname(os.path.dirname(CARD)), "evidence")
+IDX = json.load(open(os.path.join(EVID, "NATIVE-INDEX.json"), encoding="utf-8"))
+COV = {r["ordinal"]: r for r in IDX["coverage"]}
+H2F = json.load(open(os.path.join(CARD, "_hash2asm.json"), encoding="utf-8"))
+LINE_RE = re.compile(r"^/\* \[([0-9A-Fa-f]+)\]\s+\*/\s*(.*)$")
+REGION_RE = re.compile(r"<(\d+);(\d+),(\d+)>")
+REGION1_RE = re.compile(r"<(\d+)>")          # single-number region = vertStride only
+
+
+def resolve(o):
+    for c in (H2F.get(str(o)) or []):
+        if os.path.exists(c):
+            return c
+
+
+def classify(path):
+    out = Counter()
+    sites = defaultdict(list)
+    for raw in open(path, encoding="utf-8", errors="replace"):
+        m = LINE_RE.match(raw)
+        if not m:
+            continue
+        addr, body = m.group(1), m.group(2)
+        if "//" in body:
+            body = body.split("//")[0]
+        t = body.split()
+        if not t or t[0] != "mov":
+            # catch 64-bit address assembly
+            if t and t[0] == "shl" and any(":q" in x for x in t):
+                out["QADDR"] += 1
+                if len(sites["QADDR"]) < 10:
+                    sites["QADDR"].append(addr)
+            continue
+        # dst / src operands
+        ops = [x for x in t[1:] if not re.match(r"^\(\d+\|", x)]
+        if len(ops) < 2:
+            continue
+        dst, src = ops[0], ops[1]
+        dr = REGION_RE.search(dst)
+        sr = REGION_RE.search(src)
+        dtyp = re.search(r":(u?[whbdq]|u?hf|f)$", dst)
+        styp = re.search(r":(u?[whbdq]|u?hf|f)$", src)
+        dtyp = dtyp.group(1) if dtyp else None
+        styp = styp.group(1) if styp else None
+        if dtyp == "ud" and styp == "uw" and sr and int(sr.group(1)) == 2:
+            out["UNPACK_DW"] += 1
+            if len(sites["UNPACK_DW"]) < 12:
+                sites["UNPACK_DW"].append(addr)
+        elif dtyp in ("uw", "w") and styp in ("uw", "w") and sr and int(sr.group(1)) == 2:
+            out["UNPACK_WW"] += 1
+            if len(sites["UNPACK_WW"]) < 12:
+                sites["UNPACK_WW"].append(addr)
+        elif dtyp in ("uw", "w") and styp in ("uw", "w"):
+            d1 = REGION1_RE.search(dst)
+            if (dr and int(dr.group(1)) == 2) or (d1 and int(d1.group(1)) == 2):
+                out["PACK_W"] += 1
+                if len(sites["PACK_W"]) < 12:
+                    sites["PACK_W"].append(addr)
+        if dtyp in ("b", "ub") or styp in ("b", "ub"):
+            if sr and int(sr.group(1)) >= 4:
+                out["BYTE_G"] += 1
+                if len(sites["BYTE_G"]) < 12:
+                    sites["BYTE_G"].append(addr)
+    return out, sites
+
+
+if __name__ == "__main__":
+    for a in sys.argv[1:]:
+        o = int(a)
+        p = resolve(o)
+        c, s = classify(p)
+        print("%3d %-4s %-24s %s  sites=%s" % (o, COV[o]["family"], COV[o]["name"],
+              json.dumps(dict(c)), json.dumps({k: v[:4] for k, v in s.items()})))

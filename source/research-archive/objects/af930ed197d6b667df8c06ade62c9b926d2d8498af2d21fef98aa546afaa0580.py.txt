@@ -1,0 +1,103 @@
+"""C00 B-class layout/basis check: INT8-chain boundary dumps vs FP16 teacher dumps.
+
+Answers, on CPU only:
+  * is the chain tensor elementwise comparable to the teacher tensor (same layout)?
+  * is the difference a per-channel *basis* (constant diagonal) or noise?
+  * how much error is already present at each boundary, and where does it grow?
+
+Inputs are read-only:
+  chain : B/work/dsh-fullnet-static-20261029/C00-color-baseline/runs/diag65-69/c00-block*_out.bin
+  teacher: Q/real-int8-24/dump-fp16/dump_block*_out.bin
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+B = Path("@NR_WORKSPACE@")
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+CHAIN = B / "work/dsh-fullnet-static-20261029/C00-color-baseline/runs/diag65-69"
+TEACH = D / "dump-fp16"
+
+BOUNDS = [65, 66, 67, 68, 69]
+CH = 64  # block65..69 half tensors are 64 channels wide
+
+
+def load(path: Path) -> np.ndarray:
+    return np.fromfile(path, dtype="<f2").astype(np.float64)
+
+
+def rel_l2(a: np.ndarray, b: np.ndarray) -> float:
+    num = float(np.sqrt(((a - b) ** 2).sum()))
+    den = float(np.sqrt((b ** 2).sum()))
+    return num / den if den else float("inf")
+
+
+def analyse(a: np.ndarray, b: np.ndarray) -> dict:
+    n = a.size
+    out = {"elements": int(n), "rel_l2": round(rel_l2(a, b), 8)}
+    out["a_finite"] = bool(np.isfinite(a).all())
+    out["b_finite"] = bool(np.isfinite(b).all())
+    out["a_absmax"] = round(float(np.abs(a).max()), 6)
+    out["b_absmax"] = round(float(np.abs(b).max()), 6)
+    out["a_std"] = round(float(a.std()), 6)
+    out["b_std"] = round(float(b.std()), 6)
+    if n % CH == 0:
+        A = a.reshape(-1, CH)
+        Bm = b.reshape(-1, CH)
+        # per-channel least-squares gain k_c = <a,b>/<b,b>
+        num = (A * Bm).sum(axis=0)
+        den = (Bm * Bm).sum(axis=0)
+        k = np.divide(num, den, out=np.ones_like(num), where=den > 0)
+        resid = A - Bm * k
+        out["chan_gain"] = {
+            "min": round(float(k.min()), 6), "max": round(float(k.max()), 6),
+            "mean": round(float(k.mean()), 6), "std": round(float(k.std()), 6),
+        }
+        out["rel_l2_after_chan_gain"] = round(
+            float(np.sqrt((resid ** 2).sum()) / np.sqrt((Bm ** 2).sum())), 8)
+        # global scalar fit for comparison
+        g = float((a * b).sum() / (b * b).sum())
+        out["global_gain"] = round(g, 6)
+        out["rel_l2_after_global_gain"] = round(rel_l2(a, b * g), 8)
+        # per-channel bias (mean offset) after gain
+        out["resid_chan_bias_absmax"] = round(float(np.abs(resid.mean(axis=0)).max()), 8)
+        # correlation of the raw tensors
+        out["corr"] = round(float(np.corrcoef(a, b)[0, 1]), 8)
+        out["top5_gain_channels"] = [
+            {"c": int(c), "k": round(float(k[c]), 6)} for c in np.argsort(-np.abs(k - 1))[:5]]
+    return out
+
+
+def main() -> None:
+    rows = {}
+    for b in BOUNDS:
+        cp = CHAIN / f"c00-block{b}_out.bin"
+        tp = TEACH / f"dump_block{b}_out.bin"
+        if not (cp.is_file() and tp.is_file()):
+            rows[b] = {"missing": [str(cp) if not cp.is_file() else None,
+                                   str(tp) if not tp.is_file() else None]}
+            continue
+        a, t = load(cp), load(tp)
+        row = {"chain_bytes": cp.stat().st_size, "teacher_bytes": tp.stat().st_size,
+               "size_equal": cp.stat().st_size == tp.stat().st_size}
+        if a.size == t.size:
+            row.update(analyse(a, t))
+        rows[b] = row
+    (HERE / "INT8-VS-TEACHER.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    for b, r in rows.items():
+        if "rel_l2" not in r:
+            print(b, "SKIP", r)
+            continue
+        print(f"block{b}_out  relL2={r['rel_l2']:.6f}  corr={r['corr']:.6f}  "
+              f"k[{r['chan_gain']['min']:.4f}..{r['chan_gain']['max']:.4f}] std={r['chan_gain']['std']:.4f}  "
+              f"relL2_after_k={r['rel_l2_after_chan_gain']:.6f}  g={r['global_gain']:.4f} "
+              f"relL2_after_g={r['rel_l2_after_global_gain']:.6f}  stdA={r['a_std']:.4f} stdB={r['b_std']:.4f}")
+
+
+if __name__ == "__main__":
+    main()

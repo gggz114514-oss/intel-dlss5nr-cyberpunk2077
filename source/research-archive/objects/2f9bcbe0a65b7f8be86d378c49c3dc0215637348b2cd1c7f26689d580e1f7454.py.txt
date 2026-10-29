@@ -1,0 +1,55 @@
+"""Layout discrimination on block65_out: which byte layout makes the tensor spatially coherent?
+
+Three candidate layouts for the 4,128,768-half block65_out buffer (8,257,536 B):
+  H1  coarse 336x192 x 64ch, [wg][chgrp 4][slot 16][ch 16]     (FP16 parent addressing)
+  H2  coarse 336x192 x 64ch, [wg][slot 16][ch 64]              (pixel-major, "linear")
+  H3  fine   672x384 x 16ch, [wg][tile 4][slot 16][ch 16]      (16 ch per fine pixel)
+Metric: a channel's field inside one workgroup must be spatially smooth; a wrong layout
+scatters unrelated values and raises the neighbour difference.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+
+B = Path(r"@NR_WORKSPACE@")
+SRC = {
+    "fp16_teacher": B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24/dump-fp16/dump_block65_out.bin",
+    "int8_chain": B / "work/dsh-fullnet-static-20261029/C00-downstream-replace/runs2/c00-chain-dump/chain-block65_out.bin",
+}
+NWG = 84 * 48
+
+
+def rough(F):
+    """F: [C, wg, gy, gx] -> normalised neighbour difference (lower = smoother)."""
+    dx = np.abs(np.diff(F, axis=3)).mean()
+    dy = np.abs(np.diff(F, axis=2)).mean()
+    return float((dx + dy) / max(float(np.sqrt((F ** 2).mean())), 1e-9))
+
+
+def main():
+    out = {}
+    for tag, p in SRC.items():
+        reg = np.fromfile(p, dtype="<f2").astype(np.float32).reshape(NWG, 1024)
+        res = {}
+        a = reg.reshape(NWG, 4, 16, 16)                       # [wg][chgrp][slot][ch]
+        res["H1_coarse_chgrp_slot_ch"] = rough(np.transpose(a, (1, 3, 0, 2)).reshape(64, NWG, 4, 4))
+        b = reg.reshape(NWG, 16, 64)                          # [wg][slot][ch]
+        res["H2_coarse_slot_ch64"] = rough(np.transpose(b, (2, 0, 1)).reshape(64, NWG, 4, 4))
+        F3 = np.zeros((16, NWG, 8, 8), np.float32)
+        for t in range(4):
+            ty, tx = t // 2, t % 2
+            for s in range(16):
+                F3[:, :, ty * 4 + s // 4, tx * 4 + s % 4] = a[:, t, s, :].T
+        res["H3_fine_tile_slot_ch16"] = rough(F3)
+        res["_rms"] = float(np.sqrt((reg ** 2).mean()))
+        out[tag] = res
+        print(tag, {k: (round(v, 4) if isinstance(v, float) else v) for k, v in res.items()})
+    dst = Path(__file__).with_name("EVIDENCE") / "layout-discrimination.json"
+    dst.write_text(json.dumps(out, indent=1), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

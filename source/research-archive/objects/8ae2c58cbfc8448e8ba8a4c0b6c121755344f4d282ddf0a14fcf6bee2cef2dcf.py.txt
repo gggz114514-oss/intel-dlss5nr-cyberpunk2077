@@ -1,0 +1,165 @@
+"""Build C00 B-class downstream-replacement plans from the frozen XE candidate.
+
+Rules enforced here (and re-checked by planlib.validate):
+  * the base plan SHA is pinned; a mismatch aborts;
+  * the only edits are: one new file-backed BUFFER per teacher tensor, the BIND
+    line(s) of that boundary's read-only consumer(s), the POLICY of the *new*
+    buffer (the plan has no policy for a new index), and - for diagnostic arms -
+    extra OUTPUT lines plus the residency of the buffer being dumped;
+  * OUTPUT of the real frame, all pre-existing POLICY and every PUSH stay
+    byte-identical;
+  * every plan is written only after validate() returns no problems and is
+    recorded with its SHA256 and its resource-level diff.
+
+Run:  python -X utf8 build_plans.py
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+W = HERE.parent
+sys.path.insert(0, str(W / "tools"))
+import planlib  # noqa: E402
+
+B = Path("@NR_WORKSPACE@")
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+TEACH = Q / "real-int8-24/dump-fp16"
+CAND = W / "S02-f01" / "candidate-xe-34189.txt"
+CAND_SHA = "5c971f5a4ed5a59e67209d14504ea4131a396430db646bb2c7970a12b7a18dd8"
+OUTDIR = HERE / "plans"
+
+# (plan name, teacher buffers, binds to flip, diagnostic dumps, notes)
+#   teacher buffer: (buffer_name, source dump, read-only dispatch it serves)
+#   bind flip    : (dispatch ordinal, binding number, buffer_name)
+#   dump         : (buffer_name, out filename, residency window first, last)
+JOBS = [
+    {
+        "plan": "f2-both-34189.txt",
+        "why": ("A+B decisive arm: F2 (ord 281, f2.spv) is the ONLY reader of block65_out and skip4; "
+                "both are read-only in that dispatch. Feeding the FP16 teacher for both inputs makes the "
+                "rest of the graph irrelevant to F2's own inputs, so this single run answers both "
+                "questions: (A) F2's own output vs teacher block66_out (dump), (B) whether the whole "
+                "remaining 29.3 dB error is created inside F2 or upstream of it."),
+        "teachers": [
+            ("teacher_block65_out", TEACH / "dump_block65_out.bin", 281),
+            ("teacher_skip4", TEACH / "dump_skip4.bin", 281),
+        ],
+        "binds": [(281, 5, "teacher_block65_out"), (281, 6, "teacher_skip4")],
+        "dumps": [("block66_out", "f2-both-block66_out.bin", 281, 282)],
+    },
+    {
+        "plan": "f2-skip4-only-34189.txt",
+        "why": ("Separates the two F2 inputs. skip4 is the long residual from block4 (read at ord 281 "
+                "binding 6 and nowhere else). If the colour bias is carried by the long skip branch, "
+                "this alone moves the final RGB; if only the X branch matters, it does not."),
+        "teachers": [("teacher_skip4", TEACH / "dump_skip4.bin", 281)],
+        "binds": [(281, 6, "teacher_skip4")],
+        "dumps": [("block66_out", "f2-skip4-block66_out.bin", 281, 282)],
+    },
+    {
+        "plan": "chain-dump-34189.txt",
+        "why": ("No replacement at all: dump the chain's own block65_out and block66_out so the teacher "
+                "dumps can be compared elementwise on CPU (basis/layout check) and so F2's in-chain "
+                "error is measurable. Outputs are byte-identical to the baseline XE run."),
+        "teachers": [],
+        "binds": [],
+        "dumps": [("block65_out", "chain-block65_out.bin", 280, 281),
+                  ("block66_out", "chain-block66_out.bin", 281, 282)],
+    },
+    {
+        "plan": "replace-block66_out-34189.txt",
+        "why": ("Reproduces the executor's 34.409 dB arm under this card's builder so the plan SHA is "
+                "owned by C00 and the diff is auditable (single read-only consumer at ord 282 binding 2)."),
+        "teachers": [("teacher_block66_out", TEACH / "dump_block66_out.bin", 282)],
+        "binds": [(282, 2, "teacher_block66_out")],
+        "dumps": [],
+    },
+]
+
+
+def build(job: dict) -> dict:
+    p = planlib.Plan(CAND)
+    got = p.sha256()
+    if got != CAND_SHA:
+        raise SystemExit(f"base candidate SHA mismatch: {got} != {CAND_SHA}")
+    actions = []
+
+    for name, src, k in job["teachers"]:
+        if not src.is_file():
+            raise SystemExit(f"missing teacher dump {src}")
+        b = p.add_buffer(name, src.stat().st_size, str(src).replace("\\", "/"))
+        # Proven form: the executor's 34.409 dB block66 arm kept the teacher buffer resident
+        # for the whole run; a narrow [k,k] window is untested and can be evicted.
+        e = p.set_policy(name, resident=1, first=0, last=len(p.passes) - 1, clear_first=0)
+        actions.append({"op": "add_buffer", "name": name, "index": b.index,
+                        "bytes": b.bytes, "file": b.file,
+                        "source_sha256": planlib.sha256_file(src),
+                        "policy": e["new"]})
+    for ordinal, binding, bufname in job["binds"]:
+        old = next(x for x in p.dispatch(ordinal).binds if x.binding == binding)
+        old_name = p.buffers[old.buffer].name
+        e = p.set_bind(ordinal, binding, buffer_name=bufname)
+        actions.append({"op": "set_bind", **e, "was": old_name, "old_bytes": old.bytes})
+    for bufname, fname, first, last in job["dumps"]:
+        p.add_output(bufname, "float16", fname)
+        # Residency must survive to the last dispatch, otherwise the pool may reuse the
+        # allocation and the file written at the end of the run is a later tensor.
+        e = p.set_policy(bufname, resident=1, first=first, last=len(p.passes) - 1, clear_first=0)
+        actions.append({"op": "add_output_and_residency", "buffer": bufname, "file": fname,
+                        "policy": e["new"]})
+
+    problems = p.validate()
+    if problems:
+        raise SystemExit(f"{job['plan']}: validation failed:\n  " + "\n  ".join(problems))
+    out = OUTDIR / job["plan"]
+    p.write(out, check=False)
+    q = planlib.Plan(out)
+    assert q.validate() == [], q.validate()
+    diff = planlib.diff_plans(planlib.Plan(CAND), q)
+    textual = []
+    a = planlib.Plan(CAND).lines
+    b = q.lines
+    for ln in b:
+        if ln not in a:
+            textual.append("+ " + ln[:160])
+    for ln in a:
+        if ln not in b:
+            textual.append("- " + ln[:160])
+    return {
+        "plan": job["plan"],
+        "path": str(out),
+        "sha256": planlib.sha256_file(out),
+        "why": job["why"],
+        "actions": actions,
+        "resource_diff": {
+            "buffers_added": diff["buffers_added"],
+            "buffers_changed": diff["buffers_changed"],
+            "dispatch_changes": diff["dispatch_changes"],
+            "dispatches_added": diff["dispatches_added"],
+            "dispatches_removed": diff["dispatches_removed"],
+        },
+        "header": list(q.header),
+        "textual_changes": textual,
+        "validate": "clean",
+    }
+
+
+def main() -> None:
+    OUTDIR.mkdir(exist_ok=True)
+    rows = [build(j) for j in JOBS]
+    (HERE / "PLANS-BUILT.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    for r in rows:
+        print(f"{r['plan']:34s} sha={r['sha256'][:16]}  +buf={len(r['resource_diff']['buffers_added'])} "
+              f"binds={len([a for a in r['actions'] if a['op'] == 'set_bind'])} "
+              f"dumps={len([a for a in r['actions'] if a['op'] == 'add_output_and_residency'])}  "
+              f"header={r['header']}")
+        for t in r["textual_changes"]:
+            print("   ", t)
+
+
+if __name__ == "__main__":
+    main()
+

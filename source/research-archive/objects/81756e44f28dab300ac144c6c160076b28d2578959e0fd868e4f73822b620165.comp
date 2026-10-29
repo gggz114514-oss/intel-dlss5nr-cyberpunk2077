@@ -1,0 +1,710 @@
+// c32_lifetime_b70_i8.comp — ioport_block70_1 (G3 PASS 151) with EVERY matrix
+// multiply on signed INT8 operands and INT32 accumulation.
+//
+// Derived from the deployed parent
+//   candidates/amd-map-20261015/s2-c32-lifetime/full/c32_lifetime.comp
+//   (sha256 f56a03d5…31d7c5, SPV 9f359193…571c47, reproduced byte-identically by
+//    src/project/tools/glslang-16.5.0/bin/glslang.exe -V --target-env vulkan1.3)
+// and it carries forward the R21 output-projection segment
+//   work/dsh-xmx-handoff-validation-20261024/candidates/r20-r21-tail/
+//   source/candidate/c32_lifetime.comp (sha256 a09ef728…9b3eba2, SPV 905a5d36…83d794,
+//   2 of the 14 parent sites), which is NOT deployed in G3 and is re-derived here.
+//
+// Card: work/dsh-int8-fullnet-impl-20261024/candidates/c32-f1-f2-b70
+//
+// What changes (all of it inside the six matrix stages; nothing else moves):
+//   stage 1 expand    4 FP16 K16 steps -> 4 INT8 K32 steps
+//   stage 3 contract  2 FP16 K16 steps -> 2 INT8 K32 steps (inside a 4-step k32 loop)
+//   stage 4 QKV       2 FP16 K16 steps -> 2 INT8 K32 steps
+//   stage 6 score     2 FP16 K16 steps -> 2 INT8 K32 steps
+//   stage 8 context   2 FP16 K16 steps -> 2 INT8 K32 steps (inside a 2-step k32 loop)
+//   stage 9 output    2 FP16 K16 steps -> 2 INT8 K32 steps   (R21, re-derived)
+// Total 14 -> 0 FP16 matrix multiplies, 0 -> 14 INT8 (M8 N16 K32, subgroup scope).
+//
+// Activation quantisation domain (justified in REPORT.md §3; no calibration data
+// exists for this pass, so every dynamic operand scale is the amax of exactly the
+// tile that the MMA consumes, i.e. self-scaling, not a calibrated constant):
+//   X   per 8-token group, over the group's own 8x32 window (expand A)
+//   E   per 8-token group, over the group's own 8x128 activated features (contract A)
+//   Y   per 8-token group, over the group's own 8x32 contract output (QKV A)
+//   Q   per 8-token group, over the group's own 8x32 normalised query (score A)
+//   K   ONE scalar over all 64 keys x 32 dims of the workgroup's tile (score B);
+//       it must be row-consistent because stage 7 sums exp() over all 64 keys
+//   P   per 8-token group, over the group's own 8x64 normalised probabilities (PV A)
+//   V   ONE scalar over all 64 keys x 32 channels (PV B)
+//   Ctx per 8-token group, over the group's own 8x32 context (projection A, R21)
+// Weights are static signed INT8 with per-OUTPUT-channel symmetric scales.
+//
+// Unchanged on purpose: the half normalisation (stage 5/5b), the half exp and the
+// half 64-key row reduction (stage 7), all half shared tiles and half outputs, the
+// FP32 seeds (H(X)*rs, H(Y)*ars), the single narrow per stage, the debug dumps, the
+// 32-word PUSH vector, the grid and the local size.
+//
+// PUSH ABI note: p1 = (we_el, wc_el, wqkv_el, wo_el) addressed the *FP16* pack in
+// half units.  The INT8 pack is a different buffer with its own layout, so its byte
+// bases are compile-time constants below and p1 is unused by the INT8 path.  The
+// 32-word PUSH is pushed verbatim and unchanged; p2.x/p2.y still address the FP16
+// pack for the two FP32 seed-scale vectors, so binding 0 keeps its role.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer HalfBuf  { float16_t wb[];  };  // pack (FP16: seed scales only)
+layout(set = 0, binding = 1) buffer FloatBuf { float fb[];      };  // bias[4096], scalar0
+layout(set = 0, binding = 2) buffer ImageIn  { float16_t imgin[];  };  // window input
+layout(set = 0, binding = 3) buffer ImageOut { float16_t imgout[]; };  // window output
+layout(set = 0, binding = 4) buffer DebugBuf { float16_t dbg[];    };  // stage dump (debug only)
+// INT8 weights (We|Wc|Wqkv|Wo, I8B K32xN16 tiles, byte n*32+k) and the 288
+// per-output-channel dequant scales.  Both slots already exist in this pass's
+// descriptor set: G3 binds a 4-byte placeholder to 5, 6 and 7.
+layout(set = 0, binding = 5) readonly buffer I8W      { int8_t w8[];  };
+layout(set = 0, binding = 6) readonly buffer I8WScale { float wsc[]; };
+
+// INT8 pack byte bases and scale-table element bases.
+#define W8_WE    0u        // 8 x I8B K32xN16 tiles        4096 B
+#define W8_WC    4096u     // 2 n-tiles x 4 k32 tiles      4096 B
+#define W8_WQKV  8192u     // 6 x I8B K32xN16 tiles        3072 B
+#define W8_WO    11264u    // 2 x I8B K32xN16 tiles        1024 B
+#define SC_WE    0u        // 128 per-output-channel scales
+#define SC_WC    128u      //  32
+#define SC_WQKV  160u      //  96
+#define SC_WO    256u      //  32
+
+layout(push_constant) uniform PC {
+    ivec4 p0;   // x = tiles_x, y = shift, z = debug, w = wx_single
+    ivec4 p1;   // x = we_el, y = wc_el, z = wqkv_el, w = wo_el   (FP16 pack; unused here)
+    ivec4 p2;   // x = rs_el, y = ars_el, z = scalar0_fel, w = bias_fel
+    ivec4 p3;   // x = wy_single, y = single_flag, z = tiles_y, w = shift_y
+} pc;
+
+// ---- shared: 42568 B ----
+shared float16_t shXP[4096];      // early X / late P / debug O, 8192 B
+#define shX shXP
+#define shP shXP
+shared float16_t shY[2048];       // 64x32            4096 B
+shared float16_t shArena[8192];   // A[64x128] | Q K V Ctx (2048 each)  16384 B
+shared float16_t shNorm[256];     // nq[64] nk[64] inv[64]        512 B
+// INT8 activation-code scratch.  One I8A 8x32 tile per subgroup (byte k*32 + m,
+// stride 32, the layout the C32-I8 family packs use); X, E-chunk, Y (per 8-token
+// group), Q, P-chunk and Ctx reuse it at disjoint lifetimes.
+shared int8_t shC8[8192];         // 8 subgroups x 1024 B           8192 B
+shared int8_t shK8[2048];         // K  [key][dim], LCOL stride 32  2048 B
+shared int8_t shV8[2048];         // V  [key][ch ], LROW stride 32  2048 B
+shared float  shLmax[256];        // per-lane |x| max               1024 B
+shared float  shSgScale[8];       // per-subgroup activation scale     32 B
+shared float  shGrp[8];           // per-8-token-group scale (X / Y)    32 B
+shared float  shKV[2];            // { sK, sV }                          8 B
+
+#define NR_A(m, k)    shArena[(m) * 128 + (k)]
+#define NR_Q(t, c)    shArena[(t) * 32 + (c)]
+#define NR_K(t, c)    shArena[2048 + (t) * 32 + (c)]
+#define NR_V(t, c)    shArena[4096 + (t) * 32 + (c)]
+#define NR_CTX(t, c)  shArena[6144 + (t) * 32 + (c)]
+#define NR_P(i, j)    shP[(i) * 64 + (j)]
+
+#define MAT_A coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA>
+#define MAT_B coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define MAT_C coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define MAT_H coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+// INT8 K32 operands: M8 N16 K32, subgroup scope, the shape combination the C32-I8
+// family already runs on this device.
+#define I8A coopmat<int8_t, gl_ScopeSubgroup, 8, 32, gl_MatrixUseA>
+#define I8B coopmat<int8_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB>
+#define I8C coopmat<int, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define I8F coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define LROW  gl_CooperativeMatrixLayoutRowMajor
+#define LCOL  gl_CooperativeMatrixLayoutColumnMajor
+
+// half MpCubicSilu (guide §2.1): one rounding per half op
+float16_t nr_act_h(float16_t x) {
+    float16_t t = clamp(x, float16_t(-4.0), float16_t(4.0));
+    float16_t u = fma(float16_t(-0.055908203125), abs(t), float16_t(0.447265625));
+    return x * fma(t, u, float16_t(0.89453125));
+}
+
+// half swin exp (guide §2.3)
+float16_t nr_exp_h(float16_t x) {
+    float16_t y = clamp(fma(x, float16_t(0.044921875), float16_t(1.30078125)),
+                        float16_t(1.03125), float16_t(1.5693359375));
+    uint h = packHalf2x16(vec2(float(y), 0.0)) & 0xffffu;
+    return float16_t(unpackHalf2x16((h & 0x03ffu) << 5u).x);
+}
+
+// token coordinates recomputed per element (B0 v3 base, no private tables)
+uint nr_tok_addr(uint t, uint c, uint wx, uint wy, int shift, uint tiles_x, out bool oob) {
+    uint q = t >> 4u, s = t & 15u;
+    int tx = 2 * int(wx) + shift + int(q & 1u);
+    int ty = 2 * int(wy) + pc.p3.w + int(q >> 1u);
+    oob = (tx < 0 || ty < 0 || tx >= int(tiles_x) || ty >= pc.p3.z);
+    uint safe_tx = uint(clamp(tx, 0, int(tiles_x) - 1));
+    uint safe_ty = uint(clamp(ty, 0, pc.p3.z-1));
+    return (((safe_ty * tiles_x + safe_tx) * 2u + c / 16u) * 256u
+            + s * 16u + c % 16u);   // slot = s (4*(y%4)+(x%4), y-major)
+}
+#define NR_TOK_OOB(t) oob_
+#define NR_TOK_ADDR(t, c) nr_tok_addr((t), (c), wx, wy, shift, tiles_x, oob_)
+
+// symmetric INT8 code point: v * (1/s), RNE, clamp +-127 (one code point, no float
+// dot product anywhere).
+int8_t nr_code(float v, float inv) {
+    return int8_t(clamp(roundEven(v * inv), -127.0, 127.0));
+}
+
+// Subgroup-local amax over the calling subgroup's own 8 x (32*CNT) tile: lane owns
+// columns [lane*CNT, lane*CNT+CNT).  Returns amax/127 for every lane of the
+// subgroup.  `ARR` is any indexable half array, `BASE + i*ROWSTRIDE + col`.
+#define NR_SG_SCALE(ARR, BASE, ROWSTRIDE, CNT)                                  \
+    {                                                                          \
+        const uint _t = gl_LocalInvocationID.x;                                \
+        const uint _sg = _t / 32u;                                             \
+        const uint _ln = _t % 32u;                                             \
+        float _m = 0.0;                                                        \
+        for (uint _i = 0u; _i < 8u; ++_i)                                      \
+            for (uint _c = 0u; _c < (CNT); ++_c)                               \
+                _m = max(_m, abs(float((ARR)[(BASE) + _i * (ROWSTRIDE)          \
+                                                   + _ln * (CNT) + _c])));     \
+        shLmax[_t] = _m;                                                       \
+        subgroupMemoryBarrierShared();                                         \
+        subgroupBarrier();                                                     \
+        if (_ln == 0u) {                                                       \
+            float _s = 0.0;                                                    \
+            for (uint _l = 0u; _l < 32u; ++_l)                                 \
+                _s = max(_s, shLmax[_sg * 32u + _l]);                          \
+            shSgScale[_sg] = (_s > 0.0) ? (_s / 127.0) : 0.0;                  \
+        }                                                                      \
+        subgroupMemoryBarrierShared();                                         \
+        subgroupBarrier();                                                     \
+    }
+
+// Workgroup amax over an arbitrary element set; slot 0 = sK, slot 1 = sV.
+float nr_wg_scale(float lmax, uint slot) {
+    const uint t = gl_LocalInvocationID.x;
+    shLmax[t] = lmax;
+    barrier();
+    if (t == 0u) {
+        float s = 0.0;
+        for (uint l = 0u; l < 256u; ++l) s = max(s, shLmax[l]);
+        shKV[slot] = (s > 0.0) ? (s / 127.0) : 0.0;
+    }
+    barrier();
+    return shKV[slot];
+}
+
+void main() {
+    const uint t_local = gl_LocalInvocationID.x;
+    const uint sg = t_local / 32u;
+    const uint lane = t_local % 32u;
+    const uint wx = (pc.p3.y != 0) ? uint(pc.p0.w) : gl_WorkGroupID.x;
+    const uint wy = (pc.p3.y != 0) ? uint(pc.p3.x) : gl_WorkGroupID.y;
+    const int shift = pc.p0.y;
+    const uint tiles_x = uint(pc.p0.x);
+    const bool debug = pc.p0.z != 0;
+
+    // ============ stage 0: gather X (2048 halves) — identical to B0 ============
+
+    {
+        uint m0 = sg * 8u;
+        {
+            MAT_A a = MAT_A(float16_t(0.0));
+            bool oob_;
+            uint addr = NR_TOK_ADDR(m0, 0u);
+            if (!oob_) coopMatLoad(a, imgin, addr, 16u, LROW);
+            coopMatStore(a, shX, m0 * 32u, 32u, LROW);
+        }
+        {
+            MAT_A a = MAT_A(float16_t(0.0));
+            bool oob_;
+            uint addr = NR_TOK_ADDR(m0, 16u);
+            if (!oob_) coopMatLoad(a, imgin, addr, 16u, LROW);
+            coopMatStore(a, shX, m0 * 32u + 16u, 32u, LROW);
+        }
+    }
+    barrier();
+    if (debug) {
+        for (uint e = t_local; e < 2048u; e += 256u) dbg[22528u + e] = shX[e];
+        if (t_local == 0u) {
+            dbg[24576u] = float16_t(float(wx));
+            dbg[24577u] = float16_t(float(wy));
+            dbg[24578u] = float16_t(float(pc.p3.y));
+            dbg[24579u] = float16_t(float(pc.p0.w));
+            dbg[24580u] = float16_t(float(pc.p3.x));
+        }
+        barrier();
+    }
+    barrier();
+
+    // ============ stage 1: expand Mpair — INT8 K32 ============
+    // Same pair assignment, same half activation epilogue, same stored addresses.
+    // Each of the two A tiles of a round is quantised on its own 8x32 window and
+    // consumed immediately, so the two tiles take turns in the subgroup's shC8 slot
+    // (one extra quantisation pass per round; no extra shared memory).
+    for (uint round = 0u; round < 2u; ++round) {
+        uint mA = (sg / 4u + 4u * round) * 8u;
+        uint mB = mA + 16u;
+        uint n0 = (sg % 4u) * 32u;
+        MAT_C accA0, accA1, accB0, accB1;
+        for (uint half_pair = 0u; half_pair < 2u; ++half_pair) {
+            uint mh = (half_pair == 0u) ? mA : mB;
+            // --- quantise this 8-token group's X window ----------------------
+            float sX;
+            NR_SG_SCALE(shX, mh * 32u, 32u, 1u)
+            sX = shSgScale[sg];
+            const float invX = (sX > 0.0) ? (1.0 / sX) : 0.0;
+            for (uint i8 = 0u; i8 < 8u; ++i8)
+                shC8[sg * 1024u + lane * 32u + i8] =
+                    nr_code(float(shX[(mh + i8) * 32u + lane]), invX);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            // --- one INT8 K32 MMA per column tile ---------------------------
+            I8A a8;  coopMatLoad(a8, shC8, sg * 1024u, 32u, LCOL);
+            I8B b8a; coopMatLoad(b8a, w8, W8_WE + (n0 / 16u) * 512u, 32u, LCOL);
+            I8B b8b; coopMatLoad(b8b, w8, W8_WE + (n0 / 16u) * 512u + 512u, 32u, LCOL);
+            I8C i0 = I8C(0);
+            I8C i1 = I8C(0);
+            i0 = coopMatMulAdd(a8, b8a, i0);
+            i1 = coopMatMulAdd(a8, b8b, i1);
+            I8F g0 = I8F(i0);
+            I8F g1 = I8F(i1);
+            MAT_C f0; coopMatLoad(f0, wsc, SC_WE + n0, 0u, LROW);
+            MAT_C f1; coopMatLoad(f1, wsc, SC_WE + n0 + 16u, 0u, LROW);
+            MAT_C o0 = MAT_C(float16_t(0.0));
+            MAT_C o1 = MAT_C(float16_t(0.0));
+            for (int q = 0; q < 4; ++q) {
+                precise float a0 = f0[q] * sX;
+                precise float a1 = f1[q] * sX;
+                o0[q] = g0[q] * a0;
+                o1[q] = g1[q] * a1;
+            }
+            if (half_pair == 0u) { accA0 = o0; accA1 = o1; }
+            else                 { accB0 = o0; accB1 = o1; }
+        }
+        {
+            MAT_H half_result = MAT_H(accA0);
+            if (debug) coopMatStore(half_result, dbg, mA * 128u + n0, 128u, LROW);
+            for (int component = 0; component < half_result.length(); ++component)
+                half_result[component] = nr_act_h(half_result[component]);
+            coopMatStore(half_result, shArena, mA * 128u + n0, 128u, LROW);
+        }
+        {
+            MAT_H half_result = MAT_H(accA1);
+            if (debug) coopMatStore(half_result, dbg, mA * 128u + n0 + 16u, 128u, LROW);
+            for (int component = 0; component < half_result.length(); ++component)
+                half_result[component] = nr_act_h(half_result[component]);
+            coopMatStore(half_result, shArena, mA * 128u + n0 + 16u, 128u, LROW);
+        }
+        {
+            MAT_H half_result = MAT_H(accB0);
+            if (debug) coopMatStore(half_result, dbg, mB * 128u + n0, 128u, LROW);
+            for (int component = 0; component < half_result.length(); ++component)
+                half_result[component] = nr_act_h(half_result[component]);
+            coopMatStore(half_result, shArena, mB * 128u + n0, 128u, LROW);
+        }
+        {
+            MAT_H half_result = MAT_H(accB1);
+            if (debug) coopMatStore(half_result, dbg, mB * 128u + n0 + 16u, 128u, LROW);
+            for (int component = 0; component < half_result.length(); ++component)
+                half_result[component] = nr_act_h(half_result[component]);
+            coopMatStore(half_result, shArena, mB * 128u + n0 + 16u, 128u, LROW);
+        }
+    }
+    barrier(); // Original publication to contract.
+
+    // ============ stage 3: contract Y[64,32] — INT8 K32, half seed kept ============
+    // One scale for the whole 8x128 activated tile (the dequant factor has to be
+    // constant over the accumulated K), then 4 K32 steps streaming through the
+    // subgroup's shC8 slot; the FP32 seed H(X*rs) is the parent's, added once.
+    {
+        uint m0 = sg * 8u;
+        float sE;
+        NR_SG_SCALE(shArena, m0 * 128u, 128u, 4u)
+        sE = shSgScale[sg];
+        const float invE = (sE > 0.0) ? (1.0 / sE) : 0.0;
+        MAT_C acc0;
+        {
+            MAT_H seed;
+            coopMatLoad(seed, shX, m0 * 32u + 0u, 32u, LROW);
+            MAT_H scale;
+            coopMatLoad(scale, wb, uint(pc.p2.x) + 8u + 0u, 0u, LROW);
+            seed = seed * scale;
+            acc0 = MAT_C(seed);
+        }
+        MAT_C acc1;
+        {
+            MAT_H seed;
+            coopMatLoad(seed, shX, m0 * 32u + 16u, 32u, LROW);
+            MAT_H scale;
+            coopMatLoad(scale, wb, uint(pc.p2.x) + 8u + 16u, 0u, LROW);
+            seed = seed * scale;
+            acc1 = MAT_C(seed);
+        }
+        I8C i0 = I8C(0);
+        I8C i1 = I8C(0);
+        for (uint kc = 0u; kc < 4u; ++kc) {
+            subgroupMemoryBarrierShared();   // retire the previous chunk's MMA read
+            subgroupBarrier();
+            for (uint i8 = 0u; i8 < 8u; ++i8)
+                shC8[sg * 1024u + lane * 32u + i8] =
+                    nr_code(float(NR_A(m0 + i8, kc * 32u + lane)), invE);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            I8A a8;  coopMatLoad(a8, shC8, sg * 1024u, 32u, LCOL);
+            I8B b8a; coopMatLoad(b8a, w8, W8_WC + kc * 512u, 32u, LCOL);
+            I8B b8b; coopMatLoad(b8b, w8, W8_WC + 2048u + kc * 512u, 32u, LCOL);
+            i0 = coopMatMulAdd(a8, b8a, i0);
+            i1 = coopMatMulAdd(a8, b8b, i1);
+        }
+        I8F g0 = I8F(i0);
+        I8F g1 = I8F(i1);
+        MAT_C f0; coopMatLoad(f0, wsc, SC_WC, 0u, LROW);
+        MAT_C f1; coopMatLoad(f1, wsc, SC_WC + 16u, 0u, LROW);
+        for (int q = 0; q < 4; ++q) {
+            precise float a0 = f0[q] * sE;
+            precise float a1 = f1[q] * sE;
+            precise float v0 = g0[q] * a0;
+            precise float v1 = g1[q] * a1;
+            acc0[q] = acc0[q] + v0;
+            acc1[q] = acc1[q] + v1;
+        }
+        MAT_H half0 = MAT_H(acc0);
+        coopMatStore(half0, shY, m0 * 32u, 32u, LROW);
+        MAT_H half1 = MAT_H(acc1);
+        coopMatStore(half1, shY, m0 * 32u + 16u, 32u, LROW);
+    }
+    if (debug) {
+        barrier();
+        for (uint e = t_local; e < 2048u; e += 256u) dbg[8192u + e] = shY[e];
+        barrier();
+    }
+    barrier();
+
+    // ============ stage 4: QKV[64,96] — INT8 K32 ============
+    // Y is one scale per 8-token group and three subgroups read the same group, so
+    // the Y codes are built once into the group's own shC8 slot under a workgroup
+    // barrier instead of per-subgroup.
+    {
+        NR_SG_SCALE(shY, sg * 8u * 32u, 32u, 1u)   // subgroup sg owns 8-token group sg
+        const float sYg = shSgScale[sg];
+        shGrp[sg] = sYg;
+        const float invY = (sYg > 0.0) ? (1.0 / sYg) : 0.0;
+        for (uint i8 = 0u; i8 < 8u; ++i8)
+            shC8[sg * 1024u + lane * 32u + i8] =
+                nr_code(float(shY[(sg * 8u + i8) * 32u + lane]), invY);
+    }
+    barrier();   // publish every group's Y codes to all subgroups
+    for (uint j = 0u; j < 3u; ++j) {
+        uint p = sg + 8u * j;
+        uint m0 = (p / 3u) * 8u, n0 = (p % 3u) * 32u;
+        const float sY = shGrp[m0 / 8u];
+        I8A a8;  coopMatLoad(a8, shC8, (m0 / 8u) * 1024u, 32u, LCOL);
+        I8B b8a; coopMatLoad(b8a, w8, W8_WQKV + (n0 / 16u) * 512u, 32u, LCOL);
+        I8B b8b; coopMatLoad(b8b, w8, W8_WQKV + (n0 / 16u) * 512u + 512u, 32u, LCOL);
+        I8C i0 = I8C(0);
+        I8C i1 = I8C(0);
+        i0 = coopMatMulAdd(a8, b8a, i0);
+        i1 = coopMatMulAdd(a8, b8b, i1);
+        I8F g0 = I8F(i0);
+        I8F g1 = I8F(i1);
+        MAT_C f0; coopMatLoad(f0, wsc, SC_WQKV + n0, 0u, LROW);
+        MAT_C f1; coopMatLoad(f1, wsc, SC_WQKV + n0 + 16u, 0u, LROW);
+        MAT_C o0 = MAT_C(float16_t(0.0));
+        MAT_C o1 = MAT_C(float16_t(0.0));
+        for (int q = 0; q < 4; ++q) {
+            precise float a0 = f0[q] * sY;
+            precise float a1 = f1[q] * sY;
+            o0[q] = g0[q] * a0;
+            o1[q] = g1[q] * a1;
+        }
+        uint region = n0 / 32u;
+        MAT_H half0 = MAT_H(o0);
+        coopMatStore(half0, shArena, region * 2048u + m0 * 32u, 32u, LROW);
+        MAT_H half1 = MAT_H(o1);
+        coopMatStore(half1, shArena, region * 2048u + m0 * 32u + 16u, 32u, LROW);
+    }
+    barrier();
+
+    // ============ stage 5: Q/K half norm — identical to B0 ============
+    if (t_local < 128u) {
+        bool isQ = t_local < 64u;
+        uint t = t_local % 64u;
+        float16_t sq[32];
+        for (uint c = 0u; c < 32u; ++c) {
+            float16_t v = isQ ? NR_Q(t, c) : NR_K(t, c);
+            sq[c] = v * v;
+        }
+        float16_t s[8];
+        for (uint c = 0u; c < 8u; ++c) {
+            float16_t a = sq[c] + sq[c + 16];
+            float16_t b = sq[c + 8] + sq[c + 24];
+            s[c] = a + b;
+        }
+        float16_t t4[4], t2[2];
+        for (uint c = 0u; c < 4u; ++c) t4[c] = s[c] + s[c + 4];
+        for (uint c = 0u; c < 2u; ++c) t2[c] = t4[c] + t4[c + 2];
+        float16_t sum = t2[0] + t2[1];
+        float mx = max(float(sum), float(float16_t(0.000062)));
+        float16_t n = float16_t(inversesqrt(mx));
+        shNorm[t + (isQ ? 0u : 64u)] = n;
+    }
+    barrier();
+
+    // ============ stage 5b: Q/K scale — identical to B0 ============
+    {
+        float16_t scalar0 = float16_t(fb[uint(pc.p2.z)]);
+        for (uint e = t_local; e < 4096u; e += 256u) {
+            bool isQ = e < 2048u;
+            uint m = (e % 2048u) / 32u, c = e % 32u;
+            float16_t n = shNorm[(isQ ? 0u : 64u) + m];
+            float16_t v = isQ ? NR_Q(m, c) : NR_K(m, c);
+            float16_t r = v * n;
+            if (isQ) r = r * scalar0;
+            if (isQ) NR_Q(m, c) = r; else NR_K(m, c) = r;
+        }
+    }
+    if (debug) {
+        barrier();
+        for (uint e = t_local; e < 2048u; e += 256u) dbg[10240u + e] = NR_Q(e / 32u, e % 32u);
+        for (uint e = t_local; e < 2048u; e += 256u) dbg[12288u + e] = NR_K(e / 32u, e % 32u);
+        barrier();
+    }
+    barrier();
+
+    // ============ stage 5c: K INT8 (one scalar over all 64 keys) ============
+    {
+        float m = 0.0;
+        for (uint e = t_local; e < 2048u; e += 256u)
+            m = max(m, abs(float(NR_K(e / 32u, e % 32u))));
+        const float sK = nr_wg_scale(m, 0u);
+        const float invK = (sK > 0.0) ? (1.0 / sK) : 0.0;
+        for (uint e = t_local; e < 2048u; e += 256u)
+            shK8[e] = nr_code(float(NR_K(e / 32u, e % 32u)), invK);
+    }
+    barrier();
+
+    // ============ stage 6: score + bias/exp — INT8 K32 ============
+    // A = the subgroup's own 8 query rows (per-group scale), B = K^T (one scale for
+    // the whole workgroup tile, so the 64-key exp sum of stage 7 stays consistent).
+    for (uint j = 0u; j < 2u; ++j) {
+        uint m0 = (sg / 2u + 4u * j) * 8u;
+        uint n0 = (sg % 2u) * 32u;
+        float sQ;
+        NR_SG_SCALE(shArena, m0 * 32u, 32u, 1u)
+        sQ = shSgScale[sg];
+        const float invQ = (sQ > 0.0) ? (1.0 / sQ) : 0.0;
+        for (uint i8 = 0u; i8 < 8u; ++i8)
+            shC8[sg * 1024u + lane * 32u + i8] =
+                nr_code(float(NR_Q(m0 + i8, lane)), invQ);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        const float sK = shKV[0];
+        const float sQK = sQ * sK;
+        I8A a8;  coopMatLoad(a8, shC8, sg * 1024u, 32u, LCOL);
+        I8B b8a; coopMatLoad(b8a, shK8, n0 * 32u, 32u, LCOL);
+        I8B b8b; coopMatLoad(b8b, shK8, n0 * 32u + 512u, 32u, LCOL);
+        I8C i0 = I8C(0);
+        I8C i1 = I8C(0);
+        i0 = coopMatMulAdd(a8, b8a, i0);
+        i1 = coopMatMulAdd(a8, b8b, i1);
+        I8F g0 = I8F(i0);
+        I8F g1 = I8F(i1);
+        MAT_C acc0 = MAT_C(float16_t(0.0));
+        MAT_C acc1 = MAT_C(float16_t(0.0));
+        for (int q = 0; q < 4; ++q) {
+            acc0[q] = g0[q] * sQK;
+            acc1[q] = g1[q] * sQK;
+        }
+        {
+            MAT_C bias;
+            coopMatLoad(bias, fb, uint(pc.p2.w) + m0 * 64u + n0, 64u, LROW);
+            for (int component = 0; component < acc0.length(); ++component) {
+                precise float biased = acc0[component] + bias[component];
+                acc0[component] = biased;
+            }
+            MAT_H half_score = MAT_H(acc0);
+            for (int component = 0; component < half_score.length(); ++component)
+                half_score[component] = nr_exp_h(half_score[component]);
+            coopMatStore(half_score, shP, m0 * 64u + n0, 64u, LROW);
+        }
+        {
+            MAT_C bias;
+            coopMatLoad(bias, fb, uint(pc.p2.w) + m0 * 64u + n0 + 16u, 64u, LROW);
+            for (int component = 0; component < acc1.length(); ++component) {
+                precise float biased = acc1[component] + bias[component];
+                acc1[component] = biased;
+            }
+            MAT_H half_score = MAT_H(acc1);
+            for (int component = 0; component < half_score.length(); ++component)
+                half_score[component] = nr_exp_h(half_score[component]);
+            coopMatStore(half_score, shP, m0 * 64u + n0 + 16u, 64u, LROW);
+        }
+    }
+    barrier();
+
+    // ============ stage 7: 64-key half row reduction — identical ============
+    if (t_local < 64u) {
+        uint i = t_local;
+        float16_t acc[8];
+        for (uint c = 0u; c < 8u; ++c) {
+            float16_t a = float16_t(0.0);
+            for (uint j = 0u; j < 4u; ++j) {
+                float16_t pair = NR_P(i, 16u * j + c) + NR_P(i, 16u * j + c + 8u);
+                a = a + pair;
+            }
+            acc[c] = a;
+        }
+        float16_t even = (acc[0] + acc[2]) + (acc[4] + acc[6]);
+        float16_t odd  = (acc[1] + acc[3]) + (acc[5] + acc[7]);
+        float16_t s = even + odd;
+        float16_t inv = float16_t(1.0 / max(float(s), 6.103515625e-05));
+        shNorm[128u + i] = inv;
+    }
+    barrier();
+    for (uint e = t_local; e < 4096u; e += 256u) {
+        uint i = e / 64u, j = e % 64u;
+        NR_P(i, j) = NR_P(i, j) * shNorm[128u + i];
+    }
+    if (debug) {
+        barrier();
+        for (uint e = t_local; e < 4096u; e += 256u) dbg[14336u + e] = shP[e];
+        barrier();
+    }
+    barrier();
+
+    // ============ stage 7b: V INT8 (one scalar over all 64 keys x 32 ch) ============
+    {
+        float m = 0.0;
+        for (uint e = t_local; e < 2048u; e += 256u)
+            m = max(m, abs(float(NR_V(e / 32u, e % 32u))));
+        const float sV = nr_wg_scale(m, 1u);
+        const float invV = (sV > 0.0) ? (1.0 / sV) : 0.0;
+        for (uint e = t_local; e < 2048u; e += 256u)
+            shV8[e] = nr_code(float(NR_V(e / 32u, e % 32u)), invV);
+    }
+    barrier();
+
+    // ============ stage 8: context T[64,32] = P*V — INT8 K32 ============
+    // P is quantised on the subgroup's own 8x64 tile with one scale (it multiplies
+    // every K step), streamed in two K32 chunks; V is the workgroup's single scalar.
+    {
+        uint m0 = sg * 8u;
+        float sP;
+        NR_SG_SCALE(shP, m0 * 64u, 64u, 2u)
+        sP = shSgScale[sg];
+        const float invP = (sP > 0.0) ? (1.0 / sP) : 0.0;
+        const float sPV = sP * shKV[1];
+        I8C i0 = I8C(0);
+        I8C i1 = I8C(0);
+        for (uint kc = 0u; kc < 2u; ++kc) {
+            subgroupMemoryBarrierShared();   // retire the previous chunk's MMA read
+            subgroupBarrier();
+            for (uint i8 = 0u; i8 < 8u; ++i8)
+                shC8[sg * 1024u + lane * 32u + i8] =
+                    nr_code(float(NR_P(m0 + i8, kc * 32u + lane)), invP);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            I8A a8;  coopMatLoad(a8, shC8, sg * 1024u, 32u, LCOL);
+            I8B b8a; coopMatLoad(b8a, shV8, kc * 1024u, 32u, LROW);
+            I8B b8b; coopMatLoad(b8b, shV8, kc * 1024u + 16u, 32u, LROW);
+            i0 = coopMatMulAdd(a8, b8a, i0);
+            i1 = coopMatMulAdd(a8, b8b, i1);
+        }
+        I8F g0 = I8F(i0);
+        I8F g1 = I8F(i1);
+        MAT_C acc0 = MAT_C(float16_t(0.0));
+        MAT_C acc1 = MAT_C(float16_t(0.0));
+        for (int q = 0; q < 4; ++q) {
+            acc0[q] = g0[q] * sPV;
+            acc1[q] = g1[q] * sPV;
+        }
+        MAT_H half0 = MAT_H(acc0);
+        coopMatStore(half0, shArena, 6144u + m0 * 32u, 32u, LROW);
+        MAT_H half1 = MAT_H(acc1);
+        coopMatStore(half1, shArena, 6144u + m0 * 32u + 16u, 32u, LROW);
+    }
+    if (debug) {
+        barrier();
+        for (uint e = t_local; e < 2048u; e += 256u) dbg[18432u + e] = NR_CTX(e / 32u, e % 32u);
+        barrier();
+    }
+    barrier();
+
+    // ============ stage 9: projection O[64,32] + ars seed — INT8 K32 =========
+    // R21's segment, re-derived: per-subgroup Ctx quantisation (its own 8x32 tile),
+    // two INT8 K32 MMAs, folded per-channel dequant, unchanged FP32 seed, one narrow.
+    {
+        uint m0 = sg * 8u;
+        {
+            float sC;
+            NR_SG_SCALE(shArena, 6144u + m0 * 32u, 32u, 1u)
+            sC = shSgScale[sg];
+            const float invC = (sC > 0.0) ? (1.0 / sC) : 0.0;
+            for (uint i8 = 0u; i8 < 8u; ++i8)
+                shC8[sg * 1024u + lane * 32u + i8] =
+                    nr_code(float(NR_CTX(m0 + i8, lane)), invC);
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        const float sA = shSgScale[sg];
+        MAT_C acc0;
+        {
+            MAT_H seed;
+            coopMatLoad(seed, shY, m0 * 32u + 0u, 32u, LROW);
+            MAT_H scale;
+            coopMatLoad(scale, wb, uint(pc.p2.y) + 0u, 0u, LROW);
+            seed = seed * scale;
+            acc0 = MAT_C(seed);
+        }
+        MAT_C acc1;
+        {
+            MAT_H seed;
+            coopMatLoad(seed, shY, m0 * 32u + 16u, 32u, LROW);
+            MAT_H scale;
+            coopMatLoad(scale, wb, uint(pc.p2.y) + 16u, 0u, LROW);
+            seed = seed * scale;
+            acc1 = MAT_C(seed);
+        }
+        I8A a8;  coopMatLoad(a8, shC8, sg * 1024u, 32u, LCOL);
+        I8B b8a; coopMatLoad(b8a, w8, W8_WO, 32u, LCOL);
+        I8B b8b; coopMatLoad(b8b, w8, W8_WO + 512u, 32u, LCOL);
+        I8C i0 = I8C(0);
+        I8C i1 = I8C(0);
+        i0 = coopMatMulAdd(a8, b8a, i0);
+        i1 = coopMatMulAdd(a8, b8b, i1);
+        I8F g0 = I8F(i0);
+        I8F g1 = I8F(i1);
+        MAT_C fac; coopMatLoad(fac, wsc, SC_WO, 0u, LROW);
+        for (int q = 0; q < 4; ++q) fac[q] = fac[q] * sA;
+        for (int q = 0; q < 4; ++q) {
+            precise float p0 = g0[q] * fac[q];
+            precise float q0 = acc0[q] + p0;
+            acc0[q] = q0;
+            precise float p1 = g1[q] * fac[q];
+            precise float q1 = acc1[q] + p1;
+            acc1[q] = q1;
+        }
+
+        MAT_H half0 = MAT_H(acc0);
+        if (debug) coopMatStore(half0, shX, m0 * 32u, 32u, LROW);
+        bool oob0;
+        uint base0 = nr_tok_addr(m0, 0u, wx, wy, shift, tiles_x, oob0);
+        if (!oob0) coopMatStore(half0, imgout, base0, 16u, LROW);
+        MAT_H half1 = MAT_H(acc1);
+        if (debug) coopMatStore(half1, shX, m0 * 32u + 16u, 32u, LROW);
+        bool oob1;
+        uint base1 = nr_tok_addr(m0, 16u, wx, wy, shift, tiles_x, oob1);
+        if (!oob1) coopMatStore(half1, imgout, base1, 16u, LROW);
+    }
+    // Retain the original unconditional publication; debug O still uses shX.
+    barrier();
+    if (debug) {
+        barrier();
+        for (uint e = t_local; e < 2048u; e += 256u) dbg[20480u + e] = shX[e];
+    }
+}

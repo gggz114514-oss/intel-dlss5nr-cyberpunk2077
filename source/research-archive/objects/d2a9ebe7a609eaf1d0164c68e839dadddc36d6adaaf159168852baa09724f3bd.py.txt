@@ -1,0 +1,229 @@
+"""Register-budget evidence v2 (CPU only): proper def/use liveness on the native ISA.
+
+For F05 C128 (pipeline 9, n04b base capture) and F05 C64 (pipeline 5, n04a base capture):
+
+  * DPAS map: accumulator base register, operand registers, and the spacing between the
+    concurrently live QKV accumulators  -> allocator footprint per cooperative-matrix acc.
+  * QKV region: delimited by the first weight send before the single barrier; counted are
+    weight sends (load.ugm.d32x8*), A row sends (load.ugm.d32x8t*), DPAS, and the peak
+    live-GRF count with its composition (acc / A operand / B operand / scalar+address).
+  * Kernel-level peak for reference.
+
+The liveness pass is a straight-line backward def/use sweep over the whole kernel (jumps are
+ignored, so branchy debug paths are merged: the numbers are an upper bound on each path but
+exactly what the allocator has to satisfy after IGC's if-conversion/uniform branches).
+"""
+import re, json
+from pathlib import Path
+
+Q = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+         'fullnet-continuous-20261027/queue')
+OUT = Path(__file__).resolve().parent
+
+TARGETS = {
+    'C128': Q / 'n04b-f05-c128-feed/native/captures/native-native-base/ISA/'
+                'CS_asmf98d5ab4e239dd54_simd32_000000000000000a_9_orig.asm',
+    'C64':  Q / 'n04a-f05-c64-feed/native/captures/native-native-base/ISA/'
+                'CS_asm6a22246177be2653_simd32_0000000000000006_5_orig.asm',
+}
+LINE = re.compile(r'/\* \[([0-9A-Fa-f]+)\]\s*\*/\s*(\([^)]*\))?\s*([a-zA-Z0-9_.]+)\s*(.*)$')
+RTOK = re.compile(r'(?<![\w.])r(\d+)(?:\.(\d+))?')
+BPE = {'ud': 4, 'd': 4, 'f': 4, 'w': 2, 'uw': 2, 'hf': 2, 'bf': 2, 'ub': 1, 'b': 1,
+       'q': 8, 'uq': 8, 'df': 8, 'v': 2, 'uv': 2, 'vf': 2}
+
+
+def parse(path):
+    ins = []
+    for raw in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+        m = LINE.match(raw.strip())
+        if not m:
+            continue
+        pc, pred, op, rest = int(m.group(1), 16), m.group(2) or '', m.group(3), m.group(4)
+        ex = 1
+        me = re.match(r'\s*\((\d+)\|[^)]*\)\s*', rest)
+        if me:
+            ex = int(me.group(1)); rest = rest[me.end():]
+        body = rest.split('//')[0]
+        ins.append(dict(pc=pc, op=op, pred=pred, text=body, ex=ex,
+                        comment=rest.split('//')[1].strip() if '//' in rest else ''))
+    return ins
+
+
+def span(ex, typ):
+    return max(1, (ex * BPE.get((typ or 'd').lower(), 4) + 31) // 32)
+
+
+def ops_of(d):
+    return [t for t in re.split(r'\s+', d['text'].strip()) if t]
+
+
+def defuse(d):
+    """(defs set(grf), uses set(grf), roles dict grf->role)"""
+    ops = ops_of(d)
+    de, us, roles = set(), set(), {}
+    if not ops:
+        return de, us, roles
+    if d['op'].startswith('dpas'):
+        # dst acc(8) | acc-in(8) | A(8) | B(8)
+        m = RTOK.search(ops[0])
+        if m:
+            b = int(m.group(1))
+            for g in range(b, min(b + 8, 128)):
+                de.add(g); roles[g] = 'acc'
+        for role, oi in (('acc', 1), ('A', 2), ('B', 3)):
+            if oi >= len(ops):
+                continue
+            m = RTOK.search(ops[oi])
+            if not m:
+                continue
+            b = int(m.group(1))
+            for g in range(b, min(b + 8, 128)):
+                us.add(g); roles.setdefault(g, role)
+        return de, us, roles
+    if d['op'].startswith('send'):
+        m = RTOK.search(ops[0])
+        rd = re.search(r'rd:(\d+)', d['comment'])
+        n = int(rd.group(1)) if rd else 1
+        if m:
+            b = int(m.group(1))
+            for g in range(b, min(b + n, 128)):
+                de.add(g); roles[g] = 'send'
+        if len(ops) > 1:
+            m = RTOK.search(ops[1])
+            if m:
+                b = int(m.group(1))
+                for g in range(b, min(b + 2, 128)):   # message header = 2 GRF
+                    us.add(g); roles.setdefault(g, 'hdr')
+        return de, us, roles
+    # generic: first operand is the destination
+    mt = re.search(r':([a-z]+)', ops[0])
+    typ = mt.group(1) if mt else 'd'
+    m = RTOK.search(ops[0])
+    if m and not ops[0].startswith('null'):
+        b = int(m.group(1)); sp = span(d['ex'], typ)
+        for g in range(b, min(b + sp, 128)):
+            de.add(g); roles[g] = 'dst'
+    for tok in ops[1:]:
+        mt = re.search(r':([a-z]+)', tok)
+        typ2 = mt.group(1) if mt else 'd'
+        if re.match(r'^[a-zA-Z]+[0-9.]*:', tok):
+            continue
+        for mm in RTOK.finditer(tok):
+            b = int(mm.group(1)); sp = span(d['ex'], typ2)
+            for g in range(b, min(b + sp, 128)):
+                us.add(g); roles.setdefault(g, 'src')
+    return de, us, roles
+
+
+def analyse(tag, path):
+    ins = parse(path)
+    du = [defuse(d) for d in ins]
+    n = len(ins)
+    # backward liveness (straight line over the whole kernel)
+    live = [set() for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        de, us, _ = du[i]
+        live[i] = us | (live[i + 1] - de)
+    sizes = [len(live[i]) for i in range(n)]
+
+    # landmarks
+    is_dpas = [d['op'].startswith('dpas') for d in ins]
+    is_w = [('load.ugm.d32x8' in d['comment'] and 'd32x8t' not in d['comment']) for d in ins]
+    is_a = [('load.ugm.d32x8t' in d['comment'] or 'load.ugm.d16u32' in d['comment']) for d in ins]
+    bar = next((i for i, d in enumerate(ins) if 'barrier' in d['comment'] or d['op'].startswith('bar')), None)
+
+    # QKV phase groups: contiguous runs of dpas whose accumulator base repeats
+    groups, cur = [], []
+    prev_idx = None
+    for i in range(n):
+        if is_dpas[i]:
+            if prev_idx is not None and i - prev_idx > 40 and len(cur) >= 6:
+                groups.append(cur); cur = []
+            cur.append(i); prev_idx = i
+    if cur:
+        groups.append(cur)
+    qkv_groups = []
+    group_idx = []
+    for g in groups:
+        # phase groups have 6 accumulators at 8-GRF spacing; the score/PV groups do not
+        bases = []
+        for i in g:
+            m = RTOK.search(ops_of(ins[i])[0])
+            if m:
+                bases.append(int(m.group(1)))
+        uniq = sorted(set(bases))
+        qkv_groups.append(dict(first_pc=hex(ins[g[0]]['pc']), last_pc=hex(ins[g[-1]]['pc']),
+                               dpas=len(g), acc_bases=uniq,
+                               acc_gaps=sorted({b - a for a, b in zip(uniq, uniq[1:])})))
+        group_idx.append(g)
+
+    # QKV window = first weight send .. last DPAS of the first two DPAS groups (the two
+    # row_phase bodies of the QKV projection; the later groups are score / PV)
+    w_idx = [i for i in range(n) if is_w[i]]
+    qkv_dpas = [i for gg in group_idx[:2] for i in gg]
+    win = (min(w_idx) if w_idx else 0, max(qkv_dpas) if qkv_dpas else n - 1)
+
+    def peak_in(lo, hi):
+        best = (0, None)
+        for i in range(lo, hi + 1):
+            if sizes[i] > best[0]:
+                best = (sizes[i], i)
+        return best
+    pk_all = peak_in(0, n - 1)
+    pk_qkv = peak_in(win[0], win[1])
+
+    def comp(i, grfs):
+        de, us, roles = du[i]
+        acc = [g for g in grfs if roles.get(g) == 'acc' or any(0 <= g - b < 8 for b in
+              sorted({int(RTOK.search(ops_of(ins[j])[0]).group(1)) for j in qkv_dpas
+                      if RTOK.search(ops_of(ins[j])[0])}))]
+        A = [g for g in grfs if roles.get(g) == 'A']
+        B = [g for g in grfs if roles.get(g) == 'B']
+        scr = [g for g in grfs if g not in acc and g not in A and g not in B]
+        return dict(total=len(grfs), acc=len(acc), A=len(A), B=len(B), other=len(scr),
+                    other_list=sorted(scr))
+
+    return dict(tag=tag, path=str(path), instructions=n,
+                dpas=sum(is_dpas), weight_sends=sum(is_w), a_row_sends=sum(is_a),
+                barrier_index=bar,
+                qkv_groups=qkv_groups,
+                qkv_window=[hex(ins[win[0]]['pc']), hex(ins[win[1]]['pc'])],
+                peak_kernel=dict(n=pk_all[0], pc=hex(ins[pk_all[1]]['pc']),
+                                 comp=comp(pk_all[1], live[pk_all[1]])),
+                peak_qkv=dict(n=pk_qkv[0], pc=hex(ins[pk_qkv[1]]['pc']),
+                              comp=comp(pk_qkv[1], live[pk_qkv[1]]),
+                              grf=sorted(live[pk_qkv[1]])),
+                qkv_region_counts=dict(
+                    weight=sum(is_w[win[0]:win[1] + 1]),
+                    a_rows=sum(is_a[win[0]:win[1] + 1]),
+                    dpas=sum(is_dpas[win[0]:win[1] + 1])),
+                max_grf_index=max(max(de) if de else 0 for de, _, _ in du))
+
+
+def main():
+    out = {}
+    for tag, p in TARGETS.items():
+        if not p.exists():
+            out[tag] = dict(error='missing', path=str(p)); continue
+        out[tag] = analyse(tag, p)
+    (OUT / 'regs.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    for tag, r in out.items():
+        print('==', tag, r.get('path', r.get('error')))
+        if 'error' in r:
+            continue
+        print('  instructions=%d dpas=%d weight_sends=%d a_row_sends=%d barrier@%s'
+              % (r['instructions'], r['dpas'], r['weight_sends'], r['a_row_sends'],
+                 r['barrier_index']))
+        print('  max GRF index = r%d' % r['max_grf_index'])
+        for g in r['qkv_groups']:
+            print('   dpas-group %s..%s n=%d acc=%s gaps=%s'
+                  % (g['first_pc'], g['last_pc'], g['dpas'], g['acc_bases'], g['acc_gaps']))
+        print('  QKV window %s..%s counts=%s' % (r['qkv_window'][0], r['qkv_window'][1], r['qkv_region_counts']))
+        print('  peak(kernel) n=%d @%s comp=%s' % (r['peak_kernel']['n'], r['peak_kernel']['pc'], r['peak_kernel']['comp']))
+        c = dict(r['peak_qkv']['comp']); grf = c.pop('grf', None); ol = c.pop('other_list', None)
+        print('  peak(QKV)    n=%d @%s comp=%s' % (r['peak_qkv']['n'], r['peak_qkv']['pc'], c))
+        print('  peak(QKV) live set =', r['peak_qkv']['grf'])
+
+
+if __name__ == '__main__':
+    main()

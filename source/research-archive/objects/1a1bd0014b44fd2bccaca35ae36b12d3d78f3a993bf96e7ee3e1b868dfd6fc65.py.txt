@@ -1,0 +1,45 @@
+from pathlib import Path
+import json,re,hashlib,subprocess,sys
+R=Path(__file__).resolve().parent;A=R.parent;B=A.parents[1]
+P=R/'f20-peer8-single';N=R/'f20-peer8-dualweight';N.mkdir(exist_ok=True)
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+# Record lifecycle proof BEFORE creating the controlled shader.
+proof=dict(parent=ident(P/'candidate.spv'),change='Only contraction paired weight scopes; expansion, owner, transport, synchronization and stage4+ unchanged',
+ lifecycle='A and C0/C1 are unchanged. Create B0 and B1 before either MMA. C0 reads B0 once, then B0 dead; C1 reads B1 once, then B1 dead. No weight survives its K group. Next K may reuse both banks after source retirement. No cross-K prefetch.',
+ independent='B0/B1 are distinct readonly weight tiles. Both address calculations depend only on PUSH and constant K. C0 and C1 each preserve K0..112 order; each MMA and rounding unchanged.',
+ logical_live_bytes_per_lane=dict(C0_C1=32,own_cache_upper_bound=32,current_A=8,old_one_B=16,new_two_B=32,old_contraction_subtotal_upper_bound=88,new_contraction_subtotal_upper_bound=104,increment_upper_bound=16),
+ peak_limit='Logical fragment subtotal only; own/current A may alias and cache retires progressively. Expansion unchanged. Real total GRF peak includes address/packing/temp and is compiler-dependent; not proven by 104. Native must show distinct B banks and zero scratch before timing.',
+ unchanged=dict(weight_tiles_per_WG=128,contract_MMA_per_WG=128,normal_barriers=True,SLM_bytes=True,half_rounding=True),
+ acceptance='Numerical fixed/fb2 gold, native actual B send overlap and disjoint live returns, no scratch. If not materialized, no ordinary. Timing against P03 plus original single to separate recovery from baseline gain.')
+(N/'PROOF.json').write_text(json.dumps(proof,indent=2),encoding='utf-8')
+s=(P/'candidate.comp').read_text(encoding='utf-8-sig');original=s
+pat=r'                \{\n                    MAT_B w; coopMatLoad\(w,wb,uint\(pc.p1.y\)\+(\d+)u,16u,LCOL\);\n                    c0=coopMatMulAdd\(a,w,c0\);\n                \}\n                \{\n                    MAT_B w; coopMatLoad\(w,wb,uint\(pc.p1.y\)\+(\d+)u,16u,LCOL\);\n                    c1=coopMatMulAdd\(a,w,c1\);\n                \}'
+matches=list(re.finditer(pat,s));assert len(matches)==16
+for i,m in enumerate(matches):assert int(m[1])==(i%8)*256 and int(m[2])==2048+(i%8)*256
+def replace(m):return f'''                MAT_B b0,b1;
+                coopMatLoad(b0,wb,uint(pc.p1.y)+{m[1]}u,16u,LCOL);
+                coopMatLoad(b1,wb,uint(pc.p1.y)+{m[2]}u,16u,LCOL);
+                c0=coopMatMulAdd(a,b0,c0);
+                c1=coopMatMulAdd(a,b1,c1);'''
+s=re.sub(pat,replace,s)
+assert s[:s.index('        MAT_C c0;')]==original[:original.index('        MAT_C c0;')]
+assert s[s.index('    // ============ stage 4:'):]==original[original.index('    // ============ stage 4:'):]
+src=N/'candidate.comp';spv=N/'candidate.spv';src.write_text(s,encoding='utf-8')
+run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv])
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+pm=ST.Module(P/'candidate.spv');cm=ST.Module(spv);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[]);assert len(keep)==len(ST.no_contraction_ids(pm))==7
+ST.set_no_contraction(cm,set(keep),spv)
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+text=(P/'plan.txt').read_text();assert text.count((P/'candidate.spv').as_posix())==1
+plan=N/'plan.txt';plan.write_text(text.replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8')
+runner=Path(json.loads((P/'LUNA-GATES.json').read_text())['identities'][0]['path'])
+(N/'CANDIDATE.json').write_text(json.dumps(dict(source=ident(src),spv=ident(spv),plan=ident(plan),cpu=run([runner,'--plan',plan,'--cpu-check']),replacement_count=16,no_contraction_count=7),indent=2))
+for kind in ['GATES','NATIVE']:
+ task=json.loads((P/f'LUNA-{kind}.json').read_text().replace('f20-peer8-single','f20-peer8-dualweight'))
+ task['identities']=[v for v in task['identities'] if not v['path'].endswith('.spv')]+[ident(spv)]
+ for j in task['jobs']:j['plan']=ident(plan);j['argv'][j['argv'].index('--plan')+1]=str(plan)
+ task['rules']=['Exact jobs only, unique GPU lock serial. Any error/nongold stop, no rerun. Gates then native only after gates pass. No timing authorized until main native review.']
+ (N/f'LUNA-{kind}.json').write_text(json.dumps(task,indent=2))
+print(ident(spv))

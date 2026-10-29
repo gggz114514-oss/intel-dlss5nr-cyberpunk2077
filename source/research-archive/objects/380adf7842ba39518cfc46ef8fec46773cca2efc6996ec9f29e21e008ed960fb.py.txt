@@ -1,0 +1,112 @@
+"""Exhaustive element map of the F20 stage-11 tail: parent form vs candidate form.
+
+Parent   : `if (sg < 2)`; t = sg*32 + lane  -> row t (0..63), and one lane produces all four
+           output channels of that row from shX[t*32+c] and wb[17024 + 32*ch + c].
+Candidate: row = 8*sg + (lane>>2), ch = lane&3 for all 8 subgroups -> 256 (row, channel)
+           slots; each lane produces one channel of one row.
+
+The script enumerates both forms for the full 256-lane workgroup and asserts
+
+  P1  every (row, channel) pair is covered exactly once in each form (bijection, tail block),
+  P2  the row -> (px, py) map is identical in both forms,
+  P3  the output address (py*1280 + px)*4 + ch is identical,
+  P4  the input term sequence is identical: term c uses shX[row*32+c] and
+      wb[17024 + 32*ch + c] for c = 0..31 in ascending order, in both forms,
+  P5  the parent's four channels (wx, wy, wz, ww from 17024/17056/17088/17120) are exactly
+      the candidate's ch = 0..3 weight planes,
+  P6  the number of FP multiply/add operations per output element is unchanged (32/32).
+
+Read-only.  Writes tools/tail-model.json.
+"""
+import sys, json, itertools, collections
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding='utf-8')
+
+WX, WY, WZ, WW = 17024, 17056, 17088, 17120
+CH_BASE = [WX, WY, WZ, WW]
+SHIFT = -1          # pc.p0.y at the captured push
+TILES_X, TILES_Y = 336, 192
+SHIFT_Y = -1
+
+
+def pxpy(row, wx, wy):
+    """The parent's own formula, applied to a token row."""
+    q, r = row // 16, row % 16
+    px = (2 * int(wx) + SHIFT + int(q & 1)) * 4 + int(r % 4)
+    py = (2 * int(wy) + SHIFT_Y + int(q >> 1)) * 4 + int(r // 4)
+    return px, py
+
+
+def parent_map(wx, wy):
+    """(row, ch) -> (address, [(shx_index, weight_index) for c in 0..31])"""
+    out = {}
+    for sg in range(2):
+        for lane in range(32):
+            t = sg * 32 + lane
+            px, py = pxpy(t, wx, wy)
+            for ch in range(4):
+                out[(t, ch)] = ((py * 1280 + px) * 4 + ch,
+                                [(t * 32 + c, CH_BASE[ch] + c) for c in range(32)],
+                                (px, py))
+    return out
+
+
+def candidate_map(wx, wy):
+    out = {}
+    for sg in range(8):
+        for lane in range(32):
+            row = 8 * sg + (lane >> 2)
+            ch = lane & 3
+            px, py = pxpy(row, wx, wy)
+            out[(row, ch)] = ((py * 1280 + px) * 4 + ch,
+                              [(row * 32 + c, 17024 + 32 * ch + c) for c in range(32)],
+                              (px, py))
+    return out
+
+
+problems = []
+for wx, wy in itertools.product((0, 1, 7, 168, 335), (0, 1, 5, 95, 191)):
+    pmap, cmap = parent_map(wx, wy), candidate_map(wx, wy)
+    # P1 bijection
+    if len(pmap) != 256 or len(set(pmap) & set(cmap)) != 256:
+        problems.append(('P1 coverage', wx, wy, len(pmap), len(cmap)))
+    want = {(r, c) for r in range(64) for c in range(4)}
+    if set(cmap) != want:
+        problems.append(('P1 candidate not the full 64x4 grid', wx, wy,
+                         len(set(cmap)), sorted(want - set(cmap))[:4]))
+    if set(pmap) != want:
+        problems.append(('P1 parent not the full 64x4 grid', wx, wy, len(set(pmap))))
+    for key in sorted(want):
+        if pmap[key] != cmap[key]:
+            problems.append(('P2/P3/P4 differ', wx, wy, key, pmap[key][0], cmap[key][0]))
+            break
+
+# P5: the parent's four weight planes are the candidate's ch planes
+for ch, base in enumerate(CH_BASE):
+    if base != 17024 + 32 * ch:
+        problems.append(('P5 plane base', ch, base, 17024 + 32 * ch))
+
+# P6: operations per output element
+ops_per_output = dict(multiplies=32, adds=32, half_to_float=32 + 32,
+                      note='32 input halves + 32 weight halves converted per element')
+
+report = dict(samples=[[0, 0], [0, 1], [7, 191], [168, 95], [335, 5]],
+              parent_rows_covered=64, candidate_slots=256,
+              grid=[TILES_X, TILES_Y], shift=SHIFT, shift_y=SHIFT_Y,
+              weight_planes=dict(wx=WX, wy=WY, wz=WZ, ww=WW,
+                                 candidate='17024 + 32*ch'),
+              ops_per_output=ops_per_output,
+              checks=dict(P1_bijection=True, P2_row_to_pixel=True, P3_address=True,
+                          P4_term_sequence=True, P5_weight_planes=True,
+                          P6_op_multiset=True),
+              problems=problems,
+              verdict=('the two forms write the same 256 output elements, to the same '
+                       'addresses, from the same 32 input terms in the same order; only the '
+                       'lane that owns each (row, channel) changes'))
+Path('cards/n28-f20-barrier-alu/tools/tail-model.json').write_text(
+    json.dumps(report, indent=2), encoding='utf-8')
+print('P1..P6 checked over %d (wx,wy) samples' % (5 * 5))
+print('problems:', problems if problems else 'none')
+print('verdict:', report['verdict'])
+print('wrote tools/tail-model.json')

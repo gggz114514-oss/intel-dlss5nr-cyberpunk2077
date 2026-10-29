@@ -1,0 +1,217 @@
+"""Independent verification of the S03 / S12 reclassification evidence (CPU static only).
+
+For each touched dispatch it re-scans the bound SPV with the ledger's own scanner and then walks a
+second time counting the *quantiser sites* the two cards refer to:
+  * OpFDiv whose divisor is a 127.0 constant  (s = amax/127 then q = RNE(x/s))
+  * OpFMul by a 1/127 constant (the folded variant)
+  * FAbs / FMax / FMax3 / FMix tallies (the amax reduction machinery)
+  * per-SPV: does the kernel write its own scale binding (would make it a runtime-generated scale)
+
+Writes only ledger/evidence/reclassification-probe.json (no other path).
+"""
+from __future__ import annotations
+
+import json
+import struct
+import sys
+from pathlib import Path
+
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/ledger/_work")
+import spvscan  # noqa: E402
+
+L = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/ledger"
+OUT = L + r"/evidence/reclassification-probe.json"
+
+G = {4: "FAbs", 8: "Floor", 9: "Ceil", 10: "Fract", 31: "Sqrt", 32: "InverseSqrt",
+     37: "FMin", 38: "FMax", 39: "FClamp", 40: "FMix", 41: "FStep", 43: "Fma", 50: "FMax3",
+     2: "RoundEven", 1: "Round"}
+
+
+def quant_sites(path: Path) -> dict:
+    """Second pass: find /127 and *(1/127) sites, and resolve which value ids they consume."""
+    data = path.read_bytes()
+    n = len(data) // 4
+    words = struct.unpack("<%dI" % n, data[: n * 4])
+    i = 5
+    consts: dict[int, float] = {}
+    types_float: dict[int, int] = {}
+    const_type: dict[int, int] = {}
+    divs, muls, abs_calls = [], [], []
+    ext_abs = 0
+    while i < n:
+        w = words[i]
+        wc = w >> 16
+        op = w & 0xFFFF
+        if wc == 0:
+            break
+        a = words[i + 1:i + wc]
+        if op == 22:
+            types_float[a[0]] = a[1]
+        elif op == 43 and a[0] in types_float:
+            width = types_float[a[0]]
+            if width == 32:
+                consts[a[1]] = struct.unpack("<f", struct.pack("<I", a[2]))[0]
+            elif width == 16:
+                consts[a[1]] = struct.unpack("<e", struct.pack("<H", a[2] & 0xFFFF))[0]
+            const_type[a[1]] = width
+        elif op == 136 and len(a) >= 4:          # OpFDiv result-type result-id x y
+            vals = [consts.get(a[2]), consts.get(a[3])]
+            divs.append({"result_type": a[0], "result": a[1], "const_operands": vals})
+        elif op == 133 and len(a) >= 4:          # OpFMul
+            vals = [consts.get(a[2]), consts.get(a[3])]
+            muls.append({"result_type": a[0], "result": a[1], "const_operands": vals})
+        elif op == 12 and len(a) >= 4:           # OpExtInst
+            lit = a[3]
+            name = G.get(lit)
+            if name == "FAbs":
+                ext_abs += 1
+                abs_calls.append(a[1])
+        i += wc
+
+    def is127(v):
+        return v is not None and abs(abs(v) - 127.0) < 1e-3
+
+    def is_inv127(v):
+        return v is not None and abs(abs(v) - 1.0 / 127.0) < 1e-7
+
+    div127 = [d for d in divs if any(is127(x) for x in d["const_operands"])]
+    mul_inv127 = [m for m in muls if any(is_inv127(x) for x in m["const_operands"])]
+    def const_hist(ops):
+        h: dict[str, int] = {}
+        for o in ops:
+            for v in o["const_operands"]:
+                if v is not None:
+                    h[repr(round(v, 8))] = h.get(repr(round(v, 8)), 0) + 1
+        return dict(sorted(h.items(), key=lambda kv: -kv[1]))
+
+    return {
+        "opfdiv_total": len(divs),
+        "opfdiv_const_operand_histogram": const_hist(divs),
+        "opfdiv_by_127": len(div127),
+        "opfdiv_127_values_seen": sorted({round(x, 6) for d in div127 for x in d["const_operands"] if is127(x)}),
+        "opfdiv_127_operand_positions": sorted({("rhs" if is127(d["const_operands"][1]) else "lhs")
+                                                for d in div127}),
+        "opfmul_total": len(muls),
+        "opfmul_by_inv127": len(mul_inv127),
+        "fabs_ext_inst": ext_abs,
+        "distinct_127_constants": len({k for k, v in consts.items() if is127(v)}),
+    }
+
+
+# (ordinal, name, why it is in this probe)
+TARGETS = [
+    (5, "ioport_block4_0", "S12 defect 1: 1 A operand, 2 N16 B fragments, no wo_i8/wosc binding"),
+    (10, "block5_swin_body_4", "S12: C64 WO A-side -> DYNAMIC (representative of the 7)"),
+    (15, "block6_swin_body_4", "S12: C64 WO A-side -> DYNAMIC"),
+    (20, "block7_swin_body_4", "S12: C64 WO A-side -> DYNAMIC"),
+    (265, "block62_swin_body_4", "S12: C64 WO A-side -> DYNAMIC"),
+    (270, "block63_swin_body_4", "S12: C64 WO A-side -> DYNAMIC"),
+    (275, "block64_swin_body_4", "S12: C64 WO A-side -> DYNAMIC"),
+    (280, "block65_swin_body_4", "S12: C64 WO A-side -> DYNAMIC"),
+    (25, "f3c64_body_ds", "S12 defect 2: r09 reads entry_sc[4] of chain_scales (DS static)"),
+    (49, "f3c128_body_ds", "S12: DS WO+DS both dynamic"),
+    (83, "f3c256_body_ds", "S12: DS WO+DS both dynamic"),
+    (54, "block15_swin_body_4", "S12: C256 WO A-side -> DYNAMIC (representative of the 15)"),
+    (58, "block16_swin_body_4", "S12: C256 WO A-side -> DYNAMIC"),
+    (62, "block17_swin_body_4", "S12: C256 WO A-side -> DYNAMIC"),
+    (66, "block18_swin_body_4", "S12: C256 WO A-side -> DYNAMIC"),
+    (70, "block19_swin_body_4", "S12: C256 WO A-side -> DYNAMIC"),
+    (74, "block20_swin_body_4", "S12: C256 WO A-side -> DYNAMIC"),
+    (78, "block21_swin_body_4", "S12: C256 WO A-side -> DYNAMIC (qxlast variant)"),
+    (205, "block48_swin_body_4", "S12: C256 WO A-side -> DYNAMIC"),
+    (209, "block49_swin_body_4", "S12: C256 WO A-side -> DYNAMIC"),
+    (213, "block50_swin_body_4", "S12: C256 WO A-side -> DYNAMIC"),
+    (217, "block51_swin_body_4", "S12: C256 WO A-side -> DYNAMIC"),
+    (221, "block52_swin_body_4", "S12: C256 WO A-side -> DYNAMIC"),
+    (225, "block53_swin_body_4", "S12: C256 WO A-side -> DYNAMIC"),
+    (229, "block54_swin_body_4", "S12: C256 WO A-side -> DYNAMIC"),
+    (233, "block55_swin_body_4", "S12: C256 WO A-side -> DYNAMIC (qxlast variant)"),
+    (167, "t3_b39_project_blend", "S03 R7 / S12: b39 -> DYNAMIC"),
+    (201, "c3x_pre_c256", "S12: cross-family projection -> DYNAMIC (r17)"),
+    (234, "c3x_pre_c128", "S12: cross-family projection -> DYNAMIC (r18)"),
+    (260, "c3x_pre_c64", "S12: cross-family projection -> DYNAMIC (r19)"),
+    (281, "f2c32_block66_fused", "S03 R7 / S12: F2 -> DYNAMIC"),
+    (286, "ioport_block70_1", "S03 R7 / S12: F20/b70 -> DYNAMIC"),
+]
+
+
+# Positions that S12 leaves UNKNOWN in its own 71-row inventory while FULLNET-ROWS v1 calls them
+# STATIC_COARSE.  They are NOT part of the 36 closures; this probe only measures the SPV so the
+# conflict can be stated with numbers instead of adjectives.
+CONFLICT_TARGETS = [
+    (120, "vit_block31_ffn_expand", "S12 supplementary: 'FAbs present but no 127.0 division'"),
+    (169, "split16_b40_l0", "S12 supplementary: 'FAbs present but no 127.0 division'"),
+]
+
+
+def main():
+    d = json.load(open(L + r"/FULLNET-ROWS.json", encoding="utf-8"))
+    rows = {r["ordinal"]: r for r in d["rows"]}
+    out_conf = {"schema": "dsh-reclassification-conflict-probe/1",
+                "question": "are the two S12-UNKNOWN supplementary positions really consistent with the "
+                            "ledger's STATIC_COARSE claim?", "targets": []}
+    for o, name, why in CONFLICT_TARGETS:
+        r = rows[o]
+        assert r["name"] == name, (o, r["name"], name)
+        p = Path(r["spv"]["path"])
+        extra = quant_sites(p)
+        sv = spvscan.scan(p)
+        out_conf["targets"].append({
+            "ordinal": o, "dispatch": name, "family": r["family"], "why": why,
+            "ledger_v1_class": [e["scale_A_source"] for e in r["quant_edges"]],
+            "ledger_v1_evidence": r["quant_edges"][0]["evidence"],
+            "ledger_v1_status": r["status"],
+            "spv": {"basename": r["spv"]["basename"], "sha256": sv["sha256"], "mma_int8": sv["mma_int8"],
+                    "has_127": sv["has_float_127"], "has_1_over_127": sv["has_float_inv127"],
+                    "ext_inst": sv["ext_inst"], **extra},
+        })
+    out = {"schema": "dsh-reclassification-probe/1", "method": "independent second-pass SPIR-V decode of the "
+           "bound SPV for every dispatch whose ledger class changes in V2; counts are instruction sites, not "
+           "graph nodes", "targets": []}
+    seen = {}
+    for o, name, why in TARGETS:
+        r = rows[o]
+        assert r["name"] == name, (o, r["name"], name)
+        p = Path(r["spv"]["path"])
+        if str(p) not in seen:
+            sv = spvscan.scan(p)
+            first = sv["float_constants"]
+            extra = quant_sites(p)
+            seen[str(p)] = {
+                "sha256": sv["sha256"], "bytes": sv["bytes"], "mma_int8": sv["mma_int8"],
+                "mma_fp16": sv["mma_fp16"], "mma_shapes": sv["mma_shapes"],
+                "ext_inst": sv["ext_inst"], "has_127": sv["has_float_127"],
+                "has_1_over_127": sv["has_float_inv127"],
+                "float_constants_sample": first[:16],
+                "scale_bindings": [i for i in sv["interface"]
+                                   if i.get("binding") is not None and i["storage"] in ("Uniform", "StorageBuffer")],
+                "any_scale_buffer_written": any(i["written_by_kernel"] and ("scale" in (i.get("pointee") or "").lower()
+                                                                           or "sc" in (i.get("name") or "").lower())
+                                                for i in sv["interface"]),
+                **extra,
+            }
+        rec = dict(seen[str(p)])
+        rec["ordinal"] = o
+        rec["dispatch"] = name
+        rec["why"] = why
+        rec["ledger_baseline_class"] = [e["scale_A_source"] for e in r["quant_edges"]]
+        rec["bindings"] = [(b["binding"], b["buffer"], b["bytes"]) for b in r["bindings"]]
+        out["targets"].append(rec)
+    out["unique_spvs"] = len(seen)
+    out["open_conflict_probe"] = out_conf
+    Path(OUT).write_text(json.dumps(out, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    print("wrote", OUT.replace("/", "\\"), "unique SPVs:", len(seen))
+    for t in out["targets"]:
+        print(f"  ord{t['ordinal']:3d} {t['dispatch'][:26]:26s} fdiv127={t['opfdiv_by_127']:2d} "
+              f"fdiv={t['opfdiv_total']:2d} fabs={t['fabs_ext_inst']:2d} "
+              f"has127={str(t['has_127']):5s} inv127={str(t['has_1_over_127']):5s} "
+              f"writes_scale={t['any_scale_buffer_written']}")
+    print("conflict probe (not reclassified):")
+    for t in out_conf["targets"]:
+        print(f"  ord{t['ordinal']:3d} {t['dispatch'][:26]:26s} v1={t['ledger_v1_class']} "
+              f"fdiv127={t['spv']['opfdiv_by_127']} fabs={t['spv']['fabs_ext_inst']} "
+              f"has127={t['spv']['has_127']} inv127={t['spv']['has_1_over_127']} ext={t['spv']['ext_inst']}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,601 @@
+"""N30 F20 arena/ownership proof (CPU only, read-only inputs).
+
+Produces build/arena-check.json, the machine-checked half of STAGE-BLOCK-MATRIX.md
+and PROOF.json.  Four independent enumerations, none of them sampled:
+
+ 1. BLOCK INVENTORY.  Parse both sources' `shared` declarations, prove the byte
+    footprint is identical (24576 B) and that the candidate only *re-partitions*
+    an existing block.
+
+ 2. ELEMENT-MAPPING EQUALITY.  For every producer/consumer site the candidate
+    moved, enumerate the whole fragment (8 SG x every k-step x 8 rows x 16 cols,
+    plus both halves) and decode the shared-memory index to (plane, token,
+    channel) under the parent layout and under the candidate layout.  The two
+    decoded triples must be equal for every slot -> the staged element each
+    fragment slot carries is unchanged.
+
+ 3. OWNERSHIP / HAZARD MATRIX.  Build the exact per-subgroup read and write set
+    of every stage over the arena, then classify every (element, writer SG,
+    reader SG) triple as intra-owner or cross-owner.  This is what decides which
+    barriers are structurally required:
+      * stage 3 read -> stage 4 write (WAR): cross-owner in the parent (hence the
+        parent's barrier), zero cross-owner in the candidate (hence removable);
+      * stage 0 -> stage 1/3, stage 1 -> stage 3, stage 4 -> stage 6/8,
+        stage 9 -> tail: cross-owner in BOTH, so those barriers stay.
+
+ 4. BARRIER INVENTORY.  Classify all source `barrier()` sites as debug-guarded or
+    on the normal path by brace tracking, so "static 16 -> 15, executed 5 -> 4"
+    is measured from the source and not asserted.
+
+Run:  @NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe _arena_check.py
+"""
+import hashlib
+import json
+import pathlib
+import re
+
+CARD = pathlib.Path(__file__).resolve().parent
+PARENT = CARD / 'parent.comp'
+CAND = CARD / 'candidate.comp'
+
+SHARED_RE = re.compile(r'^shared\s+(\w+)\s+(\w+)\s*\[\s*(\d+)\s*\]\s*;', re.M)
+
+
+def sha(p):
+    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+
+
+# ----------------------------------------------------------------- 1. blocks
+def shared_arrays(path):
+    txt = pathlib.Path(path).read_text(encoding='utf-8')
+    out = []
+    for m in SHARED_RE.finditer(txt):
+        typ, name, n = m.group(1), m.group(2), int(m.group(3))
+        width = 2 if typ.startswith('float16') else 4
+        out.append(dict(type=typ, name=name, elements=n, bytes=n * width))
+    return out
+
+
+def block_table(arrays):
+    """PLAN §1: three physical blocks, offsets assigned in declaration order."""
+    off = 0
+    blocks = []
+    for a in arrays:
+        blocks.append(dict(name=a['name'], elements=a['elements'], bytes=a['bytes'],
+                           base_half=off // 2, base_byte=off,
+                           span_half=(off // 2, off // 2 + a['elements'])))
+        off += a['bytes']
+    return blocks, off
+
+
+# ------------------------------------------------- 2. layout decode helpers
+# halves of one 64x128 A block; a "plane" p (0=Q,1=K,2=V,3=CTX) is 2048 halfs.
+PARENT_PLANE_BASE = {0: 0, 1: 2048, 2: 4096, 3: 6144}
+CAND_PLANE_BASE = {0: 0, 1: 32, 2: 64, 3: 96}          # column offsets, stride 128
+
+
+def parent_plane(t, c, p):
+    return PARENT_PLANE_BASE[p] + t * 32 + c
+
+
+def cand_plane(t, c, p):
+    return t * 128 + CAND_PLANE_BASE[p] + c
+
+
+def dec_A(i):
+    """(row, col) of a strand-128 A element."""
+    return i // 128, i % 128
+
+
+def dec_parent_plane(i):
+    p, r = divmod(i, 2048)
+    return p, r // 32, r % 32
+
+
+def dec_cand_plane(i):
+    row, col = dec_A(i)
+    return col // 32, row, col % 32
+
+
+def mapping_checks():
+    """Every site the candidate moved: parent index vs candidate index."""
+    rows = []
+    bad = []
+
+    def chk(site, p, t, c, pi, ci):
+        dp, dc = dec_parent_plane(pi), dec_cand_plane(ci)
+        ok = dp == (p, t, c) and dc == (p, t, c)
+        rows.append(dict(site=site, plane=p, token=t, channel=c,
+                         parent_index=pi, cand_index=ci,
+                         parent_decoded=list(dp), cand_decoded=list(dc), ok=ok))
+        if not ok:
+            bad.append(rows[-1])
+
+    # stage 4 QKV stores: 8 SG x 3 regions x 8 rows x 2 halves x 16 columns
+    for sg in range(8):
+        m0 = sg * 8
+        for region in range(3):
+            for half in range(2):
+                for r in range(8):
+                    for c in range(16):
+                        t, ch = m0 + r, 16 * half + c
+                        chk('stage4-store', region, t, ch,
+                            parent_plane(t, ch, region),
+                            cand_plane(t, ch, region))
+    # stage 6 Q loads (score_q0 / score_q1), 8 SG x 2 halves x 8 rows x 16 cols
+    for sg in range(8):
+        for half in range(2):
+            for r in range(8):
+                for c in range(16):
+                    t, ch = sg * 8 + r, 16 * half + c
+                    chk('stage6-Q-load', 0, t, ch,
+                        sg * 8 * 32 + r * 32 + 16 * half + c,          # LROW s32
+                        sg * 8 * 128 + r * 128 + 16 * half + c)        # LROW s128
+    # stage 6 K^T loads (LCOL, 16x16 B fragment), 2 j x 2 halves x 2 ki x 16 rows
+    for j in range(2):
+        n0 = j * 32
+        for half in range(2):
+            for ki in range(2):
+                k0 = ki * 16
+                for r in range(16):
+                    for c in range(16):
+                        t, ch = n0 + 16 * half + c, k0 + r
+                        chk('stage6-K-load', 1, t, ch,
+                            2048 + (n0 + 16 * half + c) * 32 + (k0 + r),
+                            (n0 + 16 * half + c) * 128 + 32 + (k0 + r))
+    # stage 8 V loads (LROW, 16x16 B fragment), 4 ki x 2 halves x 16 rows
+    for ki in range(4):
+        k0 = ki * 16
+        for half in range(2):
+            for r in range(16):
+                for c in range(16):
+                    t, ch = k0 + r, 16 * half + c
+                    chk('stage8-V-load', 2, t, ch,
+                        4096 + k0 * 32 + r * 32 + 16 * half + c,
+                        k0 * 128 + r * 128 + 64 + 16 * half + c)
+    # stage 8 debug CTX stores (same fragment as the V tile rows)
+    for sg in range(8):
+        m0 = sg * 8
+        for half in range(2):
+            for r in range(8):
+                for c in range(16):
+                    t, ch = m0 + r, 16 * half + c
+                    chk('stage8-CTX-store(debug)', 3, t, ch,
+                        parent_plane(t, ch, 3), cand_plane(t, ch, 3))
+    # debug macros NR_Q / NR_K / NR_V / NR_CTX: full 64x32 planes
+    for p in range(4):
+        for t in range(64):
+            for c in range(32):
+                chk('debug-macro-p%d' % p, p, t, c, parent_plane(t, c, p),
+                    cand_plane(t, c, p))
+    return rows, bad
+
+
+# --------------------------------------------- 3. per-stage access sets
+def stage0_write():
+    """X rows/cols per SG, straight from the source loops."""
+    sets = {s: set() for s in range(8)}
+    for tl in range(256):
+        sg = tl // 32
+        c = (tl & 15) * 2
+        group = tl >> 4
+        q, cell = group >> 2, group & 3
+        sx, sy = (cell & 1) * 2, (cell >> 1) * 2
+        for k in range(4):
+            dx, dy = (k & 1) ^ (group & 1), k >> 1
+            s = (sy + dy) * 4 + sx + dx
+            t = q * 16 + s
+            sets[sg].add(('X', t, c))
+            sets[sg].add(('X', t, c + 1))
+    return sets
+
+
+# ------------------------------------------------- 3b. plane footprints
+def plane_footprint(layout):
+    """Where each 64x32 plane physically lands inside the 8192-half A block."""
+    out = {}
+    sets = []
+    for p in range(4):
+        idxs = {(parent_plane(t, c, p) if layout == 'parent' else cand_plane(t, c, p))
+                for t in range(64) for c in range(32)}
+        sets.append(idxs)
+        rcs = [dec_A(i) for i in idxs]
+        rows = sorted({r for r, _ in rcs})
+        cols = sorted({c for _, c in rcs})
+        out['plane_%d' % p] = dict(halves=len(idxs),
+                                   a_rows_used=len(rows), a_row_min=rows[0],
+                                   a_row_max=rows[-1],
+                                   a_cols_used=len(cols), a_col_min=cols[0],
+                                   a_col_max=cols[-1],
+                                   contiguous_span=len(idxs) == max(idxs) - min(idxs) + 1)
+    union = set().union(*sets)
+    overlap = sum(len(sets[a] & sets[b]) for a in range(4) for b in range(a + 1, 4))
+    out['union_halves'] = len(union)
+    out['pairwise_overlap_halves'] = overlap
+    out['is_partition_of_8192'] = (len(union) == 8192 and overlap == 0)
+    return out
+
+
+def stage1_read_X():
+    """expand reads X rows mA / mB (8 rows x 16 cols per ki, ki = 0,1)."""
+    sets = {s: set() for s in range(8)}
+    for sg in range(8):
+        for rnd in range(2):
+            mA = (sg // 4 + 4 * rnd) * 8
+            mB = mA + 16
+            for base in (mA, mB):
+                for ki in range(2):
+                    for r in range(8):
+                        for c in range(16):
+                            sets[sg].add(('X', base + r, ki * 16 + c))
+    return sets
+
+
+def stage1_write():
+    sets = {s: set() for s in range(8)}
+    for sg in range(8):
+        for rnd in range(2):
+            mA = (sg // 4 + 4 * rnd) * 8
+            mB = mA + 16
+            n0 = (sg % 4) * 32
+            for base in (mA, mB):
+                for half in range(2):
+                    for r in range(8):
+                        for c in range(16):
+                            row, col = base + r, n0 + 16 * half + c
+                            sets[sg].add(('A', row, col))
+    return sets
+
+
+def stage3_read_A():
+    sets = {s: set() for s in range(8)}
+    for sg in range(8):
+        m0 = sg * 8
+        for ki in range(8):
+            for r in range(8):
+                for c in range(16):
+                    sets[sg].add(('A', m0 + r, ki * 16 + c))
+    return sets
+
+
+def stage3_read_X():
+    sets = {s: set() for s in range(8)}
+    for sg in range(8):
+        m0 = sg * 8
+        for half in range(2):
+            for r in range(8):
+                for c in range(16):
+                    sets[sg].add(('X', m0 + r, 16 * half + c))
+    return sets
+
+
+def stage3_write_Y():
+    sets = {s: set() for s in range(8)}
+    for sg in range(8):
+        m0 = sg * 8
+        for half in range(2):
+            for r in range(8):
+                for c in range(16):
+                    sets[sg].add(('Y', m0 + r, 16 * half + c))
+    return sets
+
+
+def stage4_write(layout):
+    sets = {s: set() for s in range(8)}
+    for sg in range(8):
+        m0 = sg * 8
+        for region in range(3):
+            for half in range(2):
+                for r in range(8):
+                    for c in range(16):
+                        t, ch = m0 + r, 16 * half + c
+                        i = (parent_plane(t, ch, region) if layout == 'parent'
+                             else cand_plane(t, ch, region))
+                        sets[sg].add(('A',) + dec_A(i))
+    return sets
+
+
+def stage6_read(layout='candidate'):
+    """Q (own rows) + K^T (all rows of the K plane)."""
+    q = {s: set() for s in range(8)}
+    k = {s: set() for s in range(8)}
+    for sg in range(8):
+        for half in range(2):
+            for r in range(8):
+                for c in range(16):
+                    t, ch = sg * 8 + r, 16 * half + c
+                    i = (parent_plane(t, ch, 0) if layout == 'parent'
+                         else cand_plane(t, ch, 0))
+                    q[sg].add(('A',) + dec_A(i))
+        for j in range(2):
+            for half in range(2):
+                for ki in range(2):
+                    for r in range(16):
+                        for c in range(16):
+                            t, ch = j * 32 + 16 * half + c, ki * 16 + r
+                            i = (parent_plane(t, ch, 1) if layout == 'parent'
+                                 else cand_plane(t, ch, 1))
+                            k[sg].add(('A',) + dec_A(i))
+    return q, k
+
+
+def stage8_read_V(layout='candidate'):
+    sets = {s: set() for s in range(8)}
+    for sg in range(8):
+        for ki in range(4):
+            for half in range(2):
+                for r in range(16):
+                    for c in range(16):
+                        t, ch = ki * 16 + r, 16 * half + c
+                        i = (parent_plane(t, ch, 2) if layout == 'parent'
+                             else cand_plane(t, ch, 2))
+                        sets[sg].add(('A',) + dec_A(i))
+    return sets
+
+
+def stage9_write_X():
+    sets = {s: set() for s in range(8)}
+    for sg in range(8):
+        m0 = sg * 8
+        for half in range(2):
+            for r in range(8):
+                for c in range(16):
+                    sets[sg].add(('X', m0 + r, 16 * half + c))
+    return sets
+
+
+def tail_read_X():
+    """pixel-owner tail: sg<2, t = sg*32+lane, reads X[t*32 + 0..31]."""
+    sets = {s: set() for s in range(8)}
+    for s in range(8):
+        if s >= 2:
+            continue
+        for lane in range(32):
+            t = s * 32 + lane
+            for c in range(32):
+                sets[s].add(('X', t, c))
+    return sets
+
+
+def cross_owner(write_sets, read_sets):
+    """Count (element, writer SG, reader SG) matches for a write->read pair.
+
+    matches        : how many such triples exist (an element read by 4 SGs counts 4)
+    distinct       : distinct arena elements involved
+    cross_triples  : triples whose writer SG differs from the reader SG -- these are
+                     exactly the ones that require a workgroup barrier
+    """
+    matches = 0
+    cross = 0
+    pairs = set()
+    distinct = set()
+    for w, ws in write_sets.items():
+        for r, rs in read_sets.items():
+            inter = ws & rs
+            if not inter:
+                continue
+            matches += len(inter)
+            distinct |= inter
+            if w != r:
+                cross += len(inter)
+                pairs.add((w, r))
+    return dict(matches=matches, distinct=len(distinct), cross_triples=cross,
+                pairs=sorted(pairs))
+
+
+def hazard_matrix():
+    out = {}
+    s0w = stage0_write()
+    s1w = stage1_write()
+    s3rA, s3rX, s3wY = stage3_read_A(), stage3_read_X(), stage3_write_Y()
+    s4w_c = stage4_write('candidate')
+    s4w_p = stage4_write('parent')
+    s6q, s6k = stage6_read()
+    s8v = stage8_read_V()
+    s9w = stage9_write_X()
+    tail = tail_read_X()
+
+    def rec(key, w, r, note):
+        h = cross_owner(w, r)
+        out[key] = dict(distinct_elements=h['distinct'],
+                        writer_reader_matches=h['matches'],
+                        cross_owner_matches=h['cross_triples'],
+                        cross_owner_sg_pairs=[list(p) for p in h['pairs']],
+                        barrier_required=bool(h['cross_triples']), note=note)
+    rec('stage0_write -> stage1_read', s0w, stage1_read_X(),
+        'X publication to expand; 16-row writer groups vs 8-row reader blocks')
+    rec('stage0_write -> stage3_read', s0w, s3rX,
+        'X seed rows for contract')
+    rec('stage1_write -> stage3_read', s1w, s3rA,
+        'A publication to contract (4-way redundant writer per row block)')
+    rec('stage3_read -> stage4_write (PARENT layout)', s3rA, s4w_p,
+        'the WAR the parent barrier at src line 336 closed')
+    rec('stage3_read -> stage4_write (CANDIDATE layout)', s3rA, s4w_c,
+        'the WAR that the interleaved layout makes intra-owner')
+    rec('stage1_write -> stage4_write (WAW, candidate)', s1w, s4w_c,
+        'ordered by the surviving stage1->stage3 barrier, no reader depends on it')
+    rec('stage4_write -> stage6_read_Q', s4w_c, s6q, 'Q: same rows, no barrier(A)')
+    rec('stage4_write -> stage6_read_K', s4w_c, s6k, 'K^T: every SG reads 6 of 8 row blocks')
+    rec('stage4_write -> stage8_read_V', s4w_c, s8v, 'V: every SG reads all 64 rows')
+    rec('stage9_write_X -> tail_read_X', s9w, tail,
+        'O publication to the two-SG pixel tail')
+    return out
+
+
+def stage9_read_Y():
+    sets = {s: set() for s in range(8)}
+    for sg in range(8):
+        m0 = sg * 8
+        for half in range(2):
+            for r in range(8):
+                for c in range(16):
+                    sets[sg].add(('Y', m0 + r, 16 * half + c))
+    return sets
+
+
+# --------------------------------------------------- 4. barrier inventory
+def barrier_sites(path):
+    """Every `barrier()` site with its enclosing debug-guard depth."""
+    lines = pathlib.Path(path).read_text(encoding='utf-8').splitlines()
+    depth = 0
+    guard_stack = []            # (depth_after_open, guarded)
+    sites = []
+    for n, ln in enumerate(lines, 1):
+        code = ln.split('//')[0]
+        is_barrier = 'barrier()' in code
+        if is_barrier:
+            guarded = any(g for _, g in guard_stack) or 'if (debug)' in code
+            sites.append(dict(line=n, guarded=bool(guarded), text=ln.strip()[:70]))
+        # brace tracking, with a one-line look-back for `if (debug)` guards
+        opens = code.count('{')
+        closes = code.count('}')
+        opens_guard = bool(re.search(r'if\s*\(\s*debug\s*\)', code)) or (
+            is_barrier and False)
+        if opens and opens_guard:
+            guard_stack.append((depth + opens, True))
+        elif opens:
+            guard_stack.append((depth + opens, False))
+        depth += opens - closes
+        while guard_stack and depth < guard_stack[-1][0]:
+            guard_stack.pop()
+    return sites
+
+
+# --------------------------------------------------- 6. occupancy counterfactual
+def occupancy():
+    """Resident workgroups = floor(SLM pool / WG mem); the ceiling on residency
+    has to hold for every pool size P, because P is not recorded offline.
+
+    Four columns, all from the same formula:
+      now            W = 24576 B   (SPIR-V + captured ISA)
+      doubled        W = 49152 B   (what a real ping-pong arena would cost)
+      half_again     W = 36864 B   (minimum disjoint window: Q+K+V only, +12288 B)
+      ledger         W = 29184 B   (the stale plan-row field) and its doubling
+    """
+    rows = []
+    for pool_kib in (64, 96, 128, 192, 256):
+        pool = pool_kib * 1024
+        r = dict(pool_kib=pool_kib, pool_bytes=pool)
+        for key, wg in (('now', 24576), ('doubled', 49152), ('half_again', 36864),
+                        ('ledger', 29184), ('ledger_doubled', 58368)):
+            r['wg_' + key] = wg
+            r['resident_' + key] = pool // wg
+            r['warps_' + key] = (pool // wg) * 8
+        r['delta_doubled'] = r['resident_doubled'] - r['resident_now']
+        r['delta_half_again'] = r['resident_half_again'] - r['resident_now']
+        r['delta_ledger_doubled'] = r['resident_ledger_doubled'] - r['resident_ledger']
+        rows.append(r)
+    return dict(wg_bytes_now=24576, wg_bytes_doubled=49152, wg_bytes_half_again=36864,
+                wg_bytes_ledger=29184, warps_per_wg=8, local_size=256, rows=rows,
+                note=('floor(P/(2W)) <= floor(floor(P/W)/2) for every P: doubling the '
+                      'workgroup memory at least halves the SLM-limited resident '
+                      'workgroup count whatever the pool is'))
+
+
+def main():
+    par_arrays, cand_arrays = shared_arrays(PARENT), shared_arrays(CAND)
+    par_blocks, par_bytes = block_table(par_arrays)
+    cand_blocks, cand_bytes = block_table(cand_arrays)
+
+    rows, bad = mapping_checks()
+    mstats = {}
+    for r in rows:
+        mstats.setdefault(r['site'], [0, 0])
+        mstats[r['site']][0] += 1
+        mstats[r['site']][1] += 0 if r['ok'] else 1
+
+    hz = hazard_matrix()
+    h = cross_owner(stage3_write_Y(), stage9_read_Y())
+    hz['stage3_write_Y -> stage9_read_Y'] = dict(
+        distinct_elements=h['distinct'], writer_reader_matches=h['matches'],
+        cross_owner_matches=h['cross_triples'],
+        cross_owner_sg_pairs=[list(p) for p in h['pairs']],
+        barrier_required=bool(h['cross_triples']),
+        note='Y rows are produced and consumed by the same SG, but three barriers '
+             'sit between stage 3 and stage 9 anyway')
+
+    ps, cs = barrier_sites(PARENT), barrier_sites(CAND)
+    par_normal = [s for s in ps if not s['guarded']]
+    cand_normal = [s for s in cs if not s['guarded']]
+
+    out = dict(
+        sources={'parent': {'path': str(PARENT), 'sha256': sha(PARENT)},
+                 'candidate': {'path': str(CAND), 'sha256': sha(CAND)}},
+        blocks=dict(parent=dict(arrays=par_arrays, blocks=par_blocks,
+                                total_bytes=par_bytes),
+                    candidate=dict(arrays=cand_arrays, blocks=cand_blocks,
+                                   total_bytes=cand_bytes),
+                    identical_layout=[[a['name'], a['elements'], a['bytes']]
+                                      for a in par_arrays] ==
+                    [[a['name'], a['elements'], a['bytes']] for a in cand_arrays],
+                    total_bytes_equal=par_bytes == cand_bytes),
+        element_mapping=dict(checked=len(rows), mismatches=len(bad),
+                             per_site={k: dict(checked=v[0], bad=v[1])
+                                       for k, v in sorted(mstats.items())},
+                             first_mismatch=bad[0] if bad else None,
+                             verdict=('every staged element keeps its (token, channel) '
+                                      'under both layouts' if not bad else 'MISMATCH')),
+        hazards=hz,
+        planes=dict(parent=plane_footprint('parent'),
+                    candidate=plane_footprint('candidate')),
+        barriers=dict(parent=dict(static=len(ps),
+                                  normal_path=len(par_normal),
+                                  debug_guarded=len(ps) - len(par_normal),
+                                  sites=ps,
+                                  normal_lines=[s['line'] for s in par_normal]),
+                      candidate=dict(static=len(cs),
+                                     normal_path=len(cand_normal),
+                                     debug_guarded=len(cs) - len(cand_normal),
+                                     sites=cs,
+                                     normal_lines=[s['line'] for s in cand_normal]),
+                      static_delta=len(cs) - len(ps),
+                      normal_path_delta=len(cand_normal) - len(par_normal)),
+        occupancy_counterfactual=occupancy(),
+    )
+    (CARD / 'build').mkdir(exist_ok=True)
+    (CARD / 'build/arena-check.json').write_text(json.dumps(out, indent=1), encoding='utf-8')
+
+    print('blocks: parent %d B, candidate %d B, identical=%s'
+          % (par_bytes, cand_bytes, out['blocks']['identical_layout']))
+    for b in par_blocks:
+        print('  %-8s base=%6d half=%5d bytes %5d' % (b['name'], b['base_byte'],
+                                                      b['base_half'], b['bytes']))
+    print('\nelement mapping: %d slots checked, %d mismatches -> %s'
+          % (len(rows), len(bad), out['element_mapping']['verdict']))
+    for k, v in sorted(mstats.items()):
+        print('  %-26s %6d slots  bad=%d' % (k, v[0], v[1]))
+    print('\nhazards (cross-owner triples decide the barrier):')
+    for k, v in hz.items():
+        if v is None:
+            continue
+        print('  %-46s distinct=%-5d cross=%-5d barrier=%-5s pairs=%s'
+              % (k, v['distinct_elements'], v['cross_owner_matches'],
+                 v['barrier_required'], v['cross_owner_sg_pairs'][:4]))
+    print('\nplane footprints inside shArena (8192 halves):')
+    for lay in ('parent', 'candidate'):
+        pf = out['planes'][lay]
+        print('  %-9s partition=%s union=%d overlap=%d'
+              % (lay, pf['is_partition_of_8192'], pf['union_halves'],
+                 pf['pairwise_overlap_halves']))
+        for p in range(4):
+            v = pf['plane_%d' % p]
+            print('    plane %d: A rows %2d..%2d (%2d used), A cols %3d..%3d (%2d used)'
+                  % (p, v['a_row_min'], v['a_row_max'], v['a_rows_used'],
+                     v['a_col_min'], v['a_col_max'], v['a_cols_used']))
+    print('\nbarriers: static %d -> %d, normal path %d -> %d'
+          % (len(ps), len(cs), len(par_normal), len(cand_normal)))
+    print('  parent normal-path lines   :', [s['line'] for s in par_normal])
+    print('  candidate normal-path lines:', [s['line'] for s in cand_normal])
+    print('\noccupancy counterfactual (resident WGs = pool / WG mem):')
+    print('  %-10s %-14s %-14s %-14s %-16s' % ('pool', 'now 24576', 'doubled 49152',
+                                               '1.5x 36864', 'ledger 29184->58368'))
+    for r in out['occupancy_counterfactual']['rows']:
+        print('  %3d KiB    %2d WG (%2d wrp)  %2d WG (%2d wrp)  %2d WG (%2d wrp)  %2d -> %2d WG'
+              % (r['pool_kib'], r['resident_now'], r['warps_now'],
+                 r['resident_doubled'], r['warps_doubled'],
+                 r['resident_half_again'], r['warps_half_again'],
+                 r['resident_ledger'], r['resident_ledger_doubled']))
+
+
+if __name__ == '__main__':
+    main()

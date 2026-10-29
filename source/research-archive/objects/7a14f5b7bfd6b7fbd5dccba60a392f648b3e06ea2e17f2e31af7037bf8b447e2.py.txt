@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""Freeze the identity of every DSH C64-family candidate plan and its resources.
+
+S00 deliverable: the 24 ``combo-<frame>.txt`` replay plans in
+``real-int8-24/c64-family-static`` are the current best-quality candidate but are
+bound to captured frame inputs and must never be deployed.  Before any card
+touches a pack/scale/SPV, this tool records, for every plan:
+
+* plan SHA256 and byte size (the patch-merger's ``base_sha256`` anchor),
+* every BUFFER that names a real file: SHA256 + byte size (all 489 of them),
+* every SPV a PASS loads: SHA256 + byte size,
+* the OUTPUT identity (index, format, file name),
+* which buffers are captured frame inputs (dataset pre/post paths),
+* a per-plan resource digest / SPV digest over the above,
+* the QUALITY-24.json identity.
+
+Because the 24 plans are identical except for the two per-frame capture input
+paths, the freeze stores one canonical buffer layout (frame 34189) plus the
+per-frame path overrides, and the full deduplicated ``files`` / ``spvs`` hash
+tables that both layouts resolve through.  ``resource_digest`` per plan seals
+the resolved identity, so a changed or missing file is always detectable.
+
+``--verify CANDIDATE-FREEZE.json`` re-hashes everything and reports
+``files_missing`` / ``files_changed`` / ``spvs_*`` / ``plans_changed`` /
+``quality_changed`` / ``extra_plans``; exit code 2 if anything drifted.
+
+Usage::
+
+    python freeze_candidates.py [--dir <candidate dir>] [--out CANDIDATE-FREEZE.json]
+                                [--handoff HANDOFF-IDENTITIES.json]
+    python freeze_candidates.py --verify CANDIDATE-FREEZE.json
+
+Writes only the ``--out`` file (and only when not verifying outside a card).
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+HERE = Path(__file__).resolve()
+DEFAULT_PLANLIB_DIR = HERE.parents[1] / "tools"
+if str(DEFAULT_PLANLIB_DIR) not in sys.path:
+    sys.path.insert(0, str(DEFAULT_PLANLIB_DIR))
+
+import planlib  # noqa: E402
+
+SCHEMA = "dsh-candidate-freeze/1"
+Q = Path("@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029")
+DEFAULT_DIR = Q / "real-int8-24" / "c64-family-static"
+DEFAULT_OUT = HERE.with_name("CANDIDATE-FREEZE.json")
+DEFAULT_HANDOFF = Q / "dsh-static-handoff" / "HANDOFF-IDENTITIES.json"
+EXPECTED_FRAMES = [str(f) for f in list(range(34189, 34197)) + list(range(41444, 41452)) + list(range(43654, 43662))]
+CAPTURE_BASENAMES = {"pre.bin", "post.bin", "network-output.bin"}
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def posix(path: Path | str) -> str:
+    return Path(path).as_posix()
+
+
+def digest(lines: List[str]) -> str:
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def is_capture_input(name: str, file: str) -> bool:
+    """A capture input is a dataset path / pre|post|network-output basename.
+
+    These are per-frame replay fixtures, not model resources; production
+    integration must keep its own inputs and never copy these bindings.
+    """
+    p = Path(file)
+    return "/dataset/" in posix(file) or p.name.lower() in CAPTURE_BASENAMES
+
+
+def hash_file(path: Path) -> Tuple[Optional[str], Optional[int]]:
+    if not path.is_file():
+        return None, None
+    return planlib.sha256_file(path), path.stat().st_size
+
+
+def scan_plan(path: Path) -> Dict[str, Any]:
+    plan = planlib.Plan(path)
+    problems = plan.validate()
+    buffers = []
+    for b in plan.buffers:
+        if b.file == "-":
+            continue
+        sha, size = hash_file(Path(b.file))
+        buffers.append({"name": b.name, "bytes": b.bytes, "file": b.file,
+                        "sha256": sha, "disk_bytes": size,
+                        "capture_input": is_capture_input(b.name, b.file)})
+    spvs = []
+    seen: Dict[str, Tuple[Optional[str], Optional[int]]] = {}
+    for p in plan.passes:
+        if p.spv not in seen:
+            seen[p.spv] = hash_file(Path(p.spv))
+        sha, size = seen[p.spv]
+        spvs.append({"ordinal": p.ordinal, "name": p.name, "spv": p.spv,
+                     "sha256": sha, "bytes": size})
+    capture_bindings = []
+    for p in plan.passes:
+        for bind in p.binds:
+            if bind.buffer >= len(plan.buffers):
+                continue
+            buf = plan.buffers[bind.buffer]
+            if buf.file != "-" and is_capture_input(buf.name, buf.file):
+                capture_bindings.append({"ordinal": p.ordinal, "dispatch": p.name,
+                                         "binding": bind.binding, "buffer": buf.name,
+                                         "file": buf.file, "offset": bind.offset,
+                                         "bytes": bind.bytes})
+    return {
+        "path": posix(path),
+        "sha256": planlib.sha256_file(path),
+        "bytes": path.stat().st_size,
+        "header": list(plan.header),
+        "buffers": len(plan.buffers),
+        "file_backed_buffers": len(buffers),
+        "dispatches": len(plan.passes),
+        "outputs": [{"index": i, "format": f, "name": n} for i, f, n, _ in plan.outputs],
+        "planlib_validate": problems or "ok",
+        "buffer_records": buffers,
+        "spv_records": spvs,
+        "capture_inputs": [{"name": b["name"], "file": b["file"], "bytes": b["bytes"],
+                            "sha256": b["sha256"]} for b in buffers if b["capture_input"]],
+        "capture_bindings": capture_bindings,
+    }
+
+
+def frame_of(path: Path) -> str:
+    return path.stem.split("-", 1)[1]
+
+
+def freeze(dir_: Path, pattern: str, handoff: Optional[Path]) -> Dict[str, Any]:
+    plans = sorted(dir_.glob(pattern), key=frame_of)
+    failures: List[Dict[str, str]] = []
+    warnings: List[Dict[str, str]] = []
+    if len(plans) != len(EXPECTED_FRAMES):
+        failures.append({"code": "PLAN_COUNT", "detail": f"found {len(plans)} plans, expected {len(EXPECTED_FRAMES)}"})
+    frames = [frame_of(p) for p in plans]
+    if frames != EXPECTED_FRAMES:
+        failures.append({"code": "FRAME_SET", "detail": f"frame set mismatch: {frames}"})
+
+    scanned = {frame_of(p): scan_plan(p) for p in plans}
+    for frame, rec in scanned.items():
+        if rec["planlib_validate"] != "ok":
+            failures.append({"code": "PLAN_INVALID", "detail": f"{frame}: {rec['planlib_validate']}"})
+        for b in rec["buffer_records"]:
+            if b["sha256"] is None:
+                failures.append({"code": "RESOURCE_MISSING", "detail": f"{frame}: BUFFER {b['name']} file missing: {b['file']}"})
+            elif b["disk_bytes"] != b["bytes"]:
+                failures.append({"code": "RESOURCE_SIZE_MISMATCH",
+                                 "detail": f"{frame}: BUFFER {b['name']} declares {b['bytes']} B but file is {b['disk_bytes']} B"})
+        for s in rec["spv_records"]:
+            if s["sha256"] is None:
+                failures.append({"code": "SPV_MISSING", "detail": f"{frame}: dispatch {s['ordinal']} {s['name']} SPV missing: {s['spv']}"})
+
+    canonical_frame = EXPECTED_FRAMES[0]
+    canonical = scanned.get(canonical_frame)
+    if canonical is None:
+        raise SystemExit(f"canonical plan combo-{canonical_frame}.txt not found in {dir_}")
+    layout: Dict[str, Dict[str, Any]] = {
+        b["name"]: {"bytes": b["bytes"], "file": b["file"]} for b in canonical["buffer_records"]
+    }
+    canonical_names = set(layout)
+    files: Dict[str, Dict[str, Any]] = {}
+    spvs: Dict[str, Dict[str, Any]] = {}
+
+    def note_file(path: str) -> None:
+        if path in files:
+            return
+        sha, size = hash_file(Path(path))
+        files[path] = {"sha256": sha, "bytes": size, "present": sha is not None}
+
+    def note_spv(path: str) -> None:
+        if path in spvs:
+            return
+        sha, size = hash_file(Path(path))
+        spvs[path] = {"sha256": sha, "bytes": size, "present": sha is not None}
+
+    for path in sorted(layout[name]["file"] for name in layout):
+        note_file(path)
+
+    plan_records: List[Dict[str, Any]] = []
+    for frame in EXPECTED_FRAMES:
+        rec = scanned.get(frame)
+        if rec is None:
+            continue
+        names = {b["name"] for b in rec["buffer_records"]}
+        if names != canonical_names:
+            failures.append({"code": "BUFFER_SET_MISMATCH",
+                             "detail": f"{frame}: buffer name set differs from {canonical_frame} "
+                                       f"(missing {sorted(canonical_names - names)[:6]}, extra {sorted(names - canonical_names)[:6]})"})
+        overrides: Dict[str, str] = {}
+        for b in rec["buffer_records"]:
+            note_file(b["file"])
+            base = layout.get(b["name"])
+            if base is None:
+                continue
+            if b["file"] != base["file"]:
+                overrides[b["name"]] = b["file"]
+            if b["bytes"] != base["bytes"]:
+                failures.append({"code": "BUFFER_SIZE_DRIFT",
+                                 "detail": f"{frame}: BUFFER {b['name']} is {b['bytes']} B, canonical {base['bytes']} B"})
+        resource_lines = [f"{b['name']}\t{b['file']}\t{b['sha256'] or 'MISSING'}\t{b['bytes']}"
+                          for b in sorted(rec["buffer_records"], key=lambda x: x["name"])]
+        spv_lines = []
+        for s in rec["spv_records"]:
+            note_spv(s["spv"])
+            spv_lines.append(f"{s['ordinal']}\t{s['name']}\t{s['spv']}\t{s['sha256'] or 'MISSING'}")
+        plan_records.append({
+            "frame": frame,
+            "path": rec["path"],
+            "sha256": rec["sha256"],
+            "bytes": rec["bytes"],
+            "header": rec["header"],
+            "buffers": rec["buffers"],
+            "file_backed_buffers": rec["file_backed_buffers"],
+            "dispatches": rec["dispatches"],
+            "output": rec["outputs"][0] if len(rec["outputs"]) == 1 else rec["outputs"],
+            "capture_inputs": rec["capture_inputs"],
+            "capture_bindings": rec["capture_bindings"],
+            "overrides": overrides,
+            "resource_digest": digest(resource_lines),
+            "spv_digest": digest(spv_lines),
+            "spv_count": len({s["spv"] for s in rec["spv_records"]}),
+        })
+
+    quality: Dict[str, Any] = {}
+    for fname in ("QUALITY-24.json", "CALIBRATION.json", "REPORT.txt"):
+        p = dir_ / fname
+        sha, size = hash_file(p)
+        quality[fname] = {"path": posix(p), "sha256": sha, "bytes": size, "present": sha is not None}
+    if quality["QUALITY-24.json"]["sha256"] is None:
+        failures.append({"code": "QUALITY_MISSING", "detail": "QUALITY-24.json is missing"})
+
+    handoff_info: Dict[str, Any] = {"path": None, "checked": [], "required_mismatch": [], "informational": []}
+    if handoff is not None and handoff.is_file():
+        ho = json.loads(handoff.read_text(encoding="utf-8"))
+        handoff_info["path"] = posix(handoff)
+        handoff_info["sha256"] = planlib.sha256_file(handoff)
+        scoped_plan_paths = {r["path"] for r in plan_records}
+        scoped_file_paths = {quality["QUALITY-24.json"]["path"]} | scoped_plan_paths
+        used_spvs = set(spvs)
+        for group, table, required_set in (("files", ho.get("files", {}), scoped_file_paths),
+                                           ("spvs", ho.get("spvs", {}), used_spvs)):
+            for path, want in sorted(table.items()):
+                norm = Path(path).as_posix()
+                sha, _ = hash_file(Path(norm))
+                if sha is None:
+                    status, got = "missing", None
+                elif sha == want:
+                    status, got = "match", sha
+                else:
+                    status, got = "mismatch", sha
+                entry = {"group": group, "path": norm, "recorded_sha256": want,
+                         "actual_sha256": got, "status": status}
+                handoff_info["checked"].append(entry)
+                if status != "match":
+                    if norm in required_set:
+                        handoff_info["required_mismatch"].append(entry)
+                        failures.append({"code": f"HANDOFF_{status.upper()}",
+                                         "detail": f"{group}: {norm} recorded {want}, actual {got}"})
+                    else:
+                        handoff_info["informational"].append(entry)
+    elif handoff is not None:
+        warnings.append({"code": "HANDOFF_NOT_FOUND", "detail": f"handoff identities not found: {handoff}"})
+
+    result = {
+        "schema": SCHEMA,
+        "tool": "freeze_candidates.py",
+        "created": now(),
+        "purpose": "S00 freeze of the 24 capture-bound C64-family candidates: plan identity, every referenced resource/SPV hash, output identity. Deployment is forbidden (capture-bound); this is the merge anchor.",
+        "scope": {
+            "candidate_dir": posix(dir_),
+            "pattern": pattern,
+            "canonical_frame": canonical_frame,
+            "expected_frames": EXPECTED_FRAMES,
+            "plans": len(plans),
+        },
+        "ok": not failures,
+        "failures": failures,
+        "warnings": warnings,
+        "buffer_layout": {name: layout[name] for name in sorted(layout)},
+        "files": {p: files[p] for p in sorted(files)},
+        "spvs": {p: spvs[p] for p in sorted(spvs)},
+        "quality": quality,
+        "plans": plan_records,
+        "summary": {
+            "plans": len(plan_records),
+            "unique_files": len(files),
+            "missing_files": sum(1 for f in files.values() if not f["present"]),
+            "total_file_bytes": sum(f["bytes"] or 0 for f in files.values()),
+            "unique_spvs": len(spvs),
+            "missing_spvs": sum(1 for s in spvs.values() if not s["present"]),
+            "buffer_names": len(layout),
+            "capture_input_buffers": sorted({c["name"] for r in plan_records for c in r["capture_inputs"]}),
+        },
+        "handoff": handoff_info,
+        "verification_hint": "python freeze_candidates.py --verify CANDIDATE-FREEZE.json",
+    }
+    return result
+
+
+def verify(freeze_path: Path) -> Dict[str, Any]:
+    frozen = json.loads(freeze_path.read_text(encoding="utf-8"))
+    problems: Dict[str, List[Any]] = {
+        "plans_changed": [], "plans_missing": [], "extra_plans": [],
+        "files_missing": [], "files_changed": [], "spvs_missing": [], "spvs_changed": [],
+        "quality_changed": [], "resource_digest_mismatch": [], "layout_mismatch": [],
+    }
+    scope = frozen["scope"]
+    dir_ = Path(scope["candidate_dir"])
+    recorded_frames = {p["frame"] for p in frozen["plans"]}
+    current = {frame_of(p): p for p in sorted(dir_.glob(scope["pattern"]), key=frame_of)}
+    for frame in sorted(recorded_frames - set(current)):
+        problems["plans_missing"].append(frame)
+    for frame in sorted(set(current) - recorded_frames):
+        problems["extra_plans"].append(current[frame].name)
+    for name, entry in frozen["buffer_layout"].items():
+        path = entry["file"]
+        sha, size = hash_file(Path(path))
+        if sha is None:
+            problems["files_missing"].append(path)
+        elif size != entry["bytes"]:
+            problems["layout_mismatch"].append({"buffer": name, "file": path, "expected_bytes": entry["bytes"], "actual_bytes": size})
+    for path, entry in frozen["files"].items():
+        sha, _ = hash_file(Path(path))
+        if sha is None:
+            problems["files_missing"].append(path)
+        elif sha != entry["sha256"]:
+            problems["files_changed"].append({"path": path, "expected": entry["sha256"], "actual": sha})
+    for path, entry in frozen["spvs"].items():
+        sha, _ = hash_file(Path(path))
+        if sha is None:
+            problems["spvs_missing"].append(path)
+        elif sha != entry["sha256"]:
+            problems["spvs_changed"].append({"path": path, "expected": entry["sha256"], "actual": sha})
+    for fname, entry in frozen["quality"].items():
+        sha, _ = hash_file(Path(entry["path"]))
+        if sha != entry["sha256"]:
+            problems["quality_changed"].append({"file": fname, "expected": entry["sha256"], "actual": sha})
+    for rec in frozen["plans"]:
+        p = Path(rec["path"])
+        if not p.is_file():
+            if rec["frame"] not in problems["plans_missing"]:
+                problems["plans_missing"].append(rec["frame"])
+            continue
+        if planlib.sha256_file(p) != rec["sha256"]:
+            problems["plans_changed"].append({"frame": rec["frame"], "path": posix(p)})
+            continue
+        current_rec = scan_plan(p)
+        lines = [f"{b['name']}\t{b['file']}\t{b['sha256'] or 'MISSING'}\t{b['bytes']}"
+                 for b in sorted(current_rec["buffer_records"], key=lambda x: x["name"])]
+        if digest(lines) != rec["resource_digest"]:
+            problems["resource_digest_mismatch"].append(rec["frame"])
+    failed = {k: v for k, v in problems.items() if v}
+    summary = {k: len(v) for k, v in problems.items()}
+    summary["checked_plans"] = len(frozen["plans"])
+    summary["checked_files"] = len(frozen["files"])
+    summary["checked_spvs"] = len(frozen["spvs"])
+    return {
+        "schema": "dsh-candidate-freeze-verify/1",
+        "created": now(),
+        "freeze": posix(freeze_path),
+        "freeze_sha256": planlib.sha256_file(freeze_path),
+        "ok": not failed,
+        "summary": summary,
+        "problems": failed,
+    }
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--dir", default=posix(DEFAULT_DIR))
+    ap.add_argument("--pattern", default="combo-*.txt")
+    ap.add_argument("--out", default=posix(DEFAULT_OUT))
+    ap.add_argument("--handoff", default=posix(DEFAULT_HANDOFF))
+    ap.add_argument("--no-handoff", action="store_true")
+    ap.add_argument("--verify", metavar="FREEZE_JSON")
+    ap.add_argument("--json", action="store_true", help="print full JSON (default prints a summary)")
+    args = ap.parse_args(argv)
+
+    if args.verify:
+        result = verify(Path(args.verify))
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result["ok"] else 2
+
+    handoff = None if args.no_handoff else Path(args.handoff)
+    result = freeze(Path(args.dir), args.pattern, handoff)
+    out = Path(args.out)
+    if not out.is_absolute():
+        raise SystemExit("--out must be an absolute path")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(result, indent=2, ensure_ascii=False)
+    out.write_text(payload + "\n", encoding="utf-8")
+    if args.json:
+        print(payload)
+    else:
+        print(json.dumps({"ok": result["ok"], "out": posix(out), "summary": result["summary"],
+                          "failures": result["failures"], "warnings": result["warnings"],
+                          "handoff": {"path": result["handoff"].get("path"),
+                                      "checked": len(result["handoff"]["checked"]),
+                                      "required_mismatch": len(result["handoff"].get("required_mismatch", []))}},
+                         indent=2, ensure_ascii=False))
+    return 0 if result["ok"] else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

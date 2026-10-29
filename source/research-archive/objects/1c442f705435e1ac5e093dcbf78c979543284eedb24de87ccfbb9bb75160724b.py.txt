@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""R12 identity check: what the G3 plan actually dispatches for the 16 split16-l2 PASSes.
+
+For each `split16_bNN_l2` PASS in a PORT_NETWORK_1 plan it records the on-disk SPV path,
+its sha256 (recomputed here, not copied), bytes, subgroup/shared/nbind/npush, the grid,
+the binding list and the decoded push-constant vector, then cross-checks that identity
+against FULLNET-INT8-IMPLEMENTATION-LEDGER.json.
+
+usage: plan_identity.py <plan> <ledger.json> <out.json>
+"""
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+TOKEN = re.compile(r'"[^"]*"|\S+')
+NAMES = ["split16_b%d_l2" % b for b in list(range(23, 31)) + list(range(40, 48))]
+
+
+def sha256(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def parse_plan(path):
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    h = lines[0].split()
+    nb, npass, nout = int(h[2]), int(h[3]), int(h[4])
+    bufs = []
+    for ln in lines[1:1 + nb]:
+        m = re.match(r'BUFFER "([^"]+)" (\d+) "([^"]*)"', ln)
+        bufs.append({"name": m.group(1), "bytes": int(m.group(2)), "path": m.group(3)})
+    rest = lines[1 + nb:]
+    passes = {}
+    i = 0
+    for pi in range(npass):
+        t = TOKEN.findall(rest[i])
+        row, name, spv = int(t[1]), t[2].strip('"'), t[3].strip('"')
+        sg, sh, nbind, npush = int(t[4]), int(t[5]), int(t[6]), int(t[7])
+        grid = [int(x) for x in t[8:11]] if len(t) >= 11 else None
+        binds = []
+        for b in range(nbind):
+            w = rest[i + 1 + b].split()
+            binds.append({"binding": int(w[1]), "resource": int(w[2]),
+                          "bytes": int(w[4]) if len(w) >= 5 else None,
+                          "buffer": bufs[int(w[2])]["name"]})
+        push = [int(x) for x in rest[i + 1 + nbind].split()[1:]]
+        passes[name] = {"plan_order": row, "name": name, "spv": spv, "subgroup": sg,
+                        "shared": sh, "nbind": nbind, "npush": npush, "grid": grid,
+                        "binds": binds, "push": push}
+        i += 1 + nbind + 1
+    return {"path": str(path), "sha256": sha256(path), "buffers": nb, "passes": npass,
+            "outputs": nout, "pass_map": passes}
+
+
+def main(argv):
+    plan = parse_plan(argv[0])
+    ledger = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
+    led = {p["pass_name"]: p for p in ledger["positions"] if p["card"] == "R12"}
+    rows = []
+    for name in NAMES:
+        p = plan["pass_map"].get(name)
+        if p is None:
+            rows.append({"name": name, "in_plan": False})
+            continue
+        f = Path(p["spv"])
+        disk = sha256(f) if f.exists() else None
+        L = led.get(name, {})
+        push = p["push"]
+        vec = {k: push[4 * k:4 * k + 4] for k in range(len(push) // 4)}
+        rows.append({
+            "name": name, "in_plan": True, "plan_order": p["plan_order"],
+            "spv": p["spv"], "spv_sha256_disk": disk, "spv_bytes": f.stat().st_size if f.exists() else None,
+            "subgroup": p["subgroup"], "shared_declared": p["shared"], "nbind": p["nbind"],
+            "npush": p["npush"], "grid": p["grid"],
+            "bindings": [(b["binding"], b["buffer"], b["bytes"]) for b in p["binds"]],
+            "push_vec": vec,
+            "ledger_spv": L.get("spv"), "ledger_sha256": L.get("sha256"),
+            "ledger_grid": L.get("grid"), "ledger_fp16_static_mma": L.get("fp16_static_mma_count"),
+            "ledger_historical_gate": (L.get("historical_status_not_current_acceptance") or {}).get("gate_status"),
+            "same_path_as_ledger": str(f).replace("\\", "/").lower() == str(L.get("spv") or "").replace("\\", "/").lower() if L else None,
+            "same_sha_as_ledger": disk == L.get("sha256") if L else None,
+            "same_grid_as_ledger": p["grid"] == L.get("grid") if L else None,
+        })
+    uniq = {}
+    for r in rows:
+        if r.get("in_plan"):
+            uniq.setdefault(r["spv_sha256_disk"], []).append(r["name"])
+    out = {"plan": {k: plan[k] for k in ("path", "sha256", "buffers", "passes", "outputs")},
+           "ledger": Path(argv[1]).name,
+           "passes": rows,
+           "distinct_modules": {k: v for k, v in uniq.items()},
+           "all_paths_match_ledger": all(r.get("same_path_as_ledger") for r in rows if r.get("in_plan")),
+           "all_sha_match_ledger": all(r.get("same_sha_as_ledger") for r in rows if r.get("in_plan")),
+           "all_grids_match_ledger": all(r.get("same_grid_as_ledger") for r in rows if r.get("in_plan")),
+           "distinct_module_count": len(uniq)}
+    Path(argv[2]).write_text(json.dumps(out, indent=1) + "\n", encoding="utf-8", newline="\n")
+    print("plan", plan["sha256"], "passes", plan["passes"])
+    print("matching paths", out["all_paths_match_ledger"], "sha", out["all_sha_match_ledger"],
+          "grid", out["all_grids_match_ledger"])
+    print("distinct modules:", json.dumps(out["distinct_modules"]))
+    for r in rows:
+        print("%-16s order=%3s shared=%s nb=%2s grid=%-10s sha=%s" % (
+            r["name"], r.get("plan_order"), r.get("shared_declared"), r.get("nbind"),
+            r.get("grid"), (r.get("spv_sha256_disk") or "")[:16]))
+    print("wrote", argv[2])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,617 @@
+"""nat-index builder v4 — catalogue every existing native ISA capture and classify its
+identity against the current 232-pass baseline.
+
+Identity = *final binary* identity, not just SPV-sha bookkeeping:
+  * The baseline capture (the one run under the current baseline plan) yields one ISA per
+    pipeline; its embedded kernel hash <-> pipeline is the fingerprint table.  A 64-bit
+    kernel hash equal to a fingerprint proves the very same compiled kernel.
+  * Plan/spv evidence is carried alongside: a capture is "structurally full" when its plan
+    has the same 40-pipeline dedup order as the baseline, in which case filename pipeline
+    index -> PASS ordinal is exact.  Partial captures (1-6 ISAs) restart the index space, so
+    their index is *not* used for PASS attribution.
+
+Read-only outside cards/nat-index/. No GPU, no capture, no deployment.
+"""
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from collections import Counter, defaultdict
+
+W = Path('@NR_WORKSPACE@')
+A = W / 'work/codex-astra-fp16-int8-audit-20261024'
+CARD = A / 'fullnet-continuous-20261027' / 'cards' / 'nat-index'
+H = Path('@NR_USER_HOME@/Documents/Codex/2026-10-24/nr-fp16-int8-astra-audit-20261024/handoff/dsh-fullnet-20261027')
+BASELINE = A / 'fullnet-mechanism-transfer-20261026/f10-weight-return-separation-20261027/plan.txt'
+BASE_SHA = 'a024c3c5aa1d1432ab3f0591bf03a897880d86be2c99d6de1e1492a2a7b2befe'
+ROWS_JSON = H / 'CURRENT-232-ROWS.json'
+
+ISA_RE = re.compile(r'^CS_asm([0-9a-f]{16})_simd(\d+)_([0-9a-f]{16})_(\d+)_orig\.asm$', re.I)
+INSN_RE = re.compile(r'^\s*/\*\s*\[([0-9A-Fa-f]+)\]\s*\*/\s*(.*)$')
+LABEL_RE = re.compile(r'^L\d+:')
+TOKEN_RE = re.compile(r'"([^"]*)"|(\S+)')
+
+SCAN_ROOTS = [W / 'work', W / 'run', W / 'candidates']
+QUICK = '--quick' in sys.argv
+
+
+# ------------------------------------------------------------------ helpers
+def sha_file(p):
+    h = hashlib.sha256()
+    n = 0
+    with open(p, 'rb') as f:
+        while True:
+            b = f.read(1 << 20)
+            if not b:
+                break
+            n += len(b)
+            h.update(b)
+    return h.hexdigest(), n
+
+
+def isa_scan(p, want_trailer=True):
+    ninsn = nlab = ndpas = nsend = nbar = neot = 0
+    tail = []
+    with open(p, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            c = line[:1]
+            if c == 'L':
+                if LABEL_RE.match(line):
+                    nlab += 1
+                continue
+            if c != '/':
+                continue
+            if not INSN_RE.match(line):
+                continue
+            ninsn += 1
+            if ' dpas' in line:
+                ndpas += 1
+            if ' send' in line:
+                nsend += 1
+                if 'barrier' in line:
+                    nbar += 1
+                if 'EOT' in line:
+                    neot += 1
+            # the dump ends with the kernel hash as immediate mov constants
+            if 'null<1>:ud' in line:
+                tail.append(line)
+                if len(tail) > 6:
+                    tail.pop(0)
+    embedded = None
+    imms = []
+    for line in tail:
+        m = re.search(r'0x([0-9A-Fa-f]{8}):ud', line)
+        if m:
+            imms.append(m.group(1))
+    if len(imms) >= 4:
+        embedded = (imms[-4] + imms[-3]).lower()
+    return dict(instruction_lines=ninsn, basic_blocks=nlab, dpas=ndpas, sends=nsend,
+                barrier_sends=nbar, eot=neot, embedded_hash=embedded)
+
+
+def walk_dicts(obj, depth=0):
+    if depth > 9:
+        return
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from walk_dicts(v, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj[:4000]:
+            yield from walk_dicts(v, depth + 1)
+
+
+def argv_get(argv, flag):
+    for i, a in enumerate(argv):
+        if a == flag and i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
+def parse_plan(p):
+    """Exact re-implementation of clock_runner.cpp read_plan() -> list of PASS dicts."""
+    text = Path(p).read_text(encoding='utf-8-sig', errors='replace')
+    t = [a if a else b for a, b in TOKEN_RE.findall(text)]
+    if not t or t[0] != 'PORT_NETWORK_1':
+        raise ValueError('not a PORT_NETWORK_1 plan')
+    nb, npass = int(t[2]), int(t[3])
+    i = 5 + 4 * nb
+    passes = []
+    for _ in range(npass):
+        if t[i] != 'PASS':
+            raise ValueError('expected PASS at token %d (got %r)' % (i, t[i]))
+        row, name, spv = int(t[i + 1]), t[i + 2], t[i + 3]
+        subgroup, shared, nbind, npush = (int(t[i + 4]), int(t[i + 5]),
+                                          int(t[i + 6]), int(t[i + 7]))
+        gx, gy, gz = int(t[i + 8]), int(t[i + 9]), int(t[i + 10])
+        i += 11
+        binds = []
+        for _ in range(nbind):
+            if t[i] != 'BIND':
+                raise ValueError('expected BIND at token %d' % i)
+            binds.append(int(t[i + 1]))
+            i += 5
+        if t[i] != 'PUSH':
+            raise ValueError('expected PUSH at token %d' % i)
+        i += 1 + npush
+        passes.append(dict(ordinal=len(passes), row=row, name=name, spv=spv,
+                           subgroup=subgroup, shared=shared, nbind=nbind, npush=npush,
+                           grid=[gx, gy, gz], binds=binds))
+    return passes
+
+
+def pipeline_vector(passes):
+    """(pass -> pipeline index, pipeline index -> key) using the runner's dedup key."""
+    order, key2i, vec = [], {}, []
+    for p in passes:
+        key = (p['spv'].replace('\\', '/').lower(), p['npush'], p['subgroup'], tuple(p['binds']))
+        if key not in key2i:
+            key2i[key] = len(order)
+            order.append(key)
+        vec.append(key2i[key])
+    return vec, order
+
+
+def main():
+    t0 = time.time()
+    CARD.mkdir(parents=True, exist_ok=True)
+    (CARD / 'evidence').mkdir(exist_ok=True)
+
+    # ---------------------------------------------------------------- baseline
+    rows = json.loads(ROWS_JSON.read_text(encoding='utf-8-sig'))
+    base_plan = parse_plan(BASELINE)
+    assert len(base_plan) == 232, len(base_plan)
+    for r, bp in zip(rows, base_plan):
+        assert Path(r['spv']).as_posix().lower() == bp['spv'].replace('\\', '/').lower()
+    base_sha_actual = sha_file(BASELINE)[0]
+    base_vec, base_order = pipeline_vector(base_plan)
+    print('baseline plan sha:', base_sha_actual, 'OK' if base_sha_actual == BASE_SHA else 'MISMATCH')
+    print('baseline pipelines (derived):', len(base_order))
+
+    j = json.loads((A / 'c32-rest-20261026/root-body/run/resources-root-body/pipeline-statistics.json'
+                    ).read_text(encoding='utf-8-sig'))
+    ppi_crosscheck = dict(derived_matches_driver=(j['pass_pipeline_indices'] == base_vec),
+                          source='c32-rest-20261026/root-body/run/resources-root-body/pipeline-statistics.json')
+    print('derived vector == driver pass_pipeline_indices:', ppi_crosscheck['derived_matches_driver'])
+
+    passes_of_pipe = defaultdict(list)
+    for o, p in enumerate(base_vec):
+        passes_of_pipe[p].append(o)
+    base_pipe = {}
+    for p, ords in passes_of_pipe.items():
+        shas = {rows[o]['spv_sha256'] for o in ords}
+        assert len(shas) == 1
+        base_pipe[p] = dict(spv_sha256=shas.pop(), spv=rows[ords[0]]['spv'], passes=ords,
+                            families=sorted({rows[o]['family'] for o in ords}),
+                            shared=base_plan[ords[0]]['shared'], first_pass=rows[ords[0]]['name'])
+    sha_to_pipes = defaultdict(list)
+    for p, v in base_pipe.items():
+        sha_to_pipes[v['spv_sha256']].append(p)
+    base_key_sig = [k[1:] for k in base_order]
+
+    # ---------------------------------------------------------------- job manifests
+    def build_job_index():
+        idx = defaultdict(list)
+        nfiles = nrec = 0
+        for root in SCAN_ROOTS:
+            if not root.exists():
+                continue
+            for dp, dn, fn in os.walk(root):
+                for f in fn:
+                    if not f.endswith('.json'):
+                        continue
+                    p = Path(dp) / f
+                    try:
+                        if p.stat().st_size > 8_000_000:
+                            continue
+                    except OSError:
+                        continue
+                    nfiles += 1
+                    try:
+                        text = p.read_text(encoding='utf-8-sig', errors='ignore')
+                    except Exception:
+                        continue
+                    if 'dump_isa' not in text:
+                        continue
+                    try:
+                        obj = json.loads(text)
+                    except Exception:
+                        continue
+                    for d in walk_dicts(obj):
+                        argv = d.get('argv')
+                        if not (isinstance(argv, list) and argv and
+                                all(isinstance(x, str) for x in argv)):
+                            continue
+                        if '--dump_isa' not in ' '.join(argv):
+                            continue
+                        od, pd = argv_get(argv, '--output_dir'), argv_get(argv, '--profile_dir')
+                        if not od or not pd:
+                            continue
+                        pl = d.get('plan')
+                        nrec += 1
+                        idx[(Path(od) / pd).as_posix().lower()].append(dict(
+                            manifest=p.as_posix(),
+                            plan_path=(pl.get('path') if isinstance(pl, dict) else None)
+                            or argv_get(argv, '--plan'),
+                            plan_sha=(pl.get('sha256') if isinstance(pl, dict) else None)))
+        print('job manifests: %d json, %d native job records, %d capture dirs'
+              % (nfiles, nrec, len(idx)))
+        return idx
+
+    job_index = build_job_index()
+
+    stats_by_dir = {}
+    for root in (W / 'work', W / 'run'):
+        for dp, dn, fn in os.walk(root):
+            if 'pipeline-statistics.json' not in fn:
+                continue
+            p = Path(dp) / 'pipeline-statistics.json'
+            try:
+                jj = json.loads(p.read_text(encoding='utf-8-sig', errors='ignore'))
+            except Exception:
+                continue
+            stats_by_dir[p.parent.as_posix().lower()] = {
+                int(pl['index']): {s['name']: s.get('value') for ex in pl.get('executables', [])
+                                   for s in ex.get('statistics', [])}
+                for pl in jj.get('pipelines', []) if 'index' in pl}
+
+    # ---------------------------------------------------------------- sessions (raw)
+    sessions = {}
+    for root in SCAN_ROOTS:
+        if not root.exists():
+            continue
+        for dp, dn, fn in os.walk(root):
+            hits = [(f, ISA_RE.match(f)) for f in fn if ISA_RE.match(f)]
+            if hits:
+                sessions[Path(dp)] = hits
+    print('ISA session dirs:', len(sessions))
+
+    plan_cache = {}
+
+    def plan_info(path):
+        key = str(path).lower()
+        if key not in plan_cache:
+            p = Path(path)
+            info = dict(path=str(p), exists=p.exists(), sha256=None, passes=None, error=None)
+            if p.exists():
+                try:
+                    info['sha256'] = sha_file(p)[0]
+                    info['passes'] = parse_plan(p)
+                except Exception as e:
+                    info['error'] = repr(e)
+            plan_cache[key] = info
+        return plan_cache[key]
+
+    def stats_from_card(root, pipe):
+        for anc in (root.parent, root.parent.parent):
+            pre = anc.as_posix().lower()
+            for key in sorted(stats_by_dir):
+                if key.startswith(pre) and pipe in stats_by_dir[key]:
+                    return stats_by_dir[key][pipe], key
+        return None, None
+
+    raw = []
+    tot = 0
+    for d in sorted(sessions):
+        hits = sessions[d]
+        root = d.parent
+        recs = []
+        for f, m in sorted(hits, key=lambda x: int(x[1].group(4))):
+            recs.append(dict(file=f, native_hash=m.group(1).lower(), subgroup=int(m.group(2)),
+                             dispatch=m.group(3).lower(), pipeline=int(m.group(4))))
+        tot += len(recs)
+
+        plan_path = plan_sha = None
+        src = []
+        jobs = job_index.get(root.as_posix().lower())
+        if jobs:
+            paths = {x['plan_path'] for x in jobs if x['plan_path']}
+            shas = {x['plan_sha'] for x in jobs if x['plan_sha']}
+            if len(paths) == 1:
+                plan_path = next(iter(paths))
+                src.append('job-manifest')
+            elif paths:
+                exist = sorted(x for x in paths if Path(x).exists())
+                plan_path = exist[0] if exist else sorted(paths)[0]
+                src.append('job-manifest-MULTI(%d)' % len(paths))
+            if len(shas) == 1:
+                plan_sha = next(iter(shas))
+            elif shas:
+                src.append('manifest-sha-AMBIGUOUS(%d)' % len(shas))
+        cap_meta = None
+        for cand in (root / 'compile' / 'native-capture.json',
+                     root.parent / 'compile' / 'native-capture.json'):
+            if cand.exists():
+                try:
+                    cap_meta = json.loads(cand.read_text(encoding='utf-8-sig', errors='ignore'))
+                    src.append(cand.as_posix().replace(W.as_posix() + '/', ''))
+                except Exception:
+                    pass
+                break
+        if not plan_path:
+            for anc in (root, root.parent, root.parent.parent):
+                c = sorted(anc.glob('plan*.txt'))
+                if len(c) == 1:
+                    plan_path = str(c[0])
+                    src.append('nearby-plan')
+                    break
+                if len(c) > 1:
+                    src.append('nearby-plan-AMBIGUOUS(%d)' % len(c))
+                    break
+
+        pi = plan_info(plan_path) if plan_path else None
+        npass = len(pi['passes']) if (pi and pi['passes']) else None
+        plan_stale = bool(plan_sha and pi and pi['sha256'] and
+                          plan_sha.lower() != pi['sha256'].lower())
+
+        vec = order = None
+        structural = False
+        codes = []
+        if pi and pi['passes']:
+            vec, order = pipeline_vector(pi['passes'])
+            structural = (len(order) == len(base_order) and
+                          [k[1:] for k in order] == base_key_sig)
+            if structural:
+                codes.append('plan-dedup-order-identical-to-baseline')
+            if len(recs) != len(order):
+                codes.append('capture-record-count-%d-vs-%d-plan-pipelines'
+                             % (len(recs), len(order)))
+            if sorted(r['pipeline'] for r in recs) != list(range(len(order))):
+                codes.append('capture-pipeline-indices-not-a-full-0..N-1-set')
+        index_mapping_trusted = bool(structural and len(recs) == len(order) and
+                                     sorted(r['pipeline'] for r in recs) == list(range(len(order))))
+        pipe_ords = defaultdict(list)
+        if vec is not None:
+            for o, p in enumerate(vec):
+                pipe_ords[p].append(o)
+
+        hdr_host_diff = []
+        if pi and pi['passes']:
+            for o in range(min(232, len(pi['passes']))):
+                bp, cp = base_plan[o], pi['passes'][o]
+                if (bp['shared'], bp['nbind'], bp['npush'], bp['grid']) != \
+                   (cp['shared'], cp['nbind'], cp['npush'], cp['grid']):
+                    hdr_host_diff.append(o)
+
+        raw.append(dict(dir=d, root=root, recs=recs, plan_path=plan_path, plan_sha=plan_sha,
+                        src=src, pi=pi, npass=npass, plan_stale=plan_stale, vec=vec,
+                        order=order, structural=structural, codes=codes,
+                        trusted=index_mapping_trusted, pipe_ords=pipe_ords,
+                        hdr_host_diff=hdr_host_diff, cap_meta=cap_meta))
+
+    # ---------------------------------------------------------------- fingerprints
+    # candidate baselines: captures whose plan is byte-identical to the current baseline
+    def fingerprint_from(cap):
+        if not (cap['pi'] and cap['pi']['sha256'] == BASE_SHA):
+            return None
+        if not cap['trusted']:
+            return None
+        return {r['pipeline']: r['native_hash'] for r in cap['recs']}
+
+    cands = [c for c in raw if (c['pi'] or {}).get('sha256') == BASE_SHA]
+    fp_src = []
+    fp = {}
+    for cap in cands:
+        f = fingerprint_from(cap)
+        if not f:
+            continue
+        fp_src.append(dict(isa_dir=cap['dir'].as_posix(), pipelines=len(f),
+                           full=(len(f) == len(base_order))))
+        if len(f) == len(base_order) and not fp:
+            fp = f
+    if not fp:
+        raise SystemExit('no full capture of the baseline plan; cannot fingerprint')
+    fp_hash2pipe = {}
+    for p, h in fp.items():
+        fp_hash2pipe.setdefault(h, []).append(p)
+    print('fingerprint from %d capture(s); chosen pipelines: %d; distinct hashes %d'
+          % (len(fp_src), len(fp), len(fp_hash2pipe)))
+
+    # consistency: captures that are structurally full and whose SPV matches but whose
+    # hash differs -> corpus anomaly worth reporting
+    anomalies = []
+    for cap in raw:
+        if not cap['trusted']:
+            continue
+        for r in cap['recs']:
+            p = r['pipeline']
+            spv = cap['pi']['passes'][cap['pipe_ords'][p][0]]['spv']
+            if not Path(spv).exists():
+                continue
+            if sha_file(spv)[0] != base_pipe[p]['spv_sha256']:
+                continue
+            if r['native_hash'] != fp.get(p):
+                anomalies.append(dict(capture=cap['dir'].as_posix(), pipeline=p,
+                                      native_hash=r['native_hash'],
+                                      baseline_hash=fp.get(p), spv=spv))
+    print('spv-equal-but-binary-different records:', len(anomalies))
+
+    # ---------------------------------------------------------------- classify
+    captures = []
+    for cap in raw:
+        d, root = cap['dir'], cap['root']
+        recs = cap['recs']
+        meta_spv = {}
+        if cap['cap_meta']:
+            for k, pl in enumerate(cap['cap_meta'].get('pipelines', [])):
+                meta_spv[int(pl.get('index', k))] = pl
+
+        precs = []
+        for r in recs:
+            pipe = r['pipeline']
+            fpath = d / r['file']
+            if QUICK:
+                sha256, nbytes, scan = 'QUICK', fpath.stat().st_size, {}
+            else:
+                sha256, nbytes = sha_file(fpath)
+                scan = isa_scan(fpath)
+            e = dict(isa=fpath.as_posix(), sha256=sha256, bytes=nbytes,
+                     native_hash=r['native_hash'], pipeline_in_capture=pipe,
+                     subgroup=r['subgroup'], dispatch=r['dispatch'], isa_scan=scan,
+                     mtime=time.strftime('%Y-%m-%dT%H:%M:%S',
+                                         time.localtime(fpath.stat().st_mtime)))
+
+            # plan-side evidence
+            spv_path = spv_sha = None
+            plan_ords = cap['pipe_ords'].get(pipe)
+            if plan_ords and cap['pi'] and cap['pi']['passes']:
+                spv_path = cap['pi']['passes'][plan_ords[0]]['spv']
+                if Path(spv_path).exists():
+                    spv_sha = sha_file(spv_path)[0]
+            if spv_sha is None and pipe in meta_spv and meta_spv[pipe].get('spv'):
+                spv_path = meta_spv[pipe]['spv']
+                if Path(spv_path).exists():
+                    spv_sha = sha_file(spv_path)[0]
+            e['spv'] = spv_path
+            e['spv_sha256_at_capture'] = spv_sha
+            if plan_ords:
+                e['plan_pipeline'] = pipe
+                e['plan_ordinals'] = plan_ords
+
+            # ---- identity from the kernel fingerprint
+            hits = fp_hash2pipe.get(r['native_hash'])
+            if hits:
+                e['identity'] = 'CURRENT'
+                e['baseline_pipelines'] = hits
+                e['identity_reason'] = ('kernel hash equals the baseline capture fingerprint of '
+                                        'pipeline(s) %s' % hits)
+                e['pass_ordinals'] = sorted({o for h in hits for o in base_pipe[h]['passes']})
+                e['pass_names'] = [rows[o]['name'] for o in e['pass_ordinals']]
+                if cap['trusted'] and pipe in hits:
+                    e['also_plan_mapped'] = (pipe == hits[0])
+            else:
+                e['identity'] = 'HISTORICAL'
+                e['baseline_pipelines'] = []
+                e['identity_reason'] = 'kernel hash not in the baseline capture fingerprint'
+                if cap['trusted'] and plan_ords:
+                    e['pass_ordinals'] = plan_ords
+                    e['pass_names'] = [cap['pi']['passes'][o]['name'] for o in plan_ords]
+
+            st, ssrc = stats_from_card(root, pipe)
+            e['driver_stats'] = dict(source=ssrc, **st) if st else None
+            # a driver dump taken from a *candidate* arm would describe different code:
+            # the driver's Instruction Count tracks the static instruction lines closely
+            # (observed delta = 3), so a large delta means the dump is not this SPV's.
+            if e['driver_stats'] and scan.get('instruction_lines'):
+                di = e['driver_stats'].get('Instruction Count')
+                if di is not None and abs(di - scan['instruction_lines']) > 16:
+                    e['driver_stats_rejected'] = dict(
+                        source=ssrc, instruction_count=di,
+                        static_instruction_lines=scan['instruction_lines'])
+                    e['driver_stats'] = None
+            precs.append(e)
+
+        pmeta = None
+        if cap['plan_path']:
+            pmeta = dict(path=cap['plan_path'], sha256=cap['plan_sha'],
+                         sha_source=('manifest' if cap['plan_sha'] else
+                                     ('recomputed' if cap['pi'] and cap['pi']['sha256'] else None)),
+                         on_disk=bool(cap['pi'] and cap['pi']['exists']),
+                         computed_sha256=(cap['pi']['sha256'] if cap['pi'] else None),
+                         n_passes=cap['npass'],
+                         n_pipelines=(len(cap['order']) if cap['order'] else None),
+                         parse_error=(cap['pi'] or {}).get('error'),
+                         equals_baseline=bool(cap['plan_sha'] == BASE_SHA or
+                                              (cap['pi'] and cap['pi']['sha256'] == BASE_SHA)))
+        plan_spv_match = None
+        if cap['trusted'] and cap['pi'] and cap['pi']['passes']:
+            plan_spv_match = sum(1 for p, ords in cap['pipe_ords'].items()
+                                 if Path(cap['pi']['passes'][ords[0]]['spv']).exists() and
+                                 sha_file(cap['pi']['passes'][ords[0]]['spv'])[0] ==
+                                 base_pipe[p]['spv_sha256'])
+        captures.append(dict(capture=root.name, isa_dir=d.as_posix(), capture_root=root.as_posix(),
+                             n_isa=len(recs), plan=pmeta, plan_stale=cap['plan_stale'],
+                             mapping=dict(structural=cap['structural'],
+                                          index_mapping_trusted=cap['trusted'],
+                                          codes=cap['codes'],
+                                          pipelines_matching_baseline_spv=plan_spv_match),
+                             host_side_diff_ordinals=cap['hdr_host_diff'],
+                             metadata_sources=cap['src'],
+                             current_isa=sum(1 for e in precs if e['identity'] == 'CURRENT'),
+                             records=precs))
+
+    # ---------------------------------------------------------------- coverage
+    coverage = []
+    for o in range(232):
+        pipe = base_vec[o]
+        cur, hist = [], []
+        for c in captures:
+            for e in c['records']:
+                if o not in (e.get('pass_ordinals') or []):
+                    continue
+                ref = dict(isa=e['isa'], sha256=e['sha256'], native_hash=e['native_hash'],
+                           capture=c['isa_dir'], plan_sha=(c['plan'] or {}).get('sha256'),
+                           plan_is_baseline=bool((c['plan'] or {}).get('equals_baseline')),
+                           index_mapping_trusted=c['mapping']['index_mapping_trusted'])
+                (cur if e['identity'] == 'CURRENT' else hist).append(ref)
+        coverage.append(dict(ordinal=o, name=rows[o]['name'], family=rows[o]['family'],
+                             pass_row=base_plan[o]['row'], pipeline=pipe,
+                             baseline_spv=rows[o]['spv'],
+                             baseline_spv_sha256=rows[o]['spv_sha256'],
+                             baseline_kernel_hash=fp.get(pipe),
+                             shared_bytes=base_plan[o]['shared'],
+                             status=('CURRENT' if cur else ('HISTORICAL-ONLY' if hist else 'MISSING')),
+                             current_count=len(cur), current=cur[:6],
+                             historical_count=len(hist),
+                             historical_native_hashes=len({h['native_hash'] for h in hist}),
+                             historical_sample=[h['isa'] for h in hist[:2]]))
+
+    fam = defaultdict(Counter)
+    for c in coverage:
+        fam[c['family']][c['status']] += 1
+    missing_pipes = sorted({c['pipeline'] for c in coverage if c['status'] != 'CURRENT'})
+    idc = Counter(e['identity'] for c in captures for e in c['records'])
+    summary = dict(
+        isa_files=tot, capture_sessions=len(captures), passes_total=232,
+        passes_current=sum(1 for c in coverage if c['status'] == 'CURRENT'),
+        passes_historical_only=sum(1 for c in coverage if c['status'] == 'HISTORICAL-ONLY'),
+        passes_missing=sum(1 for c in coverage if c['status'] == 'MISSING'),
+        pipelines_total=len(base_pipe),
+        pipelines_current=len(base_pipe) - len(missing_pipes),
+        pipelines_missing=missing_pipes,
+        per_family={k: dict(v) for k, v in sorted(fam.items())},
+        isa_identity_counts=dict(idc),
+        distinct_native_hashes=len({e['native_hash'] for c in captures for e in c['records']}),
+        captures_with_any_current=sum(1 for c in captures if c['current_isa']),
+        captures_full_current=sum(1 for c in captures if c['current_isa'] == len(base_order)),
+        fingerprint_sources=fp_src,
+        spv_equal_binary_different_records=len(anomalies),
+        spv_equal_binary_different_detail=anomalies[:20],
+        filename_hash_integrity=dict(
+            checked=sum(1 for c in captures for e in c['records']
+                        if (e['isa_scan'] or {}).get('embedded_hash')),
+            mismatch=sum(1 for c in captures for e in c['records']
+                         if (e['isa_scan'] or {}).get('embedded_hash')
+                         and e['isa_scan']['embedded_hash'] != e['native_hash'])),
+    )
+
+    out = dict(
+        schema='nat-index/v1',
+        generated=time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+        generator='cards/nat-index/build_index.py — read-only disk scan; no GPU, no capture',
+        baseline=dict(plan=BASELINE.as_posix(), plan_sha256=base_sha_actual,
+                      plan_sha256_expected=BASE_SHA, plan_sha_matches=base_sha_actual == BASE_SHA,
+                      rows=ROWS_JSON.as_posix(), n_passes=232,
+                      unique_pipeline_spvs=len(sha_to_pipes),
+                      pipelines={str(k): dict(spv_sha256=v['spv_sha256'], spv=v['spv'],
+                                              shared_bytes=v['shared'], passes=v['passes'],
+                                              families=v['families'], first_pass=v['first_pass'],
+                                              kernel_hash=fp.get(k))
+                                 for k, v in sorted(base_pipe.items())}),
+        pipeline_map=dict(rule='PASS ordinal -> pipeline index from the runner dedup key '
+                               '(spv, npush, subgroup, binding list) in first-appearance order',
+                          crosscheck=ppi_crosscheck, n_pipelines=len(base_order),
+                          vector=base_vec),
+        summary=summary, captures=captures, coverage=coverage,
+    )
+    dest = CARD / 'evidence' / 'NATIVE-INDEX.json'
+    dest.write_text(json.dumps(out, indent=1, ensure_ascii=False), encoding='utf-8')
+    print('wrote %s  %.1f MB' % (dest, dest.stat().st_size / 1e6))
+    print(json.dumps(summary, indent=1, ensure_ascii=False)[:2200])
+
+
+if __name__ == '__main__':
+    main()

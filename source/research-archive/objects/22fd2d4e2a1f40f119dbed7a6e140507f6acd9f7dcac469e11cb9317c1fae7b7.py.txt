@@ -1,0 +1,205 @@
+"""S01 C32 body4 CPU reference (expand -> half SiLU -> contract + original half residual).
+
+Bit-faithful matrix-level model of dispatch `block4_swin_body_1` of the C32 unified
+INT8 tail (`int8-v15-offline-20261028/first-difference/body-vscale-corrected/
+c32_body1_i8.comp`).  No GPU is touched here.
+
+Address / layout contract derived from the shader source (see CONTRACT.json):
+  * 512 fp16 per swin tile block: addr = tile*512 + (c//16)*256 + ((c//8)%2)*8
+    + col*16 + (c%8)                    [col = token column 0..15, c = channel 0..31]
+  * expand  A tile g (0..15) at w8[g*1024 + k*32 + m]        -> We[8g+m][k]
+  * contract A tile (g,step) at w8[16384 + (g*4+step)*1024 + (e%32)*32 + m]
+                                                        -> Wc[8g+m][32*step+e%32]
+    (tile index proven from c32_body1_i8.comp: the four loads inside one K32 E-group
+     are (g*4+step) for g=0..3 with step fixed, and their dequant mbase is 0/8/16/24)
+  * fsc[0]=sX fsc[1]=invX fsc[2]=sE fsc[3]=invE
+    fsc[4..131]  = expand dequant tap per output channel (sX*sWe)
+    fsc[132..163]= contract dequant tap per output channel (sE*sWc)
+    fsc[164..291]= QKV/WO static taps (untouched by this card)
+    fsc[292..323]= per-input-channel inverse (X equalization SPV, block 1..4)
+    fsc[324..451]= per-E-channel inverse (this card)
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/tools")
+from planlib import Plan, sha256_file  # noqa: E402
+
+B = Path(r"@NR_WORKSPACE@")
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+W = B / "work/dsh-fullnet-static-20261029"
+
+FSC_X, FSC_INV_X, FSC_E, FSC_INV_E = 0, 1, 2, 3
+FSC_TAP_E = 4          # +128
+FSC_TAP_C = 132        # +32
+FSC_BASE_ENTRIES = 292
+FSC_INVX = 292         # +32  per-input-channel inverse
+FSC_INVE = 324         # +128 per-E-channel inverse
+
+
+# ---------------------------------------------------------------- half helpers
+def to_half(x):
+    return np.asarray(x, dtype=np.float32).astype(np.float16)
+
+
+def widen(h):
+    return np.asarray(h, dtype=np.float16).astype(np.float32)
+
+
+def act_h(e_half):
+    """nr_act_h: MpCubicSilu in binary16, one rounding per half op."""
+    x = np.asarray(e_half, dtype=np.float16)
+    t = np.clip(x, np.float16(-4.0), np.float16(4.0))
+    u = to_half(np.float32(-0.055908203125) * np.abs(t).astype(np.float32)
+                + np.float32(0.447265625))
+    inner = to_half(t.astype(np.float32) * u.astype(np.float32) + np.float32(0.89453125))
+    return to_half(x.astype(np.float32) * inner.astype(np.float32))
+
+
+def code8(v, inv):
+    """nr_i8_code: precise float(v)*inv, roundEven, clamp +-127."""
+    c = np.asarray(v, dtype=np.float32) * np.float32(inv)
+    return np.clip(np.rint(c), -127.0, 127.0).astype(np.int16)
+
+
+def code8_ch(v, inv_vec):
+    """Same, with a per-channel inverse; v is (rows, N).  A scalar inverse broadcasts."""
+    f = np.asarray(inv_vec, np.float32)
+    if f.ndim == 0:
+        c = np.asarray(v, dtype=np.float32) * f
+        return np.clip(np.rint(c), -127.0, 127.0).astype(np.int16)
+    out = np.empty(v.shape, np.int16)
+    for i in range(v.shape[0]):
+        out[i] = code8(v[i], f[i])
+    return out
+
+
+# ------------------------------------------------------------------ plan facts
+def block_bindings(plan_path, ordinal=4):
+    p = Plan(plan_path)
+    d = p.dispatch(ordinal)
+    buf = {b.binding: p.buffers[b.buffer] for b in d.binds}
+    push = [int(w) for w in d.push]
+    sgn = lambda u: u - 2**32 if u >= 2**31 else u
+    return {
+        "plan": str(plan_path).replace("\\", "/"),
+        "plan_sha256": p.sha256(),
+        "ordinal": ordinal,
+        "name": d.name,
+        "spv": d.spv.replace("\\", "/"),
+        "spv_sha256": sha256_file(d.spv) if Path(d.spv).is_file() else None,
+        "push16": push[:16],
+        "tiles_x": push[0],
+        "shift_x": sgn(push[1]),
+        "debug": push[2],
+        "grid_x": int(d.tail_tokens[4]),
+        "grid_y": int(d.tail_tokens[5]),
+        "tiles_y": push[14],
+        "shift_y": sgn(push[15]),
+        "input": buf[2].file.replace("\\", "/"),
+        "input_sha256": sha256_file(buf[2].file) if buf[2].file != "-" else None,
+        "out": buf[3].file.replace("\\", "/"),
+        "wb": buf[0].file.replace("\\", "/"),
+        "wb_sha256": sha256_file(buf[0].file),
+        "aux": buf[1].file.replace("\\", "/"),
+        "w8": buf[5].file.replace("\\", "/"),
+        "w8_sha256": sha256_file(buf[5].file),
+        "fsc": buf[6].file.replace("\\", "/"),
+        "fsc_sha256": sha256_file(buf[6].file),
+        "rs_base": push[8],
+        "ars_base": push[9],
+    }
+
+
+def load_w8(path):
+    raw = np.fromfile(path, dtype=np.int8)
+    assert raw.size == 49152, raw.size
+    we = raw[0:16384].reshape(16, 32, 32)[:, :, :8].transpose(0, 2, 1).reshape(128, 32)
+    ct = raw[16384:32768].reshape(16, 32, 32)
+    wc = np.zeros((32, 128), np.int16)
+    for step in range(4):
+        for g in range(4):
+            t = ct[g * 4 + step][:, :8]
+            for m in range(8):
+                wc[g * 8 + m, step * 32:step * 32 + 32] = t[:, m]
+    return we.astype(np.int16), wc
+
+
+def pack_w8(we, wc):
+    """Inverse of load_w8 -> 49152 int8 bytes (expand | contract | QKV+WO tail)."""
+    raw = np.zeros(49152, np.int8)
+    ex = raw[0:16384].reshape(16, 32, 32)
+    for g in range(16):
+        for m in range(8):
+            ex[g, :, m] = np.asarray(we, np.int16)[g * 8 + m]
+    raw[0:16384] = ex.reshape(-1)
+    ct = np.zeros((16, 32, 32), np.int16)
+    for step in range(4):
+        for g in range(4):
+            for m in range(8):
+                ct[g * 4 + step][:, m] = wc[g * 8 + m, step * 32:step * 32 + 32]
+    raw[16384:32768] = ct.reshape(-1)
+    return raw
+
+
+def load_w8_tail(path):
+    raw = np.fromfile(path, dtype=np.int8)
+    return raw[32768:49152].copy()
+
+
+def load_fsc(path):
+    return np.fromfile(path, dtype="<f4").astype(np.float32)
+
+
+def load_rs(wb_path, rs_base):
+    """Contract residual scale.  The four group loads sit at pc.p2.x+8,+16,+24,+32,
+    so rs[c] = wb[pc.p2.x + 8 + c]  (wb[pc.p2.x .. +7] is an unused 8-half pad)."""
+    wb = np.fromfile(wb_path, dtype="<f2")
+    return wb[rs_base + 8:rs_base + 40].astype(np.float16)
+
+
+# ------------------------------------------------------------------ addressing
+def chan_addr(tile_ix, col, c):
+    return tile_ix * 512 + (c // 16) * 256 + ((c // 8) % 2) * 8 + col * 16 + (c % 8)
+
+
+def gather(flat, tile_ixs, cols):
+    tile_ixs = np.asarray(tile_ixs, np.int64)
+    cols = np.asarray(cols, np.int64)
+    out = np.empty((32, tile_ixs.size), np.float16)
+    base = tile_ixs * 512 + cols * 16
+    for c in range(32):
+        off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+        out[c] = flat[base + off]
+    return out
+
+
+# --------------------------------------------------------------------- forward
+def forward(x_half, we, wc, rs_half, invx, inve, tap_e, tap_c):
+    """x_half (32,N) fp16.  Returns dict with Y f32/half, code pointers."""
+    xq = code8_ch(x_half, invx)
+    acc_e = np.rint(we.astype(np.float64) @ xq.astype(np.float64)).astype(np.int32)
+    e_f32 = acc_e.astype(np.float32) * np.asarray(tap_e, np.float32)[:, None]
+    a_h = act_h(to_half(e_f32))
+    eq = code8_ch(a_h, inve)
+    acc_c = np.rint(wc.astype(np.float64) @ eq.astype(np.float64)).astype(np.int32)
+    seed = widen(to_half(x_half * rs_half[:, None]))
+    y_f32 = acc_c.astype(np.float32) * np.asarray(tap_c, np.float32)[:, None] + seed
+    return {"y_f32": y_f32, "y_half": to_half(y_f32), "eq": eq, "a_h": a_h,
+            "xq": xq, "acc_c": acc_c, "seed": seed, "e_f32": e_f32}
+
+
+def rel_l2(a, b):
+    a = np.asarray(a, np.float64)
+    b = np.asarray(b, np.float64)
+    return float(np.sqrt(np.sum((a - b) ** 2) / max(np.sum(b ** 2), 1e-30)))
+
+
+def tile_set(tiles_x=168, tiles_y=96):
+    ty, tx = np.mgrid[0:tiles_y, 0:tiles_x]
+    return (ty * tiles_x + tx).ravel(), tx.ravel(), ty.ravel()

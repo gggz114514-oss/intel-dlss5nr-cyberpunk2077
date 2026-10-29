@@ -1,0 +1,130 @@
+"""S01 turn 2c: recalibrate block 4 on the REAL captured upstream input and quantify
+how much the pack actually moves relative to the teacher-calibrated one.
+"""
+import sys, json
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+HERE = Path(__file__).resolve().parent.parent
+REAL = L.W / "gpu/runs/input-capture/xq-c32-b4.bin"
+TEACH = L.D / "dump-fp16/dump_block3_out.bin"
+info = L.block_bindings(L.D / "c32-equalized-b4/local-b4.txt", ordinal=4)
+we, wc = L.load_w8(info["w8"])
+fsc_eq = L.load_fsc(info["fsc"])
+wb = np.fromfile(info["wb"], dtype="<f2")
+rs = wb[info["rs_base"] + 8:info["rs_base"] + 40].astype(np.float16)
+tap_e = fsc_eq[4:132].astype(np.float32)
+invx = fsc_eq[L.FSC_INVX:L.FSC_INVX + 32].copy()
+sX = np.float32(fsc_eq[0]); sE_eq = np.float32(fsc_eq[2])
+Wc_real = wc.astype(np.float32) * (fsc_eq[132:164] / sE_eq)[:, None]
+
+# ---- per-channel E amax over ALL tiles, chunked
+def e_amax(flat, chunk=1024):
+    am = np.zeros(128, np.float64)
+    n = 168 * 96
+    for start in range(0, n, chunk):
+        tl = np.arange(start, min(start + chunk, n))
+        TT, CC = np.meshgrid(tl, np.arange(16), indexing="ij")
+        TT = TT.ravel(); CC = CC.ravel()
+        x = L.gather(flat, TT, CC)
+        q = L.code8_ch(x, invx)
+        acc = np.rint(we.astype(np.float64) @ q.astype(np.float64)).astype(np.int32)
+        a = L.act_h(L.to_half(acc.astype(np.float32) * tap_e[:, None]))
+        am = np.maximum(am, np.abs(a.astype(np.float32)).max(axis=1))
+    return am
+
+
+am_real = e_amax(np.fromfile(REAL, dtype="<f2"))
+am_teach = e_amax(np.fromfile(TEACH, dtype="<f2"))
+print("E amax real  max %.3f ratio %.2f" % (am_real.max(), am_real.max() / am_real.min()))
+print("E amax teach max %.3f ratio %.2f" % (am_teach.max(), am_teach.max() / am_teach.min()))
+print("per-channel amax ratio real/teach: min %.4f med %.4f max %.4f"
+      % ((am_real / np.maximum(am_teach, 1e-9)).min(), np.median(am_real / np.maximum(am_teach, 1e-9)),
+         (am_real / np.maximum(am_teach, 1e-9)).max()))
+
+
+def build(am, tag):
+    ref = float(am.max())
+    D = np.exp2(np.rint(np.log2(np.maximum(am, 1e-12) / ref)))
+    D = np.clip(D, 2.0 ** -10, 1.0)
+    sE_g = float((am / D).max() / 127.0)
+    sEf = (D * sE_g).astype(np.float32)
+    Wp = Wc_real * sEf[None, :]
+    sWc = (np.abs(Wp).max(axis=1) / 127.0).astype(np.float32)
+    wcq = np.clip(np.rint(Wp / sWc[:, None]), -127, 127).astype(np.int16)
+    w8 = L.pack_w8(we, wcq)
+    w8[32768:49152] = L.load_w8_tail(info["w8"])
+    fsc = np.concatenate([fsc_eq[:324], (1.0 / sEf).astype(np.float32)]).astype(np.float32)
+    fsc[2] = np.float32(sE_g)
+    fsc[3] = np.float32(1.0 / sE_g)
+    fsc[132:164] = sWc
+    return dict(tag=tag, D=D, sEf=sEf, w8=w8, fsc=fsc, sE_g=sE_g)
+
+
+for am, tag in ((am_teach, "teacher_cal"), (am_real, "real_cal")):
+    p = build(am, tag)
+    w8p = HERE / "PACK" / f"c32_block4_{tag}-weights.i8.bin"
+    scp = HERE / "PACK" / f"c32_block4_{tag}-scales.f32.bin"
+    p["w8"].astype(np.int8).tofile(w8p)
+    p["fsc"].astype("<f4").tofile(scp)
+    ref8 = np.fromfile(info["w8"], dtype=np.int8)
+    print(f"{tag:11s} sE_g={p['sE_g']:.6f} contract bytes changed vs the base pack="
+          f"{int(np.count_nonzero(p['w8'][16384:32768] != ref8[16384:32768]))}")
+
+# how far apart are the two packs?
+a = np.fromfile(HERE / "PACK/c32_block4_teacher_cal-weights.i8.bin", dtype=np.int8)
+b = np.fromfile(HERE / "PACK/c32_block4_real_cal-weights.i8.bin", dtype=np.int8)
+print("teacher-cal vs real-cal contract codes differing:", int(np.count_nonzero(a[16384:32768] != b[16384:32768])),
+      "of 16384")
+invE_t = L.load_fsc(HERE / "PACK/c32_block4_teacher_cal-scales.f32.bin")[L.FSC_INVE:L.FSC_INVE + 128]
+invE_r = L.load_fsc(HERE / "PACK/c32_block4_real_cal-scales.f32.bin")[L.FSC_INVE:L.FSC_INVE + 128]
+print("invE relative difference: max %.4f median %.4f"
+      % (np.abs(invE_r / invE_t - 1).max(), np.median(np.abs(invE_r / invE_t - 1))))
+
+# ---- end-to-end CPU check on the real feed
+rng = np.random.default_rng(777)
+tiles = np.sort(rng.choice(168 * 96, size=2000, replace=False))
+TT, CC = np.meshgrid(tiles, np.arange(16), indexing="ij")
+TT = TT.ravel(); CC = CC.ravel()
+rows = []
+for feed, path in (("teacher_input", TEACH), ("real_input", REAL)):
+    x = L.gather(np.fromfile(path, dtype="<f2"), TT, CC)
+    seed = L.widen(L.to_half(x * rs[:, None]))
+    for name, w8p, scp in (("frozen_minmax", L.D / "c32-minmax/../c32-minmax/b4-scales.bin",
+                            L.D / "c32-minmax/../c32-minmax/b4-scales.bin"),):
+        pass
+    for name in ("frozen_minmax", "teacher_cal", "real_cal"):
+        if name == "frozen_minmax":
+            w8p = L.D / "c32-minmax/../c32-minmax/b4-scales.bin"
+            w8v = L.load_w8(L.D / "c32-body1-unified" if False else
+                            Path(r"@NR_WORKSPACE@/work/dsh-int8-fullnet-impl-20261024/candidates/c32-body1-unified/pack/c32_block4_unified_weights.i8.bin"))
+            fsc = L.load_fsc(L.D / "c32-minmax/b4-scales.bin")
+        else:
+            w8v = L.load_w8(HERE / "PACK" / f"c32_block4_{name}-weights.i8.bin")
+            fsc = L.load_fsc(HERE / "PACK" / f"c32_block4_{name}-scales.f32.bin")
+        wx, wcv = w8v
+        ivx = (fsc[L.FSC_INVX:L.FSC_INVX + 32] if fsc.size >= L.FSC_INVX + 32
+               else np.full(32, np.float32(fsc[L.FSC_INV_X])))
+        ive = (fsc[L.FSC_INVE:L.FSC_INVE + 128] if fsc.size >= L.FSC_INVE + 128
+               else np.full(128, np.float32(fsc[L.FSC_INV_E])))
+        q = L.code8_ch(x, ivx)
+        acc = np.rint(wx.astype(np.float64) @ q.astype(np.float64)).astype(np.int32)
+        a_h = L.act_h(L.to_half(acc.astype(np.float32) * fsc[4:132][:, None]))
+        y_ref = Wc_real @ a_h.astype(np.float32) + seed
+        eq = L.code8_ch(a_h, ive)
+        y = (np.rint(wcv.astype(np.float64) @ eq.astype(np.float64)).astype(np.int32)
+             .astype(np.float32) * fsc[132:164][:, None] + seed)
+        rows.append(dict(feed=feed, pack=name, rel_l2=L.rel_l2(y, y_ref),
+                         saturated=int(np.count_nonzero(np.abs(eq) >= 127))))
+        print(f"{feed:14s} {name:14s} FFN-Y relL2 {rows[-1]['rel_l2']:.5f} sat {rows[-1]['saturated']}")
+
+(HERE / "CPU" / "real_calibration.json").write_text(json.dumps(dict(
+    real_input=str(REAL).replace("\\", "/"), teacher_input=str(TEACH).replace("\\", "/"),
+    e_amax_real=am_real.tolist(), e_amax_teacher=am_teach.tolist(),
+    contract_codes_differing=int(np.count_nonzero(a[16384:32768] != b[16384:32768])),
+    invE_rel_diff=dict(max=float(np.abs(invE_r / invE_t - 1).max()),
+                       median=float(np.median(np.abs(invE_r / invE_t - 1)))),
+    runs=rows), indent=2))

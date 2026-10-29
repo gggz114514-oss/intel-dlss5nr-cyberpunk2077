@@ -1,0 +1,254 @@
+"""Register-budget evidence from the existing native ISA captures (CPU only).
+
+Reads (read-only) the F05 C128 base asm (pipeline 9) and F05 C64 base asm (pipeline 5)
+from the n04b / n04a native captures, then:
+
+  1. extracts every DPAS with its accumulator base register -> per-acc GRF footprint
+     (empirically: consecutive accumulator bases are exactly 8 apart, so one 8x16 f32
+     accumulator = 8 GRF of allocator footprint);
+  2. builds per-GRF live intervals (def -> last use) and reports the peak concurrent
+     live-GRF count, globally and inside the QKV projection window;
+  3. reports the composition of the live set at that peak (acc / A-operand / B-operand /
+     other) so the M-doubled projection in BUDGET.md can be computed as
+     "96 (12 acc) + measured non-acc live set".
+
+Writes only inside this card dir.
+"""
+import re, json, sys
+from pathlib import Path
+
+Q = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+         'fullnet-continuous-20261027/queue')
+OUT = Path(__file__).resolve().parent
+
+TARGETS = {
+    'C128': Q / 'n04b-f05-c128-feed/native/captures/native-native-base/ISA/'
+                'CS_asmf98d5ab4e239dd54_simd32_000000000000000a_9_orig.asm',
+    'C64':  Q / 'n04a-f05-c64-feed/native/captures/native-native-base/ISA/'
+                'CS_asm6a22246177be2653_simd32_0000000000000006_5_orig.asm',
+}
+
+LINE = re.compile(r'/\* \[([0-9A-Fa-f]+)\]\s*\*/\s*(\([^)]*\))?\s*([a-zA-Z0-9_.]+)\s*(.*)$')
+RT = re.compile(r'\br(\d+)(?:\.(\d+))?')
+BT = re.compile(r'\b(r|acc)(\d+)(?:\.(\d+))?')
+
+BPE = {'ud': 4, 'd': 4, 'f': 4, 'w': 2, 'uw': 2, 'hf': 2, 'bf': 2, 'ub': 1, 'b': 1,
+       'q': 8, 'uq': 8, 'df': 8, 'v': 2, 'uv': 2, 'vf': 2}
+
+
+def parse(path):
+    ins = []
+    for raw in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+        m = LINE.match(raw.strip())
+        if not m:
+            continue
+        pc, pred, op, rest = m.group(1), m.group(2) or '', m.group(3), m.group(4)
+        # the exec-size token "(16|M0)" is a modifier, not an operand
+        ex = 1
+        me = re.match(r'\s*\((\d+)\|[^)]*\)\s*', rest)
+        if me:
+            ex = int(me.group(1))
+            rest = rest[me.end():]
+        ins.append(dict(pc=int(pc, 16), op=op, pred=pred, body=rest, execsize=ex,
+                        comment=rest.split('//')[1] if '//' in rest else '',
+                        text=rest.split('//')[0]))
+    return ins
+
+
+def elem_span(execsize, typ):
+    n = execsize * BPE.get((typ or 'd').lower(), 4)
+    return max(1, (n + 31) // 32)
+
+
+def split_ops(text):
+    """crude operand split: tokens, keeping the '<..>;..' modifiers attached"""
+    return [t for t in re.split(r'(?<=\S)\s+', text.strip()) if t]
+
+
+def analyse(tag, path):
+    ins = parse(path)
+    if not ins:
+        return dict(tag=tag, error='no instructions parsed', path=str(path))
+
+    # ---------- DPAS map
+    dpas = []
+    for i, d in enumerate(ins):
+        if not d['op'].startswith('dpas'):
+            continue
+        ops = split_ops(d['text'])
+        dst = RT.search(ops[0]) if ops else None
+        if not dst:
+            continue
+        dpas.append(dict(idx=i, pc=d['pc'], acc=int(dst.group(1)), text=d['text'].strip()))
+
+    accs = sorted({x['acc'] for x in dpas})
+    acc_gaps = sorted({b - a for a, b in zip(accs, accs[1:]) if b - a < 24})
+
+    # ---------- QKV window: from the first dpas whose accumulator is one of the six
+    # persistent QKV accumulators, to the last QKV publication store (send.ugm store).
+    def kind(d, ops):
+        if d['op'].startswith('dpas'):
+            return 'dpas'
+        return d['op']
+
+    # per-GRF intervals (def -> last use).  Spans:
+    #   dpas: dst 8 (acc), acc src 8, A 8, B 8   (measured: consecutive accs are 8 apart)
+    #   send: dst span from "rd:N"; header = 2 GRF
+    #   other: exec-size * element bytes / 32 B
+    defs = {}      # grf -> [pcs]
+    uses = {}
+    allops = []
+    for i, d in enumerate(ins):
+        ops = split_ops(d['text'])
+        if not ops:
+            allops.append([])
+            continue
+        if d['op'].startswith('dpas'):
+            # dst acc
+            m = RT.search(ops[0])
+            base = int(m.group(1)) if m else None
+            touch = []
+            if base is not None:
+                for g in range(base, min(base + 8, 128)):
+                    defs.setdefault(g, []).append(d['pc'])
+                touch += [('acc', g) for g in range(base, base + 8)]
+            for oi, tok in enumerate(ops[1:], 1):
+                m = RT.search(tok)
+                if not m:
+                    continue
+                b = int(m.group(1))
+                for g in range(b, min(b + 8, 128)):
+                    uses.setdefault(g, []).append(d['pc'])
+                    touch.append(('op%d' % oi, g))
+            allops.append(touch)
+            continue
+        if d['op'].startswith('send'):
+            m = RT.search(ops[0])
+            base = int(m.group(1)) if m else None
+            rd = re.search(r'rd:(\d+)', d['comment'])
+            span = int(rd.group(1)) if rd else 1
+            touch = []
+            if base is not None:
+                for g in range(base, min(base + span, 128)):
+                    defs.setdefault(g, []).append(d['pc'])
+                    touch.append(('send', g))
+            for oi, tok in enumerate(ops[1:], 1):
+                m = RT.search(tok)
+                if not m:
+                    continue
+                b = int(m.group(1))
+                hspan = 2 if oi == 1 else 1
+                for g in range(b, min(b + hspan, 128)):
+                    uses.setdefault(g, []).append(d['pc'])
+                    touch.append(('hdr', g))
+            allops.append(touch)
+            continue
+        # generic
+        ex = 1
+        pe = re.search(r'\((\d+)\|', d['pred'])
+        if pe:
+            ex = int(pe.group(1))
+        touch = []
+        first = ops[0]
+        m = re.search(r':([a-z]+)', first)
+        typ = m.group(1) if m else 'd'
+        md = RT.search(first)
+        if md and not first.startswith('null'):
+            b = int(md.group(1))
+            span = elem_span(ex, typ)
+            for g in range(b, min(b + span, 128)):
+                defs.setdefault(g, []).append(d['pc'])
+                touch.append(('dst', g))
+        for oi, tok in enumerate(ops[1:], 1):
+            if ':' in tok and re.match(r'^[a-z0-9.]+:', tok):
+                continue
+            m2 = re.search(r':([a-z]+)', tok)
+            t2 = m2.group(1) if m2 else 'd'
+            for mt in RT.finditer(tok):
+                b = int(mt.group(1))
+                span = elem_span(ex, t2)
+                for g in range(b, min(b + span, 128)):
+                    uses.setdefault(g, []).append(d['pc'])
+                    touch.append(('src', g))
+        allops.append(touch)
+
+    # ---------- sweep
+    events = {}
+    for g, pcs in defs.items():
+        events.setdefault((g, min(pcs)), [0, 0])[0] += 1
+    intervals = []
+    for g, pcs in defs.items():
+        us = [p for p in uses.get(g, []) if p >= min(pcs)]
+        if not us:
+            continue
+        intervals.append((min(pcs), max(us), g))
+    # also registers used but never defined (initial params) -> pin from 0
+    for g, pcs in uses.items():
+        if g in defs:
+            continue
+        intervals.append((0, max(pcs), g))
+    points = sorted({i[0] for i in intervals} | {i[1] for i in intervals})
+    peak = (0, None)
+    for p in points:
+        live = [i for i in intervals if i[0] <= p <= i[1]]
+        if len(live) > peak[0]:
+            peak = (len(live), p, sorted(i[2] for i in live))
+
+    # ---------- QKV window peak: window = first QKV dpas .. last QKV store send
+    qkv_accs = [a for a in accs if a >= 40][:6] if len(accs) >= 6 else []
+    qkv_pcs = [x['pc'] for x in dpas if x['acc'] in qkv_accs]
+    win = (min(qkv_pcs), max(qkv_pcs)) if qkv_pcs else (0, 0)
+    qkv_peak = (0, None, [])
+    for p in points:
+        if not (win[0] <= p <= win[1]):
+            continue
+        live = [i for i in intervals if i[0] <= p <= i[1]]
+        if len(live) > qkv_peak[0]:
+            qkv_peak = (len(live), p, sorted(i[2] for i in live))
+
+    def classify(grfs):
+        acc = sum(1 for x in grfs if x in qkv_accs or any(x in range(a, a + 8) for a in accs))
+        return dict(acc_grf=acc, other_grf=len(grfs) - acc, n=len(grfs))
+
+    res = dict(
+        tag=tag, path=str(path), instructions=len(ins), dpas=len(dpas),
+        dpas_acc_bases=accs, acc_base_gaps=acc_gaps,
+        qkv_acc_bases=qkv_accs, qkv_window=[hex(win[0]), hex(win[1])],
+        peak_all=dict(n=peak[0], pc=hex(peak[1]) if peak[1] is not None else None,
+                      grf=peak[2] if len(peak) > 2 else []),
+        peak_qkv=dict(pc=hex(qkv_peak[1]) if qkv_peak[1] is not None else None,
+                      grf=qkv_peak[2], **classify(qkv_peak[2])),
+        max_grf_defined=max(defs) if defs else None,
+        n_grf_defined=len(defs),
+    )
+    return res
+
+
+def main():
+    out = {}
+    for tag, p in TARGETS.items():
+        if not p.exists():
+            out[tag] = dict(error='missing', path=str(p))
+            continue
+        out[tag] = analyse(tag, p)
+    (OUT / 'regs.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    for tag, r in out.items():
+        print('==', tag)
+        if 'error' in r:
+            print('  ', r['error'], r['path'])
+            continue
+        print('  instructions=%d dpas=%d' % (r['instructions'], r['dpas']))
+        print('  dpas acc bases =', r['dpas_acc_bases'])
+        print('  gaps between consecutive acc bases =', r['acc_base_gaps'])
+        print('  QKV acc bases =', r['qkv_acc_bases'], 'window', r['qkv_window'])
+        print('  peak(all)  n=%d @%s' % (r['peak_all']['n'], r['peak_all']['pc']))
+        print('  peak(QKV)  n=%d @%s  acc=%d other=%d' % (
+            r['peak_qkv']['n'], r['peak_qkv']['pc'],
+            r['peak_qkv']['acc_grf'], r['peak_qkv']['other_grf']))
+        print('  max grf defined = r%s ; distinct grf defined = %d' % (
+            r['max_grf_defined'], r['n_grf_defined']))
+        print('  QKV peak live set =', r['peak_qkv']['grf'])
+
+
+if __name__ == '__main__':
+    main()

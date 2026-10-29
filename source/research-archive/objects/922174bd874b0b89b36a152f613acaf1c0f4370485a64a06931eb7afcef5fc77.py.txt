@@ -1,0 +1,307 @@
+"""R09/R10/R11 static site registry (CPU only, word level).
+
+For each of the three F3 down-sample-family modules, enumerate every
+OpCooperativeMatrixMulAddKHR statically present, with its word offset, result
+id, enclosing function and operand provenance, and classify each site as
+
+  WO   - the front-end output projection: B is the f16 image of the module's
+         own `pack` buffer at the p4.x WO base (the "output projection" whose
+         reader is the next stage),
+  DS   - the post-pool down-sample projection: B is the f16 image of the
+         module's own `nrf_w` DS-weight buffer (binding 8) in the 16x16 blocked
+         form, A is the pooled tile `nrf_mean`.
+
+The classification is *derived* from the B-operand provenance chain, not from
+names or from the audit table, and is then cross-checked against
+FULLNET-RESIDUAL-MMA-SITES.json (word offsets and result ids must agree 1:1).
+
+usage: python tools/sites.py
+"""
+import json
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+CARD = HERE.parent
+sys.path.insert(0, str(HERE))
+import spvlib  # noqa: E402
+
+for _op, _name in ((3, "OpSource"), (4, "OpSourceExtension"),
+                   (185, "OpFOrdLessThan"), (186, "OpFOrdGreaterThan"),
+                   (189, "OpFUnordNotEqual"), (191, "OpFOrdEqual"),
+                   (42, "OpConstantFalse"), (48, "OpSpecConstantOp")):
+    spvlib.OP.setdefault(_op, _name)
+
+R = Path("@NR_WORKSPACE@")
+AUDIT = R / "work/codex-astra-fp16-int8-audit-20261024"
+
+SLOT = {"PackBuf": "pack(b0)", "AuxBuf": "aux(b1)", "ImageIn": "imgin(b2)",
+        "ImageOut": "imgout(b3)", "DbgBuf": "dbg(b4)", "DbgFloat": "dbgf(b4)",
+        "YBuf": "gY(b6)", "TBuf": "gT(b7)", "DsWeightBuf": "nrf_w(b8)",
+        "DsOutBuf": "nrf_o(b9)", "PackedFFNEntry": "entry_q(b10)",
+        "EntryScale": "entry_sc(b11)"}
+
+MODULES = [
+    ("r09", "f3c64_body_ds",
+     "candidates/codex-sol-attention-20261018/v4-m8col-scale-repair-v1/C-producer.spv",
+     "c2feb5dc6994560b4fe6935bc54d1ba69db07a270fe5fce455feac3e63f28447"),
+    ("r10", "f3c128_body_ds",
+     "candidates/amd-netorg-acceleration-workbuddy-20261016/f3-c128-fused-half-patch-v1/fused_c128_body_ds.spv",
+     "2041cbb01b284206ced850360be472624b8b1e510819ed025a370ab847b02b39"),
+    ("r11", "f3c256_body_ds",
+     "candidates/amd-netorg-full-scope-workbuddy-20261017/c2-layout/layout0-unify-l2-v4/spv/c2_S19_fused_c256_body_ds.spv",
+     "c853148407be055e7e2fc71ef87614f7ec003468baeb8954ed2e998ff89047fd"),
+]
+
+
+class Trace(object):
+    def __init__(self, m):
+        self.m = m
+        self.stores = {}
+        for it in m.insts:
+            if it.name == "OpStore":
+                self.stores.setdefault(self.var_of(it.a[0]), []).append((it.idx, it.a[1]))
+
+    def var_of(self, ptr):
+        b = self.m.base_var(ptr)
+        return b if b is not None else ptr
+
+    def def_of(self, vid, before):
+        it = self.m.byid.get(vid)
+        if it is None:
+            return None, None
+        if it.name in ("OpCopyObject", "OpBitcast"):
+            return self.def_of(it.a[2], before)
+        if it.name != "OpLoad":
+            return vid, it
+        var = self.var_of(it.a[2])
+        best = None
+        for idx, val in self.stores.get(var, []):
+            if idx < before:
+                best = (idx, val)
+        if best is None:
+            return vid, it
+        return self.def_of(best[1], best[0])
+
+    def origin(self, vid, before, depth=0):
+        if depth > 8:
+            return None
+        d, it = self.def_of(vid, before)
+        if it is None:
+            return None
+        if it.name == "OpCooperativeMatrixLoadKHR":
+            buf = self.m.block_name(self.m.base_var(it.a[2]) or it.a[2]) or "?"
+            return {"kind": "cm_load", "buffer": buf, "slot": SLOT.get(buf, buf),
+                    "address": self.m.resolve(it.a[2])[0],
+                    "stride": self.m.fval(it.a[4]) if self.m.fval(it.a[4]) is not None
+                    else self.m.resolve(it.a[4])[0],
+                    "layout": "ColumnMajor" if self.m.fval(it.a[3]) == 1 else "RowMajor",
+                    "cmat": self.m.cm_type(it.a[0]), "woff": it.woff}
+        if it.name == "OpCooperativeMatrixMulAddKHR":
+            return {"kind": "mma", "woff": it.woff, "result_id": it.a[1],
+                    "cmat": self.m.cm_type(it.a[0])}
+        if it.name in ("OpCooperativeMatrixConvertKHR", "OpFConvert", "OpCopyObject"):
+            return self.origin(it.a[2], it.idx, depth + 1)
+        if it.name == "OpCompositeConstruct":
+            return {"kind": "composite", "of": [self.origin(x, it.idx, depth + 1)
+                                                for x in it.a[1:]]}
+        return {"kind": it.name, "woff": it.woff}
+
+    def chain(self, vid, before, depth=0):
+        if depth > 6:
+            return {"kind": "depth_limit"}
+        d, it = self.def_of(vid, before)
+        if it is None:
+            return {"kind": "unknown"}
+        if it.name == "OpCooperativeMatrixLoadKHR":
+            buf = self.m.block_name(self.m.base_var(it.a[2]) or it.a[2]) or "?"
+            return {"kind": "load", "slot": SLOT.get(buf, buf),
+                    "address": self.m.resolve(it.a[2])[0],
+                    "stride": self.m.fval(it.a[4]) if self.m.fval(it.a[4]) is not None
+                    else self.m.resolve(it.a[4])[0],
+                    "layout": "ColumnMajor" if self.m.fval(it.a[3]) == 1 else "RowMajor"}
+        if it.name == "OpCooperativeMatrixMulAddKHR":
+            return {"kind": "mma", "woff": it.woff, "result_id": it.a[1],
+                    "A": self.chain(it.a[2], it.idx, depth + 1),
+                    "B": self.chain(it.a[3], it.idx, depth + 1),
+                    "C": self.chain(it.a[4], it.idx, depth + 1)}
+        if it.name in ("OpFConvert", "OpCopyObject", "OpBitcast", "OpQuantizeToF16",
+                       "OpSConvert", "OpUConvert", "OpCooperativeMatrixConvertKHR"):
+            return {"kind": it.name, "of": self.chain(it.a[2], it.idx, depth + 1)}
+        if it.name in ("OpFMul", "OpFAdd", "OpFSub", "OpFDiv"):
+            return {"kind": it.name,
+                    "l": self.chain(it.a[2], it.idx, depth + 1),
+                    "r": self.chain(it.a[3], it.idx, depth + 1)}
+        if it.name in ("OpConstant", "OpConstantComposite", "OpConstantNull"):
+            return {"kind": it.name}
+        return {"kind": it.name}
+
+
+def classify(m, tr, A, B, before):
+    """WO / DS / OTHER, derived from the B-operand provenance + A provenance."""
+    ob = tr.origin(B, before)
+    oa = tr.origin(A, before)
+    b = m.cm_type(m.byid[B].a[0]) if B in m.byid else None
+    rec = {"B_origin": ob, "A_origin": oa,
+           "B_cmat": b, "A_cmat": m.cm_type(m.byid[A].a[0]) if A in m.byid else None}
+    if ob is None:
+        return "OTHER", "B has no traceable definition", rec
+    if ob["kind"] == "cm_load" and ob["buffer"] == "PackBuf":
+        return "WO", ("B is an image of the module's own pack(b0) at %s, stride %s, %s"
+                      % (ob["address"], ob["stride"], ob["layout"])), rec
+    if ob["kind"] == "cm_load" and ob["buffer"] == "DsWeightBuf":
+        return "DS", ("B is an image of the DS-weight buffer nrf_w(b8) at %s, stride %s, %s"
+                      % (ob["address"], ob["stride"], ob["layout"])), rec
+    return "OTHER", "B comes from %s (%s)" % (ob.get("slot", ob["kind"]),
+                                             (b or {}).get("component")), rec
+
+
+def pool_position(m, tr, site):
+    """Where a DS site sits relative to the pool: A must read nrf_mean."""
+    oa = site["A_origin"]
+    return {"A_slot": (oa or {}).get("slot"), "A_address": (oa or {}).get("address"),
+            "A_is_pooled_tile": (oa or {}).get("buffer") not in (None, "PackBuf", "TBuf",
+                                                                "YBuf")}
+
+
+def cm_stream(m):
+    loads, stores = [], []
+    for it in m.insts:
+        if it.name == "OpCooperativeMatrixLoadKHR":
+            buf = m.block_name(m.base_var(it.a[2]) or it.a[2]) or "?"
+            loads.append({"woff": it.woff, "slot": SLOT.get(buf, buf),
+                          "address": m.resolve(it.a[2])[0],
+                          "stride": m.fval(it.a[4]) if m.fval(it.a[4]) is not None
+                          else m.resolve(it.a[4])[0],
+                          "layout": "ColumnMajor" if m.fval(it.a[3]) == 1 else "RowMajor",
+                          "cmat": m.cm_type(it.a[0])})
+        elif it.name == "OpCooperativeMatrixStoreKHR":
+            obj = it.a[1]
+            buf = m.block_name(m.base_var(it.a[0]) or it.a[0]) or "?"
+            stores.append({"woff": it.woff, "slot": SLOT.get(buf, buf),
+                           "address": m.resolve(it.a[0])[0],
+                           "stride": m.fval(it.a[3]) if m.fval(it.a[3]) is not None
+                           else m.resolve(it.a[3])[0],
+                           "layout": "ColumnMajor" if m.fval(it.a[2]) == 1 else "RowMajor",
+                           "cmat": m.cm_type(m.byid[obj].a[0]) if obj in m.byid else None})
+    return loads, stores
+
+
+def analyse(path):
+    m = spvlib.Mod(path)
+    tr = Trace(m)
+    sites = []
+    for it in m.insts:
+        if it.name != "OpCooperativeMatrixMulAddKHR":
+            continue
+        rc = m.cm_type(it.a[0])
+        kind, why, prov = classify(m, tr, it.a[2], it.a[3], it.idx)
+        sites.append({
+            "word_offset": it.woff, "result_id": it.a[1],
+            "function_id": it.func, "function": m.funcs.get(it.func, "?"),
+            "class": kind, "class_reason": why,
+            "accumulator": rc, "A_cmat": prov["A_cmat"], "B_cmat": prov["B_cmat"],
+            "A_id": it.a[2], "B_id": it.a[3], "C_id": it.a[4],
+            "B_origin": {k: v for k, v in (prov["B_origin"] or {}).items()},
+            "A_origin": {k: v for k, v in (prov["A_origin"] or {}).items()},
+            "A_pool_check": pool_position(m, tr, {"A_origin": prov["A_origin"]}),
+            "C_chain": tr.chain(it.a[4], it.idx),
+        })
+    loads, stores = cm_stream(m)
+    return m, sites, loads, stores
+
+
+def main():
+    ev = CARD / "evidence"
+    ev.mkdir(parents=True, exist_ok=True)
+    led = json.load(open(AUDIT / "FULLNET-INT8-IMPLEMENTATION-LEDGER.json", encoding="utf-8"))
+    res = json.load(open(AUDIT / "FULLNET-RESIDUAL-MMA-SITES.json", encoding="utf-8"))
+    by_path = {e["path"]: e for e in res}
+    by_pass = {p["pass_name"]: p for p in led["positions"]}
+    out = {"scope": "static FP16 MMA enumeration and WO/DS classification, CPU only",
+           "tool": "tools/sites.py + tools/spvlib.py", "modules": {}, "passes": []}
+    for card, pname, rel, sha in MODULES:
+        p = R / rel
+        m, sites, loads, stores = analyse(p)
+        aud = by_path.get(p.as_posix())
+        aud_sites = {s["word_offset"]: s for s in (aud["fp16_mma_sites"] if aud else [])}
+        mine = {s["word_offset"]: s for s in sites}
+        fp16 = [s for s in sites if (s["accumulator"] or {}).get("component") == "f32"]
+        i32 = [s for s in sites if (s["accumulator"] or {}).get("component") == "i32"]
+        wo = [s for s in sites if s["class"] == "WO"]
+        ds = [s for s in sites if s["class"] == "DS"]
+        wo16 = [s for s in wo if (s["accumulator"] or {}).get("component") == "f32"]
+        ds16 = [s for s in ds if (s["accumulator"] or {}).get("component") == "f32"]
+        ds8 = [s for s in ds if (s["accumulator"] or {}).get("component") == "i32"]
+        cross = {
+            "audit_module_found": aud is not None,
+            "audit_pass_name": aud["passes"] if aud else None,
+            "audit_fp16_static_count": len(aud_sites) if aud else None,
+            "my_fp16_static_count": len(fp16),
+            "counts_agree": (len(aud_sites) == len(fp16)) if aud else False,
+            "word_offsets_match": sorted(aud_sites) == sorted(s["word_offset"] for s in fp16),
+            "result_ids_match": all(aud_sites[s["word_offset"]]["result_id"] == s["result_id"]
+                                    for s in fp16 if s["word_offset"] in aud_sites),
+            "functions_match": all(aud_sites[s["word_offset"]]["function"] == s["function"]
+                                   for s in fp16 if s["word_offset"] in aud_sites),
+        }
+        mod = {
+            "path": p.as_posix(), "bytes": p.stat().st_size,
+            "sha256": __import__("hashlib").sha256(p.read_bytes()).hexdigest(),
+            "sha256_expected": sha,
+            "ledger_pass": by_pass[pname]["pass_name"],
+            "ledger_spv": by_pass[pname]["spv"],
+            "ledger_sha256": by_pass[pname]["sha256"],
+            "ledger_grid": by_pass[pname]["grid"],
+            "ledger_functions": by_pass[pname]["functions"],
+            "fp16_static_mma": len(fp16),
+            "int8_static_mma": len(i32),
+            "all_static_mma": len(sites),
+            "WO_fp16": len(wo16), "DS_fp16": len(ds16),
+            "WO_all": len(wo), "DS_all": len(ds),
+            "OTHER_fp16": len([s for s in fp16 if s["class"] == "OTHER"]),
+            "DS_int8": len(ds8),
+            "by_function": {f: {"fp16": sum(1 for s in fp16 if s["function"] == f),
+                                "int8": sum(1 for s in i32 if s["function"] == f),
+                                "WO_fp16": sum(1 for s in wo16 if s["function"] == f),
+                                "DS_fp16": sum(1 for s in ds16 if s["function"] == f),
+                                "DS_int8": sum(1 for s in ds8 if s["function"] == f)}
+                            for f in sorted({s["function"] for s in sites})},
+            "sites": sites,
+            "audit_cross_check": cross,
+            "cm_loads": loads, "cm_stores": stores,
+            "lds": m.lds(),
+        }
+        out["modules"][pname] = mod
+        out["passes"].append({"card": card, "pass": pname, "module": p.as_posix(),
+                              "fp16": len(fp16), "int8": len(i32),
+                              "WO": len(wo16), "DS_fp16": len(ds16),
+                              "DS_int8": len(ds8), "by_function": mod["by_function"],
+                              "cross_check": cross})
+    ok = all(c["cross_check"]["counts_agree"] and c["cross_check"]["word_offsets_match"]
+             and c["cross_check"]["result_ids_match"] and c["cross_check"]["functions_match"]
+             for c in out["passes"])
+    out["audit_cross_check_all_ok"] = ok
+    out["verdict"] = "REGISTRY_MATCHES_AUDIT" if ok else "FAIL"
+    (ev / "SITE-REGISTRY.json").write_text(json.dumps(out, indent=1, ensure_ascii=False) + "\n",
+                                           encoding="utf-8")
+    print(json.dumps({"verdict": out["verdict"], "passes": [
+        {k: v for k, v in c.items() if k != "cross_check"} |
+        {"cross": {k: c["cross_check"][k] for k in ("counts_agree", "word_offsets_match",
+                                                    "result_ids_match", "functions_match")}}
+        for c in out["passes"]]}, indent=1))
+    for pname, mod in out["modules"].items():
+        print(pname, "WO_fp16", mod["WO_fp16"], "DS_fp16", mod["DS_fp16"],
+              "DS_int8", mod["DS_int8"], "other", mod["OTHER_fp16"],
+              "by_function", json.dumps(mod["by_function"]))
+        for s in mod["sites"]:
+            print("   %-6s %-4s wo=%5d id=%-5d %-16s %s %s" % (
+                s["class"], (s["accumulator"] or {}).get("component"),
+                s["word_offset"], s["result_id"], s["function"],
+                (s["B_cmat"] or {}).get("component"), s["class_reason"][:118]))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

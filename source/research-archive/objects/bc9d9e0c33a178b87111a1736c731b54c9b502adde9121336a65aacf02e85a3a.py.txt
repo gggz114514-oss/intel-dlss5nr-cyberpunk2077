@@ -1,0 +1,291 @@
+"""N30 F20 SPIR-V structural check: parent-rebuild vs candidate (CPU only).
+
+Artifacts:
+  parent   : cards/n30-f20-arena-rotate/parent-rebuild.spv  (byte identical to 215aca67...)
+  candidate: cards/n30-f20-arena-rotate/candidate.spv
+
+Proves on the module:
+
+  1. workgroup barriers: OpControlBarrier count 16 -> 15, and every remaining
+     barrier keeps the SAME execution scope, memory scope and memory semantics as
+     the parent (no workgroup barrier was relaxed to subgroup/subgroup scope).
+     The removed barrier is the one between stage 3 (A reads) and stage 4 (Q/K/V
+     writes).
+  2. workgroup memory: Workgroup storage bytes identical (24576 B = 12288 halfs);
+     the arena is re-partitioned, not enlarged.  No Private (scratch) object.
+  3. cooperative matrix traffic: 38 loads / 20 stores in both modules (same
+     transfers, same shapes); the changed operand is only the (address, stride)
+     pair, reported per instruction kind.
+  4. numerics: the float/GLSL.std.450 expression multiset is identical, and the 45
+     NoContraction sites match as an id-free (function, opcode, signature)
+     multiset.  No FP expression, no rounding point, no reduction tree changes.
+  5. id-free structural diff of the whole module: the only hunks are the plane
+     address forms and the removed barrier.
+"""
+import collections
+import difflib
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST          # noqa: E402
+
+CARD = pathlib.Path(__file__).resolve().parent
+
+OPNAME = {
+    12: 'OpExtInst', 43: 'OpConstant', 59: 'OpVariable', 61: 'OpLoad', 62: 'OpStore',
+    65: 'OpAccessChain', 79: 'OpVectorShuffle', 80: 'OpCompositeConstruct',
+    81: 'OpCompositeExtract', 82: 'OpCompositeInsert', 83: 'OpCopyObject',
+    115: 'OpFConvert', 124: 'OpBitcast', 127: 'OpFNegate', 128: 'OpIAdd',
+    129: 'OpFAdd', 130: 'OpISub', 131: 'OpFSub', 132: 'OpIMul', 133: 'OpFMul',
+    139: 'OpSMod', 166: 'OpLogicalOr', 167: 'OpLogicalAnd', 169: 'OpSelect',
+    170: 'OpIEqual', 171: 'OpINotEqual', 177: 'OpCopyLogical',
+    224: 'OpControlBarrier', 225: 'OpMemoryBarrier',
+    246: 'OpLoopMerge', 247: 'OpSelectionMerge', 248: 'OpLabel', 249: 'OpBranch',
+    250: 'OpBranchConditional', 251: 'OpSwitch',
+    4456: 'OpTypeCooperativeMatrixKHR', 4457: 'OpCooperativeMatrixLoadKHR',
+    4458: 'OpCooperativeMatrixStoreKHR', 4459: 'OpCooperativeMatrixMulAddKHR',
+    4460: 'OpCooperativeMatrixLengthKHR',
+}
+SCOPE = {0: 'CrossDevice', 1: 'Device', 2: 'Workgroup', 3: 'Subgroup', 4: 'Invocation'}
+FP_OPS = {127, 129, 131, 133, 135, 140, 141, 142}
+FP_EXT = {4, 8, 10, 26, 27, 28, 31, 32, 37, 40, 43, 46, 49, 50}
+CM_LOAD, CM_STORE, CM_MULADD = 4457, 4458, 4459
+BARRIER = 224
+PRIVATE = 6
+
+
+class Canon:
+    """ID-free canonical expression tree (function locals tagged by ordinal)."""
+
+    def __init__(self, module):
+        self.m = module
+        self.by = module.id_to_instruction()
+        self.cache = {}
+        self.bind = {}
+        self.var_ord = {}
+        n = 0
+        for op, ops, _, _ in module.instructions:
+            if op == 71 and len(ops) > 2 and ops[1] == 33:
+                self.bind[ops[0]] = ops[2]
+            if op == 59:
+                self.var_ord[ops[1]] = n
+                n += 1
+
+    def c(self, cid, depth=0):
+        if cid in self.cache:
+            return self.cache[cid]
+        assert depth < 400, 'canon recursion'
+        op, ops = self.by.get(cid, (None, None))
+        if op is None:
+            val = ('undef', cid)
+        elif op == 43:
+            t_ops = self.by[ops[0]][1]
+            val = ('const', tuple(t_ops[1:]), ops[2])
+        elif op == 59:
+            val = ('var', ops[2], self.bind.get(cid), self.var_ord.get(cid))
+        elif op == 65:
+            val = ('ac', self.c(ops[2], depth + 1),
+                   tuple(self.c(x, depth + 1) for x in ops[3:]))
+        elif op == 61:
+            val = ('load', self.c(ops[2], depth + 1))
+        elif op == 81:
+            val = ('extract', self.c(ops[2], depth + 1), tuple(ops[3:]))
+        elif op == 80:
+            val = ('construct', tuple(self.c(x, depth + 1) for x in ops[2:]))
+        elif op == 82:
+            val = ('insert', self.c(ops[2], depth + 1), self.c(ops[3], depth + 1),
+                   tuple(ops[4:]))
+        elif op in (124, 109, 110, 111, 112, 113, 114, 115):
+            val = ('conv', op, self.c(ops[2], depth + 1))
+        elif op == 12:
+            val = ('ext', ops[2], ops[3], tuple(self.c(x, depth + 1) for x in ops[4:]))
+        elif op in (126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137,
+                    138, 139, 140, 141, 142, 169, 194, 195, 196, 197, 198, 199, 200):
+            val = ('op', op, tuple(self.c(x, depth + 1) for x in ops[2:]))
+        else:
+            val = ('id', op)
+        self.cache[cid] = val
+        return val
+
+
+def fp_multiset(m):
+    can = Canon(m)
+    bag = collections.Counter()
+    for op, ops, _, _ in m.instructions:
+        rid = ST.result_id_of(op, ops)
+        if rid is None:
+            continue
+        if op in FP_OPS:
+            bag[can.c(rid)] += 1
+        elif op == 12 and ops[3] in FP_EXT:
+            bag[can.c(rid)] += 1
+    return bag
+
+
+def nc_sites(m):
+    ids = ST.no_contraction_ids(m)
+    by = m.id_to_instruction()
+    func_of, cur = {}, None
+    for op, ops, _, _ in m.instructions:
+        if op == 54:
+            cur = ops[1]
+        rid = ST.result_id_of(op, ops)
+        if rid is not None:
+            func_of[rid] = cur
+    bag = collections.Counter()
+    for i in ids:
+        op, ops = by[i]
+        bag[(func_of.get(i), op, ST.Module.operand_signature(m, i))] += 1
+    return bag, len(ids)
+
+
+def barriers(m):
+    """[(index, exec_scope, mem_scope, semantics, mem_semantics)] with constants resolved."""
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+    out = []
+    for i, (op, ops, _, _) in enumerate(m.instructions):
+        if op != BARRIER:
+            continue
+        ex, me, sem = ops[0], ops[1], ops[2]
+        out.append(dict(index=i,
+                        execution_scope=SCOPE.get(const.get(ex, ex), const.get(ex, ex)),
+                        memory_scope=SCOPE.get(const.get(me, me), const.get(me, me)),
+                        semantics=const.get(sem, sem),
+                        raw=[const.get(ex, ex), const.get(me, me), const.get(sem, sem)]))
+    return out
+
+
+def movement_ops(m):
+    """[(kind, layout, stride, collmajor, addr-canon)] for op 4457/4458."""
+    can = Canon(m)
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+    out = []
+    for op, ops, _, _ in m.instructions:
+        if op not in (CM_LOAD, CM_STORE):
+            continue
+        layout = const.get(ops[3], ops[3])
+        stride = const.get(ops[4], ops[4])
+        coll = const.get(ops[5], ops[5]) if len(ops) > 5 else None
+        mem = ops[2] if op == CM_LOAD else ops[2]
+        out.append(dict(kind='load' if op == CM_LOAD else 'store', layout=layout,
+                        stride=stride, colmajor=coll,
+                        addr=str(can.c(mem))))
+    return out
+
+
+def struct_keys(m):
+    """id-free instruction key sequence (constants resolved, other ids dropped)."""
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+
+    def k(ops):
+        return ','.join('#%d' % const[x] if x in const else '_' for x in ops)
+    return ['%s(%s)' % (OPNAME.get(op, 'op%d' % op), k(ops))
+            for op, ops, _, _ in m.instructions]
+
+
+def main():
+    par = ST.Module(CARD / 'parent-rebuild.spv')
+    cand = ST.Module(CARD / 'candidate.spv')
+    res = {}
+    hp = collections.Counter(op for op, _, _, _ in par.instructions)
+    hc = collections.Counter(op for op, _, _, _ in cand.instructions)
+    res['words'] = {'parent': len(par.words), 'candidate': len(cand.words)}
+    res['instructions'] = {'parent': len(par.instructions),
+                           'candidate': len(cand.instructions)}
+    res['opcode_delta'] = {OPNAME.get(k, 'op%d' % k): [hp.get(k, 0), hc.get(k, 0)]
+                           for k in sorted(set(hp) | set(hc))
+                           if hp.get(k, 0) != hc.get(k, 0)}
+
+    # ---- 1. barriers ------------------------------------------------------
+    bp, bc = barriers(par), barriers(cand)
+    res['workgroup_barriers'] = {
+        'parent': len(bp), 'candidate': len(bc), 'delta': len(bc) - len(bp),
+        'parent_scope_signature': sorted({(b['execution_scope'], b['memory_scope'],
+                                           b['semantics']) for b in bp}),
+        'candidate_scope_signature': sorted({(b['execution_scope'], b['memory_scope'],
+                                              b['semantics']) for b in bc}),
+        'scope_relaxed': sorted({(b['execution_scope'], b['memory_scope'],
+                                  b['semantics']) for b in bc})
+                          != sorted({(b['execution_scope'], b['memory_scope'],
+                                      b['semantics']) for b in bp}),
+        'no_subgroup_barrier_introduced': all(b['execution_scope'] == 'Workgroup'
+                                              for b in bc),
+        'candidate_barriers': bc,
+    }
+
+    # ---- 2. storage ------------------------------------------------------
+    sp, sc = par.storage_bytes(), cand.storage_bytes()
+    res['storage_bytes'] = {'parent': sp, 'candidate': sc,
+                            'identical': sp == sc}
+    res['private_storage_variables'] = {
+        'parent': sum(1 for op, ops, _, _ in par.instructions
+                      if op == 59 and len(ops) > 2 and ops[2] == PRIVATE),
+        'candidate': sum(1 for op, ops, _, _ in cand.instructions
+                         if op == 59 and len(ops) > 2 and ops[2] == PRIVATE),
+        'note': 'no Private (spill) object declared in either module; only the ISA can show scratch',
+    }
+
+    # ---- 3. cooperative matrix movement ---------------------------------
+    mp, mc = movement_ops(par), movement_ops(cand)
+    res['coopmat_movement'] = {
+        'parent': {'loads': sum(1 for x in mp if x['kind'] == 'load'),
+                   'stores': sum(1 for x in mp if x['kind'] == 'store')},
+        'candidate': {'loads': sum(1 for x in mc if x['kind'] == 'load'),
+                      'stores': sum(1 for x in mc if x['kind'] == 'store')},
+        'stride_histogram': {
+            'parent': dict(collections.Counter(x['stride'] for x in mp)),
+            'candidate': dict(collections.Counter(x['stride'] for x in mc)),
+        },
+        'identical_transfer_count': (
+            sum(1 for x in mp if x['kind'] == 'load') ==
+            sum(1 for x in mc if x['kind'] == 'load') and
+            sum(1 for x in mp if x['kind'] == 'store') ==
+            sum(1 for x in mc if x['kind'] == 'store')),
+    }
+
+    # ---- 4. numerics -----------------------------------------------------
+    fp_p, fp_c = fp_multiset(par), fp_multiset(cand)
+    res['fp_multiset'] = {'parent_sites': sum(fp_p.values()),
+                          'candidate_sites': sum(fp_c.values()),
+                          'identical': fp_p == fp_c,
+                          'parent_only': [str(k) for k in (fp_p - fp_c)],
+                          'candidate_only': [str(k) for k in (fp_c - fp_p)]}
+    ncp, np_ = nc_sites(par)
+    ncc, nc_ = nc_sites(cand)
+    res['nc_sites'] = {'parent': np_, 'candidate': nc_,
+                       'identical_multiset': ncp == ncc}
+
+    # ---- 5. structural diff ---------------------------------------------
+    kp, kc = struct_keys(par), struct_keys(cand)
+    hunks = []
+    sm = difflib.SequenceMatcher(None, kp, kc, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            continue
+        hunks.append(dict(tag=tag, parent=[i1, i2], candidate=[j1, j2],
+                          parent_lines=kp[i1:i2], candidate_lines=kc[j1:j2]))
+    with (CARD / 'build/spv-diff.txt').open('w', encoding='utf-8') as f:
+        for h in hunks:
+            f.write('=== %s parent%s cand%s\n' % (h['tag'], h['parent'], h['candidate']))
+            for l in h['parent_lines']:
+                f.write('  - %s\n' % l)
+            for l in h['candidate_lines']:
+                f.write('  + %s\n' % l)
+    res['structural_diff'] = {
+        'hunks': len(hunks),
+        'summary': [{k: h[k] for k in ('tag', 'parent', 'candidate')} for h in hunks],
+    }
+    res['cfg_shape'] = {'parent': {OPNAME[k]: hp.get(k, 0) for k in (246, 247, 248, 249, 250)},
+                        'candidate': {OPNAME[k]: hc.get(k, 0) for k in (246, 247, 248, 249, 250)}}
+
+    (CARD / 'build/spv-check.json').write_text(json.dumps(res, indent=1), encoding='utf-8')
+    print(json.dumps({k: res[k] for k in ('workgroup_barriers', 'storage_bytes',
+                                          'private_storage_variables', 'coopmat_movement',
+                                          'fp_multiset', 'nc_sites', 'structural_diff',
+                                          'opcode_delta')}, indent=1)[:6000])
+
+
+if __name__ == '__main__':
+    main()

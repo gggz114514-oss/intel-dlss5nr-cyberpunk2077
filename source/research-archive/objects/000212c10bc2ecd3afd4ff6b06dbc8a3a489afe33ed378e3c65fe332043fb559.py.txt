@@ -1,0 +1,185 @@
+"""C00 B-class colour reading: fixed ROIs frozen from the FP16 reference, per-arm bias.
+
+Read-only on all inputs. Writes METRICS-34189.json next to this script.
+
+Plane semantics (verified by size): network-output.bin = float32[2,720,1280,4]
+  plane 0 -> RGB (+alpha-ish 4th), plane 1 -> history.  Only plane 0 ch0..2 are
+  scored as colour; channels are never averaged together with plane 1.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+B = Path("@NR_WORKSPACE@")
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+W = HERE.parent
+
+N_PIX = 720 * 1280
+SHAPE = (2, 720, 1280, 4)
+
+REF_CAPTURE = Q / "dataset/day-street-static-formal-01/0-34189/network-output.bin"
+REF_REPLAY = D / "dump-fp16/replayed-network.bin"
+
+ARMS = {
+    "fp16_capture": REF_CAPTURE,
+    "fp16_replay": REF_REPLAY,
+    "int8_xe_baseline": W / "S02-f01/runs/xe-34189/replayed-network.bin",
+    "replace_block0_out": HERE / "runs/block0_out/replayed-network.bin",
+    "replace_block66_out": HERE / "runs/block66_out/replayed-network.bin",
+}
+
+
+def load_plane0(path: Path) -> np.ndarray:
+    raw = np.fromfile(path, dtype="<f4")
+    if raw.size != 2 * N_PIX * 4:
+        raise SystemExit(f"{path}: unexpected float32 count {raw.size}")
+    a = raw.reshape(SHAPE)
+    return a[0][:, :, :3].astype(np.float64)  # (720,1280,3)
+
+
+def tile_stats(img: np.ndarray, gy: int = 8, gx: int = 8) -> np.ndarray:
+    h, w, _ = img.shape
+    th, tw = h // gy, w // gx
+    out = np.empty((gy, gx, 3))
+    for j in range(gy):
+        for i in range(gx):
+            out[j, i] = img[j * th:(j + 1) * th, i * tw:(i + 1) * tw].reshape(-1, 3).mean(axis=0)
+    return out
+
+
+def freeze_rois(ref: np.ndarray, gy: int = 8, gx: int = 8) -> dict:
+    """Deterministic ROI freeze from the FP16 reference only. Same mask for every arm.
+
+    Four *distinct* tiles are chosen: on a busy street frame an unconstrained
+    argmax collapses several rules onto the same tile, so each rule is applied
+    with the already-chosen tiles masked out.
+    """
+    h, w, _ = ref.shape
+    th, tw = h // gy, w // gx
+    t = tile_stats(ref, gy, gx)
+    lum = t @ np.array([0.2126, 0.7152, 0.0722])
+    chroma = t.max(axis=2) - t.min(axis=2)
+    blue = t[:, :, 2] - t[:, :, 0]
+
+    def pick(field: np.ndarray, mask: np.ndarray, taken: set):
+        f = np.where(mask & ~taken, field, -np.inf)
+        j, i = np.unravel_index(np.argmax(f), f.shape)
+        return int(j), int(i)
+
+    taken = np.zeros((gy, gx), dtype=bool)
+    picks = {}
+    top = np.zeros((gy, gx), dtype=bool)
+    top[: gy // 3] = True
+    picks["sky_bright"] = pick(lum, top, taken)
+    taken[picks["sky_bright"]] = True
+    picks["sign_chroma"] = pick(chroma, np.ones((gy, gx), dtype=bool), taken)
+    taken[picks["sign_chroma"]] = True
+    bottom = np.zeros((gy, gx), dtype=bool)
+    bottom[gy // 2:] = True
+    picks["blue_ground"] = pick(blue, bottom, taken)
+    taken[picks["blue_ground"]] = True
+    left = np.zeros((gy, gx), dtype=bool)
+    left[gy // 2:, : gx // 2] = True
+    picks["bright_left_mid"] = pick(lum, left, taken)
+
+    rois = {}
+    for name, (j, i) in picks.items():
+        rois[name] = {
+            "tile_ji": [j, i],
+            "rect_xywh": [i * tw, j * th, tw, th],
+            "ref_mean_rgb": [round(float(v), 6) for v in t[j, i]],
+        }
+    return {"grid": [gy, gx], "tile_wh": [tw, th], "rois": rois}
+
+
+def score(img: np.ndarray, ref: np.ndarray, rois: dict) -> dict:
+    d = img - ref
+    out = {
+        "bias_rgb_mean": [round(float(v), 6) for v in d.reshape(-1, 3).mean(axis=0)],
+        "mae": round(float(np.abs(d).mean()), 6),
+        "rmse": round(float(np.sqrt((d ** 2).mean())), 6),
+        "abs_p95": round(float(np.percentile(np.abs(d), 95)), 6),
+        "abs_p99": round(float(np.percentile(np.abs(d), 99)), 6),
+        "chroma_bias_r_minus_g": round(float((img[:, :, 0] - img[:, :, 1]).mean() - (ref[:, :, 0] - ref[:, :, 1]).mean()), 6),
+        "chroma_bias_b_minus_g": round(float((img[:, :, 2] - img[:, :, 1]).mean() - (ref[:, :, 2] - ref[:, :, 1]).mean()), 6),
+        "img_mean_rgb": [round(float(v), 6) for v in img.reshape(-1, 3).mean(axis=0)],
+        "out_of_unit_frac": round(float(((img < 0) | (img > 1)).mean()), 6),
+    }
+    per = {}
+    for name, meta in rois["rois"].items():
+        x, y, w, hgt = meta["rect_xywh"]
+        dd = img[y:y + hgt, x:x + w:hgt] if False else img[y:y + hgt, x:x + w]
+        rr = ref[y:y + hgt, x:x + w]
+        b = (dd - rr).reshape(-1, 3).mean(axis=0)
+        per[name] = {
+            "bias_rgb": [round(float(v), 6) for v in b],
+            "abs_bias_mean": round(float(np.abs(b).mean()), 6),
+            "mae": round(float(np.abs(dd - rr).mean()), 6),
+            "bias_r_minus_g": round(float(((dd[:, :, 0] - dd[:, :, 1]) - (rr[:, :, 0] - rr[:, :, 1])).mean()), 6),
+            "bias_b_minus_g": round(float(((dd[:, :, 2] - dd[:, :, 1]) - (rr[:, :, 2] - rr[:, :, 1])).mean()), 6),
+        }
+    out["roi"] = per
+    out["roi_abs_bias_overall"] = round(float(np.mean([v["abs_bias_mean"] for v in per.values()])), 6)
+    out["tiles_bias_rgb"] = np.round((img.reshape(-1, 3).mean(axis=0) * 0), 6).tolist()
+    return out
+
+
+def main() -> None:
+    paths = {k: p for k, p in ARMS.items() if p.is_file()}
+    missing = {k: str(p) for k, p in ARMS.items() if not p.is_file()}
+    ref = load_plane0(REF_CAPTURE)
+    rois = freeze_rois(ref)
+
+    result = {
+        "frame": 34189,
+        "reference": {"name": "fp16_capture", "path": str(REF_CAPTURE)},
+        "frozen_rois": rois,
+        "missing_arms": missing,
+        "arms": {},
+    }
+    tiles = {}
+    for name, p in paths.items():
+        img = load_plane0(p)
+        result["arms"][name] = {"path": str(p), **score(img, ref, rois)}
+        tiles[name] = tile_stats(img - ref).round(6).tolist()
+    result["tiles_bias"] = tiles
+
+    # fp16 replay vs capture: internal consistency of the reference pair
+    if "fp16_replay" in paths:
+        a = load_plane0(REF_REPLAY)
+        result["fp16_replay_vs_capture"] = {
+            "max_abs": round(float(np.abs(a - ref).max()), 8),
+            "mean_abs": round(float(np.abs(a - ref).mean()), 8),
+        }
+
+    (HERE / "METRICS-34189.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+    hdr = f"{'arm':24s} {'biasR':>9s} {'biasG':>9s} {'biasB':>9s} {'MAE':>8s} {'RMSE':>8s} {'p95':>8s} {'roi|b|':>8s}"
+    print(hdr)
+    for name in ["fp16_capture", "fp16_replay", "int8_xe_baseline", "replace_block0_out", "replace_block66_out"]:
+        r = result["arms"].get(name)
+        if not r:
+            print(f"{name:24s} MISSING")
+            continue
+        b = r["bias_rgb_mean"]
+        print(f"{name:24s} {b[0]:9.6f} {b[1]:9.6f} {b[2]:9.6f} {r['mae']:8.6f} {r['rmse']:8.6f} {r['abs_p95']:8.6f} {r['roi_abs_bias_overall']:8.6f}")
+    print("\nper-ROI abs bias (mean over 3 channels):")
+    names = list(rois["rois"])
+    print(f"{'arm':24s} " + " ".join(f"{n[:12]:>12s}" for n in names))
+    for name in ["int8_xe_baseline", "replace_block0_out", "replace_block66_out"]:
+        r = result["arms"].get(name)
+        if not r:
+            continue
+        print(f"{name:24s} " + " ".join(f"{r['roi'][n]['abs_bias_mean']:12.6f}" for n in names))
+    if "fp16_replay_vs_capture" in result:
+        print("\nfp16 replay vs capture:", result["fp16_replay_vs_capture"])
+
+
+if __name__ == "__main__":
+    main()

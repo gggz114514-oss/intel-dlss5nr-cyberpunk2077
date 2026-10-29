@@ -1,0 +1,270 @@
+"""R09 plan delta: G3 production plan -> one-pass INT8-WO swap (CPU only).
+
+Exactly one PASS changes (PASS 8 "f3c64_body_ds") and exactly two BUFFER lines
+are appended at the end of the buffer block (so no existing resource index
+moves).  Every other PASS/BIND/PUSH/OUTPUT/POLICY/HISTORY line, including the
+pass order, stays byte-identical.
+
+  header        buffers 739 -> 741
+  BUFFER +2     r09_c64_b8_wo_i8   4096 B   (int8 WO tile pack, I8B K32 layout)
+                r09_c64_b8_wosc    256 B    (64 f32 per-output-channel scales)
+  PASS 8        spv    -> spv/r09_f3c64_body_ds_wo_i8.spv
+                shared 9216 -> 14344   (+4096 sT8 +1024 shMax +8 shScale)
+                nbind  12 -> 14        (+BIND 12, +BIND 13)
+  everything else untouched.
+
+Runs and records: plan_lint.py (parent and candidate), the card's strict 5-field
+BIND check (TOOL-DEFECTS D1 says plan_lint's bound check is meaningless), and
+validate_pool_upload.py.
+
+usage: python tools/make_plan.py
+"""
+import hashlib
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+CARD = HERE.parent
+R = Path("@NR_WORKSPACE@")
+W = R / "work/dsh-xmx-handoff-validation-20261024"
+BUILD = W / "build/r09-r11-f3ds"
+PY = R / "run/python312/python.exe"
+G3 = R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt"
+G3_SHA = "d0bb75cf70f5def98fab66883f4d4e13099a2823655d34f15e11482cf4610cd4"
+PLAN_LINT = R / "work/dsh-int8-same-family-20261023/tools/plan_lint.py"
+POOL = R / "work/zcode-int8-full-20261020/validate_pool_upload.py"
+TOKEN = re.compile(r'"[^"]*"|\S+')
+TARGET = "f3c64_body_ds"
+NEW_SHARED = 14344
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def parse(text):
+    lines = text.splitlines()
+    h = lines[0].split()
+    nb, npass, nout = int(h[2]), int(h[3]), int(h[4])
+    bufs = []
+    for ln in lines[1:1 + nb]:
+        t = TOKEN.findall(ln)
+        bufs.append({"name": t[1].strip('"'), "bytes": int(t[2]),
+                     "path": t[3].strip('"'), "line": ln})
+    i, passes = 1 + nb, []
+    for _ in range(npass):
+        t = TOKEN.findall(lines[i])
+        nb_ = int(t[6])
+        ps = {"line": lines[i], "order": int(t[1]), "name": t[2].strip('"'),
+              "spv": t[3], "wg": int(t[4]), "shared": int(t[5]), "nbind": nb_,
+              "npush": int(t[7]), "grid": [int(t[8]), int(t[9]), int(t[10])],
+              "binds": lines[i + 1:i + 1 + nb_],
+              "push": lines[i + nb_ + 1]}
+        passes.append(ps)
+        i += nb_ + 2
+    tail = lines[i:]
+    return {"head": h, "nb": nb, "npass": npass, "nout": nout, "bufs": bufs,
+            "passes": passes, "tail": tail, "lines": lines}
+
+
+def main():
+    BUILD.mkdir(parents=True, exist_ok=True)
+    raw = G3.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == G3_SHA, "G3 plan identity changed"
+    old = parse(raw.decode("utf-8"))
+    pack8 = CARD / "packs/r09_c64_b8_wo.i8.bin"
+    psc = CARD / "packs/r09_c64_b8_wosc.f32.bin"
+    new_spv = (CARD / "spv/r09_f3c64_body_ds_wo_i8.spv").as_posix()
+    res8, ress = old["nb"], old["nb"] + 1
+    tgt = [p for p in old["passes"] if p["name"] == TARGET]
+    assert len(tgt) == 1
+    tgt = tgt[0]
+    assert tgt["order"] == 8 and tgt["wg"] == 32 and tgt["shared"] == 9216
+    assert tgt["nbind"] == 12 and tgt["npush"] == 32
+
+    out = []
+    out.append("PORT_NETWORK_1 %s %d %d %d" % (old["head"][1], old["nb"] + 2,
+                                               old["npass"], old["nout"]))
+    out += [b["line"] for b in old["bufs"]]
+    out.append('BUFFER "r09_c64_b8_wo_i8" %d "%s"' % (pack8.stat().st_size,
+                                                     pack8.as_posix()))
+    out.append('BUFFER "r09_c64_b8_wosc" %d "%s"' % (psc.stat().st_size,
+                                                    psc.as_posix()))
+    for p in old["passes"]:
+        if p["name"] != TARGET:
+            out.append(p["line"])
+            out += p["binds"]
+            out.append(p["push"])
+            continue
+        t = TOKEN.findall(p["line"])
+        out.append('PASS %d "%s" "%s" %d %d %d %d %d %d %d'
+                   % (p["order"], TARGET, new_spv, p["wg"], NEW_SHARED,
+                      p["nbind"] + 2, p["npush"], p["grid"][0], p["grid"][1],
+                      p["grid"][2]))
+        out += p["binds"]
+        out.append("BIND 12 %d 0 %d" % (res8, pack8.stat().st_size))
+        out.append("BIND 13 %d 0 %d" % (ress, psc.stat().st_size))
+        out.append(p["push"])
+    out += old["tail"]
+    plan = CARD / "plan-r09-f3ds.txt"
+    plan.write_text("\n".join(out) + "\n", encoding="utf-8")
+    new = parse(plan.read_text(encoding="utf-8"))
+
+    # ---- structural delta ------------------------------------------------
+    assert new["npass"] == old["npass"] and new["nout"] == old["nout"]
+    assert new["tail"] == old["tail"], "OUTPUT/POLICY/HISTORY tail changed"
+    assert [b["line"] for b in new["bufs"][:old["nb"]]] == [b["line"] for b in old["bufs"]]
+    changed_passes = []
+    for a, b in zip(old["passes"], new["passes"]):
+        if a["line"] == b["line"] and a["binds"] == b["binds"] and a["push"] == b["push"]:
+            continue
+        changed_passes.append({
+            "order": a["order"], "name": a["name"],
+            "fields": {k: [a[k], b[k]] for k in ("spv", "shared", "nbind", "npush", "grid")
+                       if a[k] != b[k]},
+            "binds_added": [x for x in b["binds"] if x not in a["binds"]],
+            "binds_removed": [x for x in a["binds"] if x not in b["binds"]],
+            "binds_kept_identical": [x for x in a["binds"] if x in b["binds"]],
+            "push_identical": a["push"] == b["push"],
+            "push": b["push"],
+        })
+    delta = {
+        "parent_plan": {"path": G3.as_posix(), "bytes": len(raw), "sha256": G3_SHA,
+                        "buffers": old["nb"], "passes": old["npass"],
+                        "outputs": old["nout"], "lines": len(old["lines"])},
+        "candidate_plan": {"path": plan.as_posix(), "bytes": plan.stat().st_size,
+                           "sha256": sha(plan), "buffers": new["nb"],
+                           "passes": new["npass"], "outputs": new["nout"],
+                           "lines": len(new["lines"])},
+        "header": {"before": old["lines"][0], "after": new["lines"][0],
+                   "delta": "buffer count %d -> %d" % (old["nb"], new["nb"])},
+        "buffers_appended": [
+            {"resource": res8, "line": new["bufs"][res8]["line"],
+             "file": pack8.as_posix(), "bytes": pack8.stat().st_size,
+             "sha256": sha(pack8), "role": "INT8 WO tiles, I8B K32 layout "
+                                           "(n/16)*1024+(k/32)*512+(n%16)*32+(k%32)"},
+            {"resource": ress, "line": new["bufs"][ress]["line"],
+             "file": psc.as_posix(), "bytes": psc.stat().st_size,
+             "sha256": sha(psc),
+             "role": "64 f32 per-output-channel WO scales (amax_k|W[n][k]|/127)"}],
+        "buffers_unchanged": old["nb"],
+        "passes_changed": changed_passes,
+        "passes_unchanged": old["npass"] - len(changed_passes),
+        "tail_identical": new["tail"] == old["tail"],
+        "tail_lines": len(new["tail"]),
+    }
+
+    # ---- plan_lint -------------------------------------------------------
+    lint = subprocess.run([str(PY), str(PLAN_LINT), str(plan)],
+                          capture_output=True, text=True)
+    lint_parent = subprocess.run([str(PY), str(PLAN_LINT), str(G3)],
+                                 capture_output=True, text=True)
+    (BUILD / "plan-lint-candidate.json").write_text(lint.stdout, encoding="utf-8")
+    (BUILD / "plan-lint-parent.json").write_text(lint_parent.stdout, encoding="utf-8")
+    lj, pj = json.loads(lint.stdout), json.loads(lint_parent.stdout)
+    strict = strict_bind_check(plan)
+    pool = subprocess.run([str(PY), str(POOL), "--plan", str(plan)],
+                          capture_output=True, text=True)
+    (BUILD / "pool-upload-candidate.txt").write_text(pool.stdout + pool.stderr,
+                                                     encoding="utf-8")
+    ok = (lj["ok"] and strict["ok"] and pool.returncode == 0
+          and len(changed_passes) == 1 and changed_passes[0]["name"] == TARGET
+          and changed_passes[0]["push_identical"] and delta["tail_identical"]
+          and len(changed_passes[0]["binds_removed"]) == 0)
+    rec = {"delta": delta,
+           "plan_lint": {"parent_problems": len(pj["problems"]),
+                         "parent_notes": pj["notes"],
+                         "candidate_problems": len(lj["problems"]),
+                         "candidate_notes": lj["notes"], "ok": lj["ok"],
+                         "problems": lj["problems"],
+                         "tool_defect_D1_restated": "plan_lint's BIND parser reads "
+                         "(binding,resource,offset) where the format is "
+                         "(binding,resource,offset,bytes), so its `off+len>declared` "
+                         "notes are an artefact and are not a BIND bounds proof"},
+           "strict_bind": strict,
+           "pool_upload": {"rc": pool.returncode,
+                           "tail": (pool.stdout + pool.stderr).strip().splitlines()[-6:]},
+           "verdict": "PLAN_IDENTITY_OK" if ok else "CHECK"}
+    (CARD / "evidence/PLAN-DELTA.json").write_text(
+        json.dumps(rec, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(json.dumps({"candidate_plan": delta["candidate_plan"],
+                      "passes_changed": [{"order": c["order"], "name": c["name"],
+                                          "fields": c["fields"],
+                                          "binds_added": c["binds_added"],
+                                          "binds_kept": len(c["binds_kept_identical"]),
+                                          "push_identical": c["push_identical"]}
+                                         for c in changed_passes],
+                      "passes_unchanged": delta["passes_unchanged"],
+                      "tail_identical": delta["tail_identical"],
+                      "lint": {"ok": lj["ok"], "problems": lj["problems"],
+                               "parent_problems": len(pj["problems"]),
+                               "candidate_notes": lj["notes"],
+                               "parent_notes": pj["notes"]},
+                      "strict_bind": {k: strict[k] for k in
+                                      ("ok", "binds_parsed", "problems", "files_checked",
+                                       "file_size_mismatch")},
+                      "pool_upload_rc": pool.returncode,
+                      "verdict": rec["verdict"]}, indent=1))
+    return 0 if ok else 1
+
+
+def strict_bind_check(plan):
+    """5-field BIND parse: BIND <binding> <resource> <offset> <bytes>."""
+    lines = Path(plan).read_text(encoding="utf-8").splitlines()
+    h = lines[0].split()
+    nb = int(h[2])
+    sz, paths = [], []
+    for ln in lines[1:1 + nb]:
+        t = TOKEN.findall(ln)
+        assert t[0] == "BUFFER"
+        sz.append(int(t[2]))
+        paths.append(t[3].strip('"'))
+    files = {}
+    for fn in paths:
+        if fn != "-":
+            p = Path(fn)
+            files[fn] = p.stat().st_size if p.exists() else None
+    problems, checked, dup = [], 0, []
+    seen = {}
+    pi, i = 0, 1 + nb
+    npass = int(h[3])
+    for pi in range(npass):
+        t = lines[i].split()
+        assert t[0] == "PASS", (i, t)
+        nbind = int(t[6])
+        local = {}
+        for j in range(1, nbind + 1):
+            ln = lines[i + j]
+            tt = ln.split()
+            assert tt[0] == "BIND", (i + j, tt)
+            assert len(tt) == 5, (i + j, tt)
+            b, r, o, n = int(tt[1]), int(tt[2]), int(tt[3]), int(tt[4])
+            checked += 1
+            if b in local:
+                dup.append({"pass": pi, "name": t[2].strip('"'), "binding": b,
+                            "lines": (local[b] + 1, i + j + 1)})
+            local[b] = i + j
+            if not (0 <= r < nb):
+                problems.append("line %d: resource %d out of range" % (i + j + 1, r))
+                continue
+            if o < 0 or n < 0 or o + n > sz[r]:
+                problems.append("line %d: offset %d + bytes %d > declared %d (res %d)"
+                                % (i + j + 1, o, n, sz[r], r))
+            if not (0 <= b <= 63):
+                problems.append("line %d: binding %d out of range" % (i + j + 1, b))
+        i += nbind + 2
+    bad_files = {i: {"path": fn, "declared": sz[i], "actual": files.get(fn)}
+                 for i, fn in enumerate(paths) if fn != "-" and files.get(fn) != sz[i]}
+    return {"ok": not problems and not bad_files and not dup, "binds_parsed": checked,
+            "problems": problems[:20], "duplicate_binding_resource": dup[:20],
+            "files_checked": len(files), "file_size_mismatch": bad_files,
+            "note": "parsed as the 5 fields the format actually has; this is the check "
+                    "TOOL-DEFECTS D1 says plan_lint does not perform"}
+
+
+if __name__ == "__main__":
+    sys.exit(main())

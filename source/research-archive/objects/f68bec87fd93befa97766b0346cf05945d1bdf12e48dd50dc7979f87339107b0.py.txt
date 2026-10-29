@@ -1,0 +1,502 @@
+"""R01 F1 - build evidence/F1-FIRST-DIFF.json and evidence/F1-MMA-SITES.json.
+
+CPU only.  Every number here is either read from the frozen capture/pack files,
+recomputed from them with the frozen oracle, or read statically from the SPV
+modules.  No GPU, no pipeline, no plan execution.
+"""
+import hashlib
+import json
+import struct
+import sys
+from pathlib import Path
+
+ROOT = Path("@NR_WORKSPACE@")
+CARD = ROOT / "work/dsh-xmx-handoff-validation-20261024/candidates/r01-f1"
+DUMP = ROOT / "run/int8-coverage-v2-20261020/C/c32-i8-diag-f1-scalex2-001/diag_f1_debug.bin"
+WEIGHTS = ROOT / "candidates/int8-coverage-v2-20261020/C/pack/c32_f1_weights.i8.bin"
+SCALES = ROOT / "candidates/int8-coverage-v2-20261020/C/c32-scale-from-x-v2/pack/c32_f1_scales.f32.bin"
+FP16PACK = ROOT / "candidates/amd-map-20261015/s1-integrated/candidate/packs/ioport_0_ioport_pack.fp16.bin"
+PLAN = ROOT / "candidates/int8-coverage-v2-20261020/C/c32-scale-from-x-v2/plans/plan-c32-i8-diag-f1-scalex2.txt"
+ARGV = ROOT / "work/int8-coverage-v2-20261020/C/argv-c32-i8-diag-f1-scalex2-001.json"
+GATE = ROOT / "work/int8-coverage-v2-20261020/C/evidence/GATE-f1-scalex2.json"
+ORACLE = ROOT / "work/int8-coverage-v2-20261020/C/tools/ref_c32.py"
+SRC = ROOT / "candidates/int8-coverage-v2-20261020/C/c32-i8-debug-eact-v1/source/c32_f1_i8.comp"
+COMMON = ROOT / "candidates/int8-coverage-v2-20261020/C/c32-i8-debug-eact-v1/source/c32_i8_common.glsl"
+HANDOFF = ROOT / "candidates/int8-coverage-v2-20261020/C/c32-i8-debug-eact-v1/source/register_handoff.glsl"
+CAND_SPV = ROOT / "candidates/int8-coverage-v2-20261020/C/c32-i8-debug-eact-v1/spv/c32_f1_i8.spv"
+PARENT_SPV = ROOT / "candidates/dhs-netorg-long-20261018/T3/c32a-f1-transport-v1/c32a_f1_transport.spv"
+AUDIT_SITES = ROOT / "work/codex-astra-fp16-int8-audit-20261024/FULLNET-RESIDUAL-MMA-SITES.json"
+
+sys.path.insert(0, str(ROOT / "work/int8-coverage-v2-20261020/C/tools"))
+from ref_c32 import Ref, half_array, f32, h16, code  # noqa: E402
+
+
+def sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def ident(p):
+    p = Path(p)
+    return {"path": p.as_posix(), "bytes": p.stat().st_size, "sha256": sha(p)}
+
+
+def bits(v):
+    return "0x%04x" % struct.unpack("<H", struct.pack("<e", v))[0]
+
+
+dbg = half_array(DUMP)
+ref = Ref(WEIGHTS, SCALES, FP16PACK, 17280, 8)
+W = [[ref.w[(f // 8) * 1024 + k * 32 + (f % 8)] for k in range(32)] for f in range(128)]
+Wc = [[ref.w[16384 + ((o // 8) * 4 + e // 32) * 1024 + (e % 32) * 32 + (o % 8)] for e in range(128)]
+      for o in range(32)]
+
+
+def act_h(x):
+    t = max(-4.0, min(4.0, x))
+    u = h16((-0.055908203125) * abs(t) + 0.447265625)
+    v = h16(t * u + 0.89453125)
+    return h16(x * v)
+
+
+def stage(qx, x):
+    acc = [sum(W[f][k] * qx[k] for k in range(32)) for f in range(128)]
+    e = [act_h(h16(f32(a * ref.mult_e[f]))) for f, a in enumerate(acc)]
+    qe = [code(e[f], ref.inve) for f in range(128)]
+    y = []
+    for o in range(32):
+        a = sum(Wc[o][k] * qe[k] for k in range(128))
+        y.append(h16(f32(f32(a * ref.mult_c[o]) + float(h16(x[o] * ref.rs[o])))))
+    return e, y
+
+
+# --------------------------------------------------------------------------
+# 1. replay the recorded gate exactly, then localise
+# --------------------------------------------------------------------------
+e_bad = y_bad = 0
+first_e = first_y = None
+max_e = max_y = 0.0
+sat = {"x": 0, "e": 0}
+per_token = []
+diff_positions = []
+for t in range(64):
+    x = [dbg[22528 + t * 32 + c] for c in range(32)]
+    qx = [code(x[c], ref.invx) for c in range(32)]
+    e, y = stage(qx, x)
+    nb = ny = 0
+    for f in range(128):
+        g = dbg[t * 128 + f]
+        d = abs(float(g) - float(e[f]))
+        max_e = max(max_e, d)
+        if g != e[f]:
+            e_bad += 1
+            nb += 1
+            if first_e is None:
+                first_e = {"token": t, "feature": f, "dbg_index": t * 128 + f,
+                           "gpu_half": g, "gpu_bits": bits(g),
+                           "ref_half": e[f], "ref_bits": bits(e[f]),
+                           "abs_diff": d}
+    for o in range(32):
+        g = dbg[8192 + t * 32 + o]
+        d = abs(float(g) - float(y[o]))
+        max_y = max(max_y, d)
+        if g != y[o]:
+            y_bad += 1
+            ny += 1
+            if first_y is None:
+                first_y = {"token": t, "channel": o, "dbg_index": 8192 + t * 32 + o,
+                           "gpu_half": g, "gpu_bits": bits(g),
+                           "ref_half": y[o], "ref_bits": bits(y[o]),
+                           "abs_diff": d}
+    sat["x"] += sum(1 for q in qx if abs(q) == 127)
+    sat["e"] += sum(1 for q in [code(e[f], ref.inve) for f in range(128)] if abs(q) == 127)
+    per_token.append({"token": t, "sg": t // 16, "col_in_sg": t % 16,
+                      "e_neq": nb, "y_neq": ny})
+
+# exact single-code search on the offending tokens
+offending = [r["token"] for r in per_token if r["e_neq"]]
+fix = {}
+for t in offending:
+    x = [dbg[22528 + t * 32 + c] for c in range(32)]
+    qx = [code(x[c], ref.invx) for c in range(32)]
+    ej = [dbg[t * 128 + f] for f in range(128)]
+    yj = [dbg[8192 + t * 32 + o] for o in range(32)]
+    hits = []
+    for k in range(32):
+        for d in (-1, 1):
+            q = list(qx)
+            q[k] += d
+            if not (-127 <= q[k] <= 127):
+                continue
+            e, y = stage(q, x)
+            if e == ej and y == yj:
+                hits.append({"channel": k, "delta": d})
+    assert len(hits) == 1, (t, hits)
+    k, d = hits[0]["channel"], hits[0]["delta"]
+    fix[t] = (k, d)
+    prod = f32(float(x[k]) * ref.invx)
+    up = h16(float(x[k]) + (abs(x[k]) * 2 ** -10 if x[k] >= 0 else -abs(x[k]) * 2 ** -10))
+    diff_positions.append({
+        "token": t, "sg": t // 16, "col_in_sg": t % 16,
+        "patch_x": (t % 16) % 4 + 4 * ((t // 16) & 1),
+        "patch_y": ((t % 16) // 4) + 4 * ((t // 16) >> 1),
+        "channel": k,
+        "x_dbg_half": x[k], "x_dbg_bits": bits(x[k]),
+        "x_dbg_index": 22528 + t * 32 + k,
+        "code_from_dbg_x": qx[k], "code_consumed": qx[k] + d, "code_delta": d,
+        "x_times_invX_f32": prod,
+        "abs_distance_to_round_boundary": abs(abs(prod) % 1.0 - 0.5),
+        "half_ulp_of_x": abs(next_h := (h16(float(x[k]) * (1 + 2 ** -11)) - x[k])),
+        "boundary_inside_half_ulp_interval": abs(abs(prod) % 1.0 - 0.5) / ref.invx <= abs(next_h) / 2,
+    })
+
+# closure: apply the recovered codes and re-run the whole gate
+e_bad2 = y_bad2 = 0
+for t in range(64):
+    x = [dbg[22528 + t * 32 + c] for c in range(32)]
+    qx = [code(x[c], ref.invx) for c in range(32)]
+    if t in fix:
+        k, d = fix[t]
+        qx[k] += d
+    e, y = stage(qx, x)
+    e_bad2 += sum(1 for f in range(128) if e[f] != dbg[t * 128 + f])
+    y_bad2 += sum(1 for o in range(32) if y[o] != dbg[8192 + t * 32 + o])
+
+recorded = json.loads(GATE.read_text(encoding="utf-8"))
+
+first_diff = {
+    "schema": "r01-f1/first-diff/1",
+    "card": "R01 F1 f1c32_image_pre",
+    "generated_utc": "2026-10-24T10:20:00Z",
+    "qualification": ["CPU_STRUCT", "SPV_IDENTITY"],
+    "not_qualified": ["NATIVE", "GATE", "ORDINARY", "QUALITY"],
+    "scope": "first-difference localisation on the frozen GATE-f1-scalex2 capture; no kernel change, no threshold change, no GPU run",
+
+    "arms": {
+        "A_gpu_kernel": {
+            "role": "executed arm: fused F1 INT8 candidate, debug buffer dumped",
+            "plan": ident(PLAN),
+            "argv": ident(ARGV),
+            "pass_index": 0,
+            "pass_name": "f1c32_image_pre",
+            "pass_header_verbatim": "PASS 0 \"f1c32_image_pre\" <spv> 32 20480 10 32 168 96 1",
+            "spv": ident(CAND_SPV),
+            "source": ident(SRC),
+            "shared_headers": [ident(COMMON), ident(HANDOFF)],
+            "binds": [
+                {"binding": 0, "resource": 450, "offset": 0, "bytes": 34656, "name": "wb (half pack, ioport_0_ioport_pack.fp16.bin)", "sha256": sha(FP16PACK)},
+                {"binding": 1, "resource": 454, "offset": 0, "bytes": 16400, "name": "fb (c32_aux)"},
+                {"binding": 2, "resource": 452, "offset": 0, "bytes": 52936784, "name": "image floats"},
+                {"binding": 3, "resource": 453, "offset": 0, "bytes": 66060288, "name": "imgout"},
+                {"binding": 4, "resource": 455, "offset": 0, "bytes": 50176, "name": "dbg (swin_1_debug)", "dump": ident(DUMP)},
+                {"binding": 5, "resource": 2, "offset": 0, "bytes": 16515072, "name": "pooled (block0_out)"},
+                {"binding": 6, "resource": 451, "offset": 0, "bytes": 4, "name": "pc buffer a"},
+                {"binding": 7, "resource": 451, "offset": 0, "bytes": 4, "name": "pc buffer b"},
+                {"binding": 8, "resource": 604, "offset": 0, "bytes": 32768, "name": "c32_f1_i8_weights", "sha256": sha(WEIGHTS)},
+                {"binding": 9, "resource": 605, "offset": 0, "bytes": 656, "name": "c32_f1_i8_scales", "sha256": sha(SCALES)},
+            ],
+            "run_dir_outputs": [
+                ident(DUMP),
+                ident(DUMP.parent / "frame_out.bin"),
+                ident(DUMP.parent / "port_network_receipt.json"),
+                ident(DUMP.parent / "pilot-capabilities.json"),
+            ],
+            "pinned_window_metadata": {
+                "words": "dbg[24576..24580] = (wx, wy, pc.p3.y, pc.p0.w, pc.p3.x)",
+                "values": [float(v) for v in dbg[24576:24581]],
+                "reading": "pc.p3.y == 1 => every workgroup evaluates the pinned window wx=pc.p0.w=0, wy=pc.p3.x=0; the dump is one 8x8 patch, not a mix of windows",
+            },
+        },
+        "B_cpu_oracle": {
+            "role": "reference arm: recomputes INT8 expand+contract from the SAME dump's X region",
+            "oracle": ident(ORACLE),
+            "gate_command": ("python run/python312/python.exe work/int8-coverage-v2-20261020/C/tools/ref_c32.py "
+                             "--gate --dump <run>/diag_f1_debug.bin --weights <i8.bin> --scales <scales.f32.bin> "
+                             "--fp16 candidates/amd-map-20261015/s1-integrated/candidate/packs/ioport_0_ioport_pack.fp16.bin "
+                             "--rs-base 17280 --out work/int8-coverage-v2-20261020/C/evidence/GATE-f1-scalex2.json"),
+            "recorded_evidence": ident(GATE),
+            "inputs_used": {"weights": ident(WEIGHTS), "scales": ident(SCALES), "fp16_rs_pack": ident(FP16PACK),
+                            "rs_base": 17280, "rs_offset": 8, "rs_distinct_values": len(set(ref.rs))},
+            "has_own_dump": False,
+            "note": "the historical F1 stage gate is single-dump: arm B is derived, it owns no dump file. There is no second GPU dump for F1 (no parent-vs-candidate F1 dump pair exists in run/).",
+        },
+    },
+
+    "replay_of_recorded_gate": {
+        "e_neq": e_bad, "e_n": 8192, "e_max_abs": max_e, "e_first_error": first_e,
+        "y_neq": y_bad, "y_n": 2048, "y_max_abs": max_y, "y_first_error": first_y,
+        "saturation_codes": sat,
+        "saturation_frac_x": sat["x"] / 2048.0, "saturation_frac_e": sat["e"] / 8192.0,
+        "matches_recorded_json": {
+            "e_neq": e_bad == recorded["e_neq"],
+            "y_neq": y_bad == recorded["y_neq"],
+            "e_max_abs": max_e == recorded["e_max_abs"],
+            "y_max_abs": max_y == recorded["y_max_abs"],
+            "e_first_error": first_e["token"] == recorded["e_first_error"]["token"] and
+                             first_e["feature"] == recorded["e_first_error"]["feature"] and
+                             first_e["gpu_half"] == recorded["e_first_error"]["gpu"] and
+                             first_e["ref_half"] == recorded["e_first_error"]["ref"],
+            "y_first_error": first_y["token"] == recorded["y_first_error"]["token"] and
+                             first_y["channel"] == recorded["y_first_error"]["channel"] and
+                             first_y["gpu_half"] == recorded["y_first_error"]["gpu"] and
+                             first_y["ref_half"] == recorded["y_first_error"]["ref"],
+            "saturation": sat == recorded["saturation_codes"],
+            "dump_sha256": sha(DUMP) == recorded["dump_sha256"],
+            "weights_sha256": sha(WEIGHTS) == recorded["weights_sha256"],
+            "scales_sha256": sha(SCALES) == recorded["scales_sha256"],
+        },
+    },
+
+    "x_identity_reconciliation": {
+        "question": "is the X that the gate compares the same X the F1 second half consumes?",
+        "answer": "same block, same element coordinates, same effective domain, same producer register; NOT the same bits at 5 of 2048 positions (one int8 code differs by +-1, all five at a rounding boundary)",
+        "producer": {
+            "call": "nrf_lift(sg, g) -> nrh_narrow(NRH_C acc), g = 0..3",
+            "source_lines": "c32_f1_i8.comp:203-210 (call+debug store), 218-221 (nr_i8_put_x)",
+            "lift_mma": "1 static OpCooperativeMatrixMulAddKHR, function nrf_lift (candidate word_offset 44790, result_id 7442-class id; parent word_offset 45131 result_id 7567)",
+            "input": "nrf_feat[token*16 + feature], 64 tokens x 16 features, f16 shared, K = 16",
+        },
+        "debug_copy": {
+            "buffer": "binding 4 = resource 455, 50176 B = 25088 halfs",
+            "region": "halfs 22528..24576 (4096 B), 4 subgroups x 512",
+            "element_address": "22528 + sg*512 + token_in_sg*32 + channel",
+            "store_sites": ["22528+t0*32+0 (ch 0..7)", "22528+t0*32+8 (ch 8..15)",
+                            "22528+t0*32+16 (ch 16..23)", "22528+t0*32+24 (ch 24..31)"],
+            "layout": "coopMatStore LCOL, 8 rows (channels) x 16 columns (tokens), stride 32",
+            "coverage": "lane lv, component i -> (row = 2i ^ (lv>>4), col = lv & 15): bijective over 32 lanes x 4 components = 8x16, so all 512 elements per subgroup are written once",
+        },
+        "consumed_copy_int8": {
+            "buffer": "shared int8_t sX8[2048]",
+            "element_address": "sX8[sg*512 + token_in_sg*32 + channel]  (nr_i8_put_x: rc.y*32 + cbase + rc.x)",
+            "reader": "coopMatLoad(xb8, sX8, sg*512, 32, LCOL) -> I8B 32(K=channel) x 16(N=token), expand stage",
+            "code_point": "nr_i8_code(x[i], fsc[1]) = clamp(roundEven(float(x)*invX), -127, 127), invX = fsc[1] = 70.44853973388672",
+        },
+        "consumed_copy_fp16_seed": {
+            "expression": "seed = x_g * scale, scale = coopMatLoad(wb, pc.p2.x + 8, stride 0, LCOL) => one broadcast half wb[17288]",
+            "then": "nrh_widen_exact(seed) is added inside nr_i8_deq_add as the FP32 contract seed",
+            "oracle_model": "ref_c32 models per-channel rs[c] = pack[17280+8+c]; 30 distinct values in 32 entries",
+            "note": "the closure test below shows the per-channel rs model reproduces all 2048 Y values exactly, so the broadcast form is numerically equivalent on this capture (the 32 entries agree at the used precision) - it is not a free parameter of the failure",
+        },
+        "reconciliation_table": [
+            {"property": "buffer/region", "debug_copy": "dbg 22528..24576", "consumed_int8": "sX8 0..2048", "same_block": True},
+            {"property": "index formula", "debug_copy": "sg*512 + tok*32 + ch", "consumed_int8": "sg*512 + tok*32 + ch", "same_block": True},
+            {"property": "dtype", "debug_copy": "float16", "consumed_int8": "int8 code", "same_block": None},
+            {"property": "effective domain", "debug_copy": "4 sg x 16 tok x 32 ch = 2048", "consumed_int8": "4 sg x 16 tok x 32 ch = 2048", "same_block": True},
+            {"property": "value", "debug_copy": "half of the narrowed lift output", "consumed_int8": "code of the same expression", "same_block": False,
+             "detail": "5 of 2048 codes differ by +-1; the quantiser input is 1 half ULP away from the dumped half at exactly those 5 positions"},
+        ],
+        "pass_read_points": [
+            {"what": "INT8 expand", "reads": "sX8", "count": "16 static MMA (8 feature groups x 2) = 16 dynamic"},
+            {"what": "FP16 seed", "reads": "x_g registers", "count": "4 widen+multiply fragments, 0 MMA"},
+        ],
+    },
+
+    "first_difference": {
+        "in_compared_order": {
+            "what": "E (first array the gate compares)",
+            "token": first_e["token"], "feature": first_e["feature"],
+            "dbg_half_index": first_e["dbg_index"],
+            "gpu_half": first_e["gpu_half"], "gpu_bits": first_e["gpu_bits"],
+            "ref_half": first_e["ref_half"], "ref_bits": first_e["ref_bits"],
+            "abs_diff": first_e["abs_diff"],
+            "y_counterpart": {"token": first_y["token"], "channel": first_y["channel"],
+                              "dbg_half_index": first_y["dbg_index"],
+                              "gpu_half": first_y["gpu_half"], "gpu_bits": first_y["gpu_bits"],
+                              "ref_half": first_y["ref_half"], "ref_bits": first_y["ref_bits"],
+                              "abs_diff": first_y["abs_diff"]},
+        },
+        "root_positions": diff_positions,
+        "root_count": len(diff_positions),
+        "all_root_positions_are_rounding_boundaries": all(p["boundary_inside_half_ulp_interval"] for p in diff_positions),
+        "affected_tokens": offending,
+        "tokens_clean": 64 - len(offending),
+    },
+
+    "closure": {
+        "method": "apply only the recovered +-1 code at the 5 root positions, recompute E and Y with the frozen oracle, compare with the same dump",
+        "e_neq_after": e_bad2, "y_neq_after": y_bad2,
+        "verdict": "EXACT_CLOSURE" if e_bad2 == 0 and y_bad2 == 0 else "INCOMPLETE",
+        "meaning": "the INT8 expand/contract math, the scale application (invX, mult_e[128], mult_c[32]), the activation, the FP32 seed and the single narrow are all bit-exact; the whole 630/8192 + 151/2048 gap is those five quantiser boundary events",
+    },
+
+    "priority": {
+        "verdict": "NARROWING_POINT",
+        "ranked": [
+            {"candidate": "lift segment", "status": "EXCLUDED_AS_CAUSE", "why": "the same register value feeds the debug store and the quantiser; no second lift evaluation exists, and the closure proves the dumped X reproduces E/Y bit-exactly once the five codes are corrected. The gate cannot see lift errors by construction (it takes X from the dump)."},
+            {"candidate": "narrowing point (fp32 -> f16 of the lift accumulator) vs the int8 code point", "status": "CAUSE", "why": "5/5 root positions have the round boundary inside the half-ULP interval of the dumped value; flip directions are mixed (4 down, 1 up), which rules out a rounding-mode bias and matches 'the quantiser saw the unrounded value'"},
+            {"candidate": "scale application point", "status": "EXCLUDED_AS_CAUSE", "why": "59/64 tokens reproduce bit-exactly with the frozen scales; the 5 corrected tokens then reproduce bit-exactly too, so invX / mult_e / mult_c are right"},
+            {"candidate": "dump selected the wrong block", "status": "EXCLUDED_AS_CAUSE", "why": "region, offset, stride, element formula and effective domain all reconcile 1:1 with the consumed copy; saturation counts (x=1, e=1) also replay exactly"},
+        ],
+        "statistical_note": "P(a .5 rounding boundary falls inside the half-ULP interval of the stored value) = ULP*invX, which for the five measured magnitudes (half ULP 2.44e-4, 3.05e-5, 4.88e-4, 2.44e-4, 2.44e-4 and invX = 70.44853973388672) is 1.72e-2, 2.15e-3, 3.44e-2, 1.72e-2, 1.72e-2; the joint probability of all five happening by chance is 3.8e-10",
+    },
+
+    "historical_claims_check": {
+        "claim": "C32-BATCH-REPORT.md:91-93 'boundary tokens and the fused lift/feature path are not the same input as debug X'",
+        "status": "PARTIALLY_CONFIRMED_RESTATED",
+        "detail": "the values are indeed not bit-identical, but the cause is not the patch/token boundary of the feature path: the five tokens are spread over 3 of the 4 subgroups and 5 different in-patch columns, and each differs by exactly one int8 code at a rounding boundary. 'Boundary' means the quantiser round boundary, not an image/patch boundary.",
+        "claim_scale": "GUIDE line 9 'existing scale is single-window diagnostic only'",
+        "scale_status": "UNCHANGED: sX/sE in c32-scale-from-x-v2 are SINGLE_WINDOW_DIAGNOSTIC_NOT_CALIBRATION (see C32-I8-SCALE-CALIBRATION.json); this card does not promote them and does not change them",
+    },
+
+    "missing_evidence": [
+        {"what": "a second GPU dump for the FP16 parent c32a_f1_transport.spv on the same pinned window",
+         "why": "would let the INT8 arm be compared against the FP16 parent element-by-element instead of only against the CPU oracle",
+         "who": "coordinator: needs a GPU window (ticket in run/r01-f1/jobs.json, arm 'parent-dump')"},
+        {"what": "the quantiser input itself (the int8 code) in the dump",
+         "why": "the current dump records the pre-quantiser half, so the gate can only be closed by a tolerance (forbidden) or by dumping the code",
+         "who": "DSH: minimal source change described in REPORT.md section 6"},
+        {"what": "a formal sX/sE calibration from a real F1 input capture",
+         "why": "the present scales are single-window diagnostics; coverage-grade acceptance needs the real distribution",
+         "who": "coordinator / main auditor to schedule the capture"},
+    ],
+}
+
+(CARD / "evidence").mkdir(parents=True, exist_ok=True)
+(CARD / "evidence/F1-FIRST-DIFF.json").write_text(json.dumps(first_diff, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+
+# --------------------------------------------------------------------------
+# 2. MMA sites
+# --------------------------------------------------------------------------
+sys.path.insert(0, str(CARD / "tools"))
+from spv_mma import scan  # noqa: E402
+
+par = scan(PARENT_SPV)
+cand = scan(CAND_SPV)
+audit = json.loads(AUDIT_SITES.read_text(encoding="utf-8"))
+audit_f1 = next(e for e in audit if "c32a_f1_transport" in e["path"])
+calib = ([f"{s['word_offset']}:{s['result_id']}:{s['function_id']}" for s in audit_f1["fp16_mma_sites"]] ==
+         [f"{s['word_offset']}:{s['result_id']}:{s['function_id']}" for s in par["fp16_mma_sites"]])
+
+
+def segment_cand(off, rank):
+    if off >= 40000:
+        return "nrf_lift (K=16 fp16 MMA)"
+    if off < 24407:
+        return "QKV projection (3 x 8)"
+    if off < 30456:
+        return "score S^T = K.Q^T (8 blocks x 2)"
+    if off < 34030:
+        return "PV context (4 P blocks x 4)"
+    return "output projection (4 fragments x 2)"
+
+
+def segment_parent(off, rank):
+    """Parent: expand and contract interleave per feature group (4 expand then
+    4 contract, 8 groups; source kernel.comp:243-713).  In word order the
+    instruction gap alternates 450 / 81, which identifies the blocks."""
+    if off >= 40000:
+        return "nrf_lift (K=16 fp16 MMA)"
+    if off <= 22543:
+        return "expand (8 groups x 4)" if (rank // 4) % 2 == 0 else "contract (8 groups x 4)"
+    if off < 24890:
+        return "QKV projection (3 x 8)"
+    if off < 30939:
+        return "score S^T = K.Q^T (8 blocks x 2)"
+    if off < 34513:
+        return "PV context (4 P blocks x 4)"
+    return "output projection (4 fragments x 2)"
+
+
+def group(offs, seg):
+    out = []
+    for rank, s in enumerate(offs):
+        name = seg(s["word_offset"], rank)
+        if out and out[-1]["segment"] == name:
+            out[-1]["sites"].append(s["word_offset"])
+        else:
+            out.append({"segment": name, "sites": [s["word_offset"]]})
+    return out
+
+
+sites = {
+    "schema": "r01-f1/mma-sites/1",
+    "card": "R01 F1 f1c32_image_pre",
+    "qualification": ["SPV_IDENTITY", "CPU_STRUCT"],
+    "method": "work/dsh-xmx-handoff-validation-20261024/build/r08-c128-ffn/spv_mma.py (copied to candidates/r01-f1/tools/spv_mma.py); a site = one OpCooperativeMatrixMulAddKHR, word_offset = index of the instruction's first word",
+    "calibration": {
+        "against": ident(AUDIT_SITES),
+        "parent_sites_reproduced_exactly": calib,
+        "parent_sites_in_audit": len(audit_f1["fp16_mma_sites"]),
+        "parent_sites_here": len(par["fp16_mma_sites"]),
+        "functions_in_audit": {"nr_body_stage(": 128, "nrf_lift(u1;u1;": 1},
+        "note": "offset / result id / function id triples are identical, so the enumeration is the same one the audit used",
+    },
+    "parent_module": {
+        "spv": ident(PARENT_SPV),
+        "muladd_total": par["muladd_count"], "fp16": par["fp16_mma_count"],
+        "int8": par["int8_mma_count"], "other": par["other_mma_count"],
+        "fp16_by_function": {"nr_body_stage": 128, "nrf_lift": 1},
+        "fp16_segments": group(par["fp16_mma_sites"], segment_parent),
+        "fp16_mma_sites": par["fp16_mma_sites"],
+    },
+    "candidate_module": {
+        "spv": ident(CAND_SPV),
+        "source": ident(SRC),
+        "muladd_total": cand["muladd_count"], "fp16": cand["fp16_mma_count"],
+        "int8": cand["int8_mma_count"], "other": cand["other_mma_count"],
+        "fp16_by_function": {str(k): v for k, v in
+                             {"nr_body_stage(equivalent)": sum(1 for s in cand["fp16_mma_sites"] if s["function_id"] == 118),
+                              "nrf_lift": sum(1 for s in cand["fp16_mma_sites"] if s["function_id"] != 118)}.items()},
+        "fp16_segments": group(cand["fp16_mma_sites"], segment_cand),
+        "fp16_mma_sites": cand["fp16_mma_sites"],
+        "int8_mma_sites": cand["int8_mma_sites"],
+        "int8_dynamic_note": "16 expand sites are straight-line (16 dynamic per workgroup); the 4 contract sites sit inside `for kg in 0..3` (c32_f1_i8.comp:473-485), so 4 static = 16 dynamic",
+        "int8_removed_from_parent": {
+            "expand_fp16_removed": 32, "contract_fp16_removed": 32,
+            "int8_static_added": 20, "int8_dynamic_added": 32,
+            "identity": "parent 129 = 32 expand + 32 contract + 65 retained; candidate 65 retained + 20 int8 static",
+        },
+    },
+    "remaining_fp16": {
+        "count": cand["fp16_mma_count"],
+        "segments": {
+            "nrf_lift": 1,
+            "QKV projection": 24,
+            "score QK": 16,
+            "PV": 16,
+            "output projection": 8,
+        },
+        "ownership": {
+            "R01": "nrf_lift (1) - the only FP16 MMA left in the lift segment",
+            "R02": "QKV 24 + score 16 + PV 16 + output 8 = 64 (GUIDE line 8: FFN is followed by R02's QKV/QK/PV/output)",
+        },
+    },
+    "int8_entry_points": [
+        {"segment": "expand", "source": "c32_f1_i8.comp:258-464", "shapes": "I8A 8x32 x I8B 32x16 -> I8C 8x16 int32",
+         "weights": "w8[0..16384), 16 blocks of 1024 B, w_e(f,k) = w8[(f//8)*1024 + k*32 + (f%8)]",
+         "activation_input": "sX8 codes", "dequant": "nr_i8_deq(a, mbase, 4): f32(acc)*fsc[4+mbase+row]",
+         "epilogue": "one f16 narrow, then nr_act_h per component (4 half ops)"},
+        {"segment": "contract", "source": "c32_f1_i8.comp:467-490", "shapes": "I8A 8x32 x I8B 32x16 -> I8C 8x16, 4 K32 steps",
+         "weights": "w8[16384..32768), 16 blocks of 1024 B, w_c(o,e) = w8[16384 + ((o//8)*4 + e//32)*1024 + (e%32)*32 + (o%8)]",
+         "activation_input": "sE8 codes", "dequant": "nr_i8_deq_add(a, mbase, 132, seed): f32(acc)*fsc[132+mbase+row] + seed",
+         "epilogue": "one f16 narrow after the full K=128"},
+    ],
+    "blockers": [
+        {"id": "F1-B1", "name": "lift is K=16, INT8 operand is K=32",
+         "detail": "nrf_feat gives 16 features per token (K=16); I8A/I8B are declared 8x32 / 32x16. An INT8 lift needs the 16 features packed into a 32-wide K with the tail zero-filled (GUIDE line 8). Zero fill is exact for the accumulator but changes the effective K, so it must be re-verified positionally.",
+         "status": "OPEN - not implemented in c32_f1_i8"},
+        {"id": "F1-B2", "name": "no INT8 input scale / weight pack for the lift",
+         "detail": "c32_f1_scales.f32 carries sX/invX for the post-lift X and sE/invE for the activated E only (164 f32). The lift consumes nrf_feat (dynamic) and wb[p7.x + g*128] (fp16 weights, stride 16). Both need a new pack: a 32x16 int8 feature tile per subgroup and a 8x32 int8 lift weight tile per g.",
+         "status": "OPEN - pack not built"},
+        {"id": "F1-B3", "name": "lift output feeds both the INT8 code point and the FP16 residual seed",
+         "detail": "seed = x*rs is an FP16 multiply whose product is widened into the FP32 contract accumulator; an INT8 lift would have to dequantise back to half before that multiply, i.e. one extra narrow, and the seed value must not change silently.",
+         "status": "OPEN - epilogue not designed"},
+        {"id": "F1-B4", "name": "quantiser input is not observable in the dump",
+         "detail": "the debug region records the pre-quantiser half; the gate therefore cannot be closed bit-exactly without dumping the code (see REPORT.md section 6).",
+         "status": "OPEN - minimal fix specified, needs a GPU window to verify"},
+    ],
+}
+(CARD / "evidence/F1-MMA-SITES.json").write_text(json.dumps(sites, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+
+print(json.dumps({
+    "replay": {"e_neq": e_bad, "y_neq": y_bad, "sat": sat,
+               "match": first_diff["replay_of_recorded_gate"]["matches_recorded_json"]},
+    "closure": {"e_neq_after": e_bad2, "y_neq_after": y_bad2},
+    "roots": diff_positions,
+    "calibration": calib,
+    "parent": (par["muladd_count"], par["fp16_mma_count"]),
+    "cand": (cand["muladd_count"], cand["fp16_mma_count"], cand["int8_mma_count"]),
+}, indent=1, ensure_ascii=False, default=str))

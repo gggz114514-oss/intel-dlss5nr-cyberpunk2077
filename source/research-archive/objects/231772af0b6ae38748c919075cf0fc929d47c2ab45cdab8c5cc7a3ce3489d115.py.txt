@@ -1,0 +1,154 @@
+"""Backward-slice the *address operand* of every fragment load in the F20 ISA capture and
+report the dependency depth (instructions on the longest producer path) plus the opcode
+histogram of that cone.
+
+This is the quantitative basis for the ALU-chain audit (card n28, task B): it measures what
+the compiler actually emitted for the 38 shared-memory `coopMatLoad` sites, instead of what
+the GLSL source expression looks like.
+
+Read-only: the ISA capture is never modified.
+"""
+import re, sys, json, collections
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding='utf-8')
+
+ISA = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024'
+           r'/fullnet-mechanism-transfer-20261026/f10-weight-return-separation-20261027'
+           r'/captures/native-f20-pixel-owner/ISA'
+           r'/CS_asm76902ef344609c8a_simd32_0000000000000027_38_orig.asm')
+
+LINE = re.compile(r'^/\* \[(?P<addr>[0-9A-F]+)\]  \*/ (?P<pre>.*?)\s{2,}(?P<op>[a-z][a-z0-9._]*)\s+'
+                  r'(?P<rest>.*)$')
+MSG = re.compile(r'//\s*(.*)$')
+# destination register(s) at the head of the operand list, e.g. "r14", "null", "r12.0<1>:ud"
+DST = re.compile(r'^(?P<dst>(?:null|r\d+))\b')
+# every register token in an operand list
+REG = re.compile(r'\br(\d+)\b')
+
+
+def parse(path):
+    out = []
+    for ln, raw in enumerate(path.read_text(encoding='utf-8', errors='replace').splitlines(), 1):
+        m = LINE.match(raw.rstrip())
+        if not m:
+            continue
+        rest = m.group('rest')
+        msg = ''
+        mm = MSG.search(rest)
+        if mm:
+            msg = mm.group(1).strip()
+        body = rest.split('//', 1)[0]
+        toks = body.split()
+        # drop a leading exec/predicate token such as "(32|M0)", "(W&f0.0)", "(~f1.0)"
+        if toks and toks[0].startswith('('):
+            toks = toks[1:]
+        dst = toks[0] if toks else ''
+        # address operand of a send: token 2 (after dst); for normal ALU ops every operand
+        # after the destination is a source.
+        srcs = toks[1:3] if m.group('op').startswith('send') else toks[1:]
+        out.append(dict(ln=ln, addr=int(m.group('addr'), 16), op=m.group('op'),
+                        dst=dst, srcs=srcs, msg=msg))
+    return out
+
+
+def regs(tok):
+    return set('r' + x for x in REG.findall(tok))
+
+
+def single_reg(tok):
+    m = DST.match(tok.strip())
+    if not m:
+        return None
+    name = m.group('dst')
+    return None if name == 'null' else name
+
+
+def build_writers(ins):
+    """reg -> sorted list of (index) that write it."""
+    w = collections.defaultdict(list)
+    for i, x in enumerate(ins):
+        if x['op'] in ('send.slm', 'send.ugm', 'send.gtwy', 'sync.bar', 'sync.nop',
+                       'sync.allrd', 'sync.allwr', 'join', 'jmpi', 'goto'):
+            if x['op'].startswith('send') and x['msg'] and 'load' in x['msg']:
+                d = single_reg(x['dst'])
+                if d:
+                    w[d].append(i)
+            continue
+        d = single_reg(x['dst'])
+        if d:
+            w[d].append(i)
+    return w
+
+
+def slice_depth(ins, writers, idx, budget=4000):
+    """Longest dependent path length ending at instruction idx (inclusive)."""
+    memo = {}
+
+    def depth(i, stack):
+        if i in memo:
+            return memo[i]
+        if i in stack or len(stack) > 24:
+            return 0
+        srcs = regs(' '.join(ins[i]['srcs']))
+        best = 0
+        for r in srcs:
+            cand = [j for j in writers.get(r, []) if j < i]
+            if not cand:
+                continue
+            j = cand[-1]
+            best = max(best, depth(j, stack | {i}))
+        memo[i] = best + 1
+        return memo[i]
+
+    return depth(idx, frozenset())
+
+
+def cone(ins, writers, idx):
+    """All instructions in the transitive producer cone of idx."""
+    seen = set()
+    work = [idx]
+    while work:
+        i = work.pop()
+        if i in seen:
+            continue
+        seen.add(i)
+        for r in regs(' '.join(ins[i]['srcs'])):
+            cand = [j for j in writers.get(r, []) if j < i]
+            if cand:
+                work.append(cand[-1])
+    return seen
+
+
+def main():
+    ins = parse(ISA)
+    writers = build_writers(ins)
+    loads = [i for i, x in enumerate(ins)
+             if x['op'].startswith('send') and x['msg'] and 'load' in x['msg']]
+    print('total load messages:', len(loads))
+    by_msg = collections.Counter(x['msg'] for x in (ins[i] for i in loads))
+    for k, v in sorted(by_msg.items(), key=lambda kv: -kv[1]):
+        print('  %5d  %s' % (v, k))
+
+    rows = []
+    for i in loads:
+        d = slice_depth(ins, writers, i)
+        c = cone(ins, writers, i)
+        ops = collections.Counter(ins[j]['op'] for j in c if not ins[j]['op'].startswith('send'))
+        rows.append(dict(ln=ins[i]['ln'], addr=hex(ins[i]['addr']), msg=ins[i]['msg'],
+                         depth=d, cone=len(c),
+                         ops=dict(sorted(ops.items(), key=lambda kv: -kv[1]))))
+    rows.sort(key=lambda r: -r['depth'])
+    print('\n=== deepest address cones (top 24 of %d) ===' % len(rows))
+    for r in rows[:24]:
+        print('  depth=%2d cone=%2d ln=%4d %-8s %s' %
+              (r['depth'], r['cone'], r['ln'], r['addr'], r['msg'][:60]))
+        print('           ops:', ', '.join('%s=%d' % kv for kv in list(r['ops'].items())[:8]))
+    Path('cards/n28-f20-barrier-alu/tools/addr-cones.json').write_text(
+        json.dumps(rows, indent=2), encoding='utf-8')
+    hist = collections.Counter(r['depth'] for r in rows)
+    print('\ndepth histogram:', dict(sorted(hist.items())))
+
+
+if __name__ == '__main__':
+    main()

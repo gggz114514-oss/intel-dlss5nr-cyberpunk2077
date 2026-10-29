@@ -1,0 +1,105 @@
+"""Splice n05e's QKV section into the F05 C128 parent source (CPU only, no build).
+
+Reads the baseline source (read-only), replaces exactly one contiguous block
+(the QKV projection, from the AN6 comment to the row_phase close brace) with
+_build/qkv-block.glsl, and writes:
+
+    cards/n05e-f05-atile/parent-rebuild.comp   = the parent source, byte-identical
+    cards/n05e-f05-atile/candidate.comp        = parent with the new QKV block
+
+and prints the number of changed/unchanged lines, so the diff scope is auditable
+without running diff.
+"""
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+BUILD = CARD / '_build'
+
+PARENT_SRC = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                  'fullnet-mechanism-transfer-20261026/f05-kv-consumer-layout/family/c128/candidate.comp')
+PARENT_SRC_SHA = 'd628a08e35bce7b148dc330b42b20004a404a6a9c1f03eb20ca3df90803699f2'
+
+START = '    // AN6: one standard direct-Y A fragment feeds all six Q/K/V fragments.\n'
+END = '    } // row_phase values retire before next phase\n'
+
+HEADER_NOTE = """// ---------------------------------------------------------------------------
+// n05e-f05-atile : A-side owner reblock (2026-10-27).
+//
+// WHAT CHANGED (one hunk, the QKV projection only)
+//   The parent gave every subgroup one head and two 8-token m-blocks
+//   (row_phase = 0,1).  The 4 subgroups of head h and the 4 subgroups of head h+1
+//   read the *same* gY rows, so every 8x128 A row tile was fetched twice per
+//   workgroup.  Here the two axes swap: a subgroup owns one 8-token m-block
+//   (m0 = sg*8; the 8 subgroups cover the 64 tokens once) and both heads of the
+//   workgroup, so each A row tile is fetched once.  One A fragment now feeds
+//   twelve MMAs (6 channel blocks x 2 heads).
+//
+// WHAT IS NOT CHANGED
+//   shared qkv[12288] and its addresses, the single publication barrier, the
+//   weight address expressions (only h -> h0/h1), the attention stage, the
+//   debug echoes (they key off the unchanged `h`), the grid, the bindings.
+//
+// WHY IT IS BIT-EXACT
+//   Per output element (token t, channel c) the K chain is still ki = 0..7 in
+//   ascending order, both operands are the same FP16 values, and there is still
+//   exactly one MAT_C -> MAT_H narrowing per published tile.  Only the owning
+//   subgroup changes, and the norm tree is applied per head on the same four
+//   fragments as before.
+//
+// COST
+//   Live accumulators 6 -> 12 (96 GRF at the measured 8 GRF per accumulator).
+//   That is the whole risk of this card: see BUDGET in ANALYSIS.md and the
+//   native witness (scratch / accumulator blocks) in NATIVE-PREDICTION.md.
+// ---------------------------------------------------------------------------
+"""
+
+
+def main():
+    src = PARENT_SRC.read_text(encoding='utf-8')
+    import hashlib
+    sha = hashlib.sha256(PARENT_SRC.read_bytes()).hexdigest()
+    assert sha == PARENT_SRC_SHA, ('parent source sha changed', sha)
+    (CARD / 'parent-rebuild.comp').write_text(src, encoding='utf-8')
+
+    i = src.index(START)
+    j = src.index(END)
+    assert src.count(START) == 1 and src.count(END) == 1, 'block markers are not unique'
+    end = j + len(END)
+    block = (BUILD / 'qkv-block.glsl').read_text(encoding='utf-8')
+
+    # header comment: insert right after the leading comment banner of the parent
+    marker = '\n#version 450\n'
+    k = src.index(marker)
+    out = src[:k] + '\n' + HEADER_NOTE + src[k:i] + block + src[end:]
+
+    (CARD / 'candidate.comp').write_text(out, encoding='utf-8')
+
+    a = src.splitlines()
+    b = out.splitlines()
+    import difflib
+    sm = difflib.SequenceMatcher(None, a, b)
+    removed = added = same = 0
+    hunks = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            same += i2 - i1
+        else:
+            hunks += 1
+            removed += i2 - i1
+            added += j2 - j1
+    print('parent lines %d  candidate lines %d' % (len(a), len(b)))
+    print('same %d  removed %d  added %d  hunks %d' % (same, removed, added, hunks))
+    print('parent sha %s' % sha)
+    print('candidate sha %s' % hashlib.sha256((CARD / 'candidate.comp').read_bytes()).hexdigest())
+    # every unchanged parent line outside the block must appear verbatim
+    outside = src[:i] + src[end:]
+    for line in outside.splitlines():
+        if line.strip() and line not in out:
+            print('LOST LINE:', line[:110])
+            sys.exit(2)
+    print('all parent lines outside the QKV block are present verbatim')
+
+
+if __name__ == '__main__':
+    main()

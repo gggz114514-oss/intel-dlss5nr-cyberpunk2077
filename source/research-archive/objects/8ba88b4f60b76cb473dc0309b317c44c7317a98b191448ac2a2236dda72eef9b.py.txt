@@ -1,0 +1,126 @@
+"""n29-f01-alu-chain: execution mask of the F01 entry region (CPU only, read-only ISA).
+
+Why this exists
+---------------
+The card's premise is "ALUWR 0.385 ms is the entry address chain".  A chain is
+only worth shortening if it runs.  The identity's own push constants and the
+uniform branch that tests them are both readable without a GPU:
+
+  * plan PASS 0 PUSH words 20..23 are pc.p5 = (source_W, source_H, seed, flags)
+    and words 24..27 are pc.p6 = (controls, history, motion, depth bases).
+  * controls = f[pc.p6.x ..], and `nrf_ctl(i)` is f[pc.p6.x+i]; the file behind
+    binding 2 ("ioport_0_ioport_images", 52936784 B) holds them verbatim.
+  * the shader guards the whole history/depth/motion block with
+    `if(nrf_ctl(8)!=0.0)`, which the compiler turned into the uniform branch
+    at [0CD0]:  cmp (ne)f1.0 null r70.3 0.0S ; (W&~f1.0) jmpi L14160(=0x3750)
+
+So ctl(8)==0 means every gather between 0x0CE0 and 0x3750 is skipped.
+
+Outputs tools/exec-mask.json.
+"""
+import json
+import struct
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parents[1]
+CAMP = CARD.parents[1]
+sys.path.insert(0, str(CARD))
+from tools.isa_chain import load, region_of, gathers, slice_of, int_tail, depth_of, REGION  # noqa: E402
+
+IMAGES = Path(r'@NR_WORKSPACE@/src/project/artifacts/parallel-port-20261013/io/block0/fixture-cold-v2/ioport_images.f32.bin')
+# plan PASS 0: BIND 5 -> BUFFER 2, BIND 2 -> BUFFER 452 (ioport_0_ioport_images)
+CTL_BASE = 3686400          # pc.p6.x from PUSH word 24
+CTL_N = 24
+PUSH_P5 = (1280, 720, 0, 4)  # source_W, source_H, seed, flags
+GRID = (168, 96)
+
+DEAD = [(0x0CE0, 0x3750),    # ctl(8)==0 arm: jump target of [0CD0] is 0x3750
+        (0x3850, 0x47A0)]    # flags&4!=0 arm: [3840] (W) jmpi L18336 skips the PCG noise arm
+TAIL_JOIN = (0x3840, 0x47A0)
+
+
+def ctl_values():
+    vals = []
+    with open(IMAGES, 'rb') as fh:
+        fh.seek(CTL_BASE * 4)
+        raw = fh.read(CTL_N * 4)
+    vals = list(struct.unpack('<%df' % CTL_N, raw))
+    return vals
+
+
+def main():
+    isa, by_dw = load()
+    reg = [i for i in isa if region_of(i['addr'])]
+    gs = gathers(isa)
+    ctl = ctl_values()
+    def is_dead(a):
+        return any(lo <= a < hi for lo, hi in DEAD)
+    dead = [i for i in reg if is_dead(i['addr'])]
+    live = [i for i in reg if not is_dead(i['addr'])]
+    g_dead = [g for g in gs if is_dead(g['addr'])]
+    g_live = [g for g in gs if not is_dead(g['addr'])]
+
+    chain_live, tail_live = set(), set()
+    rows_live = []
+    for g in g_live:
+        nodes = slice_of(isa, by_dw, g['idx'])
+        tail, _ = int_tail(isa, nodes, g['idx'])
+        d = depth_of(isa, nodes)[0]
+        td = depth_of(isa, tail)[0]
+        for k in nodes:
+            if region_of(isa[k]['addr']):
+                chain_live.add(isa[k]['addr'])
+        tail_live |= {isa[k]['addr'] for k in tail}
+        rows_live.append(dict(addr=hex(g['addr']), nodes=len(nodes), depth=d,
+                              tail=len(tail), tail_depth=td,
+                              offreg=g['ops'][1] if len(g['ops']) > 1 else '?',
+                              msg=g['comment'].split(';')[-1].strip()))
+    chain_dead, tail_dead = set(), set()
+    for g in g_dead:
+        nodes = slice_of(isa, by_dw, g['idx'])
+        for k in nodes:
+            if region_of(isa[k]['addr']):
+                chain_dead.add(isa[k]['addr'])
+        t, _ = int_tail(isa, nodes, g['idx'])
+        tail_dead |= {isa[k]['addr'] for k in t}
+
+    out = dict(
+        identity=dict(plan_push_p4=(1344, 768, 0, 10137620),
+                      plan_push_p5=PUSH_P5, plan_push_p6=(3686400, 3686420, 7372820, 9216020),
+                      grid=GRID, ctl=[round(v, 9) for v in ctl]),
+        guard=dict(branch='[0CD0] (W&~f1.0) jmpi L14160', taken_when='nrf_ctl(8)==0.0',
+                   target=hex(DEAD[0][1]), ctl8=ctl[8],
+                   skipped_spans=[[hex(lo), hex(hi)] for lo, hi in DEAD]),
+        region=dict(lo=hex(REGION[0]), hi=hex(REGION[1]), instructions=len(reg),
+                    gathers=len(gs)),
+        dead=dict(instructions=len(dead), gathers=len(g_dead),
+                  chain=len(chain_dead), int_tail=len(tail_dead),
+                  opcodes={}),
+        live=dict(instructions=len(live), gathers=len(g_live),
+                  chain=len(chain_live), int_tail=len(tail_live),
+                  per_gather=rows_live),
+    )
+    for i in dead:
+        out['dead']['opcodes'][i['op']] = out['dead']['opcodes'].get(i['op'], 0) + 1
+    out['live']['opcodes'] = {}
+    for i in live:
+        out['live']['opcodes'][i['op']] = out['live']['opcodes'].get(i['op'], 0) + 1
+    out['live']['opcodes'] = dict(sorted(out['live']['opcodes'].items(), key=lambda kv: -kv[1]))
+    out['dead']['opcodes'] = dict(sorted(out['dead']['opcodes'].items(), key=lambda kv: -kv[1]))
+    (CARD / 'tools' / 'exec-mask.json').write_text(json.dumps(out, indent=1), encoding='utf-8')
+    print('ctl(8)=%r ctl(9)=%r ctl(10)=%r ctl(11)=%r ctl(12)=%r' %
+          (ctl[8], ctl[9], ctl[10], ctl[11], ctl[12]))
+    print('region %d instrs, %d gathers' % (len(reg), len(gs)))
+    print('dead   %d instrs, %d gathers, chain %d, int-tail %d' %
+          (len(dead), len(g_dead), len(chain_dead), len(tail_dead)))
+    print('live   %d instrs, %d gathers, chain %d, int-tail %d' %
+          (len(live), len(g_live), len(chain_live), len(tail_live)))
+    for r in rows_live:
+        print('  %s off=%-4s nodes=%3d depth=%2d tail=%2d tdep=%2d %s' %
+              (r['addr'], r['offreg'], r['nodes'], r['depth'], r['tail'], r['tail_depth'], r['msg']))
+
+
+if __name__ == '__main__':
+    main()
+

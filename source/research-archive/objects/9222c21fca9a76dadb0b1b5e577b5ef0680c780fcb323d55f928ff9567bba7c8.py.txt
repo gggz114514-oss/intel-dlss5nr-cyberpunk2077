@@ -1,0 +1,152 @@
+"""S01: emit CALIBRATION.json / QUALITY.json / JOBS.json from the measured CPU results."""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/tools")
+from planlib import Plan, sha256_file  # noqa: E402
+
+B = Path(r"@NR_WORKSPACE@")
+D = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+HERE = Path(__file__).resolve().parent
+cal = json.loads((HERE / "CPU" / "calibration_e_b4.json").read_text())
+align = json.loads((HERE / "CPU" / "align_sweep.json").read_text()) if (HERE / "CPU" / "align_sweep.json").is_file() else []
+plans = json.loads((HERE / "PLANS.json").read_text())
+
+
+def P(p):
+    return str(p).replace("\\", "/")
+
+
+e_am = cal["e_channel_absmax_3frames"]
+order = sorted(range(128), key=lambda i: e_am[i])
+sens = cal["contract_sensitivity_old"]
+metrics = cal["metrics"]
+old_mean = sum(m["old_rel_l2"] for m in metrics) / len(metrics)
+new_mean = sum(m["new_rel_l2"] for m in metrics) / len(metrics)
+
+calibration = dict(
+    card="S01 C32 body4",
+    status="candidate only; GPU_VERIFICATION=NOT_RUN",
+    frames=["34189 (dump-fp16)", "41444 (teacher-41444)", "43654 (teacher-43654)"],
+    token_sampling=dict(calibration_tiles_per_frame=cal["calibration_tiles_per_frame"],
+                        evaluation_tiles_per_frame=cal["evaluation_tiles_per_frame"],
+                        tiles_total=168 * 96, columns_per_tile=16,
+                        eval_disjoint_from_calibration=True,
+                        columns_used_for_calibration=cal["calibration_tiles_per_frame"] * 16 * 3,
+                        columns_used_for_evaluation=cal["evaluation_tiles_per_frame"] * 16 * 3),
+    objective=cal["metric_definition"],
+    search_space=dict(
+        diagonal="D_E[f] = 2^round(log2(amax_E[f]/max_f amax_E)) clipped to [2^-10, 1]",
+        global_after_diagonal="sE_g = max_f(amax_E[f]/D_E[f]) / 127",
+        per_channel_scale="sE'[f] = D_E[f] * sE_g  ->  invE[f] = 1/sE'[f]",
+        weight_fold="W'[o][f] = Wc_real[o][f] * sE'[f]; sWc'[o] = max_f|W'[o][f]|/127; "
+                    "Wc_q'[o][f] = clip(roundEven(W'[o][f]/sWc'[o]), -127, 127); fsc[132+o] = sWc'[o]",
+        x_side="unchanged from the already measured c32-equalized-b4 pack (per-input-channel "
+                "inverse fsc[292..323] + D folded into the expand tiles)",
+        not_searched="no per-frame amax, no runtime prediction, no histogram, no adaptive precision",
+    ),
+    old_new_local_error=dict(
+        metric="relL2(FFN Y, ref Y) where ref Y = Wc_real @ a_h + seed (activation quantiser removed, "
+               "same dequantised weights). The X quantiser is identical in both arms.",
+        old_mean_rel_l2=old_mean, new_mean_rel_l2=new_mean, ratio=old_mean / new_mean,
+        per_frame=metrics,
+        interpretation="this is the FFN-Y quantisation error of the E contract only. It is NOT the "
+                       "block-exit error: dispatch 4 also runs QKV/QK/PV/WO, and the published local "
+                       "12.699% -> 11.397% figures are block-exit errors against dump_skip4.",
+        per_frame_exact_scale_lower_bound=[m["per_frame_exact_scale_rel_l2"] for m in metrics],
+    ),
+    e_channel_range=dict(
+        ratio_max_over_min=cal["e_channel_ratio"],
+        global_absmax=cal["e_global_absmax"],
+        per_calibration_frame_absmax=cal["e_absmax_per_cal_frame"],
+        quietest_channels=[[i, e_am[i]] for i in order[:8]],
+        loudest_channels=[[i, e_am[i]] for i in order[-8:]],
+        old_scale=cal["old_sE"], new_scale_global=cal["new_sE_global"],
+        new_scale_range=cal["new_sE_range"],
+        diagonal_powers_of_two=sorted({float(v) for v in cal["diagonal_D_E"]}),
+        x_side_for_comparison=dict(ratio=cal["x_channel_ratio"], absmax=cal["x_channel_absmax"]),
+    ),
+    contract_sensitivity=dict(
+        definition="sens[f] = sE[f] * ||Wc_real[:,f]||_2 : the per-E-channel scale times the norm of "
+                   "the contract weight column it feeds, i.e. the Y-error amplification of channel f",
+        old=sens,
+        new=cal["contract_sensitivity_new"],
+        old_ratio_max_over_min=max(sens) / min(sens),
+        new_ratio_max_over_min=max(cal["contract_sensitivity_new"]) / min(cal["contract_sensitivity_new"]),
+        note="the pow2 diagonal equalises the geometric mean of (E range, Wc column norm) by "
+             "construction; the residual spread is the part a diagonal cannot fix",
+    ),
+    cpu_gpu_audit=dict(
+        status="BLOCKED_ON_ORACLE (see CONTRACT.json cpu_gpu_validation)",
+        measured=align,
+        threshold_required=1e-3, threshold_met=False,
+        why="dispatch 4 writes the whole swin body to binding 3; the existing local-b4 output is the "
+            "block exit. A CPU/GPU proof at 1e-3 therefore needs the block-4 debug dump "
+            "(oracle-local-b4-debug.txt), not a parameter search.",
+    ),
+)
+(HERE / "CALIBRATION.json").write_text(json.dumps(calibration, indent=2))
+
+quality = dict(
+    card="S01 C32 body4",
+    scope="block-4 FFN contract, CPU only",
+    GPU_VERIFICATION="NOT_RUN",
+    gpu_psnr=None, gpu_rel_l2=None, gpu_24frame=None,
+    quality_accepted=False,
+    cpu_metrics=dict(
+        metric="relL2 of the block-4 FFN Y against the same-weight float reference (E quantiser "
+               "removed); X quantiser identical in both arms",
+        old_mean_rel_l2=old_mean, new_mean_rel_l2=new_mean,
+        improvement_ratio=old_mean / new_mean,
+        per_frame=[dict(frame=m["frame"], old=m["old_rel_l2"], new=m["new_rel_l2"],
+                        old_saturated_codes=m["old_saturated_codes"],
+                        new_saturated_codes=m["new_saturated_codes"], codes=m["codes"])
+                   for m in metrics],
+        new_saturation_fraction=max(m["new_saturated_codes"] / m["codes"] for m in metrics),
+    ),
+    not_measured=["block-exit relL2 (needs GPU)", "24-frame PSNR (needs GPU)", "any attention-path effect",
+                  "performance (UNMEASURED)"],
+    claim_boundary="a CPU estimate of one quantiser inside one dispatch; not a block, not a frame, "
+                   "not a network result",
+)
+(HERE / "QUALITY.json").write_text(json.dumps(quality, indent=2))
+
+RUNNER = "@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe"
+jobs = [
+    dict(id="S01-B4-ORACLE", priority=1, purpose="close the CPU/GPU proof for dispatch 4 (debug stores)",
+         plan=P(HERE / "oracle-local-b4-debug.txt"), plan_sha256=plans["oracle_debug"]["out_sha256"],
+         argv=[RUNNER, "--plan", P(HERE / "oracle-local-b4-debug.txt"), "--out",
+               P(HERE / "runs/S01-B4-ORACLE"), "--pool", "--warm", "0", "--reps", "1"],
+         expected_output_sha256=None, output="swin_4_debug.bin (50176 B) + replayed-network.bin",
+         note="debug=1 rewrites nothing else; compare the debug arm's replayed-network.bin with "
+              "c32-minmax/local-b4/replayed-network.bin and require equality before trusting the dbg dump"),
+    dict(id="S01-B4-LOCAL", priority=1, purpose="block-exit relL2 of the X+E equalised pack vs the FP16 teacher",
+         plan=P(HERE / "candidate-local-b4.txt"), plan_sha256=plans["local_b4"]["out_sha256"],
+         argv=[RUNNER, "--plan", P(HERE / "candidate-local-b4.txt"), "--out",
+               P(HERE / "runs/S01-B4-LOCAL"), "--pool", "--warm", "0", "--reps", "1"],
+         expected_output_sha256=None,
+         reference=P(D / "dump-fp16/dump_skip4.bin"),
+         compare_against=[P(D / "c32-minmax/local-b4/replayed-network.bin"),
+                          P(D / "c32-equalized-b4/local-b4/replayed-network.bin")],
+         note="reported relL2 must be produced by the existing measure path; the CPU number in "
+              "QUALITY.json is a different (FFN-Y) metric and must not be compared numerically"),
+]
+for frame in (34189, 41444, 43654):
+    jobs.append(dict(id=f"S01-B4-COMBO-{frame}", priority=2,
+                     purpose=f"three-frame screen of the accumulated plan (frame {frame})",
+                     plan=P(HERE / f"candidate-{frame}.txt"),
+                     plan_sha256=plans[f"combo_{frame}"]["out_sha256"],
+                     argv=[RUNNER, "--plan", P(HERE / f"candidate-{frame}.txt"), "--out",
+                           P(HERE / f"runs/S01-B4-COMBO-{frame}"), "--pool", "--warm", "0", "--reps", "1"],
+                     expected_output_sha256=None,
+                     reference=P(D / f"c64-family-static/run-{frame}/replayed-network.bin")
+                     if (D / f"c64-family-static/run-{frame}/replayed-network.bin").is_file() else None,
+                     note="frozen combo identity is recorded in PLANS.json; only block 4 differs"))
+(HERE / "JOBS.json").write_text(json.dumps(dict(
+    card="S01 C32 body4", executed=False, gpu_lock_untouched=True,
+    note="this card ran no GPU work; jobs are for the main executor's queue",
+    jobs=jobs), indent=2))
+print("written CALIBRATION/QUALITY/JOBS")
+print(f"old {old_mean:.6f} new {new_mean:.6f} ratio {old_mean/new_mean:.3f}")

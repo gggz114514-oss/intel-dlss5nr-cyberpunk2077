@@ -1,0 +1,100 @@
+from pathlib import Path
+import json, hashlib, subprocess, sys
+R=Path(__file__).resolve().parent; A=R.parent; B=A.parents[1]
+P=A/'c32-norm-owner-20261025/f20-den-pv-owner'; N=R/'f20-owner-bridge'; N.mkdir(exist_ok=True)
+rd=lambda p:json.loads(p.read_text(encoding='utf-8-sig'))
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(args):
+    p=subprocess.run(list(map(str,args)),capture_output=True,text=True)
+    assert p.returncode==0,p.stdout+p.stderr
+    return p.stdout
+
+# Independent enumeration of parent and candidate ownership, including ordered K.
+old={}; new={}
+def put(dst,stage,m,n,seq):
+    key=f'{stage}:{m}:{n}'; assert key not in dst; dst[key]=seq
+for sg in range(8):
+    for r in range(2):
+        for m in [(sg//4+4*r)*8,(sg//4+4*r)*8+16]:
+            for n in [(sg%4)*32,(sg%4)*32+16]:
+                put(old,'expand',m,n,['zero',0,16,'half','nr_act_h'])
+    for n in [0,16]:put(old,'contract',sg*8,n,['half(X*rs)',*range(0,128,16),'half'])
+for sg in range(4):
+    for m in [sg*8,sg*8+32]:
+        for n in range(0,128,16):put(new,'expand',m,n,['zero',0,16,'half','nr_act_h'])
+        for n in [0,16]:put(new,'contract',m,n,['half(X*rs)',*range(0,128,16),'half'])
+assert old==new and len(old)==80
+handoff=[dict(consumer_sg=sg,producer_sg=sg%4,m=sg*8,transport='register' if sg<4 else 'SLM') for sg in range(8)]
+assert all(x['m']==x['producer_sg']*8+(32 if x['consumer_sg']>=4 else 0) for x in handoff)
+proof=dict(ordered_tiles_equal=True,tiles=80,expand_elements=8192,contract_elements=2048,
+    handoff=handoff,weight_tile_reads=dict(expand=[64,64],contract=[128,64],QKV=[96,96]),
+    logical_SLM_bytes=dict(activation_write=[16384,0],activation_read=[16384,0],X_read=[20480,4096],Y_write=[4096,4096],Y_QKV_read=[0,2048]),
+    active_SG=dict(FFN=[8,4],QKV=[8,8]),normal_barriers_removed=1,
+    lifetime='Four X half fragments (32 B/lane), four contract f32 accumulators (64), two expand f32 accumulators (32): 128 B/lane subtotal, plus operands/temporaries. Not GRF allocation. FFN scope retires before original QKV. Only two half handoff fragments survive into QKV on SG0..3; SG4..7 load theirs once.',
+    synchronization='Fold publication retained. Same-SG expand/activation/contract needs no barrier. Full-WG Y publication retained before SG4..7 read. Debug Y readers and downstream arena reuse remain ordered.',
+    numerical='Per-output K steps, half seed, half narrowing and activation function unchanged. C-half -> A component mapping reuses measured direct-handoff contract; GPU bit-exact gate required.',
+    limits='FFN has four active SG and higher live subtotal than parent. Reject scratch. No claim of throughput or occupancy improvement.')
+(N/'PROOF.json').write_text(json.dumps(proof,indent=2))
+(N/'ORDERED-TILES.json').write_text(json.dumps(old,indent=2))
+
+s=(P/'candidate.comp').read_text(encoding='utf-8-sig'); original=s
+lines=['    // M-paired streaming FFN; restore eight QKV owners at the small Y boundary.',
+       '    MAT_A handoff0,handoff1;', '    if(sg<4u) {','        uint mA=sg*8u,mB=mA+32u;']
+for row in ['A','B']:
+    for c in range(2):
+        lines += [f'        MAT_H x{row}{c}; coopMatLoad(x{row}{c},shX,m{row}*32u+{c*16}u,32u,LROW);',
+                  f'        MAT_A xa{row}{c}; for(int d=0;d<4;++d) xa{row}{c}[d]=x{row}{c}[d];']
+for c in range(2):
+    lines += [f'        MAT_C cA{c},cB{c};','        {',
+              f'            MAT_H scale; coopMatLoad(scale,wb,uint(pc.p2.x)+8u+{c*16}u,0u,LROW);',
+              f'            MAT_H seedA=xA{c}*scale; cA{c}=MAT_C(seedA);',
+              f'            MAT_H seedB=xB{c}*scale; cB{c}=MAT_C(seedB);','        }']
+lines += ['        for(uint ki=0u;ki<8u;++ki) {','            MAT_C eA=MAT_C(float16_t(0.0)),eB=MAT_C(float16_t(0.0));']
+for k in range(2):
+    lines += ['            {',f'                MAT_B w; coopMatLoad(w,wb,uint(pc.p1.x)+ki*512u+{k*256}u,16u,LCOL);',
+              f'                eA=coopMatMulAdd(xaA{k},w,eA); eB=coopMatMulAdd(xaB{k},w,eB);','            }']
+for row in ['A','B']:
+    lines += [f'            MAT_H h{row}=MAT_H(e{row});',
+              f'            if(debug) coopMatStore(h{row},dbg,m{row}*128u+ki*16u,128u,LROW);',
+              f'            for(int d=0;d<4;++d) h{row}[d]=nr_act_h(h{row}[d]);',
+              f'            MAT_A a{row}; for(int d=0;d<4;++d) a{row}[d]=h{row}[d];']
+for c in range(2):
+    lines += ['            {',f'                MAT_B w; coopMatLoad(w,wb,uint(pc.p1.y)+{c*2048}u+ki*256u,16u,LCOL);',
+              f'                cA{c}=coopMatMulAdd(aA,w,cA{c}); cB{c}=coopMatMulAdd(aB,w,cB{c});','            }']
+lines += ['        }']
+for row in ['A','B']:
+    for c in range(2):
+        lines += ['        {',f'            MAT_H h=MAT_H(c{row}{c});']
+        if row=='A':lines += [f'            for(int d=0;d<4;++d) handoff{c}[d]=h[d];']
+        lines += [f'            coopMatStore(h,shY,m{row}*32u+{c*16}u,32u,LROW);','        }']
+lines += ['    }','    barrier(); // Publish Y to the four newly active QKV owners.',
+          '    if(debug) {','        for(uint e=t_local;e<2048u;e+=256u) dbg[8192u+e]=shY[e];','        barrier();','    }',
+          '    if(sg>=4u) {','        coopMatLoad(handoff0,shY,sg*8u*32u,32u,LROW);',
+          '        coopMatLoad(handoff1,shY,sg*8u*32u+16u,32u,LROW);','    }','']
+start=s.index('    // ============ stage 1:'); end=s.index('    // ============ stage 4:',start)
+s=s[:start]+'\n'.join(lines)+'\n'+s[end:]
+assert s[s.index('    // ============ stage 4:'):]==original[end:]
+src=N/'candidate.comp';src.write_text(s,encoding='utf-8');spv=N/'candidate.spv'
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv])
+pm=ST.Module(P/'candidate.spv');cm=ST.Module(spv)
+keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[])
+assert len(keep)==len(ST.no_contraction_ids(pm))==7
+ST.set_no_contraction(cm,set(keep),spv)
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+baseline=rd(A/'LATEST-FP16-COMBO.json')
+assert baseline['plan']['sha256']=='73892993c22df2be0e3174b229a22d614c2259174d54f0f79f1896e5fb572e24'
+text=Path(baseline['plan']['path']).read_text();assert text.count((P/'candidate.spv').as_posix())==1
+plan=N/'plan.txt';plan.write_text(text.replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8')
+tmpl=R/'f20-stream1m'; runner=Path(rd(tmpl/'LUNA-GATES.json')['identities'][0]['path'])
+m=dict(source=ident(src),spv=ident(spv),plan=ident(plan),parent_spv=ident(P/'candidate.spv'),parent_plan=baseline['plan'],proof=proof,no_contraction_count=7,QKV_and_downstream_source_identical=True,cpu_check=run([runner,'--plan',plan,'--cpu-check']))
+(N/'CANDIDATE.json').write_text(json.dumps(m,indent=2));(N/'run').mkdir(exist_ok=True);(N/'captures').mkdir(exist_ok=True)
+for kind in ['GATES','NATIVE','ORDINARY']:
+    task=rd(tmpl/f'LUNA-{kind}.json')
+    task=json.loads(json.dumps(task).replace(str(tmpl).replace('\\','\\\\'),str(N).replace('\\','\\\\')).replace('f20-stream1m','f20-owner-bridge'))
+    task['output_root']=str(N);task['identities']=[x for x in task['identities'] if not x['path'].endswith('.spv')]+[m['spv']]
+    for j in task['jobs']:
+        j['plan']=baseline['plan'] if j['candidate']=='parent' else m['plan']
+        j['argv'][j['argv'].index('--plan')+1]=j['plan']['path']
+    (N/f'LUNA-{kind}.json').write_text(json.dumps(task,indent=2))
+print(m['cpu_check'],m['spv'])

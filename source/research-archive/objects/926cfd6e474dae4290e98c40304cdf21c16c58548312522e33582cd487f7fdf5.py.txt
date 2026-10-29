@@ -1,0 +1,112 @@
+"""S05 step 12: ablation inside the real code domain - where does block9's 41.8% come from?
+
+Variants (all consume the captured int8 qX of frame 34189, all against dump_swin_9_Y):
+  V0 bound pack                                              (reference)
+  V1 residual table refitted per input channel (LS on q->X)
+  V2 expand columns refitted per input channel (gain fold), residual refitted
+  V3 V2 + (sA, sM) retune
+  V4 residual refitted with the inverse direction (sign sanity check)
+  V5 'oracle': the codes are replaced by X/sX (teacher-derived) -> the teacher-domain 5.86%
+Also reports the per-channel step distribution recovered from the codes.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import s05_common as C
+
+CAP = C.B / 'work/dsh-fullnet-static-20261029/gpu/runs/input-capture/xq-c128-b9.bin'
+data = C.rows()
+buf = data['buffers']
+r1 = C.row_by_name('block9_swin_body_1', data)
+b1 = {int(k): v for k, v in r1['bindings'].items()}
+OLD_W, OLD_S = buf[b1[0][0]]['file'], buf[b1[1][0]]['file']
+idx_m8 = ((np.arange(C.WIN_X * C.WIN_Y)[:, None, None] * 8192
+           + (np.arange(64)[None, :, None] >> 3) * 1024
+           + np.arange(128)[None, None, :] * 8
+           + (np.arange(64)[None, :, None] & 7)).reshape(-1))
+qx = C.i8(CAP)[idx_m8].reshape(C.TOK, 128).astype(np.float32)
+X = C.load_x(C.D / 'dump-fp16/dump_block8_out.bin')
+Y = C.load_y(C.D / 'dump-fp16/dump_swin_9_Y.bin')
+w = C.i8(OLD_W).astype(np.int32)
+sc = C.f32(OLD_S)
+sX = np.float32(sc[0])
+we, wm, wc = w[0:65536].reshape(512, 128), w[65536:81920].reshape(128, 128), w[81920:98304].reshape(128, 128)
+
+
+def ffn(q, we8, wm8, wc8, s):
+    de = np.rint(q @ we8.astype(np.float32).T)
+    a = C.act(C.half(de * s[16:528][None, :]))
+    qa = C.code(a * np.float32(s[2]))
+    mo = np.empty((q.shape[0], 128), np.float32)
+    for g in range(4):
+        mo[:, g * 32:(g + 1) * 32] = qa[:, g * 128:(g + 1) * 128] @ wm8[g * 32:(g + 1) * 32].astype(np.float32).T
+    qm = C.code(np.rint(mo) * np.float32(s[528:656])[None, :] * np.float32(s[3]))
+    dc = np.rint(qm @ wc8.astype(np.float32).T)
+    return C.half(dc.astype(np.float32) * np.float32(s[656:784])[None, :] + q * np.float32(s[784:912])[None, :])
+
+
+# per-channel step from the LS slope q -> X
+slope = (qx * X).sum(axis=0) / (X * X).sum(axis=0)
+step = (1.0 / slope).astype(np.float32)
+rs = sc[784:912] / sX
+
+res = dict(card='S05-c128', step='real-domain ablation', frame=34189,
+           capture_sha256=C.sha256(CAP),
+           steps=dict(min=float(step.min()), median=float(np.median(step)), max=float(step.max()),
+                      uniform_sX=float(sX), ratio_min=float(step.min() / sX), ratio_max=float(step.max() / sX)),
+           variants={})
+
+res['variants']['V0_bound'] = C.rel(ffn(qx, we, wm, wc, sc), Y)
+
+s1 = sc.copy()
+s1[784:912] = (step * rs).astype(np.float32)
+res['variants']['V1_residual_refit'] = C.rel(ffn(qx, we, wm, wc, s1), Y)
+
+wfloat = we.astype(np.float32) * sc[16:528][:, None]
+ratio = (step / sX).astype(np.float32)              # multiply column k by step_k/sX  (undo the gain)
+wcorr = wfloat * ratio[None, :]
+sWe2 = (np.max(np.abs(wcorr), axis=1) / np.float32(127)).astype(np.float32)
+we2 = np.clip(np.rint(wcorr * (np.float32(1) / sWe2)[:, None]), -127, 127).astype(np.int32)
+s2 = s1.copy()
+s2[16:528] = (sX * sWe2 * (sX / sX)).astype(np.float32)
+s2[16:528] = (np.float32(sX) * sWe2).astype(np.float32)
+res['variants']['V2_expand_fold_plus_residual'] = C.rel(ffn(qx, we2, wm, wc, s2), Y)
+
+sWm = sc[528:656] * np.float32(sc[2])
+sWc = sc[656:784] * np.float32(sc[3])
+best = (res['variants']['V2_expand_fold_plus_residual'], 1.0, 1.0)
+for fa in [0.4, 0.5, 0.65, 0.8, 1.0, 1.25]:
+    for fm in [0.4, 0.5, 0.65, 0.8, 1.0, 1.25]:
+        s = s2.copy()
+        s[2] = np.float32(sc[2]) / np.float32(fa)
+        s[3] = np.float32(sc[3]) / np.float32(fm)
+        s[528:656] = sWm / s[2]
+        s[656:784] = sWc / s[3]
+        r = C.rel(ffn(qx, we2, wm, wc, s), Y)
+        if r < best[0]:
+            best = (r, fa, fm)
+res['variants']['V3_plus_AM_retune'] = best[0]
+res['V3_factors'] = dict(sa=best[1], sm=best[2])
+
+s4 = sc.copy()
+s4[784:912] = (sX * sX / step * rs).astype(np.float32)     # inverse direction, sanity only
+res['variants']['V4_inverse_direction'] = C.rel(ffn(qx, we, wm, wc, s4), Y)
+
+res['variants']['V5_teacher_codes_oracle'] = C.rel(ffn(C.code(X * np.float32(sc[1])), we, wm, wc, sc), Y)
+
+# how much of Y is the residual term?  -> the residual table is the dominant knob
+Yres_only = C.half(qx * np.float32(sc[784:912])[None, :])
+res['decomposition'] = dict(
+    teacher_y_rms=float(np.sqrt((Y.astype(np.float64) ** 2).mean())),
+    residual_term_rms=float(np.sqrt((Yres_only.astype(np.float64) ** 2).mean())),
+    teacher_x_rms=float(np.sqrt((X.astype(np.float64) ** 2).mean())),
+    residual_only_rel_l2_vs_teacher=C.rel(Yres_only, Y),
+    note='if residual_only is already ~40% then the residual table dominates and V1 must have helped; '
+         'if it is ~40% and V1 did not help, the codes themselves carry the error',
+)
+(C.CARD / 'evidence/REAL-QX-ABLATION.json').write_text(json.dumps(res, indent=2))
+print(json.dumps(res, indent=2))

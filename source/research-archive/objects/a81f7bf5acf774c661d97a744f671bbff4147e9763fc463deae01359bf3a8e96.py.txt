@@ -1,0 +1,157 @@
+"""make_plan.py - build the R02 QKV INT8 candidate plan from the deployed
+production plan by an exactly enumerable delta set.
+
+Parent: candidates/int8-coverage-v2-20261020/plan-c32pass8-production.txt
+(the plan the seven R02 passes actually run under).
+
+Deltas (all of them, nothing else may change):
+  1. header buffer count          622 -> 624   (two appended pack buffers)
+  2. two appended BUFFER lines    the combined 45056 B int8 weight pack and the
+                                  1044 B scale table for block1
+  3. PASS 1 "block1_swin_body_1"  spv -> the candidate module; shared 18432 -> 20480
+  4. BIND 5 of that pass          resource 604 (32768 B) -> the new 45056 B pack
+  5. BIND 6 of that pass          resource 605 (656 B)   -> the new 1044 B table
+
+Only block1 is switched: the other six R02 passes keep the parent module because
+their activation quantiser invY needs that block's own capture.  Their weight
+packs are built and staged by tools/qkv_pack_oracle.py.
+"""
+import hashlib
+import json
+import re
+from pathlib import Path
+
+R = Path("@NR_WORKSPACE@")
+CARD = R / "work/dsh-xmx-handoff-validation-20261024/candidates/r02-c32-body"
+PARENT = R / "candidates/int8-coverage-v2-20261020/plan-c32pass8-production.txt"
+OUT = CARD / "plan-r02-qkv-i8.txt"
+EV = CARD / "evidence/PLAN-DELTA.json"
+SPV = CARD / "spv/r02_body1_qkv_i8.spv"
+WEIGHTS = CARD / "pack/c32_b1_weights_qkv.i8.bin"
+SCALES = CARD / "pack/c32_block1_qkvscales.f32.bin"
+PASS_NAME = "block1_swin_body_1"
+NEW_SHARED = 20480
+W8_NEW_BYTES = 45056
+SC_NEW_BYTES = 1044
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def main():
+    # the combined weight pack = the deployed 32768 B parent pack + the 12288 B
+    # QKV tiles, so binding 5 keeps the parent's tiles at their original offsets
+    # the deployed plan binds the pack through its buffer table; read that path
+    _lines = PARENT.read_text(encoding="utf-8").splitlines()
+    _nb = int(_lines[0].split()[2])
+    _bufs = {}
+    for l in _lines[1:1 + _nb]:
+        m = re.match(r'BUFFER "([^"]+)" (\d+) "([^"]*)"', l)
+        if m:
+            _bufs[m.group(1)] = Path(m.group(3))
+    _w8_name = _lines[1 + 604].split('"')[1]
+    parent_w8 = _bufs[_w8_name]
+    assert parent_w8.is_file(), parent_w8
+    qkv = CARD / "pack/c32_block1_qkvweights.i8.bin"
+    base = parent_w8.read_bytes()
+    add = qkv.read_bytes()
+    assert len(base) == 32768 and len(add) == 12288, (len(base), len(add))
+    WEIGHTS.write_bytes(base + add)
+    assert WEIGHTS.stat().st_size == W8_NEW_BYTES, WEIGHTS.stat().st_size
+
+    lines = PARENT.read_text(encoding="utf-8").splitlines()
+    h = lines[0].split()
+    nb, npass = int(h[2]), int(h[3])
+    assert h[0] == "PORT_NETWORK_1"
+    new = list(lines)
+    deltas = []
+
+    # 1/2: buffer table
+    new[0] = " ".join([h[0], h[1], str(nb + 2), h[3], h[4]])
+    deltas.append({"line": 1, "field": "header buffer count", "old": nb,
+                   "new": nb + 2,
+                   "reason": "two pack buffers appended (weights, scales)"})
+    buf_w = 'BUFFER "c32_b1_i8_weights_qkv" %d "%s"' % (W8_NEW_BYTES, WEIGHTS.as_posix())
+    buf_s = 'BUFFER "c32_b1_i8_scales_qkv" %d "%s"' % (SC_NEW_BYTES, SCALES.as_posix())
+    new[nb + 1:nb + 1] = [buf_w, buf_s]
+    deltas.append({"line": nb + 1, "field": "BUFFER (inserted)", "old": None,
+                   "new": buf_w, "reason": "parent 32768 B w8 ++ 12288 B QKV tiles"})
+    deltas.append({"line": nb + 2, "field": "BUFFER (inserted)", "old": None,
+                   "new": buf_s, "reason": "164 parent scale entries + 96 QKV dequant "
+                                           "+ invY"})
+
+    rest = new[1 + nb + 2:]
+    i, found = 0, None
+    for _ in range(npass):
+        t = re.findall(r'"[^"]*"|\S+', rest[i])
+        nbind = int(t[6])
+        if t[2].strip('"') == PASS_NAME:
+            found = i
+            break
+        i += 1 + nbind + 1
+    assert found is not None, "pass not found"
+    off = 1 + nb + 2 + found
+    t = re.findall(r'"[^"]*"|\S+', new[off])
+    old_pass = new[off]
+    t[3] = '"%s"' % SPV.as_posix()
+    deltas.append({"line": off + 1, "field": "PASS %s spv" % PASS_NAME,
+                   "old": old_pass.split()[3], "new": t[3].strip('"'),
+                   "reason": "candidate module (QKV segment INT8)"})
+    deltas.append({"line": off + 1, "field": "PASS %s shared" % PASS_NAME,
+                   "old": int(t[5]) if False else 18432, "new": NEW_SHARED,
+                   "reason": "declared shared 18432 -> 20480: sY8[2048] added; "
+                             "declaration, not a native allocation"})
+    t[5] = str(NEW_SHARED)
+    new[off] = " ".join(t)
+
+    b5 = off + 1 + 5
+    b6 = off + 1 + 6
+    w5 = new[b5].split()
+    deltas.append({"line": b5 + 1, "field": "BIND 5 (w8)", "old": new[b5],
+                   "new": "BIND 5 %d 0 %d" % (nb, W8_NEW_BYTES),
+                   "reason": "appended QKV weight tiles live at w8[32768..45056)"})
+    new[b5] = "BIND 5 %d 0 %d" % (nb, W8_NEW_BYTES)
+    deltas.append({"line": b6 + 1, "field": "BIND 6 (fsc)", "old": new[b6],
+                   "new": "BIND 6 %d 0 %d" % (nb + 1, SC_NEW_BYTES),
+                   "reason": "96 dequant factors + invY appended after the parent's "
+                             "164 entries"})
+    new[b6] = "BIND 6 %d 0 %d" % (nb + 1, SC_NEW_BYTES)
+
+    OUT.write_text("\n".join(new) + "\n", encoding="utf-8")
+    import difflib
+    hunks = [h for h in difflib.unified_diff(lines, new, "parent", "candidate", n=0)
+             if h.startswith(("-", "+")) and not h.startswith(("---", "+++"))]
+    diff = hunks
+    rec = {"parent": {"path": PARENT.as_posix(), "sha256": sha(PARENT),
+                      "bytes": PARENT.stat().st_size},
+           "candidate": {"path": OUT.as_posix(), "sha256": sha(OUT),
+                         "bytes": OUT.stat().st_size},
+           "line_count": {"parent": len(lines), "candidate": len(new)},
+           "weight_pack": {"path": WEIGHTS.as_posix(), "bytes": W8_NEW_BYTES,
+                           "sha256": sha(WEIGHTS),
+                           "parent_part": {"path": parent_w8.as_posix(),
+                                           "sha256": sha(parent_w8)},
+                           "appended": {"path": qkv.as_posix(), "sha256": sha(qkv)}},
+           "scale_pack": {"path": SCALES.as_posix(), "bytes": SC_NEW_BYTES,
+                          "sha256": sha(SCALES)},
+           "spv": {"path": SPV.as_posix(), "sha256": sha(SPV),
+                   "bytes": SPV.stat().st_size},
+           "deltas": deltas,
+           "changed_lines_unified": diff,
+           "changed_line_count": len(diff),
+           "scope": {"switched_passes": [PASS_NAME],
+                     "parent_passes_kept": 6,
+                     "why": "only block1 has a calibrated invY; the other six R02 "
+                            "passes keep the parent module until their own capture "
+                            "exists (their weight packs are staged)"}}
+    EV.write_text(json.dumps(rec, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps({"parent_sha256": rec["parent"]["sha256"],
+                      "candidate_sha256": rec["candidate"]["sha256"],
+                      "changed_lines": len(diff),
+                      "weights_sha256": rec["weight_pack"]["sha256"],
+                      "scales_sha256": rec["scale_pack"]["sha256"]}, indent=1))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,112 @@
+n27-f07 - F07 (C64/C128/C256 三核) 成本分解 + D0 候选
+状态: BUILT / AWAITING-GPU (父字节复现 + SPV 验证 + plan + cpu-check 全过; 未跑 GPU)
+日期: 2026-10-28
+
+================================================================================
+0. 给主代理卡模板用的两条硬结论 (请优先采纳)
+================================================================================
+(1) F07 = ordinal 17 / 35 / 59 (f3c64_body_ds / f3c128_body_ds / f3c256_body_ds,
+    PASS 行 8/14/22, pipeline 7/11/15, SPV e45c8204 / af2304e5 / c8531484).
+    卡面写的 [217,218,219] 在台账里是 F04/F05/F06. 本轮已两次写错族归属 (n25, n27),
+    建议卡模板不再手写 ordinal, 一律写「从 CURRENT-232-ROWS 现取」.
+
+(2) 该族三核是三个不同层, 不共享权重/输入. 逐条依据:
+    - 权重块布局相同 [(n/16)*(K/16)+(k/16)]*256, 但 K = 64 / 128 / 256,
+      块步长 (n/16)*1024 / *2048 / *4096, wo 与 ars 三个 PASS 各自不同 -> 三份不同权重.
+    - 输入行距 64 / 128 / 256 半, T/Y 张量各自 w*64*K 起始 -> 三份不同输入.
+    - 三个 PASS 是三个独立 dispatch (中间隔着其他 PASS 的输出依赖) -> 跨 dispatch 合并读
+      就是 L19 已判 D 的跨 PASS 布局折叠.
+    => F05 M 批那种「同地址重复读合并」在本族不存在. 族内唯一的重复读是 C64 的 4x 权重
+      (4 个 sg%2 相同的 subgroup 读同一批块, 24 KiB/WG 冗余), 被 128 GRF 上限挡死 (见 1 节 D5).
+
+================================================================================
+1. 可删清单的量级对照 (本条是本卡最有价值的产出)
+================================================================================
+族级: 三核隔离时间合计 0.221 ms (帧份额 1.22%); 每帧约 4.3M 条消息 / 约 401 MiB 逻辑读.
+L13 批间漂移阈值 0.03 ms => 任何机制必须删掉本族 >=13.6% 的工作才可能被 ordinary 检出.
+
+| # | 可删工作 | 每帧量 | 占本族消息 | 折算时间 | 门槛判定 |
+|---|---|---|---|---|---|
+| D0 | C256 A 片段读: 8x32 B -> 1x256 B | -7168 msg/WG x 77 | -11% | 约 0.038 ms | 唯一过阈值 (1.3 倍) |
+| D1 | C256 shT 往返 (512 load + 512 store + 1 barrier) | -1024 msg/WG | -1.8% | <=0.005 ms | 6 倍低于底噪; 且是交易 (A 读 8x 搬到 global, +17 MiB/帧) |
+| D2 | C256 nrf_pair (池化 staging) = F07-P | -640 msg/WG | -1.2% | <=0.003 ms | 6-10 倍低于底噪; 已测 INDISTINCT |
+| D3 | C256 DS staging = F07-D | -320 msg/WG | -0.6% | <=0.002 ms | 15 倍低于底噪; 已测 INDISTINCT |
+| D4 | C256 scale 片段跨 j 复用 | -112 msg/WG | -0.2% | <=0.001 ms | 已测 INDISTINCT (f07-scale-fragments, -0.0112 ms) |
+| D5 | C64 4x 权重重复读 | -48 msg/WG x 1050 | -1.2% | <=0.003 ms | 寄存器挡死: 8 累加器 = +16 GRF @ max_r 127 (L9/L15) |
+| D6 | C256 DS 两轮共读 A | -1024 msg/WG | -1.8% | <=0.005 ms | 寄存器挡死: 合并两轮 = +16 GRF @ max_r 126 |
+| D7 | 整数/地址重算 (C256 1890 add + 430 mul + 194 shl) | - | - | - | 轴已封闭: L16 (21 族普查 0 个值得开卡) + L1 (实测 0 收益) |
+| D8 | debug 路径 (三核 if(debug)) | - | - | - | 不算收益: L17 实测 +0.005 ms |
+
+结论: 除 D0 外, 全部可删工作 <=0.005 ms, 比 L13 底噪低 6 倍以上.
+这也是本卡没有选「重复读/共享权重」(D5/D6 被寄存器挡死) 和「整数重算」(D7 轴封闭) 的原因.
+
+================================================================================
+2. 已测过的同族机制 (禁止原样重跑)
+================================================================================
+- f07d-f3-direct-scatter (C64+C128, F07-D): INDISTINCT.
+- f07p-f3-regpool (C64+C128, F07-P): INDISTINCT.
+- f07dp-f3-combined (C64+C128, P+D): gate PASS 但 ordinary SLOWER -0.027 ms
+  CI[-0.048,-0.005], 归因「shuffle > SLM savings」(handoff RESULTS.json).
+  注: 该 SLOWER 的 SPV 仍进了 CURRENT-232-ROWS 的 17/35 行 (历史组合 plan 带入), 本卡不动它们.
+- f07-scale-fragments (三宽, 系数/scale 片段复用): INDISTINCT -0.0112 ms
+  CI[-0.0510,+0.0286] (fullnet-mechanism-transfer-20261026).
+- ups-* 系列是 F18 c3x_pre_* (ord 166/192/212), 不是 F07, 勿混.
+
+================================================================================
+3. 本卡候选 (D0)
+================================================================================
+机制: 把 C256 的 T staging (shT, 32 KiB) 改成片段连续布局, 使 DPAS 的 A 片段
+(8x16 半 = 256 B) 在 SLM 里成为一段连续 256 B, 从而把 8 条 32 B 的 exec=1 uniform 读
+合成 1 条 256 B 的 uniform 读. 不是片段变宽 (片段仍 8x16), 是去掉行距 256 半的 stride.
+
+映射: dst(row,k) = ((row/8*16 + k/16)*8 + row%8)*16 + k%16
+(PROOF.json.mapping: 16384 元素双射; 128 片段 x 128 元素逐元素等价, 0 失配; 每片段连续 256 B).
+
+改动面 (SOURCE-DIFF.patch, 3 处):
+1. shT 填充循环: 线性 shT[e] = gT[w*16384+e] -> 按 16 半一块的置换拷贝 (每线程仍搬 64 半).
+2. A 读: coopMatLoad(a, shT, m0*256+k0, 256, LROW) -> coopMatLoad(a, shT, ((m0>>3)*16+ki)*128, 16, LROW).
+3. debug 分支: dbg[...] = shT[perm(e)] (语义与父一致; 门跑 debug=0).
+
+构建三件套 (全过):
+- 父字节复现: parent-rebuild.spv sha = c853148407be055e..., 与父逐字节相同
+  (RECIPES.json 配方, raw 编译, 无 decoration 转移、无 NoContraction 补丁, header pin 315e7c34).
+- candidate.spv sha = da0ee2d2f81bb1b2..., 33572 B, spv_validate_cpu.exe PASS.
+- plan.txt sha = ea053b92ea8f0c44..., 167526 B, 建在链头
+  accepted/restore-n10-f10-next-20261027/plan.txt (sha 719f100b...) 上, replaced == 1,
+  cpu_check = CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded.
+- float_NC_checked = 4 (NoContraction 4 个站点, 父子逐条一致: op129 x3 + op133 x1).
+- 算术对齐: 浮点算术零变化; 算术 opcode delta 仅 OpIAdd +9 / OpUDiv +10 (索引置换).
+- 资源: 3 个 Workgroup 变量不变 (WG mem 45056)、binding 集合不变、scratch 0.
+- pipeline 映射不变 (40 pipelines, ordinal 59 = pipeline 15, 已用两份 plan 逐行重算).
+
+================================================================================
+4. 未决项 / 风险
+================================================================================
+1. U1 (决定成败): IGC 会不会把 8 条连续的 32 B uniform SLM 读合成 1 条 256 B?
+   反证是 L20/n23 (连续化没换来更宽 opcode, 但那是 exec16 逐 lane gather 区);
+   正证是本网络里 256 B/512 B 的 uniform 块读大量存在 (load.ugm.d32x64t x547、
+   load.slm.d64x64t x64、load.slm.d32x64t x3), 且本核自己就在 exec=1 用 256 B 的
+   store.slm.d32x64t. 判据写死: 看不到 256 B 级消息 => A 类, 把「SLM A 分块行距」轴按 A 关闭.
+2. U2: 填充的 SLM 写从线性变成 256 B 跨步, 可能 32 路银行冲突 (512 条 store/WG 不变).
+   若 native 看到 fill 的 store.slm 条数/停顿上升或 mov 显著上升 => B 类,
+   修法: fill 改成 fragment-major 线程映射 (连续 lane 写连续 32 B).
+3. U3: 预测 0.038 ms 只有 L13 阈值 1.3 倍 => 单批显著不算数, 必须第二批平衡批复现.
+4. replaced == 1 而非卡面要求的 3: C64/C128 没有 SLM staging 可改; 造字节相同副本会改 SPV 路径,
+   而 runner 的 pipeline key 是路径 (clock_runner.cpp:354), 会重排 pipeline 索引、破坏 native 映射.
+   已按主代理 2026-10-28 裁定执行, 并记进 BUILD.json.scope.
+
+================================================================================
+5. 恢复点 (下一处具体改动)
+================================================================================
+若 GPU 回来判 A 类 (无 256 B 消息):
+  下一处改动 = 把 A 读改成 IGC 必须认的宽搬运形式——例如把 8 行放进一个显式 8xdword 的
+  uvec/f16vec8 连续搬运再喂给 coopMatLoad (load.slm.d32x64t 的 8 GRF 目标正好等于 DPAS 的
+  A 操作数窗口), 或改用 ColumnMajor + 转置分块再试一次; 若两版都拿不到更宽 opcode
+  => 这条轴按 A 彻底关闭, 本族转 D 类收口.
+若判 B 类 (有 256 B 消息但 mov/停顿上升):
+  下一处改动 = fill 改 fragment-major 线程映射 (连续 lane 处理同一片段的连续 8 行), 消除银行冲突.
+
+文件: COST-BREAKDOWN.md (成本分解)、ANALYSIS.md (六问)、PROOF.json (映射/算术/资源证明)、
+SOURCE-DIFF.patch、candidate.comp、candidate.spv、parent-rebuild.spv、plan.txt、BUILD.json、
+COST-LEDGER.json、COST-RAW.json (ISA 原始计数)、NATIVE-PREDICTION.md、PIPELINE-PREDICTION.json、
+GPU-REQUEST.json、脚本 isa_cost.py / build.py / proof.py / pipeline_prediction.py / finalize.py.

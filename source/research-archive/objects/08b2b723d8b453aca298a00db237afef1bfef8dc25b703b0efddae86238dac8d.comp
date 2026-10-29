@@ -1,0 +1,169 @@
+// c256_output_qx_int8.comp — C256 body_4 output epilogue, unchanged FP16
+// attention output projection + residual, plus the one-time qX production for
+// the NEXT block's expand.
+//
+// Parent identity: candidates/amd-map-20261015/s1-output-complete/c256/epi-only/
+// c256_d4_epi_only.comp (byte-exact reproduction of the deployed
+// output-c256-epi-only.spv recorded in evidence/parent-repro).
+//
+// The qX store is a cooperative int8 store of the already-narrowed FP16 output
+// fragment (no lane map is assumed), with the destination block's inverse step
+// read from the destination buffer's SC[0]. C256_QX_LAST=1 compiles the last
+// block's variant without binding 8 and without the qX write (block55 has no
+// C256 consumer; the next block is C128).
+#version 450
+#ifndef C256_QX_LAST
+#define C256_QX_LAST 0
+#endif
+// Diagnostic contract experiment (v5): 0 = v4 pack/unpack roundtrip,
+// 1 = explicit precise float16 roundtrip before the quantiser.  The hypothesis
+// under test is that the compiler folds the pack/unpack pair back to the
+// unrounded FP32 accumulator, so qX is quantised from a value that is not the
+// half written to imgout.  A new SPV identity and a separate arm are required.
+#ifndef C256_QX_HALF_MODE
+#define C256_QX_HALF_MODE 0
+#endif
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256) in;
+#ifndef NR_D4_MODE
+#define NR_D4_MODE 0
+#endif
+#include "c256_common.glsl"
+
+layout(set = 0, binding = 6) buffer YBuf { float16_t gY[]; };
+layout(set = 0, binding = 7) buffer TBuf { float16_t gT[]; };
+#if !C256_QX_LAST
+// destination block's new buffer; only scal[0] (invX) and the qX region are used.
+// v2 FIX (2026-10-19): v1 read invX at 360,448 = ew[0] (~3e-4) instead of the inverse
+// step at 372,736 (C256_SCAL_OFF), so every emitted code rounded to 0.
+layout(set = 0, binding = 8) buffer DestQX {
+    int8_t d_pad0[372736];      //  0        weights + per-channel factors of the destination block
+    float  d_sc[32];            //  372,736  scal[]: [0]=127/absmaxX of the destination
+    int8_t d_pad1[3968];        //  372,864  rs[256] and padding -> qx at 376,832
+    int8_t d_qx[];              //  376,832  canonical 32-channel-group qX
+};
+#endif
+
+shared float16_t shT[16384];
+#define MAT_H coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define C256_MF8 coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define C256_MQ8 coopmat<int8_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+
+void emit_qx(MAT_H narrowed, uint m0, uint n0, uint wx, uint wy, uint lane) {
+#if !C256_QX_LAST
+    uint q = m0 >> 4u, s = m0 & 15u;
+    int tx = 2 * int(wx) + pc.p0.z + int(q & 1u);
+    int ty = 2 * int(wy) + pc.p0.w + int(q >> 1u);
+    if (tx < 0 || ty < 0 || tx >= pc.p0.x || ty >= pc.p0.y) return;
+    uint tile = uint(ty) * uint(pc.p0.x) + uint(tx);
+    uint base = ((tile * 8u + (n0 / 32u)) * 16u + s) * 32u + (n0 % 32u);
+    float invX = d_sc[0];
+    C256_MF8 f = C256_MF8(narrowed);
+    for (uint c = 0u; c < f.length(); ++c) {
+        // v4 FIX: force the exact half value that imgout receives. v3 let the
+        // compiler feed the unrounded FP32 accumulator to the qX quantiser,
+        // producing +-1 codes at .5 boundaries (1693/4032 tokens on block49).
+#if C256_QX_HALF_MODE == 1
+        precise float16_t hv = float16_t(f[c]);
+        precise float fv = float(hv);
+#else
+        float fv = float(unpackHalf2x16(packHalf2x16(vec2(f[c], 0.0))).x);
+#endif
+        precise float code = fv * invX;
+        f[c] = clamp(roundEven(code), -127.0, 127.0);
+    }
+    C256_MQ8 qq = C256_MQ8(f);
+    coopMatStore(qq, d_qx, base, 32u, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+}
+
+void main() {
+    const uint t_local = gl_LocalInvocationID.x;
+    const uint sg = t_local / 32u;
+    const uint lane = t_local % 32u;
+    const uint wx = (pc.p1.z != 0) ? uint(pc.p2.x) : gl_WorkGroupID.x;
+    const uint wy = (pc.p1.z != 0) ? uint(pc.p2.y) : gl_WorkGroupID.y;
+    const uint w = wy * uint(pc.p1.x) + wx;
+    const bool debug = pc.p1.w != 0;
+    const uint wo = uint(pc.p4.x);
+    const uint ars = uint(pc.p4.z);   // p4.y is rs (used by D2) — ars is p4.z
+
+    for (uint e = t_local; e < 16384u; e += 256u)
+        shT[e] = gT[w * 16384u + e];
+    barrier();
+    if (debug) {
+        for (uint e = t_local; e < 16384u; e += 256u) {
+            dbg[425984u + e] = shT[e];
+        }
+        barrier();
+    }
+
+    for (uint j = 0u; j < 8u; ++j) {
+        uint m0 = (sg / 8u + 1u * j) * 8u;
+        uint n0 = (sg % 8u) * 32u;
+        MAT_C acc0;
+        {
+            MAT_H seed;
+            coopMatLoad(seed, gY, (w * 64u + m0) * 256u + n0, 256u, LROW);
+            MAT_H scale;
+            coopMatLoad(scale, pack, ars + n0, 0u, LROW);
+            seed = seed * scale;
+#if NR_D4_MODE == 2
+            acc0 = MAT_C(0.0);
+#else
+            acc0 = MAT_C(seed);
+#endif
+        }
+        MAT_C acc1;
+        {
+            MAT_H seed;
+            coopMatLoad(seed, gY, (w * 64u + m0) * 256u + (n0 + 16u), 256u, LROW);
+            MAT_H scale;
+            coopMatLoad(scale, pack, ars + (n0 + 16u), 0u, LROW);
+            seed = seed * scale;
+#if NR_D4_MODE == 2
+            acc1 = MAT_C(0.0);
+#else
+            acc1 = MAT_C(seed);
+#endif
+        }
+        for (uint ki = 0u; ki < 16u; ++ki) {
+            uint k0 = ki * 16u;
+            MAT_A a;  coopMatLoad(a, shT, m0 * 256u + k0, 256u, LROW);
+            MAT_B b0; coopMatLoad(b0, pack, wo + n0 * 256u + k0, 256u, LCOL);
+            MAT_B b1; coopMatLoad(b1, pack, wo + (n0 + 16u) * 256u + k0,
+                                  256u, LCOL);
+#if NR_D4_MODE != 1
+            acc0 = coopMatMulAdd(a, b0, acc0);
+            acc1 = coopMatMulAdd(a, b1, acc1);
+#endif
+        }
+        {
+            MAT_H narrowed = MAT_H(acc0);
+            if (debug)
+                coopMatStore(narrowed, dbg, 442368u + m0 * 256u + n0, 256u, LROW);
+            bool oob;
+            uint addr = c256_img_half_index(m0, n0, wx, wy, oob);
+            if (!oob)
+                coopMatStore(narrowed, imgout, addr, 16u, LROW);
+            emit_qx(narrowed, m0, n0, wx, wy, lane);
+        }
+        {
+            MAT_H narrowed = MAT_H(acc1);
+            if (debug)
+                coopMatStore(narrowed, dbg, 442368u + m0 * 256u + (n0 + 16u), 256u, LROW);
+            bool oob;
+            uint addr = c256_img_half_index(m0, (n0 + 16u), wx, wy, oob);
+            if (!oob)
+                coopMatStore(narrowed, imgout, addr, 16u, LROW);
+            emit_qx(narrowed, m0, n0 + 16u, wx, wy, lane);
+        }
+    }
+}

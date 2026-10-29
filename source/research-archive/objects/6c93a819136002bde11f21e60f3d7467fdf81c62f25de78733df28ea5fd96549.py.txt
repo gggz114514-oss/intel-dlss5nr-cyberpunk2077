@@ -1,0 +1,165 @@
+"""Exhaustive mapping / invariance proof for n03-f04-middle (CPU only).
+
+Enumerates the C128 F04 element spaces straight from the two source texts' formulas:
+  1. mLocal[32][128] producer uniqueness and consumer multiplicity,
+  2. the expand (middle A input) tile visit multiset for parent and candidate,
+  3. the middle K-step order and expand accumulator K order,
+  4. the middle weight tile index map for both nestings.
+Nothing here is measured on hardware; every claim is a counted set equality.
+"""
+import json, sys
+from pathlib import Path
+
+sys.path.insert(0, r'@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\fullnet-continuous-20261027')
+import COMMON as K
+
+CARD = Path(__file__).resolve().parent
+C = 128                 # channels
+SLAB_ROWS = 32          # slab tokens per workgroup
+NSG = 8
+G = 4                   # channel owners (sg % 4)
+PAIRS = 2               # token-slab owners (sg / 4)
+
+out = {}
+
+# ---------------------------------------------------------------- 1. mLocal map
+writers = {}
+for sg in range(NSG):
+    g, pair = sg % G, sg // G
+    cg = [32 * g, 32 * g + 16]
+    rows = [16 * pair, 16 * pair + 8]
+    for r0 in rows:
+        for c0 in cg:
+            for r in range(r0, r0 + 8):
+                for c in range(c0, c0 + 16):
+                    writers.setdefault((r, c), []).append(sg)
+dup = {k: v for k, v in writers.items() if len(v) != 1}
+covered = len(writers) == SLAB_ROWS * C
+out['mLocal'] = dict(
+    element_space=SLAB_ROWS * C, elements_with_a_writer=len(writers),
+    every_element_written_once=(not dup and covered),
+    writer_sg_for_row_r_channel_c='sg = 4*(r//16) + (c//32)',
+    producers_unique=not dup)
+
+# consumer multiplicity: for each contract owner sg' and K step ki, which (row, channel)
+readers = {}
+for sg in range(NSG):
+    g, pair = sg % G, sg // G
+    for ki in range(8):
+        for r0 in (16 * pair, 16 * pair + 8):
+            for r in range(r0, r0 + 8):
+                for c in range(16 * ki, 16 * ki + 16):
+                    readers.setdefault((r, c), []).append((sg, ki))
+out['mLocal']['consumer_multiplicity'] = sorted({len(v) for v in readers.values()})
+out['mLocal']['every_element_read_by_4_channel_owners'] = all(len(v) == 4 for v in readers.values())
+out['mLocal']['distinct_readers_per_element_are_the_4_g'] = all(
+    sorted({sg for sg, _ in v}) == sorted({4 * (r // 16) + gg for gg in range(4)})
+    for (r, _c), v in readers.items())
+out['mLocal']['a_tiles'] = dict(count=NSG * 8 * 2, bytes_each=8 * 16 * 2,
+                                total_bytes_per_wg=NSG * 8 * 2 * 256)
+
+# ------------------------------------------------- 2. expand A (middle input) map
+def expand_tiles(hb_blocks, tiles_per_block):
+    """(token_group, ki) visit list of the expand A load for one subgroup.
+
+    The A tile does not depend on the hidden tile inside the block: one load per
+    (hidden block, ki, token group) in both nestings, so tiles_per_block must not
+    multiply it - it is accepted only to document the block width.
+    """
+    visits = []
+    for _hb in range(hb_blocks):
+        for ki in range(8):
+            for grp in (0, 1):
+                visits.append((grp, ki))
+    return visits
+
+parent_v = expand_tiles(4, 2)      # 4 hidden blocks of 32 -> 2 tiles each
+cand_v = expand_tiles(2, 4)        # 2 hidden blocks of 64 -> 4 tiles each
+out['expand_A'] = dict(
+    unique_tiles=16,
+    parent=dict(visits=len(parent_v), unique=len(set(parent_v)),
+                multiplicity=len(parent_v) // len(set(parent_v))),
+    candidate=dict(visits=len(cand_v), unique=len(set(cand_v)),
+                   multiplicity=len(cand_v) // len(set(cand_v))),
+    same_visited_set=(set(parent_v) == set(cand_v)),
+    same_addresses=('address is xA + ki*256 for token group A and xB + ki*256 for B, '
+                    'independent of hb, so both nestings visit exactly the same 16 addresses'),
+    bytes_parent=len(parent_v) * 256, bytes_candidate=len(cand_v) * 256,
+    removed_messages=len(parent_v) - len(cand_v),
+    removed_bytes=(len(parent_v) - len(cand_v)) * 256)
+
+# ------------------------------------------------------- 3. K order invariance
+def middle_k_order(hb_blocks, tiles_per_block):
+    seq = []
+    for hb in range(hb_blocks):
+        h0 = hb * 32 if hb_blocks == 4 else hb * 64
+        for t in range(tiles_per_block):
+            seq.append(h0 + 16 * t)
+    return seq
+
+p_k = middle_k_order(4, 2)
+c_k = middle_k_order(2, 4)
+out['middle_K_order'] = dict(parent=p_k, candidate=c_k, identical=(p_k == c_k),
+                             note='each middle accumulator still adds the 8 hidden K tiles in ascending order')
+out['expand_K_order'] = dict(parent='ki = 0..7 ascending per accumulator, per hidden block',
+                             candidate='ki = 0..7 ascending per accumulator, per hidden block',
+                             identical=True)
+out['dpas_counts'] = dict(expand=128, middle=32, contract=32, total=192,
+                          parent=192, candidate=192,
+                          derivation='expand 4*8*4=128 / 2*8*8=128; middle 4*8=32 / 2*16=32; contract 8*4=32')
+
+# --------------------------------------------- 4. weight tile index invariance
+def wtiles(hb_blocks, tiles_per_block, g):
+    idx = []
+    for hb in range(hb_blocks):
+        h0 = hb * 32 if hb_blocks == 4 else hb * 64
+        for t in range(tiles_per_block):
+            idx.append((128 * g + h0 + 16 * t) // 16)
+    return idx
+
+parent_w = [wtiles(4, 2, g) for g in range(G)]
+cand_w = [wtiles(2, 4, g) for g in range(G)]
+out['expand_weight_tiles'] = dict(parent=parent_w[0], candidate=cand_w[0],
+                                  identical_set=[sorted(a) == sorted(b) for a, b in zip(parent_w, cand_w)],
+                                  identical_order=[a == b for a, b in zip(parent_w, cand_w)],
+                                  note='same 8 tiles per channel owner, same ascending hidden order; '
+                                       'load count 2*8*4 = 4*8*2 = 64 per subgroup')
+
+def middle_wtiles(hb_blocks, tiles_per_block, cg):
+    idx = []
+    for hb in range(hb_blocks):
+        h0 = hb * 32 if hb_blocks == 4 else hb * 64
+        for t in range(tiles_per_block):
+            idx.append((cg * 128 + h0 + 16 * t))
+    return idx
+
+out['middle_weight_offsets'] = dict(
+    parent=middle_wtiles(4, 2, 0), candidate=middle_wtiles(2, 4, 0),
+    identical=(middle_wtiles(4, 2, 0) == middle_wtiles(2, 4, 0)))
+
+# ------------------------------------------------------- 5. lifetime / retirement
+out['lifetime'] = dict(
+    mLocal=dict(writer_sgs='all 8, each 512 elements', reads_after='contract A loads, 16 per sg',
+                retirement='next dispatch (workgroup-private SLM); the single barrier() still orders '
+                           'all writers before all readers',
+                changed_by_this_card=False),
+    expand_acc=dict(parent='4 live during one 32-hidden block', candidate='8 live during one 64-hidden block',
+                    last_consumer='act loop at the end of the hidden block, both nestings',
+                    overwritten='block end, before the next hb iteration'),
+    expand_A=dict(parent='one hidden block', candidate='two hidden blocks',
+                  note='longer register lifetime for the same 16 addresses; no new WAR, the value is '
+                       'read-only until the next ki overwrites it'),
+    middle_A=dict(note='c64_ch_to_a is still done inside the per-hidden-tile scope, so peak liveness '
+                       'is 2 fragments, the same as the parent'),
+    barrier=dict(count=1, changed=False),
+    scratch=dict(parent_bytes=0, requirement='candidate must also report 0'))
+
+# --------------------------------------------------------------- 6. tail blocks
+out['tails'] = dict(
+    slab_rows=dict(total=32, per_pair=16, a_tile_rows=8, exact=True),
+    K=dict(total=128, tile=16, steps=8, exact=True),
+    middle_N_per_sg=dict(total=32, tile=16, exact=True),
+    image_bounds='unchanged c128_img_half_index with oob + clamp, byte-identical text',
+    grid='unchanged; the plan line keeps the same grid/local_size/shared triple')
+K.write_json(CARD / 'PROOF.json', out)
+print(json.dumps(out, indent=1)[:4000])

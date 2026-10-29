@@ -1,0 +1,219 @@
+"""spv_sites.py - enumerate every static cooperative-matrix multiply of a module,
+attribute it to one of the four R02 segments, and record A/B/C provenance.
+
+CPU only.  The module is decoded from raw words (tools/spvlib.py); nothing is
+executed, no driver, device or lock is touched.
+
+Segment rule (objective, derived from the module itself, not from source text):
+  * A is a shared-array load of `shK`            -> QK
+  * A is a shared-array load of `shV`            -> PV
+  * A is a half weight load from binding 0 and B is authored by the `yb*`
+    register handoff (the contract output rows)  -> QKV
+  * A is a half weight load from binding 0 and B is authored by the `tb*`
+    register handoff (the context rows)          -> OUTPUT
+Any site that does not match exactly one rule is reported as UNASSIGNED and the
+tool exits non-zero: a silent fifth segment would be an unattributed difference.
+
+Usage:  python spv_sites.py <spv> [--json out.json]
+"""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import spvlib as S  # noqa: E402
+
+SEGMENT_ORDER = ["QKV", "QK", "PV", "OUTPUT"]
+
+
+def producers(mod, id_, at_idx, depth=0, budget=None, acc=None):
+    """Terminal producers of a value, resolving function-variable stores in order.
+
+    SPIR-V operand positions are exact: "Result Type, Result <id>, ...", so the
+    first real operand of a binary instruction is a[2].  Every hop is followed
+    through the id graph, so the answer does not depend on the source text.
+    """
+    if acc is None:
+        acc = {"cm_load": [], "mma": [], "named_var": [], "call": [], "other": []}
+    if budget is None:
+        budget = [20000]
+    if depth > 40 or budget[0] <= 0:
+        return acc
+    budget[0] -= 1
+    it = mod.byid.get(id_)
+    if it is None:
+        if id_ in mod.consts:
+            acc["other"].append({"kind": "const", "value": mod.consts[id_]})
+        return acc
+    nm = it.name
+    if it.op == S.CMLOAD:
+        ptr = it.a[2]
+        b = mod.base_var(ptr)
+        chain = mod.byid.get(ptr)
+        off = [mod.resolve(x)[0] for x in chain.a[3:]] if (
+            chain is not None and chain.name in ("OpAccessChain",
+                                                 "OpInBoundsAccessChain")) else None
+        acc["cm_load"].append({
+            "var": mod.label_var(b) if b is not None else "?",
+            "base": (mod.names.get(b) or mod.block_name(b) or "#%d" % b)
+                    if b is not None else "?",
+            "binding": (mod.decor.get(b, {}).get(33, [[None]])[0][0]
+                        if b is not None else None),
+            "offset": off,
+            "layout": mod.resolve(it.a[3])[1] if len(it.a) > 3 else None,
+            "stride": mod.resolve(it.a[4])[1] if len(it.a) > 4 else None,
+            "type": mod.cm_type(it.a[0]),
+            "word_offset": it.woff,
+        })
+        return acc
+    if it.op == S.MMA:
+        acc["mma"].append({"word_offset": it.woff, "type": mod.cm_type(it.a[0])})
+        return acc
+    if nm == "OpLoad":
+        ptr = it.a[2]
+        b = mod.base_var(ptr)
+        if b is not None:
+            src = None
+            for prev in reversed(mod.insts[:it.idx]):
+                if prev.op == 62 and prev.a[0] == ptr:
+                    src = prev.a[1]
+                    break
+            name = mod.names.get(b)
+            if name:
+                acc["named_var"].append(name)
+            if src is not None:
+                return producers(mod, src, it.idx, depth + 1, budget, acc)
+            return acc
+        return producers(mod, ptr, it.idx, depth + 1, budget, acc)
+    if nm in ("OpCopyObject", "OpBitcast", "OpFConvert", "OpUConvert", "OpSConvert",
+              "OpConvertSToF", "OpConvertUToF", "OpQuantizeToF16", "OpFNegate", "OpNot"):
+        return producers(mod, it.a[2], it.idx, depth + 1, budget, acc)
+    if nm in ("OpCompositeConstruct", "OpVectorShuffle", "OpVectorExtractDynamic",
+              "OpVectorInsertDynamic"):
+        for v in it.a[2:]:
+            producers(mod, v, it.idx, depth + 1, budget, acc)
+        return acc
+    if nm == "OpCompositeExtract":
+        return producers(mod, it.a[2], it.idx, depth + 1, budget, acc)
+    if nm == "OpCompositeInsert":
+        producers(mod, it.a[2], it.idx, depth + 1, budget, acc)
+        return producers(mod, it.a[3], it.idx, depth + 1, budget, acc)
+    if nm in ("OpSelect", "OpVectorExtractDynamic"):
+        for v in it.a[2:5]:
+            producers(mod, v, it.idx, depth + 1, budget, acc)
+        return acc
+    if nm == "OpPhi":
+        for v in it.a[2::2]:
+            producers(mod, v, it.idx, depth + 1, budget, acc)
+        return acc
+    if nm in ("OpFMul", "OpFAdd", "OpFSub", "OpFDiv"):
+        acc["other"].append({"kind": "float_expr", "woff": it.woff})
+        for v in (it.a[2], it.a[3]):
+            producers(mod, v, it.idx, depth + 1, budget, acc)
+        return acc
+    if nm == "OpFunctionCall":
+        acc["call"].append({"callee": mod.funcs.get(it.a[2], "?"), "woff": it.woff})
+        for v in it.a[3:]:
+            producers(mod, v, it.idx, depth + 1, budget, acc)
+        return acc
+    if nm in ("OpGroupNonUniformShuffleXor", "OpGroupNonUniformShuffle"):
+        acc["other"].append({"kind": nm, "woff": it.woff})
+        return producers(mod, it.a[3], it.idx, depth + 1, budget, acc)
+    if nm == "OpGroupNonUniformBroadcastFirst":
+        acc["other"].append({"kind": nm, "woff": it.woff})
+        return producers(mod, it.a[3], it.idx, depth + 1, budget, acc)
+    acc["other"].append({"kind": nm, "woff": it.woff})
+    return acc
+
+
+def classify(prov):
+    if prov["cm_load"]:
+        v = prov["cm_load"][0]
+        return {"kind": "cm_load", "var": v["var"], "base": v["base"],
+                "binding": v["binding"], "offset": v["offset"],
+                "layout": v["layout"], "stride": v["stride"]}
+    return {"kind": "register_handoff", "named_vars": sorted(set(prov["named_var"])),
+            "upstream_mma": [m["word_offset"] for m in prov["mma"]],
+            "float_exprs": len(prov["other"]),
+            "shuffles": sum(1 for o in prov["other"]
+                            if str(o.get("kind", "")).startswith("OpGroupNonUniform"))}
+
+
+def segment_of(a_src, b_src):
+    abase = a_src.get("base")
+    bnames = set(b_src.get("named_vars") or [])
+    if abase == "shK":
+        return "QK"
+    if abase == "shV":
+        return "PV"
+    if a_src.get("kind") == "cm_load" and a_src.get("binding") == 0:
+        if bnames & {"yb0", "yb1", "y0", "y1", "y2", "y3"}:
+            return "QKV"
+        if bnames & {"tb0", "tb1", "ctx0", "ctx1", "ctx2", "ctx3"}:
+            return "OUTPUT"
+    return "UNASSIGNED"
+
+
+def band(offsets, gap):
+    bands = []
+    for o in sorted(offsets):
+        if bands and o - bands[-1][1] <= gap:
+            bands[-1][1] = o
+            bands[-1][2] += 1
+        else:
+            bands.append([o, o, 1])
+    return bands
+
+
+def main():
+    spv = sys.argv[1]
+    gap = 512
+    mod = S.Mod(spv)
+    sites = mod.mma_sites()
+    fp16 = [s for s in sites if s["result_type"]["component"] == "f32"]
+    int8 = [s for s in sites if s["result_type"]["component"] == "i32"]
+    for s, label in [(x, "fp16") for x in fp16] + [(x, "int8") for x in int8]:
+        s["label"] = label
+        s["A_src"] = classify(producers(mod, s["A_id"], s["idx"]))
+        s["B_src"] = classify(producers(mod, s["B_id"], s["idx"]))
+        s["C_src"] = classify(producers(mod, s["C_id"], s["idx"]))
+        s["segment"] = segment_of(s["A_src"], s["B_src"]) if label == "fp16" else "INT8"
+    counts = {}
+    for s in sites:
+        counts[s["segment"]] = counts.get(s["segment"], 0) + 1
+    bands = band([s["word_offset"] for s in fp16], gap)
+    out = {
+        "spv": str(spv),
+        "sha256": None,
+        "bytes": len(mod.raw),
+        "words": len(mod.w),
+        "bound": mod.bound,
+        "lds": mod.lds(),
+        "lds_bytes": sum(x["bytes"] for x in mod.lds()),
+        "mma_total": len(sites),
+        "fp16_mma": len(fp16),
+        "int8_mma": len(int8),
+        "segment_counts": counts,
+        "fp16_offset_bands": [{"first_word": b[0], "last_word": b[1], "count": b[2]}
+                              for b in bands],
+        "sites": [{k: s[k] for k in ("segment", "label", "word_offset", "result_id",
+                                     "function", "function_name", "A_id", "B_id", "C_id",
+                                     "result_type", "B_type", "C_type",
+                                     "A_src", "B_src", "C_src")} for s in sites],
+        "histogram": mod.histogram(),
+    }
+    import hashlib
+    out["sha256"] = hashlib.sha256(mod.raw).hexdigest()
+    txt = json.dumps(out, ensure_ascii=False, indent=1)
+    if "--json" in sys.argv:
+        Path(sys.argv[sys.argv.index("--json") + 1]).write_text(txt, encoding="utf-8")
+    summary = {k: out[k] for k in ("sha256", "bytes", "words", "lds_bytes",
+                                   "mma_total", "fp16_mma", "int8_mma",
+                                   "segment_counts", "fp16_offset_bands")}
+    print(json.dumps(summary, ensure_ascii=False, indent=1))
+    if counts.get("UNASSIGNED"):
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

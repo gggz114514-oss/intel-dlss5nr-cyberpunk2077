@@ -1,0 +1,599 @@
+"""S05 step 6: emit CONTRACT.json / QUALITY.json / JOBS.json / COST.txt from live evidence.
+
+Every SHA256 in the emitted files is computed here from the file on disk, so nothing is
+transcribed by hand.  Citations are (relative path, line) pairs into the read-only sources.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import s05_common as C
+
+data = C.rows()
+buf = data['buffers']
+rows = {r['name']: r for r in data['rows']}
+r25, r26, r27, r28, r29 = (rows['f3c64_body_ds'], rows['block9_swin_body_1'], rows['block9_swin_body_2'],
+                           rows['block9_swin_body_3'], rows['block9_swin_body_4'])
+b25 = {int(k): v for k, v in r25['bindings'].items()}
+b26 = {int(k): v for k, v in r26['bindings'].items()}
+b27 = {int(k): v for k, v in r27['bindings'].items()}
+b29 = {int(k): v for k, v in r29['bindings'].items()}
+push = [int(x) for x in r26['push']]
+push_signed = [x if x < 2 ** 31 else x - 2 ** 32 for x in push]
+
+cal = json.loads((C.CARD / 'evidence/CALIBRATION-CPU.json').read_text())
+ver = json.loads((C.CARD / 'evidence/PACK-VERIFY.json').read_text())
+proof = json.loads((C.CARD / 'evidence/LAYOUT-PROOF.json').read_text())
+base = C.D / 'c64-family-static/combo-34189.txt'
+
+# ---- who binds the two block9 resources?  (is the 4160 B table shared?)
+OWN = (b26[0][0], b26[1][0])
+users = {i: [] for i in OWN}
+for r in data['rows']:
+    for k, v in r['bindings'].items():
+        if v[0] in OWN:
+            users[v[0]].append(dict(ordinal=r['ordinal'], pass_name=r['name'], binding=int(k),
+                                    offset=v[1], bytes=v[2]))
+shared = dict(
+    card='S05-c128',
+    weight_res=dict(index=OWN[0], name=buf[OWN[0]]['name'], users=users[OWN[0]]),
+    scale_res=dict(index=OWN[1], name=buf[OWN[1]]['name'], users=users[OWN[1]]),
+    verdict='NOT shared: the 4160 B table is bound only by ordinals 25/26/27 (the block9 chain). '
+            'No other C128 block reads this buffer, so changing it cannot pollute blocks 10..14/56..61. '
+            'The measured whole-network regression is caused by block9 itself.',
+    other_c128_scale_resources={str(b): [buf[b]['name'], buf[b]['bytes']] for b in
+                                (490, 492, 759, 762, 765, 768, 771, 774, 777, 780, 606)},
+)
+(C.CARD / 'evidence/SHARED-TABLE-CHECK.json').write_text(json.dumps(shared, indent=2))
+vd = json.loads((C.CARD / 'evidence/V2-FIX.json').read_text())
+gd1 = json.loads((C.CARD / 'evidence/GATE-DIAG.json').read_text())
+gd2 = json.loads((C.CARD / 'evidence/GATE-DIAG2.json').read_text())
+
+REL = lambda p: str(p).replace('\\', '/')
+B = REL(C.B)
+
+
+def spv_of(r):
+    p = Path(r['spv'])
+    return dict(path=REL(p), bytes=p.stat().st_size, sha256=C.sha256(p), plan_row_sha256=r['sha256'])
+
+
+def res(i):
+    x = buf[i]
+    return dict(index=i, name=x['name'], bytes=x['bytes'],
+                file=REL(x['file']) if x['file'] != '-' else '-',
+                sha256=C.sha256(x['file']) if x['file'] != '-' else None)
+
+
+dispatches = [
+    dict(ordinal=25, group=int(r25['pass_number']), name=r25['name'], spv=spv_of(r25),
+         role='C64->C128 write-out (WO) epilogue + DS projection + qX quantiser for block9',
+         pass_tokens_tail=r25['pass_tokens'][4:],
+         bindings={k: dict(res=v[0], name=buf[v[0]]['name'], offset=v[1], bytes=v[2]) for k, v in sorted(b25.items())},
+         push=[int(x) for x in r25['push']]),
+    dict(ordinal=26, group=int(r26['pass_number']), name=r26['name'], spv=spv_of(r26),
+         role='C128 FFN expand (512) + activation requant + mid (4x32) -> swin_9_M',
+         pass_tokens_tail=r26['pass_tokens'][4:],
+         bindings={k: dict(res=v[0], name=buf[v[0]]['name'], offset=v[1], bytes=v[2]) for k, v in sorted(b26.items())},
+         push=push),
+    dict(ordinal=27, group=int(r27['pass_number']), name=r27['name'], spv=spv_of(r27),
+         role='C128 FFN contract (128) + qX residual -> swin_9_Y',
+         pass_tokens_tail=r27['pass_tokens'][4:],
+         bindings={k: dict(res=v[0], name=buf[v[0]]['name'], offset=v[1], bytes=v[2]) for k, v in sorted(b27.items())},
+         push=push),
+    dict(ordinal=28, group=int(r28['pass_number']), name=r28['name'], spv=spv_of(r28),
+         role='C128 attention (consumes swin_9_Y/T as FP16 ABI)', pass_tokens_tail=r28['pass_tokens'][4:]),
+    dict(ordinal=29, group=int(r29['pass_number']), name=r29['name'], spv=spv_of(r29),
+         role='C128 WO producer: attention out -> block9_out (int8 qX for block10) using block10 scales',
+         pass_tokens_tail=r29['pass_tokens'][4:],
+         bindings={k: dict(res=v[0], name=buf[v[0]]['name'], offset=v[1], bytes=v[2]) for k, v in sorted(b29.items())}),
+]
+
+contract = dict(
+    card='S05-c128',
+    block=9,
+    written_utc='2026-10-29',
+    scope='One block closed end to end on CPU; GPU = NOT_RUN. Block9 is the first C128 FFN of the '
+          'first C128 group (blocks 9..14). Its two FFN dispatches are ordinals 26 (expand/mid) and '
+          '27 (contract/residual); its qX is produced by ordinal 25.',
+    boundary=dict(write_zone=REL(C.CARD),
+                  read_only=[REL(C.Q), REL(C.D), REL(C.B / 'candidates'), REL(C.B / 'src')],
+                  gpu='not touched (no clock_runner, no GPU.lock, no game)'),
+    bound_plan=dict(path=REL(base), sha256=C.sha256(base),
+                    header=base.read_text(encoding='utf-8').splitlines()[0],
+                    note='probe/calibration/candidate derive from this exact file'),
+    dispatches=dispatches,
+    resources=dict(
+        qx_input=dict(res=res(48), layout='int8 m8col per window (64 tokens x 128 ch), 252 windows',
+                      writer='ordinal 25 (f3c64_body_ds, r09)', readers='26,27,28,29'),
+        mid=dict(res=res(51), layout='int8 m8col per window, 64 tokens x 128 mid channels',
+                 writer='ordinal 26', reader='ordinal 27'),
+        y=dict(res=res(52), layout='half token-major (w*64+m)*128+n, 16128 tokens x 128 ch',
+               writer='ordinal 27', readers='ordinal 28, 29'),
+        t=dict(res=res(53), layout='half token-major', writer='ordinal 28', readers='29'),
+        weight_pack=dict(res=res(b26[0][0]), bound_binding=0,
+                         note='same 106496 B file is bound by ordinals 25 (b8), 26 (b0), 27 (b0)'),
+        scale_pack=dict(res=res(b26[1][0]), bound_binding=1,
+                        note='same 4160 B file is bound by ordinals 25 (b11), 26 (b1), 27 (b1)'),
+        parent_fp16_pack=dict(res=res(46), note='parent FP16 pack of this block; bound to 28/29 only, '
+                                                'used here as the weight-decode witness'),
+        aux=res(47), debug=res(50),
+        qx_next_block=res(49),
+    ),
+    weight_pack=dict(
+        bytes=106496,
+        int8_regions=[
+            dict(range=[0, 65536], shape=[512, 128], name='expand', form='row-major [n][k] stride 128',
+                 consumer='pilot_d1.comp:29-30  coopMatLoad(v, qw, (g*128+n0)*128+k, 128, COL)',
+                 parent_form='blocked 32x8x16x16 T(0,2,1,3)',
+                 parent_citation='build_batch.py:106'),
+            dict(range=[65536, 81920], shape=[128, 128], name='mid', form='row-major [o][k] stride 128',
+                 consumer='pilot_d1.comp:58-59  coopMatLoad(b, qw, 65536+(32g)*128+k, 128, COL)',
+                 parent_form='direct 128x128', parent_citation='build_batch.py:107'),
+            dict(range=[81920, 98304], shape=[128, 128], name='contract', form='row-major [n][k] stride 128',
+                 consumer='pilot_d2.comp:40-41  coopMatLoad(v, qw, 81920+n*128+k, 128, COL)',
+                 parent_form='blocked 8x8x16x16 T(0,2,1,3)', parent_citation='build_batch.py:108'),
+            dict(range=[98304, 106496], shape=[128, 64], name='ds_projection',
+                 form='int8, read as 98304 + n*64 + k',
+                 consumer='r09_f3c64_body_ds_wo_i8.comp:365,367',
+                 note='NOT owned by this card; byte-identical in the new pack'),
+        ],
+        decode=dict(signed=True, per_output_channel=True,
+                    quantiser='s = row_absmax/127 (float32); code = clip(rint(w * (1/s)), -127, 127)',
+                    citation='build_batch.py:45-46,115-127',
+                    audit='G1 (evidence/LAYOUT-PROOF.json): 0 mismatches on 65536+16384+16384 codes'),
+    ),
+    scale_pack=dict(
+        bytes=4160, floats=1040, consumers='ordinals 25 (912..1039), 26 (0..3,16..527,528..655), 27 (0..3,656..783,784..911)',
+        slots=[
+            dict(range=[0, 1], name='sX', meaning='FFN input scale; qX code = round(X/sX)'),
+            dict(range=[1, 2], name='invSX', meaning='1/sX, exact float32 reciprocal (build_batch.py:201)'),
+            dict(range=[2, 3], name='invSA', meaning='1/sA, activation code multiplier (pilot_d1.comp:19,38)'),
+            dict(range=[3, 4], name='invSM', meaning='1/sM, mid code multiplier (pilot_d1.comp:19,61-63)'),
+            dict(range=[4, 5], name='ds_pooled_scale', meaning='r09 producer entry_sc[4] for the C64 pooled value (source:315)',
+                 preserved='byte-identical to the bound pack'),
+            dict(range=[5, 16], name='unused', meaning='sc[5] is a stale sX copy nothing reads; 6..15 are zero',
+                 preserved='byte-identical to the bound pack'),
+            dict(range=[16, 528], name='sX*sWe[512]', meaning='expand output-channel dequant (pilot_d1.comp:20-22)'),
+            dict(range=[528, 656], name='sA*sWm[128]', meaning='mid output-channel dequant (pilot_d1.comp:49-53); '
+                 'index 528+g*32+j, g<4, j<32 -> 528..655'),
+            dict(range=[656, 784], name='sM*sWc[128]', meaning='contract output-channel dequant (pilot_d2.comp:30-31)'),
+            dict(range=[784, 912], name='sX*rs[128]', meaning='residual per-channel scale; residual = qX_code * sX*rs '
+                 '(pilot_d2.comp:32-33,17)'),
+            dict(range=[912, 1040], name='producer per-channel composed scale', meaning='the r09 producer '
+                 'computes code = round(acc * sc[912+c]) (source:347-348), so the STEP of channel c in feature '
+                 'units is  step_c = sX_anchor * bound_sc912_c / sc912_c  with sX_anchor = the bound pack\'s '
+                 'sc[0] (the FFN dequant, proved exact by G2).  Equivalently sc912_c = k_c/step_c with k_c the '
+                 'unobservable DS weight dequant.  It is NOT a free per-channel inverse: any edit must be '
+                 'expressed as a ratio of the bound table, and the resulting step_c must equal '
+                 'sc[0]_new * D_c (the uniform FFN dequant times the folded diagonal).  v1 violated this and '
+                 'is preserved as a negative result; v2 implements it (see this_card_change.v2).'),
+        ],
+        identities=dict(
+            sX_times_invSX=proof['gates']['G3']['sX_times_invSX'],
+            sc16_eq_sX_times_sWe_exact=proof['gates']['G2']['expand_exact'],
+            sc528_eq_sWm_over_invSA_exact=proof['gates']['G2']['mid_exact'],
+            sc656_eq_sWc_over_invSM_maxrel=proof['gates']['G2']['contract'],
+            sc784_eq_sX_times_pack_rs_exact=proof['gates']['G3']['residual_exact'],
+            note='G2/G3 in evidence/LAYOUT-PROOF.json, computed from the bound files only'),
+    ),
+    push_constants=dict(
+        words=push, signed=push_signed,
+        fields=dict(
+            p0=dict(tiles_x=push[0], tiles_y=push[1], shift_x=push_signed[2], shift_y=push_signed[3],
+                    citation='pilot_common.glsl:37-42 input_addr bounds/shift'),
+            p1=dict(window_grid_x=push[4], window_grid_y=push[5], single=push_signed[6], debug=push_signed[7],
+                    citation='pilot_d1.comp:15 / pilot_d2.comp:28  w = wy*p1.x + wx'),
+            p3=dict(we_half_offset=push[12], wm_half_offset=push[13], wc_half_offset=push[14], wq_half_offset=push[15],
+                    citation='build_batch.py:99,500 offsets_elements'),
+            p4=dict(word1=push[17], meaning='rs half offset in the parent FP16 pack (build_batch.py:99); '
+                    'the v4 C-d2 reads rs from sc[784..912] instead'),
+            p7=dict(word0=push[28], meaning='dumpdot gate; 0 = all integer diagnostic dumps disabled'),
+        ),
+        note='ordinals 26..29 carry the identical 32-word PUSH; ordinal 25 (producer) carries its own',
+    ),
+    addresses=dict(
+        token_major=dict(formula='Y[(w*64+m)*128 + n]', citation='pilot_d2.comp:24 coopMatStore(h, gy, (w*64+m)*128+n, 128, ROW)'),
+        m8col=dict(formula='m8_addr(m,c) = ((m>>3)*128 + c)*8 + (m&7); buffer offset w*8192 + m8_addr(m,c)',
+                   citation='pilot_common.glsl:43-44',
+                   used_by=['qX (48) read at pilot_d1.comp:29', 'residual seed at pilot_d2.comp:13',
+                            'M (51) written at pilot_d1.comp:62-64 and read at pilot_d2.comp:42,44']),
+        producer_writes_m8col=dict(formula='((window*8 + (token>>3))*N + group*16)*8 + (token&7)',
+                                   equals_m8col=True,
+                                   citation='r09_f3c64_body_ds_wo_i8.comp:350'),
+        image_half=dict(formula='((ty*42+tx)*8 + c//16)*256 + (t&15)*16 + c%16 with tx=2*wx+(q&1), ty=2*wy+(q>>1), q=t>>4',
+                        citation='pilot_common.glsl:37-42 (v4 input_addr) and build_batch.py:151-162 (windowize)',
+                        note='layout of the parent FP16 buffers and of the teacher dump_block8_out.bin; NOT the '
+                             'layout of qX/M/Y in this plan'),
+    ),
+    logical_shapes=dict(
+        tokens=16128, windows=252, tokens_per_window=64, tiles=1008, tile_px='4x4', pixel_grid='168x96',
+        channels=128,
+        expand=dict(M=16128, N=512, K=128, groups=4, group_width=128,
+                    grid='(21,12,4) workgroups x 4 z-shards, local 256'),
+        mid=dict(M=16128, N=128, K=128, groups=4, group_rows=32, block_diagonal=True,
+                 note='mid group g consumes exactly expand columns g*128..g*128+127 (pilot_d1.comp:57-60)',),
+        contract=dict(M=16128, N=128, K=128, groups=1),
+    ),
+    dataflow=dict(
+        steps=[
+            'qX[m][c] (int8, m8col) = clamp(roundEven(acc_ds * sc[912+c]), +-127)   [ordinal 25]',
+            'E[m][n] = act(half(sum_k qX[m][k]*We[n][k] * sc[16+n]))                 [ordinal 26, n<512]',
+            'qE[m][n] = clamp(roundEven(E[m][n] * sc[2]), +-127)',
+            'M[m][o] = (sum_j qE[m][g*128+j]*Wm[o][j]) * sc[528+o],  g=o//32        [ordinal 26]',
+            'qM[m][o] = clamp(roundEven(M[m][o] * sc[3]), +-127)',
+            'C[m][n] = (sum_o qM[m][o]*Wc[n][o]) * sc[656+n]                        [ordinal 27]',
+            'Y[m][n] = half(C[m][n] + qX[m][n]*sc[784+n])                            [ordinal 27]',
+        ],
+        activation=dict(form= 'x * fma(t, fma(-0.055908203125, |t|, 0.447265625), 0.89453125), t = clamp(x,-4,4)',
+                        dtype='half', citation='pilot_common.glsl:49-53; build_batch.py:174-177'),
+        ordering_note='dequant multiply happens in fp32, the activation input is narrowed to half, the '
+                      'activation output is narrowed to half, then the code multiply happens in fp32 '
+                      '(pilot_common.glsl:65-84)',
+    ),
+    residual=dict(
+        kind='qX (dequantised input) residual, per output channel',
+        formula='residual = float(qX_code) * sc[784+n]',
+        citation='pilot_d2.comp:13-19',
+        half_residual_available=False,
+        why='block9 qX lives in block8_out (int8 only, 2064384 B). The C128 half image buffer the parent '
+            'used for this stage (4128768 B) is not written anywhere in this plan, so an original-half '
+            'residual would need a new buffer plus a store in ordinal 25 and a new d2. The r08 family '
+            '(blocks 12/13/14/57..61) does have it via imgin + pack_rs.',
+        diagnostic_ceiling=dict(rel_l2=cal['diagnostic_half_residual_rel_l2'],
+                                what='same pack, residual replaced by X*pack_rs (the parent half expression)',
+                                status='NOT IMPLEMENTED, diagnostic only'),
+    ),
+    static_scales=dict(
+        runtime_amax=False, histograms=False, adaptive_precision=False,
+        sources=['sc[0..3], sc[16..527], sc[528..655], sc[656..783], sc[784..911] (FFN, static constants)',
+                 'sc[912..1039] (qX producer, static constants)'],
+        dynamic_remainders_outside_this_block='attention Q/K/V/P scales of this block are still per-workgroup '
+                                             'dynamic (r04-r05-attn-dynamic); that is S10/S11 scope and is NOT '
+                                             'claimed static here',
+    ),
+    group_context=dict(
+        first_group='blocks 9..14; block9 is the only one whose weights are 106496 B and whose scale table is 4160 B',
+        same_shape_blocks='10 (v6-m8col, 98304/3648), 11 (v3-m8col, 98304/3648), 12,13,14 (r08 token-major, 98304/3648)',
+        second_group='blocks 56..61 (block56 zcode c128_d1/d2 + c128_b56_qx_producer, 57..61 r08)',
+        qx_producers=dict(
+            block9='ordinal 25 f3c64_body_ds (r09): code = round(acc_ds * sc[912+c]) - PER-CHANNEL table slot',
+            block10_11='previous block body4 = c128_cproducer_wo_i8: invX = chain_sc[1] - SINGLE scalar',
+            block12_14_57_61='previous block body4 = c128_d4_wo_qx: invX = qxsc[1] - SINGLE scalar',
+            block56='c128_b56_qx_producer: inv = sc[1] - SINGLE scalar',
+        ),
+        consequence='the table-only X equalisation demonstrated here is unique to block9.  The other '
+                    '11 C128 blocks need one shader edit per producer family (c128_d4_wo_qx covers 8 '
+                    'blocks, c128_cproducer_wo_i8 covers 2, the b56 producer 1) plus +128 floats appended '
+                    'to that family\'s scale table (912 -> 1040 floats).  Their residual paths also differ: '
+                    'blocks 10/11/56 are qX residuals, blocks 12/13/14/57..61 already carry the half image '
+                    'residual (r08 contract_half_residual).',
+    ),
+    citations=[
+        dict(file=REL(C.B / 'candidates/codex-sol-attention-20261018/v4-m8col-scale-repair-v1/source/pilot_common.glsl'),
+             sha256=C.sha256(C.B / 'candidates/codex-sol-attention-20261018/v4-m8col-scale-repair-v1/source/pilot_common.glsl'),
+             lines='26-35 bindings; 37-42 input_addr; 43-44 m8_addr/mid_addr; 49-53 act; 60-62 nr_scale_column; '
+                   '65-84 requant_act/requant_linear'),
+        dict(file=REL(C.B / 'candidates/codex-sol-attention-20261018/v4-m8col-scale-repair-v1/source/pilot_d1.comp'),
+             sha256=C.sha256(C.B / 'candidates/codex-sol-attention-20261018/v4-m8col-scale-repair-v1/source/pilot_d1.comp'),
+             lines='10 shared sa[8192]; 14 g=WorkGroupID.z; 20-22 expand scales; 27-33 expand MMA; 38-45 activation '
+                   'codes; 49-50 mid scales; 52-58 mid MMA; 61-64 mid codes'),
+        dict(file=REL(C.B / 'candidates/codex-sol-attention-20261018/v4-m8col-scale-repair-v1/source/pilot_d2.comp'),
+             sha256=C.sha256(C.B / 'candidates/codex-sol-attention-20261018/v4-m8col-scale-repair-v1/source/pilot_d2.comp'),
+             lines='9-25 finish(): residual from gx int8, (w*64+m)*128+n half store; 30-33 scales; 38-46 contract MMA'),
+        dict(file=REL(C.B / 'candidates/codex-sol-int8-long-008-20261019/c128-diffusion-batch-v1/tools/build_batch.py'),
+             sha256=C.sha256(C.B / 'candidates/codex-sol-int8-long-008-20261019/c128-diffusion-batch-v1/tools/build_batch.py'),
+             lines='45-46 quantiser; 98-147 weight pack; 151-162 windowize; 165-214 scale table + CPU chain; '
+                   '500-506 offsets/regions proof'),
+        dict(file=REL(C.B / 'work/dsh-xmx-handoff-validation-20261024/candidates/r09-r11-f3ds/source/candidate/r09_f3c64_body_ds_wo_i8.comp'),
+             sha256=C.sha256(C.B / 'work/dsh-xmx-handoff-validation-20261024/candidates/r09-r11-f3ds/source/candidate/r09_f3c64_body_ds_wo_i8.comp'),
+             lines='315 pooled quantiser; 340-351 emit_qx (scale 347, code 348, store 350); 358-371 DS MMA'),
+        dict(file=REL(C.B / 'work/dsh-xmx-handoff-validation-20261024/candidates/r08-c128-ffn/source/r08_d2_contract_half_residual.comp'),
+             sha256=C.sha256(C.B / 'work/dsh-xmx-handoff-validation-20261024/candidates/r08-c128-ffn/source/r08_d2_contract_half_residual.comp'),
+             lines='10-16 the half-residual difference vs the sealed kernel; 86-97 parent_seed'),
+    ],
+    spv_reproduction=dict(
+        toolchain=REL(C.B / 'src/project/tools/glslang-16.5.0/bin/glslang.exe'),
+        glslang_sha256=C.sha256(C.B / 'src/project/tools/glslang-16.5.0/bin/glslang.exe'),
+        command='glslang -V --target-env vulkan1.3 -DNATIVE=1 -I<source dir> -o <out> <src>',
+        results=[
+            dict(source='.../v4-m8col-scale-repair-v1/source/pilot_d1.comp', repro=REL(C.CARD / 'evidence/repro-pilot_d1.spv'),
+                 sha256=C.sha256(C.CARD / 'evidence/repro-pilot_d1.spv'),
+                 equals_plan_ordinal26=bool(C.sha256(C.CARD / 'evidence/repro-pilot_d1.spv') == spv_of(r26)['sha256'])),
+            dict(source='.../v4-m8col-scale-repair-v1/source/pilot_d2.comp', repro=REL(C.CARD / 'evidence/repro-pilot_d2.spv'),
+                 sha256=C.sha256(C.CARD / 'evidence/repro-pilot_d2.spv'),
+                 equals_plan_ordinal27=bool(C.sha256(C.CARD / 'evidence/repro-pilot_d2.spv') == spv_of(r27)['sha256'])),
+            dict(source='.../r09-r11-f3ds/source/candidate/r09_f3c64_body_ds_wo_i8.comp', repro=REL(C.CARD / 'evidence/repro-r09-ds.spv'),
+                 sha256=C.sha256(C.CARD / 'evidence/repro-r09-ds.spv'),
+                 equals_plan_ordinal25=bool(C.sha256(C.CARD / 'evidence/repro-r09-ds.spv') == spv_of(r25)['sha256'])),
+        ],
+    ),
+    this_card_change=dict(
+        kind='content-only: data files, no shader, no bind, no push, no dispatch, no buffer size change',
+        v1_REJECTED=dict(
+            weight_pack=dict(before=proof['identities']['weight_pack'], after=ver['packs']['weight']),
+            scale_pack=dict(before=proof['identities']['scale_pack'], after=ver['packs']['scale']),
+            status='FAILED ON GPU: 3-frame network -0.082..-0.242 dB, block9 output attenuated by 1/%0.1f. '
+                   'Cause: sc[912..1039] was scaled by 1/(D*f0) while the FFN dequant moved to the new sX, '
+                   'leaving producer_step/ffn_dequant = %0.2f on every channel.  Kept as negative evidence.'
+                   % (vd['identities']['v1_signal_gain']['gain_inverse'],
+                      vd['identities']['v1_signal_gain']['gain_inverse']),
+            gate='the v1 gate dumps are INVALID (see gate_attempt below), so the 3.17%% figure says nothing '
+                 'about the pack; the -0.2 dB does.',
+        ),
+        v2=dict(scale_pack=dict(path=vd['v2']['path'], bytes=vd['v2']['bytes'], sha256=vd['v2']['sha256']),
+                weight_pack='identical to v1 (unchanged)',
+                changed_region=vd['changed_region'], formula=vd['formula'],
+                identities=vd['identities'],
+                status='CPU-verified, GPU NOT_RUN; needs the v2 gate (JOBS.json j2)'),
+        regions_untouched=['weight bytes 65536..106495 (mid, contract, DS projection)',
+                           'scale floats 4..15 (r09 pooled quantiser and unused slots)'],
+    ),
+    gate_attempt=dict(
+        run='GPU/gate-34189 (executed by the main executor under the exclusive lock)',
+        dumps=dict(qx='block9_qx.bin', mid='block9_M.bin', y='block9_Y.bin'),
+        verdict='INVALID DUMPS - do not use these three files as evidence about block9.',
+        why=[
+            'the buffers are non-resident (POLICY ... 0 ...) and the runner ran with allocation_mode=pool and '
+            'dump_alias_disabled=false (receipt fields), so after ordinal 27/29 the slots are recycled and the '
+            'end-of-run dump reads whatever lives there now',
+            'per-channel correlation of the dumped qX against the teacher X (the only real X available): '
+            'max |rho| per dumped channel median %.3f, max %.3f - a genuine qX, even with a permuted channel '
+            'order, would be >=0.9' % (gd2['T1_correlation']['max_abs_rho_per_dumped_channel']['median'],
+                                        gd2['T1_correlation']['max_abs_rho_per_dumped_channel']['max']),
+            'the dumped M is not a function of the dumped qX (agreement %.4f) and the dumped Y is not a function '
+            'of the dumped M/qX (relL2 %.3f): the three dumps are not even from the same execution state'
+            % (gd2['T2_mid']['m_dump_vs_m_from_dumped_qx'], gd2['T3_contract']['y_dump_vs_y_from_dumped_M_and_qX']['rel_l2']),
+            'the first differing byte of the qX prediction is byte 0 (window 0, token 0, channel 0): there is no '
+            'partial region that agrees, which is what a recycled buffer looks like',
+        ],
+        proven_pattern='the workspace\'s own valid-dump arm sets resident=1 on every dumped buffer: '
+                       'real-int8-24/c64-stage/old.txt has POLICY 30 1 13 15 0 / POLICY 31 1 14 15 0 (that arm is '
+                       'the bit-exact CPU/GPU reference), while the no-dump arm teacher-Y.txt has POLICY 30 0 13 15 0. '
+                       'The gate plans in this card now follow that pattern.',
+        fix='gate-34189-anchor.txt and candidate-34189-v2-gate.txt set resident=1 on block8_out/swin_9_M/swin_9_Y',
+    ),
+)
+(C.CARD / 'CONTRACT.json').write_text(json.dumps(contract, indent=2, ensure_ascii=False))
+
+# ------------------------------------------------------------------ QUALITY.json
+frames = cal['new']['frames']
+old_frames = cal['old']['frames']
+quality = dict(
+    card='S05-c128', block=9, level='CPU_ONLY', GPU_VERIFICATION='NOT_RUN',
+    gpu_status=dict(v1='FAILED on GPU (3-frame network -0.082..-0.242 dB) - rejected, kept as negative evidence',
+                    v2='NOT_RUN (gate plans emitted, JOBS.json j1/j2)',
+                    gate_dumps_for_v1='INVALID, do not cite (see CONTRACT.gate_attempt)'),
+    scope='common FP16 teacher input (dump_block8_out.bin); this is a LOCAL single-block number '
+          'against the FP16 teacher Y, NOT an end-to-end quality result',
+    objective='relL2 = ||Y_candidate - Y_teacher|| / ||Y_teacher||, 16128 tokens x 128 channels per frame',
+    old=dict(mean_rel_l2=cal['old']['rel_l2'], per_frame=old_frames,
+             rmse_mean=float(np.mean([f['rmse'] for f in old_frames]))),
+    new=dict(mean_rel_l2=cal['new']['rel_l2'], per_frame=frames,
+             rmse_mean=float(np.mean([f['rmse'] for f in frames])),
+             factors=cal['new']['factors'], sX=cal['new']['sx'], sA=cal['new']['sA'], sM=cal['new']['sM']),
+    improvement=dict(abs_rel_l2=cal['old']['rel_l2'] - cal['new']['rel_l2'],
+                     ratio=cal['new']['rel_l2'] / cal['old']['rel_l2'],
+                     every_frame_improved=bool(all(n['rel_l2'] < o['rel_l2'] for n, o in zip(frames, old_frames))),
+                     rmse_reduction=1.0 - float(np.mean([f['rmse'] for f in frames])) /
+                     float(np.mean([f['rmse'] for f in old_frames]))),
+    input_provenance='common FP16 teacher input.  The bound INT8 arm consumes the DS result of '
+                     'ordinal 25, which the teacher dump does not contain, so this is NOT the '
+                     '"actual quantised upstream" number; the GPU gate job measures that.',
+    controls=dict(requantisation_only_rel_l2=cal['arms']['requant_only_D1']['rel_l2'],
+                  note='re-quantising the expand rows without any X equalisation or scale search leaves the '
+                       'error unchanged at 5.7249%, so the gain is the equalisation + scale coordinates, '
+                       'not re-quantisation noise'),
+    saturation=dict(new=cal['saturation_new'], old=cal['saturation_old'],
+                    note='x/8.2e6 elements (expand activation) and x/2.06e6 (qX, qM)'),
+    diagnostic_not_implemented=dict(half_residual_rel_l2=cal['diagnostic_half_residual_rel_l2'],
+                                    why='needs a half X buffer + a new d2 for block9 (see CONTRACT.residual)'),
+    gpu=None,
+    gpu_attempt_1=dict(
+        plan='candidate-34189.txt (v1 scale table %s)' % ver['packs']['scale']['sha256'][:16],
+        network_3frames=dict(baseline_db=[29.2956, 29.5277, 29.7877], candidate_db=[29.0905, 29.2853, 29.7057],
+                             delta_db=[-0.2051, -0.2424, -0.0820],
+                             measured_by='main executor, exclusive lock, control arm reproduced 56318ff6...'),
+        mechanism='block9 output attenuated by 1/%.1f, i.e. the block behaves like a disabled FFN: '
+                  'producer step = %.6f*D but the FFN dequantised with %.6f, ratio %.6f on every channel'
+                  % (vd['identities']['v1_signal_gain']['gain_inverse'],
+                     vd['identities']['v1_signal_gain']['producer_step_uniform_part'],
+                     vd['identities']['v1_signal_gain']['ffn_dequant'],
+                     vd['identities']['v1_signal_gain']['gain']),
+        cpu_reproduction=dict(v1_as_shipped_rel_l2=vd['cpu_arm']['v1_as_shipped_rel_l2'],
+                              note='the CPU arm with the shipped step reproduces relL2~1 (block9 nearly zero), '
+                                   'which is the same statement as the measured network loss'),
+        verdict='REJECTED. Not a quantisation loss: a scale-anchor implementation error, plus invalid gate dumps.',
+    ),
+    v2=dict(scale_pack=dict(path=vd['v2']['path'], sha256=vd['v2']['sha256']),
+            cpu_rel_l2_pooled=vd['cpu_arm']['v2_rel_l2_pooled'], cpu_rel_l2_frames=vd['cpu_arm']['v2_rel_l2'],
+            identity_max_rel_err=vd['identities']['producer_step_v2_equals_ffn_step']['max_rel_err'],
+            gpu='NOT_RUN'),
+    not_claimed=['29.61 dB', '24-frame PSNR', 'playability', 'performance'],
+    reproduction='python -X utf8 tools/calibrate_b9.py   (Q/tool-env python, ~2 min, CPU only)',
+)
+(C.CARD / 'QUALITY.json').write_text(json.dumps(quality, indent=2, ensure_ascii=False))
+
+# ------------------------------------------------------------------ JOBS.json
+runner = REL(C.B / 'work/codex-astra-fp16-int8-audit-20261024/phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe')
+outroot = REL(C.CARD / 'GPU')
+
+# ---- CPU predictions the two gate runs are compared against (same frame 34189)
+sc_old = C.f32(proof['identities']['scale_pack']['path'])
+w_old = C.i8(proof['identities']['weight_pack']['path']).astype(np.int32)
+D = np.array(ver['D'], np.float32)
+sc_v2 = C.f32(vd['v2']['path'])
+qw = C.i8(ver['packs']['weight']['path']).astype(np.int32)
+X1 = C.load_x(C.D / 'dump-fp16/dump_block8_out.bin')
+Y1 = C.load_y(C.D / 'dump-fp16/dump_swin_9_Y.bin')
+
+
+def m8_pack(qx_tok):
+    out = np.zeros(C.WIN_X * C.WIN_Y * 8192, np.int8)
+    for w in range(C.WIN_X * C.WIN_Y):
+        blk = qx_tok[w * 64:(w + 1) * 64]
+        for m in range(64):
+            out[w * 8192 + ((m >> 3) * 128 + np.arange(128)) * 8 + (m & 7)] = blk[m]
+    return out
+
+
+qa_anchor = C.code(X1 * np.float32(sc_old[1]))
+(C.CARD / 'evidence/qx-pred-anchor-34189.i8.bin').write_bytes(m8_pack(qa_anchor).tobytes())
+ya = C.ffn_forward(X1, w_old[0:65536].reshape(512, 128), w_old[65536:81920].reshape(128, 128),
+                   w_old[81920:98304].reshape(128, 128), sc_old)
+(C.CARD / 'evidence/y-pred-anchor-34189.f16.bin').write_bytes(ya.astype('<f2').tobytes())
+yv2 = C.ffn_forward(X1, qw[0:65536].reshape(512, 128), qw[65536:81920].reshape(128, 128),
+                    qw[81920:98304].reshape(128, 128), sc_v2, invX=(np.float32(sc_v2[1]) / D))
+(C.CARD / 'evidence/y-pred-v2-34189.f16.bin').write_bytes(yv2.astype('<f2').tobytes())
+pred_files = dict(
+    qx_anchor=dict(path=REL(C.CARD / 'evidence/qx-pred-anchor-34189.i8.bin'),
+                   sha256=C.sha256(C.CARD / 'evidence/qx-pred-anchor-34189.i8.bin'),
+                   meaning='round(X*sc[1]) of the BOUND pack in the m8col layout; the anchor gate must agree '
+                           'with it at >0.99 codes if the CPU model of the bound arm is right'),
+    y_anchor=dict(path=REL(C.CARD / 'evidence/y-pred-anchor-34189.f16.bin'),
+                  sha256=C.sha256(C.CARD / 'evidence/y-pred-anchor-34189.f16.bin'),
+                  rel_l2_vs_teacher=C.rel(ya, Y1)),
+    y_v2=dict(path=REL(C.CARD / 'evidence/y-pred-v2-34189.f16.bin'),
+              sha256=C.sha256(C.CARD / 'evidence/y-pred-v2-34189.f16.bin'),
+              rel_l2_vs_teacher=C.rel(yv2, Y1)),
+)
+
+jobs = [
+    dict(id='j1-s05-anchor-gate-34189', purpose='measure the BOUND pack\'s real qX step per channel and validate '
+         'the CPU model of the old arm (this is the piece that was never verified)',
+         plan=REL(C.CARD / 'gate-34189-anchor.txt'),
+         plan_sha256=C.sha256(C.CARD / 'gate-34189-anchor.txt'),
+         out=outroot + '/gate-anchor-34189',
+         argv=[runner, '--plan', REL(C.CARD / 'gate-34189-anchor.txt'), '--out', outroot + '/gate-anchor-34189',
+               '--pool', '--warm', '0', '--reps', '1'],
+         dump=True, resident_dumps=True, expected_output_sha256=None,
+         expected='the frame output must equal the control 56318ff6d8e7c57dafaa82f4fd10f1ffd817be5075b15d3e4b38c7e8fb2c37c0 '
+                  '(same pack, dumps only); block9_qx.bin vs evidence/qx-pred-anchor-34189.i8.bin; block9_Y.bin vs '
+                  'evidence/y-pred-anchor-34189.f16.bin (CPU relL2 %.6f vs teacher)' % pred_files['y_anchor']['rel_l2_vs_teacher']),
+    dict(id='j2-s05-v2-gate-34189', purpose='verify the fixed scale table (v2) end to end on one frame',
+         plan=REL(C.CARD / 'candidate-34189-v2-gate.txt'),
+         plan_sha256=C.sha256(C.CARD / 'candidate-34189-v2-gate.txt'),
+         out=outroot + '/gate-v2-34189',
+         argv=[runner, '--plan', REL(C.CARD / 'candidate-34189-v2-gate.txt'), '--out', outroot + '/gate-v2-34189',
+               '--pool', '--warm', '0', '--reps', '1'],
+         dump=True, resident_dumps=True, expected_output_sha256=None,
+         expected_alignment='block9_qx.bin vs evidence/qx-pred-34189.i8.bin (same prediction: the qX step is '
+                            'unchanged between the model and v2 by construction); block9_Y.bin vs '
+                            'evidence/y-pred-v2-34189.f16.bin at relL2 < 1e-3 (the CPU/GPU closure the card asks '
+                            'for); block9_M.bin likewise'),
+    dict(id='j3-s05-v2-frames', purpose='3-frame network check of v2 (only after j2 closes)',
+         plan=REL(C.CARD / 'candidate-34189-v2.txt'), plan_sha256=C.sha256(C.CARD / 'candidate-34189-v2.txt'),
+         out=outroot + '/cand-v2-34189',
+         argv=[runner, '--plan', REL(C.CARD / 'candidate-34189-v2.txt'), '--out', outroot + '/cand-v2-34189',
+               '--pool', '--warm', '0', '--reps', '1'],
+         expected_output_sha256=None, dump=False,
+         conditional='only if j2 shows <1e-3 CPU/GPU agreement; otherwise stop and diagnose again',
+         extra_frames='41444, 43654 via python -X utf8 tools/build_plans.py --frame <n> then the same two '
+                      'BUFFER edits onto the v2 scale file'),
+]
+
+(C.CARD / 'JOBS.json').write_text(json.dumps(dict(card='S05-c128', execute=False,
+                                                 note='the card does not run GPU; the main executor schedules these',
+                                                 lock='@NR_GPU_WORKSPACE@/artifacts/parallel-port-20261013/GPU.lock',
+                                                 jobs=jobs), indent=2, ensure_ascii=False))
+
+# ------------------------------------------------------------------ COST.txt
+cost = """S05-c128 block9 C128 FFN cost ledger
+=====================================
+
+Structural delta: NONE.
+  weight pack          106496 B -> 106496 B   (2 files, same lengths)
+  scale table            4160 B ->    4160 B
+  dispatches                 0 added / 0 removed / 0 changed
+  BIND lines                 0 changed (byte counts unchanged, so no bound moves)
+  PUSH words                 0 changed
+  buffers                    0 added / 0 removed / 0 resized
+  SPIR-V                     0 changed (all four ordinals keep their bound SPV SHA)
+
+Reads per dispatch: unchanged.  The expand codes are read exactly as before
+(coopMatLoad(v, qw, (g*128+n0)*128+k, 128, COL)); the scale reads are the same 1040-float
+table.  Nothing was added to the hot loop: no per-channel K-side multiply, because the
+power-of-two diagonal D is folded into the code bytes and into the existing producer/scale
+slots (sc[912+c] and sc[784+c]).
+
+Registers / SLM: unchanged.  d1 keeps shared sa[8192] int8 and local_size 256; d2 keeps
+0 B shared.  No new scratch, no new barrier, no repack, no extra dispatch, no staging.
+
+Work done offline (CPU, one-off): ~2 min for the 3-frame coordinate search
+(tools/calibrate_b9.py), 3 s for the pack round-trip (tools/verify_pack.py).
+
+Performance: UNMEASURED.  No GPU run, no timing.  There is no structural reason for a
+speed change, but this card does not claim one.
+
+Quality cost: none accepted on purpose - the equalisation is off-line only.  Saturation is
+85..87 of 2064384 qX codes at +-127 (0.0040%), 171..300 of 8257536 activation codes
+(0.0021..0.0036%) and 42..83 of 2064384 mid codes (0.0020..0.0040%).  The sX coordinate
+deliberately spends a handful of clipped outliers for finer codes; it is not sitting on
+the clamp (the search kept the interior factor 0.8 for sX and 0.4/0.65 for sA/sM).
+"""
+(C.CARD / 'COST.txt').write_text(cost, encoding='utf-8')
+
+# ------------------------------------------------------------------ CALIBRATION.json (card root)
+baseline = json.loads((C.CARD / 'evidence/BASELINE-CPU.json').read_text())
+calibration = dict(
+    card='S05-c128', block=9, mode='CPU_ONLY', GPU_VERIFICATION='NOT_RUN',
+    frames=[dict(name='34189 (day-street-static-formal-01)', dump=REL(C.D / 'dump-fp16')),
+            dict(name='41444 (day-street-motion-formal-01)', dump=REL(C.D / 'teacher-diagnostics/teacher-41444')),
+            dict(name='43654 (day-street-motion-formal-02)', dump=REL(C.D / 'teacher-diagnostics/teacher-43654'))],
+    tokens=dict(sampling='exhaustive: all 16128 tokens of every frame (no window/token subsampling)',
+                tokens_per_frame=16128, frames=3, total=48384,
+                note='unlike the C64 card (4096 window-token samples), the C128 block is small enough to '
+                     'calibrate on the whole activation'),
+    input_target=dict(input='dump_block8_out.bin decoded from the image-half layout to token-major (16128,128)',
+                      target='dump_swin_9_Y.bin token-major (16128,128)',
+                      caveat='common FP16 teacher input, not the INT8 arm\'s own upstream values'),
+    objective='minimise ||Y - Y_teacher||_2 / ||Y_teacher||_2 over the whole FFN output Y',
+    search_space=dict(
+        diagonal='D_c = 2**round(log2(amax_c)) per FFN input channel c (power of two); global scale of D is '
+                 'a no-op because sX and the expand row scales absorb it (verified: shifts 0/-1/-2 give the '
+                 'identical 5.2628% before the scale search)',
+        folds=['expand code bytes = clip(rint(We[n,k]*D_k / sWe[n])), sWe[n]=row absmax/127',
+               'producer table sc[912+c] /= D_c  (per-channel inverse, no shader change)',
+               'residual table sc[784+c] *= D_c'],
+        coordinates='(sX, sA, sM) coordinate descent, factors [0.5,0.65,0.8,1.0,1.2], 3 sweeps, then one '
+                    'boundary extension on sA (optimum hit 0.5): [0.2,0.3,0.4,0.5,0.65]',
+        final_factors=cal['new']['factors'], at_boundary=cal.get('at_boundary', []),
+        D_values=sorted(set(np.float64(v) for v in ver['D_values'])),
+    ),
+    old=dict(rel_l2=cal['old']['rel_l2'], frames=baseline['frames'],
+             arm='bound plan: C-d1/C-d2 (v4-m8col), qX residual, D = 1'),
+    new=dict(rel_l2=cal['new']['rel_l2'], frames=cal['new']['frames'],
+             sX=cal['new']['sx'], invSA=cal['new']['invSA'], invSM=cal['new']['invSM'],
+             sA=cal['new']['sA'], sM=cal['new']['sM']),
+    arms={k: dict(rel_l2=v['rel_l2']) for k, v in cal['arms'].items()},
+    saturation=dict(new=cal['saturation_new'], old=cal['saturation_old']),
+    cpu_audit=dict(
+        layout_gates='evidence/LAYOUT-PROOF.json G1..G5 (0 code mismatches on 98304 codes; scale identities '
+                     'exact to 1 ulp)',
+        pack_roundtrip='evidence/PACK-VERIFY.json: re-reading the written PACK reproduces %.9f exactly'
+                       % ver['rel_l2_from_written_bytes'],
+        spv_identity='evidence/repro-*.spv are byte-identical to the plan-bound C-d1/C-d2/r09 SPVs',
+        gpu_alignment='NOT POSSIBLE on CPU only: no C128 local GPU arm exists in this workspace '
+                      '(the bit-exact arms are C64 only). GPU_VERIFICATION=NOT_RUN',
+    ),
+    diagnostic_half_residual=dict(rel_l2=cal['diagnostic_half_residual_rel_l2'],
+                                  status='not implemented for block9 (no half X buffer)'),
+    reproduction=dict(
+        probe='python -X utf8 tools/probe_layout.py',
+        baseline='python -X utf8 tools/baseline_cpu.py',
+        calibrate='python -X utf8 tools/calibrate_b9.py',
+        verify='python -X utf8 tools/verify_pack.py',
+        plans='python -X utf8 tools/build_plans.py',
+        emit='python -X utf8 tools/make_contract.py',
+        python=REL(C.Q / 'tool-env/Scripts/python.exe'), runtime='~2 min total, CPU only',
+    ),
+    evidence_files=[REL(p) for p in sorted((C.CARD / 'evidence').iterdir())],
+)
+(C.CARD / 'CALIBRATION.json').write_text(json.dumps(calibration, indent=2, ensure_ascii=False))
+
+print(json.dumps(dict(contract=str(C.CARD / 'CONTRACT.json'), quality=str(C.CARD / 'QUALITY.json'),
+                      calibration=str(C.CARD / 'CALIBRATION.json'),
+                      jobs=len(jobs), old=cal['old']['rel_l2'], new=cal['new']['rel_l2']), indent=2))

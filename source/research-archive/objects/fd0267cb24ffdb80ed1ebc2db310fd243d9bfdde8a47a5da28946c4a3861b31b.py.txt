@@ -1,0 +1,90 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,shlex,shutil,collections,re
+D=Path(__file__).resolve().parent;A=D.parent;B=A.parent.parent;R=D/'ups-projection-register-blend';R.mkdir(exist_ok=True);P=D/'coefficient-reuse-combined';T=D/'f05-owner-concurrency/subgroup-owner-family'
+read=lambda p:json.loads(p.read_text(encoding='utf-8-sig'));sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+def ident(p):return dict(path=str(p),sha256=sha(p))
+def save(p,x):p.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding='utf-8')
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def restore(pm,cm,out):
+ ints={128,130,132,134,135,137,138,139};allnc=set(ST.no_contraction_ids(pm));nc={ST.result_id_of(op,a) for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in allnc and op not in ints};ops={op for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in nc};pr=ST.function_regions(pm);cr=ST.function_regions(cm);assert len(pr)==len(cr);keep=[];checked=0
+ for p,c in zip(pr,cr):
+  ps=[pm.instructions[i] for i in p if pm.instructions[i][0] in ops];cs=[cm.instructions[i] for i in c if cm.instructions[i][0] in ops];assert len(ps)==len(cs)
+  for x,y in zip(ps,cs):
+   assert (x[0],x[3])==(y[0],y[3]);a=ST.result_id_of(x[0],x[1]);b=ST.result_id_of(y[0],y[1]);assert pm.operand_signature(a,3)==cm.operand_signature(b,3);checked+=1
+   if a in nc:keep.append(b)
+ assert len(keep)==len(nc);raw=set(ST.no_contraction_ids(cm));keepint=[ST.result_id_of(op,a) for op,a,_,_ in cm.instructions if op in ints and ST.result_id_of(op,a) in raw];ST.set_no_contraction(cm,keep+keepint,out);return dict(checked=checked,float_NC=len(keep),integer_NC=len(keepint))
+
+
+scan=read(D/'CURRENT-CENSUS.json')['rows'];pt=(P/'plan.txt').read_text(encoding='utf-8');planrows=[shlex.split(l) for l in pt.splitlines() if l.startswith('PASS ')];S=R/'c256';S.mkdir(exist_ok=True);ordinal=166;C=256;src=Path(scan[ordinal]['source']);parent=Path(planrows[ordinal][3]);assert sha(parent)==scan[ordinal]['sha256'];d=S
+oldcells=collections.Counter();newcells=collections.Counter()
+for wx in range(11):
+ for wy in range(6):
+  for half in range(2):
+   for t in range(32):
+    tg=half*32+t;q=tg//16;ss=tg%16;tx=2*wx+(q&1);ty=2*wy+(q>>1)
+    if tx>=21 or ty>=12:continue
+    px=4*tx+ss%4;py=4*ty+ss//4;ps=(py//2-(4*wy+2*half))*4+(px//2-4*wx);assert 0<=ps<8
+    for c in range(256):oldcells[px,py,c,wx,wy,half,ps]+=1
+   for sg in range(8):
+    for lane in range(32):
+     for ci in range(4):
+      ps=2*ci+lane//16
+      for child in range(4):
+       px=8*wx+2*(ps%4)+(child&1);py=8*wy+4*half+2*(ps//4)+(child>>1)
+       if px>=84 or py>=48:continue
+       for side in range(2):newcells[px,py,sg*32+side*16+lane%16,wx,wy,half,ps]+=1
+assert oldcells==newcells and max(newcells.values())==1 and len(newcells)==84*48*256
+lines=pt.splitlines();ix=next(i for i,l in enumerate(lines) if l.startswith('PASS ') and shlex.split(l)==planrows[ordinal]);push=next(l for l in lines[ix+1:] if l.startswith('PUSH '));words=list(map(int,push.split()[1:]));assert words[:4]==[21,12,0,0] and words[20:24]==[512,256,787584,0]
+def compile(label,t):
+ f=d/(label+'.comp');o=d/(label+'.spv');f.write_text(t,encoding='utf-8');run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(src.parent),f,'-o',o]);return o
+original=src.read_text(encoding='utf-8-sig');pm=ST.Module(parent);rb=compile('parent-rebuild',original);rm=ST.Module(rb);keep,info=ST.transfer_decoration_pattern_aligned(pm,rm,set());ST.set_no_contraction(rm,keep,rb);assert sha(rb)==sha(parent)
+cut=original.index('        barrier();\n        { MAT_H h = MAT_H(acc0);')
+tail="""
+        // Projection fragments directly feed their four spatial children.
+        MAT_H h0=MAT_H(acc0),h1=MAT_H(acc1);
+        const uint lane=gl_SubgroupInvocationID;
+        const uint c0=sg*32u+(lane&15u),c1=c0+16u;
+        for(uint ci=0u;ci<4u;++ci) {
+            const uint ps=2u*ci+(lane>>4u);
+            for(uint child=0u;child<4u;++child) {
+                const uint px3=8u*wx+2u*(ps%4u)+(child&1u);
+                const uint py3=8u*wy+4u*half3+2u*(ps/4u)+(child>>1u);
+                if(px3>=uint(pc.p0.x)*4u || py3>=uint(pc.p0.y)*4u) continue;
+                precise f16vec2 main_scaled=f16vec2(h0[ci],h1[ci]);
+                if(pc.p5.w==1u) main_scaled=main_scaled*f16vec2(pw[pc.p5.z+pc.p5.y+c0],pw[pc.p5.z+pc.p5.y+c1]);
+                const f16vec2 skip_gain=f16vec2(pw[pc.p5.z+c0],pw[pc.p5.z+c1]);
+                const uint sa0=pc.p4.z+nr3_io_at0(px3,py3,c0,pc.p6.x,pc.p5.y);
+                const uint sa1=pc.p4.z+nr3_io_at0(px3,py3,c1,pc.p6.x,pc.p5.y);
+                const f16vec2 skip_input=f16vec2(sk[sa0],sk[sa1]);
+                precise f16vec2 skip_v=skip_input*skip_gain;
+                precise f16vec2 value=main_scaled+skip_v;
+                blout[nr3_io_at0(px3,py3,c0,uint(pc.p0.x)*4u,pc.p5.y)]=value.x;
+                blout[nr3_io_at0(px3,py3,c1,uint(pc.p0.x)*4u,pc.p5.y)]=value.y;
+            }
+        }
+    }
+}
+"""
+changed=original[:cut]+tail;o=compile('candidate',changed);cm=ST.Module(o)
+# Float op/type sequence and NC mask; transport operands intentionally change.
+ints={128,130,132,134,135,137,138,139};nc=set(ST.no_contraction_ids(pm));ops={op for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in nc and op not in ints};keep=[];checked=[]
+assert len(ST.function_regions(pm))==len(ST.function_regions(cm))
+for p,c in zip(ST.function_regions(pm),ST.function_regions(cm)):
+ ps=[pm.instructions[i] for i in p if pm.instructions[i][0] in ops];cs=[cm.instructions[i] for i in c if cm.instructions[i][0] in ops];assert len(ps)==len(cs),(len(ps),len(cs))
+ for x,y in zip(ps,cs):
+  assert (x[0],x[3])==(y[0],y[3]);a=ST.result_id_of(x[0],x[1]);b=ST.result_id_of(y[0],y[1]);checked.append([x[0],a,b])
+  if a in nc:keep.append(b)
+assert len(keep)==sum(ST.result_id_of(op,a) in nc and op not in ints for op,a,_,_ in pm.instructions)
+raw=set(ST.no_contraction_ids(cm));keepint=[ST.result_id_of(op,a) for op,a,_,_ in cm.instructions if op in ints and ST.result_id_of(op,a) in raw];ST.set_no_contraction(cm,keep+keepint,o)
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',o]);sources=[dict(width=C,ordinal=ordinal,ordinals=[ordinal],parent=ident(parent),parent_rebuilt=ident(rb),source=ident(o.with_suffix('.comp')),candidate=ident(o),arithmetic_alignment=dict(float_NC=len(keep),operations=checked,scope='Float op/type sequence matches; operand transport changed with exhaustive address proof.'))]
+plan=S/'plan.txt';plan.write_text(pt.replace(parent.as_posix(),o.as_posix()),encoding='utf-8');cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check']);save(S/'BUILD.json',dict(parent=ident(P/'plan.txt'),plan=ident(plan),sources=sources,CPU=cpu));save(S/'PROOF.json',dict(elements=len(newcells),unique_writers=True,push=words,layout='CH row2ci+lane/16,col lane%16. Four2x2children perprojectionrow; same ps/channel/producer WG for everycurrentgrid output.',scope='Only ordinal166 C256 zero shifts. C128 -1 shift not generalized. C64 would reduce blend activeSG8to4, deferred.',lifetime='TwoFP32acc terminate at halfcast; twohalf fragments16B/lane live throughblend. No extra accum/weights/prefetch. EightSG retained. Reject new scratch.',removed='Projection SLM stores2048halves/WG, blend SLMreads8192halves/WG source logical. TwoWGbarriers removed since gatherallocation neveroverwritten; gather4096halves/onebarrier remains. Not DRAM savings.',added='Two c0/c0+16 address chains replace adjacentchannelhalf2; skipload/store fragmentation possible. No newshuffle/weightreads. Measure native.',rounding='SameK chain, halfcast before optionalhalfmainmultiply, halfskipmultiply,halfadd; pair components independent, originalprecise/NC retained.'))
+(S/'run').mkdir(exist_ok=True)
+for kind in ['GATES','RESOURCES','NATIVE','ORDINARY']:
+ t=read(T/f'LUNA-{kind}.json');ex=S/(kind.lower()+'-execution');ex.mkdir(exist_ok=True);t['output_root']=str(ex);t['identities']=[v for v in t['identities'] if not v['path'].endswith('.spv')]+[x['candidate'] for x in sources]+[x['parent'] for x in sources]
+ for j in t['jobs']:
+  jp=P/'plan.txt' if kind=='ORDINARY' and j['candidate']=='parent' else plan;j['plan']=ident(jp);j['runner_output']=str(S/'run'/j['id']);ar=j['argv'];ar[ar.index('--plan')+1]=str(jp);ar[ar.index('--out')+1]=j['runner_output']
+  if kind=='NATIVE':ar[ar.index('--output_dir')+1]=str(S/'captures');ar[ar.index('--msg_file')+1]=str(S/'native.log');j['capture_output']=str(S/'captures'/ar[ar.index('--profile_dir')+1])
+ save(S/f'LUNA-{kind}.json',t)
+(S/'execute.ps1').write_text((T/'execute.ps1').read_text(encoding='utf-8').replace('LUNA-F05-SUBGROUP-OWNER-FAMILY','LUNA-UPS-C256-REGISTER-BLEND').replace('F05 owner concurrency','UPS C256 register blend'),encoding='utf-8');shutil.copyfile(T/'review_timing.py',S/'review_timing.py');print(cpu)

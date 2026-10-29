@@ -1,0 +1,71 @@
+"""Run an externally-built plan (e.g. one that also needs BUFFER edits) against the chain head.
+
+Usage: python run_external.py <name> <plan.txt> [stages] [--no-gold]
+
+Runs gates (fixed+fb2) unless --no-gold, then native, resources and ordinary in the usual
+balanced design. The plan is used as-is: the caller is responsible for it being the chain
+head plus exactly the intended edits.
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+import STAGE
+import ANALYZE
+
+name = sys.argv[1]
+plan = Path(sys.argv[2]).resolve()
+stages = sys.argv[3] if len(sys.argv) > 3 else 'all'
+no_gold = '--no-gold' in sys.argv
+base, base_sha, chain = K.current_best()
+psha = K.sha(plan)
+out = K.C / 'queue' / name
+out.mkdir(parents=True, exist_ok=True)
+run = out / 'run'
+arms = [('base', base, base_sha), ('cand', plan, psha)]
+
+
+def go(stage, jobs, root):
+    spec = dict(stage=stage, owner='LUNA-CONTINUOUS-EXTERNAL',
+                authorization='Main (this session) authorized this external-plan run; gold enforced unless --no-gold.',
+                output_root=str(root), identities=[str(base), str(plan), str(K.RUNNER)],
+                jobs=jobs, rules='external plan; all samples retained')
+    K.write_json(out / ('spec-%s.json' % stage), spec)
+    manifest, ps1 = STAGE.prepare(spec)
+    STAGE.run(manifest, ps1)
+    s = STAGE.summarize(spec['output_root'])
+    K.write_json(Path(spec['output_root']) / 'STAGE-SUMMARY.json', s)
+    print(stage, s['status'], [(j['id'], j['status'], j['frame']) for j in s['jobs']])
+    return s['status']
+
+
+if stages in ('all', 'gates') and not no_gold:
+    jobs = [K.gate_job('gates-%s-%s' % (a, m), p, s, run / ('gates-%s-%s' % (a, m)), m, a)
+            for a, p, s in arms for m in ('fixed', 'fb2')]
+    if go('gates', jobs, out / 'gates') != 'COMPLETED':
+        sys.exit(1)
+
+if stages in ('all', 'native'):
+    jobs = [K.native_job('native-%s' % a, p, s, run / ('native-%s' % a),
+                          run / ('captures-%s' % a), run / ('native-%s.log' % a), a)
+            for a, p, s in arms]
+    go('native', jobs, out / 'native')
+
+if stages in ('all', 'resources'):
+    jobs = [K.resources_job('resources-%s' % a, p, s, run / ('resources-%s' % a), a) for a, p, s in arms]
+    go('resources', jobs, out / 'resources')
+
+if stages in ('all', 'ordinary'):
+    jobs = []
+    for pi in range(6):
+        order = [arms[0], arms[1]] if pi % 2 == 0 else [arms[1], arms[0]]
+        for a, p, s in order:
+            jobs.append(K.ordinary_job('ord-%d-%s' % (pi, a), p, s, run / ('ord-%d-%s' % (pi, a)), a, pi))
+    if go('ordinary', jobs, out / 'ordinary') != 'COMPLETED':
+        sys.exit(1)
+    rep = ANALYZE.report(out / 'ordinary' / 'LUNA-ORDINARY.json', [dict(arms=('base', 'cand'))],
+                         out / 'TIMING.json')
+    c = rep['comparisons'][0]
+    print('%s: %s saving=%.6f CI95=[%.6f, %.6f] groups=%d' % (
+        name, c['status'], c['saving_ms'], c['CI95_ms'][0], c['CI95_ms'][1], c['groups']))
+    print('pairs', [(g['pair'], round(g['base'], 5), round(g['cand'], 5)) for g in c['group_means']])

@@ -1,0 +1,301 @@
+"""S05 step 3: block9 C128 pure-static calibration (X channel equalisation + X/A/M search).
+
+Method (mirrors Q/calibrate_c64_family_static.py, with the C128 shapes proved by
+probe_layout.py and the chain of build_batch.py::build_scales):
+  * D = 2**round(log2(amax_c)) per FFN input channel, power of two, folded into the
+    expand weight rows (We'_n = We_n * D) and into the qX producer scale table
+    sc[912+c] (/D_c) and the residual table sc[784+c] (*D_c).
+  * static coordinate search over (sX, sA, sM) factors, objective = the whole FFN
+    output Y against the FP16 teacher Y, original half residual kept as a diagnostic.
+  * no runtime amax, no per-token data: every output is a constant table.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import s05_common as C
+
+TEACHERS = [('34189', C.D / 'dump-fp16'),
+            ('41444', C.D / 'teacher-diagnostics/teacher-41444'),
+            ('43654', C.D / 'teacher-diagnostics/teacher-43654')]
+OUT = C.CARD / 'PACK'
+OUT.mkdir(exist_ok=True)
+EVID = C.CARD / 'evidence'
+
+data = C.rows()
+buf = data['buffers']
+r1 = C.row_by_name('block9_swin_body_1', data)
+b1 = {int(k): v for k, v in r1['bindings'].items()}
+push = [int(x) for x in r1['push']]
+W_PATH = buf[b1[0][0]]['file']
+S_PATH = buf[b1[1][0]]['file']
+F_PATH = buf[46]['file']
+pk = C.decode_pack(W_PATH, S_PATH, F_PATH, push)
+sc_old = pk['sc'].copy()
+
+# ------------------------------------------------------------------ teacher data
+Xs, Ys = [], []
+for tag, td in TEACHERS:
+    Xs.append(C.load_x(td / 'dump_block8_out.bin'))
+    Ys.append(C.load_y(td / 'dump_swin_9_Y.bin'))
+X = np.concatenate(Xs)
+Y = np.concatenate(Ys)
+nframes = len(TEACHERS)
+amax = np.abs(X).max(axis=0)
+
+invA0, invM0 = np.float32(sc_old[2]), np.float32(sc_old[3])
+sWe0 = sc_old[16:528] / np.float32(sc_old[0])
+sWm0 = sc_old[528:656] * invA0
+sWc0 = sc_old[656:784] * invM0
+rs = pk['rs']
+ds_old = sc_old[912:1040]
+
+# ---- control arm: re-quantise the expand weights without any X equalisation
+def quant_expand(we, D):
+    wf = (we.astype(np.float64) * D[None, :].astype(np.float64)).astype(np.float32)
+    s = (np.max(np.abs(wf), axis=1) / np.float32(127)).astype(np.float32)
+    inv = (np.float32(1) / s).astype(np.float32)
+    codes = np.clip(np.rint(wf * inv[:, None]), -127, 127).astype(np.int8)
+    return codes, s
+
+
+def build_scales(sx, invA, invM, sWe, sWm, sWc, D):
+    """Start from the bound table so every slot this card does not own is bit-identical.
+
+    Owned (rewritten): 0,1,2,3, 16:528, 528:656, 656:784, 784:912, 912:1040.
+    Preserved verbatim: 4:16 (sc[4] is the r09 DS producer's pooled quantiser,
+    sc[5] is a stale sX copy nothing reads).  Zero-filled slots 6:16 stay zero.
+    """
+    sc = sc_old.copy()
+    sc[0] = sx
+    sc[1] = np.float32(1) / np.float32(sx)
+    sc[2] = invA
+    sc[3] = invM
+    sc[16:528] = np.float32(sx) * sWe
+    sc[528:656] = sWm / np.float32(invA)
+    sc[656:784] = sWc / np.float32(invM)
+    sc[784:912] = np.float32(sx) * D * rs
+    sc[912:1040] = ds_old / D
+    return sc
+
+
+def invx(sc, D):
+    return (np.float32(sc[1]) / D).astype(np.float32)
+
+
+def evaluate(we8, wm8, wc8, sc, D, frames=False):
+    inv = invx(sc, D)
+    if not frames:
+        y = C.ffn_forward(X, we8, wm8, wc8, sc, invX=inv)
+        return float(np.sqrt(np.mean((y - Y) ** 2)) / np.sqrt(np.mean(Y * Y)))
+    off = 0
+    out = []
+    for (tag, _), xf, yf in zip(TEACHERS, Xs, Ys):
+        y = C.ffn_forward(xf, we8, wm8, wc8, sc, invX=inv)
+        out.append(dict(frame=tag, rel_l2=C.rel(y, yf),
+                        rmse=float(np.sqrt(np.mean((y - yf) ** 2)))))
+    return out
+
+
+old_rel = evaluate(pk['we8'], pk['wm8'], pk['wc8'], sc_old, np.ones(128, np.float32))
+
+results = dict(card='S05-c128', block=9, method='X power-of-two equalisation + static X/A/M coordinate search, qX residual kept',
+               objective='whole C128 FFN output Y vs FP16 teacher Y (dump_swin_9_Y)',
+               tokens=dict(frames=[t for t, _ in TEACHERS], tokens_per_frame=int(X.shape[0] // nframes),
+                           total=int(X.shape[0])),
+               old=dict(rel_l2=old_rel, frames=evaluate(pk['we8'], pk['wm8'], pk['wc8'], sc_old, np.ones(128, np.float32), frames=True)),
+               arms={}, history=[])
+
+# ---- arm D0 (control): same quantiser, D = 1 (isolates the equalisation from requantisation)
+we8_d1, sWe_d1 = quant_expand(pk['we'], np.ones(128, np.float32))
+sc_d1 = build_scales(np.float32(sc_old[0]), invA0, invM0, sWe_d1, sWm0, sWc0, np.ones(128, np.float32))
+sc_d1[912:1040] = ds_old
+results['arms']['requant_only_D1'] = dict(rel_l2=evaluate(we8_d1, pk['wm8'], pk['wc8'], sc_d1, np.ones(128, np.float32)))
+print('old', old_rel, 'requant_only', results['arms']['requant_only_D1']['rel_l2'], flush=True)
+
+# ---- arm D1..: power-of-two equalisation strengths
+best = None
+for shift in (0, -1, -2):
+    e = np.rint(np.log2(np.maximum(amax, 1e-12))).astype(np.int64) + shift
+    D = np.exp2(e.astype(np.float64)).astype(np.float32)
+    we8, sWe = quant_expand(pk['we'], D)
+    sx = np.float32(np.max(amax / D) / np.float32(127))
+    sc = build_scales(sx, invA0, invM0, sWe, sWm0, sWc0, D)
+    rel = evaluate(we8, pk['wm8'], pk['wc8'], sc, D)
+    key = 'D_shift%+d' % shift
+    results['arms'][key] = dict(rel_l2=rel, sx=float(sx), D_values=sorted(set(np.round(D, 6).tolist())),
+                                shift=int(shift))
+    print(key, rel, 'sx', float(sx), flush=True)
+    if best is None or rel < best[0]:
+        best = (rel, shift, D, we8, sWe, sc, sx)
+
+rel0, shift0, D, we8, sWe, sc_base, sx = best
+print('chosen shift', shift0, 'rel', rel0, flush=True)
+
+# ---- static coordinate search on (sX, sA, sM) factors
+FACTORS = [0.5, 0.65, 0.8, 1.0, 1.2]
+
+
+def scaled(sc, f):
+    s = sc.copy()
+    s[0] *= np.float32(f[0]); s[1] /= np.float32(f[0])
+    s[16:528] *= np.float32(f[0]); s[784:912] *= np.float32(f[0]); s[912:1040] /= np.float32(f[0])
+    s[2] /= np.float32(f[1]); s[528:656] *= np.float32(f[1])
+    s[3] /= np.float32(f[2]); s[656:784] *= np.float32(f[2])
+    return s
+
+
+f = np.ones(3)
+cur = rel0
+for sweep in range(3):
+    for dim in range(3):
+        opts = []
+        for v in FACTORS:
+            trial = f.copy()
+            trial[dim] = v
+            r = evaluate(we8, pk['wm8'], pk['wc8'], scaled(sc_base, trial), D)
+            opts.append((r, trial))
+            results['history'].append(dict(sweep=sweep, dim=dim, factor=v, rel_l2=r))
+        r, f = min(opts, key=lambda z: z[0])
+        cur = r
+    print('sweep', sweep, 'factors', f.tolist(), 'rel', cur, flush=True)
+
+# the optimum landed on the sA boundary (0.5); extend that list once, as the book requires
+EXT = {0: FACTORS, 1: [0.2, 0.3, 0.4, 0.5, 0.65], 2: [0.4, 0.5, 0.65, 0.8, 1.0]}
+for sweep in range(3):
+    moved = False
+    for dim in range(3):
+        opts = []
+        for v in EXT[dim]:
+            trial = f.copy()
+            trial[dim] = v
+            r = evaluate(we8, pk['wm8'], pk['wc8'], scaled(sc_base, trial), D)
+            opts.append((r, trial))
+            results['history'].append(dict(phase='extend', sweep=sweep, dim=dim, factor=v, rel_l2=r))
+        r, nf = min(opts, key=lambda z: z[0])
+        if r < cur - 1e-9:
+            moved = True
+        cur, f = r, nf
+    print('extend sweep', sweep, 'factors', f.tolist(), 'rel', cur, flush=True)
+    if not moved:
+        break
+
+at_boundary = [i for i in range(3) if f[i] in (min(EXT[i]), max(EXT[i]))]
+results['at_boundary'] = at_boundary
+
+sc_new = scaled(sc_base, f)
+new_rel = evaluate(we8, pk['wm8'], pk['wc8'], sc_new, D)
+new_frames = evaluate(we8, pk['wm8'], pk['wc8'], sc_new, D, frames=True)
+
+# ---- saturation / per-frame audit of the final arm (qX, qA, qM all measured)
+def audit(xf, sc, D, we8, wm8, wc8):
+    inv = invx(sc, D)
+    qx = C.code(xf * inv[None, :])
+    de = np.rint(qx @ we8.astype(np.float32).T)
+    h = C.half(de * sc[16:528][None, :])
+    a = C.act(h)
+    qa = C.code(a * np.float32(sc[2]))
+    mo = np.empty((qa.shape[0], 128), np.float32)
+    for g in range(4):
+        mo[:, g * 32:(g + 1) * 32] = qa[:, g * 128:(g + 1) * 128] @ wm8[g * 32:(g + 1) * 32].astype(np.float32).T
+    mid = np.rint(mo) * np.float32(sc[528:656])[None, :]
+    qm = C.code(mid * np.float32(sc[3]))
+    return dict(
+        qx_at_127=int((np.abs(qx) == 127).sum()), qx_elements=int(qx.size),
+        qa_at_127=int((np.abs(qa) == 127).sum()), qa_elements=int(qa.size),
+        qm_at_127=int((np.abs(qm) == 127).sum()), qm_elements=int(qm.size),
+        qx_absmax=float(np.abs(qx).max()), qa_absmax=float(np.abs(qa).max()), qm_absmax=float(np.abs(qm).max()),
+    )
+
+
+sat = []
+for tag, td in TEACHERS:
+    d = audit(C.load_x(td / 'dump_block8_out.bin'), sc_new, D, we8, pk['wm8'], pk['wc8'])
+    d['frame'] = tag
+    d['x_absmax'] = float(np.abs(C.load_x(td / 'dump_block8_out.bin')).max())
+    sat.append(d)
+sat_old = []
+for tag, td in TEACHERS:
+    d = audit(C.load_x(td / 'dump_block8_out.bin'), sc_old, np.ones(128, np.float32),
+              pk['we8'], pk['wm8'], pk['wc8'])
+    d['frame'] = tag
+    sat_old.append(d)
+
+# ---- diagnostic only: the parent's own half residual (X * pack_rs); block9 has no
+#      half X buffer and C-d2 has no half seed load, so this is NOT implemented.
+rs_pack = pk['rs']
+half_res = []
+for (tag, td), xf, yf in zip(TEACHERS, Xs, Ys):
+    d = audit(xf, sc_new, D, we8, pk['wm8'], pk['wc8'])
+    qx = C.code(xf * invx(sc_new, D)[None, :])
+    dc = np.rint(d['qa_absmax'] * 0)  # placeholder to keep flake quiet
+    y = C.ffn_forward(xf, we8, pk['wm8'], pk['wc8'], sc_new, invX=invx(sc_new, D))
+    # recompute the contract integer dot for the half-residual variant
+    mo = np.empty((xf.shape[0], 128), np.float32)
+    qa = C.code(C.act(C.half((qx @ we8.astype(np.float32).T) * sc_new[16:528][None, :])) * np.float32(sc_new[2]))
+    for g in range(4):
+        mo[:, g * 32:(g + 1) * 32] = qa[:, g * 128:(g + 1) * 128] @ pk['wm8'][g * 32:(g + 1) * 32].astype(np.float32).T
+    qm = C.code(np.rint(mo) * np.float32(sc_new[528:656])[None, :] * np.float32(sc_new[3]))
+    dcc = np.rint(qm @ pk['wc8'].astype(np.float32).T)
+    yh = C.half(dcc * np.float32(sc_new[656:784])[None, :] + xf * rs_pack[None, :])
+    half_res.append(C.rel(yh, yf))
+
+results.update(new=dict(rel_l2=new_rel, frames=new_frames, factors=f.tolist(),
+                        sx=float(sc_new[0]), invSA=float(sc_new[2]), invSM=float(sc_new[3]),
+                        D=sorted(set(np.round(D, 6).tolist())), shift=int(shift0),
+                        sA=float(1.0 / np.float64(sc_new[2])), sM=float(1.0 / np.float64(sc_new[3]))),
+               saturation_new=sat, saturation_old=sat_old,
+               diagnostic_half_residual_rel_l2=half_res,
+               diagnostic_half_residual_note='X*pack_rs residual; NOT implemented for block9 '
+               '(no half X buffer and C-d2 has no half seed load)',
+               search=dict(factors=FACTORS, extended=EXT[1], sweeps=3, order='coordinate descent on (sX,sA,sM), boundary extension once'))
+
+# ---- write packs
+wp8 = C.i8(W_PATH).copy()
+wp8[0:65536] = we8.reshape(-1)
+(OUT / 'c128_b9_weights.i8.bin').write_bytes(wp8.tobytes())
+sc_new.astype('<f4').tofile(OUT / 'c128_b9_scales.f32.bin')
+
+w_old = C.i8(W_PATH)
+w_new = C.i8(OUT / 'c128_b9_weights.i8.bin')
+sc_diff = np.where(sc_new != sc_old)[0]
+diff_run = []
+if sc_diff.size:
+    s = p = sc_diff[0]
+    for i in sc_diff[1:]:
+        if i == p + 1:
+            p = i
+            continue
+        diff_run.append([int(s), int(p)])
+        s = p = i
+    diff_run.append([int(s), int(p)])
+
+weight_diff = np.where(w_old != w_new)[0]
+sha = dict(
+    old_weight=dict(path=str(Path(W_PATH)), bytes=Path(W_PATH).stat().st_size, sha256=C.sha256(W_PATH)),
+    old_scale=dict(path=str(Path(S_PATH)), bytes=Path(S_PATH).stat().st_size, sha256=C.sha256(S_PATH)),
+    new_weight=C.file_meta(OUT / 'c128_b9_weights.i8.bin'),
+    new_scale=C.file_meta(OUT / 'c128_b9_scales.f32.bin'),
+    weight_changed=dict(bytes=int(weight_diff.size),
+                        first=int(weight_diff.min()), last=int(weight_diff.max()),
+                        region='expand codes only (bytes 0..65535)'),
+    weight_tail_identical=bool(np.array_equal(w_old[65536:], w_new[65536:])),
+    scale_changed_floats=int(sc_diff.size),
+    scale_changed_runs=diff_run,
+    scale_preserved_slots=dict(slot4_ds_pooled_scale=float(sc_new[4]), slot5_unused=float(sc_new[5]),
+                               identical=bool(np.array_equal(sc_new[4:16], sc_old[4:16]))),
+    unchanged_regions=dict(mid_bytes='65536..81919 identical to the bound pack',
+                           contract_bytes='81920..98303 identical to the bound pack',
+                           ds_bytes='98304..106495 identical to the bound pack',
+                           unused_scale_slots='sc[4..15] identical to the bound pack'),
+)
+results['packs'] = sha
+(EVID / 'CALIBRATION-CPU.json').write_text(json.dumps(results, indent=2))
+
+print(json.dumps(dict(old=old_rel, new=new_rel, factors=f.tolist(), shift=int(shift0),
+                      saturation=sat, half_residual_diag=half_res,
+                      packs={k: v for k, v in sha.items() if k != 'scale_changed_runs'},
+                      frames_old=results['old']['frames'], frames_new=new_frames), indent=2))

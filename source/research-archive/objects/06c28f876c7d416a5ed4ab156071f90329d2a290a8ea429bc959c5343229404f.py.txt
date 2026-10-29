@@ -1,0 +1,113 @@
+"""n11-vit-ffn: mapping / tail / K-order / read-bounds proof (CPU only)."""
+import json, sys
+from pathlib import Path
+
+CARD = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/cards/n11-vit-ffn')
+GX, GY, NSG = 9, 32, 8
+M_FULL, N = 288, 4096
+K = 1024
+STEP = 16
+
+
+def sg_map(wgx, wgy, sg):
+    mA = wgx * 32 + 16 * (sg // 4)
+    mB = mA + 8
+    n0 = wgy * 128 + 32 * (sg % 4)
+    return mA, mB, n0
+
+
+def coverage(grid_x=GX, grid_y=GY):
+    seen = {}
+    dup = 0
+    for wgx in range(grid_x):
+        for wgy in range(grid_y):
+            for sg in range(NSG):
+                mA, mB, n0 = sg_map(wgx, wgy, sg)
+                for base in (mA, mB):
+                    for r in range(base, base + 8):
+                        for c in range(n0, n0 + 32):
+                            key = (r, c)
+                            if key in seen:
+                                dup += 1
+                            seen[key] = (wgx, wgy, sg)
+    # every cell exactly once?
+    missing = [(r, c) for r in range(M_FULL) for c in range(N) if (r, c) not in seen]
+    return dict(cells=len(seen), expected=M_FULL * N, duplicates=dup,
+                missing=len(missing), ok=(len(seen) == M_FULL * N and dup == 0 and not missing))
+
+
+def store_domain(live):
+    """Rows/cols the epilogue can store for a given live-token count."""
+    rows = []
+    for wgx in range(GX):
+        for wgy in range(GY):
+            for sg in range(NSG):
+                mA, mB, n0 = sg_map(wgx, wgy, sg)
+                for m in (mA, mB):
+                    if m < live:
+                        rows.append((m, n0))
+    # cooperative-matrix store writes whole 8-row slices: a slice is written iff its
+    # start row m < live (epilogue guard, identical in parent and candidate).
+    written_rows = set()
+    for m, n0 in rows:
+        for r in range(m, m + 8):
+            if r < M_FULL:
+                written_rows.add(r)
+    cells = len(rows) * 8 * 32
+    expect_rows = min(M_FULL, ((live + 7) // 8) * 8)
+    return dict(live=live, sg_slices=len(rows), cells=cells,
+                written_rows=len(written_rows),
+                expected_rows=expect_rows,
+                over_store_rows=max(0, len(written_rows) - live),
+                max_row=max(written_rows) if written_rows else None,
+                exact_no_over_store=(len(written_rows) == live),
+                ok=(len(written_rows) == expect_rows and cells == expect_rows * N))
+
+
+def read_domain(live):
+    """Candidate: for SGs that run the loop (mA < live), the clamped rows must be
+    inside [0, 287] (the declared activation buffer is 288x1024 halves)."""
+    bad = []
+    clamp_active = 0
+    runs = 0
+    for wgx in range(GX):
+        for wgy in range(GY):
+            for sg in range(NSG):
+                mA, mB, n0 = sg_map(wgx, wgy, sg)
+                if mA >= live:
+                    continue
+                runs += 1
+                last = live - 1 if live > 0 else 0
+                rA = min(mA, last)
+                rB = min(mB, last)
+                if rB != mB:
+                    clamp_active += 1
+                for r in (rA, rB):
+                    if r < 0 or r > M_FULL - 1:
+                        bad.append((wgx, wgy, sg, r))
+    return dict(live=live, sgs_running_loop=runs, sgs_with_clamped_row=clamp_active,
+                out_of_buffer=len(bad), ok=not bad)
+
+
+def k_order_proof():
+    ks = list(range(0, K, STEP))
+    return dict(steps=len(ks), first=ks[0], last=ks[-1], strictly_ascending=ks == sorted(ks),
+                per_acc_per_step=1, ok=(len(ks) == K // STEP and ks[-1] == K - STEP))
+
+
+if __name__ == '__main__':
+    out = dict(
+        mapping=coverage(),
+        store_domain={str(l): store_domain(l) for l in (0, 7, 8, 16, 255, 257, 288, 289)},
+        read_domain={str(l): read_domain(l) for l in (0, 8, 16, 255, 257, 288)},
+        k_order=k_order_proof(),
+        grid=dict(gx=GX, gy=GY, wg=GX * GY, sg_per_wg=NSG, threads=256),
+        shapes=dict(M=M_FULL, N=N, K=K, wg_tile='M32 x N128', sg_tile='M16 x N32 (2 x M8, 2 x N16)'),
+        buffers=dict(x_halves=M_FULL * K, aHidden_halves=M_FULL * N),
+    )
+    out['all_ok'] = (out['mapping']['ok'] and out['k_order']['ok']
+                     and all(v['ok'] for v in out['store_domain'].values())
+                     and all(v['ok'] for v in out['read_domain'].values()))
+    print(json.dumps(out, indent=1))
+    (CARD / 'PROOF-RAW.json').write_text(json.dumps(out, indent=1), encoding='utf-8')
+

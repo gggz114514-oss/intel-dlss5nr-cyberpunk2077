@@ -1,0 +1,121 @@
+// C1 candidate: FP16 C256 D4 epilogue, 16-token strip staging (shT 8 KiB, 4 strips).
+// Parent: source/parent_c256_d4_epi_only.comp (unmodified copy)
+//   sha256 cae1c84f652f02f6bb0d0b4106dfdc80a8f0945cb610efabe1226ed6360ad049
+// Parent SPV: spv/parent_repro.spv
+//   sha256 fdcb85b0d86a39ae1a88d0087255b8b41be246029bb5ba6525575765ac0919d7
+// Changed/added lines are tagged [C1-n]; every other line is the parent text.
+//   [C1-1] parent L19  shared shT[16384] -> shT[4096]  (32 KiB -> 8 KiB declared SLM)
+//   [C1-2] parent L33  new strip loop (4 strips x 16 tokens), j order kept as j = 2*strip+jj
+//   [C1-3] parent L34  T staging bound 16384 -> 4096, global index gains sbase (strip*4096)
+//   [C1-4] parent L35  barrier: strip writes complete -> strip reads may start
+//   [C1-5] parent L37  debug dump per strip: dbg[425984 + sbase + e] (same final bytes)
+//   [C1-6] parent L40  debug barrier kept per strip (debug-only path)
+//   [C1-7] parent L43  j loop -> jj loop (2 M8 per strip), j = strip*2 + jj; m0 expression unchanged
+//   [C1-8] parent L74  A load: local row inside strip is 8*jj -> index jj*2048 + k0
+//   [C1-9] parent L101 barrier: strip reads complete -> next strip writes may start (not after strip 3)
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256) in;
+// diagnostics: NR_D4_SEED_ONLY / NR_D4_MMA_ONLY isolate the two O components
+#ifndef NR_D4_MODE
+#define NR_D4_MODE 0   // 0 = full, 1 = seed only, 2 = mma only
+#endif
+#include "c256_common.glsl"
+
+layout(set = 0, binding = 6) buffer YBuf { float16_t gY[]; };
+layout(set = 0, binding = 7) buffer TBuf { float16_t gT[]; };
+
+shared float16_t shT[4096];                 // [C1-1] was 16384 (32 KiB); now 4096 (8 KiB)
+#define MAT_H coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+
+void main() {
+    const uint t_local = gl_LocalInvocationID.x;
+    const uint sg = t_local / 32u;
+    const uint lane = t_local % 32u;
+    const uint wx = (pc.p1.z != 0) ? uint(pc.p2.x) : gl_WorkGroupID.x;
+    const uint wy = (pc.p1.z != 0) ? uint(pc.p2.y) : gl_WorkGroupID.y;
+    const uint w = wy * uint(pc.p1.x) + wx;
+    const bool debug = pc.p1.w != 0;
+    const uint wo = uint(pc.p4.x);
+    const uint ars = uint(pc.p4.z);   // p4.y is rs (used by D2) — ars is p4.z
+
+    for (uint strip = 0u; strip < 4u; ++strip) {                    // [C1-2] 4 strips x 16 tokens
+    const uint sbase = strip * 4096u;                               // [C1-3] strip base in gT / dbg
+    for (uint e = t_local; e < 4096u; e += 256u)                    // [C1-3] 4096 elements per strip
+        shT[e] = gT[w * 16384u + sbase + e];                        // [C1-3] strip offset added
+    barrier();                                                      // [C1-4] strip writes -> reads
+    if (debug) {
+        for (uint e = t_local; e < 4096u; e += 256u) {              // [C1-5] per-strip debug dump
+            dbg[425984u + sbase + e] = shT[e];                      // [C1-5]
+        }
+        barrier();                                                  // [C1-6] debug-only
+    }
+
+    for (uint jj = 0u; jj < 2u; ++jj) {                             // [C1-7] two M8 per 16-token strip
+        uint j = strip * 2u + jj;                                   // [C1-7] global j order 0..7
+        uint m0 = (sg / 8u + 1u * j) * 8u;
+        uint n0 = (sg % 8u) * 32u;
+        MAT_C acc0;
+        {
+            MAT_H seed;
+            coopMatLoad(seed, gY, (w * 64u + m0) * 256u + n0, 256u, LROW);
+            MAT_H scale;
+            coopMatLoad(scale, pack, ars + n0, 0u, LROW);
+            seed = seed * scale;
+#if NR_D4_MODE == 2
+            acc0 = MAT_C(0.0);
+#else
+            acc0 = MAT_C(seed);
+#endif
+        }
+        MAT_C acc1;
+        {
+            MAT_H seed;
+            coopMatLoad(seed, gY, (w * 64u + m0) * 256u + (n0 + 16u), 256u, LROW);
+            MAT_H scale;
+            coopMatLoad(scale, pack, ars + (n0 + 16u), 0u, LROW);
+            seed = seed * scale;
+#if NR_D4_MODE == 2
+            acc1 = MAT_C(0.0);
+#else
+            acc1 = MAT_C(seed);
+#endif
+        }
+        for (uint ki = 0u; ki < 16u; ++ki) {
+            uint k0 = ki * 16u;
+            MAT_A a;  coopMatLoad(a, shT, jj * 2048u + k0, 256u, LROW);  // [C1-8] local row 8*jj
+            MAT_B b0; coopMatLoad(b0, pack, wo + (n0 / 16u) * 4096u + (k0 / 16u) * 256u, 16u, LCOL);
+            MAT_B b1; coopMatLoad(b1, pack, wo + ((n0 + 16u) / 16u) * 4096u + (k0 / 16u) * 256u,
+                                  16u, LCOL);
+#if NR_D4_MODE != 1
+            acc0 = coopMatMulAdd(a, b0, acc0);
+            acc1 = coopMatMulAdd(a, b1, acc1);
+#endif
+        }
+        {
+            MAT_H narrowed = MAT_H(acc0);
+            if (debug)
+                coopMatStore(narrowed, dbg, 442368u + m0 * 256u + n0, 256u, LROW);
+            bool oob;
+            uint addr = c256_img_half_index(m0, n0, wx, wy, oob);
+            if (!oob)
+                coopMatStore(narrowed, imgout, addr, 16u, LROW);
+        }
+        {
+            MAT_H narrowed = MAT_H(acc1);
+            if (debug)
+                coopMatStore(narrowed, dbg, 442368u + m0 * 256u + (n0 + 16u), 256u, LROW);
+            bool oob;
+            uint addr = c256_img_half_index(m0, (n0 + 16u), wx, wy, oob);
+            if (!oob)
+                coopMatStore(narrowed, imgout, addr, 16u, LROW);
+        }
+    }
+    if (strip < 3u) barrier();                                      // [C1-9] strip reads -> next writes
+    }
+}

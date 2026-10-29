@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Operand-level MMA census of an actual PORT_NETWORK_1 plan.
+
+For every PASS in the plan: resolve its SPV, run the operand-level audit
+(tools/mma_operand_audit.py, which reads A/B/C/Result component types and
+signedness, not the result type), and report FP16 vs INT8 matrix multiplies.
+
+The census is the only authority used here for "how many positions are still
+FP16"; a plan's PASS number is not an identity (TOOL-DEFECTS D3), so rows are
+keyed by (pass_name, ordinal).
+
+usage: plan_mma_census.py [--json out.json] <plan> [<plan> ...]
+"""
+import hashlib
+import json
+import sys
+from collections import Counter, OrderedDict
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024/tools")
+
+import planlib as L            # noqa: E402
+import mma_operand_audit as A  # noqa: E402
+
+_CACHE = {}
+
+
+def audit_cached(path):
+    p = Path(path)
+    if not p.exists():
+        return {"missing": True, "path": str(p), "fp16": 0, "int8": 0, "total": 0,
+                "classes": {}, "sha256": None}
+    key = (str(p).lower(), p.stat().st_size, p.stat().st_mtime_ns)
+    if key in _CACHE:
+        return _CACHE[key]
+    r = A.audit(p)
+    out = {"missing": False, "path": str(p), "sha256": r["sha256"],
+           "bytes": r["bytes"], "fp16": r["fp16_matrix_multiplies"],
+           "int8": r["int8_matrix_multiplies"], "total": r["muladd_total"],
+           "classes": r["classes"]}
+    _CACHE[key] = out
+    return out
+
+
+def census(plan_path):
+    plan = L.Plan(plan_path)
+    rows, mods = [], {}
+    for p in plan.passes:
+        a = audit_cached(p["spv"])
+        rows.append({"pass_name": p["name"], "ordinal": p["ordinal"],
+                     "spv": Path(p["spv"]).name, "spv_path": p["spv"],
+                     "spv_sha256": a["sha256"], "fp16_mma": a["fp16"],
+                     "int8_mma": a["int8"], "mma_total": a["total"],
+                     "classes": a["classes"], "missing": a["missing"]})
+        m = mods.setdefault(Path(p["spv"]).name,
+                            {"fp16": a["fp16"], "int8": a["int8"],
+                             "sha256": a["sha256"], "passes": []})
+        m["passes"].append(p["name"])
+    fp16_total = sum(r["fp16_mma"] for r in rows)
+    int8_total = sum(r["int8_mma"] for r in rows)
+    fp16_passes = [r for r in rows if r["fp16_mma"] > 0]
+    return {
+        "plan": str(plan_path),
+        "plan_sha256": hashlib.sha256(Path(plan_path).read_bytes()).hexdigest(),
+        "header": plan.raw[0],
+        "buffers": plan.nb, "passes": plan.npass, "outputs": plan.nout,
+        "policies": len(plan.policy),
+        "fp16_static_mma_total": fp16_total,
+        "int8_static_mma_total": int8_total,
+        "passes_with_fp16": len(fp16_passes),
+        "passes_with_int8": len([r for r in rows if r["int8_mma"] > 0]),
+        "missing_modules": sorted({r["spv"] for r in rows if r["missing"]}),
+        "by_class": dict(Counter(k for r in rows for k, v in r["classes"].items() for _ in range(v))),
+        "modules": OrderedDict(sorted(mods.items())),
+        "rows": rows,
+    }
+
+
+def main(argv):
+    out = None
+    if argv and argv[0] == "--json":
+        out = Path(argv[1])
+        argv = argv[2:]
+    if not argv:
+        raise SystemExit(__doc__)
+    res = [census(p) for p in argv]
+    for r in res:
+        print(f"{Path(r['plan']).name:28} {r['plan_sha256'][:16]} "
+              f"passes={r['passes']:4d} bufs={r['buffers']:4d} "
+              f"fp16={r['fp16_static_mma_total']:5d} int8={r['int8_static_mma_total']:4d} "
+              f"fp16passes={r['passes_with_fp16']:3d} missing={len(r['missing_modules'])}")
+        for m in r["missing_modules"]:
+            print("   MISSING", m)
+    if out:
+        out.write_text(json.dumps({"tool": "tools/plan_mma_census.py",
+                                   "note": "operand-level A/B dtype per OpCooperativeMatrixMulAddKHR",
+                                   "plans": res}, indent=1, ensure_ascii=False) + "\n",
+                       encoding="utf-8", newline="\n")
+        print("wrote", out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

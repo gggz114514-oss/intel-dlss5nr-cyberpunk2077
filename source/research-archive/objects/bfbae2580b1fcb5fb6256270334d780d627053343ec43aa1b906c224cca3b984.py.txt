@@ -1,0 +1,57 @@
+from pathlib import Path
+import json, hashlib, subprocess, sys, shutil
+D=Path(__file__).resolve().parent; A=D.parent; B=A.parent.parent
+R=D/'f05-owner-concurrency'; T=R/'two-head-8sg'; P=D/'f05-local-inverse'; S=R/'c64-subgroup-owner'; S.mkdir(exist_ok=True)
+read=lambda p:json.loads(p.read_text(encoding='utf-8-sig'))
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+def ident(p):return dict(path=str(p),sha256=sha(p))
+def save(p,x):p.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding='utf-8')
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+old=read(T/'BUILD.json')['sources'][0];assert old['width']==64
+d=S/'c64';d.mkdir(exist_ok=True);src=Path(old['source']['path']);s=src.read_text(encoding='utf-8')
+assert s.count('const uint sg = t_local / 32u;')==1
+s=s.replace('const uint sg = t_local / 32u;','const uint sg = gl_SubgroupID;').replace('const uint lane = t_local % 32u;','const uint lane = gl_SubgroupInvocationID;').replace('(gl_LocalInvocationID.x / 128u)','(gl_SubgroupID / 4u)')
+f=d/'candidate.comp';o=d/'candidate.spv';f.write_text(s,encoding='utf-8')
+base=next(x for x in read(P/'BUILD.json')['sources'] if x['width']==64);inc=Path(base['source']['path']).parent
+run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(inc),f,'-o',o])
+pm=ST.Module(Path(old['candidate']['path']));cm=ST.Module(o)
+# Integer ownership changes disrupt whole-function sequence alignment. Match the
+# unchanged arithmetic stream per function, with the same operand proof as the
+# existing helper; stop on any count, opcode or operand-signature difference.
+allnc=set(ST.no_contraction_ids(pm));integer_ops={128,130,132,134,135,137,138,139}
+nc={ST.result_id_of(op,a) for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in allnc and op not in integer_ops};ops={op for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in nc}
+pr=ST.function_regions(pm);cr=ST.function_regions(cm);assert len(pr)==len(cr)
+keep=[];checked=0
+for p,c in zip(pr,cr):
+ ps=[pm.instructions[i] for i in p if pm.instructions[i][0] in ops];cs=[cm.instructions[i] for i in c if cm.instructions[i][0] in ops];assert len(ps)==len(cs)
+ for x,y in zip(ps,cs):
+  assert (x[0],x[3])==(y[0],y[3]);a=ST.result_id_of(x[0],x[1]);b=ST.result_id_of(y[0],y[1])
+  assert pm.operand_signature(a,3)==cm.operand_signature(b,3),(a,b)
+  checked+=1
+  if a in nc:keep.append(b)
+assert len(keep)==len(nc)
+rawnc=set(ST.no_contraction_ids(cm));integer_keep=[ST.result_id_of(op,a) for op,a,_,_ in cm.instructions if op in integer_ops and ST.result_id_of(op,a) in rawnc]
+ST.set_no_contraction(cm,keep+integer_keep,o)
+save(S/'ARITHMETIC-ALIGNMENT.json',dict(arithmetic_sites_checked=checked,floating_decorations=len(keep),integer_decorations=len(integer_keep),method='Per-function ordered floating arithmetic stream, equal opcode/size and recursive depth3 operand signatures at every site. Preserve raw integer decorations; integer ownership arithmetic changed, floating contraction mask matches parent.'))
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',o])
+parents=(P/'plan.txt').read_text(encoding='utf-8').splitlines();tl=[l for l in (T/'plan.txt').read_text(encoding='utf-8').splitlines() if l.startswith('PASS ')];ordinal=-1
+for i,l in enumerate(parents):
+ if l.startswith('PASS '):
+  ordinal+=1
+  if ordinal in old['ordinals']:parents[i]=tl[ordinal].replace(Path(old['candidate']['path']).as_posix(),o.as_posix())
+plan=S/'plan.txt';plan.write_text('\n'.join(parents)+'\n',encoding='utf-8')
+cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check'])
+save(S/'BUILD.json',dict(parent=ident(P/'plan.txt'),control=ident(T/'plan.txt'),plan=ident(plan),CPU=cpu,sources=[dict(width=64,source=ident(f),candidate=ident(o),parent=base['candidate'],ordinals=old['ordinals'])]))
+save(S/'PROOF.json',dict(hypothesis='Make subgroup-uniform head and SLM region explicit rather than derive them from vector local IDs. Whether address-vector liveness/scratch falls is a native measurement, not assumed.',evidence='Two-head C64 native 0x1230 add3 forms address, 0x1240 shifts to byte address r10, 0x1248 stores r10:2 to scratch. Resource scratch=1856, baseline=0.',owner='Real subgroup s owns head 2*z+s//4, QKV rows 8*(s%4)+32*phase ..+7; query rows16*(s%4)..+15. Eight real subgroups of32 lanes exhaustively cover two heads. No dependence on ordering of local IDs across subgroups.',arithmetic='All arithmetic expressions, NoContraction mask, K loops, norm and den trees, rounding, shared addressing formulas relative to head unchanged. Only identification of subgroup and lane changes.',lifetime='Two sequential QKV phases, same matrix payload, same one WG barrier, same24576B SLM, no added weights/read requests. Address representation and native peak unknown until captured.',scope='Only eight C64 dispatches; C128/C256 exact accepted new parent. Diagnostic PUSH remains0; diagnostic echoes not accepted oracle. Required subgroup size32 is same captured pipeline assumption as control; GPU gate and native SIMD confirm.'))
+(S/'run').mkdir(exist_ok=True)
+for kind in ['GATES','RESOURCES','NATIVE','ORDINARY']:
+ t=read(T/f'LUNA-{kind}.json');ex=S/(kind.lower()+'-execution');ex.mkdir(exist_ok=True);t['output_root']=str(ex)
+ t['identities']=[v for v in t['identities'] if not v['path'].endswith('.spv')]+[ident(o),base['candidate']]
+ for j in t['jobs']:
+  jp=P/'plan.txt' if kind=='ORDINARY' and j['candidate']=='parent' else plan;j['plan']=ident(jp);j['runner_output']=str(S/'run'/j['id']);ar=j['argv'];ar[ar.index('--plan')+1]=str(jp);ar[ar.index('--out')+1]=j['runner_output']
+  if kind=='NATIVE':ar[ar.index('--output_dir')+1]=str(S/'captures');ar[ar.index('--msg_file')+1]=str(S/'native.log');j['capture_output']=str(S/'captures'/ar[ar.index('--profile_dir')+1])
+ save(S/f'LUNA-{kind}.json',t)
+(S/'execute.ps1').write_text((T/'execute.ps1').read_text(encoding='utf-8').replace('LUNA-F05-OWNER-two-head-8sg','LUNA-F05-C64-SUBGROUP-OWNER'),encoding='utf-8');shutil.copyfile(T/'review_timing.py',S/'review_timing.py')
+print(cpu)

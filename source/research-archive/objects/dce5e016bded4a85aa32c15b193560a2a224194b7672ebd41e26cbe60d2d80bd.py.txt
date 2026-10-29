@@ -1,0 +1,38 @@
+"""C64 b6 X-channel balance; compensate both expand weights and qX residual."""
+from pathlib import Path
+import json,shlex,subprocess,argparse,numpy as np
+ap=argparse.ArgumentParser();ap.add_argument('--alpha',type=float,choices=[.5,1.],default=.5);args=ap.parse_args()
+Q=Path(__file__).resolve().parent;B=Q.parents[2];D=Q/'real-int8-24';O=D/('c64-b6-equal-x' if args.alpha==.5 else 'c64-b6-equal-x-alpha1');O.mkdir(exist_ok=False)
+d=json.loads((Q/'ACTIVE-ROWS.json').read_text());buf=d['buffers'];r=next(r for r in d['rows'] if r['name']=='block6_swin_body_3');p=list(map(int,r['push']));b={int(k):v for k,v in r['bindings'].items()};r1=next(r for r in d['rows'] if r['name']=='block6_swin_body_1');b1={int(k):v for k,v in r1['bindings'].items()}
+wp=np.fromfile(buf[b[0][0]]['file'],dtype='<f2').astype(np.float32);we=np.array([[wp[p[12]+(n//16)*1024+(k//16)*256+(n%16)*16+k%16] for k in range(64)] for n in range(256)],np.float32)
+am=np.zeros(64,np.float32)
+for td in [D/'dump-fp16',D/'teacher-diagnostics/teacher-41444',D/'teacher-diagnostics/teacher-43654']:
+ x=np.fromfile(td/('dump_'+buf[b[2][0]]['name']+'.bin'),dtype='<f2').reshape(-1,4,16,16).transpose(0,2,1,3).reshape(-1,64).astype(np.float32);am=np.maximum(am,abs(x).max(axis=0))
+balance=np.maximum(am,1e-12)**args.alpha/np.maximum(abs(we).max(axis=0),1e-12)**(1-args.alpha)
+diag=np.exp2(np.rint(np.log2(balance))).astype(np.float32);wt=we*diag;sw=np.maximum(abs(wt).max(axis=1)/127,1e-12);sx=np.float32(np.max(am/diag)/127)
+ow=Path(buf[b1[0][0]]['file']);os=Path(buf[b1[1][0]]['file']);w8=np.fromfile(ow,dtype='i1');before=w8.copy();w8[:16384]=np.clip(np.rint(wt/sw[:,None]),-127,127).astype('i1').ravel();assert np.array_equal(w8[16384:],before[16384:])
+sc=np.fromfile(os,dtype='<f4');sc=np.concatenate([sc,np.float32(1/sx)/diag]).astype('<f4');sc[400:464]*=sx*diag/sc[0];sc[:2]=[sx,1/sx];sc[16:272]=sx*sw;wfile=O/'weights.bin';sfile=O/'scales.bin';w8.tofile(wfile);sc.tofile(sfile)
+src=B/'candidates/int8-coverage-v2-20261020/B/source/c64_qx_producer.comp';comp=B/'src/project/tools/glslang-16.5.0/bin/glslang.exe';shader=src.read_text();(O/'candidate.comp').write_text(shader)
+def compile(name):
+ z=subprocess.run([str(comp),'-V','--target-env','vulkan1.3','-o',str(O/name),str(O/'candidate.comp')],capture_output=True,text=True);assert z.returncode==0,z.stdout+z.stderr
+compile('parent.spv');assert (O/'parent.spv').read_bytes()==(src.parent.parent/'spv/c64_qx_producer.spv').read_bytes()
+assert shader.count('v * inv')==1;shader=shader.replace('v * inv','v * sc[464u+c]');(O/'candidate.comp').write_text(shader);compile('candidate.spv')
+def transform(text):
+ text=text.replace(ow.as_posix(),wfile.as_posix()).replace(os.as_posix(),sfile.as_posix());lines=text.splitlines();bi=-1;qxpass=None
+ # Identify producer by its scale resource, not a presumed pass name.
+ for i,l in enumerate(lines):
+  t=shlex.split(l)
+  if not t:continue
+  if t[0]=='PASS':qxpass=i if t[3].endswith('/c64_qx_producer.spv') else None
+  if t[0]=='BIND' and t[1]=='1' and int(t[2])==b1[1][0] and qxpass is not None:
+   a=shlex.split(lines[qxpass]);lines[qxpass]=lines[qxpass].replace(a[3],(O/'candidate.spv').as_posix())
+  if t[0]=='BUFFER':
+   bi+=1
+   if bi==b1[1][0]:lines[i]=f'BUFFER "{t[1]}" {sc.nbytes} "{t[3]}"'
+  if t[0]=='BIND' and int(t[2])==b1[1][0]:t[4]=str(sc.nbytes);lines[i]=' '.join(t)
+ assert sum(str(O/'candidate.spv').replace('\\','/') in l for l in lines)==1
+ return '\n'.join(lines)+'\n'
+jobs=[]
+for name,source,frame in [('local',D/'c64-stage/old.txt',34189)]+[(str(f),D/f'c32-equalized/combo-{f}.txt',f) for f in [34189,41444,43654]]:
+ plan=O/f'{name}.txt';plan.write_text(transform(source.read_text()));jobs.append(dict(sequence=name,frame=frame,plan=str(plan),out=str(O/name),expected_output_sha256=None,dump=False))
+(O/'JOBS.json').write_text(json.dumps(jobs,indent=2));(O/'PROOF.json').write_text(json.dumps(dict(mapping='qX=RNE(X/(sX*D)); We_new=We*D; residual multiplier=sX*D*rs (all 64 channels compensated)',rounding='same RNE/clamp and half activation; altered quantization codes expected; no floating algebra equality claim after requantization',runtime='one per-channel scale read replacing uniform scalar, no new reduction/SLM/MMA; native cost unmeasured',diagonal=diag.tolist(),channel_absmax=am.tolist(),sX=float(sx),scope='b6 only, three calibration frames, no holdout'),indent=2));print('Built',len(jobs),'jobs')

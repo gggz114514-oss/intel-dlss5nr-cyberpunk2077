@@ -1,0 +1,108 @@
+"""n34-f19-latency: SPIR-V structure of the 24 expensive ops (why a call-site
+reorder cannot move the 16 math.rsqt).
+
+Fact: the module contains exactly 2 OpExtInst Inversesqrt (inside `full_norm`)
+and 8 OpFDiv (the softmax denominators, in the main function).  The 16 SASS
+`math.rsqt` exist because IGC inlines `full_norm` at its 8 call sites.  Therefore
+moving `full_norm(...)` calls in the source permutes 8 *call sites*; the two
+rsqrt operations stay in one callee body and their distance to the inlined
+consumer is decided only by IGC.
+
+Writes SPV-STRUCTURE.json.  CPU only.
+"""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST  # noqa: E402
+
+HERE = Path(__file__).parent
+SPVS = {
+    'parent_baseline': Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                            'c32-rest-20261026/root-f2/candidate.spv'),
+    'parent_rebuild': HERE / 'parent-rebuild.spv',
+    'diag_reorder_full': HERE / 'build/candidate/raw.spv',
+}
+OUT = HERE / 'SPV-STRUCTURE.json'
+
+
+def names_of(m):
+    names = {}
+    for op, ops, _, _ in m.instructions:
+        if op == 5:
+            raw = b''.join(int(w).to_bytes(4, 'little') for w in ops[1:]).split(b'\0')[0]
+            names[ops[0]] = raw.decode('utf-8', 'replace')
+    return names
+
+
+def function_name_at(m, names, region):
+    """name of the function whose OpFunction is region[0]"""
+    fid = m.instructions[region[0]][1][1]
+    for k, v in names.items():
+        if k == fid:
+            return v
+    return 'f%d' % fid
+
+
+def analyse(p):
+    m = ST.Module(p)
+    ins = m.instructions
+    names = names_of(m)
+    regions = ST.function_regions(m)
+    fnames = [function_name_at(m, names, r) for r in regions]
+    ops = {}
+    for op, ops_, _, _ in ins:
+        ops[op] = ops.get(op, 0) + 1
+    # ids of the rsqrt ops and their containing function
+    rsq = []
+    fdiv = []
+    for i, (op, ops_, _, _) in enumerate(ins):
+        if op == 12 and len(ops_) > 3 and ops_[3] == 32:
+            rsq.append(i)
+        if op == 136:
+            fdiv.append(i)
+    ridx = {gi: ri for ri, r in enumerate(regions) for gi in r}
+
+    def fn_of(i):
+        return fnames[ridx[i]] if i in ridx else '?'
+
+    # call sites of full_norm
+    calls = []
+    for i, (op, ops_, _, _) in enumerate(ins):
+        if op == 57 and len(ops_) > 3:
+            callee = ops_[2]
+            nm = names.get(callee, 'f%d' % callee)
+            if 'full_norm' in nm:
+                calls.append(dict(idx=i, callee=nm, function=fn_of(i)))
+    return dict(
+        path=str(p), sha256=__import__('hashlib').sha256(Path(p).read_bytes()).hexdigest(),
+        instructions=len(ins), functions=len(regions),
+        inversesqrt=dict(count=len(rsq), sites=[dict(idx=i, function=fn_of(i)) for i in rsq]),
+        fdiv=dict(count=len(fdiv), sites=[dict(idx=i, function=fn_of(i)) for i in fdiv]),
+        full_norm_call_sites=dict(count=len(calls), sites=calls),
+        function_sizes={fnames[i]: len(r) for i, r in enumerate(regions)},
+        reasoning=('the 16 SASS math.rsqt = 2 OpExtInst Inversesqrt inside the single '
+                   'full_norm callee x 8 inlined call sites; reordering the call sites in '
+                   'the source permutes OpFunctionCall instructions, not the rsqrt ops, so '
+                   'their ISA distance is decided by IGC inlining/scheduling alone'),
+    )
+
+
+if __name__ == '__main__':
+    out = {}
+    for k, p in SPVS.items():
+        if not p.exists():
+            out[k] = dict(path=str(p), missing=True)
+            continue
+        out[k] = analyse(p)
+    OUT.write_text(json.dumps(out, indent=1), encoding='utf-8')
+    for k, v in out.items():
+        if v.get('missing'):
+            print(k, 'MISSING', v['path'])
+            continue
+        print('%-20s instr %5d  Inversesqrt %d (%s)  OpFDiv %d  full_norm calls %d'
+              % (k, v['instructions'], v['inversesqrt']['count'],
+                 sorted({s['function'] for s in v['inversesqrt']['sites']}),
+                 v['fdiv']['count'], v['full_norm_call_sites']['count']))
+    print('wrote', OUT)

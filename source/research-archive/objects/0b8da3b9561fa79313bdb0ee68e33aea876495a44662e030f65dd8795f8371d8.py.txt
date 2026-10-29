@@ -1,0 +1,95 @@
+"""Task 2/4: audit every tap of c64_b65_scales (2368 B = 592 f32) and cross-check
+   against the FP16 parent pack (swin_65_weights.fp16.bin, 107024 B).
+
+Tap map (from c64_int8_common.glsl + original-half.comp + candidate.comp):
+    0      sX
+    1      invSX
+    2      invSA       (activation requant inverse scale)
+    3      invSM       (mid requant inverse scale)
+    16..271   expand   dequant = sX * sWe[256]
+    272..335  mid      dequant = sA * sWm[64]
+    336..399  contract dequant = sM * sWc[64]
+    400..463  residual (qx path) = sX*D*rs[64]
+    464..527  per-channel qX inverse scale = 1/(sX*D)[64]
+    528..591  residual (half path) = rs[64]
+Push constants of block65_swin_body_2/4: p4.y = rs_half = 53384, p4.z = ars_half = 12288.
+"""
+import json
+import numpy as np
+from pathlib import Path
+
+B = Path("@NR_WORKSPACE@")
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+SC = Q / "real-int8-24/c64-family-static/b65-scales.bin"
+W8 = Q / "real-int8-24/c64-family-static/b65-weights.bin"
+PACK = (B / "candidates/amd-map-20261015/round4-integrated/candidate/packs"
+        / "swin_65_weights.fp16.bin")
+RS_HALF = 53384
+ARS_HALF = 12288
+
+
+def main():
+    sc = np.fromfile(SC, dtype="<f4")
+    w8 = np.fromfile(W8, dtype="i1").astype(np.int32)
+    pk = np.fromfile(PACK, dtype="<f2").astype(np.float32)
+    o = {"scale_file": str(SC), "n_floats": int(sc.size), "bytes": SC.stat().st_size,
+         "weights_bytes": W8.stat().st_size, "pack_halves": int(pk.size),
+         "taps": {
+             "sX": float(sc[0]), "invSX": float(sc[1]),
+             "invSA": float(sc[2]), "invSM": float(sc[3]),
+             "sX_x_invSX": float(sc[0] * sc[1]),
+             "sA": float(1.0 / sc[2]) if sc[2] else None,
+             "sM": float(1.0 / sc[3]) if sc[3] else None,
+         }}
+    exp = sc[16:272]; mid = sc[272:336]; con = sc[336:400]
+    res_qx = sc[400:464]; inv_qx = sc[464:528]; rs = sc[528:592]
+    # internal consistency: res_qx * inv_qx == rs
+    prod = res_qx * inv_qx
+    o["consistency"] = {
+        "res_qx_x_inv_qx_vs_rs_maxrel": float(np.max(np.abs(prod - rs) / np.maximum(np.abs(rs), 1e-30))),
+        "inv_qx_x_sX_range": [float((inv_qx * sc[0]).min()), float((inv_qx * sc[0]).max())],
+        "implied_D_from_inv_qx": [round(float(x), 3) for x in (1.0 / (inv_qx * sc[0]))[:16]],
+        "exp_over_sX_range": [float((exp / sc[0]).min()), float((exp / sc[0]).max())],
+    }
+    # FP16 pack residual taps
+    pk_rs = pk[RS_HALF:RS_HALF + 64]
+    pk_ars = pk[ARS_HALF:ARS_HALF + 64]
+    o["fp16_pack"] = {
+        "pack_rs_half_offset": RS_HALF,
+        "pack_ars_half_offset": ARS_HALF,
+        "rs_vs_pack_rs_maxabs": float(np.max(np.abs(rs - pk_rs))),
+        "rs_vs_pack_rs_relL2": float(np.linalg.norm(rs - pk_rs) / np.linalg.norm(pk_rs)),
+        "ars_vs_pack_ars_maxabs": float(np.max(np.abs(rs - pk_ars))),
+        "ars_vs_pack_ars_relL2": float(np.linalg.norm(rs - pk_ars) / np.linalg.norm(pk_ars)),
+        "rs_head8": [round(float(x), 5) for x in rs[:8]],
+        "pack_rs_head8": [round(float(x), 5) for x in pk_rs[:8]],
+        "pack_ars_head8": [round(float(x), 5) for x in pk_ars[:8]],
+        "ars_equals_rs": bool(np.allclose(pk_ars, pk_rs, atol=1e-6)),
+    }
+    # zero / degenerate checks
+    o["degenerate"] = {
+        "any_zero_scales": [int(i) for i in np.where(sc == 0)[0][:20]],
+        "any_nan": bool(np.any(~np.isfinite(sc))),
+        "exp_min_max": [float(exp.min()), float(exp.max())],
+        "mid_min_max": [float(mid.min()), float(mid.max())],
+        "con_min_max": [float(con.min()), float(con.max())],
+        "rs_min_max": [float(rs.min()), float(rs.max())],
+        "w8_absmax": int(np.abs(w8).max()),
+        "w8_zero_frac": float(np.mean(w8 == 0)),
+        "w8_saturated_frac": float(np.mean(np.abs(w8) == 127)),
+    }
+    # weight sanity: expand rows should have per-row absmax near 127 after the
+    # calibration's per-row scaling sw[n] = max|We*D|/127 -> w8 row max ~127.
+    e = w8[:16384].reshape(256, 64)
+    m = w8[16384:24576].reshape(64, 128)
+    c = w8[24576:28672].reshape(64, 64)
+    o["weight_rows"] = {
+        "expand_row_absmax_min_med_max": [int(np.abs(e).max(1).min()), float(np.median(np.abs(e).max(1))), int(np.abs(e).max(1).max())],
+        "mid_row_absmax_min_med_max": [int(np.abs(m).max(1).min()), float(np.median(np.abs(m).max(1))), int(np.abs(m).max(1).max())],
+        "contract_row_absmax_min_med_max": [int(np.abs(c).max(1).min()), float(np.median(np.abs(c).max(1))), int(np.abs(c).max(1).max())],
+    }
+    print(json.dumps(o, indent=1))
+
+
+if __name__ == "__main__":
+    main()

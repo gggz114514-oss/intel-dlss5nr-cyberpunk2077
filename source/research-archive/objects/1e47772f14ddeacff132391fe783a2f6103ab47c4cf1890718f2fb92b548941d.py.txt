@@ -1,0 +1,232 @@
+"""Native ISA accounting for n12b-f14-scale (read-only, no GPU).
+
+Input = the two ISAs the campaign already captured for these exact SPV bytes in
+queue/n12-vit-qkv/native/captures (plan = the n12 plan rebased on the current
+chain head; base arm = the F14 baseline SPV 72e2df7c..., cand arm = the n12
+candidate SPV d008f8fe...).  This card captured nothing.
+
+Output = evidence/ISA-STATS.json: opcode histogram, send.ugm message histogram,
+the two Q-segment scalar-load sites (address, address setup, consumer chain) and
+the counters the native criterion uses.
+"""
+import hashlib
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+CAMPAIGN = CARD.parent.parent
+sys.path.insert(0, str(CAMPAIGN))
+import COMMON as K  # noqa: E402
+
+EVID = CARD / 'evidence'
+EVID.mkdir(exist_ok=True)
+
+Q = CAMPAIGN / 'queue/n12-vit-qkv/native/captures'
+ARMS = {
+    'base': Q / 'native-native-base/ISA/CS_asm2ef42bf87fecdff2_simd32_0000000000000019_24_orig.asm',
+    'n12_cand': Q / 'native-native-cand/ISA/CS_asm220ce9995b78f549_simd32_0000000000000019_24_orig.asm',
+}
+ARM_SPV = {
+    'base': '72e2df7c7b1e542f375f5c7c2bdc572433a08c5f1a1a0d706026efa54b9a1e87',
+    'n12_cand': 'd008f8fefca9e8fa881713302bb45fab4c23a5d4c8258a4b1cbca07e8577e4c7',
+}
+
+INSN = re.compile(r'^\s*/\*\s*\[([0-9A-Fa-f]+)\]\s*\*/\s*(.*)$')
+PRED = re.compile(r'^(?:\([^)]*\)\s+)*')
+OPC = re.compile(r'^([a-z][a-z0-9_.]*)')
+MSG = re.compile(r'//\s*(?:[^;]*;\s*)?(.+)$')
+RREG = re.compile(r'\br(\d+)(?:\.\d+)?')
+
+
+def parse(path):
+    lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+    insts = []
+    for i, ln in enumerate(lines, 1):
+        m = INSN.match(ln)
+        if not m:
+            continue
+        addr = int(m.group(1), 16)
+        body = m.group(2)
+        rest = PRED.sub('', body)
+        om = OPC.match(rest)
+        if not om:
+            continue
+        op = om.group(1)
+        msg = None
+        if op in ('send.ugm', 'send.gtwy', 'send.ugm.mem'):
+            mm = MSG.search(body)
+            if mm:
+                msg = mm.group(1).strip()
+        regs = [int(x) for x in RREG.findall(rest)]
+        insts.append(dict(line=i, addr=addr, op=op, body=body.strip(),
+                          msg=msg, max_reg=max(regs) if regs else -1))
+    return lines, insts
+
+
+def hist(insts):
+    c = Counter(i['op'] for i in insts)
+    msg = Counter(i['msg'] for i in insts if i['msg'])
+    return c, msg
+
+
+def scan_scale_sites(insts):
+    """The Q coefficient sequence (one per unrolled group copy):
+         add  (1|M0) rD<1>:d rLOAD<0;1,0>:d rHEAD<0;1,0>:d   ; p2.z + (gy & 31)
+         shl  (1|M0) rD2<1>:ud rD<0;1,0>:d 2:w                ; float index -> byte offset
+         send.ugm (1|M0) rSCALE rD2 null:0 a0.0 ... load.ugm.d32x1t.a32.bss[a0.0]
+         mov  (1|M0) rH<2>:hf rSCALE.0<0;1,0>:f               ; float -> two halves
+         mul  ... rH.0<0,1,0>:hf x8                           ; the eight vq_scale_q
+    The head register is the one the prolog fills with (gy & 31).
+    """
+    head_regs = []
+    for i in insts:
+        m = re.search(r'and \(1\|M0\)\s+r(\d+)\.(\d+)<1>:d\s+r(\d+)\.(\d+)<0;1,0>:d\s+31:w',
+                      i['body'])
+        if m:
+            head_regs.append('r%s.%s' % (m.group(1), m.group(2)))
+    sites = []
+    for idx, i in enumerate(insts):
+        if not (i['op'] == 'send.ugm' and i['msg'] and
+                'load.ugm.d32x1t.a32.bss' in i['msg']):
+            continue
+        prev = [insts[j] for j in range(max(0, idx - 24), idx)]
+        shl = next((p for p in reversed(prev) if p['op'] == 'shl' and '2:w' in p['body']), None)
+        add = None
+        if shl:
+            srcs = re.findall(r'r(\d+)\.(\d+)<0;1,0>:d', shl['body'])
+            if srcs:
+                want = 'r%s.%s<1>:d' % srcs[0]
+                add = next((p for p in reversed(prev) if p['op'] == 'add'
+                            and want in p['body']), None)
+        flat = next((p for p in reversed(prev) if p['op'] == 'send.ugm' and p['msg'] and
+                     'd32x1t.a64.ca.cc.flat[A+0x48]' in p['msg']), None)
+        head = None
+        if add:
+            srcs = re.findall(r'r(\d+)\.(\d+)<0;1,0>:d', add['body'])
+            cand = ['r%s.%s' % (a, b) for a, b in srcs]
+            hit = [c for c in cand if c in head_regs]
+            head = hit[0] if hit else (cand[-1] if cand else None)
+        nxt = [insts[j] for j in range(idx + 1, min(len(insts), idx + 16))]
+        conv = next((p for p in nxt if p['op'] == 'mov' and '<2>:hf' in p['body']
+                     and '<0;1,0>:f' in p['body']), None)
+        scale_reg = None
+        if conv:
+            m = re.search(r'(r\d+\.0)<2>:hf', conv['body'])
+            scale_reg = m.group(1) if m else None
+        uses = []
+        if scale_reg:
+            for p in insts[idx: idx + 40]:
+                if p['op'] == 'mul' and (scale_reg + '<') in p['body']:
+                    uses.append('0x%X' % p['addr'])
+                if len(uses) >= 8:
+                    break
+        sites.append(dict(
+            addr='0x%X' % i['addr'],
+            message=i['msg'],
+            address_setup=dict(
+                add='0x%X' % add['addr'] if add else None,
+                shl='0x%X' % shl['addr'] if shl else None,
+                p2z_flat_load='0x%X' % flat['addr'] if flat else None,
+                head_register=head,
+                head_register_is_prolog_gy_and_31=(head in head_regs) if head else None,
+            ),
+            convert_to_half='0x%X' % conv['addr'] if conv else None,
+            scale_register=scale_reg,
+            scale_mul_uses=uses,
+            scale_mul_use_count=len(uses),
+        ))
+    return sites, head_regs
+
+
+def arm_stats(tag, path):
+    lines, insts = parse(path)
+    c, msg = hist(insts)
+    sites, head_regs = scan_scale_sites(insts)
+    return dict(
+        tag=tag, path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        bytes=path.stat().st_size, instruction_lines=len(insts),
+        spv_sha256=ARM_SPV[tag],
+        opcode_histogram=dict(c.most_common()),
+        counters=dict(
+            dpas=c.get('dpas.8x8', 0),
+            send_ugm=c.get('send.ugm', 0),
+            send_gtwy=c.get('send.gtwy', 0),
+            send_total=c.get('send.ugm', 0) + c.get('send.gtwy', 0),
+            sync_nop=c.get('sync.nop', 0),
+            sync_allrd=c.get('sync.allrd', 0),
+            goto=c.get('goto', 0),
+            join=c.get('join', 0),
+            jmpi=c.get('jmpi', 0),
+            jmpi_uniform=sum(1 for i in insts if i['op'] == 'jmpi' and '(W' in i['body']),
+            math_rsqt=c.get('math.rsqt', 0),
+            sel=c.get('sel', 0),
+            cmp=c.get('cmp', 0),
+            mov=c.get('mov', 0),
+            add=c.get('add', 0),
+            add3=c.get('add3', 0),
+            mul=c.get('mul', 0),
+            shl=c.get('shl', 0),
+            load_grf_indirect=sum(1 for i in insts if re.search(r'>:[a-z]+ +r\[a0', i['body'])),
+        ),
+        max_register=max(i['max_reg'] for i in insts),
+        first_dpas_line=next((i['line'] for i in insts if i['op'] == 'dpas.8x8'), None),
+        send_ugm_messages=dict(msg.most_common()),
+        scalar_scale_sites=sites,
+        head_index_register=head_regs[0] if head_regs else None,
+        flat_A48_count=sum(1 for i in insts if i['msg'] and 'flat[A+0x48]' in i['msg']),
+        scalar_bss_d32x1t_count=sum(1 for i in insts if i['msg'] and
+                                    'load.ugm.d32x1t.a32.bss' in i['msg']),
+        shl_2w_count=sum(1 for i in insts if i['op'] == 'shl' and '2:w' in i['body']),
+        half_convert_from_f32_count=sum(
+            1 for i in insts if i['op'] == 'mov' and '<2>:hf' in i['body'] and '<0;1,0>:f' in i['body']),
+    )
+
+
+def main():
+    out = {tag: arm_stats(tag, p) for tag, p in ARMS.items()}
+    b, n = out['base'], out['n12_cand']
+    out['delta_n12_vs_base'] = dict(
+        instruction_lines=n['instruction_lines'] - b['instruction_lines'],
+        send_ugm=n['counters']['send_ugm'] - b['counters']['send_ugm'],
+        goto=n['counters']['goto'] - b['counters']['goto'],
+        join=n['counters']['join'] - b['counters']['join'],
+        mov=n['counters']['mov'] - b['counters']['mov'],
+        scalar_scale_sites=n['scalar_scale_sites'].__len__() - b['scalar_scale_sites'].__len__(),
+        note='the n12 candidate removed the norm broadcast; the two Q scalar scale loads '
+             'survived byte-for-byte in both group copies, which is the delta this card targets',
+    )
+    out['prediction'] = dict(
+        target_message='load.ugm.d32x1t.a32.bss[a0.0]',
+        target_sites=dict(base=[s['addr'] for s in b['scalar_scale_sites']],
+                          n12_cand=[s['addr'] for s in n['scalar_scale_sites']]),
+        expected_candidate=dict(
+            scalar_scale_sites=1,
+            send_total=n['counters']['send_total'] - 2,
+            note='one scalar bss load and one p2.z flat load disappear; send.ugm+send.gtwy '
+                 '1225 -> 1223 in the current capture batch (never higher)',
+        ),
+        unchanged=['dpas.8x8', 'math.rsqt', 'sync.allrd', 'goto', 'join', 'scratch', 'workgroup memory'],
+    )
+    K.write_json(EVID / 'ISA-STATS.json', out)
+    print(json.dumps({t: dict(instruction_lines=out[t]['instruction_lines'],
+                              counters=out[t]['counters'],
+                              head_reg=out[t]['head_index_register'],
+                              sites=[s['addr'] for s in out[t]['scalar_scale_sites']],
+                              flat_A48=out[t]['flat_A48_count'],
+                              scalar_bss=out[t]['scalar_bss_d32x1t_count'],
+                              shl_2w=out[t]['shl_2w_count'],
+                              half_conv=out[t]['half_convert_from_f32_count'])
+                     for t in ARMS}, indent=2))
+    print('delta', json.dumps(out['delta_n12_vs_base']))
+    for t in ARMS:
+        for s in out[t]['scalar_scale_sites']:
+            print(t, s['addr'], s['address_setup'], 'conv', s['convert_to_half'],
+                  'uses', s['scale_mul_use_count'])
+        print(t, 'messages:', json.dumps(out[t]['send_ugm_messages'], indent=1)[:900])
+
+
+if __name__ == '__main__':
+    main()

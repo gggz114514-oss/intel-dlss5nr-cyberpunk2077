@@ -1,0 +1,148 @@
+"""n33 task B3: block-permutation-aware NoContraction transfer (CPU only).
+
+The campaign recipe (evidence/RECIPES.json) copies the parent's NoContraction
+pattern onto a freshly compiled SPIR-V by matching each decorated parent
+instruction as an *in-order subsequence* of the child function.  This card's
+candidate is a pure statement reorder, so `main` is a permutation of contiguous
+blocks and the in-order match fails ("no child function aligns with a decorated
+parent function").
+
+This script keeps the recipe's semantics (185 decorated sites, same sites) but
+does the match block-aware:
+
+  1. functions are matched by index (both modules have 10, `main` is the largest);
+  2. inside a function the two instruction streams are aligned with
+     difflib.SequenceMatcher on id-free skeletons,
+  3. equal runs map 1:1; a run that the candidate moved appears as one delete +
+     one insert with identical skeletons and is paired back;
+  4. every parent NoContraction site must map, otherwise the script fails.
+
+Output: build/candidate-decorated.spv + build/nc.json (parent 185 -> candidate N).
+"""
+import sys, json, difflib
+from pathlib import Path
+
+HERE = Path(__file__).parent
+CAMP = HERE.parent.parent
+sys.path.insert(0, str(CAMP))
+import COMMON as K  # noqa: E402
+
+ST = K.ST
+BUILD = HERE / "build"
+PARENT_SPV = Path("@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/"
+                  "c32-rest-20261026/body-pv-den-overlap/candidate.spv")
+
+
+def sha(p):
+    import hashlib
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def idset(m):
+    s = set()
+    for op, ops, *_ in m.instructions:
+        rid = ST.result_id_of(op, ops)
+        if rid is not None:
+            s.add(rid)
+        if ops:
+            s.add(ops[0])            # result type of most instructions
+    return s
+
+
+def skeleton(m, region, ids):
+    out = []
+    for idx in region:
+        op, ops = m.instructions[idx][0], m.instructions[idx][1]
+        norm = []
+        for k, o in enumerate(ops):
+            if o in ids and not (op == 12 and k <= 3):
+                norm.append("#")
+            else:
+                norm.append(o)
+        out.append((op, tuple(norm)))
+    return out
+
+
+def match_function(psk, csk):
+    """[(p_pos, c_pos)] complete mapping of parent positions to child positions."""
+    sm = difflib.SequenceMatcher(None, psk, csk, autojunk=False)
+    pairs, pend, cend = [], [], []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            pairs.extend((i1 + k, j1 + k) for k in range(i2 - i1))
+        elif tag == "replace":
+            if (i2 - i1) == (j2 - j1) and psk[i1:i2] == csk[j1:j2]:
+                pairs.extend((i1 + k, j1 + k) for k in range(i2 - i1))
+            else:
+                pend.append((i1, i2))
+                cend.append((j1, j2))
+        elif tag == "delete":
+            pend.append((i1, i2))
+        elif tag == "insert":
+            cend.append((j1, j2))
+    # pair moved blocks by identical skeleton content
+    used = set()
+    for (i1, i2) in pend:
+        want = psk[i1:i2]
+        for c, (j1, j2) in enumerate(cend):
+            if c in used:
+                continue
+            if csk[j1:j2] == want:
+                pairs.extend((i1 + k, j1 + k) for k in range(len(want)))
+                used.add(c)
+                break
+    pairs.sort()
+    return pairs
+
+
+def main():
+    pm = ST.Module(PARENT_SPV)
+    raw = BUILD / "candidate-raw.spv"
+    cm = ST.Module(raw)
+    pr, cr = ST.function_regions(pm), ST.function_regions(cm)
+    assert len(pr) == len(cr), (len(pr), len(cr))
+    pids, cids = idset(pm), idset(cm)
+    decorated = set(ST.no_contraction_ids(pm))
+    keep, report = set(), []
+    for fi, (preg, creg) in enumerate(zip(pr, cr)):
+        psk, csk = skeleton(pm, preg, pids), skeleton(cm, creg, cids)
+        pairs = match_function(psk, csk)
+        mapping = {preg[p]: creg[c] for p, c in pairs if p < len(preg) and c < len(creg)}
+        missing = [x for x in preg if x not in mapping]
+        report.append(dict(function=fi, parent_instr=len(preg), child_instr=len(creg),
+                           matched=len(mapping), unmatched=len(missing)))
+        for idx in preg:
+            rid = ST.result_id_of(pm.instructions[idx][0], pm.instructions[idx][1])
+            if rid is not None and rid in decorated:
+                if idx not in mapping:
+                    raise AssertionError(("decorated parent instruction has no child counterpart",
+                                          fi, idx, pm.instructions[idx][:2]))
+                cidx = mapping[idx]
+                crid = ST.result_id_of(cm.instructions[cidx][0], cm.instructions[cidx][1])
+                assert crid is not None, (fi, cidx)
+                keep.add(crid)
+    print(json.dumps(report, indent=1))
+    print("parent NC %d -> mapped %d" % (len(decorated), len(keep)))
+    assert len(keep) == len(decorated), (len(keep), len(decorated))
+
+    out = HERE / "candidate.spv"
+    ST.set_no_contraction(cm, keep, out)
+    m2 = ST.Module(out)
+    nc2 = ST.no_contraction_ids(m2)
+    print("candidate NC after set: %d   bytes %d" % (len(nc2), out.stat().st_size))
+    K.validate_spv(out)
+    print("spv_validate_cpu: OK")
+    rec = dict(parent_spv=str(PARENT_SPV), parent_spv_sha=sha(PARENT_SPV),
+               parent_nc=len(decorated), candidate_raw=str(raw),
+               candidate_raw_sha=sha(raw), candidate_spv=str(out),
+               candidate_spv_sha=sha(out), candidate_nc=len(nc2),
+               candidate_bytes=out.stat().st_size,
+               parent_bytes=PARENT_SPV.stat().st_size,
+               method="block-permutation-aware NoContraction pattern transfer",
+               functions=report)
+    (BUILD / "nc.json").write_text(json.dumps(rec, indent=1), encoding="utf-8")
+    print("wrote", BUILD / "nc.json")
+
+
+if __name__ == "__main__":
+    main()

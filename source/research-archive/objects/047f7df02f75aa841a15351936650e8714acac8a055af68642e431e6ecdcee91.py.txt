@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""C128 WO INT8 pack generator / verifier (CPU only, offline).
+
+Purpose: the R07 C128 card (`candidates/r07-c128-wo-i8`) ships nine WO packs but no
+generator and no receipt, so their layout claim is unverified.  This tool re-derives
+the packs from the frozen G3 plan + the FP16 pack the deployed shader actually reads,
+then compares byte for byte with the shipped files.  A byte-identical result is the
+proof that the int8 tile layout and the per-output-channel quantiser are the ones the
+kernel reads; it also lets a missing block be produced by the same code.
+
+Deployed FP16 addressing (parent c128_d4_full.comp, K=N=128, LCOL stride 16):
+    W[n][k] = pack[wo + (n//16)*2048 + (k//16)*256 + (n%16)*16 + (k%16)]
+INT8 B fragment addressing (c128_d4_full_i8.comp, I8B 32x16, LCOL stride 32):
+    i8[(n//16)*2048 + (k//32)*512 + (n%16)*32 + (k%32)]
+Quantiser: sW[n] = amax_k|W[n][k]| / 127 ; code = roundEven(W[n][k] / sW[n]) clamped +-127.
+
+usage: gen_c128_wo_packs.py [--check | --write] [--blocks 11,12,...]
+"""
+import argparse
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+
+R = Path("@NR_WORKSPACE@")
+G3 = R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt"
+G3_SHA = "d0bb75cf70f5def98fab66883f4d4e13099a2823655d34f15e11482cf4610cd4"
+SHIPPED = R / "work/dsh-xmx-handoff-validation-20261024/candidates/r07-c128-wo-i8/packs"
+OUT = R / "work/dsh-int8-fullnet-impl-20261024/candidates/r07-c128-wo-qx-unified/packs"
+
+K = N = 128
+TOKEN = re.compile(r'"[^"]*"|\S+')
+# C128 body_4 output projections in G3 (the nine the R07 card converted)
+BLOCKS = [11, 12, 13, 56, 57, 58, 59, 60, 61]
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def parse_plan():
+    lines = G3.read_text(encoding="utf-8").splitlines()
+    nb, npass = int(lines[0].split()[2]), int(lines[0].split()[3])
+    bufs = {}
+    for ln in lines[1:1 + nb]:
+        m = re.match(r'BUFFER "([^"]+)" (\d+) "([^"]*)"', ln)
+        bufs[m.group(1)] = {"bytes": int(m.group(2)), "path": m.group(3)}
+    names = list(bufs)
+    rest = lines[1 + nb:]
+    out, i = {}, 0
+    for _ in range(npass):
+        t = TOKEN.findall(rest[i])
+        t = [x[1:-1] if x.startswith('"') else x for x in t]
+        name, spv = t[2], t[3]
+        nbind = int(t[6])
+        binds = {}
+        for b in range(nbind):
+            w = rest[i + 1 + b].split()
+            binds[int(w[1])] = {"res": int(w[2]), "off": int(w[3]), "len": int(w[4])}
+        pw = [int(x) for x in rest[i + 1 + nbind].split()[1:]]
+        m = re.match(r'block(\d+)_swin_body_4$', name)
+        if m and spv.endswith("output-c128-full.spv"):
+            pb = names[binds[0]["res"]]
+            out[int(m.group(1))] = {
+                "pass_name": name, "spv": spv,
+                "pack_buffer": pb, "pack_path": bufs[pb]["path"],
+                "pack_bytes": bufs[pb]["bytes"],
+                "wo": pw[16], "rs": pw[17], "ars": pw[18],
+                "grid": (int(t[8]), int(t[9]), int(t[10])), "nbind": nbind,
+                "nbind0": binds[0]}
+        i += 1 + nbind + 1
+    return out
+
+
+def decode_w(half, wo):
+    idx = np.arange(N)[:, None] // 16 * 2048 + np.arange(K)[None, :] // 16 * 256 \
+        + np.arange(N)[:, None] % 16 * 16 + np.arange(K)[None, :] % 16
+    return half[wo + idx].astype(np.float32)
+
+
+def build_block(info):
+    pack = np.fromfile(info["pack_path"], dtype="<f2")
+    assert pack.size * 2 == info["pack_bytes"], (pack.size, info["pack_bytes"])
+    w = decode_w(pack, info["wo"])
+    amax = np.abs(w).max(axis=1)
+    # shipped convention: sW[n] = amax_k|W[n][k]| / 127, and a channel whose weights are
+    # all zero keeps sW = 0 (not 1.0) — the shipped b11 scale table proves it.
+    sW = (np.float32(amax) / np.float32(127.0)).astype(np.float32)
+    # the sealed quantiser multiplies by the f32 reciprocal, not divides: with division
+    # ~1% of codes differ by 1 at ties (same defect the R08 scale chain recorded)
+    invs = np.where(sW > 0, np.float32(1.0) / np.where(sW > 0, sW, np.float32(1.0)),
+                    np.float32(0.0)).astype(np.float32)
+    q = np.clip(np.rint(w * invs[:, None]), -127.0, 127.0).astype(np.int32)
+    ni, ki = np.arange(N)[:, None], np.arange(K)[None, :]
+    off = (ni // 16) * 2048 + (ki // 32) * 512 + (ni % 16) * 32 + (ki % 32)
+    i8 = np.zeros(N * K, np.int8)
+    i8[off.ravel()] = q.ravel().astype(np.int8)
+    ars = np.array([pack[info["ars"] + n] for n in range(N)], np.float16)
+    return i8.tobytes(), sW.astype(np.float32).tobytes(), {
+        "pass_name": info["pass_name"], "pack_buffer": info["pack_buffer"],
+        "pack_path": info["pack_path"], "pack_sha256": sha(info["pack_path"]),
+        "pack_bytes": info["pack_bytes"], "wo_half_offset": info["wo"],
+        "rs_half_offset": info["rs"], "ars_half_offset": info["ars"],
+        "grid": list(info["grid"]), "nbind": info["nbind"],
+        "weight_absmax": float(np.abs(w).max()),
+        "sW_max": float(sW.max()), "sW_min": float(sW.min()),
+        "codes_at_full_scale": int(np.count_nonzero(np.abs(q) >= 127)),
+        "ars_absmax": float(np.abs(ars.astype(np.float32)).max()),
+        "decoded_region_bytes": int(N * K),
+    }
+
+
+def main(argv):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--write", action="store_true")
+    ap.add_argument("--blocks", default="")
+    a = ap.parse_args(argv)
+    assert sha(G3) == G3_SHA, "frozen G3 changed"
+    passes = parse_plan()
+    want = [int(x) for x in a.blocks.split(",")] if a.blocks else BLOCKS
+    meta = {"scheme": "static_symmetric_int8_per_output_channel", "family": "C128",
+            "K": K, "N": N, "plan": str(G3), "plan_sha256": G3_SHA,
+            "fp16_layout": "pack[wo + (n//16)*2048 + (k//16)*256 + (n%16)*16 + (k%16)]",
+            "tile_layout": "i8[(n//16)*2048 + (k//32)*512 + (n%16)*32 + (k%32)]",
+            "code_point": "roundEven(w / sW[n]), clamp +-127, sW[n] = amax_k|W[n][k]|/127",
+            "blocks": {}}
+    ok = True
+    for b in want:
+        assert b in passes, ("block not found in G3", b)
+        i8b, scb, rec = build_block(passes[b])
+        rec["codes_sha256"] = hashlib.sha256(i8b).hexdigest()
+        rec["codes_bytes"] = len(i8b)
+        rec["scales_sha256"] = hashlib.sha256(scb).hexdigest()
+        rec["scales_bytes"] = len(scb)
+        codes_p = SHIPPED / ("c128_b%d_wo.codes.i8.bin" % b)
+        sc_p = SHIPPED / ("c128_b%d_wo.sc.f32.bin" % b)
+        rec["shipped_codes"] = str(codes_p)
+        rec["shipped_codes_sha256"] = sha(codes_p) if codes_p.exists() else None
+        rec["codes_identical_to_shipped"] = (codes_p.exists() and codes_p.read_bytes() == i8b)
+        rec["scales_identical_to_shipped"] = (sc_p.exists() and sc_p.read_bytes() == scb)
+        if codes_p.exists() and not rec["codes_identical_to_shipped"]:
+            old = np.frombuffer(codes_p.read_bytes(), np.int8).astype(np.int32)
+            new = np.frombuffer(i8b, np.int8).astype(np.int32)
+            rec["code_diff_count"] = int(np.count_nonzero(old != new))
+            rec["code_max_abs_diff"] = int(np.abs(old - new).max())
+        ok = ok and rec["codes_identical_to_shipped"] and rec["scales_identical_to_shipped"]
+        meta["blocks"]["block%d" % b] = rec
+        print("block%-3d codes=%s scales=%s diff=%s" % (
+            b, rec["codes_identical_to_shipped"], rec["scales_identical_to_shipped"],
+            rec.get("code_diff_count", 0)))
+        if a.write:
+            OUT.mkdir(parents=True, exist_ok=True)
+            (OUT / ("c128_b%d_wo.codes.i8.bin" % b)).write_bytes(i8b)
+            (OUT / ("c128_b%d_wo.sc.f32.bin" % b)).write_bytes(scb)
+    meta["all_blocks_match_shipped"] = bool(ok)
+    (OUT.parent / "evidence").mkdir(parents=True, exist_ok=True)
+    (OUT.parent / "evidence/PACK-VERIFY.json").write_text(
+        json.dumps(meta, indent=1, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    print("all_blocks_match_shipped", ok, "blocks", len(want))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

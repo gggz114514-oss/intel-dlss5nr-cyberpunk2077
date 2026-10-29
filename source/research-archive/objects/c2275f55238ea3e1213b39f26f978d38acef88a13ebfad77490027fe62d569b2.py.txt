@@ -1,0 +1,69 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,struct,shlex
+B=Path('@NR_WORKSPACE@');N=Path(__file__).resolve().parent;A=N.parent;S=B/'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1/source';Q=A/'c32-feed-owner-20261025/kv-tile';T=A/'f20-pv-owner-20261025/coop-den';sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def rd(p):return json.loads(p.read_text(encoding='utf-8-sig'))
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+base=Path(rd(A/'LATEST-FP16-COMBO.json')['plan']['path']);assert base==T/'plan.txt'
+nat=(Q/'candidate.comp').read_text(encoding='utf-8-sig');old_trans=(A/'c32-owner-layout-20261025/candidate.comp').read_text(encoding='utf-8-sig');trans=old_trans[old_trans.index('void nr_transpose16('):old_trans.index('void main()')]
+f1root=B/'candidates/dsh-fp16-same-family-20261023/d01-k03-v1';f2root=B/'work/zcode-fp16-fullnet-handoff-20261024/candidates/f19-f2-kv-reuse'
+for label in sys.argv[1:] or ['f01','f2']:
+ folder=N/label;folder.mkdir(parents=True,exist_ok=True);isf1=label=='f01';order=0 if isf1 else 226;parent=f1root/'spv/K03.spv' if isf1 else f2root/'spv/kernel.spv';old=(f1root/'source/kernel.comp' if isf1 else f2root/'source/candidate/kernel.comp').read_text(encoding='utf-8-sig');s=nat.replace('void main() {','void nr_body_stage() {')
+ # ABI copied from each actual parent, including external projection/feature resources.
+ a=s.index('layout(set=0,binding=2)');b=s.index('shared float16_t shK',a);oa=old.index('layout(set=0,binding=2)');ob=old.index('shared float16_t shK',oa);s=s[:a]+old[oa:ob]+s[b:]
+ if isf1:
+  helpers=old[old.index('uint nrf_pcg('):old.index('void main()')];s=s.replace('void nr_body_stage() {',trans+'\nNRH_B nrf_prepare_B(uint q);\nNRH_CH nrf_lift(NRH_B feats,uint g);\nvoid nr_body_stage() {')
+  setup='NRH_CH nx00,nx01,nx10,nx11;\n{\nNRH_B feats=nrf_prepare_B(sg);\n{NRH_CH a=nrf_lift(feats,0u),b=nrf_lift(feats,1u);nr_transpose16(a,b,nx00,nx10);}\n{NRH_CH a=nrf_lift(feats,2u),b=nrf_lift(feats,3u);nr_transpose16(a,b,nx01,nx11);}\n}\n'
+  s=s.replace('if(sg<4u) {\nNRH_A xa00;', 'if(sg<4u) {\n'+setup+'NRH_A xa00;',1)
+  for t in range(2):
+   for f in range(2):
+    oldload=f'NRH_CH x=NRH_CH(float16_t(0)); if(!tok_oob_u) coopMatLoad(x,imgin,tok_base+{t*128+f*256}u,16u,LROW);';assert oldload in s;s=s.replace(oldload,f'NRH_CH x=nx{t}{f};')
+  # Retain four natural output halves only until the original pool consumes them.
+  s=s.replace('NRH_CH ctx00=', 'NRH_CH pool00,pool01,pool10,pool11;\nNRH_CH ctx00=',1)
+  for t in range(2):
+   for f in range(2):
+    needle=f'NRH_CH o{t}=nrh_narrow(oc{t}{f});';s=s.replace(needle,needle+f'pool{t}{f}=o{t};')
+  pool=old[old.index('        // ---- v5 register pool ('):old.index('        bool o_oob3;')]
+  pos=s.rfind('\n}\n}');assert pos>0;s=s[:pos]+'\nNRH_CH o0,o1,o2,o3;\nnr_transpose16(pool00,pool10,o0,o1);\nnr_transpose16(pool01,pool11,o2,o3);\n'+pool+s[pos:]
+  s+='\n'+helpers+'\nvoid main(){nr_body_stage();}\n'
+ else:
+  helpers=old[old.index('uint nr_tok_addr('):old.index('void nr_body_stage()')];s=s.replace('void nr_body_stage() {',helpers+'\nvoid nr_body_stage() {')
+  for t in range(2):
+   for f in range(2):
+    needle=f'coopMatLoad(x,imgin,tok_base+{t*128+f*256}u,16u,LROW);';assert needle in s;s=s.replace(needle,f'coopMatLoad(x,shV,sg*512u+{t*256+f*16}u,32u,LROW);')
+  needle='NRH_C ec0=NRH_C(0.0), ec1=NRH_C(0.0);';at=s.index('{\n'+needle);s=s[:at]+'subgroupBarrier(); // Retire this SG blend reads before its own V overwrite.\n'+s[at:]
+  s+='\nvoid main(){nrf2_project_and_blend();nr_body_stage();}\n'
+ src=folder/'candidate.comp';src.write_text(s,encoding='utf-8');spv=folder/'candidate.spv';run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(S),src,'-o',spv]);cm=ST.Module(spv)
+ # Keep compiled precise arithmetic of natural body/pool. Copy unchanged helper NC by exact function skeleton.
+ def names(mod):return {ops[0]:struct.pack('<'+'I'*len(ops[1:]),*ops[1:]).split(b'\0')[0].decode() for op,ops,*_ in mod.instructions if op==5}
+ def regions(mod):
+  ns=names(mod);return {ns.get(mod.instructions[r[0]][1][1],'?'):r for r in ST.function_regions(mod)}
+ keep=set(ST.no_contraction_ids(cm));copied=[]
+ for pm in [ST.Module(Q/'candidate.spv'),ST.Module(parent)]:
+  for name,pr in regions(pm).items():
+   cr=regions(cm).get(name)
+   if not cr or name.startswith(('main(','nr_body_stage(')):continue
+   if [(pm.instructions[i][0],pm.instructions[i][3]) for i in pr]!=[(cm.instructions[i][0],cm.instructions[i][3]) for i in cr]:continue
+   ids={ST.result_id_of(cm.instructions[i][0],cm.instructions[i][1]) for i in cr};keep-=ids
+   for pos in ST.decoration_pattern(pm,pr):keep.add(ST.result_id_of(cm.instructions[cr[pos]][0],cm.instructions[cr[pos]][1]))
+   copied.append(name)
+ assert any(x.startswith('full_norm(') for x in copied);ST.set_no_contraction(cm,keep,spv);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+ lines=base.read_text(encoding='utf-8-sig').splitlines();buf=[];passes=[]
+ for i,l in enumerate(lines):
+  p=shlex.split(l)
+  if not p:continue
+  if p[0]=='BUFFER':buf.append((i,p))
+  if p[0]=='PASS':passes.append(dict(line=i,t=p,binds=[]))
+  if p[0]=='BIND':passes[-1]['binds'].append(p)
+  if p[0]=='PUSH':passes[-1]['push']=list(map(int,p[1:]))
+ p=passes[order];bind=next(b for b in p['binds'] if b[1]=='0');resource=int(bind[2]);assert int(bind[3])==0;assert [i for i,q in enumerate(passes) if any(int(b[2])==resource for b in q['binds'])]==[order];bi,bp=buf[resource];origin=Path(bp[3]);raw=origin.read_bytes();data=list(struct.unpack('<'+'H'*(len(raw)//2),raw));touched=set()
+ for off,size in zip(p['push'][4:8],[4096,4096,3072,1024]):
+  assert off+size<=len(data)
+  for k in range(off,off+size,256):
+   tile=data[k:k+256];data[k:k+256]=[tile[c*16+r] for r in range(16) for c in range(16)];assert not touched.intersection(range(k,k+256));touched.update(range(k,k+256))
+ pack=folder/'weights.bin';pack.write_bytes(struct.pack('<'+'H'*len(data),*data));new=pack.read_bytes();assert all(raw[i*2:i*2+2]==new[i*2:i*2+2] for i in range(len(data)) if i not in touched);lines[bi]=lines[bi].replace(bp[3],pack.as_posix());assert p['t'][3]==parent.as_posix();lines[p['line']]=lines[p['line']].replace(p['t'][3],spv.as_posix());plan=folder/'plan.txt';plan.write_text('\n'.join(lines)+'\n',encoding='utf-8');runner=A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe';m=dict(label=label,source=ident(src),spv=ident(spv),plan=ident(plan),baseline=ident(base),parent=ident(parent),weight_source=ident(origin),pack=ident(pack),weight_transposed_half_count=len(touched),helpers_NC_copied=copied,cpu_check=run([runner,'--plan',plan,'--cpu-check']),order=order,slm_bytes=8192);(folder/'CANDIDATE.json').write_text(json.dumps(m,indent=2))
+ task=rd(T/'LUNA-GATES.json');task['output_root']=str(folder);task['identities']=[ident(runner),ident(spv),ident(pack)];(folder/'run').mkdir(exist_ok=True)
+ for j in task['jobs']:
+  j['id']='gate-'+label+'-'+j['mode'];j['candidate']=label;j['plan']=m['plan'];j['runner_output']=str(folder/'run'/j['id']);j['argv'][2]=str(plan);j['argv'][4]=j['runner_output']
+ (folder/'LUNA-GATES.json').write_text(json.dumps(task,indent=2));print(label,m['cpu_check'],m['spv'])

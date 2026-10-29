@@ -1,0 +1,83 @@
+"""S05 step 5: round-trip verify the written PACK from its own bytes.
+
+Recomputes the whole FFN from PACK/c128_b9_{weights,scales}.bin only (the same bytes
+the plan binds), and emits the predicted block9 qX buffer in the *m8col* layout the
+r09 DS producer writes, so the GPU gate job can diff codes byte-for-byte.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import s05_common as C
+
+TEACHERS = [('34189', C.D / 'dump-fp16'),
+            ('41444', C.D / 'teacher-diagnostics/teacher-41444'),
+            ('43654', C.D / 'teacher-diagnostics/teacher-43654')]
+PW = C.CARD / 'PACK/c128_b9_weights.i8.bin'
+PS = C.CARD / 'PACK/c128_b9_scales.f32.bin'
+
+w8 = C.i8(PW).astype(np.int32)
+sc = C.f32(PS)
+we8 = w8[0:65536].reshape(512, 128)
+wm8 = w8[65536:81920].reshape(128, 128)
+wc8 = w8[81920:98304].reshape(128, 128)
+
+Xs = [C.load_x(t / 'dump_block8_out.bin') for _, t in TEACHERS]
+Ys = [C.load_y(t / 'dump_swin_9_Y.bin') for _, t in TEACHERS]
+X = np.concatenate(Xs)
+Y = np.concatenate(Ys)
+amax = np.abs(X).max(axis=0)
+e = np.rint(np.log2(np.maximum(amax, 1e-12))).astype(np.int64)
+D = np.exp2(e.astype(np.float64)).astype(np.float32)
+invX = (np.float32(sc[1]) / D).astype(np.float32)
+
+pred = C.ffn_forward(X, we8, wm8, wc8, sc, invX=invX)
+rel = float(np.sqrt(np.mean((pred - Y) ** 2)) / np.sqrt(np.mean(Y * Y)))
+
+cal = json.loads((C.CARD / 'evidence/CALIBRATION-CPU.json').read_text())
+match = abs(rel - cal['new']['rel_l2']) < 1e-12
+
+# ---- predicted qX in the producer's m8col layout (block8_out int8, 2064384 B)
+qx = C.code(X[:C.TOK] * invX[None, :]).astype(np.int8)
+buf = np.zeros(C.WIN_X * C.WIN_Y * 8192, np.int8)
+for w in range(C.WIN_X * C.WIN_Y):
+    for m in range(64):
+        base = w * 8192
+        for c in range(128):
+            buf[base + C.m8_addr(m, c)] = qx[w * 64 + m, c]
+qxpath = C.CARD / 'evidence/qx-pred-34189.i8.bin'
+buf.tofile(qxpath)
+
+# ---- residual-table cross-check: the producer inverse is encoded as a ratio to the
+#      bound pack, so record the ratio for the audit instead of hiding it
+old_sc = C.f32(C.buffers()[C.row_by_name('block9_swin_body_1')['bindings']['1'][0]]['file'])
+ratio = (sc[912:1040] / old_sc[912:1040]).astype(np.float64)
+
+out = dict(
+    card='S05-c128', block=9,
+    packs=dict(weight=C.file_meta(PW), scale=C.file_meta(PS)),
+    rel_l2_from_written_bytes=rel, rel_l2_matches_calibration=bool(match),
+    calibration_rel_l2=cal['new']['rel_l2'],
+    per_frame=[dict(frame=t, rel_l2=C.rel(C.ffn_forward(x, we8, wm8, wc8, sc, invX=invX), y))
+               for (t, _), x, y in zip(TEACHERS, Xs, Ys)],
+    D_exponent=[int(v) for v in e], D_values=sorted(set(np.float64(v) for v in D.tolist())),
+    D=[float(v) for v in D],
+    invX=[float(v) for v in invX],
+    producer_scale_ratio_to_bound_pack=[float(v) for v in ratio],
+    producer_scale_ratio_equals_1_over_D_times_f0=dict(
+        note='sc[912+c] (new) / sc[912+c] (bound) == 1/(D_c*f0); f0 is the searched sX factor',
+        f0=float(cal['new']['factors'][0]),
+        max_rel_err=float(np.abs(ratio * D * np.float32(cal['new']['factors'][0]) - 1.0).max())),
+    qx_prediction=dict(path=str(qxpath), bytes=int(qxpath.stat().st_size), sha256=C.sha256(qxpath),
+                       layout='w*8192 + m8_addr(m,c)  (the r09 DS producer address)',
+                       meaning='codes the FP16 teacher X would produce under this pack; a GPU diff '
+                               'against block9_qx.bin separates producer-scale error from DS-result drift'),
+    saturation=dict(qx_at_127=int((np.abs(qx) == 127).sum()), qx_elements=int(qx.size)),
+)
+(C.CARD / 'evidence' / 'PACK-VERIFY.json').write_text(json.dumps(out, indent=2))
+print(json.dumps(dict(rel=rel, match=match, f0=cal['new']['factors'][0],
+                      max_rel=out['producer_scale_ratio_equals_1_over_D_times_f0']['max_rel_err'],
+                      qx_sha=out['qx_prediction']['sha256'], D=sorted(set(D.tolist()))), indent=2))

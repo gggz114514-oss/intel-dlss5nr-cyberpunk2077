@@ -1,0 +1,69 @@
+"""Profile two arms (chain head vs a candidate plan) and compare per-PASS stall counters.
+
+Usage: python counters_two_arm.py <name> <plan.txt> [target-pass-substring]
+
+Needed because a change can vanish in the static ISA (the driver merges barriers), so the
+only proof that a barrier deletion landed is the hardware counter.
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+import STAGE
+import json
+
+NAME = sys.argv[1]
+PLAN = Path(sys.argv[2]).resolve()
+TARGET = sys.argv[3] if len(sys.argv) > 3 else 's37_fold_body'
+METRICS = ('GpuTime,XVE_ACTIVE,XVE_STALL_BARRIER,XVE_STALL_ALUWR,XVE_STALL_SENDWR,'
+           'XVE_INST_EXECUTED_XMX_FP16')
+base, base_sha, _ = K.current_best()
+out = K.C / 'queue' / NAME
+out.mkdir(parents=True, exist_ok=True)
+arms = [('base', base, base_sha), ('cand', PLAN, K.sha(PLAN))]
+res = {}
+for aid, plan, psha in arms:
+    run = out / ('run-' + aid)
+    job = dict(id='counters-' + aid, candidate=aid, pair=0,
+               plan=dict(path=str(plan), sha256=psha),
+               argv=[str(K.ZPROF), '--plan', str(plan), '--out', str(run), '--pool',
+                     '--warm', '0', '--reps', '1', '--metrics', METRICS],
+               runner_output=str(run), expected_frame_out=K.FIXED_GOLD,
+               expected_fixed_frame_out=K.FIXED_GOLD, expected_frame0=K.FIXED_GOLD,
+               metric_group='resource_only')
+    spec = dict(stage='resources', owner='LUNA-CONTINUOUS-COUNTERS2',
+                authorization='Main (this session) authorized a two-arm counter comparison; measurement only.',
+                output_root=str(out / ('spec-' + aid)), identities=[str(plan), str(K.ZPROF)],
+                jobs=[job], rules='counter comparison; gold enforced')
+    K.write_json(out / ('spec-%s.json' % aid), spec)
+    manifest, ps1 = STAGE.prepare(spec)
+    STAGE.run(manifest, ps1)
+    s = STAGE.summarize(spec['output_root'], slim=False)
+    print(aid, s['status'])
+    hits = list(out.rglob('hardware-counters.json'))
+    res[aid] = [h for h in hits if ('run-' + aid) in str(h)][0]
+
+def table(path):
+    d = K.read_json(path)
+    names = [m['name'] for m in d['metrics']]
+    idx = {n: i for i, n in enumerate(names)}
+    return {p['name']: {n: p['values'][idx[n]] for n in names} for p in d['frames'][0]['passes']}
+
+a, b = table(res['base']), table(res['cand'])
+keys = [k for k in a if TARGET in k]
+print('\ntarget passes:', keys)
+for k in keys:
+    print('  %s' % k)
+    for m in ('GpuTime', 'XVE_ACTIVE', 'XVE_STALL_BARRIER', 'XVE_STALL_ALUWR', 'XVE_STALL_SENDWR'):
+        va, vb = a[k][m], b[k][m]
+        if m == 'GpuTime':
+            print('    %-20s base %10.0f ns   cand %10.0f ns   delta %+8.0f ns' % (m, va, vb, vb - va))
+        else:
+            print('    %-20s base %10.3f %%   cand %10.3f %%   delta %+8.3f %%' % (m, va, vb, vb - va))
+    ms = a[k]['GpuTime'] / 1e6
+    print('    barrier ms: base %.4f  cand %.4f  delta %+.4f' % (
+        ms * a[k]['XVE_STALL_BARRIER'] / 100.0, b[k]['GpuTime'] / 1e6 * b[k]['XVE_STALL_BARRIER'] / 100.0,
+        b[k]['GpuTime'] / 1e6 * b[k]['XVE_STALL_BARRIER'] / 100.0 - ms * a[k]['XVE_STALL_BARRIER'] / 100.0))
+tot_a = sum(v['GpuTime'] for v in a.values()) / 1e6
+tot_b = sum(v['GpuTime'] for v in b.values()) / 1e6
+print('\nframe gpu (sum of passes): base %.3f ms  cand %.3f ms  delta %+.3f' % (tot_a, tot_b, tot_b - tot_a))

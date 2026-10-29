@@ -1,0 +1,279 @@
+"""n01-c32-chain build: parent byte reproduction -> candidate -> NC alignment -> plan -> CPU gates.
+
+CPU only.  Never loads Vulkan, never touches the GPU lock.
+
+Identity chain (contract 2 + 8.3):
+  parent source  c32-rest-20261026/body-pv-den-overlap/candidate.comp
+  parent SPV     4c034a53...  (7 PASS: ordinals 1,2,3,4,227,228,229)
+  recipe         cards/idt-identity-recipe/RECIPES.json[4c034a53]  (pinned header +
+                 NoContraction pattern transferred from c32-feed-owner-20261025/kv-tile)
+"""
+import json, sys, hashlib, subprocess, shutil
+from pathlib import Path
+
+CARD = Path(__file__).parent
+sys.path.insert(0, str(CARD.parent.parent))
+import COMMON as K
+
+# variant suffix: '' = v1 (already measured, triage B), '-v2' = side-effect fix
+SUF = (sys.argv[1] if len(sys.argv) > 1 else '').strip()
+CAND_SRC = CARD / ('candidate%s.comp' % SUF)
+CAND_SPV = CARD / ('candidate%s.spv' % SUF)
+PLAN = CARD / ('plan%s.txt' % SUF)
+BUILD = CARD / ('BUILD%s.json' % SUF)
+
+PARENT_SHA = '4c034a532ce60f5fa608d1ce67f6368819c052c3d5268eb51f7f680ea83aaf10'
+PARENT_SRC = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                  'c32-rest-20261026/body-pv-den-overlap/candidate.comp')
+PARENT_SPV = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                  'c32-rest-20261026/body-pv-den-overlap/candidate.spv')
+REC = K.read_json(K.C / 'cards' / 'idt-identity-recipe' / 'RECIPES.json')[PARENT_SHA]
+PINNED = Path(REC['compile']['pinned_include_dir'])
+ORIGIN = Path(REC['compile']['include_dirs'][0])
+DECO_PARENT = Path(REC['decoration_parent'])          # == nc_recipe parent
+
+# float opcodes whose contraction is at stake + the integer control-flow set of contract 2
+FLOAT_ARITH = {129: 'OpFAdd', 131: 'OpFSub', 133: 'OpFMul', 136: 'OpFDiv', 12: 'OpExtInst'}
+INT_CTRL = {128: 'OpIAdd', 130: 'OpISub', 132: 'OpIMul', 134: 'OpUDiv', 135: 'OpSDiv',
+            137: 'OpUMod', 138: 'OpSRem', 139: 'OpSMod'}
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def compile_to(src, out):
+    out.parent.mkdir(parents=True, exist_ok=True)
+    K.compile_glsl(src, out, [PINNED, ORIGIN, Path(src).parent])
+    return out
+
+
+def nc_apply(raw, out):
+    """Transfer the recorded parent NoContraction pattern, then rewrite the NC set."""
+    pm = K.ST.Module(DECO_PARENT)
+    rm = K.ST.Module(raw)
+    keep, info = K.ST.transfer_decoration_pattern_aligned(pm, rm, set())
+    K.ST.set_no_contraction(rm, keep, out)
+    return keep, info
+
+
+def function_names(module):
+    """[name] indexed by function region index (OpName string decoded)."""
+    names = {}
+    for op, ops, _, _ in module.instructions:
+        if op == 5 and len(ops) >= 2:
+            raw = b''.join(int(w).to_bytes(4, 'little') for w in ops[1:])
+            names[ops[0]] = raw.split(b'\x00')[0].decode('utf-8', 'replace')
+    out = []
+    for reg in K.ST.function_regions(module):
+        rid = None
+        for idx in reg:
+            op, ops, _, _ = module.instructions[idx]
+            if op == 54:                      # OpFunction
+                rid = K.ST.result_id_of(op, ops)
+                break
+        out.append(names.get(rid, '<anon>'))
+    return out
+
+
+def fp_map(module):
+    """function name -> ordered [(float opcode, NC?)] over that function's body."""
+    nc = set(K.ST.no_contraction_ids(module))
+    names = function_names(module)
+    out = {}
+    for fname, reg in zip(names, K.ST.function_regions(module)):
+        seq = []
+        for idx in reg:
+            op, ops, _, _ = module.instructions[idx]
+            rid = K.ST.result_id_of(op, ops)
+            if op in FLOAT_ARITH:
+                if op == 12:
+                    if len(ops) >= 5 and ops[3] == 50:      # GLSLstd450 Fma
+                        seq.append(('Fma', rid in nc))
+                else:
+                    seq.append((FLOAT_ARITH[op], rid in nc))
+        out.setdefault(fname, []).extend(seq)
+    return out
+
+
+def int_ctrl(module):
+    """Multiset of integer control-flow opcodes (contract 2: tracked separately)."""
+    import collections
+    return dict(collections.Counter(INT_CTRL[op] for op, _, _, _ in module.instructions
+                                    if op in INT_CTRL))
+
+
+def fp_census(module):
+    import collections
+    c = collections.Counter()
+    for op, ops, _, _ in module.instructions:
+        if op in (129, 131, 133, 136):
+            c[FLOAT_ARITH[op]] += 1
+        elif op == 12 and len(ops) >= 5 and ops[3] == 50:
+            c['Fma'] += 1
+        elif op == 115:
+            c['OpFConvert'] += 1
+    return dict(c)
+
+
+def opcode_census(module):
+    import collections
+    return dict(collections.Counter(op for op, _, _, _ in module.instructions))
+
+
+def main():
+    CARD.mkdir(parents=True, exist_ok=True)
+    build = {'card': 'n01-c32-chain',
+             'parent_spv': {'path': str(PARENT_SPV), 'sha256': PARENT_SHA},
+             'parent_sha_expected': PARENT_SHA,
+             'identity_recipe': {'source': str(PARENT_SRC), 'pinned_include_dir': str(PINNED),
+                                 'include_dirs': [str(ORIGIN)], 'defines': [],
+                                 'header_pin_sha256': sha(PINNED / 'register_handoff.glsl'),
+                                 'decoration_parent': str(DECO_PARENT),
+                                 'decoration_parent_sha256': sha(DECO_PARENT)},
+             'gpu': 'NONE (CPU only)'}
+
+    # ---- 1. parent byte reproduction -------------------------------------
+    praw = compile_to(PARENT_SRC, CARD / ('parent-raw%s.spv' % SUF))
+    rec = {'source': str(PARENT_SRC), 'source_sha256': sha(PARENT_SRC),
+           'raw_sha256': sha(praw), 'raw_match': sha(praw) == PARENT_SHA}
+    if rec['raw_match']:
+        shutil.copyfile(praw, CARD / ('parent-rebuild%s.spv' % SUF))
+        rec['recipe'] = 'raw'
+    else:
+        keep, info = nc_apply(praw, CARD / ('parent-rebuild%s.spv' % SUF))
+        rec['nc_count'] = len(keep)
+        rec['nc_parent'] = len(K.ST.no_contraction_ids(K.ST.Module(DECO_PARENT)))
+        rec['rebuild_sha256'] = sha(CARD / ('parent-rebuild%s.spv' % SUF))
+        rec['byte_match'] = rec['rebuild_sha256'] == PARENT_SHA
+        rec['recipe'] = 'decoration-parent' if rec['byte_match'] else 'NO-MATCH'
+        rec['nc_info'] = {k: info[k] for k in ('functions_mapped', 'parent_decorations_total',
+                                               'child_functions_without_parent_counterpart')}
+    pm = K.ST.Module(CARD / ('parent-rebuild%s.spv' % SUF))
+    rec['target'] = str(PARENT_SPV)
+    rec['target_sha256'] = sha(PARENT_SPV)
+    build['parent'] = rec
+    build['parent_rebuild'] = {'path': str(CARD / ('parent-rebuild%s.spv' % SUF)),
+                               'sha256': sha(CARD / ('parent-rebuild%s.spv' % SUF))}
+    assert rec.get('byte_match', rec['raw_match']), 'parent byte reproduction failed'
+    print('[1] parent rebuild OK', rec.get('rebuild_sha256', rec['raw_sha256']))
+
+    # ---- 2. candidate ----------------------------------------------------
+    craw = compile_to(CAND_SRC, CARD / ('candidate%s-raw.spv' % SUF))
+    keep, info = nc_apply(craw, CAND_SPV)
+    cm = K.ST.Module(CAND_SPV)
+    build['candidate_spv'] = {'path': str(CAND_SPV), 'sha256': sha(CAND_SPV)}
+    build['candidate'] = {
+        'source': str(CAND_SRC), 'source_sha256': sha(CAND_SRC),
+        'raw_sha256': sha(craw), 'spv': str(CAND_SPV),
+        'spv_sha256': sha(CAND_SPV),
+        'nc_count': len(keep),
+        'nc_info': {k: info[k] for k in ('functions_mapped', 'parent_decorations_total',
+                                         'child_functions_without_parent_counterpart')}}
+    print('[2] candidate built', build['candidate']['spv_sha256'])
+
+    # ---- 3. float NoContraction one-to-one + opcode census ---------------
+    pfm, cfm = fp_map(pm), fp_map(cm)
+    rows, nc_checked, total_p, total_c = [], 0, 0, 0
+    ok = True
+    for fname in sorted(set(pfm) | set(cfm)):
+        p = pfm.get(fname, [])
+        c = cfm.get(fname, [])
+        np_ = sum(1 for _, d in p if d)
+        nc_ = sum(1 for _, d in c if d)
+        total_p += len(p)
+        total_c += len(c)
+        nc_checked += min(np_, nc_)
+        same = ([x[0] for x in p] == [x[0] for x in c]
+                and [x[1] for x in p] == [x[1] for x in c])
+        ok = ok and same
+        rows.append({'function': fname, 'parent_float_sites': len(p), 'candidate_float_sites': len(c),
+                     'parent_nc': np_, 'candidate_nc': nc_, 'identical': same})
+    build['float_NC_alignment'] = {'method': 'function-name keyed ordered (float opcode, NC flag) sequence',
+                                   'float_NC_checked': nc_checked,
+                                   'parent_float_sites': total_p,
+                                   'candidate_float_sites': total_c,
+                                   'all_functions_identical': ok,
+                                   'functions': rows}
+    build['integer_NC_opcodes'] = {'opcodes': INT_CTRL,
+                                   'parent': int_ctrl(pm), 'candidate': int_ctrl(cm),
+                                   'identical': int_ctrl(pm) == int_ctrl(cm),
+                                   'note': 'contract 2/8: integer control-flow opcode set is a '
+                                           'separate ledger, not a NoContraction one-to-one map'}
+
+    # full NoContraction id set, keyed by function + ordered opcode sequence
+    def nc_seq(module):
+        nc = set(K.ST.no_contraction_ids(module))
+        out = {}
+        for fname, reg in zip(function_names(module), K.ST.function_regions(module)):
+            seq = [module.instructions[i][0] for i in reg
+                   if K.ST.result_id_of(*module.instructions[i][:2]) in nc]
+            out.setdefault(fname, []).extend(seq)
+        return out
+
+    pn, cn = nc_seq(pm), nc_seq(cm)
+    nc_rows = []
+    nc_total = 0
+    for fname in sorted(set(pn) | set(cn)):
+        p, c = pn.get(fname, []), cn.get(fname, [])
+        nc_total += min(len(p), len(c))
+        nc_rows.append({'function': fname, 'parent_nc_sites': len(p),
+                        'candidate_nc_sites': len(c), 'opcode_sequence_identical': p == c})
+    build['no_contraction_sites'] = {
+        'method': 'function-name keyed ordered opcode sequence of every OpDecorate NoContraction id',
+        'parent_total': len(K.ST.no_contraction_ids(pm)),
+        'candidate_total': len(K.ST.no_contraction_ids(cm)),
+        'one_to_one_checked': nc_total,
+        'all_identical': all(r['opcode_sequence_identical'] for r in nc_rows),
+        'functions': nc_rows}
+    build['fp_census'] = {'parent': fp_census(pm), 'candidate': fp_census(cm)}
+    pc, cc = opcode_census(pm), opcode_census(cm)
+    build['opcode_census'] = {'parent_total': sum(pc.values()), 'candidate_total': sum(cc.values()),
+                              'changed': {str(k): [pc.get(k, 0), cc.get(k, 0)]
+                                          for k in sorted(set(pc) | set(cc))
+                                          if pc.get(k, 0) != cc.get(k, 0)}}
+    print('[3] float NC checked=%d identical=%s; int ctrl identical=%s'
+          % (nc_checked, ok, build['integer_NC_opcodes']['identical']))
+    print('    fp census', build['fp_census'])
+    print('    spv size %d -> %d' % (sum(pc.values()), sum(cc.values())))
+
+    # ---- 4. SPV validation + plan + CPU gates ---------------------------
+    val = subprocess.run([str(K.VALIDATE), str(CAND_SPV)],
+                         capture_output=True, text=True, encoding='utf-8', errors='replace')
+    build['spv_validate_cpu'] = {'argv': [str(K.VALIDATE), str(CAND_SPV)],
+                                 'returncode': val.returncode,
+                                 'stdout': val.stdout.strip(), 'stderr': val.stderr.strip()}
+    print('[4] spv_validate_cpu rc=%d %s' % (val.returncode, (val.stdout or val.stderr).strip()[:200]))
+
+    repl = K.make_plan(CAND_SPV, PLAN,
+                       spv_shas={PARENT_SHA}, expect_passes=True)
+    ps, bs = sha(K.BASELINE), sha(PLAN)
+    build['plan'] = {'parent_plan': str(K.BASELINE), 'parent_plan_sha256': ps,
+                     'parent_plan_sha_expected': K.BASELINE_SHA,
+                     'plan': str(PLAN), 'plan_sha256': bs,
+                     'passes_replaced': repl,
+                     'replaced_spv_sha256': [PARENT_SHA],
+                     'replaced_ordinals': [1, 2, 3, 4, 227, 228, 229],
+                     'baseline_plan_sha_ok': ps == K.BASELINE_SHA}
+    print('[5] plan written, %d PASS replaced, sha=%s' % (repl, bs))
+
+    ck = subprocess.run([str(K.RUNNER), '--plan', str(PLAN), '--cpu-check'],
+                        capture_output=True, text=True, encoding='utf-8', errors='replace')
+    build['cpu_check'] = {'argv': [str(K.RUNNER), '--plan', str(PLAN), '--cpu-check'],
+                          'returncode': ck.returncode, 'stdout': ck.stdout.strip(),
+                          'stderr': ck.stderr.strip()}
+    print('[6] cpu-check rc=%d :: %s' % (ck.returncode, ck.stdout.strip()))
+
+    base_ck = subprocess.run([str(K.RUNNER), '--plan', str(K.BASELINE), '--cpu-check'],
+                             capture_output=True, text=True, encoding='utf-8', errors='replace')
+    build['cpu_check_baseline'] = {'returncode': base_ck.returncode,
+                                   'stdout': base_ck.stdout.strip()}
+    build['status'] = ('AWAITING-GPU' if (rec.get('byte_match', rec['raw_match']) and ok
+                                          and val.returncode == 0 and ck.returncode == 0)
+                       else 'BLOCKED')
+    K.write_json(BUILD, build)
+    print('[7] status', build['status'])
+
+
+if __name__ == '__main__':
+    main()

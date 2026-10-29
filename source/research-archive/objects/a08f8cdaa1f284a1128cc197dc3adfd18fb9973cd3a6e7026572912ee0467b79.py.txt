@@ -1,0 +1,179 @@
+"""n36-f05-arena-shrink: static address audit of every shared-memory access.
+
+The gate the first build did not have.  The E-class bug it catches: the PV A-operand
+reads address the V plane with an intra-section literal (`+ 4096u`, VBASE) that is NOT the
+section stride, so moving the V plane into the Q plane left PV reading 4096 half past the
+head section (and out of the 8192-half declaration for the second head).
+
+It parses every `coopMatLoad/Store(..., qkv, OFFSET, ...)` and every scalar `qkv[EXPR]`,
+strips the section base `(gl_SubgroupID / 4u) * <stride>u`, then checks:
+
+  I1  the plane literal of every offset is in the arm's allowed set
+        parent    {0, 2048, 4096}   candidate {0, 2048}   (4096 must be gone)
+  I2  the section stride is the arm's stride (6144 / 4096)
+  I3  the candidate still has its three access families: a V store carrying `vt`,
+      a Q^T load carrying `qg`, and the PV loads (16 sites on the V plane, `+ 0u`)
+  I4  the parent still has its three planes, one site family each
+
+Exit 0 only when all four hold for all six files.
+"""
+import collections
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+A = CARD.parent.parent.parent
+LIT = re.compile(r'\+\s*(\d+)u')
+
+ARMS = {
+    # file : (kind, allowed plane literals, section stride, arena halves)
+    'parent-c64': (A / 'fullnet-mechanism-transfer-20261026/f05-kv-consumer-layout/family/c64/candidate.comp',
+                   'parent', {0, 2048, 4096}, 6144, 12288),
+    'parent-c128': (A / 'fullnet-mechanism-transfer-20261026/f05-kv-consumer-layout/family/c128/candidate.comp',
+                    'parent', {0, 2048, 4096}, 6144, 12288),
+    'parent-c256': (A / 'fullnet-continuous-20261027/cards/n05a-f05-c256-mreuse/candidate.comp',
+                    'parent', {0, 2048, 4096}, 6144, 12288),
+    'candidate-c64': (CARD / 'candidate-c64.comp', 'candidate', {0, 2048}, 4096, 8192),
+    'candidate-c128': (CARD / 'candidate-c128.comp', 'candidate', {0, 2048}, 4096, 8192),
+    'candidate-c256': (CARD / 'candidate-c256.comp', 'candidate', {0, 2048}, 4096, 8192),
+}
+SEC = re.compile(r'\(gl_SubgroupID / 4u\) \* (\d+)u')
+
+
+def split_args(s):
+    """Top-level comma split of a call argument list."""
+    depth, cur, out = 0, '', []
+    for ch in s:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            out.append(cur)
+            cur = ''
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur)
+    return out
+
+
+def offset_of(frag):
+    """The offset argument of a coopMatLoad/Store on qkv, or None."""
+    m = re.search(r'coopMat(?:Load|Store)\s*\(', frag)
+    if not m:
+        return None
+    start = m.end()
+    depth, i = 1, start
+    while i < len(frag) and depth:
+        if frag[i] == '(':
+            depth += 1
+        elif frag[i] == ')':
+            depth -= 1
+        i += 1
+    args = split_args(frag[start:i - 1])
+    if len(args) < 3 or args[1].strip() != 'qkv':
+        return None
+    return args[2]
+
+
+def plane_of(off):
+    """The plane literal of an offset expression: 2048 if it carries +2048u as its first
+    literal plane term, 4096 for the old V literal, else 0."""
+    lits = [int(x) for x in LIT.findall(off)]
+    for v in lits:
+        if v >= 1024:            # plane bases are 0 / 2048 / 4096; strides are <= 256
+            return v
+    return 0
+
+
+def audit(name, arm, allowed, stride, arena):
+    text = pathlib.Path(ARMS[name][0]).read_text(encoding='utf-8')
+    seen = collections.Counter()
+    rows = []
+    bad = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if 'qkv' not in line or line.lstrip().startswith('//'):
+            continue
+        # cooperative-matrix accesses (one per call; a line may hold two calls)
+        for frag in re.split(r'(?=coopMat)', line):
+            off = offset_of(frag)
+            if off is None:
+                continue
+            secs = SEC.findall(frag)
+            for s in secs:
+                if int(s) != stride:
+                    bad.append(dict(line=lineno, rule='I2', why='section stride %s != %d'
+                                    % (s, stride), text=frag.strip()[:110]))
+            if not secs:
+                bad.append(dict(line=lineno, rule='I2', why='no section base in offset',
+                                text=frag.strip()[:110]))
+            pl = plane_of(off)
+            kind = 'store' if 'coopMatStore' in frag else 'load'
+            fam = ('V-store' if 'vt' in off else
+                   'Q-store' if (kind == 'store' and pl == 0) else
+                   'K' if pl == 2048 else
+                   'Q^T' if 'qg' in off else
+                   'PV' if pl == 0 or pl == 4096 else 'other')
+            seen[(kind, pl, fam)] += 1
+            rows.append(dict(line=lineno, kind=kind, plane=pl, family=fam,
+                             offset=' '.join(off.split())[:90]))
+            if pl not in allowed:
+                bad.append(dict(line=lineno, rule='I1', why='plane literal %d not in %s'
+                                % (pl, sorted(allowed)), text=off.strip()[:110]))
+            if pl + 2047 >= stride:
+                bad.append(dict(line=lineno, rule='I1', why='plane %d + 2047 >= section %d'
+                                % (pl, stride), text=off.strip()[:110]))
+        # scalar echo: dbg[...] = qkv[...]
+        m = re.search(r'qkv\[([^\]]*)\]', line)
+        if m:
+            off = m.group(1)
+            pl = plane_of(off)
+            seen[('scalar', pl, 'echo')] += 1
+            rows.append(dict(line=lineno, kind='scalar', plane=pl, family='echo',
+                             offset=' '.join(off.split())[:90]))
+            if pl not in allowed:
+                bad.append(dict(line=lineno, rule='I1', why='echo plane %d not in %s'
+                                % (pl, sorted(allowed)), text=off.strip()[:110]))
+    # I3 / I4: the access families that must exist
+    fams = {f: sum(1 for r in rows if r['family'] == f) for f in
+            ('V-store', 'Q^T', 'PV', 'K', 'Q-store', 'echo')}
+    if arm == 'candidate':
+        if fams['V-store'] < 1:
+            bad.append(dict(rule='I3', why='no V store carrying vt'))
+        if fams['Q^T'] < 1:
+            bad.append(dict(rule='I3', why='no Q^T load carrying qg'))
+        if fams['PV'] < 16:
+            bad.append(dict(rule='I3', why='PV sites %d < 16' % fams['PV']))
+    else:
+        for f in ('Q-store', 'K', 'Q^T', 'PV'):
+            if fams[f] < 1:
+                bad.append(dict(rule='I4', why='parent family %s missing' % f))
+    return dict(source=dict(path=str(ARMS[name][0]),
+                            sha256=hashlib.sha256(pathlib.Path(ARMS[name][0]).read_bytes()).hexdigest()),
+                arm=arm, allowed=sorted(allowed), section_stride=stride, arena_halves=arena,
+                families=fams, sites=rows, violations=bad,
+                verdict='PASS' if not bad else 'FAIL')
+
+
+def main():
+    out, ok = {}, True
+    for name in ARMS:
+        rec = audit(name, ARMS[name][1], ARMS[name][2], ARMS[name][3], ARMS[name][4])
+        out[name] = rec
+        ok = ok and rec['verdict'] == 'PASS'
+        print('%-15s %s sites=%2d %s' % (name, rec['verdict'], len(rec['sites']),
+                                         dict(sorted(rec['families'].items()))))
+        for v in rec['violations'][:8]:
+            print('   line %-4s %s: %s | %s' % (v.get('line', '-'), v['rule'], v['why'],
+                                                v.get('text', '')))
+    (CARD / 'build/addr-audit.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print('ADDRESS AUDIT', 'PASS' if ok else 'FAIL')
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

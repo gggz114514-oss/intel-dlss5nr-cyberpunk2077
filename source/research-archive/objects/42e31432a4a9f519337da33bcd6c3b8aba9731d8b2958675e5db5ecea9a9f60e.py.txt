@@ -1,0 +1,58 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,shlex,shutil,collections,re
+D=Path(__file__).resolve().parent;A=D.parent;B=A.parent.parent;R=D/'f06-scale-fragments';R.mkdir(exist_ok=True);P=D/'owner-output-transfer/combined';T=D/'f05-owner-concurrency/subgroup-owner-family'
+read=lambda p:json.loads(p.read_text(encoding='utf-8-sig'));sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+def ident(p):return dict(path=str(p),sha256=sha(p))
+def save(p,x):p.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding='utf-8')
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def restore(pm,cm,out):
+ ints={128,130,132,134,135,137,138,139};allnc=set(ST.no_contraction_ids(pm));nc={ST.result_id_of(op,a) for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in allnc and op not in ints};ops={op for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in nc};pr=ST.function_regions(pm);cr=ST.function_regions(cm);assert len(pr)==len(cr);keep=[];checked=0
+ for p,c in zip(pr,cr):
+  ps=[pm.instructions[i] for i in p if pm.instructions[i][0] in ops];cs=[cm.instructions[i] for i in c if cm.instructions[i][0] in ops];assert len(ps)==len(cs)
+  for x,y in zip(ps,cs):
+   assert (x[0],x[3])==(y[0],y[3]);a=ST.result_id_of(x[0],x[1]);b=ST.result_id_of(y[0],y[1]);assert pm.operand_signature(a,3)==cm.operand_signature(b,3);checked+=1
+   if a in nc:keep.append(b)
+ assert len(keep)==len(nc);raw=set(ST.no_contraction_ids(cm));keepint=[ST.result_id_of(op,a) for op,a,_,_ in cm.instructions if op in ints and ST.result_id_of(op,a) in raw];ST.set_no_contraction(cm,keep+keepint,out);return dict(checked=checked,float_NC=len(keep),integer_NC=len(keepint))
+scan=read(D/'CURRENT-CENSUS.json')['rows'];pt=(P/'plan.txt').read_text(encoding='utf-8');planrows=[shlex.split(l) for l in pt.splitlines() if l.startswith('PASS ')]
+for name,targets in [('family',[(8,64),(20,128),(38,256)])]:
+ S=R/name;S.mkdir(exist_ok=True);text=pt;sources=[];proof=[]
+ for ordinal,C in targets:
+  old=scan[ordinal];parent=Path(planrows[ordinal][3]);src=Path(old['source']);binding=next(x for x in read(D/'owner-output-transfer/f06-output-family/BUILD.json')['sources'] if x['width']==C);assert sha(parent)==binding['candidate']['sha256'];d=S/f'c{C}';d.mkdir(exist_ok=True)
+  def compile(label,s):
+   f=d/(label+'.comp');o=d/(label+'.spv');f.write_text(s,encoding='utf-8');run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(src.parent),f,'-o',o]);return o
+  original=Path(binding['source']['path']).read_text(encoding='utf-8-sig');pm=ST.Module(parent);rb=compile('parent-rebuild',original);rm=ST.Module(rb);keep,info=ST.transfer_decoration_pattern_aligned(pm,rm,set());ST.set_no_contraction(rm,keep,rb);assert sha(rb)==sha(parent)
+  changed=original
+  if C>64:
+   ndecl=f'        uint n0 = (sg % {C//32}u) * 32u;'
+   assert original.count(ndecl)==1
+   startloop=f'    for (uint j = 0u; j < {C//32}u; ++j) {{'
+   pre=f'    const uint n0 = (sg % {C//32}u) * 32u;\n    MAT_H scale0, scale1;\n    coopMatLoad(scale0, pack, ars + n0, 0u, LROW);\n    coopMatLoad(scale1, pack, ars + (n0 + 16u), 0u, LROW);\n'
+   changed=original.replace(startloop,pre+startloop).replace(ndecl+'\n','')
+   block0='            MAT_H scale;\n            coopMatLoad(scale, pack, ars + n0, 0u, LROW);\n            seed = seed * scale;'
+   block1='            MAT_H scale;\n            coopMatLoad(scale, pack, ars + (n0 + 16u), 0u, LROW);\n            seed = seed * scale;'
+   assert changed.count(block0)==changed.count(block1)==1
+   changed=changed.replace(block0,'            seed = seed * scale0;').replace(block1,'            seed = seed * scale1;')
+   proof.append(dict(width=C,mapping='Unchanged acceptedF06 owner: n0 depends onlysg,ars onlyPUSH; j changesrows only.',reuse=f'Two scale fragments loaded once instead of{C//32} times; logical coop loads perSG{2*(C//32)}->2. Each scale contains16unique half values repeated over8rows; not DRAM byte savings claim.',lifetime='TwoMH scale payload16B/lane persists acrossj and K; at most16B/lane additional source payload duringK (512B/subgroup), actualGRF unknown. No addedacc, weights or SLM. Reject anynewspill.',rounding='Same half seed*halfscale and floatwiden beforeeach originalK chain; outputnarrow unchanged. Scale values invariant, no arithmetic reassociation.'))
+  loads=list(re.finditer(r'coopMatLoad\((scale[01]),\s*pack,\s*(ars[^,]+),\s*0u,\s*LROW\);',changed));assert len(loads)==2
+  def replace_scale(m):
+   name,expr=m.group(1),m.group(2)
+   return f'float16_t gain_{name}=pack[({expr})+(lane & 15u)];\n    for(int component=0;component<{name}.length();++component) {name}[component]=gain_{name};'
+  changed=re.sub(r'coopMatLoad\((scale[01]),\s*pack,\s*(ars[^,]+),\s*0u,\s*LROW\);',replace_scale,changed)
+  cells=collections.Counter()
+  for lane in range(32):
+   for ci in range(4):
+    row=2*ci+lane//16;col=lane%16;assert row*0+col==col;cells[row,col]+=1
+  assert cells==collections.Counter((r,c) for r in range(8) for c in range(16))
+  proof.append(dict(width=C,scale_fragment_mapping='B580 MH8x16: lane/16+2ci=row,lane%16=channel. Parent stride0 address ars+n0+side16+col; new lane coefficient identical for all4ci. Exhaustive128elements exactonce. No shuffle/conversion/new arithmetic.',scope='Two scalar half reads perlane (duplicate betweenlane halves), fill eachMH component withsamebits. Not a claim2DRAMtransactions; native must confirm actualsend reduction.',lifetime='At most original hoistedtwoMH16B/lane payload, optional scalar temporaries; optimizer allocation unknown. C64 retainsoriginalseed scope; C128/C256 hoistacrossj. Reject anynewspill.'))
+  o=compile('candidate',changed);am=restore(pm,ST.Module(o),o);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',o]);selected=[i for i,t in enumerate(planrows) if Path(t[3])==parent];text=text.replace(parent.as_posix(),o.as_posix());sources.append(dict(width=C,ordinal=ordinal,ordinals=selected,parent=ident(parent),parent_rebuilt=ident(rb),source=ident(o.with_suffix('.comp')),candidate=ident(o),arithmetic_alignment=am))
+ plan=S/'plan.txt';plan.write_text(text,encoding='utf-8');cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check']);save(S/'BUILD.json',dict(parent=ident(P/'plan.txt'),plan=ident(plan),sources=sources,CPU=cpu));save(S/'PROOF.json',dict(rows=proof,hypothesis='Remove repeated invariant scale loads; long-lived16B/lane may cost register pressure. Native must prove actual load reduction and zero new scratch before timing.',unchanged='All floating expression/order/NC checked; grid/SLM/bind/PUSH untouched; every parent byte-rebuilt. SIMD32 checked on native.'))
+ (S/'run').mkdir(exist_ok=True)
+ for kind in ['GATES','RESOURCES','NATIVE','ORDINARY']:
+  t=read(T/f'LUNA-{kind}.json');ex=S/(kind.lower()+'-execution');ex.mkdir(exist_ok=True);t['output_root']=str(ex);t['identities']=[v for v in t['identities'] if not v['path'].endswith('.spv')]+[x['candidate'] for x in sources]+[x['parent'] for x in sources]
+  for j in t['jobs']:
+   jp=P/'plan.txt' if kind=='ORDINARY' and j['candidate']=='parent' else plan;j['plan']=ident(jp);j['runner_output']=str(S/'run'/j['id']);ar=j['argv'];ar[ar.index('--plan')+1]=str(jp);ar[ar.index('--out')+1]=j['runner_output']
+   if kind=='NATIVE':ar[ar.index('--output_dir')+1]=str(S/'captures');ar[ar.index('--msg_file')+1]=str(S/'native.log');j['capture_output']=str(S/'captures'/ar[ar.index('--profile_dir')+1])
+  save(S/f'LUNA-{kind}.json',t)
+ (S/'execute.ps1').write_text((T/'execute.ps1').read_text(encoding='utf-8').replace('LUNA-F05-SUBGROUP-OWNER-FAMILY','LUNA-F06-SCALE-FRAGMENTS-'+name),encoding='utf-8');shutil.copyfile(T/'review_timing.py',S/'review_timing.py');print(name,cpu.strip())

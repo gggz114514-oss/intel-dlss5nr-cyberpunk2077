@@ -1,0 +1,303 @@
+"""n35-f18-latency task A: where the 16 `math.inv` of ord 166 sit, how exposed they
+are, and what independent work exists around them.
+
+Read-only on existing evidence (no GPU, no plan, no deploy):
+  ISA   queue/n01b-f02-load-side/native/captures/native-native-{base,cand}/ISA/
+        CS_asma606bc5d667e43fa_simd32_000000000000001d_28_orig.asm
+  stall evidence/STALL-TARGETS.json row index=166 (gpu / ALUWR / SENDWR / barrier / active)
+  family evidence/STALL-BY-FAMILY.json
+
+Method is the campaign's own (latency_audit.py): dst = first register token of the
+op, distance = instructions until the first reader of that exact `rN.S`.
+Chain/concurrency is n32's N(p) (greedy def-use path cover over the back-slice of
+every memory-writing send, max simultaneously live chains).
+ALU price is n32/L24's weight table.
+
+Outputs A-AUDIT.json next to this file and a human summary on stdout.
+"""
+import json, re, sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+CAMP = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(CAMP))
+import ISA as CISA          # campaign ISA reader (addr/op/ops/flags/comment)
+
+HERE = Path(__file__).resolve().parent
+BASE = CAMP / 'queue/n01b-f02-load-side/native/captures/native-native-base/ISA/CS_asma606bc5d667e43fa_simd32_000000000000001d_28_orig.asm'
+CAND = CAMP / 'queue/n01b-f02-load-side/native/captures/native-native-cand/ISA/CS_asma606bc5d667e43fa_simd32_000000000000001d_28_orig.asm'
+
+EXPENSIVE = {'math.rsqt', 'math.inv', 'math.div', 'math.sqrt'}
+RGX = re.compile(r'\br(\d+)(?:\.(\d+))?')
+
+# n32 / L24 price weights
+WEIGHT = {"math.inv": 30, "math.rsqt": 30, "math.log": 30, "math.exp": 30,
+          "dpas.8x8": 6, "send.slm": 12, "send.ugm": 12, "sync.bar": 12,
+          "sync.allwr": 8, "sync.allrd": 6, "fma": 2, "mad": 2, "mul": 2,
+          "add": 1, "add3": 1, "sel": 1, "cmp": 1, "mov": 0.3, "and": 1,
+          "or": 1, "shl": 1, "shr": 1, "bfn.0xFE": 1, "bfn.0xF8": 1,
+          "sync.nop": 0.1, "illegal": 1, "macl": 2, "mach": 2, "xor": 1,
+          "rndd": 1, "rndu": 1, "rnde": 1, "rndz": 1, "frc": 1, "join": 1,
+          "goto": 1, "jmpi": 1, "goto.b": 1}
+
+
+def regs(o):
+    m = RGX.search(o or '')
+    return (int(m.group(1)), m.group(2)) if m else None
+
+
+def parse_ops(o):
+    """(reg, sub, type, dwords) for an rN/accN operand token."""
+    s = o.lstrip('-~')
+    m = re.match(r'^(r|acc)(\d+)\.(\d+)(?:<(\d+)(?:;(\d+),(\d+))?>)?(?::([a-z0-9]+))?', s)
+    if m:
+        pre, num, sub, W, H, V, ty = m.groups()
+        sub = int(sub)
+        W = int(W) if W is not None else 1
+        H = int(H) if H is not None else 1
+        ty = ty or ''
+        if ty in ('hf', 'h', 'bf'):
+            lo = sub // 2
+            hi = (sub + (max(W, 1) - 1) * max(H, 1)) // 2
+            ds = set(range(lo, hi + 1))
+        elif W == 0:
+            ds = {sub}
+        else:
+            ds = set(range(sub, sub + (W - 1) * max(H, 1) + 1))
+        return [('%s%s' % (pre, num), sub, ty, ds)]
+    m = re.match(r'^(r|acc)(\d+)(?![\d.])', s)
+    if m:
+        return [(m.group(1) + m.group(2), 0, '', {0})]
+    return []
+
+
+def wr_rd(comment):
+    wr = rd = 0
+    m = re.search(r'wr:(\d+)\+(\d+)', comment or '')
+    if m:
+        wr = int(m.group(1)) + int(m.group(2))
+    m = re.search(r'rd:(\d+)', comment or '')
+    if m:
+        rd = int(m.group(1))
+    return wr, rd
+
+
+def classify(ins):
+    """(writes, reads) as [(reg, set(dwords))]."""
+    op, ops, com = ins['op'], ins['ops'], ins['comment'] or ''
+    w, r = [], []
+    if op.startswith('send'):
+        store = 'store.' in com or 'fence' in com
+        wr, rd = wr_rd(com)
+        if store:
+            if len(ops) > 2:                       # data payload = ops[2]
+                b = parse_ops(ops[2])
+                if b:
+                    rg, sb, ty, _ = b[0]
+                    m = re.search(r':(\d+)$', ops[2])
+                    n = int(m.group(1)) if m else max(wr, 1)
+                    r.append((rg, set(range(sb, sb + n))))
+        else:
+            if ops:
+                b = parse_ops(ops[0])
+                if b and not ops[0].startswith('null'):
+                    r_ = b[0]
+                    r.append((r_[0], set(range(r_[1], r_[1] + max(rd, 1)))))
+                    w.append((r_[0], set(range(r_[1], r_[1] + max(rd, 1)))))
+        for o in ops:
+            if re.match(r'^a0\.\d+', o):
+                r.append(('a0', {0, 1}))
+        return w, r
+    if not ops:
+        return w, r
+    if ops[0] != 'null':
+        b = parse_ops(ops[0])
+        if b:
+            w.append((b[0][0], b[0][3]))
+    for o in ops[1:]:
+        if o.startswith('null'):
+            continue
+        b = parse_ops(o)
+        if b:
+            r.append((b[0][0], b[0][3]))
+    return w, r
+
+
+def audit(path):
+    isa = CISA.parse(path)
+    n = len(isa)
+    for i, it in enumerate(isa):
+        it['idx'] = i
+        it['w'], it['r'] = classify(it)
+    # ---- official exposure metric (latency_audit.py), unchanged
+    exposed = []
+    for i, it in enumerate(isa):
+        if it['op'] not in EXPENSIVE:
+            continue
+        srcs = [regs(o) for o in it['ops']]
+        srcs = [s for s in srcs if s]
+        if not srcs:
+            continue
+        dst = srcs[0]
+        dist = None
+        cons = None
+        for j in range(i + 1, min(i + 80, n)):
+            if any(regs(o) == dst for o in isa[j]['ops']):
+                dist, cons = j - i, j
+                break
+        exposed.append(dict(idx=i, addr='%04X' % it['addr'], op=it['op'],
+                            dst=dst, distance=dist,
+                            consumer=None if cons is None else '%04X' % isa[cons]['addr'],
+                            consumer_op=None if cons is None else isa[cons]['op'],
+                            exec_mask=it['flags']))
+    # ---- def-use + chain / concurrency (n32 N(p))
+    by_dw = defaultdict(list)
+    for it in isa:
+        for rg, ds in it['w']:
+            for d in ds:
+                by_dw[(rg, d)].append(it['idx'])
+    for v in by_dw.values():
+        v.sort()
+
+    def reaching(key, idx):
+        lst = by_dw.get(key)
+        if not lst:
+            return None
+        hit = None
+        for x in lst:
+            if x < idx:
+                hit = x
+            else:
+                break
+        return hit
+
+    def par(k):
+        s = set()
+        for rg, ds in isa[k]['r']:
+            for d in ds:
+                p = reaching((rg, d), k)
+                if p is not None:
+                    s.add(p)
+        return s
+
+    sinks = [it['idx'] for it in isa if it['op'].startswith('send') and
+             ('store.' in (it['comment'] or '') or 'signal barrier' in (it['comment'] or '')
+              or 'end of thread' in (it['comment'] or ''))]
+    chain, stack = set(), list(sinks)
+    while stack:
+        k = stack.pop()
+        if k in chain:
+            continue
+        chain.add(k)
+        stack.extend(par(k))
+    order = sorted(chain)
+    owner, chains = {}, []
+    for k in order:
+        cand = None
+        for p in sorted(par(k), reverse=True):
+            if p in owner:
+                cand = owner[p]
+                break
+        if cand is None:
+            cand = len(chains)
+            chains.append(dict(id=cand, lo=isa[k]['addr'], hi=isa[k]['addr'], n=0))
+        owner[k] = cand
+        c = chains[cand]
+        c['n'] += 1
+        c['lo'] = min(c['lo'], isa[k]['addr'])
+        c['hi'] = max(c['hi'], isa[k]['addr'])
+    ev = []
+    for c in chains:
+        ev.append((c['lo'], 1))
+        ev.append((c['hi'] + 1, -1))
+    ev.sort()
+    cur = best = best_at = 0
+    for a, d in ev:
+        cur += d
+        if cur > best:
+            best, best_at = cur, a
+    # ---- live dwords per program point (GRF pressure proxy)
+    last_use = {}
+    for it in isa:
+        for rg, ds in it['r']:
+            for d in ds:
+                last_use[(rg, d)] = it['idx']
+    live_now, peak, peak_at = {}, 0, None
+    defs = {}
+    for it in isa:
+        k = it['idx']
+        for rg, ds in it['w']:
+            for d in ds:
+                defs[(rg, d)] = k
+        for (rg, d), lu in last_use.items():
+            pass
+        # live = defined before k and last-used at/after k
+        live_now = {}
+        for key, lu in last_use.items():
+            d0 = defs.get(key)
+            if d0 is not None and d0 <= k <= lu:
+                live_now[key] = 1
+        if len(live_now) > peak:
+            peak, peak_at = len(live_now), k
+
+    # ---- L24 price over ALU ops
+    alu = [it for it in isa if not it['op'].startswith('send') and not it['op'].startswith('sync')]
+    price = defaultdict(lambda: [0, 0.0])
+    for it in alu:
+        price[it['op']][0] += 1
+        price[it['op']][1] += WEIGHT.get(it['op'], 1.0)
+    w_alu = sum(v[1] for v in price.values())
+
+    # ---- per unrolled iteration window: what is independent of the site's division
+    return dict(
+        isa=str(path), n=n,
+        exposed=exposed,
+        hist={str(k): v for k, v in sorted(Counter(e['distance'] for e in exposed).items(), key=lambda kv: (kv[0] is None, kv[0]))},
+        spacing=[exposed[i + 1]['idx'] - exposed[i]['idx'] for i in range(len(exposed) - 1)],
+        sinks=len(sinks), chain=len(chain), chains=len(chains),
+        max_concurrent=best, max_concurrent_at='%04X' % best_at,
+        live_peak_dwords=peak, live_peak_at='%04X' % isa[peak_at]['addr'] if peak_at is not None else None,
+        max_reg=max(int(m.group(1)) for it in isa for o in it['ops'] for m in re.finditer(r'\br(\d+)', o)),
+        distinct_regs=len({int(m.group(1)) for it in isa for o in it['ops'] for m in re.finditer(r'\br(\d+)', o)}),
+        ops=dict(Counter(it['op'] for it in isa).most_common()),
+        w_alu=round(w_alu, 1),
+        price=sorted([dict(op=o, n=v[0], weight=round(v[1], 1)) for o, v in price.items()],
+                     key=lambda x: -x['weight']),
+    )
+
+
+def main():
+    # optional argument: audit another capture (e.g. the candidate arm of the native
+    # run) with the very same metric, so before/after are directly comparable.
+    import sys as _sys
+    path = Path(_sys.argv[1]) if len(_sys.argv) > 1 else BASE
+    a = audit(path)
+    out = dict(card='n35-f18-latency', family='F18', ordinal=166, pass_label='129',
+               name='c3x_pre_c256', kernel='a606bc5d667e43fa', base=a)
+    stalls = json.loads((CAMP / 'evidence/STALL-TARGETS.json').read_text(encoding='utf-8'))['rows']
+    r166 = [r for r in stalls if r['index'] == 166][0]
+    out['stall_row_166'] = r166
+    aluwr = r166['aluwr']
+    inv_w = 30.0 * 16
+    out['l24'] = dict(aluwr_per_pass_ms=round(aluwr, 6),
+                      w_alu=a['w_alu'], inv_weight=inv_w,
+                      inv_share_of_alu=round(inv_w / a['w_alu'], 4),
+                      inv_ms_per_pass=round(aluwr * inv_w / a['w_alu'], 6),
+                      note='16 math.inv x L24 weight 30 / W(ALU) of this kernel, priced on the measured per-PASS ALUWR')
+    (HERE / 'A-AUDIT.json').write_text(json.dumps(out, indent=1), encoding='utf-8')
+    print(json.dumps({k: v for k, v in out.items() if k not in ('base',)}, indent=1)[:4000])
+    print('--- inv sites')
+    for e in a['exposed']:
+        print('  idx %4d @%s  %-9s dst r%s.%s  dist %s -> @%s %s  exec %s'
+              % (e['idx'], e['addr'], e['op'], e['dst'][0], e['dst'][1], e['distance'],
+                 e['consumer'], e['consumer_op'], e['exec_mask']))
+    print('--- histogram', a['hist'])
+    print('--- chains', a['chains'], 'max_concurrent', a['max_concurrent'], '@', a['max_concurrent_at'])
+    print('--- live peak dwords', a['live_peak_dwords'], '@', a['live_peak_at'],
+          ' max_reg', a['max_reg'], 'distinct', a['distinct_regs'])
+    print('--- W(ALU)', a['w_alu'])
+    print('--- price', a['price'][:12])
+
+
+if __name__ == '__main__':
+    main()

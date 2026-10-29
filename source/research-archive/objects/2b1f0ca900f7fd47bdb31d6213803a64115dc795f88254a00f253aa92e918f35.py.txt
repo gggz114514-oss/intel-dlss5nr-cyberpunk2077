@@ -1,0 +1,187 @@
+"""S08: candidate B - per-channel basis fitted on the union of the 3 FP16-teacher frames AND
+the actual quantised-upstream input (4 samples, still multi-frame static calibration).
+
+Motivation (CALIBRATION-ACTUAL.json): the actual block30_out is 64.0% relL2 away from the FP16
+teacher input, and the per-channel A absmax ratio actual/fitted has median 0.29 but max 4.26,
+i.e. the fitted basis is simultaneously too generous for most channels and too tight for a few.
+A single-frame refit would score 1.094% but is exactly the SINGLE_FRAME_DIAGNOSTIC defect; the
+union keeps 4 samples and only tilts the basis toward the deployed distribution.
+"""
+from pathlib import Path
+import hashlib
+import json
+
+import numpy as np
+
+R = Path("@NR_WORKSPACE@")
+S = R / "work/dsh-fullnet-static-20261029/S08-vit"
+Q = R / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+ACTUAL = R / "work/dsh-fullnet-static-20261029/gpu/runs/input-capture/xq-vit-b31.bin"
+FP16W = R / "src/project/artifacts/parallel-port-20261013/vit/block31/vit_weights.fp16.bin"
+OLDPACK = R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-v1/pack/vit_block31_weights.int8.bin"
+PACK_A = S / "PACK/vit_block31_weights.int8.s08.bin"
+PACK_B = S / "PACK/vit_block31_weights.int8.s08b.bin"
+W_HALF = dict(WE=(0, 4096, 1024), WC=(4194304, 1024, 4096))
+GAIN_HALF = 12582912
+TOTAL = 25169920
+WE8, WC8 = 0, 4194304
+WS_OFF, EW_OFF, AC_OFF = 9437184, 9437248, 9453632
+NEW_X, NEW_A = 12623936, 12628032
+M, KX, NE, NY = 288, 1024, 4096, 1024
+TEACH = [D / "dump-fp16", D / "teacher-diagnostics/teacher-41444", D / "teacher-diagnostics/teacher-43654"]
+GAMMA, F = 0.8, 1.02
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def idx_half(n, k, N, K):
+    return (n // 32) * (K // 16) * 512 + (k // 16) * 512 + (n % 32) * 16 + (k % 16)
+
+
+def idx_int8(n, k, N, K):
+    return (n // 32) * (K // 32) * 1024 + (k // 32) * 1024 + (n % 32) * 32 + (k % 32)
+
+
+def unpack_half(flat, off, N, K):
+    n = np.arange(N)[:, None]
+    k = np.arange(K)[None, :]
+    return flat[off + idx_half(n, k, N, K)]
+
+
+def pack_int8(W, N, K):
+    n = np.arange(N)[:, None]
+    k = np.arange(K)[None, :]
+    buf = np.zeros(N * K, np.int8)
+    buf[idx_int8(n, k, N, K).ravel()] = W.ravel()
+    return buf.tobytes()
+
+
+def half(v):
+    return np.asarray(v, np.float32).astype(np.float16).astype(np.float32)
+
+
+def cubic(z):
+    z = np.float16(z)
+    t = np.clip(z, np.float16(-4.0), np.float16(4.0)).astype(np.float32)
+    u = half(np.float32(-0.055908203125) * np.abs(t) + np.float32(0.447265625))
+    v = half(t * u + np.float32(0.89453125))
+    return half(z.astype(np.float32) * v)
+
+
+def code(v, inv):
+    return np.clip(np.rint(np.asarray(v, np.float32) * np.asarray(inv, np.float32)), -127, 127).astype(np.int16)
+
+
+def rowscale(W):
+    ch = np.abs(W).max(axis=1)
+    return np.where(ch > 0, ch / 127.0, 1.0).astype(np.float32)
+
+
+def rowq(W, s):
+    return np.clip(np.rint(W / s.astype(np.float64)[:, None]), -127, 127).astype(np.int8)
+
+
+def main():
+    flat16 = np.frombuffer(FP16W.read_bytes(), dtype="<f2")
+    WE = unpack_half(flat16, *W_HALF["WE"]).astype(np.float64)
+    WC = unpack_half(flat16, *W_HALF["WC"]).astype(np.float64)
+    gain = flat16[GAIN_HALF:GAIN_HALF + 1024].astype(np.float32).astype(np.float64)
+    qWE, qWC = rowq(WE, rowscale(WE)), rowq(WC, rowscale(WC))
+    dWE = qWE.astype(np.float64) * rowscale(WE).astype(np.float64)[:, None]
+    dWC = qWC.astype(np.float64) * rowscale(WC).astype(np.float64)[:, None]
+
+    def fp16_ref(X):
+        return half(gain[None, :] * X.astype(np.float64)
+                    + (cubic(half(X @ dWE.T)) @ dWC.T).astype(np.float64)).astype(np.float32)
+
+    Xs, names = [], []
+    for t in TEACH:
+        Xs.append(np.fromfile(t / "dump_block30_out.bin", dtype="<f2")[:M * KX].reshape(M, KX).astype(np.float32))
+        names.append(t.name)
+    Xa = np.fromfile(ACTUAL, dtype="<f2")[:M * KX].reshape(M, KX).astype(np.float32)
+    Xs.append(Xa)
+    names.append("ACTUAL(34189,qX-domain)")
+    # teacher A statistics come from the FP16 kernel's own dump (same source stage 2 used);
+    # only the new actual sample is scored with a computed A, so the teacher-3 leg of the
+    # union is byte-identical to pack A's fitting basis.
+    Ateach = [np.fromfile(t / "dump_vit_block31_A.bin", dtype="<f2")[:M * NE].reshape(M, NE).astype(np.float32)
+              for t in TEACH]
+
+    def fit(idx):
+        Xu = np.concatenate([Xs[i] for i in idx]).astype(np.float64)
+        AX = np.abs(Xu).max(axis=0)
+        Aall = [Ateach[i].astype(np.float64) if i < 3 else cubic(half(Xs[i] @ dWE.T)).astype(np.float64)
+                for i in idx]
+        AA = np.abs(np.concatenate(Aall)).max(axis=0)
+        Dx = np.exp2(np.rint(GAMMA * np.log2(np.maximum(AX, 1e-8)))).astype(np.float32)
+        Da = np.exp2(np.rint(GAMMA * np.log2(np.maximum(AA, 1e-8)))).astype(np.float32)
+        bx = np.float32(np.max(AX / Dx) / 127.0) * np.float32(F)
+        ba = np.float32(np.max(AA / Da) / 127.0) * np.float32(F)
+        WEx, WCx = WE * Dx.astype(np.float64)[None, :], WC * Da.astype(np.float64)[None, :]
+        sE, sC = rowscale(WEx), rowscale(WCx)
+        return dict(cE=rowq(WEx, sE), cC=rowq(WCx, sC), ew=(bx * sE).astype(np.float32),
+                    ac=(ba * sC).astype(np.float32), bx=bx, ba=ba, Dx=Dx, Da=Da)
+
+    def score(st, i):
+        X = Xs[i]
+        qX = code(X, (np.float32(1.0) / (st["bx"] * st["Dx"])).astype(np.float32))
+        E = half((qX.astype(np.float64) @ st["cE"].astype(np.float64).T).astype(np.float32) * st["ew"][None, :])
+        A = cubic(E)
+        inva = (np.float32(1.0) / (st["ba"] * st["Da"])).astype(np.float32)
+        qA = code(A, inva)
+        lin = (qA.astype(np.float64) @ st["cC"].astype(np.float64).T).astype(np.float32) * st["ac"][None, :]
+        Y = half(gain[None, :] * X.astype(np.float64) + lin.astype(np.float64)).astype(np.float32)
+        Yr = fp16_ref(X)
+        e = Y.astype(np.float64) - Yr.astype(np.float64)
+        return dict(rel_l2=float(np.linalg.norm(e) / np.linalg.norm(Yr.astype(np.float64))),
+                    qX_sat=int(np.count_nonzero(np.abs(X * (np.float32(1.0) / (st["bx"] * st["Dx"]))[None, :]) > 127.0)),
+                    qA_sat=int(np.count_nonzero(np.abs(A * inva[None, :]) > 127.0)))
+
+    out = dict(recipe=dict(gamma=GAMMA, f=F, note="same recipe as stage2, different fitting set"))
+    for tag, idx in (("fit_teacher3", [0, 1, 2]), ("fit_union4", [0, 1, 2, 3])):
+        st = fit(idx)
+        rows = {names[i]: score(st, i) for i in range(4)}
+        pooled = float(np.sqrt(sum(rows[n]["rel_l2"] ** 2 for n in rows) / len(rows)))
+        out[tag] = dict(per_input=rows, mean_rel_l2=pooled, bx=float(st["bx"]), ba=float(st["ba"]))
+        print(tag, {k: round(v["rel_l2"], 5) for k, v in rows.items()}, "mean", round(pooled, 5), flush=True)
+
+    # write candidate B only if it wins on the actual input
+    a_actual = out["fit_teacher3"]["per_input"]["ACTUAL(34189,qX-domain)"]["rel_l2"]
+    b_actual = out["fit_union4"]["per_input"]["ACTUAL(34189,qX-domain)"]["rel_l2"]
+    out["decision"] = dict(pack_A_actual=a_actual, pack_B_actual=b_actual, b_better=b_actual < a_actual)
+    if b_actual < a_actual:
+        st = fit([0, 1, 2, 3])
+        blob = bytearray(Path(OLDPACK).read_bytes())
+        blob[WE8:WE8 + 4096 * 1024] = pack_int8(st["cE"], 4096, 1024)
+        blob[WC8:WC8 + 1024 * 4096] = pack_int8(st["cC"], 1024, 4096)
+        ws = np.frombuffer(bytes(blob[WS_OFF:WS_OFF + 64]), dtype="<f4").copy()
+        ws[3] = st["bx"]
+        ws[4] = st["ba"]
+        ws[8] = float(np.float32(1.0) / st["bx"])
+        ws[9] = float(np.float32(1.0) / st["ba"])
+        blob[WS_OFF:WS_OFF + 64] = ws.astype("<f4").tobytes()
+        blob[EW_OFF:EW_OFF + 16384] = st["ew"].astype("<f4").tobytes()
+        blob[AC_OFF:AC_OFF + 4096] = st["ac"].astype("<f4").tobytes()
+        blob[NEW_X:NEW_X + 4096] = (np.float32(1.0) / (st["bx"] * st["Dx"])).astype("<f4").tobytes()
+        blob[NEW_A:NEW_A + 16384] = (np.float32(1.0) / (st["ba"] * st["Da"])).astype("<f4").tobytes()
+        PACK_B.write_bytes(bytes(blob))
+        out["pack_B"] = dict(path=str(PACK_B), bytes=TOTAL, sha256=sha(PACK_B),
+                             pack_A_sha256=sha(PACK_A), changed_vs_A=int(np.count_nonzero(
+                                 np.frombuffer(bytes(blob), np.uint8)
+                                 != np.frombuffer(PACK_A.read_bytes(), np.uint8))))
+    prior_path = S / "CALIBRATION-ACTUAL.json"
+    prior = json.loads(prior_path.read_text(encoding="utf-8")) if prior_path.is_file() else {}
+    prior.pop("union_fit", None)
+    prior.update(union_fit=out)
+    prior_path.write_text(json.dumps(prior, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps(out["decision"], indent=1))
+    if "pack_B" in out:
+        print("pack B", out["pack_B"]["sha256"], "changed vs A", out["pack_B"]["changed_vs_A"])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

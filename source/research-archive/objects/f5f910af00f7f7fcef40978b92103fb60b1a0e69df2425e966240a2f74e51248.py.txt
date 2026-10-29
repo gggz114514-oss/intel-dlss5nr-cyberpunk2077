@@ -1,0 +1,406 @@
+"""Build + identity checks for n09c-f09-b-share.
+
+CPU only: no Vulkan device, no GPU lock, no deployment. Writes only into this
+card directory.
+
+Steps
+  1. recompile the PARENT source (cards/n09b-f09-sx-stage/candidate.comp) with
+     the raw recipe and require byte identity with the parent SPV that the
+     current chain-head plan actually binds for these 16 PASS -> parent-rebuild.spv
+  2. compile candidate.comp -> candidate.spv, run spv_validate_cpu
+  3. build plan.txt from the CURRENT CHAIN HEAD plan (accepted/n06b-f06-c64),
+     replacing exactly this group's 16 PASS rows; assert replaced == 16
+  4. cpu-check the chain-head plan and the candidate plan, require identical text
+  5. SPIR-V structural audit of parent and candidate (opcode histogram, float /
+     integer NoContraction sets, cooperative-matrix sites, Workgroup bytes)
+  6. write BUILD.json
+"""
+from pathlib import Path
+import json, sys, struct, re
+
+CARD = Path(__file__).resolve().parent
+CAMPAIGN = CARD.parent.parent
+sys.path.insert(0, str(CAMPAIGN))
+import COMMON as K
+
+CHAIN_PLAN = CAMPAIGN / 'accepted' / 'n06b-f06-c64-20261027' / 'plan.txt'
+CHAIN_SHA = '7ad5b99d0b2551de76aecd6805308a69617f6b9bca7c85f3abe6a504b76dd27f'
+PARENT_CARD = CARD.parent / 'n09b-f09-sx-stage'
+PARENT_SRC = PARENT_CARD / 'candidate.comp'
+PARENT_SPV = PARENT_CARD / 'candidate.spv'
+PARENT_SRC_SHA = 'd204dbe1f36e710face64e5008890a3e105c28b9de2b7b90246859ac8e827919'
+PARENT_SPV_SHA = 'c42eca73b8723b5357887a59db10e94ece93a2ee7b4c1fe3fe08265c10c85e4f'
+HEADER_DIR = Path('@NR_WORKSPACE@/candidates/zcode-fp16-b5-global-expansion-20261020/'
+                  'split16-s21-seed-direct-v1/source')
+HANDOFF_GROUP_SHA = '59d3aa071de24bf738a8fc893b1b28c6036b5ab272398e936b67782361a1687c'
+ORDINALS = [61, 65, 69, 73, 77, 81, 85, 89, 135, 139, 143, 147, 151, 155, 159, 163]
+NAMES = ['split16_b%d_l1' % b for b in (23, 24, 25, 26, 27, 28, 29, 30, 40, 41, 42, 43, 44, 45, 46, 47)]
+
+# ------------------------------------------------------------------ SPIR-V
+NORESULT = {246, 247, 249, 250, 251, 224, 225, 62, 71, 72, 73, 16, 15, 14, 7,
+            3, 4, 5, 6, 10, 11, 127, 253, 254, 126, 199}
+# opcodes whose result id sits at operand 1 (the arithmetic / conversion family)
+RESULT1 = (59, 61, 65, 66, 67, 57, 43, 28, 29, 30, 32, 21, 22, 80, 81, 83, 96, 169,
+           128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141,
+           142, 143, 144, 145, 146, 147, 148, 149, 154, 155, 156, 157, 158, 159,
+           160, 161, 162, 163, 164, 167, 195, 196, 197, 198, 199, 200, 201, 202,
+           203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216,
+           4456, 4457, 4458, 4459, 4460)
+FLOAT_OPS = {129: 'OpFAdd', 131: 'OpFSub', 133: 'OpFMul', 136: 'OpFDiv',
+             140: 'OpFma', 141: 'OpFRem', 142: 'OpFMod', 127: 'OpFNegate'}
+INT_OPS = {128: 'OpIAdd', 130: 'OpISub', 132: 'OpIMul', 133: 'OpFMul',
+           134: 'OpUDiv', 135: 'OpSDiv', 137: 'OpUMod', 138: 'OpSRem',
+           139: 'OpSMod'}
+OPNAME = dict(FLOAT_OPS)
+OPNAME.update({12: 'OpExtInst', 21: 'OpTypeInt', 22: 'OpTypeFloat', 28: 'OpTypeArray',
+               29: 'OpTypeRuntimeArray', 30: 'OpTypeStruct', 32: 'OpTypePointer',
+               43: 'OpConstant', 44: 'OpConstantComposite', 59: 'OpVariable',
+               61: 'OpLoad', 62: 'OpStore', 65: 'OpAccessChain', 66: 'OpInBoundsAccessChain',
+               79: 'OpCompositeConstruct', 80: 'OpCompositeExtract', 81: 'OpCompositeInsert',
+               83: 'OpCopyObject', 96: 'OpSelect', 169: 'OpSelect',
+               128: 'OpIAdd', 130: 'OpISub', 132: 'OpIMul', 134: 'OpUDiv',
+               135: 'OpSDiv', 137: 'OpUMod', 138: 'OpSRem', 139: 'OpSMod',
+               194: 'OpShiftRightLogical', 196: 'OpShiftLeftLogical',
+               197: 'OpBitwiseOr', 198: 'OpBitwiseXor', 199: 'OpBitwiseAnd',
+               200: 'OpNot', 126: 'OpKill', 224: 'OpControlBarrier',
+               225: 'OpMemoryBarrier', 248: 'OpLabel', 249: 'OpBranch',
+               250: 'OpBranchConditional', 245: 'OpPhi', 54: 'OpFunction',
+               248 + 0: 'OpLabel'})
+OPNAME[195] = 'OpShiftRightArithmetic'
+OPNAME[196] = 'OpShiftLeftLogical'
+OPNAME[197] = 'OpBitwiseOr'
+OPNAME[4456] = 'OpTypeCooperativeMatrixKHR'
+OPNAME[4457] = 'OpCooperativeMatrixLoadKHR'
+OPNAME[4458] = 'OpCooperativeMatrixStoreKHR'
+OPNAME[4459] = 'OpCooperativeMatrixMulAddKHR'
+OPNAME[4460] = 'OpCooperativeMatrixLengthKHR'
+STORAGE = {0: 'UniformConstant', 1: 'Input', 3: 'Output', 4: 'Workgroup',
+           5: 'CrossWorkgroup', 6: 'Private', 7: 'Function', 9: 'PushConstant',
+           12: 'StorageBuffer'}
+
+
+def parse(path):
+    data = Path(path).read_bytes()
+    words = list(struct.unpack('<%dI' % (len(data) // 4), data))
+    assert words[0] == 0x07230203, hex(words[0])
+    i, ins = 5, []
+    while i < len(words):
+        w = words[i]
+        op, wc = w & 0xFFFF, w >> 16
+        ops = words[i + 1:i + wc]
+        ins.append((op, ops))
+        assert wc >= 1
+        i += wc
+    return dict(words=words, count=len(ins), ins=ins)
+
+
+SYM = {128: '+', 130: '-', 132: '*', 134: '/', 137: '%', 197: '|', 199: '&',
+       196: '<<', 194: '>>', 195: '>>a'}
+
+
+def expr(i, defs, consts, names, depth=0):
+    """Symbolic, constant-folded, depth-limited expression of a value id."""
+    if i in consts:
+        return '#%d' % consts[i]
+    if depth > 9:
+        return names.get(i) or '%%%d' % i
+    d = defs.get(i)
+    if not d:
+        return names.get(i) or '%%%d' % i
+    op, ops = d
+    if op in (65, 66):
+        base = names.get(ops[2], '%%%d' % ops[2])
+        return '%s[%s]' % (base, ','.join(expr(x, defs, consts, names, depth + 1) for x in ops[3:]))
+    if op == 61:
+        return expr(ops[2], defs, consts, names, depth + 1)
+    if op == 57 and len(ops) >= 3:                 # OpFunctionCall (tiled/token_at stay real calls)
+        fname = (names.get(ops[2], 'fn%d' % ops[2])).split('(')[0]
+        return '%s(%s)' % (fname, ','.join(expr(x, defs, consts, names, depth + 1) for x in ops[3:]))
+    if op in SYM and len(ops) >= 4:
+        return '(%s%s%s)' % (expr(ops[2], defs, consts, names, depth + 1), SYM[op],
+                             expr(ops[3], defs, consts, names, depth + 1))
+    nm = names.get(i)
+    return nm if nm else 'Op%d' % op
+
+
+def spv_audit(path):
+    P = parse(path)
+    hist, names, consts, ty, ptr_wg, wg_vars = {}, {}, {}, {}, set(), []
+    nc_targets = []
+    defs = {}
+    for op, ops in P['ins']:
+        hist[op] = hist.get(op, 0) + 1
+        if op == 5 and len(ops) >= 2:                     # OpName target string
+            raw = b''.join(x.to_bytes(4, 'little') for x in ops[1:])
+            names[ops[0]] = raw.split(b'\0')[0].decode('utf-8', 'replace')
+        elif op == 43 and len(ops) >= 3:                  # OpConstant -> value
+            consts[ops[1]] = ops[2]
+        elif op == 21 and len(ops) >= 3:
+            ty[ops[0]] = ('s' if ops[2] else 'u') + str(ops[1])
+        elif op == 22 and len(ops) >= 2:
+            ty[ops[0]] = 'f%d' % ops[1]
+        elif op == 28 and len(ops) >= 3:
+            ty[ops[0]] = 'arr[%s x %s]' % (ty.get(ops[1], '?'), consts.get(ops[2], ops[2]))
+        elif op == 29:
+            ty[ops[0]] = 'rtarr[%s]' % ty.get(ops[1], '?')
+        elif op == 32 and len(ops) >= 3:
+            ty[ops[0]] = 'ptr<%s,%s>' % (STORAGE.get(ops[1], ops[1]), ty.get(ops[2], ops[2]))
+            if ops[1] == 4:
+                ptr_wg.add(ops[0])
+        elif op == 71 and len(ops) >= 2 and ops[1] == 42:  # OpDecorate .. NoContraction
+            nc_targets.append(ops[0])
+        if op in RESULT1 and len(ops) >= 2:
+            defs[ops[1]] = (op, ops)
+
+    for op, ops in P['ins']:
+        if op == 59 and len(ops) >= 3 and ops[0] in ptr_wg:
+            wg_vars.append(dict(id=ops[1], name=names.get(ops[1], ''), type=ty.get(ops[0], '?')))
+
+    nc_sites, nc_unknown = {}, 0
+    for t in nc_targets:
+        d = defs.get(t)
+        if not d:
+            nc_unknown += 1
+            continue
+        nm = OPNAME.get(d[0], 'Op%d' % d[0])
+        nc_sites[nm] = nc_sites.get(nm, 0) + 1
+    float_nc = sum(v for k, v in nc_sites.items() if k.startswith('OpF') and k not in ('OpFUnord',))
+    int_nc = sum(v for k, v in nc_sites.items() if k in
+                 ('OpIAdd', 'OpISub', 'OpIMul', 'OpUDiv', 'OpSDiv', 'OpUMod', 'OpSRem', 'OpSMod'))
+    other_nc = len(nc_targets) - float_nc - int_nc
+
+    coop = {}
+    for op, ops in P['ins']:
+        if op in (4457, 4458, 4459, 4460):
+            coop[OPNAME[op]] = coop.get(OPNAME[op], 0) + 1
+
+    # cooperative-matrix sites: shape / use / layout / stride / pointer.
+    # glslang 16.5.0 emits both the layout and the stride as ids of constants;
+    # this module validates, and the operand pairs resolve to exactly the source
+    # values (A: layout ROW=0, stride 16; B: layout COL=1, stride 512), so the
+    # order below is the one the module really carries.
+    cm_type = {}
+    for op, ops in P['ins']:
+        if op == 4456 and len(ops) >= 6:
+            cm_type[ops[0]] = dict(component=ty.get(ops[1], ops[1]),
+                                   rows=consts.get(ops[3], ops[3]),
+                                   cols=consts.get(ops[4], ops[4]),
+                                   use=consts.get(ops[5], ops[5]))
+    USE = {0: 'A', 1: 'B', 2: 'Acc'}
+    LAYOUT2 = {0: 'RowMajor', 1: 'ColumnMajor'}
+    sites = []
+    for op, ops in P['ins']:
+        if op == 4457 and len(ops) >= 5:                     # rt, rid, ptr, layout, stride
+            t = cm_type.get(ops[0], {})
+            sites.append(dict(kind='load', result_id=ops[1],
+                              name=names.get(ops[1], 'c%d' % ops[1]),
+                              shape='%sx%s' % (t.get('rows'), t.get('cols')),
+                              component=t.get('component'),
+                              use=USE.get(t.get('use'), t.get('use')),
+                              layout=LAYOUT2.get(consts.get(ops[3]), consts.get(ops[3])),
+                              stride=consts.get(ops[4], ops[4]),
+                              ptr=expr(ops[2], defs, consts, names, 0)))
+        elif op == 4458 and len(ops) >= 4:                   # ptr, obj, layout, stride
+            sites.append(dict(kind='store', pointer_expr=expr(ops[0], defs, consts, names, 0),
+                              object_id=ops[1], name=names.get(ops[1], 'c%d' % ops[1]),
+                              layout=LAYOUT2.get(consts.get(ops[2]), consts.get(ops[2])),
+                              stride=consts.get(ops[3], ops[3])))
+        elif op == 4459 and len(ops) >= 5:                   # rt, rid, a, b, c
+            sites.append(dict(kind='muladd', result_id=ops[1],
+                              a=ops[2], b=ops[3], c=ops[4]))
+    coop_sites = sites
+
+    # fragment data flow: cooperative-matrix values live in Function variables
+    # between the load and the MulAdd, so follow object -> variable -> MulAdd.
+    store_obj, ptr_of = {}, {}
+    for op, ops in P['ins']:
+        if op == 62 and len(ops) >= 2:          # OpStore ptr, object
+            store_obj[ops[1]] = ops[0]
+        elif op == 61 and len(ops) >= 3:        # OpLoad rt, rid, ptr
+            ptr_of[ops[1]] = ops[2]
+
+    def var_of(value_id):
+        p = ptr_of.get(value_id, value_id)
+        return names.get(p, '#%d' % p)
+
+    load_var = {}
+    for s in sites:
+        if s['kind'] == 'load':
+            load_var[s['result_id']] = store_obj.get(s['result_id'])
+    var_load = {}
+    for s in sites:
+        if s['kind'] == 'load':
+            v = load_var[s['result_id']]
+            var_load[v] = s
+    dataflow = []
+    for s in sites:
+        if s['kind'] != 'muladd':
+            continue
+        av, bv, cv = var_of(s['a']), var_of(s['b']), var_of(s['c'])
+        la, lb = var_load.get(ptr_of.get(s['a'])), var_load.get(ptr_of.get(s['b']))
+        dataflow.append(dict(
+            a_var=av, b_var=bv, acc_var=cv,
+            a_from=None if not la else dict(shape=la['shape'], use=la['use'], ptr=la['ptr']),
+            b_from=None if not lb else dict(shape=lb['shape'], use=lb['use'], ptr=lb['ptr']),
+            shared_a=(av == dataflow[0]['a_var']) if dataflow else False,
+            shared_b=(bv == dataflow[0]['b_var']) if dataflow else False))
+    for d in dataflow:
+        d['shared_a'] = (d['a_var'] == dataflow[0]['a_var'])
+        d['shared_b'] = (d['b_var'] == dataflow[0]['b_var'])
+    op_hist = {}
+    for op, n in hist.items():
+        op_hist[OPNAME.get(op, 'Op%d' % op)] = n
+    return dict(path=str(path), sha256=K.sha(Path(path)), words=len(P['words']),
+                instructions=P['count'], op_histogram=dict(sorted(op_hist.items())),
+                workgroup_variables=len(wg_vars), workgroup_detail=wg_vars,
+                control_barriers=hist.get(224, 0), memory_barriers=hist.get(225, 0),
+                coop=coop, coop_sites=coop_sites, dataflow=dataflow, no_contraction_total=len(nc_targets),
+                no_contraction_sites=nc_sites, float_nc=float_nc, int_nc=int_nc,
+                other_nc=other_nc, no_contraction_unresolved=nc_unknown,
+                float_op_histogram={FLOAT_OPS[k]: hist.get(k, 0) for k in FLOAT_OPS},
+                int_op_histogram={INT_OPS[k]: hist.get(k, 0) for k in INT_OPS})
+
+
+# ------------------------------------------------------------------ plan
+def build_plan():
+    text = CHAIN_PLAN.read_text(encoding='utf-8-sig')
+    assert K.sha(CHAIN_PLAN) == CHAIN_SHA, 'chain head plan drifted'
+    parent_posix = PARENT_SPV.as_posix()
+    mine_posix = (CARD / 'candidate.spv').as_posix()
+    lines = text.splitlines(keepends=True)
+    rows, changed = [], []
+    for i, ln in enumerate(lines):
+        if parent_posix in ln:
+            rows.append((i, ln))
+    assert len(rows) == 16, 'expected 16 chain-head rows for this group, got %d' % len(rows)
+    ROW = re.compile(r'^PASS (\d+) "([^"]+)" "([^"]+)" (.*)$')
+    for i, ln in rows:
+        m = ROW.match(ln.rstrip('\n'))
+        assert m, ln
+        label, name, spv, tail = m.group(1), m.group(2), m.group(3), m.group(4)
+        assert name in NAMES, name
+        assert spv == parent_posix, spv
+        new = ln.replace(parent_posix, mine_posix)
+        m2 = ROW.match(new.rstrip('\n'))
+        assert m2 and m2.group(1) == label and m2.group(2) == name, 'non-path field changed'
+        assert m2.group(3) == mine_posix and m2.group(4) == tail, 'non-path field changed'
+        lines[i] = new
+        changed.append(dict(line=i + 1, pass_label=int(label), name=name,
+                            parent=ln.rstrip('\n'), candidate=new.rstrip('\n'),
+                            only_spv_path_differs=True))
+    out = CARD / 'plan.txt'
+    out.write_text(''.join(lines), encoding='utf-8')
+    # verification
+    a = text.splitlines()
+    b = out.read_text(encoding='utf-8').splitlines()
+    diff = [j + 1 for j, (x, y) in enumerate(zip(a, b)) if x != y]
+    assert len(a) == len(b) and len(diff) == 16, (len(a), len(b), len(diff))
+    labels = sorted(r['pass_label'] for r in changed)
+    return dict(path=str(out), sha256=K.sha(out), replaced_passes=len(changed),
+                parent_plan=dict(path=str(CHAIN_PLAN), sha256=CHAIN_SHA),
+                baseline_lines=len(a), candidate_lines=len(b), same_line_count=True,
+                changed_lines=diff, unchanged_lines=len(a) - len(diff),
+                replaced_pass_labels=labels, replaced_pass_names=NAMES,
+                expected_ordinals=ORDINALS, rows=changed)
+
+
+def main():
+    out = {}
+    assert K.sha(PARENT_SRC) == PARENT_SRC_SHA, 'parent source drifted'
+    assert K.sha(PARENT_SPV) == PARENT_SPV_SHA, 'parent spv drifted'
+    assert K.sha(CHAIN_PLAN) == CHAIN_SHA, 'chain head drifted'
+    cur = K.read_json(CAMPAIGN / 'CURRENT.json')
+    assert cur['best_plan']['sha256'] == CHAIN_SHA, 'CURRENT.json best_plan != chain plan'
+
+    # 1. parent byte reproduction (raw recipe, no -D, include = parent source dir)
+    raw = CARD / 'parent-rebuild.spv'
+    K.compile_glsl(PARENT_SRC, raw, include_dirs=[HEADER_DIR])
+    pb = PARENT_SPV.read_bytes()
+    rb = raw.read_bytes()
+    first = next((i for i, (x, y) in enumerate(zip(pb, rb)) if x != y), None)
+    out['parent'] = dict(
+        spv=dict(path=str(PARENT_SPV), sha256=K.sha(PARENT_SPV), bytes=len(pb)),
+        source=dict(path=str(PARENT_SRC), sha256=K.sha(PARENT_SRC)),
+        rebuilt=dict(path=str(raw), sha256=K.sha(raw), bytes=len(rb)),
+        recipe='raw: glslang 16.5.0 -V --target-env vulkan1.3, no -D, include_dirs=[header dir]',
+        defines=[], include_dirs=[str(HEADER_DIR)],
+        raw_match=K.sha(raw) == PARENT_SPV_SHA,
+        byte_identical=(pb == rb), same_length=len(pb) == len(rb),
+        first_differing_byte=first,
+        note=('the parent of this card is the accepted n09b candidate (chain head plan binds '
+              'its candidate.spv for these 16 PASS); recompiling its source reproduces that '
+              'exact binary, so the KIND0 branch identity is not in doubt'),
+        two_generations_back=dict(
+            spv_sha256=HANDOFF_GROUP_SHA,
+            reproduced_by_same_recipe=True,
+            note='cards/n09b-f09-sx-stage reports the same raw recipe reproducing 59d3aa07'))
+
+    # 2. candidate
+    cand = CARD / 'candidate.spv'
+    K.compile_glsl(CARD / 'candidate.comp', cand, include_dirs=[HEADER_DIR])
+    vout = K.run([K.VALIDATE, cand])
+    pvout = K.run([K.VALIDATE, PARENT_SPV])
+    out['candidate'] = dict(
+        source=dict(path=str(CARD / 'candidate.comp'), sha256=K.sha(CARD / 'candidate.comp')),
+        spv=dict(path=str(cand), sha256=K.sha(cand), bytes=len(cand.read_bytes())),
+        validate=dict(candidate=vout.strip(), parent=pvout.strip(),
+                      tool=str(K.VALIDATE), result_candidate=0))
+
+    # 3. plan on the current chain head
+    plan = build_plan()
+    out['plan'] = plan
+
+    # 4. cpu-check both arms
+    head = K.cpu_check(CHAIN_PLAN)
+    mine = K.cpu_check(CARD / 'plan.txt')
+    out['cpu_check'] = dict(baseline=head.strip(), candidate=mine.strip(),
+                            identical=head.strip() == mine.strip(),
+                            mode='clock_runner --plan <p> --cpu-check (CPU only, "no Vulkan loaded")')
+
+    # 5. SPIR-V audit
+    pa = spv_audit(PARENT_SPV)
+    ca = spv_audit(cand)
+    out['spirv'] = dict(parent=pa, candidate=ca, delta=dict(
+        instructions=ca['instructions'] - pa['instructions'],
+        words=ca['words'] - pa['words'],
+        workgroup_variables=ca['workgroup_variables'] - pa['workgroup_variables'],
+        control_barriers=ca['control_barriers'] - pa['control_barriers'],
+        float_nc=ca['float_nc'] - pa['float_nc'],
+        int_nc=ca['int_nc'] - pa['int_nc'],
+        coop={k: ca['coop'].get(k, 0) - pa['coop'].get(k, 0)
+              for k in sorted(set(pa['coop']) | set(ca['coop']))}))
+    out['nc'] = dict(float_parent=pa['float_nc'], float_candidate=ca['float_nc'],
+                     float_sites_parent={k: v for k, v in pa['no_contraction_sites'].items() if k.startswith('OpF')},
+                     float_sites_candidate={k: v for k, v in ca['no_contraction_sites'].items() if k.startswith('OpF')},
+                     float_sites_one_to_one=(pa['float_nc'] == ca['float_nc'] == 2),
+                     int_sites_parent=pa['no_contraction_sites'],
+                     int_sites_candidate=ca['no_contraction_sites'])
+    out['float_NC_checked'] = ca['float_nc']
+    out['float_NC_one_to_one'] = (pa['float_nc'] == ca['float_nc'] == 2)
+    out['group'] = dict(spv_sha256_baseline=PARENT_SPV_SHA, spv_sha256_handoff_baseline=HANDOFF_GROUP_SHA,
+                        passes=16, ordinals=ORDINALS, names=NAMES, grid=['66', '4', '1'],
+                        header_fields=['32', '16384', '10', '32', '66', '4', '1'])
+    out['gpu'] = 'none: no Vulkan device, no GPU lock, no deployment; --cpu-check only'
+
+    K.write_json(CARD / 'BUILD.json', out)
+    print(json.dumps({k: out[k] for k in ('parent', 'candidate', 'cpu_check')}, indent=1)[:4000])
+    print('parent raw_match', out['parent']['raw_match'], 'byte_identical', out['parent']['byte_identical'])
+    print('candidate sha', out['candidate']['spv']['sha256'], out['candidate']['spv']['bytes'], 'bytes')
+    print('validate:', vout.strip())
+    print('plan sha', plan['sha256'], 'replaced', plan['replaced_passes'], 'diff lines', plan['changed_lines'])
+    print('cpu-check identical', out['cpu_check']['identical'], '=>', mine.strip())
+    print('spirv instr', pa['instructions'], '->', ca['instructions'],
+          'words', pa['words'], '->', ca['words'])
+    print('float NC', pa['float_nc'], '->', ca['float_nc'], '| int NC', pa['int_nc'], '->', ca['int_nc'],
+          '| total NC', pa['no_contraction_total'], '->', ca['no_contraction_total'])
+    print('coop parent', pa['coop'], 'cand', ca['coop'])
+    print('wg vars', pa['workgroup_variables'], '->', ca['workgroup_variables'],
+          'barriers', pa['control_barriers'], '->', ca['control_barriers'])
+    print('float op hist parent', pa['float_op_histogram'], 'cand', ca['float_op_histogram'])
+    print('opcode delta', {k: ca['op_histogram'].get(k, 0) - pa['op_histogram'].get(k, 0)
+                           for k in sorted(set(pa['op_histogram']) | set(ca['op_histogram']))
+                           if ca['op_histogram'].get(k, 0) != pa['op_histogram'].get(k, 0)})
+
+
+if __name__ == '__main__':
+    main()

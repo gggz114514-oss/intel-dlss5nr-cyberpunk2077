@@ -1,0 +1,78 @@
+n05e-f05-atile — RESUME（2026-10-27）
+
+状态：BUILT / AWAITING-GPU（本卡未跑任何 Vulkan 任务、未取 GPU 锁、未部署、未改基线 plan / 指针 /
+COMMON.py / 其他卡目录；只写了 cards/n05e-f05-atile/）
+
+一、这一版的结论（三行）
+1. F05 C128 的 A 侧重复读**可以**用 n06b 那种「改 tile 归属」消掉，**不需要动 SLM、不需要加屏障**：
+   归属从「每 SG 1 head × 2 个 m-block（row_phase）」改成「每 SG 2 head × 1 个 m-block」，
+   一个 A 片段喂 12 条独立 MMA（6 通道块 × 2 head）→ A 行消息 **1024 → 512/WG（2× → 1×）**，
+   权重 768 → 768/WG，DPAS 768 → 768，`qkv[12288]` 与那 1 个 `barrier()` 一字未动。
+2. 唯一代价：同时活的累加器 **6 → 12 = 96 GRF**。峰值 71 → **119（增量读法）/ 126（绝对）/ 121（标量地板）**，
+   三种读法都 ≤128，两种 >120 ⇒ 属「必须由 native 裁决」的形态（合同 §8.5 次序）。
+3. **卡的前提要更正一处：A 侧是 2×，不是 4×。** 4× 是**权重 tile** 的重复度（同 head 4 个 SG 各载同一批
+   96 个 tile，n05c 已减半到 2×）。枚举见 ANALYSIS §1.1 与 PROOF.json.mapping：
+   每 (token, ki) 的 A tile 父被读 2 次、候选 1 次，读取面完全相等（不是少读）。
+
+二、已证（全部 CPU、可复核）
+1. 父字节复现：父源 + pinned headers 的 raw 配方 → **逐字节等于 20f4074f…**（`_build/build.py`，
+   raw_match=true，无需 decoration transfer）。
+2. 候选：candidate.spv = **ea8d46e2…a23be1b1**（62,500 B，比父 +7,708 B），spv_validate_cpu exit 0。
+3. plan：**09a42735…c555dbbe**，在**当前链头 n18-f01-entry（244e9192…）**上只替换 12 行 PASS，
+   `replaced_passes=12`（断言），与链头逐行 diff 恰好 12 行且只有 SPV 路径 token 变化；
+   cpu_check = `CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded`。
+4. NoContraction：73 → 73，73 个父站点 1:1 对齐，候选自有装饰 **0**（`float_NC_checked=73`）。
+5. 映射证明（枚举，`_build/mapping.py` → mapping.json → PROOF.json）：
+   A 读取面相等、每 head 覆盖 64 tokens、重复度 2→1；qkv 的 Q/K/V 三个发布集合逐元素相等、
+   每元素恰好一个写入者；每 WG 的 (head, token, 通道块, ki) 元组集合 6144 = 6144 相等；
+   权重地址集合逐条相等；debug 镜像并集相等；尾块整除（64 = 8 SG × 8，128 k = 8 ki × 16）。
+6. SPIR-V 静态：CoopMatLoad 26→32（全部来自权重 site 6→12，A site 数不变）、
+   CoopMatMulAdd 23→29、CoopMatStore 33→47（发布 6→12 + debug 8→16）、
+   OpLoopMerge 7→6（去掉 row_phase）、**OpBarrier 1→1**、OpExtInst 9→9。
+7. 预算实测（`_build/budget_isa.py` 自算父 ISA，只读既有捕获）：8 GRF/acc（QKV 段 6 个基址 42…82 间隔恒 8）；
+   两个 phase 窗口峰值各 71（0x2e08 acc41 / 0x7b18 acc45），与 n05c 在同一 SPIR-V 字节上的独立复算逐项一致。
+8. 源码改动范围：SOURCE-DIFF.patch = **2 hunk**（1 个头部注释 + 1 个 QKV 段），+126/−34；
+   父文件其余每一行在候选里逐字节出现（`splice.py` 断言）。
+
+三、未证（必须 GPU 闭环）
+1. A 行消息是否真 128 → 64（N1，本卡唯一主判据）。
+2. 12 acc 是否形成（N6：12 个不同 DPAS 基址、仍 8 间隔）、是否无 spill（N4：scratch = 0）。
+3. 整体 ordinary 收益：−512 条 32 B 的 A 消息/WG（load 逻辑字节 −3.8%）对 −48 GRF 余量的净权衡。
+
+四、分诊（无 GPU，按合同 §6 预登记）
+· N1 仍 128 → **A 实现未落地**（归属改写未被采用），读 ISA 解释，不改方向结论。
+· N1 成立但 scratch > 0 / 静态指令升高 → **B 副作用**，第一修法（已算）：每 ki 只保留 1 个权重 tile 在飞，
+  立刻放掉 4 GRF；**不允许**退回 n05c 的 V 拆分（那会 A 翻倍，等于重跑被禁的形态）。
+· 全成立、门通过、整体不显著 → **D**（事前概率最高），与 C64 同族成包，不挑显著样本。
+· 门不过 → **E**，先查 m0 = sg*8 的 K 块 `2*sg + {0,1}` 与 norm 的 `auxf[p5.x+h0/h1]`。
+
+五、下一处具体改动（两条，都已算清，但本卡不做）
+A) **A 侧与权重侧在该 shape 上均已到边界**（要写清，避免下一卡白跑）：8 SG / 64 tokens / 2 head 意味着
+   每 WG 有 16 个 (m-block × head) 单元、每 SG 必须包 2 个；**包哪 2 个决定 A 重复度，不改变权重消息数**
+   （同 head 的 2 个 m-block = 父/n05c 形态 → A 2×；同 m-block 的 2 个 head = 本卡 → A 1×，代价 12 acc）。
+   两者权重都是 96/SG = 768/WG，这是**下限**：降到 384/WG 要每 SG 包 4 个单元 = 24 acc = 192 GRF，不可行；
+   跨 SG 共享权重只能走 SLM，已按 ANALYSIS §7 定价为负。n05c 的「权重减半」是靠**把 A 翻倍**换来的，
+   而 n05c 的 M 批包（与 n05d 成包）实测 INDISTINCT。⇒ 该核再要动只能换 shape（改 WG token 数 / SG 数 /
+   分发，会改 grid 与 WG 数，属别的卡）或由生产侧（F04）直接发布 DPAS 友好布局（跨派发）。
+B) 若 native 证伪 12 acc（scratch > 0 或只有 <12 基址）：A 侧在 C128 上封顶在 2×，
+   该核应转向权重侧 4×（每 WG 768 条 512 B 消息）或按 PASS-TIME-RANKING 转 F20；F05 的 C64/C256
+   两个宽度不在本卡范围。
+
+六、恢复点 / 文件
+· candidate.comp（c54b3004…）、candidate.spv（ea8d46e2…）、parent-rebuild.spv（= 20f4074f…）、
+  parent-rebuild.comp（= 父源，d628a08e…）、plan.txt（09a42735…）、SOURCE-DIFF.patch、BUILD.json、
+  PROOF.json、COST-LEDGER.json、NATIVE-PREDICTION.md、GPU-REQUEST.json、ANALYSIS.md、CARD.txt
+· 可复跑（全部 CPU 只读，**按此顺序**，后面的会读前面的产物）：
+  `_build/splice.py → build.py → nc_check.py → mapping.py → budget_isa.py → mkplan.py → gen_diff.py → emit_docs.py → verify.py`
+  产物：_build/{parent-raw.spv,cand-raw.spv,build.json,nc.json,mapping.json,budget-isa.json,plan.json}
+· 复核：基线 plan a024c3c5…、链头 plan 244e9192…、CURRENT.json、COMMON.py、F05 C128 父 SPV 20f4074f…、
+  父源码 d628a08e… **哈希均未变**（本卡全程只读它们）。
+
+七、未决项（不阻塞，交主代理裁决）
+1. 12 acc 的分配器级证据仍缺（与 n05c 的 D1 同族缺口）：本机没有 GPU-free 的 IGC
+   （ocloc 对含 SPV_KHR_cooperative_matrix 的模块 ICE，n05c §6 已实测）。本卡没有把它当挡箭牌：
+   形态已实现、CPU 侧全部通过，只差 native 判 A/B/C/D。
+2. GPU-REQUEST.json 里我加了 `purpose` 与 `shader_group.spv_sha256_candidate`；若 manifest 生成器
+   不接受额外键，删掉即可（与 n05c 同做法）。
+3. 本卡只做一个宽度（C128）。C64（8 PASS）与 C256（16 PASS）的同族形态未开卡；
+   C256 的 A 侧需要 12 acc × 更大 M 片段，预算要另算，不能套本卡数字。

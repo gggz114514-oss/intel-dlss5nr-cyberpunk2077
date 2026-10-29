@@ -1,0 +1,73 @@
+"""CPU/GPU alignment sweep over the C32 body local arms (blocks 1,2,3,4)."""
+import sys
+import json
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+ARMS = {
+    1: [("minmax", L.D / "c32-minmax/local-b1.txt", "c32-minmax/local-b1/replayed-network.bin"),
+        ("equalx", L.D / "c32-equalized/local-b1.txt", "c32-equalized/local-b1/replayed-network.bin")],
+    2: [("minmax", L.D / "c32-minmax/local-b2.txt", "c32-minmax/local-b2/replayed-network.bin"),
+        ("equalx", L.D / "c32-equalized/local-b2.txt", "c32-equalized/local-b2/replayed-network.bin")],
+    3: [("minmax", L.D / "c32-minmax/local-b3.txt", "c32-minmax/local-b3/replayed-network.bin"),
+        ("equalx", L.D / "c32-equalized/local-b3.txt", "c32-equalized/local-b3/replayed-network.bin")],
+    4: [("minmax", L.D / "c32-minmax/local-b4.txt", "c32-minmax/local-b4/replayed-network.bin"),
+        ("equalx", L.D / "c32-equalized-b4/local-b4.txt", "c32-equalized-b4/local-b4/replayed-network.bin")],
+}
+teacher = {"1": "dump_block1_out.bin", "2": "dump_block2_out.bin", "3": "dump_block3_out.bin", "4": "dump_skip4.bin"}
+
+rng = np.random.default_rng(3)
+tiles = np.sort(rng.choice(168 * 96, size=200, replace=False))
+TT, CC = np.meshgrid(tiles, np.arange(16), indexing="ij")
+TT = TT.ravel(); CC = CC.ravel()
+base = TT * 512 + CC * 16
+
+
+def take(flat):
+    out = np.empty((32, TT.size), np.float16)
+    for c in range(32):
+        off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+        out[c] = flat[base + off]
+    return out
+
+
+rows = []
+for blk, arms in ARMS.items():
+    teach = take(np.fromfile(L.D / "dump-fp16" / teacher[str(blk)], dtype="<f2")).astype(np.float32)
+    for tag, pplan, gpu_rel in arms:
+        pp = L.D / pplan
+        gp = L.D / gpu_rel
+        if not pp.is_file() or not gp.is_file():
+            print(f"b{blk} {tag}: MISSING")
+            continue
+        info = L.block_bindings(pp, ordinal=blk)
+        x_flat = np.fromfile(info["input"], dtype="<f2")
+        gpu = take(np.fromfile(gp, dtype="<f2")).astype(np.float32)
+        we, wc = L.load_w8(info["w8"])
+        fsc = L.load_fsc(info["fsc"])
+        rs = L.load_rs(info["wb"], info["rs_base"])
+        invx = fsc[L.FSC_INVX:L.FSC_INVX + 32] if fsc.size >= L.FSC_INVX + 32 else np.full(32, fsc[L.FSC_INV_X], np.float32)
+        inve = fsc[L.FSC_INVE:L.FSC_INVE + 128] if fsc.size >= L.FSC_INVE + 128 else np.full(128, fsc[L.FSC_INV_E], np.float32)
+        x = L.gather(x_flat, TT, CC)
+        got = L.forward(x, we, wc, rs, invx, inve, fsc[L.FSC_TAP_E:L.FSC_TAP_E + 128], fsc[L.FSC_TAP_C:L.FSC_TAP_C + 32])
+        # clean float path (no activation quantiser) for a decode sanity check
+        sX = np.float32(fsc[0]); sE = np.float32(fsc[2])
+        We_f = we.astype(np.float32) * (fsc[4:132] / sX)[:, None]
+        Wc_f = wc.astype(np.float32) * (fsc[132:164] / sE)[:, None]
+        e_pre = We_f @ L.widen(x)
+        a_h = L.act_h(L.to_half(e_pre))
+        y_clean = Wc_f @ L.widen(a_h) + got["seed"]
+        r = dict(block=blk, arm=tag, spv_sha16=info["spv_sha256"][:16], fsc_entries=int(fsc.size),
+                 cpu_vs_gpu=L.rel_l2(got["y_half"], gpu),
+                 clean_vs_teacher=L.rel_l2(y_clean, teach),
+                 clean_vs_gpu=L.rel_l2(y_clean, gpu),
+                 gpu_vs_teacher=L.rel_l2(gpu, teach),
+                 cpu_vs_teacher=L.rel_l2(got["y_half"], teach))
+        rows.append(r)
+        print(f"b{blk} {tag:7s} spv={r['spv_sha16']} fsc={r['fsc_entries']:4d} "
+              f"cpu/gpu={r['cpu_vs_gpu']:.3e} clean/teach={r['clean_vs_teacher']:.4f} "
+              f"clean/gpu={r['clean_vs_gpu']:.4f} gpu/teach={r['gpu_vs_teacher']:.4f}")
+(Path(__file__).resolve().parent / "align_sweep.json").write_text(json.dumps(rows, indent=2))

@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Generic cumulative merge: base plan + N card plans (G3-derived) -> new plan.
+
+Why a new tool: `merge_cumulative_v4.py` copies only the base plan's tail, so every card's
+POLICY lines are silently dropped (v1..v4 carry 63 resources with no POLICY at all), and
+its precedence rule "skip a PASS the base already changed" is what silently discarded 8 of
+R07's 9 C128 passes.  This tool keeps the same two-namespace discipline (pass identity is
+the pass NAME because R13/R14 inserted a PASS and moved every later ordinal; buffer ids
+>= 739 are the card namespace) but reports every collision instead of hiding it.
+
+usage:
+  merge_plans.py --base <plan> --out <plan> --card NAME=<card plan> [--card ...]
+                 [--allow-collision NAME]
+"""
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-int8-fullnet-impl-20261024/tools")
+import planlib as L  # noqa: E402
+
+G3 = Path("@NR_WORKSPACE@/candidates/int8-coverage-v2-20261020"
+          "/plan-g3-production.txt")
+G3_NBUF = 739
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def block_lines(p):
+    head = (f'PASS {p["row"]} "{p["name"]}" "{p["spv"]}" {p["sg"]} {p["shared"]} '
+            f'{p["nbind"]} {p["npush"]} {p["grid"][0]} {p["grid"][1]} {p["grid"][2]}')
+    return [head] + [f'BIND {b["binding"]} {b["res"]} {b["offset"]} {b["bytes"]}'
+                     for b in p["binds"]] + \
+           ["PUSH " + " ".join(str(x) for x in p["push"])]
+
+
+def name_index(plan, label):
+    idx = {}
+    for p in plan.passes:
+        if p["name"] in idx:
+            raise SystemExit(f"{label}: duplicate pass name {p['name']!r}; refusing to merge "
+                             f"by name")
+        idx[p["name"]] = p
+    return idx
+
+
+def main(argv):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--base", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--card", action="append", default=[])
+    ap.add_argument("--allow-collision", action="append", default=[])
+    a = ap.parse_args(argv)
+
+    base = L.Plan(a.base)
+    g3 = L.Plan(G3)
+    assert base.nb >= G3_NBUF
+    for r in range(G3_NBUF):                       # frozen prefix must be untouched
+        assert base.buffers[r] == g3.buffers[r], (r, base.buffers[r], g3.buffers[r])
+    g3p = name_index(g3, "g3")
+    bidx = name_index(base, "base")
+    blocks = [block_lines(p) for p in base.passes]
+    pos = {p["name"]: i for i, p in enumerate(base.passes)}
+    newbufs, newpolicies = [], []
+    report = {"base": {"path": str(a.base), "sha256": sha(a.base),
+                                   "buffers": base.nb, "passes": base.npass,
+                                   "policies": len(base.policy)},
+                           "cards": [], "collisions": [], "applied": []}
+    nb = base.nb
+
+    def card_ord_to_base_ord(card, k):
+        """translate a card PASS ordinal into the base plan's ordinal by pass name"""
+        if k < 0 or k >= card.npass:
+            return None
+        nm = card.passes[k]["name"]
+        return bidx[nm]["ordinal"] if nm in bidx else None
+
+    for spec in a.card:
+        name, path = spec.split("=", 1)
+        card = L.Plan(path)
+        cidx = name_index(card, name)
+        remap = {r: nb + (r - G3_NBUF) for r in range(G3_NBUF, card.nb)}
+        changed, skipped = [], []
+        for pname, p in cidx.items():
+            if pname not in bidx:
+                skipped.append({"pass": pname, "why": "not in base"})
+                continue
+            if block_lines(p) == block_lines(g3p[pname]):
+                continue
+            cur = bidx[pname]
+            if (cur["spv"] != g3p[pname]["spv"] or cur["binds"] != g3p[pname]["binds"]) \
+                    and name not in a.allow_collision:
+                report["collisions"].append(
+                    {"pass": pname, "card": name,
+                     "already_changed_in_base_to": Path(cur["spv"]).name,
+                     "action": "skipped (base owns it)"})
+                skipped.append({"pass": pname, "why": "base already changed it"})
+                continue
+            binds = [(b["binding"], remap.get(b["res"], b["res"]), b["offset"], b["bytes"])
+                     for b in p["binds"]]
+            head = (f'PASS {cur["row"]} "{cur["name"]}" "{p["spv"]}" {p["sg"]} {p["shared"]} '
+                    f'{len(binds)} {cur["npush"]} {cur["grid"][0]} {cur["grid"][1]} '
+                    f'{cur["grid"][2]}')
+            blocks[pos[pname]] = [head] + \
+                [f"BIND {b} {r} {o} {n}" for b, r, o, n in binds] + \
+                ["PUSH " + " ".join(str(x) for x in cur["push"])]
+            changed.append({"pass": pname, "ordinal": cur["ordinal"],
+                            "old_spv": Path(cur["spv"]).name,
+                            "new_spv": Path(p["spv"]).name,
+                            "old_shared": cur["shared"], "new_shared": p["shared"],
+                            "old_nbind": cur["nbind"], "new_nbind": len(binds),
+                            "grid_unchanged": p["grid"] == cur["grid"],
+                            "push_unchanged": p["push"] == cur["push"]})
+        added = [card.buffers[r] for r in range(G3_NBUF, card.nb)]
+        newbufs += [f'BUFFER "{n}" {s} "{p}"' for n, s, p in added]
+        # carry the card's POLICY lines over, translated into the base plan's ordinals.
+        # The old merge tool copied only the base tail, so every card's residency policy
+        # was silently lost (v1..v4 carry 63 resources with no POLICY at all).
+        carried, dropped = [], []
+        for pol in card.policy:
+            if pol["res"] not in remap:
+                dropped.append(pol["line"])
+                continue
+            f, l = card_ord_to_base_ord(card, pol["first"]), card_ord_to_base_ord(card, pol["last"])
+            if f is None or l is None:
+                dropped.append(pol["line"])
+                continue
+            carried.append(f"POLICY {remap[pol['res']]} {pol['resident']} {f} {l} 0")
+        newpolicies += carried
+        nb += len(added)
+        report["cards"].append({"card": name, "plan": str(path), "plan_sha256": sha(path),
+                                "changed": changed, "skipped": skipped,
+                                "buffers_added": len(added),
+                                "new_buffers": [f'BUFFER "{n}" {s} "{p}"' for n, s, p in added],
+                                "policies_carried": carried,
+                                "policies_not_carried": dropped})
+        report["applied"] += [c["pass"] for c in changed]
+
+    tail = base.raw[1 + base.nb + sum(1 + p["nbind"] + 1 for p in base.passes):]
+    # POLICY lines must precede HISTORY: insert the carried ones before the first HISTORY
+    hist = next((i for i, l in enumerate(tail) if l.startswith("HISTORY ")), len(tail))
+    tail = tail[:hist] + newpolicies + tail[hist:]
+    out = [f"PORT_NETWORK_1 {base.rows} {nb} {base.npass} {base.nout}"]
+    out += [f'BUFFER "{n}" {s} "{p}"' for n, s, p in base.buffers] + newbufs
+    for blk in blocks:
+        out += blk
+    out += tail
+    Path(a.out).write_text("\n".join(out) + "\n", encoding="utf-8", newline="\n")
+    chk = L.Plan(a.out)
+    report["result"] = {"path": str(a.out), "sha256": sha(a.out), "buffers": chk.nb,
+                        "passes": chk.npass, "policies": len(chk.policy),
+                        "header": chk.raw[0]}
+    rep = Path(a.out).with_name(Path(a.out).stem + ".MERGE.json")
+    rep.write_text(json.dumps(report, indent=1, ensure_ascii=False) + "\n",
+                   encoding="utf-8", newline="\n")
+    print(json.dumps({"out": report["result"], "applied": len(report["applied"]),
+                      "collisions": len(report["collisions"])}, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

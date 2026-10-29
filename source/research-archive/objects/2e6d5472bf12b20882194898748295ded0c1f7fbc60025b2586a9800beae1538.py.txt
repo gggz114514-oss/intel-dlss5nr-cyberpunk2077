@@ -1,0 +1,46 @@
+from pathlib import Path
+import json,hashlib
+import numpy as np
+R=Path('@NR_WORKSPACE@');O=R/'work/codex-astra-fp16-int8-audit-20261024'
+# Integer projection partials: split K by contiguous head groups, exact sum then original epilogue.
+rng=np.random.default_rng(20261024);A=rng.integers(-127,128,(32,1024),dtype=np.int32);W=rng.integers(-127,128,(1024,64),dtype=np.int32)
+ref=A.astype(np.int64)@W.astype(np.int64);tests=[];models=[]
+for G in [2,4,8]:
+ k=1024//G;parts=[A[:,g*k:(g+1)*k].astype(np.int64)@W[g*k:(g+1)*k].astype(np.int64) for g in range(G)]
+ got=sum(parts);assert np.array_equal(ref,got)
+ assert max(np.abs(p).max() for p in parts)<=k*127**2
+ H=32//G;waves=H//4;oneway=G*288*1024*4
+ tests.append(dict(groups=G,components=2048,mismatches=0,partial_bound=k*127**2,full_bound=1024*127**2))
+ models.append(dict(heads_per_WG=H,head_groups=G,WG_count=9*G,query_per_WG=32,attention_recompute_factor=1,KV_global_source_bytes=5308416,context_shared_bytes=32*H*32,KV_shared_bytes=16384,total_shared_bytes=32*H*32+16384,projection_accumulator_bytes_per_lane=64,wide_attention_projection_overlap=False,partial_buffer_bytes=oneway,partial_write_plus_read_bytes=2*oneway,source_global_delta_vs_fullINT8_parent=5308416-2949120+2*oneway-294912-9437184,WG_barriers_per_WG=10*waves,WG_barrier_executions_per_block=9*G*10*waves,extra_dispatches=1))
+# KV2 remaps former one-head/4-active-query-SG WG to two-head/8-active-query-SG WG.
+old={(h,wx*64+q*16) for h in range(32) for wx in range(5) for q in range(4)}
+new=set()
+for hp in range(16):
+ for wx in range(5):
+  for sg in range(8):
+   pair=(2*hp+sg//4,wx*64+(sg%4)*16);assert pair not in new;new.add(pair)
+assert old==new
+# Compact Q + head-major K/V uses exactly the existing 288*3072 element range.
+seen=set();count=0
+for kind in range(3):
+ for h in range(32):
+  for t in range(288):
+   for d in range(32):
+    if kind==0:a=t*1024+h*32+d
+    else:a=kind*288*1024+h*288*32+t*32+d
+    assert a not in seen;seen.add(a);count+=1
+assert min(seen)==0 and max(seen)==288*3072-1 and len(seen)==288*3072
+# Standard K/V loads fit each head's contiguous slice; tail padded tokens never loaded.
+loadchecks=0
+for h in range(32):
+ for key0 in range(0,288,8):
+  for d0 in [0,16]:
+   base=288*1024+h*288*32+key0*32+d0
+   for r in range(8):
+    for c in range(16):
+     assert base+r*32+c==288*1024+h*288*32+(key0+r)*32+d0+c;loadchecks+=1
+paths=['candidates/zcode-fp16-b5-global-expansion-20261020/vit-qkv-norm-owner-v2/source/b3_04_vit_qkv_norm_owner.comp','candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-qkv-v2/source/vit_nb04_mpair.glsl','candidates/zcode-fp16-compute-backend-20261021/b-t04-vit-chunk-split-v1/source/vit_attention_pden_register.comp']
+def ident(s):
+ p=R/s;b=p.read_bytes();return dict(path=p.as_posix(),sha256=hashlib.sha256(b).hexdigest(),bytes=len(b))
+r=dict(scope='CPU integer partial projection, owner permutation, packed layout proof and analytical source cost; no shader/native/GPU validation',INT8_partial_tests=tests,INT8_partial_models=models,partial_constraints=['qT codes unchanged','one projection activation scale across K and per-output weight factor independent of K','no partial dequant/float epilogue','reduce int32 then original alpha multiply/residual FMA/half'],KV2=dict(WGs=80,score_owner_SGs_per_WG=8,old_query_head_tiles=len(old),new_query_head_tiles=len(new),valid_query_head_tiles=sum(q<288 for h,q in new),owner_mismatches=0,barriers_per_WG=9,barrier_executions_per_block=720,shared_FP16=16384,shared_INT8=8192,FP16_KV_global_source_bytes=5898240,INT8_KV_global_source_bytes=2949120,context_global_edge='retained; projection separate',attention_context_accumulator_bytes_per_lane=64),QKV_pack=dict(elements=count,unique_writers=len(seen),holes=0,extra_elements=0,FP16_bytes=1769472,INT8_bytes=884736,K_load_coordinate_checks=loadchecks,padded_tokens='288..319 remain guarded/zero; no320-token allocation',source_bytes_saved=0,scope='layout/coalescing candidate only; cache/transaction improvements unmeasured'),sources=[ident(s) for s in paths])
+(O/'HOWN-READ-PARALLELISM-PROOF.json').write_text(json.dumps(r,indent=2),encoding='utf-8');print(json.dumps({k:v for k,v in r.items() if k!='sources'}))

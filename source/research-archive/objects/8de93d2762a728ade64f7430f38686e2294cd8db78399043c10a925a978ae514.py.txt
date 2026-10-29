@@ -1,0 +1,83 @@
+"""End-to-end per-card GPU pipeline: gates -> native -> resources -> ordinary -> analysis.
+
+Usage:
+  python card_pipeline.py <card-id> [--stage gates|native|resources|ordinary|all] [--native-arms both|cand|base]
+
+Every stage runs through STAGE.py, which takes the unique lock exclusively and
+runs one job at a time. On a gate failure the pipeline stops immediately and
+writes the failure into cards/<id>/PIPELINE.json (no reruns, no gold fiddling).
+"""
+import json, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+import STAGE
+import submit_card
+
+PY = '@NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe'
+
+
+def stage_run(card_id, stage, only_arm=None):
+    spec_path, spec = submit_card.build(card_id, stage, only_arm)
+    manifest, ps1 = STAGE.prepare(spec)
+    r = STAGE.run(manifest, ps1)
+    s = STAGE.summarize(spec['output_root'])
+    out = Path(spec['output_root']) / 'STAGE-SUMMARY.json'
+    K.write_json(out, s)
+    s['_spec'] = str(spec_path)
+    s['_ps_rc'] = r.returncode
+    if r.returncode != 0:
+        s['_stderr'] = r.stderr[-3000:]
+    return s
+
+
+def verify(s):
+    ok = s.get('status') == 'COMPLETED' and all(j.get('status') == 'COMPLETED' and j.get('frame')
+                                                for j in s.get('jobs', []))
+    return ok
+
+
+def main():
+    card_id = sys.argv[1]
+    stages = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith('--') else 'all'
+    native_arms = None
+    if '--native-arms' in sys.argv:
+        v = sys.argv[sys.argv.index('--native-arms') + 1]
+        native_arms = None if v == 'both' else ('cand' if v == 'cand' else 'base')
+    order = ['gates', 'native', 'resources', 'ordinary'] if stages == 'all' else [stages]
+    log = dict(card=card_id, stages={}, status='RUNNING')
+    logp = K.C / 'cards' / card_id / 'PIPELINE.json'
+    for st in order:
+        s = stage_run(card_id, st, native_arms if st == 'native' else None)
+        log['stages'][st] = s
+        print('[%s] %s -> %s' % (card_id, st, s.get('status')), flush=True)
+        for j in s.get('jobs', []):
+            print('   %-28s %-18s frame=%s samples=%s' % (j.get('id'), j.get('status'),
+                                                          j.get('frame'), j.get('samples')), flush=True)
+        K.write_json(logp, log)
+        if not verify(s):
+            log['status'] = 'STOPPED_AT_' + st
+            K.write_json(logp, log)
+            print('STOPPED at', st, s.get('stop_reason'))
+            return 1
+        if st in ('gates', 'native', 'resources'):
+            log['status'] = 'PENDING_' + st
+            K.write_json(logp, log)
+    log['status'] = 'ORDINARY_DONE'
+    K.write_json(logp, log)
+    # analysis of the ordinary batch
+    if 'ordinary' in log['stages'] and verify(log['stages']['ordinary']):
+        spec = K.read_json(Path(log['stages']['ordinary']['_spec']))
+        manifest = Path(spec['output_root']) / 'LUNA-ORDINARY.json'
+        arms = sorted({j['candidate'] for j in spec['jobs']})
+        comps = [dict(arms=(arms[0], arms[1]))] if len(arms) == 2 else [dict(arms=c) for c in
+                                                                       [('A', 'B'), ('A', 'C'), ('B', 'C')]]
+        out = K.C / 'cards' / card_id / 'TIMING.json'
+        rep = __import__('ANALYZE').report(manifest, [dict(arms=c['arms']) for c in comps], out,
+                                          extra=dict(card=card_id))
+        print(json.dumps(rep, indent=2)[:3000])
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

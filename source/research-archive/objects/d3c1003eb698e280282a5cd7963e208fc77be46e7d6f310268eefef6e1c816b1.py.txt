@@ -1,0 +1,108 @@
+"""Build the S08 candidate plans: capture-replay only, NOT deployable.
+
+Changes vs combo-34189.txt (resource level, nothing else):
+  BUFFER 399 vit_block31_weights            -> S08 PACK (same 25,169,920 B, so every BIND stays valid)
+  dispatch 119 vit_block31_ffn_qx_producer  -> SOURCE/spv/qx_producer.s08.spv        (per-channel invX)
+  dispatch 120 vit_block31_ffn_expand       -> SOURCE/spv/vit_nb04_expand_int8.s08.spv (per-channel invA)
+The contract / qkv / attention / projection SPVs, every PUSH word, every BIND and every
+POLICY row are untouched. -diag additionally appends three OUTPUT rows so a GPU arm can
+be checked element-wise against the CPU reference.
+"""
+from pathlib import Path
+import json
+import sys
+
+import numpy as np
+
+R = Path(r"@NR_WORKSPACE@")
+S = R / "work/dsh-fullnet-static-20261029/S08-vit"
+Q = R / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+BASE = Q / "real-int8-24/c64-family-static/combo-34189.txt"
+sys.path.insert(0, str(R / "work/dsh-fullnet-static-20261029/tools"))
+import planlib  # noqa: E402
+
+NEW_PACK = S / "PACK/vit_block31_weights.int8.s08.bin"
+NEW_PROD_SPV = S / "SOURCE/spv/qx_producer.s08.spv"
+NEW_EXP_SPV = S / "SOURCE/spv/vit_nb04_expand_int8.s08.spv"
+DIAG_OUTPUTS = [("343", "float16", "x31.bin"), ("395", "raw", "A31.bin"), ("396", "float16", "Y31.bin")]
+
+
+def _clean_lines(text):
+    """planlib joins with '\\n' while the source file is CRLF, so header rewrites can
+    leave a stray '\\r'. Normalise: strip every '\\r', drop empty lines, CRLF on write."""
+    out = [l.rstrip("\r") for l in text.split("\n")]
+    out = [l for l in out if l != ""]
+    return out
+
+
+def _write_crlf(path, lines):
+    path.write_bytes(("\r\n".join(lines) + "\r\n").encode("utf-8"))
+
+
+def main():
+    p = planlib.Plan(BASE)
+    p.assert_valid()
+    base_lines = _clean_lines(BASE.read_text(encoding="utf-8"))
+    rep = dict(base=dict(path=str(BASE), sha256=p.sha256(), header=p.header,
+                         dispatches=len(p.passes), buffers=len(p.buffers), outputs=len(p.outputs),
+                         lines=len(base_lines)))
+    rep["set_buffer"] = p.set_buffer("vit_block31_weights", file=NEW_PACK.as_posix())
+    rep["set_spv"] = [p.set_spv(119, NEW_PROD_SPV.as_posix()),
+                      p.set_spv(120, NEW_EXP_SPV.as_posix())]
+    cand_lines = _clean_lines(p.to_text())
+    out1 = S / "candidate-34189.txt"
+    _write_crlf(out1, cand_lines)
+
+    # ---- diag variant: three OUTPUT rows, header output count bumped ----
+    h = cand_lines[0].split()
+    assert h[0] == "PORT_NETWORK_1"
+    pol = [i for i, l in enumerate(cand_lines) if l.startswith("POLICY ")]
+    out_idx = [i for i, l in enumerate(cand_lines) if l.startswith("OUTPUT ")]
+    assert out_idx and max(out_idx) < min(pol), (max(out_idx), min(pol))
+    assert max(out_idx) == min(pol) - 1
+    lines = list(cand_lines)
+    ins = max(out_idx) + 1
+    for buf, fmt, name in DIAG_OUTPUTS:
+        lines.insert(ins, f'OUTPUT {buf} {fmt} "{name}"')
+        ins += 1
+    h[4] = str(int(h[4]) + len(DIAG_OUTPUTS))
+    lines[0] = " ".join(h)
+    out2 = S / "candidate-34189-diag.txt"
+    _write_crlf(out2, lines)
+
+    a = planlib.Plan(out1)
+    b = planlib.Plan(out2)
+    a.assert_valid()
+    b.assert_valid()
+    assert len(a.passes) == len(p.passes) and a.header[3] == p.header[3]
+    # textual proof: exactly three lines differ from the base plan
+    changed = [(i, base_lines[i], x) for i, x in enumerate(cand_lines) if i >= len(base_lines) or base_lines[i] != x]
+    rep["candidate"] = dict(path=str(out1), sha256=a.sha256(), header=a.header,
+                            dispatches=len(a.passes), buffers=len(a.buffers), outputs=len(a.outputs),
+                            lines=len(cand_lines),
+                            changed_line_count=len(changed),
+                            changed_lines=[dict(line=i + 1, old=o[:160], new=n[:160]) for i, o, n in changed],
+                            delta_vs_base=planlib.diff_plans(planlib.Plan(BASE), a))
+    rep["diag"] = dict(path=str(out2), sha256=b.sha256(), header=b.header,
+                       dispatches=len(b.passes), buffers=len(b.buffers), outputs=len(b.outputs),
+                       lines=len(lines),
+                       added_outputs=[dict(buffer=x[0], format=x[1], file=x[2]) for x in DIAG_OUTPUTS],
+                       delta_vs_candidate=planlib.diff_plans(a, b))
+    # identity of the resources the candidate actually loads
+    rep["loaded_resources"] = dict(
+        pack=dict(path=NEW_PACK.as_posix(), sha256=planlib.sha256_file(NEW_PACK),
+                  bytes=NEW_PACK.stat().st_size),
+        expand_spv=dict(path=NEW_EXP_SPV.as_posix(), sha256=planlib.sha256_file(NEW_EXP_SPV)),
+        producer_spv=dict(path=NEW_PROD_SPV.as_posix(), sha256=planlib.sha256_file(NEW_PROD_SPV)),
+        unchanged_spv=[dict(ordinal=i, name=a.passes[i].name, spv=a.passes[i].spv,
+                            sha256=planlib.sha256_file(a.passes[i].spv))
+                       for i in (121, 122, 123, 124)])
+    (S / "PLANS.json").write_text(json.dumps(rep, indent=1, default=str) + "\n", encoding="utf-8")
+    print(json.dumps(dict(candidate=rep["candidate"]["sha256"], diag=rep["diag"]["sha256"],
+                          header_base=rep["base"]["header"], header_candidate=rep["candidate"]["header"],
+                          header_diag=rep["diag"]["header"]), indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

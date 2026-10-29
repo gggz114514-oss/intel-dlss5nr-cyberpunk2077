@@ -1,0 +1,81 @@
+import json, hashlib, subprocess, sys, shlex, struct
+from pathlib import Path
+N=Path(__file__).resolve().parent; B=Path('@NR_WORKSPACE@'); R=N.parent/'bridge-optimization-20261025'; D=N.parent/'phase-diagnosis-20261025'
+S=B/'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1/source'
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts')); import spv_tools_local as ST
+def ident(p): return {'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+def run(a):
+ p=subprocess.run(list(map(str,a)),capture_output=True,text=True); assert p.returncode==0,p.stdout+p.stderr; return p.stdout
+# Exhaustive symbolic lane/component permutation. Values are coordinates, not floats.
+v=[[(2*(d%4)+l//16+8*(d//4),l%16) for d in range(8)] for l in range(32)]
+helper=['void nr_transpose16(NRH_CH lo, NRH_CH hi, out NRH_CH o0, out NRH_CH o1) {','uint lane=gl_SubgroupInvocationID;']
+helper += [f'float16_t v{d}={"lo" if d<4 else "hi"}[{d%4}];' for d in range(8)]
+for j in range(3):
+ pairs=[(a,a+(1<<j)) for a in range(8) if not a&(1<<j)]
+ old=[x[:] for x in v]
+ for l in range(32):
+  choose=bool(l&(1<<(j+1))); peer=l^(1<<(j+1))
+  for a,b in pairs:
+   recv=old[peer][a if peer&(1<<(j+1)) else b]
+   v[l][a]=recv if choose else old[l][a]; v[l][b]=old[l][b] if choose else recv
+ for k in range(0,4,2):
+  (a,b),(c,d)=pairs[k:k+2]
+  helper += ['{',f'bool s=(lane & {1<<(j+1)}u)!=0u;',f'f16vec2 r=unpackFloat2x16(subgroupShuffleXor(packFloat2x16(f16vec2(s?v{a}:v{b},s?v{c}:v{d})),{1<<(j+1)}u));',f'v{a}=s?r.x:v{a}; v{b}=s?v{b}:r.x;',f'v{c}=s?r.y:v{c}; v{d}=s?v{d}:r.y;','}']
+v=[v[(l&14)|((l&1)<<4)|(l>>4)][:] for l in range(32)]
+assert all(v[l][d]==(l%16,2*(d%4)+l//16+8*(d//4)) for l in range(32) for d in range(8))
+helper += ['uint sl=(lane&14u)|((lane&1u)<<4u)|(lane>>4u);','o0=NRH_CH(float16_t(0)); o1=NRH_CH(float16_t(0));']
+for d in range(0,8,2):
+ o='o0' if d<4 else 'o1'
+ helper += [f'{{ f16vec2 r=unpackFloat2x16(subgroupShuffle(packFloat2x16(f16vec2(v{d},v{d+1})),sl)); {o}[{d%4}]=r.x; {o}[{d%4+1}]=r.y; }}']
+helper += ['}']
+(N/'MAPPING-PROOF.json').write_text(json.dumps({'coordinates_checked':256,'mismatches':0,'transpose_shuffles_per_tile':10,'tiles':2,'old_join_shuffles':48,'new_transpose_plus_join_shuffles':28,'new_half_selects':72,'new_shared_bytes':0,'new_barriers':0},indent=2))
+s=(S/'c32_register.comp').read_text(encoding='utf-8-sig'); body=[]
+for t in range(2):
+ for f in range(2):
+  a=f'{t}{f}'
+  body += [f'NRH_A xa{a}; NRH_C ny{a};','{',f'NRH_CH x=NRH_CH(float16_t(0)); if(!tok_oob_u) coopMatLoad(x,imgin,tok_base+{t*128+f*256}u,16u,LROW);',f'if(debug) coopMatStore(x,dbg,22528u+t0*32u+{t*256+f*16}u,32u,LROW);',f'xa{a}=nrh_to_A(x);',f'NRH_CH scale; coopMatLoad(scale,wb,uint(pc.p2.x)+{8+f*16}u,0u,LROW);',f'ny{a}=nrh_widen_exact(x*scale);','}']
+for h in range(8):
+ body += ['{','NRH_C ec0=NRH_C(0.0), ec1=NRH_C(0.0);']
+ for k in range(2):
+  body += ['{',f'NRH_B w; coopMatLoad(w,wb,uint(pc.p1.x)+{h*512+k*256}u,16u,LROW);',f'ec0=coopMatMulAdd(xa0{k},w,ec0); ec1=coopMatMulAdd(xa1{k},w,ec1);','}']
+ for t in range(2):
+  body += [f'NRH_CH e{t}=nrh_narrow(ec{t});',f'if(debug) coopMatStore(e{t},dbg,t0*128u+{t*1024+h*16}u,128u,LROW);']
+  body += [f'e{t}[{i}]=nr_act_h(e{t}[{i}]);' for i in range(4)]
+  body += [f'NRH_A ea{t}=nrh_to_A(e{t});']
+ for f in range(2):
+  body += ['{',f'NRH_B w; coopMatLoad(w,wb,uint(pc.p1.y)+{f*2048+h*256}u,16u,LROW);',f'ny0{f}=coopMatMulAdd(ea0,w,ny0{f}); ny1{f}=coopMatMulAdd(ea1,w,ny1{f});','}']
+ body += ['}']
+body += ['nr_transpose16(nrh_narrow(ny00),nrh_narrow(ny10),y0,y1);','nr_transpose16(nrh_narrow(ny01),nrh_narrow(ny11),y2,y3);']
+body += [f'if(debug) coopMatStore(y{i},dbg,8192u+t0*32u+{i*8}u,32u,LCOL);' for i in range(4)]
+start=s.index('        // Each active subgroup owns16'); end=s.index('        NRH_B yb0',start)
+s=s[:start]+'\n'.join(body)+'\n'+s[end:]; s=s.replace('void main() {','\n'.join(helper)+'\nvoid main() {')
+src=N/'candidate.comp'; src.write_text(s,encoding='utf-8'); dst=N/'candidate.spv'; parent=S.parent/'spv/c32_register.spv'
+run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(S),src,'-o',dst])
+pm=ST.Module(parent); cm=ST.Module(dst); keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[]); assert len(keep)==66; ST.set_no_contraction(cm,keep,dst)
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',dst])
+baseline=R/'f20-linear-scale2/plan.txt'; lines=baseline.read_text(encoding='utf-8-sig').splitlines(); orders={1,2,3,4,227,228,229}; buffers=[]; passes=[]
+for i,line in enumerate(lines):
+ p=shlex.split(line)
+ if not p: continue
+ if p[0]=='BUFFER': buffers.append((i,p))
+ if p[0]=='PASS': passes.append({'line':i,'tokens':p,'binds':[]})
+ if p[0]=='BIND': passes[-1]['binds'].append(p)
+ if p[0]=='PUSH': passes[-1]['push']=list(map(int,p[1:]))
+packs=[]
+for o in sorted(orders):
+ p=passes[o]; b=next(x for x in p['binds'] if x[1]=='0'); resource=int(b[2]); assert int(b[3])==0
+ users=[n for n,q in enumerate(passes) if any(int(x[2])==resource for x in q['binds'])]; assert set(users)<=orders,(resource,users)
+ bi,bp=buffers[resource]; origin=Path(bp[3]); raw=origin.read_bytes(); data=list(struct.unpack('<'+'H'*(len(raw)//2),raw)); ranges=[]
+ for base in p['push'][4:6]:
+  assert base+4096<=len(data); ranges += list(range(base,base+4096))
+  for tile in range(base,base+4096,256):
+   old=data[tile:tile+256]; data[tile:tile+256]=[old[c*16+r] for r in range(16) for c in range(16)]
+ assert len(set(ranges))==8192
+ out=N/f'weights-{resource}.bin'; out.write_bytes(struct.pack('<'+'H'*len(data),*data)); lines[bi]=lines[bi].replace(bp[3],out.as_posix()); lines[p['line']]=lines[p['line']].replace(p['tokens'][3],dst.as_posix()); packs.append({'source':ident(origin),'candidate':ident(out),'pass_order':o,'resource':resource,'half_offsets':p['push'][4:6]})
+plan=N/'plan.txt'; plan.write_text('\n'.join(lines)+'\n',encoding='utf-8'); cpu=run([D/'direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check']); (N/'CPU-CHECK.txt').write_text(cpu)
+(N/'CANDIDATE.json').write_text(json.dumps({'baseline':ident(baseline),'source':ident(src),'spv':ident(dst),'plan':ident(plan),'packs':packs,'no_contraction_mapping':info},indent=2))
+task=json.loads((R/'LUNA-ROUND2-GATES.json').read_text()); task['output_root']=str(N); task['identities']=task['identities'][:1]+[ident(dst)]+[x['candidate'] for x in packs]; task['jobs']=task['jobs'][-2:]; (N/'run').mkdir(exist_ok=True)
+for j in task['jobs']:
+ j['id']='gate-c32-owner-'+j['mode']; j['candidate']='c32-owner'; j['plan']=ident(plan); j['runner_output']=str(N/'run'/j['id']); j['argv'][2]=str(plan); j['argv'][4]=j['runner_output']
+(N/'LUNA-GATES.json').write_text(json.dumps(task,indent=2)); print(cpu,ident(dst))
+

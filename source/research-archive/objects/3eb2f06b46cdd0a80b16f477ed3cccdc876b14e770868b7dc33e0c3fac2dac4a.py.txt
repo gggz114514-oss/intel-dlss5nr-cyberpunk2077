@@ -1,0 +1,102 @@
+"""S06 post-GPU step 2: what IS the captured block15 input?
+
+The capture is said to differ from the FP16 teacher by relL2 = 53.1 %, yet its
+absmax and rms are almost identical (40.19/39.66, 3.659/3.812).  That signature
+is a layout/permutation, not a quantisation difference, so test it before any
+re-calibration: if the tensors match under a permutation, the teacher-domain
+calibration is NOT the problem.
+
+Writes evidence/17-input-capture.json.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+import c256b15 as L
+
+W = L.W
+CAP = W.parent / "gpu/runs/input-capture/xq-c256-b15.bin"
+TEACH = L.D / "dump-fp16/dump_block14_out.bin"
+ev = dict(capture=str(CAP), teacher=str(TEACH))
+cap = np.fromfile(CAP, dtype="<f2")
+tea = np.fromfile(TEACH, dtype="<f2")
+ev["sizes"] = dict(capture=int(cap.size * 2), teacher=int(tea.size * 2),
+                   hashes=dict(capture=L.sha256(CAP), teacher=L.sha256(TEACH)))
+
+idx, oob = L.window_to_canonical()
+valid = idx >= 0
+C = L.load_x_canonical(CAP)
+T = L.load_x_canonical(TEACH)
+
+
+def rl2(a, b):
+    a = a.astype(np.float64); b = b.astype(np.float64)
+    return float(np.sqrt(np.mean((a - b) ** 2) / np.mean(b ** 2)))
+
+
+ev["whole_file"] = dict(
+    cap_absmax=float(np.abs(cap).max()), teach_absmax=float(np.abs(tea).max()),
+    cap_rms=float(np.sqrt(np.mean(cap.astype(np.float64) ** 2))),
+    teach_rms=float(np.sqrt(np.mean(tea.astype(np.float64) ** 2))),
+    rel_l2_raw_flat=rl2(cap.astype(np.float32), tea.astype(np.float32)),
+    cap_zeros=int((cap == 0).sum()), teach_zeros=int((tea == 0).sum()),
+)
+ev["canonical_decode"] = dict(
+    rel_l2=rl2(C, T),
+    cap_absmax_valid=float(np.abs(C).max()), teach_absmax_valid=float(np.abs(T).max()),
+    per_channel_corr=[float(np.corrcoef(C[:, c].astype(np.float64), T[:, c].astype(np.float64))[0, 1]) for c in range(8)],
+    per_channel_rl2=[rl2(C[:, c], T[:, c]) for c in range(8)],
+)
+# window-major decode of the capture (rows = window slot, zero for oob)
+Cw = np.zeros((L.N_TOK, 256), dtype=np.float32); Cw[valid] = C[idx[valid]]
+Tw = np.zeros((L.N_TOK, 256), dtype=np.float32); Tw[valid] = T[idx[valid]]
+ev["window_major_decode"] = dict(rel_l2=rl2(Cw, Tw))
+
+# --- permutation test: nearest teacher token for a sample of capture tokens ----
+rng = np.random.default_rng(20261029)
+sample = rng.choice(valid.sum(), 512, replace=False)
+A = C[sample].astype(np.float32)          # capture-side sample
+Bm = T.astype(np.float32)                 # teacher-side candidates
+d2 = (A * A).sum(1)[:, None] - 2 * A @ Bm.T + (Bm * Bm).sum(1)[None, :]
+nn = np.argmin(d2, axis=1)
+nn_dist = np.sqrt(np.maximum(d2[np.arange(len(sample)), nn], 0) / 256)
+self_dist = np.sqrt(((A - Bm[sample]) ** 2).mean(axis=1))
+ev["nearest_neighbour"] = dict(
+    note="if the capture is a permutation of the teacher, nn_dist << self_dist and nn is unique",
+    self_dist_mean=float(self_dist.mean()), self_dist_p50=float(np.median(self_dist)),
+    nn_dist_mean=float(nn_dist.mean()), nn_dist_p50=float(np.median(nn_dist)),
+    nn_is_self_frac=float((nn == sample).mean()),
+    nn_unique_frac=float(len(np.unique(nn)) / len(nn)),
+    ratio_nn_over_self=float(nn_dist.mean() / max(self_dist.mean(), 1e-12)),
+)
+# token energy profile: is the capture a scaled/shifted copy?
+ev["profiles"] = dict(
+    cap_token_rms_first10=[float(x) for x in np.sqrt((C[:10].astype(np.float64) ** 2).mean(1))],
+    teach_token_rms_first10=[float(x) for x in np.sqrt((T[:10].astype(np.float64) ** 2).mean(1))],
+    cap_token_rms_all=float(np.sqrt((C.astype(np.float64) ** 2).mean())),
+    teach_token_rms_all=float(np.sqrt((T.astype(np.float64) ** 2).mean())),
+)
+# try a one-tile vertical/horizontal shift of the canonical grid
+best = None
+for dy in (-1, 0, 1):
+    for dx in (-1, 0, 1):
+        for ty_swap in (False, True):
+            g = 21
+            src = np.zeros((12 * 21 * 16, 256), dtype=np.float32)
+            for ty in range(12):
+                for tx in range(21):
+                    sy, sx = (ty + dy, tx + dx) if not ty_swap else (tx + dy, ty + dx)
+                    if 0 <= sy < 12 and 0 <= sx < 21:
+                        src[(ty * g + tx) * 16:(ty * g + tx) * 16 + 16] = \
+                            T[(sy * g + sx) * 16:(sy * g + sx) * 16 + 16]
+            r = rl2(C, src)
+            if best is None or r < best[0]:
+                best = (r, dy, dx, ty_swap)
+ev["tile_shift_search"] = dict(best_rel_l2=best[0], dy=best[1], dx=best[2], swapped=best[3],
+                               note="a small shift would show up as a much lower relL2")
+
+(W / "evidence/17-input-capture.json").write_text(json.dumps(ev, indent=1), encoding="utf-8")
+print(json.dumps(ev, indent=1)[:4500])

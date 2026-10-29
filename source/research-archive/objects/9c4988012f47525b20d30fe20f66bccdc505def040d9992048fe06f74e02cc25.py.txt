@@ -1,0 +1,261 @@
+"""S06 block15 C256 FFN static calibration (CPU only).
+
+Recipe follows the proven C64-family-static method (offline X channel
+equalisation with a power-of-two diagonal, static X/A/M coordinate search
+against the FP16 teacher Y) but uses the C256 ABI:
+  scal[0]=invX [1]=invA [2]=invM [3]=sX [4]=sA [5]=sM
+  ew[]=sX*sWe  mw[]=sA*sWm  alpha[]=sM*sWc
+and the C256 residual branch already reads the original half image, so no
+residual compensation term is needed (unlike C64).
+
+Objective: pooled squared error of the block15 FFN output Y against the FP16
+teacher dump_swin_15_Y over three frames x all valid window tokens.
+"""
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+import c256b15 as L
+
+OUT = L.W / "evidence/06-calibration-search.json"
+FRAMES = [("34189", L.D / "dump-fp16"),
+          ("41444", L.D / "teacher-diagnostics/teacher-41444"),
+          ("43654", L.D / "teacher-diagnostics/teacher-43654")]
+FACTORS = [0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2, 1.35]
+T0 = time.time()
+
+
+def log(msg):
+    print(f"[{time.time() - T0:7.1f}s] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------- data ------
+idx, oob = L.window_to_canonical()
+valid = idx >= 0
+NW = L.N_TOK
+We, Wm, Wc, rs = L.decode_weights()
+qWm, sWm = L.pack_codes(Wm, 128)
+qWc, sWc = L.pack_codes(Wc, 256)
+wm_i8 = qWm.astype(np.int64)
+wc_i8 = qWc.astype(np.int64)
+
+frames = []
+am = np.zeros(256, dtype=np.float64)
+for name, td in FRAMES:
+    Xc = L.load_x_canonical(td / "dump_block14_out.bin")
+    Y = np.fromfile(td / "dump_swin_15_Y.bin", dtype="<f2").reshape(NW, 256).astype(np.float32)
+    Xw = np.zeros((NW, 256), dtype=np.float32)
+    Xw[valid] = Xc[idx[valid]]
+    am = np.maximum(am, np.abs(Xw[valid]).max(axis=0).astype(np.float64))
+    frames.append(dict(name=name, dir=str(td), X=Xw, Y=Y))
+    log(f"loaded frame {name}: X_absmax={np.abs(Xw).max():.6f} Y_absmax={np.abs(Y).max():.6f}")
+Yall = np.concatenate([f["Y"][valid] for f in frames]).astype(np.float64)
+REF_ENERGY = float(np.mean(Yall * Yall))
+
+raw0 = np.fromfile(L.PACK_OLD, dtype=np.uint8)
+sc0 = np.frombuffer(raw0[L.SCAL_OFF:L.SCAL_OFF + 128].tobytes(), dtype="<f4")
+OLD = dict(invX=float(sc0[0]), invA=float(sc0[1]), invM=float(sc0[2]),
+           sX=float(sc0[3]), sA=float(sc0[4]), sM=float(sc0[5]))
+log("shipped scales " + json.dumps(OLD))
+
+# ------------------------------------------------------------- machinery ----
+_cache = {}
+
+
+def weights_for_diag(diag):
+    """Fold the power-of-two diagonal into expand, requantise per output channel."""
+    wt = We.astype(np.float64) * diag[None, :]
+    sWe = np.maximum(np.abs(wt).max(axis=1) / 127.0, 1e-12)
+    codes = np.clip(np.rint(wt / sWe[:, None]), -127.0, 127.0).astype(np.int64)
+    return codes, sWe
+
+
+def stage_a(fr, codes_e, sWe, sX, diag, invx_tab):
+    """qX -> expand MMA -> ew -> half -> act.  Returns act output (float32)."""
+    Xw = fr["X"]
+    qx = np.clip(np.rint(Xw.astype(np.float64) * invx_tab[None, :]), -127.0, 127.0)
+    acc = qx @ codes_e.T                                  # exact integer product
+    f = acc.astype(np.float32)
+    ew = (np.float64(sX) * sWe).astype(np.float32)
+    v = np.float32(f * ew[None, :])
+    return L.act_half32(L.narrow_half(v)), qx
+
+
+def stage_m(ha, sA):
+    """act output -> qA codes (step sA) -> mid MMA -> mw -> real M."""
+    invA = np.float32(1.0 / sA)
+    qa = np.clip(np.rint((ha * invA).astype(np.float64)), -127.0, 127.0).astype(np.int64)
+    mw = (np.float64(sA) * sWm).astype(np.float32)
+    out = np.empty((NW, 256), dtype=np.float32)
+    for g in range(L.MID_GROUPS):
+        sl = slice(32 * g, 32 * g + 32)
+        acc = qa[:, 128 * g:128 * g + 128] @ wm_i8[sl].T
+        out[:, sl] = (acc.astype(np.float32) * mw[sl][None, :])
+    return out
+
+
+def stage_y(mreal, sM, seed):
+    alpha = (np.float64(sM) * sWc).astype(np.float32)
+    invM = np.float32(1.0 / sM)
+    qm = np.clip(np.rint((mreal * invM).astype(np.float64)), -127.0, 127.0).astype(np.int64)
+    acc = qm @ wc_i8.T
+    real = np.float32(acc.astype(np.float32) * alpha[None, :])
+    y = np.float32(real + seed)
+    return y.astype(np.float16).astype(np.float32), qm
+
+
+SEED = {}
+for fr in frames:
+    SEED[fr["name"]] = L.narrow_half(fr["X"] * rs[None, :])
+
+
+def evaluate(diag, sX, sA, sM, tag=""):
+    """Full pooled objective; caches the act output on (diag, sX)."""
+    codes_e, sWe = weights_for_diag_cached(diag)
+    invx = (1.0 / sX) / diag
+    se = 0.0
+    per = {}
+    has = {}
+    for fr in frames:
+        key = (diag.tobytes(), round(float(sX), 9))
+        ha = _cache.get(("ha", key, fr["name"]))
+        if ha is None:
+            ha, qx = stage_a(fr, codes_e, sWe, sX, diag, invx)
+            _cache[("ha", key, fr["name"])] = ha
+        mreal = stage_m(ha, sA)
+        y, qm = stage_y(mreal, sM, SEED[fr["name"]])
+        d = y[valid].astype(np.float64) - fr["Y"][valid].astype(np.float64)
+        se += float(np.sum(d * d))
+        per[fr["name"]] = float(np.sqrt(np.mean(d * d) / np.mean(
+            fr["Y"][valid].astype(np.float64) ** 2)))
+    pooled = float(np.sqrt(se / (REF_ENERGY * Yall.size)))
+    return pooled, per
+
+
+def weights_for_diag_cached(diag):
+    key = diag.tobytes()
+    v = _cache.get(("w", key))
+    if v is None:
+        v = weights_for_diag(diag)
+        _cache[("w", key)] = v
+    return v
+
+
+# ------------------------------------------------------------- 1) baseline --
+ev = {"block": 15, "frames": [fr["name"] for fr in frames],
+      "objective": "pooled relL2 of FFN Y vs FP16 teacher dump_swin_15_Y, all valid window tokens (4032/frame)",
+      "tokens_per_frame": int(valid.sum()), "frames_n": len(frames)}
+
+diag1 = np.ones(256, dtype=np.float64)
+pooled_old, per_old = evaluate(diag1, OLD["sX"], OLD["sA"], OLD["sM"], "old")
+ev["old_shipped"] = dict(scales=OLD, diagonal="identity",
+                         pooled_rel_l2=pooled_old, per_frame=per_old)
+log(f"OLD shipped pack: pooled={pooled_old:.6f} per-frame={per_old}")
+
+# --------------------------------------------------- 2) recalibrated absmax --
+amx = float((am).max())
+sX_abs = amx / 127.0
+# A and M statistics come from the unquantised CPU reference of the same chain
+A_stat = 0.0
+M_stat = 0.0
+codes1, sWe1 = weights_for_diag_cached(diag1)
+for fr in frames:
+    Xw = fr["X"]
+    Araw = (Xw.astype(np.float64) @ We.astype(np.float64).T).astype(np.float32)
+    ha = L.act_half32(L.narrow_half(Araw))
+    A_stat = max(A_stat, float(np.abs(ha[valid]).max()))
+    Mr = np.empty((NW, 256), dtype=np.float32)
+    for g in range(8):
+        sl = slice(32 * g, 32 * g + 32)
+        Mr[:, sl] = (ha[:, 128 * g:128 * g + 128].astype(np.float64) @ Wm[sl].astype(np.float64).T).astype(np.float32)
+    M_stat = max(M_stat, float(np.abs(Mr[valid]).max()))
+sA_abs = A_stat / 127.0
+sM_abs = M_stat / 127.0
+ev["recalibrated_absmax"] = dict(
+    x_absmax=amx, a_absmax=A_stat, m_absmax=M_stat,
+    shipped=dict(absX=OLD["sX"], absA=OLD["sA"], absM=OLD["sM"]),
+    ratio_vs_shipped=dict(X=OLD["sX"] / sX_abs, A=OLD["sA"] / sA_abs, M=OLD["sM"] / sM_abs),
+    sX=sX_abs, sA=sA_abs, sM=sM_abs)
+log(f"absmax recalibrated: sX={sX_abs:.6f} sA={sA_abs:.6f} sM={sM_abs:.6f} "
+    f"(shipped {OLD['sX']:.6f}/{OLD['sA']:.6f}/{OLD['sM']:.6f})")
+pooled_r, per_r = evaluate(diag1, sX_abs, sA_abs, sM_abs)
+ev["recalibrated"] = dict(pooled_rel_l2=pooled_r, per_frame=per_r)
+log(f"recalibrated (no equalisation): pooled={pooled_r:.6f} {per_r}")
+
+# ------------------------------------------------- 3) equalisation variants --
+wcol = np.abs(We).max(axis=0).astype(np.float64)
+cands = {}
+cands["none"] = diag1.copy()
+e_raw = np.rint(np.log2(np.maximum(am, 1e-30)))
+for alpha, cap, tag in ((1.0, 0, "x_eq_a100"), (0.5, 0, "x_eq_a050"),
+                        (1.0, 3, "x_eq_a100_cap3"), (0.5, 2, "x_eq_a050_cap2")):
+    bal = np.maximum(am, 1e-12) ** alpha / np.maximum(wcol, 1e-12) ** (1 - alpha)
+    e = np.rint(np.log2(bal))
+    if cap:
+        e = np.clip(e, -cap, cap)
+    e = np.clip(e, -10, 10)
+    cands[tag] = np.exp2(e)
+ev_am = dict(min=float(am.min()), p05=float(np.percentile(am, 5)),
+             median=float(np.median(am)), p95=float(np.percentile(am, 95)),
+             max=float(am.max()),
+             octave_span=float(np.log2(am.max() / max(am.min(), 1e-30))),
+             log2_rounded=[float(v) for v in sorted(set(e_raw.tolist()))])
+log("am stats " + json.dumps(ev_am))
+eq_res = {}
+for tag, diag in cands.items():
+    sx = float(np.max(am / diag) / 127.0)
+    p, pf = evaluate(diag, sx, sA_abs, sM_abs)
+    eq_res[tag] = dict(pooled_rel_l2=p, per_frame=pf, sX=sx,
+                       diag_min=float(diag.min()), diag_max=float(diag.max()),
+                       diag_unique=sorted(float(v) for v in np.unique(diag)))
+    log(f"equalisation {tag}: pooled={p:.6f} sX={sx:.6f} diag=[{diag.min():g},{diag.max():g}]")
+ev["am_stats"] = ev_am
+ev["equalisation"] = eq_res
+best_tag = min(eq_res, key=lambda k: eq_res[k]["pooled_rel_l2"])
+diag = cands[best_tag]
+sX_b = eq_res[best_tag]["sX"]
+log(f"best equalisation = {best_tag}")
+
+# -------------------------------------------- 4) coordinate scale search ----
+state = dict(sX=sX_b, sA=sA_abs, sM=sM_abs)
+best = evaluate(diag, state["sX"], state["sA"], state["sM"])
+history = []
+
+
+def dim_search(key, rounds=1):
+    global best, state
+    for _ in range(rounds):
+        opts = []
+        for f in FACTORS:
+            trial = dict(state)
+            trial[key] = state[key] * f
+            p, pf = evaluate(diag, trial["sX"], trial["sA"], trial["sM"])
+            opts.append((p, f, trial, pf))
+        p, f, trial, pf = min(opts, key=lambda z: z[0])
+        history.append(dict(dim=key, factor=f, pooled=p, per_frame=pf,
+                            state={k: float(v) for k, v in trial.items()}))
+        state, best = trial, p
+        log(f"  {key} *{f}: pooled={p:.6f} -> sX={state['sX']:.6f} sA={state['sA']:.6f} sM={state['sM']:.6f}")
+
+
+for _round in range(3):
+    dim_search("sM"); dim_search("sA"); dim_search("sX")
+ev["coordinate_search"] = dict(start={k: float(v) for k, v in state.items()},
+                               history=history, final={k: float(v) for k, v in state.items()},
+                               final_pooled=best)
+log(f"search done: pooled={best:.6f} state={state}")
+
+# ------------------------------------------------------------- 5) result ----
+p_new, pf_new = evaluate(diag, state["sX"], state["sA"], state["sM"])
+ev["new"] = dict(diagonal=diag.tolist(), scales={k: float(v) for k, v in state.items()},
+                 pooled_rel_l2=p_new, per_frame=pf_new,
+                 improvement_pooled=1 - p_new / pooled_old,
+                 improvement_per_frame={k: 1 - pf_new[k] / per_old[k] for k in pf_new})
+np.save(L.W / "evidence/06-diag.npy", diag)
+(L.W / "evidence/06-calibration-search.json").write_text(json.dumps(ev, indent=1), encoding="utf-8")
+log(json.dumps(ev["new"], indent=1))
+log("written evidence/06-calibration-search.json")

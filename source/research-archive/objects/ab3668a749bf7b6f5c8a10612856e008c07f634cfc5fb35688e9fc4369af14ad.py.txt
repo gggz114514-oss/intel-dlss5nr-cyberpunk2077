@@ -1,0 +1,56 @@
+import json,re,hashlib,subprocess,copy
+from pathlib import Path
+D=Path(__file__).resolve().parent;R=D/'direct-clock';B=Path('@NR_WORKSPACE@')
+source=B/'candidates/zcode-fp16-four-hotspots-20261020/s37-context-a-v1/source/s37_fold_body_r1a.comp'
+compiler=B/'src/project/tools/glslang-16.5.0/bin/glslang.exe';validator=B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'
+original=source.read_text(encoding='utf-8-sig')
+def identity(p):return {'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+boundaries=['entry',0,2,3,6,7,8,11,12,13,16,19,'exit']
+names=['fold','second-barrier','expand','contract','qkv','norm','scale','score-exp','den','p-normalize','pv','output']
+specs={'clock-whole':('entry','exit'),'clock-null':('entry','entry'),'clock-first':('entry',7),'clock-second':(7,'exit')}
+specs.update({name:(boundaries[i],boundaries[i+1]) for i,name in enumerate(names)})
+wrapper='''
+layout(set=0,binding=15,std430) buffer ClockProbe { uint clockWords[]; };
+void main() {
+ENTRY_CLOCK
+    nr_original_main();
+EXIT_CLOCK
+    if ((gl_WorkGroupID.x & 15u)==8u && (gl_WorkGroupID.y & 15u)==8u && gl_SubgroupInvocationID==0u) {
+        uint record = ((gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*8u+gl_SubgroupID)*4u;
+        clockWords[record]=nrClockStart.x; clockWords[record+1u]=nrClockStart.y;
+        clockWords[record+2u]=nrClockEnd.x; clockWords[record+3u]=nrClockEnd.y;
+    }
+}
+'''
+out={'status':'CPU_PREPARED_NOT_MEASURED','windows':{},'barrier_occurrences':22}
+for name,(a,b) in specs.items():
+ s=original.replace('#version 450','#version 450\n#extension GL_ARB_shader_clock : require')
+ s=s.replace('void main() {','uvec2 nrClockStart, nrClockEnd;\nvoid nr_original_main() {')
+ count=[-1]
+ def replace(m):
+  count[0]+=1;v=m[0]
+  if count[0]==a:v+=' nrClockStart=clock2x32ARB();'
+  if count[0]==b:v+=' nrClockEnd=clock2x32ARB();'
+  return v
+ s=re.sub(r'barrier\(\);',replace,s);assert count[0]==21
+ entry=('nrClockStart=clock2x32ARB();' if a=='entry' else '')+('nrClockEnd=clock2x32ARB();' if b=='entry' else '')
+ end='nrClockEnd=clock2x32ARB();' if b=='exit' else ''
+ s+=wrapper.replace('ENTRY_CLOCK',entry).replace('EXIT_CLOCK',end)
+ src=R/(name+'.comp');spv=R/(name+'.spv');src.write_text(s,encoding='utf-8')
+ r=subprocess.run([str(compiler),'-V','--target-env','vulkan1.3',str(src),'-o',str(spv)],capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+ r=subprocess.run([str(validator),str(spv)],capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+ plan=R/('plan-'+name+'.txt');text=(R/'plan-whole.txt').read_text(encoding='utf-8').replace((R/'whole.spv').as_posix(),spv.as_posix());plan.write_text(text,encoding='utf-8')
+ out['windows'][name]={'start':a,'end':b,'source':identity(src),'spv':identity(spv),'plan':identity(plan),'validation':r.stdout.strip()}
+(R/'WINDOWS.json').write_text(json.dumps(out,indent=2),encoding='utf-8')
+base=json.loads((D/'LUNA-DIRECT-CLOCK-JOBS.json').read_text(encoding='utf-8-sig'))
+base['jobs']=[];base['identities']=[identity(D/'direct-clock-build/Release/clock_runner.exe')]
+for name in ['clock-whole','clock-null','clock-first','clock-second']:base['identities'].append(out['windows'][name]['spv'])
+for rep in range(3):
+ order=['control','clock-whole','clock-first','clock-second','clock-null'] if rep%2==0 else ['clock-null','clock-second','clock-first','clock-whole','control']
+ for name in order:
+  plan=identity(R/('plan-'+name+'.txt'));label=f'f20-closure-r{rep}-{name}';dest=D/'run'/label
+  base['jobs'].append({'id':label,'plan':plan,'argv':[str(D/'direct-clock-build/Release/clock_runner.exe'),'--plan',plan['path'],'--out',str(dest),'--pool','--warm','1','--reps','10','--per-pass-timing'],'runner_output':str(dest),'expected_fixed_frame_out':'1755e9c2fadba97f08cb5b02b7a4294cde3675379bdec75352287505f7e129d6'})
+base['status']='F20_DIRECT_CLOCK_REPEATS_AND_ADDITIVITY_CALIBRATION'
+base['rules']+=['15 jobs exactly, three independent processes per each of 5 arms. Alternating arm order.','Any nongold/error stops remaining jobs. Preserve all raw clocks. No stage interpretation by executor.']
+(D/'LUNA-F20-CLOSURE-JOBS.json').write_text(json.dumps(base,indent=2),encoding='utf-8')
+print('16 CPU-validated windows, 15 closure jobs prepared')

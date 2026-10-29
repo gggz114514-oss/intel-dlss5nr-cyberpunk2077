@@ -1,0 +1,92 @@
+"""Occupancy probe, step 1: correlate measured occupancy / XVE activity against the resources
+each PASS declares (registers from its ISA, shared memory from the plan line).
+
+If passes that sit at lower register/SLM footprints show higher occupancy and higher XVE
+activity, the occupancy lever has a measurable slope and a forced-low-resource kernel is worth
+building. If there is no relation, the lever is dead and we save a GPU slot.
+"""
+import json, struct, sys
+from collections import Counter
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+import ISA
+from audit_card import pass_lines
+
+cur = K.read_json(K.C / 'CURRENT.json')
+recs = pass_lines(Path(cur['best_plan']['path']))
+
+# per-pass counters
+p = list((K.C / 'queue' / 'counters-head2').rglob('hardware-counters.json'))[0]
+d = K.read_json(p)
+names = [m['name'] for m in d['metrics']]
+idx = {n: i for i, n in enumerate(names)}
+cnt = {x['name']: dict(gpu=x['values'][idx['GpuTime']] / 1e6,
+                       occ=x['values'][idx['XVE_THREADS_OCCUPANCY_ALL']],
+                       active=x['values'][idx['XVE_ACTIVE']],
+                       aluwr=x['values'][idx['XVE_STALL_ALUWR']]) for x in d['frames'][0]['passes']}
+
+# per-pass registers from ISA captures (match by kernel hash via NATIVE-INDEX)
+index = K.read_json(K.C / 'evidence' / 'NATIVE-INDEX.json')
+by_ord = {}
+def walk(n):
+    if isinstance(n, dict):
+        if 'ordinal' in n and 'baseline_kernel_hash' in n:
+            by_ord.setdefault(int(n['ordinal']), str(n['baseline_kernel_hash'])[:16])
+        for v in n.values():
+            walk(v)
+    elif isinstance(n, list):
+        for v in n:
+            walk(v)
+walk(index)
+want = {v for v in by_ord.values()}
+hit = {}
+for a in (K.C / 'queue').rglob('*.asm'):
+    for w in want:
+        if w in a.name:
+            hit.setdefault(w, a)
+        if len(hit) == len(want):
+            break
+
+rows = []
+for r in K.rows():
+    o = r['ordinal']
+    c = cnt.get(r['name'])
+    if not c:
+        continue
+    a = hit.get(by_ord.get(o, ''))
+    if not a:
+        continue
+    s = ISA.summary(a)
+    toks = recs[o]['line'].split()
+    slm = int(toks[-8]) if toks[-8].isdigit() else 0
+    rows.append(dict(name=r['name'], family=r['family'], max_r=s['max_r'], slm=slm,
+                     occ=c['occ'], active=c['active'], aluwr=c['aluwr'], gpu=c['gpu']))
+print('passes with all data:', len(rows))
+
+def bucket(lo, hi):
+    sel = [x for x in rows if lo <= x['max_r'] <= hi]
+    if not sel:
+        return None
+    n = len(sel)
+    return (n, sum(x['occ'] for x in sel) / n, sum(x['active'] for x in sel) / n,
+            sum(x['gpu'] for x in sel) / n, sum(x['aluwr'] for x in sel) / n)
+
+print('\nby register ceiling (max_r):')
+print('  %-10s %3s %8s %8s %8s %8s' % ('max_r', 'n', 'occ%', 'active%', 'gpu_ms', 'aluwr%'))
+for lo, hi in ((0, 39), (40, 63), (64, 95), (96, 119), (120, 127)):
+    b = bucket(lo, hi)
+    if b:
+        print('  %-10s %3d %8.1f %8.1f %8.3f %8.1f' % ('%d-%d' % (lo, hi), b[0], b[1], b[2], b[3], b[4]))
+
+print('\nby shared memory (bytes):')
+print('  %-12s %3s %8s %8s %8s' % ('slm', 'n', 'occ%', 'active%', 'aluwr%'))
+for lo, hi in ((0, 4096), (4097, 16384), (16385, 32768), (32769, 65536)):
+    sel = [x for x in rows if lo <= x['slm'] <= hi]
+    if sel:
+        n = len(sel)
+        print('  %-12s %3d %8.1f %8.1f %8.1f' % ('%d-%d' % (lo, hi), n,
+                                                 sum(x['occ'] for x in sel) / n,
+                                                 sum(x['active'] for x in sel) / n,
+                                                 sum(x['aluwr'] for x in sel) / n))
+K.write_json(K.C / 'evidence' / 'OCCUPANCY-PROBE.json', dict(rows=rows))

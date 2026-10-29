@@ -15,6 +15,8 @@ NR 负责神经图像处理与风格控制；FSR XMX 负责超分；XeSS FG / Xe
 
 **下载最新版：请使用本页 main 分支的 Code → Download ZIP 或 git clone。旧 v0.2.0 Release 压缩包是历史版本，当前优化版以 main 为准。**
 
+[实验工具与用法](tools/experiments/README.md) · [项目恢复与私人备份清单](docs/RECOVERY.md) · [研究源码档案](source/research-archive/README.md)
+
 ## 两种模型都能从本地 DLL 开始构建
 
 **不再要求用户已经拥有 VK102 包。** 只需提供对应版本的本地 `nvngx_dlssnr.dll` 作为模型输入，再准备下文列出的开发依赖。提取器把 DLL 当数据解析，不加载或执行 DLL。

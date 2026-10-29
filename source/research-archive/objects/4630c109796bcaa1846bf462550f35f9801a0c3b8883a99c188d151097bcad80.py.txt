@@ -1,0 +1,120 @@
+"""Read-only CFG / region analysis of the F01 baseline ISA dump.
+
+Goals
+  * map labels -> instruction index
+  * find uniform `(W&f1.0) jmpi T` guards (f1.0 = (pc.p0.z == 0) = debug off)
+    and measure the forward span they skip (the debug-only body)
+  * report instruction classes inside / outside the debug spans
+  * locate the entry-gather region and its surrounding message cluster
+
+No GPU, no writes outside this card.
+"""
+import re, sys, json, collections
+
+INSN = re.compile(r'^/\* \[(?P<addr>[0-9A-F]+)\]\s+\*/\s*(?P<pre>\([^)]*\))?\s*(?P<op>[a-z][a-z0-9.]*)\s*(?P<rest>.*)$')
+LABEL = re.compile(r'^(?P<lab>L\d+):$')
+
+CLASS = [
+    ('send', lambda o: o.startswith('send')),
+    ('dpas', lambda o: o.startswith('dpas')),
+    ('mov', lambda o: o == 'mov'),
+    ('math', lambda o: o.startswith('math')),
+    ('sync', lambda o: o.startswith('sync') or o in ('fence', 'signal barrier')),
+    ('ctrl', lambda o: o in ('jmpi', 'goto', 'join', 'brc', 'illegal', 'ret') or o.startswith('send.gtwy')),
+    ('sel', lambda o: o == 'sel'),
+    ('add', lambda o: o in ('add', 'add3', 'addc', 'subb')),
+    ('mul', lambda o: o in ('mul', 'macl', 'mach', 'mad', 'madm')),
+    ('bit', lambda o: o in ('and', 'or', 'xor', 'shl', 'shr', 'asr', 'bfn', 'fbl', 'not', 'bswap')),
+    ('cmp', lambda o: o in ('cmp', 'cmpn')),
+]
+
+
+def cls(op):
+    for name, f in CLASS:
+        if f(op):
+            return name
+    return 'other'
+
+
+def load(path):
+    ins, labels = [], {}
+    for line in open(path, encoding='utf-8', errors='replace'):
+        line = line.rstrip('\n')
+        m = LABEL.match(line.strip())
+        if m:
+            labels[m.group('lab')] = len(ins)
+            continue
+        m = INSN.match(line)
+        if not m:
+            continue
+        ins.append(dict(addr=m.group('addr'), pre=(m.group('pre') or ''), op=m.group('op'),
+                        rest=m.group('rest').strip(), text=line.strip()))
+    return ins, labels
+
+
+def main(path):
+    ins, labels = load(path)
+    n = len(ins)
+    for i, r in enumerate(ins):
+        r['i'] = i
+        r['cls'] = cls(r['op'])
+        r['targets'] = []
+        if r['op'] in ('jmpi', 'goto'):
+            r['targets'] = [labels[t] for t in re.findall(r'\bL(\d+):', r['rest'] + ':') if t in labels] \
+                if False else [labels['L' + t] for t in re.findall(r'\bL(\d+)\b', r['rest']) if 'L' + t in labels]
+
+    # uniform debug guards: f1.0 = (pc.p0.z == 0)  =>  jump = debug OFF
+    spans = []
+    for r in ins:
+        if r['op'] == 'jmpi' and 'f1.0' in r['pre'] and 'W' in r['pre'] and r['targets']:
+            t = r['targets'][0]
+            if t > r['i']:
+                spans.append((r['i'] + 1, t - 1, r['i'], t))
+    # drop spans fully contained in another span
+    outer = []
+    for s in sorted(spans, key=lambda x: (x[0], -x[1])):
+        if any(o[0] <= s[0] and s[1] <= o[1] for o in outer):
+            continue
+        outer.append(s)
+    covered = set()
+    for a, b, *_ in outer:
+        covered.update(range(a, b + 1))
+
+    def hist(idx):
+        return dict(collections.Counter(ins[i]['cls'] for i in idx).most_common())
+
+    hot = [i for i in range(n) if i not in covered]
+    # message histogram per region
+    def msgs(idx):
+        c = collections.Counter()
+        for i in idx:
+            m = re.search(r'//\s*wr:\S+,\s*rd:\S+;\s*(.*)$', ins[i]['text'])
+            if m:
+                c[m.group(1).strip()] += 1
+        return dict(c.most_common())
+
+    # gather region: first scalar d32 load cluster
+    gidx = [i for i, r in enumerate(ins) if 'load.ugm.d32.a32.bss' in r['text']]
+    res = dict(
+        file=path, n=len(ins),
+        n_labels=len(labels),
+        debug_guard_spans=[dict(from_i=a, to_i=b, guard_i=g, guard_addr=ins[g]['addr'],
+                                target_i=t, size=b - a + 1) for a, b, g, t in outer],
+        debug_covered=len(covered),
+        hot_instructions=len(hot),
+        hot_classes=hist(hot),
+        debug_classes=hist(sorted(covered)),
+        hot_msgs=msgs(hot),
+        debug_msgs=msgs(sorted(covered)),
+        scalar_load_positions=gidx,
+        scalar_load_total=len(gidx),
+    )
+    if len(sys.argv) > 2:
+        open(sys.argv[2], 'w', encoding='utf-8').write(json.dumps(res, indent=1))
+        print('wrote', sys.argv[2])
+    else:
+        print(json.dumps(res, indent=1))
+
+
+if __name__ == '__main__':
+    main(sys.argv[1])

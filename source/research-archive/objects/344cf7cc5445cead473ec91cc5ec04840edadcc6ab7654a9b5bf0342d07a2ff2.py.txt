@@ -1,0 +1,164 @@
+"""R10/R11 INT8 weight pack generator (CPU only, numpy).
+
+Decodes the FP16 pack that the *deployed* PASS actually reads (G3 plan BIND 0 /
+BIND 8 for PASS 14 and PASS 22) with the tile layout its own source uses, and
+re-emits it in the I8B K32 layout the new INT8 kernel reads.
+
+  FP16 WO, C64/C128 family : idx(n,k) = wo + (n/16)*(K/16)*256 + (k/16)*256
+                                      + (n%16)*16 + (k%16)        [stride 16, LCOL]
+  FP16 WO, C256            : idx(n,k) = wo + n*K + k               [stride K, LCOL]
+  FP16 DS, C128/C256       : idx(n,k) = whalf + (n/16)*(K/16)*256 + (k/16)*256
+                                      + (n%16)*16 + (k%16)        [stride 16, LCOL]
+  INT8  B, all four        : idx(n,k) = (n/16)*(K/32)*512 + (k/32)*512
+                                      + (n%16)*32 + (k%32)        [stride 32, LCOL]
+
+Quantiser: per output channel n, s[n] = max_k |W[n][k]| / 127, code =
+clamp(roundEven(W[n][k] / s[n]), -127, 127).  A channel whose whole row is zero
+gets s = 0 and codes 0 (reported separately as `zero_channels`).
+
+Every decode is checked to be a bijection onto [base, base + N*K): the set of
+touched FP16 indices must be exactly that range, which is what proves the
+formula addresses the region the buffer actually holds.
+
+usage: python tools/make_packs.py
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+CARD = HERE.parent
+R = Path("@NR_WORKSPACE@")
+PACKDIR = R / "candidates/amd-map-20261015/round4-integrated/candidate/packs"
+
+SPECS = [
+    dict(tag="r10_wo", pass_name="f3c128_body_ds", role="WO",
+         src=PACKDIR / "swin_14_weights.fp16.bin", fp16_base=0, family="blocked",
+         N=128, K=128, out="r10_c128_b14_wo.i8.bin", sc="r10_c128_b14_wosc.f32.bin"),
+    dict(tag="r10_ds", pass_name="f3c128_body_ds", role="DS",
+         src=PACKDIR / "ioport_14_ioport_pack.fp16.bin", fp16_base=180736,
+         family="blocked", N=256, K=128, out="r10_c128_b14_ds.i8.bin",
+         sc="r10_c128_b14_dssc.f32.bin"),
+    dict(tag="r11_wo", pass_name="f3c256_body_ds", role="WO",
+         src=PACKDIR / "swin_22_weights.fp16.bin", fp16_base=0, family="linear",
+         N=256, K=256, out="r11_c256_b22_wo.i8.bin", sc="r11_c256_b22_wosc.f32.bin"),
+    dict(tag="r11_ds", pass_name="f3c256_body_ds", role="DS",
+         src=PACKDIR / "ioport_22_ioport_pack.fp16.bin", fp16_base=656128,
+         family="blocked", N=512, K=256, out="r11_c256_b22_ds.i8.bin",
+         sc="r11_c256_b22_dssc.f32.bin"),
+]
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def fp16_index(family, base, N, K, n, k):
+    if family == "linear":
+        return base + n * K + k
+    return (base + (n // 16) * (K // 16) * 256 + (k // 16) * 256
+            + (n % 16) * 16 + (k % 16))
+
+
+def i8_index(N, K, n, k):
+    return (n // 16) * (K // 32) * 512 + (k // 32) * 512 + (n % 16) * 32 + (k % 32)
+
+
+def quantise_row(W, s):
+    """roundEven(W/s) clamped to +-127; s == 0 -> all zero codes."""
+    code = np.zeros_like(W, dtype=np.int32)
+    nz = s > 0
+    if np.any(nz):
+        q = np.rint(W[nz] / s[nz][:, None])          # np.rint = round-half-to-even
+        code[nz] = np.clip(q, -127.0, 127.0).astype(np.int32)
+    return code
+
+
+def build(spec):
+    raw = np.fromfile(spec["src"], dtype="<f2")
+    N, K, base = spec["N"], spec["K"], spec["fp16_base"]
+    nn = np.arange(N)[:, None] * np.ones((1, K), dtype=np.int64)
+    kk = np.ones((N, 1), dtype=np.int64) * np.arange(K)[None, :]
+    idx = fp16_index(spec["family"], base, N, K, nn, kk)
+    used = np.unique(idx)
+    expected = np.arange(base, base + N * K)
+    bijective = bool(used.size == N * K and np.array_equal(used, expected))
+    if idx.max() >= raw.size:
+        raise SystemExit("%s: index %d beyond buffer (%d halfs)"
+                         % (spec["tag"], idx.max(), raw.size))
+    W = raw[idx].astype(np.float32)
+
+    amax = np.abs(W).max(axis=1)
+    s = amax / 127.0
+    code = quantise_row(W, s)
+    Wh = (code.astype(np.float32) * s[:, None])
+    err = W - Wh
+    den = float(np.sqrt((W.astype(np.float64) ** 2).sum()))
+    rel = float(np.sqrt((err.astype(np.float64) ** 2).sum()) / den) if den else 0.0
+
+    out = np.full(N * K, 127, dtype=np.int8)
+    flat = i8_index(N, K, nn, kk)
+    if np.unique(flat).size != N * K:
+        raise SystemExit("%s: int8 layout is not a bijection" % spec["tag"])
+    out[flat.ravel()] = code.astype(np.int8).ravel()
+    i8path = CARD / "packs" / spec["out"]
+    scpath = CARD / "packs" / spec["sc"]
+    i8path.parent.mkdir(parents=True, exist_ok=True)
+    out.tofile(i8path)
+    s.astype("<f4").tofile(scpath)
+
+    sat = int(np.count_nonzero(np.abs(code) == 127))
+    zero_ch = [int(i) for i in np.nonzero(amax == 0)[0][:20]]
+    meta = {
+        "tag": spec["tag"], "pass_name": spec["pass_name"], "role": spec["role"],
+        "source_pack": {"path": spec["src"].as_posix(), "bytes": spec["src"].stat().st_size,
+                        "sha256": sha(spec["src"]), "halfs": int(raw.size)},
+        "geometry": {"N": N, "K": K, "fp16_base_halfs": base, "family": spec["family"],
+                     "fp16_region_halfs": N * K,
+                     "fp16_region_end_halfs": base + N * K},
+        "fp16_layout_index": ("base + n*K + k" if spec["family"] == "linear" else
+                              "base + (n/16)*(K/16)*256 + (k/16)*256 + (n%16)*16 + (k%16)"),
+        "int8_layout_index": "(n/16)*(K/32)*512 + (k/32)*512 + (n%16)*32 + (k%32)",
+        "decode_bijection": bijective,
+        "quantiser": "s[n] = max_k |W[n][k]| / 127 ; code = clamp(roundEven(W/s),-127,127)",
+        "int8_pack": {"path": i8path.as_posix(), "bytes": i8path.stat().st_size,
+                      "sha256": sha(i8path)},
+        "scale_table": {"path": scpath.as_posix(), "bytes": scpath.stat().st_size,
+                        "sha256": sha(scpath), "entries": N, "dtype": "little-endian f32"},
+        "round_trip": {"rel_l2": rel,
+                       "max_abs_err": float(np.abs(err).max()),
+                       "rms": float(np.sqrt((err.astype(np.float64) ** 2).mean())),
+                       "weight_absmax": float(np.abs(W).max()),
+                       "weight_rms": float(np.sqrt((W.astype(np.float64) ** 2).mean()))},
+        "saturation": {"codes_at_pm127": sat, "share": sat / float(N * K)},
+        "zero_channels": {"count": int(np.count_nonzero(amax == 0)), "first": zero_ch},
+        "scale_range": {"min": float(s.min()), "max": float(s.max()),
+                        "mean": float(s.mean())},
+        "amax_range": {"min": float(amax.min()), "max": float(amax.max())},
+    }
+    return meta
+
+
+def main():
+    metas = [build(s) for s in SPECS]
+    doc = {"card": "r10-r11-ds", "generated_by": "tools/make_packs.py",
+           "numpy": np.__version__, "packs": metas}
+    (CARD / "packs/PACK-META.json").write_text(
+        json.dumps(doc, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    for m in metas:
+        print("%-7s %-6s N=%3d K=%3d bytes=%6d relL2=%.6f%% sat=%d/%d(%.4f%%) zero=%d "
+              "biject=%s sha=%s"
+              % (m["tag"], m["role"], m["geometry"]["N"], m["geometry"]["K"],
+                 m["int8_pack"]["bytes"], 100.0 * m["round_trip"]["rel_l2"],
+                 m["saturation"]["codes_at_pm127"], m["geometry"]["N"] * m["geometry"]["K"],
+                 100.0 * m["saturation"]["share"], m["zero_channels"]["count"],
+                 m["decode_bijection"], m["int8_pack"]["sha256"][:16]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

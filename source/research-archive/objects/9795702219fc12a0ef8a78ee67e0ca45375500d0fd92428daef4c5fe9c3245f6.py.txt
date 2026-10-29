@@ -1,0 +1,42 @@
+"""Static block-output reconstruction search, using captured FP16 teacher Y.
+CPU model is audited against existing GPU Y; GPU remains acceptance oracle.
+"""
+from pathlib import Path
+import json,numpy as np
+Q=Path(__file__).resolve().parent;D=Q/'real-int8-24';O=D/'c64-b6-reconstruction';O.mkdir(exist_ok=False)
+data=json.loads((Q/'ACTIVE-ROWS.json').read_text());buf=data['buffers'];r=next(r for r in data['rows'] if r['name']=='block6_swin_body_3');p=list(map(int,r['push']));b={int(k):v for k,v in r['bindings'].items()}
+r1=next(r for r in data['rows'] if r['name']=='block6_swin_body_1');bb={int(k):v for k,v in r1['bindings'].items()}
+scold=np.fromfile(buf[bb[1][0]]['file'],dtype='<f4');wold=np.fromfile(buf[bb[0][0]]['file'],dtype='i1').astype(np.float32)
+wp=np.fromfile(buf[b[0][0]]['file'],dtype='<f2').astype(np.float32);rs=wp[p[17]:p[17]+64]
+ids=np.random.default_rng(20261029).choice(43*25*64,4096,replace=False)
+win=ids//64;t=ids%64;tx=2*(win%43)-1+((t//16)&1);ty=2*(win//43)-1+((t//16)>>1);valid=(tx>=0)&(tx<84)&(ty>=0)&(ty<48)
+xs=[];ys=[]
+for td in [D/'dump-fp16',D/'teacher-diagnostics/teacher-41444',D/'teacher-diagnostics/teacher-43654']:
+ raw=np.fromfile(td/'dump_block5_out.bin',dtype='<f2').reshape(-1,4,16,16).transpose(0,2,1,3).astype(np.float32);x=np.zeros((len(ids),64),np.float32);x[valid]=raw[ty[valid]*84+tx[valid],t[valid]%16].reshape(-1,64);xs.append(x);ys.append(np.fromfile(td/'dump_swin_6_Y.bin',dtype='<f2').reshape(-1,64)[ids].astype(np.float32))
+X=np.concatenate(xs);Y=np.concatenate(ys)
+def half(x):return x.astype(np.float16).astype(np.float32)
+def code(x):return np.clip(np.rint(x),-127,127)
+def forward(sc,w,x,half_residual=False):
+ inv=sc[464:528] if len(sc)>464 else np.full(64,sc[1],np.float32);qx=code(x*inv)
+ e=half((qx@w[:16384].reshape(256,64).T)*sc[16:272]);t=np.clip(e,-4,4);a=half(e*half(t*half(-.055908203125*abs(t)+.447265625)+.89453125));qa=code(a*sc[2])
+ mw=w[16384:24576].reshape(64,128);m=np.concatenate([qa[:,g*128:(g+1)*128]@mw[g*32:(g+1)*32].T for g in range(2)],axis=1)*sc[272:336];qm=code(m*sc[3]);c=(qm@w[24576:28672].reshape(64,64).T)*sc[336:400]
+ residual=half(x*rs) if half_residual else qx*sc[400:464]
+ return half(c+residual)
+gpu=np.fromfile(D/'c64-stage/old/Y.bin',dtype='<f2').reshape(-1,64)[ids].astype(np.float32);model=forward(scold,wold,xs[0]);audit={'cpu_vs_gpu_y_relative_l2':float(np.linalg.norm(model-gpu)/np.linalg.norm(gpu)),'equal_fraction':float(np.mean(model==gpu)),'model_vs_teacher_relative_l2':float(np.linalg.norm(model-ys[0])/np.linalg.norm(ys[0]))};assert audit['cpu_vs_gpu_y_relative_l2']<.01,audit
+history=[];candidates=[]
+for name,folder in [('original',None),('balanced',D/'c64-b6-equal-x'),('balanced-alpha1',D/'c64-b6-equal-x-alpha1')]:
+ sc0=scold.copy() if folder is None else np.fromfile(folder/'scales.bin',dtype='<f4');w=wold if folder is None else np.fromfile(folder/'weights.bin',dtype='i1').astype(np.float32)
+ def scales(factors):
+  sx,sa,sm=factors;s=sc0.copy();s[0]*=sx;s[1]/=sx;s[16:272]*=sx;s[400:464]*=sx
+  if len(s)>464:s[464:528]/=sx
+  s[2]/=sa;s[272:336]*=sa;s[3]/=sm;s[336:400]*=sm;return s
+ for residual in [False,True]:
+  factors=np.ones(3);best=float(np.mean((forward(scales(factors),w,X,residual)-Y)**2))
+  for dim in range(3):
+   options=[]
+   for f in [.5,.65,.8,1.,1.2]:
+    trial=factors.copy();trial[dim]=f;loss=float(np.mean((forward(scales(trial),w,X,residual)-Y)**2));options.append((loss,trial));history.append(dict(arm=name,half_residual=residual,dimension=dim,factors=trial.tolist(),mse=loss))
+   best,factors=min(options,key=lambda z:z[0])
+  s=scales(factors);key=name+('-half-residual' if residual else '-qx-residual');s.tofile(O/(key+'.bin'));candidates.append(dict(name=key,source_folder=str(folder) if folder else None,factors=factors.tolist(),mse=best,relative_l2=float(np.sqrt(best/np.mean(Y*Y))),half_residual=residual,scale_file=str(O/(key+'.bin'))))
+out=dict(status='offline candidates; GPU validation required',audit=audit,selection='4096 deterministic window-token samples per frame; 3 frames, 12288 samples; Y teacher output objective; coordinate search not global optimum',candidates=sorted(candidates,key=lambda z:z['mse']),history=history)
+(O/'SEARCH.json').write_text(json.dumps(out,indent=2));print(json.dumps({'audit':audit,'candidates':out['candidates']},indent=2))

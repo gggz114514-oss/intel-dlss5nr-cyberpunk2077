@@ -1,0 +1,316 @@
+"""S08 static calibration of ViT block31 expand+contract (FFN slice), target = teacher Y.
+
+Method (the validated C64-family recipe, adapted to this FFN's topology):
+  1. real weights: decode the FP16 hostile layout; per-output-channel symmetric
+     absmax/127 rows (identical to the packer's quantiser).
+  2. X equalisation: per-input-channel diag D_x[k]=2**round(log2(amax_k)) folded into
+     the expand K dimension (W_E[n,k] *= D_x[k]); the qX producer quantises with the
+     per-channel inverse invx[k]=127/(sX*fx*D_x[k]) instead of the single ws[8].
+     sX = max_k(amax_k/D_x[k])/127 (the C64 convention: the global step is the ratio,
+     the diag carries the magnitude).
+  3. A equalisation: same on the post-GELU edge (4096 channels), folded into the
+     contract K dimension (W_C[n,k] *= D_a[k]); the expand epilogue quantises qA with
+     inva[n]=127/(sA*fa*D_a[n]).
+     The PRE-GELU E edge cannot be equalised: vit_cubic is not homogeneous, so a
+     per-channel diag on E is not equivalent to one on A. Only the post-GELU edge is
+     mathematically legal for a diagonal fold.
+  4. coordinate search f_X, f_A on the static steps with the FFN output Y as target.
+  5. the residual is the FP16 x read (contract), untouched by all of the above.
+
+Every new number is a constant in the block weight pack: no dynamic amax, no runtime
+reduction, no per-token/head statistic.
+"""
+from pathlib import Path
+import hashlib
+import json
+
+import numpy as np
+
+R = Path(r"@NR_WORKSPACE@")
+S = R / "work/dsh-fullnet-static-20261029/S08-vit"
+Q = R / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+
+OLD_PACK = R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-v1/pack/vit_block31_weights.int8.bin"
+FP16W = R / "src/project/artifacts/parallel-port-20261013/vit/block31/vit_weights.fp16.bin"
+W_HALF = dict(WE=(0, 4096, 1024), WC=(4194304, 1024, 4096))
+GAIN_HALF_OFF, GAIN_BYTE = 12582912, 25165824
+TOTAL = 25169920
+WE8, WC8 = 0, 4194304
+WS_OFF, EW_OFF, AC_OFF, AP_OFF, WG_OFF = 9437184, 9437248, 9453632, 9457728, 9461824
+NEW_ARR = 12623936          # first free byte after aq[3072]; 4,153,280 B free before FP16 WQKV
+
+M_ROWS, K_X, N_E, N_Y = 288, 1024, 4096, 1024
+TEACHERS = [D / "dump-fp16", D / "teacher-diagnostics/teacher-41444",
+            D / "teacher-diagnostics/teacher-43654"]
+AUDIT_POOLED = None   # filled from AUDIT/audit-b31-ffn.json when present
+
+
+def sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def idx_half(n, k, N, K):
+    return (n // 32) * (K // 16) * 512 + (k // 16) * 512 + (n % 32) * 16 + (k % 16)
+
+
+def idx_int8(n, k, N, K):
+    return (n // 32) * (K // 32) * 1024 + (k // 32) * 1024 + (n % 32) * 32 + (k % 32)
+
+
+def unpack_half(flat, off, N, K):
+    n = np.arange(N)[:, None]
+    k = np.arange(K)[None, :]
+    return flat[off + idx_half(n, k, N, K)]
+
+
+def pack_int8(W, off, N, K):
+    n = np.arange(N)[:, None]
+    k = np.arange(K)[None, :]
+    pos = idx_int8(n, k, N, K)
+    buf = np.zeros(N * K, np.int8)
+    buf[pos.ravel()] = W.ravel()
+    return buf.tobytes()
+
+
+def half(x):
+    return np.asarray(x, np.float32).astype(np.float16).astype(np.float32)
+
+
+def cubic(z):
+    z = np.float16(z)
+    t = np.clip(z, np.float16(-4.0), np.float16(4.0)).astype(np.float32)
+    u = half(np.float32(-0.055908203125) * np.abs(t) + np.float32(0.447265625))
+    v = half(t * u + np.float32(0.89453125))
+    return half(z.astype(np.float32) * v)
+
+
+def code(x, inv):
+    c = np.asarray(x, np.float32) * np.asarray(inv, np.float32)
+    return np.clip(np.rint(c), -127, 127).astype(np.int16)
+
+
+def rowscale(W):
+    ch = np.abs(W).max(axis=1)
+    return np.where(ch > 0, ch / 127.0, 1.0).astype(np.float32)
+
+
+def rowq(W, s32):
+    return np.clip(np.rint(W / s32.astype(np.float64)[:, None]), -127, 127).astype(np.int8)
+
+
+def main():
+    rep = {}
+    old_bytes = OLD_PACK.read_bytes()
+    old = np.frombuffer(old_bytes, dtype=np.int8)
+    flat16 = np.frombuffer(FP16W.read_bytes(), dtype="<f2")
+    WE = unpack_half(flat16, *W_HALF["WE"]).astype(np.float64)
+    WC = unpack_half(flat16, *W_HALF["WC"]).astype(np.float64)
+    gain = flat16[GAIN_HALF_OFF:GAIN_HALF_OFF + 1024].astype(np.float32)
+
+    Xs, Ats, Yts = [], [], []
+    for td in TEACHERS:
+        Xs.append(np.fromfile(td / "dump_block30_out.bin", dtype="<f2")[:M_ROWS * K_X].reshape(M_ROWS, K_X).astype(np.float32))
+        Ats.append(np.fromfile(td / "dump_vit_block31_A.bin", dtype="<f2")[:M_ROWS * N_E].reshape(M_ROWS, N_E).astype(np.float32))
+        Yts.append(np.fromfile(td / "dump_vit_block31_Y.bin", dtype="<f2")[:M_ROWS * N_Y].reshape(M_ROWS, N_Y).astype(np.float32))
+    X = np.concatenate(Xs).astype(np.float64)
+    At = np.concatenate(Ats).astype(np.float64)
+    Yt = np.concatenate(Yts).astype(np.float64)
+    gainA = gain.astype(np.float64)[None, :]
+
+    AX = np.abs(X).max(axis=0)          # per-input-channel absmax, 3 frames
+    AA = np.abs(At).max(axis=0)         # per-activation-channel absmax, 3 frames
+
+    def diag_of(amax):
+        return np.exp2(np.rint(np.log2(np.maximum(amax, 1e-8)))).astype(np.float32)
+
+    Dx, Da = diag_of(AX), diag_of(AA)
+    rep["edges"] = dict(
+        x_absmax_global=float(AX.max()), x_absmax_channel_min=float(AX.min()),
+        a_absmax_global=float(AA.max()), a_absmax_channel_min=float(AA.min()),
+        d_x_min=float(Dx.min()), d_x_max=float(Dx.max()),
+        d_a_min=float(Da.min()), d_a_max=float(Da.max()),
+        note="D=2**round(log2(channel absmax)); global step = max_k(amax_k/D_k)/127")
+
+    def forward(cE, ew, cC, ac, invx, inva, want_A=False):
+        ivx = np.atleast_1d(np.asarray(invx, np.float32))
+        iva = np.atleast_1d(np.asarray(inva, np.float32))
+        qX = code(X, ivx)
+        acc1 = qX.astype(np.float64) @ cE.astype(np.float64).T
+        E = half(acc1.astype(np.float32) * ew[None, :])
+        A = cubic(E)
+        qA = code(A, iva)
+        acc2 = qA.astype(np.float64) @ cC.astype(np.float64).T
+        Y = half(gainA * X + (acc2.astype(np.float32) * ac[None, :]).astype(np.float64)).astype(np.float32)
+        out = dict(Y=Y, qX_sat=int(np.count_nonzero(np.abs(X * ivx[None, :]) > 127.0)),
+                   qA_sat=int(np.count_nonzero(np.abs(A * iva[None, :]) > 127.0)),
+                   A=A if want_A else None)
+        return out
+
+    def metrics(Y, extra=None):
+        y = Y.astype(np.float64)
+        d = dict(rel_l2=float(np.linalg.norm(y - Yt) / np.linalg.norm(Yt)),
+                 mse=float(np.mean((y - Yt) ** 2)))
+        if extra:
+            d.update(extra)
+        return d
+
+    # ---------------- V0/V1: FP16 reference and the pack the plan binds today ----------------
+    sWE, sWC = rowscale(WE), rowscale(WC)
+    qWE, qWC = rowq(WE, sWE), rowq(WC, sWC)
+    dWE = qWE.astype(np.float64) * sWE.astype(np.float64)[:, None]
+    dWC = qWC.astype(np.float64) * sWC.astype(np.float64)[:, None]
+    y0 = half(gainA * X + (cubic(half(X @ dWE.T)) @ dWC.T)).astype(np.float32)
+    rep["V0_fp16_ref"] = metrics(y0, dict(note="FP16 weights, no activation quant (dump reproduction check)"))
+
+    ew0 = np.frombuffer(old_bytes[EW_OFF:EW_OFF + 16384], dtype="<f4")
+    ac0 = np.frombuffer(old_bytes[AC_OFF:AC_OFF + 4096], dtype="<f4")
+    ws0 = np.frombuffer(old_bytes[WS_OFF:WS_OFF + 64], dtype="<f4")
+    cWE0 = old[idx_int8(np.arange(4096)[:, None], np.arange(1024)[None, :], 4096, 1024)]
+    cWC0 = old[WC8 + idx_int8(np.arange(1024)[:, None], np.arange(4096)[None, :], 1024, 4096)]
+    r1 = forward(cWE0, ew0, cWC0, ac0, np.float32(ws0[8]), np.float32(ws0[9]))
+    rep["V1_current_pack"] = metrics(r1["Y"], dict(
+        note="v1 pack sha 9166f9c8 (real INT8, single-frame diagnostic scales, no equalisation)",
+        qX_sat=r1["qX_sat"], qA_sat=r1["qA_sat"], sX=float(ws0[3]), sA=float(ws0[4]),
+        invX=float(ws0[8]), invA=float(ws0[9])))
+    print("V0", rep["V0_fp16_ref"]["rel_l2"], "V1", rep["V1_current_pack"]["rel_l2"], flush=True)
+
+    # ---------------- ablations ----------------
+    rep["abl_weights_only"] = metrics(half(gainA * X + (cubic(half(X @ dWE.T)) @ dWC.T)).astype(np.float32))
+    gx, ga = np.float32(AX.max() / 127.0), np.float32(AA.max() / 127.0)
+    qXi = code(X, np.float32(127.0 / AX.max()))
+    Ei = (qXi.astype(np.float64) @ dWE.T).astype(np.float32) * gx
+    rep["abl_qX_only"] = metrics(half(gainA * X + (cubic(half(Ei)) @ dWC.T)).astype(np.float32),
+                                 dict(qX_sat=int(np.count_nonzero(np.abs(X * (127.0 / AX.max())) > 127.0))))
+    Ai = cubic(half(X @ dWE.T))
+    qAi = code(Ai, np.float32(127.0 / AA.max()))
+    rep["abl_qA_only"] = metrics(half(gainA * X + ((qAi.astype(np.float64) @ dWC.T).astype(np.float32) * ga)).astype(np.float32),
+                                 dict(qA_sat=int(np.count_nonzero(np.abs(Ai * (127.0 / AA.max())) > 127.0))))
+    print("ablations", {k: round(v["rel_l2"], 6) for k, v in rep.items() if k.startswith("abl")}, flush=True)
+
+    # ---------------- scale/weight construction ----------------
+    def build(fx, fa, eqx, eqa):
+        Dx_ = Dx if eqx else np.ones(K_X, np.float32)
+        Da_ = Da if eqa else np.ones(N_E, np.float32)
+        bx = np.float32(np.max(AX / Dx_) / 127.0) * np.float32(fx)     # global X step
+        ba = np.float32(np.max(AA / Da_) / 127.0) * np.float32(fa)     # global A step
+        WEx = WE * Dx_.astype(np.float64)[None, :]
+        WCx = WC * Da_.astype(np.float64)[None, :]
+        sWEx, sWCx = rowscale(WEx), rowscale(WCx)
+        invx = (np.float32(1.0) / (bx * Dx_)).astype(np.float32)
+        inva = (np.float32(1.0) / (ba * Da_)).astype(np.float32)
+        ew = (bx * sWEx).astype(np.float32)
+        ac = (ba * sWCx).astype(np.float32)
+        return dict(WEx=WEx, WCx=WCx, sWEx=sWEx, sWCx=sWCx, invx=invx, inva=inva,
+                    ew=ew, ac=ac, bx=bx, ba=ba, cE=rowq(WEx, sWEx), cC=rowq(WCx, sWCx))
+
+    def evaluate(fx, fa, eqx, eqa, keep=False):
+        b = build(fx, fa, eqx, eqa)
+        r = forward(b["cE"], b["ew"], b["cC"], b["ac"], b["invx"], b["inva"], want_A=True)
+        m = metrics(r["Y"], dict(fx=float(fx), fa=float(fa), eq_x=bool(eqx), eq_a=bool(eqa),
+                                 qX_sat=r["qX_sat"], qA_sat=r["qA_sat"],
+                                 qX_sat_frac=float(r["qX_sat"] / X.size),
+                                 qA_sat_frac=float(r["qA_sat"] / r["A"].size)))
+        if keep:
+            m["state"] = dict(b, Y=r["Y"])
+        return m
+
+    grid = []
+    for eqx, eqa, tag in [(0, 0, "V2_scalar_recal"), (1, 0, "V3_x_equalised"),
+                          (0, 1, "V3b_a_equalised"), (1, 1, "V4_xa_equalised")]:
+        m = evaluate(1.0, 1.0, eqx, eqa)
+        rep[tag] = m
+        grid.append((m["rel_l2"], tag, (eqx, eqa)))
+        print(tag, round(m["rel_l2"], 6), "qX_sat", m["qX_sat"], "qA_sat", m["qA_sat"], flush=True)
+    best_eq = min(grid)[2]
+    print("best variant", min(grid)[1], best_eq, flush=True)
+
+    # ---------------- coordinate search ----------------
+    fx, fa = 1.0, 1.0
+    cur = evaluate(fx, fa, *best_eq)
+    hist = []
+    for rnd in range(3):
+        moved = False
+        for dim in range(2):
+            cand = [(cur["rel_l2"], fx, fa)]
+            for v in (0.5, 0.65, 0.8, 1.0, 1.2, 1.5):
+                tfx, tfa = (v, fa) if dim == 0 else (fx, v)
+                mm = evaluate(tfx, tfa, *best_eq)
+                cand.append((mm["rel_l2"], tfx, tfa))
+                hist.append(dict(fx=tfx, fa=tfa, rel_l2=mm["rel_l2"], qX_sat=mm["qX_sat"], qA_sat=mm["qA_sat"]))
+            best = min(cand)
+            if best[1:] != (fx, fa):
+                moved = True
+            fx, fa = best[1], best[2]
+            cur = evaluate(fx, fa, *best_eq)
+        print("search round", rnd, "fx", fx, "fa", fa, "rel", round(cur["rel_l2"], 6), flush=True)
+        if not moved:
+            break
+    rep["search_history"] = hist
+    final = evaluate(fx, fa, *best_eq, keep=True)
+    rep["V5_searched"] = {k: v for k, v in final.items() if k != "state"}
+    st = final["state"]
+
+    # ---------------- write the new pack ----------------
+    blob = bytearray(old_bytes)
+    blob[WE8:WE8 + 4096 * 1024] = pack_int8(st["cE"], WE8, 4096, 1024)
+    blob[WC8:WC8 + 1024 * 4096] = pack_int8(st["cC"], WC8, 1024, 4096)
+    ws = np.frombuffer(old_bytes[WS_OFF:WS_OFF + 64], dtype="<f4").copy()
+    ws[3] = st["bx"]
+    ws[4] = st["ba"]
+    ws[8] = float(np.float32(1.0) / st["bx"])
+    ws[9] = float(np.float32(1.0) / st["ba"])
+    blob[WS_OFF:WS_OFF + 64] = ws.astype("<f4").tobytes()
+    blob[EW_OFF:EW_OFF + 16384] = st["ew"].astype("<f4").tobytes()
+    blob[AC_OFF:AC_OFF + 4096] = st["ac"].astype("<f4").tobytes()
+    if best_eq[0]:
+        blob[NEW_ARR:NEW_ARR + 4096] = st["invx"].tobytes()
+    if best_eq[1]:
+        blob[NEW_ARR + 4096:NEW_ARR + 4096 + 16384] = st["inva"].tobytes()
+
+    P = S / "PACK"
+    P.mkdir(exist_ok=True)
+    outp = P / "vit_block31_weights.int8.s08.bin"
+    outp.write_bytes(bytes(blob))
+    newsha = sha(bytes(blob))
+    diff = np.nonzero(np.frombuffer(bytes(blob), np.uint8) != np.frombuffer(old_bytes, np.uint8))[0]
+    segs = []
+    for i in diff:
+        if segs and i == segs[-1][1] + 1:
+            segs[-1][1] = int(i)
+        else:
+            segs.append([int(i), int(i)])
+    rep["pack"] = dict(old_path=str(OLD_PACK), old_sha256=sha(old_bytes),
+                       new_path=str(outp), new_sha256=newsha, bytes=TOTAL,
+                       changed_bytes=int(diff.size),
+                       changed_segments=[dict(start=a, end=b, bytes=b - a + 1) for a, b in segs[:40]],
+                       changed_segments_total=len(segs),
+                       new_arrays=dict(
+                           x_inverse=dict(offset=NEW_ARR, floats=1024, bytes=4096, used=bool(best_eq[0])),
+                           a_inverse=dict(offset=NEW_ARR + 4096, floats=4096, bytes=16384, used=bool(best_eq[1])),
+                           free_bytes_after=16777216 - (NEW_ARR + 4096 + 16384)))
+    np.savez_compressed(P / "s08-scales.npz", invx=st["invx"], inva=st["inva"], ew=st["ew"],
+                        ac=st["ac"], ws=ws, Dx=Dx, Da=Da)
+
+    per = []
+    for ti, (td, yt) in enumerate(zip(TEACHERS, Yts)):
+        a, b = ti * M_ROWS, (ti + 1) * M_ROWS
+        per.append(dict(teacher=td.name,
+                        old_rel_l2=float(np.linalg.norm((r1["Y"][a:b] - yt).astype(np.float64)) / np.linalg.norm(yt)),
+                        new_rel_l2=float(np.linalg.norm((st["Y"][a:b] - yt).astype(np.float64)) / np.linalg.norm(yt))))
+    rep["per_frame"] = per
+    rep["final"] = dict(fx=float(fx), fa=float(fa), equalise_x=bool(best_eq[0]), equalise_a=bool(best_eq[1]),
+                        rel_l2=final["rel_l2"], old_rel_l2=rep["V1_current_pack"]["rel_l2"],
+                        improvement=float(1.0 - final["rel_l2"] / rep["V1_current_pack"]["rel_l2"]),
+                        qX_sat=int(final["qX_sat"]), qA_sat=int(final["qA_sat"]),
+                        sX=float(ws[3]), sA=float(ws[4]), invX=float(ws[8]), invA=float(ws[9]),
+                        bx=float(st["bx"]), ba=float(st["ba"]))
+    (S / "CALIBRATION.json").write_text(json.dumps(rep, indent=1, default=str) + "\n", encoding="utf-8")
+    print(json.dumps(rep["final"], indent=1))
+    print("per-frame", json.dumps(per, indent=1))
+    print("new pack", newsha, "changed", int(diff.size))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

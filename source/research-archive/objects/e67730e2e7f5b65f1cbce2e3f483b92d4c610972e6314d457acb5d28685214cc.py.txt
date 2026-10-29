@@ -1,0 +1,43 @@
+"""A-channel equalization, folded into mid weights; original X/M/residual unchanged."""
+from pathlib import Path
+import json,shlex,subprocess,numpy as np
+Q=Path(__file__).resolve().parent;B=Q.parents[2];D=Q/'real-int8-24';O=D/'c64-b6-equal-a';O.mkdir(exist_ok=False)
+d=json.loads((Q/'ACTIVE-ROWS.json').read_text());buf=d['buffers'];r=next(r for r in d['rows'] if r['name']=='block6_swin_body_3');p=list(map(int,r['push']));b={int(k):v for k,v in r['bindings'].items()};r1=next(r for r in d['rows'] if r['name']=='block6_swin_body_1');b1={int(k):v for k,v in r1['bindings'].items()}
+wp=np.fromfile(buf[b[0][0]]['file'],dtype='<f2').astype(np.float32)
+we=np.array([[wp[p[12]+(n//16)*1024+(k//16)*256+(n%16)*16+k%16] for k in range(64)] for n in range(256)],np.float32);wm=wp[p[13]:p[13]+8192].reshape(64,128)
+am=np.zeros(256,np.float32)
+for td in [D/'dump-fp16',D/'teacher-diagnostics/teacher-41444',D/'teacher-diagnostics/teacher-43654']:
+ x=np.fromfile(td/('dump_'+buf[b[2][0]]['name']+'.bin'),dtype='<f2').reshape(-1,4,16,16).transpose(0,2,1,3).reshape(-1,64).astype(np.float32)
+ for st in range(0,len(x),4096):
+  e=(x[st:st+4096]@we.T).astype(np.float16).astype(np.float32);t=np.clip(e,-4,4);u=(-.055908203125*abs(t)+.447265625).astype(np.float16).astype(np.float32);v=(t*u+.89453125).astype(np.float16).astype(np.float32);a=(e*v).astype(np.float16).astype(np.float32);am=np.maximum(am,abs(a).max(axis=0))
+wmmax=np.concatenate([abs(wm[g*32:(g+1)*32]).max(axis=0) for g in range(2)])
+diag=np.exp2(np.rint(np.log2(np.sqrt(np.maximum(am,1e-12)/np.maximum(wmmax,1e-12))))).astype(np.float32)
+wt=wm.copy()
+for g in range(2):wt[g*32:(g+1)*32]*=diag[g*128:(g+1)*128]
+sw=np.maximum(abs(wt).max(axis=1)/127,1e-12);sa=np.float32(np.max(am/diag)/127)
+ow=Path(buf[b1[0][0]]['file']);os=Path(buf[b1[1][0]]['file']);w8=np.fromfile(ow,dtype='i1');before=w8.copy();w8[16384:24576]=np.clip(np.rint(wt/sw[:,None]),-127,127).astype('i1').ravel();assert np.array_equal(w8[:16384],before[:16384]) and np.array_equal(w8[24576:],before[24576:])
+sc=np.fromfile(os,dtype='<f4');sc=np.concatenate([sc,np.float32(1/sa)/diag]).astype('<f4');sc[2]=1/sa;sc[272:336]=sa*sw;wfile=O/'weights.bin';sfile=O/'scales.bin';w8.tofile(wfile);sc.tofile(sfile)
+src=B/'candidates/int8-coverage-v2-20261020/B/source';comp=B/'src/project/tools/glslang-16.5.0/bin/glslang.exe'
+common=(src/'c64_int8_common.glsl').read_text();shader=(src/'c64_d1.comp').read_text();(O/'c64_int8_common.glsl').write_text(common);(O/'candidate.comp').write_text(shader)
+def compile(name):
+ z=subprocess.run([str(comp),'-V','--target-env','vulkan1.3','-I'+str(O),'-o',str(O/name),str(O/'candidate.comp')],capture_output=True,text=True);assert z.returncode==0,z.stdout+z.stderr
+compile('parent.spv');assert (O/'parent.spv').read_bytes()==(src.parent/'spv/c64_d1.spv').read_bytes()
+common=common.replace('MQ requant_act(ACC a, MF multiplier, float invs)','MQ requant_act(ACC a, MF multiplier, MF invs)').replace('rounded_code(float(h), invs)','rounded_code(float(h), invs[i])');(O/'c64_int8_common.glsl').write_text(common)
+shader=shader.replace('MF eScale0, eScale1;','MF eScale0, eScale1, invA0, invA1;\n    coopMatLoad(invA0, sc, 464u+g*128u+n0, 0u, ROW);\n    coopMatLoad(invA1, sc, 464u+g*128u+n0+16u, 0u, ROW);')
+shader=shader.replace('eScale0, invA)','eScale0, invA0)').replace('eScale1, invA)','eScale1, invA1)');assert shader.count('eScale0, invA0)')==2 and shader.count('eScale1, invA1)')==2
+(O/'candidate.comp').write_text(shader);compile('candidate.spv')
+def transform(text):
+ text=text.replace(ow.as_posix(),wfile.as_posix()).replace(os.as_posix(),sfile.as_posix());lines=text.splitlines();bi=-1
+ for i,l in enumerate(lines):
+  t=shlex.split(l)
+  if not t:continue
+  if t[0]=='BUFFER':
+   bi+=1
+   if bi==b1[1][0]:lines[i]=f'BUFFER "{t[1]}" {sc.nbytes} "{t[3]}"'
+  if t[0]=='BIND' and int(t[2])==b1[1][0]:t[4]=str(sc.nbytes);lines[i]=' '.join(t)
+  if t[0]=='PASS' and t[2]=='block6_swin_body_1':lines[i]=l.replace(t[3],(O/'candidate.spv').as_posix())
+ return '\n'.join(lines)+'\n'
+jobs=[]
+for name,source,frame in [('local',D/'c64-stage/old.txt',34189)]+[(str(f),D/f'c32-equalized/combo-{f}.txt',f) for f in [34189,41444,43654]]:
+ plan=O/f'{name}.txt';plan.write_text(transform(source.read_text()));jobs.append(dict(sequence=name,frame=frame,plan=str(plan),out=str(O/name),expected_output_sha256=None,dump=False))
+(O/'JOBS.json').write_text(json.dumps(jobs,indent=2));(O/'PROOF.json').write_text(json.dumps(dict(mapping='A[...,g*128+k]/D[g*128+k]; mid W[g*32+n,k]*D[g*128+k]; signed symmetric int8, RNE, int32 MMA retained',rounding='half expand and half activation unchanged before quantizer; mid/contract original; integer codes intentionally differ',lifetime='two extra per-column inverse fragments live during expand; no new SLM; native resource cost unmeasured',extra_scale_bytes=1024,diagonal=diag.tolist(),activation_absmax=am.tolist(),new_sA=float(sa),limitation='three daytime teacher calibration frames, CPU range estimate; no acceptance claim'),indent=2));print('Built',len(jobs),'jobs')

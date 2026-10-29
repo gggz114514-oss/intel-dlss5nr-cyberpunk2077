@@ -1,0 +1,146 @@
+"""n21 step-3: operand-level proof that the candidate differs from the parent only by
+the deleted debug store path.
+
+Method: align parent<->candidate instructions with an LCS on (opcode, word count), then
+derive an id map from the *matched* pairs themselves (parent result id -> child result id)
+and require every operand of every matched instruction to satisfy that map. No analytic
+renumbering assumption is used, so the check is self-validating.
+"""
+import sys, re, json, collections
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent
+C = CARD.parent.parent
+sys.path.insert(0, str(C))
+import COMMON as K
+ST = K.ST
+
+HPP = Path('@NR_WORKSPACE@/src/project/tools/glslang-16.5.0/include/glslang/SPIRV/spirv.hpp11')
+NAMES = {}
+for m in re.finditer(r'\b(Op[A-Za-z0-9_]+)\s*=\s*(\d+)', HPP.read_text(encoding='utf-8', errors='replace')):
+    NAMES.setdefault(int(m.group(2)), m.group(1))
+
+PARENT = Path(K.row_by_ordinal(194)['spv'])
+CAND = CARD / 'candidate.spv'
+
+
+class Mod:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.m = ST.Module(self.path)
+        self.ins = self.m.instructions
+        self.names = {}
+        for op, ops, _, _ in self.ins:
+            if op == 5 and len(ops) >= 2:
+                b = b''.join(int(w).to_bytes(4, 'little') for w in ops[1:])
+                self.names.setdefault(ops[0], b.split(b'\0')[0].decode('utf-8', 'replace'))
+        self.def_at = {}
+        for i, (op, ops, _, _) in enumerate(self.ins):
+            rid = ST.result_id_of(op, ops)
+            if rid is not None:
+                self.def_at.setdefault(rid, i)
+
+    def const(self, vid):
+        i = self.def_at.get(vid)
+        if i is None:
+            return None
+        op, ops, _, _ = self.ins[i]
+        return ops[1] if op == 43 else None
+
+    def text(self, i):
+        op, ops, _, _ = self.ins[i]
+        parts = []
+        for w in ops:
+            c = self.const(w)
+            if c is not None:
+                parts.append('%s(%d)' % (self.names.get(w, '%%%d' % w), c))
+            else:
+                parts.append(self.names.get(w, '%%%d' % w))
+        return '%s %s' % (NAMES.get(op, 'op%d' % op), ' '.join(parts))
+
+
+pm, cm = Mod(PARENT), Mod(CAND)
+A = [(pm.ins[i][0], pm.ins[i][3]) for i in range(len(pm.ins))]
+B = [(cm.ins[j][0], cm.ins[j][3]) for j in range(len(cm.ins))]
+
+n, m = len(A), len(B)
+tbl = [[0] * (m + 1) for _ in range(n + 1)]
+for i in range(n - 1, -1, -1):
+    for j in range(m - 1, -1, -1):
+        tbl[i][j] = tbl[i + 1][j + 1] + 1 if A[i] == B[j] else max(tbl[i + 1][j], tbl[i][j + 1])
+pairs, i, j = [], 0, 0
+while i < n and j < m:
+    if A[i] == B[j]:
+        pairs.append((i, j)); i += 1; j += 1
+    elif tbl[i + 1][j] >= tbl[i][j + 1]:
+        i += 1
+    else:
+        j += 1
+mp = {p for p, _ in pairs}
+mc = {c for _, c in pairs}
+removed = [i for i in range(n) if i not in mp]
+added = [j for j in range(m) if j not in mc]
+
+# ---------------------------------------------------------------- id map from matched pairs
+fwd, rev, conflicts = {}, {}, []
+for (pi, ci) in pairs:
+    rp = ST.result_id_of(pm.ins[pi][0], pm.ins[pi][1])
+    rc = ST.result_id_of(cm.ins[ci][0], cm.ins[ci][1])
+    if rp is None and rc is None:
+        continue
+    if rp is None or rc is None:
+        conflicts.append(('result-presence', pi, ci, rp, rc)); continue
+    if rp in fwd and fwd[rp] != rc:
+        conflicts.append(('parent-id-twice', pi, rp, fwd[rp], rc))
+    fwd.setdefault(rp, rc)
+    if rc in rev and rev[rc] != rp:
+        conflicts.append(('child-id-twice', ci, rc, rev[rc], rp))
+    rev.setdefault(rc, rp)
+
+# monotone?
+ks = sorted(fwd)
+mono = all(fwd[k] < fwd[k2] for k, k2 in zip(ks, ks[1:])) if len(ks) > 1 else True
+gaps = collections.Counter(fwd[k2] - fwd[k] for k, k2 in zip(ks, ks[1:])) if len(ks) > 1 else {}
+
+# ---------------------------------------------------------------- operand check
+bad = []
+checked_ops = 0
+for (pi, ci) in pairs:
+    pops, cops = pm.ins[pi][1], cm.ins[ci][1]
+    if len(pops) != len(cops):
+        bad.append(dict(pi=pi, why='len', text=pm.text(pi))); continue
+    for k, (w1, w2) in enumerate(zip(pops, cops)):
+        has_result = ST.result_id_of(pm.ins[pi][0], pops) is not None
+        is_result_pos = (k == (0 if pm.ins[pi][0] in (7, 11) + tuple(range(19, 40)) + (248,) else 1)) and has_result
+        if is_result_pos:
+            checked_ops += 1
+            continue               # result ids are the renumbering itself, mapped already
+        if w1 in pm.def_at:        # id operand (type, pointer, value...)
+            want = fwd.get(w1)
+            if want is None:
+                bad.append(dict(pi=pi, why='id-not-mapped', k=k, id=w1, child=w2, text=pm.text(pi))); break
+            if want != w2:
+                bad.append(dict(pi=pi, why='id-mismatch', k=k, parent_id=w1, child_id=w2,
+                                mapped=want, text=pm.text(pi), child_text=cm.text(ci))); break
+        else:
+            if w1 != w2:
+                bad.append(dict(pi=pi, why='literal', k=k, p=w1, c=w2, text=pm.text(pi))); break
+        checked_ops += 1
+
+res = dict(
+    alignment=dict(parent_n=n, candidate_n=m, matched=len(pairs), removed=len(removed), added=len(added)),
+    removed=dict(count=len(removed),
+                 grouped=dict(collections.Counter(NAMES.get(pm.ins[i][0], pm.ins[i][0]) for i in removed)),
+                 rows=[dict(gi=i, text=pm.text(i), opcode=NAMES.get(pm.ins[i][0], pm.ins[i][0])) for i in removed]),
+    added_rows=[dict(gj=j, text=cm.text(j), opcode=NAMES.get(cm.ins[j][0], cm.ins[j][0])) for j in added],
+    id_map=dict(size=len(fwd), monotone=mono, conflicts=conflicts[:10], n_conflicts=len(conflicts),
+                gap_histogram=dict(gaps)),
+    operand_check=dict(operands_checked=checked_ops, instructions_with_mismatch=len(bad),
+                       mismatches=bad[:15]),
+)
+K.write_json(CARD / 'build' / 'operand-proof.json', res)
+print(json.dumps({k: v for k, v in res.items() if k not in ('removed', 'added_rows')}, indent=1)[:2500])
+print('--- added (candidate-only) ---')
+for r in res['added_rows']:
+    print(' %4d %s' % (r['gj'], r['text']))
+print('--- removed grouped ---', json.dumps(res['removed']['grouped']))

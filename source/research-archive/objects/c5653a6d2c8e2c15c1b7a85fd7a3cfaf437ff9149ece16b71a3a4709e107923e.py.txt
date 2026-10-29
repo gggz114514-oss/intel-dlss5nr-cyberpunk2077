@@ -1,0 +1,141 @@
+"""Full-frame CPU quality for the S02 F01 candidates (all 3 calibration frames, every token).
+
+Arms:
+  old   : shipped lift-equalized D/sF + corrected f1-ffn-scales.bin
+  minmax: shipped D/sF + measured f01-ffn-minmax scales (GPU-measured arm, context)
+  xe    : shipped D/sF + PACK/f1-ffn-scales.bin (this card)
+  xed   : PACK lift D + PACK body weights/scales + PACK/f1-ffn-scales.bin
+"""
+import json
+import hashlib
+import numpy as np
+import f01_model as M
+import f01_eval as E
+
+S02 = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S02-f01"
+PACK = S02 + "/PACK"
+CHUNK = 65536
+
+
+def sha(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest()
+
+
+def qw_from_file(path):
+    w = np.fromfile(path, dtype=np.int8).astype(np.int32)
+    qw = np.array([[w[49152 + (c // 8) * 1024 + k * 32 + (c % 8)] for k in range(16)]
+                   for c in range(32)], np.int32)
+    return qw
+
+
+def sw_from_scales(path):
+    s = np.fromfile(path, dtype="<f4")
+    return s[128:160].copy()
+
+
+def run_arm(name, x, y16, kind):
+    """kind: old|xe|xed.  y16 is the per-chunk teacher computed by the caller."""
+    if kind == "old":
+        d = np.array(E.base_cfg()["d"], np.float32)
+        sf = np.float32(E.base_cfg()["sf"])
+        sc = np.fromfile(E.BASE_SCALES, dtype="<f4")
+        qw, sw = M.qmat(M.WLIFT_AS_F32, d)
+    elif kind == "minmax":
+        d = np.array(E.base_cfg()["d"], np.float32)
+        sf = np.float32(E.base_cfg()["sf"])
+        sc = np.fromfile(E.D24 + "/f01-ffn-minmax/scales.bin", dtype="<f4")
+        qw, sw = M.qmat(M.WLIFT_AS_F32, d)
+    elif kind == "xe":
+        d = np.array(E.base_cfg()["d"], np.float32)
+        sf = np.float32(E.base_cfg()["sf"])
+        sc = np.fromfile(PACK + "/f1-ffn-scales.bin", dtype="<f4")
+        qw, sw = M.qmat(M.WLIFT_AS_F32, d)
+    else:
+        meta = json.load(open(PACK + "/PACK.json", encoding="utf-8"))
+        d = np.array(meta["lift_d"]["d"], np.float32)
+        sf = np.float32(meta["lift_d"]["sf"])
+        sc = np.fromfile(PACK + "/f1-ffn-scales.bin", dtype="<f4")
+        qw = qw_from_file(PACK + "/f1-body-weights-dopt.bin")
+        sw = sw_from_scales(PACK + "/f1-body-scales-dopt.bin")
+    lift8 = M.lift_int8(x, d, sf, qw, sw)
+    _, y8, _, _ = M.ffn_int8(lift8, sc)
+    e = y8.astype(np.float64) - y16.astype(np.float64)
+    return float((e * e).sum()), int(y8.size), lift8
+
+
+def main():
+    meta = json.load(open(PACK + "/PACK.json", encoding="utf-8"))
+    d_eff = np.array(meta["lift_d"]["d"], np.float32)
+    invd_check = [float(np.float32(1.0) / np.float32(v)) for v in d_eff]
+    print("1/D float32 == printed invd:", invd_check == [float(np.float32(t)) for t in meta["lift_d"]["invd_text"]])
+    arms = ["old", "minmax", "xe", "xed"]
+    acc = {a: {"sse": 0.0, "n": 0, "sse_lift": 0.0, "n_lift": 0, "base": 0.0,
+               "frames": {}} for a in arms}
+    sat = {a: 0 for a in arms}
+    for fr in E.FRAMES:
+        xall = np.fromfile(E.FEAT % fr, dtype="<f2").reshape(-1, 16)
+        per = {a: [0.0, 0, 0.0] for a in arms}
+        for s in range(0, len(xall), CHUNK):
+            x = np.ascontiguousarray(xall[s:s + CHUNK])
+            lift16, y16 = E.teacher_y(x)
+            base = float((y16.astype(np.float64) ** 2).sum())
+            acc_base = base
+            for a in arms:
+                num, n, lift8 = run_arm(a, x, y16, a)
+                per[a][0] += num; per[a][1] += n
+                per[a][2] += acc_base
+                # lift error against the FP16 lift, same tokens
+                el = lift8.astype(np.float64) - lift16.astype(np.float64)
+                acc[a]["sse_lift"] += float((el * el).sum()); acc[a]["n_lift"] += int(lift16.size)
+                acc[a]["lift_base"] = acc[a].get("lift_base", 0.0) + float(
+                    (lift16.astype(np.float64) ** 2).sum())
+                if a == "xe":
+                    pass
+                # saturation of the X quantiser for this arm
+                sc = (np.fromfile(E.BASE_SCALES, dtype="<f4") if a in ("old", "minmax")
+                      else np.fromfile(PACK + "/f1-ffn-scales.bin", dtype="<f4"))
+                qx = M.rne_clamp127((lift8.astype(np.float32) * sc[1]).astype(np.float32))
+                sat_frac = float((np.abs(qx) == 127).mean())
+                acc[a].setdefault("sat", []).append(sat_frac)
+                acc[a]["base"] += base
+        for a in arms:
+            sse, n, den = per[a]
+            rmse = (sse / n) ** 0.5
+            rel = (sse / den) ** 0.5
+            acc[a]["frames"][str(fr)] = {"relL2": rel, "rmse": rmse, "sse": sse, "n": n}
+            acc[a]["sse"] += sse; acc[a]["n"] += n
+            print(fr, a, "relL2 %.6f rmse %.6f" % (rel, rmse), flush=True)
+    out = {}
+    for a in arms:
+        sse, n = acc[a]["sse"], acc[a]["n"]
+        rel = (sse / acc[a]["base"]) ** 0.5
+        out[a] = {"pooled_relL2_Y": rel, "pooled_rmse_Y": (sse / n) ** 0.5,
+                  "lift_relL2": (acc[a]["sse_lift"] / acc[a]["lift_base"]) ** 0.5,
+                  "frames": acc[a]["frames"],
+                  "X_saturation_mean": float(np.mean(acc[a]["sat"]))}
+        print(a, json.dumps({k: v for k, v in out[a].items() if k != "frames"}, indent=1))
+    # measured endpoint (dumps), not reconstructed
+    a16 = np.fromfile(M.D24 + "/dump-fp16/dump_block0_out.bin", dtype="<f2").astype(np.float64)
+    a8 = np.fromfile(M.D24 + "/dump-int8/dump_block0_out.bin", dtype="<f2").astype(np.float64)
+    e = a16 - a8
+    out["endpoint_block0_out_measured"] = {
+        "source": "dump-fp16/dump_block0_out.bin vs dump-int8/dump_block0_out.bin (frame 34189)",
+        "relL2": float((e * e).sum() ** 0.5 / (a16 * a16).sum() ** 0.5),
+        "rmse": float(np.sqrt((e * e).mean())),
+        "corr": float((a16 * a8).sum() / np.sqrt((a16 * a16).sum() * (a8 * a8).sum())),
+        "absmax_fp16": float(np.abs(a16).max()), "absmax_int8": float(np.abs(a8).max()),
+        "shape": "32 x 672 x 384 half (2x2 pooled block0_out)",
+        "note": "includes attention/QKV/WO and the dynamic Y quantiser; not attributable to lift/FFN alone",
+    }
+    out["files"] = {p: {"bytes": __import__("os").path.getsize(PACK + "/" + p),
+                        "sha256": sha(PACK + "/" + p)}
+                    for p in ["f1-ffn-scales.bin", "f1-body-weights-dopt.bin",
+                              "f1-body-scales-dopt.bin"]}
+    out["spv"] = {"path": S02 + "/SOURCE/candidate-dopt.spv",
+                  "sha256": sha(S02 + "/SOURCE/candidate-dopt.spv")}
+    open(S02 + "/QUALITY.json", "w", encoding="utf-8").write(json.dumps(out, indent=2))
+    print(json.dumps({k: out[k] for k in ("old", "minmax", "xe", "xed")}, indent=1))
+
+
+if __name__ == "__main__":
+    main()

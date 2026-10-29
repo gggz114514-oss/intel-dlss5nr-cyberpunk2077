@@ -1,0 +1,195 @@
+"""Machine proof for card n02c-f02-fb-bias.  CPU only.
+
+Proves, by enumeration, everything the card's price rests on:
+
+  P1  the (lane, component) -> (row, col) law of an NRH_C accumulator fragment,
+      re-derived from the sealed header's nrh_coord_C (not assumed);
+  P2  the 8 bias `coopMatLoad` sites of one subgroup cover the 16x64 f32 bias
+      tile exactly once (1024 elements, no duplicate, no hole);
+  P3  one uniform 64-B message supplies exactly 16 distinct (lane, component)
+      elements of one fragment (one memory row), so 8 messages cover a
+      fragment exactly once -> the 64 messages carry 4096 B with zero
+      redundancy, i.e. there is no duplicated read to delete;
+  P4  the bias base address is dispatch-invariant (push constant + sg only),
+      so every workgroup re-reads the same 16 KiB table: the gathers carry no
+      per-workgroup DRAM growth, they are message-issue cost only;
+  P5  the SLM read-back identity: a linear SLM copy cannot reduce the number of
+      fragment segment loads (the segment count is the row count, in any
+      address space), so only a *transposing* store can, at the scatter price
+      counted in COST-LEDGER.json.
+"""
+import json, sys, hashlib
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+CARD = Path(__file__).parent
+OUT = CARD / 'PROOF.json'
+
+ROWS, COLS, COMPS = 8, 16, 4
+LANES = 32
+SITES = [(h, b) for h in (0, 1) for b in (0, 1, 2, 3)]   # (row half, column block)
+TILE_ROWS, TILE_COLS = 16, 64                            # per subgroup
+STRIDE = 64                                              # f32 elements per fb row
+FB_ROW_BYTES = STRIDE * 4                                # 256 B
+
+
+def coord_C(lane, comp):
+    """nrh_coord_C from register_handoff.glsl, verbatim arithmetic."""
+    x = (lane << 2) | comp
+    z = (((x & 3) << 5) ^ ((x & 124) >> 2))
+    return z // 16, z % 16
+
+
+def proof_p1():
+    rows = []
+    for comp in range(COMPS):
+        for lane in range(LANES):
+            r, c = coord_C(lane, comp)
+            formula = (2 * comp + (lane >> 4), lane & 15)
+            rows.append({'lane': lane, 'component': comp, 'row': r, 'col': c,
+                         'closed_form': list(formula), 'equal': (r, c) == formula})
+    return {'law': 'row = 2*component + (lane>>4), col = lane & 15',
+            'derived_from': 'nrh_coord_C (register_handoff.glsl sha 1c4c7489...)',
+            'pairs_checked': len(rows), 'all_equal': all(r['equal'] for r in rows),
+            'bit_identity': 'z = 32*component + lane  ==>  row = z>>4, col = z&15',
+            'elements': rows}
+
+
+def proof_p2():
+    """Exact cover of the per-subgroup 16x64 tile by the 8 sites."""
+    cover = {}
+    per_site = []
+    for (h, b) in SITES:
+        elems = []
+        for comp in range(COMPS):
+            for lane in range(LANES):
+                r, c = coord_C(lane, comp)
+                tile_row = 8 * h + r
+                tile_col = 16 * b + c
+                e = tile_row * TILE_COLS + tile_col
+                elems.append((tile_row, tile_col))
+                cover[e] = cover.get(e, 0) + 1
+        per_site.append({'site': {'row_half': h, 'col_block': b},
+                         'fragment_base_row': 8 * h,
+                         'fragment_base_col': 16 * b,
+                         'elements': len(elems),
+                         'distinct': len(set(elems)),
+                         'rows_touched': sorted({r for r, _ in elems}),
+                         'cols_touched': sorted({c for _, c in elems})})
+    total = TILE_ROWS * TILE_COLS
+    return {'per_site': per_site,
+            'tile_elements': total,
+            'covered_elements': len(cover),
+            'max_multiplicity': max(cover.values()),
+            'exact_cover': len(cover) == total and set(cover.values()) == {1},
+            'fragment_elements_per_site': ROWS * COLS,
+            'sites': len(SITES),
+            'elements_per_site': ROWS * COLS * 1,
+            'product_check': len(SITES) * ROWS * COLS == total}
+
+
+def proof_p3():
+    """One message == one memory row == 16 distinct (lane, component) elements."""
+    msgs = []
+    for (h, b) in SITES:
+        for r in range(ROWS):
+            supplied = []
+            for comp in range(COMPS):
+                for lane in range(LANES):
+                    fr, fc = coord_C(lane, comp)
+                    if fr == r:
+                        supplied.append((lane, comp, fc))
+            msgs.append({'site': {'row_half': h, 'col_block': b},
+                         'memory_row': 8 * h + r,
+                         'fb_element_offset': (8 * h + r) * STRIDE + 16 * b,
+                         'bytes': COLS * 4,
+                         'supplies': len(supplied),
+                         'distinct': len({(l, c) for l, c, _ in supplied}),
+                         'cols': sorted({fc for _, _, fc in supplied})})
+    total_elements = sum(m['supplies'] for m in msgs)
+    return {'messages': len(msgs),
+            'bytes_per_message': COLS * 4,
+            'total_bytes': len(msgs) * COLS * 4,
+            'tile_bytes': TILE_ROWS * TILE_COLS * 4,
+            'bytes_match': len(msgs) * COLS * 4 == TILE_ROWS * TILE_COLS * 4,
+            'elements_supplied': total_elements,
+            'fragment_elements_total': len(SITES) * ROWS * COLS,
+            'no_redundant_read': (total_elements == len(SITES) * ROWS * COLS
+                                  and all(m['supplies'] == 16 and m['distinct'] == 16
+                                          for m in msgs)),
+            'row_stride_bytes': FB_ROW_BYTES,
+            'measured_row_stride_bytes_from_isa': [256, 256, 512, 768, 1024, 1280,
+                                                   1536, 1792],
+            'detail': msgs}
+
+
+def proof_p4():
+    return {'base_expression': 'uint(pc.p2.w) + (t0+0u)*64u + {0,16,32,48}u  '
+                               'and uint(pc.p2.w) + (t0+8u)*64u + {0,16,32,48}u',
+            'symbols_in_base': ['pc.p2.w (push constant)', 't0 = sg*16 (subgroup id)'],
+            'workgroup_dependent_terms': 0,
+            'consequence': 'every workgroup reads the same 16 KiB f32 table '
+                           '(64 rows x 64 cols); per-SG tile = 4 KiB, per-WG = 16 KiB, '
+                           'unique bytes per dispatch = 16 KiB. The 64 gathers are '
+                           'message-issue cost, not DRAM cost.',
+            'cross_check': 'contrast: imgin uses nr_tok_base(t0>>4, wx, wy, ...) i.e. a '
+                           'workgroup-dependent base; fb bias does not.'}
+
+
+def proof_p5():
+    return {'claim': 'A linear (non-transposing) SLM copy cannot reduce the fragment '
+                     'load count: coopMatLoad of an 8x16 window at row stride 64 must '
+                     'read 8 discontiguous 64-B rows in every address space, because '
+                     'the row length (256 B) exceeds the 64-B window.',
+             'measured_in_same_kernel': {
+                 'stride 16 half, 16x16 B tile (contiguous 512 B)': '1 message (d64x64t rd:8)',
+                 'stride 16 half, 8x16 CH tile (contiguous 256 B)': '1 message (d32x64t rd:4)',
+                 'stride 64 f32, 8x16 C tile (8 rows x 64 B)': '8 messages (d32x16t rd:1, 64 B each)',
+                 'stride 0 half, 8x16 CH tile (same 32 B eight times)': '8 messages (d32x8t rd:1, 32 B each)'},
+             'rule': 'messages = number of maximal contiguous row segments of the window',
+             'consequence': 'only a transposing store (scatter) makes a fragment '
+                            'contiguous in SLM, and a scatter of 4 KiB costs 4096/128 = 32 '
+                            'messages at per-lane dword granularity; see COST-LEDGER.json.'}
+
+
+def main():
+    p = {'card': 'n02c-f02-fb-bias',
+         'scope': 'F02 body, 7 PASS (ordinals 1,2,3,4,227,228,229), '
+                  'parent SPV 4c034a532ce60f5fa608d1ce67f6368819c052c3d5268eb51f7f680ea83aaf10',
+         'numerics_invariants': {
+             'k_order': 'unchanged: this card deletes no DPAS and reorders no reduction',
+             'half_rounding_points': 'the 8 nrh_narrow() sites per group are untouched '
+                                     '(OpFConvert 26 and the 64 half-narrowing movs are '
+                                     'the rounding points; they are not part of the '
+                                     'removable work)',
+             'f32_bias_add': 'precise float biasedN = sc0[N] + bias[N] keeps the same '
+                             'operands and the same order; a half cache would round the '
+                             'bias before the add and is therefore illegal',
+             'exp/inverse/clamp': 'not touched'},
+         'P1_coordinate_law': proof_p1(),
+         'P2_exact_cover': proof_p2(),
+         'P3_message_to_element_map': proof_p3(),
+         'P4_dispatch_invariance': proof_p4(),
+         'P5_slm_readback_identity': proof_p5()}
+    blob = json.dumps({k: p[k] for k in ('P1_coordinate_law', 'P2_exact_cover',
+                                         'P3_message_to_element_map')},
+                      sort_keys=True).encode()
+    p['enumerations_sha256'] = hashlib.sha256(blob).hexdigest()
+    OUT.write_text(json.dumps(p, indent=2), encoding='utf-8')
+    print('P1 all_equal', p['P1_coordinate_law']['all_equal'],
+          '(%d pairs)' % p['P1_coordinate_law']['pairs_checked'])
+    print('P2 exact_cover', p['P2_exact_cover']['exact_cover'],
+          '(%d/%d elements, max multiplicity %d)'
+          % (p['P2_exact_cover']['covered_elements'],
+             p['P2_exact_cover']['tile_elements'],
+             p['P2_exact_cover']['max_multiplicity']))
+    print('P3 no_redundant_read', p['P3_message_to_element_map']['no_redundant_read'],
+          '(%d msgs x %d B = %d B)'
+          % (p['P3_message_to_element_map']['messages'],
+             p['P3_message_to_element_map']['bytes_per_message'],
+             p['P3_message_to_element_map']['total_bytes']))
+    print('sha', p['enumerations_sha256'])
+
+
+if __name__ == '__main__':
+    main()

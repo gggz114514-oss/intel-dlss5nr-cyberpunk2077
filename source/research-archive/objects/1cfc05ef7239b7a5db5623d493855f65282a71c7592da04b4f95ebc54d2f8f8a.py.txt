@@ -1,0 +1,237 @@
+"""Per-descriptor read/write scan for the n24 gM-fold card (CPU only, read-only inputs).
+
+Purpose: independently re-derive the reader/writer set of one plan BUFFER
+(resource id) from the PASS bindings of the chain-head plan AND the SPIR-V
+accesses of each PASS's module -- "binding != use" is the whole point.
+
+Method
+  * parse the plan: BUFFER lines (resource id = order of appearance), PASS/BIND.
+  * for each PASS that binds the resource, scan that PASS's SPIR-V for
+    reads/writes of the *binding number that PASS uses*.
+  * SPIR-V side: pointer-provenance fixed point.
+      - OpVariable with DescriptorSet/Binding decorations seed the provenance
+        of that descriptor pointer with its (set, binding) key.
+      - OpAccessChain / OpInBoundsAccessChain / OpPtrAccessChain / OpCopyObject
+        propagate provenance to the result id.
+      - Function-storage variables that receive a pointer (OpStore <var> <ptr>)
+        propagate provenance to every later OpLoad of that variable, which is
+        how glslang materialises pointer temporaries.
+      - OpPhi / OpSelect are unioned conservatively.
+      - Then: OpLoad / OpCooperativeMatrixLoadKHR / OpAtomicLoad on a pointer
+        with provenance = READ; OpStore / OpCooperativeMatrixStoreKHR /
+        OpAtomic* = WRITE.  Loads/stores whose pointer is a Function-storage
+        variable itself are local pointer arithmetic, not buffer accesses.
+
+Output: JSON (stdout, and --out when given).
+"""
+import json
+import struct
+import sys
+from pathlib import Path
+
+W = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+
+OP_ACCESS_CHAIN = {65, 67}
+OP_PTR_ACCESS_CHAIN = 70
+OP_COPY_OBJECT = 83
+OP_LOAD = 61
+OP_STORE = 62
+OP_FUNCTION_CALL = 57
+OP_VARIABLE = 59
+OP_DECORATE = 71
+OP_PHI = 245
+OP_SELECT = 169          # OpSelect (169 in SPIR-V 1.0+ for non-pointer too)
+OP_ATOMIC = set(range(227, 234))
+OP_CM_LOAD = 4457      # glslang 16.5.0: Load=4457, Store=4458, MulAdd=4459
+OP_CM_STORE = 4458
+DEC_DESCRIPTOR_SET = 34
+DEC_BINDING = 33
+STORAGE_FUNCTION = 7
+
+
+def parse(path):
+    b = Path(path).read_bytes()
+    assert struct.unpack('<I', b[:4])[0] == 0x07230203, path
+    words = list(struct.unpack('<%dI' % (len(b) // 4), b))
+    i = 5
+    ops = []
+    while i < len(words):
+        wc = words[i] >> 16
+        op = words[i] & 0xFFFF
+        ops.append((op, words[i + 1:i + wc]))
+        i += wc if wc else 1
+    return ops
+
+
+def descriptor_vars(ops):
+    dec = {}
+    for op, a in ops:
+        if op == OP_DECORATE and len(a) >= 3:
+            tid, d = a[0], a[1]
+            if d in (DEC_DESCRIPTOR_SET, DEC_BINDING):
+                dec.setdefault(tid, {})[d] = a[2]
+    out, fun_vars = {}, set()
+    for op, a in ops:
+        if op == OP_VARIABLE and len(a) >= 3:
+            vid, sc = a[1], a[2]
+            if sc == STORAGE_FUNCTION:
+                fun_vars.add(vid)
+            if DEC_BINDING in dec.get(vid, {}):
+                out[vid] = (dec[vid].get(DEC_DESCRIPTOR_SET, 0), dec[vid][DEC_BINDING])
+    return out, fun_vars, dec
+
+
+def analyse(path):
+    """{binding_key: {reads, writes, kinds}} plus diagnostics."""
+    ops = parse(path)
+    desc, fun_vars, _ = descriptor_vars(ops)
+    prov = {v: frozenset([k]) for v, k in desc.items()}
+    var_store = {}
+
+    changed = True
+    rounds = 0
+    while changed and rounds < 40:
+        changed = False
+        rounds += 1
+        for op, a in ops:
+            if op in OP_ACCESS_CHAIN or op == OP_PTR_ACCESS_CHAIN:
+                if len(a) >= 3:
+                    r, base = a[1], a[2]
+                    if base in prov:
+                        n = prov.get(r, frozenset()) | prov[base]
+                        if n != prov.get(r, frozenset()):
+                            prov[r] = n
+                            changed = True
+            elif op == OP_COPY_OBJECT and len(a) >= 2:
+                r, src = a[0], a[1]
+                if src in prov:
+                    n = prov.get(r, frozenset()) | prov[src]
+                    if n != prov.get(r, frozenset()):
+                        prov[r] = n
+                        changed = True
+            elif op in (OP_PHI, OP_SELECT) and len(a) >= 3:
+                r = a[1]
+                acc = prov.get(r, frozenset())
+                for src in a[2:]:
+                    if src in prov:
+                        acc = acc | prov[src]
+                if acc != prov.get(r, frozenset()):
+                    prov[r] = acc
+                    changed = True
+            elif op == OP_LOAD and len(a) >= 3:
+                r, ptr = a[1], a[2]
+                if ptr in var_store:
+                    n = prov.get(r, frozenset()) | var_store[ptr]
+                    if n != prov.get(r, frozenset()):
+                        prov[r] = n
+                        changed = True
+            elif op == OP_STORE and len(a) >= 2:
+                ptr, obj = a[0], a[1]
+                if obj in prov and (ptr in fun_vars or ptr not in desc):
+                    n = var_store.get(ptr, frozenset()) | prov[obj]
+                    if n != var_store.get(ptr, frozenset()):
+                        var_store[ptr] = n
+                        changed = True
+
+    res = {}
+    for op, a in ops:
+        if op == OP_LOAD and len(a) >= 3:
+            ptr = a[2]
+            if ptr in fun_vars:
+                continue
+            for k in prov.get(ptr, ()):
+                r = res.setdefault(k, {'reads': 0, 'writes': 0, 'kinds': {}})
+                r['reads'] += 1
+                r['kinds']['load'] = r['kinds'].get('load', 0) + 1
+        elif op == OP_CM_LOAD and len(a) >= 3:
+            for k in prov.get(a[2], ()):
+                r = res.setdefault(k, {'reads': 0, 'writes': 0, 'kinds': {}})
+                r['reads'] += 1
+                r['kinds']['cmload'] = r['kinds'].get('cmload', 0) + 1
+        elif op == OP_STORE and len(a) >= 2:
+            ptr = a[0]
+            if ptr in fun_vars:
+                continue
+            for k in prov.get(ptr, ()):
+                r = res.setdefault(k, {'reads': 0, 'writes': 0, 'kinds': {}})
+                r['writes'] += 1
+                r['kinds']['store'] = r['kinds'].get('store', 0) + 1
+        elif op == OP_CM_STORE and len(a) >= 1:
+            for k in prov.get(a[0], ()):
+                r = res.setdefault(k, {'reads': 0, 'writes': 0, 'kinds': {}})
+                r['writes'] += 1
+                r['kinds']['cmstore'] = r['kinds'].get('cmstore', 0) + 1
+        elif op in OP_ATOMIC and len(a) >= 1:
+            for k in prov.get(a[0], ()):
+                r = res.setdefault(k, {'reads': 0, 'writes': 0, 'kinds': {}})
+                r['reads'] += 1
+                r['writes'] += 1
+                r['kinds']['atomic'] = r['kinds'].get('atomic', 0) + 1
+    out = [{'set': k[0], 'binding': k[1], **v} for k, v in sorted(res.items(),
+                                                                 key=lambda kv: (kv[0][1], kv[0][0]))]
+    return out, desc, fun_vars
+
+
+def parse_plan(plan):
+    lines = Path(plan).read_text(encoding='utf-8-sig').splitlines()
+    bufs, passes = [], []
+    for l in lines:
+        if l.startswith('BUFFER '):
+            q = l.split('"')
+            name = q[1] if len(q) > 1 else l.split()[1]
+            size = int(q[2].split()[0]) if len(q) > 2 else int(l.split()[2])
+            bufs.append({'resource': len(bufs), 'name': name, 'bytes': size})
+        elif l.startswith('PASS '):
+            q = l.split('"')
+            if len(q) >= 5:
+                name, spv = q[1], q[3]
+            else:
+                t = l.split()
+                name, spv = t[2], t[3]
+            passes.append({'ordinal': len(passes), 'name': name, 'spv': spv, 'binds': {}})
+        elif l.startswith('BIND '):
+            t = l.split()
+            passes[-1]['binds'][int(t[1])] = int(t[2])
+    return bufs, passes
+
+
+def main():
+    plan = sys.argv[1] if len(sys.argv) > 1 else str(W / 'accepted/restore-n10-f10-next-20261027/plan.txt')
+    resources = [int(x) for x in (sys.argv[2].split(',') if len(sys.argv) > 2 else ['208'])]
+    out_path = sys.argv[3] if len(sys.argv) > 3 else None
+    bufs, passes = parse_plan(plan)
+    cache = {}
+    rep = {'plan': plan, 'passes': len(passes), 'buffers': len(bufs), 'resources': []}
+    for res in resources:
+        rows = []
+        for p in passes:
+            bs = [bd for bd, r in p['binds'].items() if r == res]
+            if not bs:
+                continue
+            spv = p['spv']
+            if spv not in cache:
+                cache[spv] = analyse(spv)[0]
+            by_b = {u['binding']: u for u in cache[spv]}
+            for bd in bs:
+                u = by_b.get(bd, {})
+                rows.append({'ordinal': p['ordinal'], 'name': p['name'], 'binding': bd,
+                             'reads': u.get('reads', 0), 'writes': u.get('writes', 0),
+                             'kinds': u.get('kinds', {})})
+        rep['resources'].append({
+            'resource': res,
+            'buffer': bufs[res]['name'],
+            'bytes': bufs[res]['bytes'],
+            'bound_by': len(rows),
+            'readers': [r for r in rows if r['reads']],
+            'writers': [r for r in rows if r['writes']],
+            'bound_not_used': [{'ordinal': r['ordinal'], 'name': r['name'], 'binding': r['binding']}
+                               for r in rows if not (r['reads'] or r['writes'])]})
+    txt = json.dumps(rep, indent=2)
+    if out_path:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_text(txt, encoding='utf-8')
+    print(txt)
+
+
+if __name__ == '__main__':
+    main()

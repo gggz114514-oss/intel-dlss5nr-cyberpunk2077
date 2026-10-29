@@ -1,0 +1,94 @@
+"""S01 follow-up: two ablation packs for a one-frame localisation run.
+
+E-only     : minmax X path (scalar inverse replicated per channel) + the per-E-channel
+             inverse + the E fold.  Isolates the *E* stage from the X stage that was
+             already measured as network-neutral.
+E-half     : same but with D_E**0.5, i.e. half the diagonal strength, to test whether
+             the network effect is monotone in how far the block-4 exit moves.
+"""
+import sys, json
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+HERE = Path(__file__).resolve().parent.parent
+PACK = HERE / "PACK"
+
+# reference facts from the frozen (minmax) block-4 arm
+info_min = L.block_bindings(L.D / "c32-minmax/local-b4.txt", ordinal=4)
+we_min, wc_min = L.load_w8(info_min["w8"])
+fsc_min = L.load_fsc(info_min["fsc"])                  # 292 entries
+sE_min = np.float32(fsc_min[2])
+sWc_min = (fsc_min[132:164] / sE_min).astype(np.float32)
+Wc_real = wc_min.astype(np.float32) * sWc_min[:, None]
+
+info_eq = L.block_bindings(L.D / "c32-equalized-b4/local-b4.txt", ordinal=4)
+we_eq, _ = L.load_w8(info_eq["w8"])
+
+cal = json.loads((HERE / "CPU" / "calibration_e_b4.json").read_text())
+amax_E = np.asarray(cal["e_channel_absmax_3frames"], np.float64)
+D_full = np.asarray(cal["diagonal_D_E"], np.float64)
+tail = L.load_w8_tail(info_min["w8"])
+
+
+def build(name, D_use, expand_weights, fsc_base):
+    am_ref = float(amax_E.max())
+    D = np.clip(D_use, 2.0 ** -10, 1.0)
+    sE_g = float((amax_E / D).max() / 127.0)
+    sEf = (D * sE_g).astype(np.float32)
+    Wp = Wc_real * sEf[None, :]
+    sWc = (np.abs(Wp).max(axis=1) / 127.0).astype(np.float32)
+    wcq = np.clip(np.rint(Wp / sWc[:, None]), -127, 127).astype(np.int16)
+    w8 = L.pack_w8(expand_weights, wcq)
+    w8[32768:49152] = tail
+    fsc = np.concatenate([fsc_base[:324], np.zeros(128, np.float32)]).astype(np.float32)
+    fsc[2] = np.float32(sE_g)
+    fsc[3] = np.float32(1.0 / sE_g)
+    fsc[132:164] = sWc
+    fsc[324:452] = (1.0 / sEf).astype(np.float32)
+    out8 = PACK / f"{name}-weights.i8.bin"
+    outs = PACK / f"{name}-scales.f32.bin"
+    w8.astype(np.int8).tofile(out8)
+    fsc.astype("<f4").tofile(outs)
+    return dict(name=name, weights=str(out8).replace("\\", "/"), scales=str(outs).replace("\\", "/"),
+                weights_bytes=int(w8.size), scales_bytes=int(fsc.nbytes),
+                sE_global=sE_g, sE_range=[float(sEf.min()), float(sEf.max())],
+                wc_changed_bytes=int(np.count_nonzero(wcq.ravel() != 0)))
+
+
+# E-only: minmax X path -> the 32 per-input-channel inverses are the same scalar
+x_inv_scalar = np.full(32, np.float32(fsc_min[L.FSC_INV_X]), np.float32)
+fsc_eonly = np.concatenate([fsc_min, x_inv_scalar]).astype(np.float32)     # 324 entries
+res = [build("ablate-e-only", D_full, we_min, fsc_eonly),
+       build("ablate-e-half", np.sqrt(D_full), we_eq, fsc_eonly)]
+for r in res:
+    print(r)
+(PACK / "ABLATION.json").write_text(json.dumps(dict(
+    note="both packs use SOURCE/c32_b4_xe.spv and differ only in the E diagonal strength / X path",
+    packs=res, diagonal_full=D_full.tolist(), diagonal_half=np.sqrt(D_full).tolist()), indent=2))
+
+# --- per-channel signed bias of the three measured block-4 exits (CPU, no GPU) ---
+def tile_view(path):
+    v = np.fromfile(path, dtype="<f2").astype(np.float32).reshape(-1, 512)
+    out = np.empty((v.shape[0], 16, 32), np.float32)
+    for c in range(32):
+        off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+        out[:, :, c] = v[:, off: off + 16 * 16: 16]
+    return out
+
+
+te = tile_view(L.D / "dump-fp16/dump_skip4.bin")
+bias = {}
+for name, path in (("frozen_minmax", L.D / "c32-minmax/local-b4/replayed-network.bin"),
+                   ("x_equalised", L.D / "c32-equalized-b4/local-b4/replayed-network.bin"),
+                   ("x_plus_e", HERE / "runs/S01-B4-LOCAL/replayed-network.bin")):
+    a = tile_view(path)
+    b = (a - te).mean(axis=(0, 1))
+    bias[name] = dict(mean_signed_bias_per_channel=b.tolist(),
+                      abs_bias_rms=float(np.sqrt((b ** 2).mean())),
+                      rel_to_teacher_rms=float(np.sqrt((b ** 2).mean()) / np.sqrt((te ** 2).mean())))
+    print(f"{name:14s} bias rms {bias[name]['abs_bias_rms']:.5f} "
+          f"({100 * bias[name]['rel_to_teacher_rms']:.3f}% of teacher rms)")
+(HERE / "CPU" / "exit_bias.json").write_text(json.dumps(bias, indent=2))

@@ -1,0 +1,136 @@
+"""Enumerate native jobs that were declared in a manifest but produced NO ISA file.
+
+The card requires that `--dump_isa` exiting 0 is not treated as success: a declared capture
+directory with no `ISA/*_orig.asm` is recorded as MISSING.
+"""
+import json
+import os
+import re
+from pathlib import Path
+from collections import defaultdict
+
+W = Path('@NR_WORKSPACE@')
+A = W / 'work/codex-astra-fp16-int8-audit-20261024'
+CARD = A / 'fullnet-continuous-20261027' / 'cards' / 'nat-index'
+ISA_RE = re.compile(r'^CS_asm([0-9a-f]{16})_simd(\d+)_([0-9a-f]{16})_(\d+)_orig\.asm$', re.I)
+SCAN_ROOTS = [W / 'work', W / 'run', W / 'candidates']
+
+
+def walk_dicts(obj, depth=0):
+    if depth > 9:
+        return
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from walk_dicts(v, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj[:4000]:
+            yield from walk_dicts(v, depth + 1)
+
+
+def argv_get(argv, flag):
+    for i, a in enumerate(argv):
+        if a == flag and i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
+def main():
+    jobs = defaultdict(list)
+    nfiles = 0
+    for root in SCAN_ROOTS:
+        if not root.exists():
+            continue
+        for dp, dn, fn in os.walk(root):
+            for f in fn:
+                if not f.endswith('.json'):
+                    continue
+                p = Path(dp) / f
+                try:
+                    if p.stat().st_size > 8_000_000:
+                        continue
+                    text = p.read_text(encoding='utf-8-sig', errors='ignore')
+                except Exception:
+                    continue
+                if 'dump_isa' not in text:
+                    continue
+                nfiles += 1
+                try:
+                    obj = json.loads(text)
+                except Exception:
+                    continue
+                for d in walk_dicts(obj):
+                    argv = d.get('argv')
+                    if not (isinstance(argv, list) and argv and all(isinstance(x, str) for x in argv)):
+                        continue
+                    if '--dump_isa' not in ' '.join(argv):
+                        continue
+                    od, pd = argv_get(argv, '--output_dir'), argv_get(argv, '--profile_dir')
+                    if not od or not pd:
+                        continue
+                    pl = d.get('plan')
+                    jobs[(Path(od) / pd).as_posix().lower()].append(dict(
+                        manifest=p.as_posix(), job=d.get('id'),
+                        plan_path=(pl.get('path') if isinstance(pl, dict) else None)
+                        or argv_get(argv, '--plan'),
+                        plan_sha=(pl.get('sha256') if isinstance(pl, dict) else None),
+                        msg_file=argv_get(argv, '--msg_file'),
+                        runner_out=argv_get(argv, '--out')))
+
+    rows = []
+    with_isa = without = 0
+    for cap, recs in sorted(jobs.items()):
+        d = Path(cap)
+        isa = sorted((d / 'ISA').glob('*_orig.asm')) if (d / 'ISA').is_dir() else []
+        isadir = d / 'ISA'
+        exists_isa_dir = isadir.is_dir()
+        # a nested ISA dir is also accepted (some tools add gtpin/)
+        if not isa and exists_isa_dir:
+            isa = sorted(isadir.glob('**/*_orig.asm'))
+        r = dict(capture_dir=cap, declared_by=sorted({x['manifest'] for x in recs}),
+                 job_ids=sorted({x['job'] for x in recs if x['job']}),
+                 plan_path=sorted({x['plan_path'] for x in recs if x['plan_path']}),
+                 plan_sha=sorted({x['plan_sha'] for x in recs if x['plan_sha']}),
+                 capture_dir_exists=d.is_dir(),
+                 isa_dir_exists=exists_isa_dir,
+                 isa_files=len(isa),
+                 sample_isa=[p.as_posix() for p in isa[:2]],
+                 msg_files=sorted({x['msg_file'] for x in recs if x['msg_file']})[:3])
+        if isa:
+            with_isa += 1
+        else:
+            without += 1
+            r['status'] = 'NO-ISA'
+            r['note'] = ('capture directory + ISA dir exist but contain no ISA file'
+                         if (d.is_dir() and exists_isa_dir) else
+                         'capture or ISA directory absent')
+            # a log file with content means the tool ran and still produced nothing
+            for mf in r['msg_files']:
+                mp = Path(mf)
+                if mp.exists():
+                    r['msg_file_bytes'] = mp.stat().st_size
+                    break
+        rows.append(r)
+
+    out = dict(schema='nat-index/no-isa-runs-v1',
+               scanned_manifest_files=nfiles,
+               declared_capture_dirs=len(jobs),
+               dirs_with_isa=with_isa,
+               dirs_without_isa=without,
+               runs=rows)
+    (CARD / 'evidence').mkdir(exist_ok=True)
+    dest = CARD / 'evidence' / 'NO-ISA-RUNS.json'
+    dest.write_text(json.dumps(out, indent=1, ensure_ascii=False), encoding='utf-8')
+    print('manifest files with dump_isa: %d' % nfiles)
+    print('declared capture dirs: %d   with ISA: %d   without ISA: %d'
+          % (len(jobs), with_isa, without))
+    print('wrote', dest, dest.stat().st_size, 'bytes')
+    print('\n--- runs with no ISA (first 25) ---')
+    for r in [x for x in rows if x.get('status') == 'NO-ISA'][:25]:
+        print('  %-90s isa_dir=%s msg_bytes=%s' % (r['capture_dir'][-90:],
+                                                   r['isa_dir_exists'], r.get('msg_file_bytes')))
+    return out
+
+
+if __name__ == '__main__':
+    main()

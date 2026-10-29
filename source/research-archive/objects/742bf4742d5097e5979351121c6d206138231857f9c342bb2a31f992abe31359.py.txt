@@ -1,0 +1,179 @@
+"""n33 task C: value-identity check of the "redundant expensive op" census for F02.
+
+evidence/REDUNDANT-LATENCY-OPS.json groups the 24 expensive ops of kernel
+7a38a17947f21ae6 by the *text* of their source operand:
+
+    math.rsqt 16 copies / 4 distinct_sources  -> "12 redundant"
+    math.inv   8 copies / 2 distinct_sources  -> " 6 redundant"
+
+Its own `proof_requirement` says text identity is not sufficient.  This script
+decides value identity on the executed path:
+
+  * reaching definition (dword granular) of the source operand at every site;
+  * for each pair of sites that share the same source text: every instruction
+    between them that writes that dword (a rewrite proves the value changed);
+  * leaf signature of each site's backward slice: the set of (register,dword)
+    reads whose definition lies outside the slice (the fragment / buffer inputs
+    the value is actually computed from).  Two slices with different leaf
+    signatures cannot be the same value.
+
+Output: C-REDUNDANCY.json + console tables for REDUNDANCY-PROOF.md.
+"""
+import sys, json
+from pathlib import Path
+from collections import Counter, defaultdict
+
+HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE))
+import _isa  # noqa: E402
+from _t02_live import reachable  # noqa: E402
+from _t01_identity import classify, reg_base, reaching  # noqa: E402
+
+OUT = HERE / "C-REDUNDANCY.json"
+
+
+def build():
+    ins, labels = _isa.parse()
+    seen = reachable(ins, labels)
+    for i, it in enumerate(ins):
+        it["live"] = seen[i]
+        it["w"], it["r"] = classify(it)
+    by_dw = defaultdict(list)
+    for it in ins:
+        for f, no, dw, n in it["w"]:
+            for d in range(dw, dw + n):
+                by_dw[(f, no, d)].append(it["idx"])
+    for v in by_dw.values():
+        v.sort()
+    return ins, by_dw
+
+
+def src_dw(ins, k):
+    """first register operand of the expensive op = its source (also its dst)."""
+    for o in ins[k]["ops"]:
+        b = reg_base(o)
+        if b:
+            return (b[0], b[1], b[2])
+    return None
+
+
+def defs_between(ins, by_dw, key, lo, hi):
+    return [i for i in by_dw.get(key, []) if lo < i < hi]
+
+
+def slice_leaf_and_body(ins, by_dw, live_idx, k, limit=400):
+    """backward slice; returns (body indices, leaf reads [(reg,dword,idx)])."""
+    body, leaves = set(), set()
+    stack = [k]
+    while stack:
+        j = stack.pop()
+        if j in body:
+            continue
+        body.add(j)
+        for f, no, dw, n in ins[j]["r"]:
+            for d in range(dw, dw + n):
+                p = reaching(by_dw, (f, no, d), j)
+                if p is None or p not in live_idx:
+                    leaves.add((f, no, d, j))
+                else:
+                    stack.append(p)
+        if len(body) > limit:
+            break
+    return body, leaves
+
+
+def main():
+    ins, by_dw = build()
+    n = len(ins)
+    live_idx = {i for i in range(n) if ins[i]["live"]}
+
+    exp = [k for k in sorted(live_idx) if ins[k]["op"] in ("math.rsqt", "math.inv")]
+    rows = []
+    for k in exp:
+        key = src_dw(ins, k)
+        prod = reaching(by_dw, key, k)
+        body, leaves = slice_leaf_and_body(ins, by_dw, live_idx, k)
+        # canonical leaf signature: the dword reads at the slice boundary
+        leaf_sig = sorted({(f, no, d) for f, no, d, _ in leaves})
+        rows.append(dict(
+            idx=k, addr=hex(ins[k]["addr"]), op=ins[k]["op"],
+            src_text=";".join(ins[k]["ops"][:2]),
+            src_key=list(key) if key else None,
+            producer=prod, producer_text=ins[prod]["text"][:80] if prod is not None else None,
+            slice_len=len(body), leaf_sig=leaf_sig, leaf_n=len(leaf_sig),
+        ))
+
+    print("== 24 expensive ops: source operand, reaching definition, slice leaves ==")
+    print("%-6s %-9s %-24s %6s %8s %5s" % ("idx", "op", "src text", "prod", "prod addr", "leaf"))
+    for r in rows:
+        print("%-6d %-9s %-24s %6s %8s %5d"
+              % (r["idx"], r["op"], r["src_text"][:24], r["producer"],
+                 hex(ins[r["producer"]]["addr"]) if r["producer"] is not None else "-",
+                 r["leaf_n"]))
+
+    # ---------- group by source text (the census criterion)
+    groups = defaultdict(list)
+    for r in rows:
+        groups[(r["op"], r["src_text"])].append(r)
+    print("\n== groups by identical source-operand text (census criterion) ==")
+    verdicts = []
+    for (op, txt), rs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        rs.sort(key=lambda r: r["idx"])
+        print("\n%-9s source '%s' x%d" % (op, txt.split(";")[0], len(rs)))
+        for i, r in enumerate(rs):
+            print("   site %5d @%s  producer %s @%s  slice %d leaves %d"
+                  % (r["idx"], r["addr"], r["producer"],
+                     hex(ins[r["producer"]]["addr"]) if r["producer"] is not None else "-",
+                     r["slice_len"], r["leaf_n"]))
+        # pairwise: are any two the same value?
+        same_value_pairs = []
+        rewrite_evidence = []
+        for i in range(len(rs)):
+            for j in range(i + 1, len(rs)):
+                a, b = rs[i], rs[j]
+                if a["producer"] is not None and a["producer"] == b["producer"]:
+                    same_value_pairs.append((a["idx"], b["idx"], "same reaching definition"))
+                    continue
+                # which writes of the dword sit between them
+                key = tuple(a["src_key"])
+                w = defs_between(ins, by_dw, key, a["idx"], b["idx"])
+                rewrite_evidence.append(dict(a=a["idx"], b=b["idx"], rewrites=w,
+                                             rewrite_text=[ins[x]["text"][:60] for x in w],
+                                             leaf_diff=a["leaf_sig"] != b["leaf_sig"],
+                                             leaf_n=[a["leaf_n"], b["leaf_n"]]))
+        print("   pairs with a shared reaching definition: %d" % len(same_value_pairs))
+        for w in rewrite_evidence[:8]:
+            print("   %5d -> %5d : %d write(s) of the source dword in between %s ; leaves differ=%s"
+                  % (w["a"], w["b"], len(w["rewrites"]),
+                     w["rewrites"][:4] if len(w["rewrites"]) <= 4 else w["rewrites"][:4] + ["..."],
+                     w["leaf_diff"]))
+        verdicts.append(dict(op=op, src_text=txt.split(";")[0], copies=len(rs),
+                             distinct_producers=len({r["producer"] for r in rs}),
+                             same_value_pairs=same_value_pairs,
+                             rewrites=rewrite_evidence,
+                             distinct_leaf_signatures=len({tuple(r["leaf_sig"]) for r in rs})))
+
+    tot_copies = len(rows)
+    redundant_claimed = sum(v["copies"] - v["distinct_producers"] for v in verdicts)
+    truly_same = sum(len(v["same_value_pairs"]) for v in verdicts)
+    print("\n== summary ==")
+    print("expensive ops: %d" % tot_copies)
+    print("distinct reaching definitions over all sites: %d"
+          % len({r["producer"] for r in rows}))
+    print("copy-pairs the census would call redundant: %d" % redundant_claimed)
+    print("pairs that actually share one reaching definition: %d" % truly_same)
+    print("distinct leaf signatures (per group): %s"
+          % [(v["src_text"], v["distinct_leaf_signatures"], v["copies"]) for v in verdicts])
+
+    out = dict(kernel="7a38a17947f21ae6", isa=str(_isa.path()), ordinals=_isa.ORDINALS,
+               sites=rows, groups=verdicts,
+               n_sites=tot_copies,
+               n_distinct_producers=len({r["producer"] for r in rows}),
+               census_redundant=redundant_claimed,
+               actual_same_value_pairs=truly_same)
+    OUT.write_text(json.dumps(out, indent=1), encoding="utf-8")
+    print("\nwrote", OUT)
+
+
+if __name__ == "__main__":
+    main()

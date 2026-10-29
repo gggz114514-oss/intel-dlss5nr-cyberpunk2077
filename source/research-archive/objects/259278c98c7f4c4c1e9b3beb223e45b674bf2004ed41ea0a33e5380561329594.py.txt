@@ -1,0 +1,102 @@
+"""NoContraction transfer, aligned by FP-site ordinal per function.
+
+Why not the campaign helper
+---------------------------
+`spv_tools_local.transfer_decoration_pattern_aligned` requires every decorated
+parent position to fall inside a difflib matching block over a
+`(opcode, word-count)` skeleton.  Hoisting one `coopMatLoad` into a shared
+fragment shifts a handful of instructions, and the skeleton of `OpLoad(type,
+ptr)` / `OpFMul(type, load, load)` sequences is heavily repetitive, so difflib
+picks a *wrong but equally valid-looking* correspondence for exactly one
+`OpFMul` (parent pos 874 vs pos 927 both map to child pos 901).  Rejecting it
+therefore rejects the whole module.
+
+What this does instead
+----------------------
+Per function, per opcode class, the ordered list of sites and of their ID-free
+operand signatures must be **identical** between parent and child.  When that
+holds there is exactly one order-preserving bijection between the two lists, and
+that bijection is the correspondence: the k-th FP site of a class in the child
+*is* the k-th FP site of that class in the parent.  Any other alignment would
+have to move a decoration onto a site with a different operand shape, which is
+impossible because the shapes match position for position.
+
+So the assertions are:
+  A1 per (function, opcode class): same length,
+  A2 per (function, opcode class): identical ordered operand-signature sequence,
+  A3 per (function, opcode class): identical count of decorated sites.
+Any failure aborts the build rather than silently moving a rounding point.
+
+CPU only.  Card-local; COMMON.py is imported, never modified.
+"""
+import sys
+from pathlib import Path
+
+BASE = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+            'fullnet-continuous-20261027')
+sys.path.insert(0, str(BASE))
+import COMMON as K
+
+ST = K.ST
+
+# opcodes that carry NoContraction in the recorded parent recipe
+#   12 = OpExtInst (Fma), 129 OpFAdd, 131 OpFSub, 133 OpFMul, 136 OpFDiv,
+#   137 OpSRem -- the last one is an *integer control-flow ledger* artifact of
+#   the kv-tile recipe, not a float rounding point (CONTRACT 2/8).
+NC_OPCODES = (12, 129, 131, 133, 136, 137)
+
+OPNAME = {12: 'Fma', 129: 'OpFAdd', 131: 'OpFSub', 133: 'OpFMul', 136: 'OpFDiv',
+          137: 'OpSRem'}
+
+
+def _sites(module, region, opcode):
+    """[(instruction index, result id, signature)] for one opcode class."""
+    out = []
+    for i in region:
+        op, ops, _, _ = module.instructions[i]
+        if op != opcode:
+            continue
+        if opcode == 12 and not (len(ops) >= 5 and ops[3] == 50):
+            continue                      # only GLSLstd450 Fma
+        rid = ST.result_id_of(op, ops)
+        if rid is None:
+            continue
+        out.append((i, rid, module.operand_signature(rid, 3)))
+    return out
+
+
+def transfer(parent_path, child_path, out_path):
+    parent = ST.Module(Path(parent_path))
+    child = ST.Module(Path(child_path))
+    preg, creg = ST.function_regions(parent), ST.function_regions(child)
+    assert len(preg) == len(creg), ('function count changed', len(preg), len(creg))
+    pnc = set(ST.no_contraction_ids(parent))
+    keep = set()
+    rows = []
+    for fi, (pr, cr) in enumerate(zip(preg, creg)):
+        for opcode in NC_OPCODES:
+            ps = _sites(parent, pr, opcode)
+            cs = _sites(child, cr, opcode)
+            ndec_p = sum(1 for _, rid, _ in ps if rid in pnc)
+            if not ps and not cs:
+                continue
+            assert len(ps) == len(cs), ('site count changed', fi, OPNAME[opcode],
+                                        len(ps), len(cs))
+            assert [x[2] for x in ps] == [x[2] for x in cs], \
+                ('operand-signature sequence changed', fi, OPNAME[opcode])
+            for (_, prid, _), (_, crid, _) in zip(ps, cs):
+                if prid in pnc:
+                    keep.add(crid)
+            ndec_c = sum(1 for _, rid, _ in cs if rid in keep)
+            assert ndec_p == ndec_c, ('decorated count changed', fi, OPNAME[opcode],
+                                      ndec_p, ndec_c)
+            rows.append({'function_index': fi, 'opcode': OPNAME[opcode],
+                         'sites': len(ps), 'parent_decorated': ndec_p,
+                         'candidate_decorated': ndec_c,
+                         'signature_sequence_identical': True})
+    ST.set_no_contraction(child, keep, out_path)
+    info = {'method': 'per-(function, opcode-class) order-preserving bijection on '
+                      'identical operand-signature sequences',
+            'nc_count': len(keep), 'parent_nc': len(pnc),
+            'rows': rows}
+    return keep, info

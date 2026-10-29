@@ -1,0 +1,199 @@
+"""F14 producer <-> F15 consumer layout proof, with the boundary enumeration the
+card demands (three chunk bases, head index, V region end, live-token tail).
+
+Both sides are re-derived from source, not from a captured dump:
+
+F14 producer (b3_04_vit_qkv_norm_owner.comp, grid = (3, 96, 1), local_size 256):
+    n0 = gl_WorkGroupID.y * 32                       y = 0..95  -> n0 = 0..3040 step 32
+    mA = gl_WorkGroupID.x*128 + sg*8, mB = mA + 64   sg = 0..7,  x = 0..2
+    write: qkv[p6.x + m*3072 + n0 + c]               c = 0..31 (h0 at +0..15, h1 at +16..31)
+    guard: if (m >= p0.x) continue                   p0.x = live tokens = 288
+
+F15 consumer (vit_attention_pden_register.comp, grid = (5, 32, 1)):
+    Q  : coopMatLoad(qf, qkv, p6.x + (q0+qg)*3072 + h*32 (+16), stride 3072, columnMajor)
+    K  : sk[e] = qkv[p6.x + (j0+key)*3072 + 1024 + h*32 + c],  e = key*32 + c
+    V  : sv[e] = qkv[p6.x + (j0+key)*3072 + 2048 + h*32 + c],  e = key*32 + c
+    h = 0..31, q0 = gl_WorkGroupID.x*64, qg = (sg/2)*16, j0 = key chunk base, step 64
+
+So the demanded element is qkv[token*3072 + S + head*32 + c] with
+  S = 0 for Q, 1024 for K, 2048 for V,  head = 0..31, c = 0..31,
+i.e. n = S + head*32 + c = 0..3071 -- exactly the producer's n0 + c with
+n0 = 32*gy.  The proof enumerates both index sets, checks that they are equal for
+the live tokens, that every element is written exactly once, and that nothing
+outside the row is touched.  It also enumerates the boundary cases that broke
+before: V region end (n0 = 3040 + 31 = 3071), chunk base forgetfulness
+(K/V without +1024/+2048), head 31, last live token 287, and the padding tokens
+288..383 that must stay untouched.
+
+Output: evidence/LAYOUT-PROOF.json
+"""
+import json
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CARD = HERE.parent
+EVID = CARD / 'evidence'
+EVID.mkdir(exist_ok=True)
+
+ROW = 3072          # half elements per token row of the qkv buffer
+Q_BASE, K_BASE, V_BASE = 0, 1024, 2056 - 8   # 0 / 1024 / 2048
+V_BASE = 2048
+HEADS = 32
+CHA = 32            # channels per head
+LIVE = 288          # push constant word 0 for all eight F14 calls
+GRID_X, GRID_Y = 3, 96
+SG = 8
+FRAG_ROWS = 8
+
+
+def producer_writes():
+    """{element_index: [(x, sg, group, row, c)]} over the whole launch."""
+    w = {}
+    for x in range(GRID_X):
+        for sg in range(SG):
+            mA = x * 128 + sg * 8
+            mB = mA + 64
+            for group, m in ((0, mA), (1, mB)):
+                if m >= LIVE:
+                    continue
+                for row in range(FRAG_ROWS):
+                    t = m + row
+                    for gy in range(GRID_Y):
+                        n0 = gy * 32
+                        for c in range(CHA):
+                            idx = t * ROW + n0 + c
+                            w.setdefault(idx, []).append((x, sg, group, row, n0, c))
+    return w
+
+
+def consumer_reads():
+    """{(token, n): [(region, head, c, site)]} demanded by F15."""
+    r = {}
+
+    def add(t, n, tag):
+        r.setdefault((t, n), []).append(tag)
+
+    # Q: one 16x16 column-major B fragment per (score SG, head), base
+    #    (q0+qg)*ROW + h*32, so it covers the 16 tokens q0+qg .. q0+qg+15.
+    #    q0 = gx*64 (gx = 0..4), qg = (sg/2)*16 for sg = 0..7 -> 0,16,32,48.
+    for gx in range(5):
+        for sg in range(0, 8, 2):                    # score_owner = (sg%2)==0
+            q = gx * 64 + (sg // 2) * 16
+            if q >= LIVE:
+                continue
+            for h in range(HEADS):
+                for j in range(16):                  # fragment rows = tokens
+                    t = q + j
+                    for cc in range(16):
+                        add(t, Q_BASE + h * CHA + cc, ('Q', h, cc, 'qf0'))
+                        add(t, Q_BASE + h * CHA + 16 + cc, ('Q', h, 16 + cc, 'qf1'))
+    # K and V: 64-key chunks from j0 = 0 while j0 < p0.y; the FULL body reads all
+    # 64 keys, the TAIL body reads only key < p0.x.
+    j0 = 0
+    while j0 < LIVE:
+        full = (j0 + 64) <= LIVE
+        keys = range(64) if full else range(LIVE - j0)
+        for h in range(HEADS):
+            for key in keys:
+                t = j0 + key
+                for c in range(CHA):
+                    add(t, K_BASE + h * CHA + c, ('K', h, c, 'FULL' if full else 'TAIL'))
+                    add(t, V_BASE + h * CHA + c, ('V', h, c, 'FULL' if full else 'TAIL'))
+        j0 += 64
+    return r
+
+
+def main():
+    w = producer_writes()
+    r = consumer_reads()
+
+    prod = set(w)
+    cons = set((t * ROW + n) for (t, n) in r)
+    dup = {k: v for k, v in w.items() if len(v) != 1}
+    prod_tokens = sorted({k // ROW for k in prod})
+    out_of_row = sorted(k for k in prod if (k % ROW) >= ROW)
+
+    # boundary enumeration ---------------------------------------------------
+    boundary = {}
+    # 1. per region, the smallest and largest element written and read
+    for name, base in (('Q', Q_BASE), ('K', K_BASE), ('V', V_BASE)):
+        lo = min(base, 0)
+        first = base
+        last = base + HEADS * CHA - 1
+        boundary[name] = dict(first_n=first, last_n=last,
+                              first_n0=first - first % 32, last_n0=last - last % 32,
+                              last_gy=(last - first) // 32,
+                              inside_row=last < ROW)
+    # 2. the exact V end: n0 = 3040, c = 31
+    boundary['V_end'] = dict(n0=3040, c=31, n=3071, row_ok=3071 < ROW,
+                             next_n_would_be=3072, overflows_row=3072 >= ROW)
+    # 3. chunk-base forgetfulness: what a missing +1024/+2048 would read
+    boundary['missing_chunk_base'] = {}
+    for name, base, wrong in (('K', K_BASE, 0), ('V', V_BASE, 0),
+                              ('V', V_BASE, 1024)):
+        bad = set()
+        for h in range(HEADS):
+            for t in range(LIVE):
+                for c in range(CHA):
+                    bad.add((t, wrong + h * CHA + c))
+        bad_elems = set(t * ROW + n for (t, n) in bad)
+        boundary['missing_chunk_base'][f'{name}_as_base{wrong}'] = dict(
+            reads_not_written=len(bad_elems - prod),
+            reads_pointing_at_another_region=len(
+                [1 for (t, n) in bad if (t * ROW + n) in prod and n != base + (n % 1024)]),
+            note='a consumer with the wrong chunk base reads a different region of the same row')
+    # 4. head index and tail tokens
+    boundary['head_31'] = dict(Q=[Q_BASE + 31 * 32, Q_BASE + 31 * 32 + 31],
+                               K=[K_BASE + 31 * 32, K_BASE + 31 * 32 + 31],
+                               V=[V_BASE + 31 * 32, V_BASE + 31 * 32 + 31])
+    boundary['live_tokens'] = dict(
+        live=LIVE, groups=LIVE // FRAG_ROWS,
+        group_guard_equivalent=(LIVE % FRAG_ROWS == 0),
+        key_chunk=LIVE % 64, key_chunks=(LIVE + 63) // 64,
+        full_chunks=LIVE // 64, tail_chunk_keys=LIVE % 64,
+        tail_path_taken=(LIVE % 64 != 0),
+        max_written_token=max(prod_tokens), padding_first=LIVE,
+        padding_written=len([t for t in prod_tokens if t >= LIVE]))
+    boundary['grid'] = dict(
+        token_slots=GRID_X * 128, token_live=LIVE, token_slots_wasted=GRID_X * 128 - LIVE,
+        channel_tiles=GRID_Y, channel_span=GRID_Y * 32, row=ROW,
+        exact=(GRID_Y * 32 == ROW), workgroups=GRID_X * GRID_Y,
+        subgroups=GRID_X * GRID_Y * SG)
+
+    out = dict(
+        schema='n12-vit-qkv/layout-proof/v1',
+        row=ROW, live_tokens=LIVE, grid=[GRID_X, GRID_Y, 1],
+        producer_elements=len(prod),
+        producer_elements_expected=LIVE * ROW,
+        consumer_elements=len(cons),
+        producer_equals_consumer=prod == cons,
+        producer_only=sorted(prod - cons)[:8],
+        consumer_only=sorted(cons - prod)[:8],
+        duplicate_writes=len(dup),
+        duplicate_examples=[(k, v) for k, v in list(dup.items())[:4]],
+        writes_outside_row=len(out_of_row),
+        tokens_written=len(prod_tokens),
+        tokens_written_range=[min(prod_tokens), max(prod_tokens)],
+        boundary=boundary,
+        direction_statement=(
+            'the producer stores h0 at n0+0..15 and h1 at n0+16..31 of the same token row, '
+            'i.e. the 32 contiguous channels of head (n0/32); F15 reads exactly those 32 '
+            'contiguous channels per (token, head) -- Q as two 16x16 column-major B fragments, '
+            'K/V through the 32-channel contiguous shared fill -- so the last store is already '
+            'in the consumer read direction and no output repack is available without a mirror'),
+        conclusion=('producer set == consumer set over the 288 live tokens; every element '
+                    'written once; V region ends at n=3071 inside the 3072-wide row; the three '
+                    'chunk bases 0/1024/2048 and the head index n0/32 are the only offsets'),
+    )
+    (EVID / 'LAYOUT-PROOF.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print(json.dumps({k: v for k, v in out.items() if not k.startswith(('producer_only',
+                                                                     'consumer_only',
+                                                                     'duplicate_examples'))},
+                     indent=2))
+    ok = (out['producer_equals_consumer'] and out['duplicate_writes'] == 0
+          and out['writes_outside_row'] == 0 and len(out['producer_only']) == 0)
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

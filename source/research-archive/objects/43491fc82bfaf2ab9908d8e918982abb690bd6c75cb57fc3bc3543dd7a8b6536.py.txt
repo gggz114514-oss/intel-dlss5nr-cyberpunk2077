@@ -1,0 +1,113 @@
+"""Locate every 16-lane interleave block in the F02 body ISA and classify what
+feeds it.
+
+Instruction shape (the "528"):
+    mov (32|M0) rD.0<2>:uw  rS.0<32;16,1>:uw
+    mov (32|M0) rD.1<2>:uw  rS.16<32;16,1>:uw
+Semantics (derived and cross-checked on two blocks at 0x1520 and 0x16B0):
+    dst GRF pair (D, D+1) <- src GRF pair (S, S+1), word-granular 2-way zip:
+        dst[D].dword[j]   = (src[S].word[j],   src[S+1].word[j])     j = 0..7
+        dst[D+1].dword[j] = (src[S].word[8+j], src[S+1].word[8+j])
+i.e. 8 movs convert an 8-GRF (256 B) linear block into 8 GRFs of DPAS A-operand
+(VNNI) layout, and the zip is an involution on each GRF pair.
+
+CPU only; read-only on the dump.
+"""
+import re, sys, collections
+sys.path.insert(0, '@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/cards/n01b-f02-load-side')
+import isaparse as P
+
+ZIP = re.compile(r'^r(?P<d>\d+)\.(?P<dh>[01])<2>:uw$')
+SRC = re.compile(r'^r(?P<s>\d+)\.(?P<off>0|16)<32;16,1>:uw$')
+
+
+def find_zips(isa):
+    out = []
+    for i in isa:
+        if i['op'] != 'mov' or len(i['ops']) != 2:
+            continue
+        m = ZIP.match(i['ops'][0])
+        n = SRC.match(i['ops'][1])
+        if not (m and n):
+            continue
+        d = int(m.group('d'))
+        s = int(n.group('s')) + (1 if n.group('off') == '16' else 0)
+        out.append(dict(idx=i['idx'], addr=i['addr'], dst=d, src=s, raw=i['raw']))
+    return out
+
+
+def blocks(zips, gap=4):
+    if not zips:
+        return []
+    groups = []
+    cur = [zips[0]]
+    for a, b in zip(zips, zips[1:]):
+        if b['idx'] - a['idx'] <= gap:
+            cur.append(b)
+        else:
+            groups.append(cur)
+            cur = [b]
+    groups.append(cur)
+    return groups
+
+
+def last_writer(isa, before_idx, reg):
+    """Last instruction before `before_idx` that writes GRF `reg` (approx: GRF
+    number covered by its destination region, using the dst span we know for the
+    ops that matter here: 1 GRF for mov/mul/add narrowing forms, rd window for
+    sends)."""
+    for k in range(before_idx - 1, -1, -1):
+        i = isa[k]
+        d = P.reg(i['ops'][0]) if i['ops'] else None
+        if d is None:
+            continue
+        if i['op'].startswith('send'):
+            rd = P.rd_of(i)
+            if rd and d <= reg <= d + rd - 1:
+                return i
+            continue
+        if d == reg:
+            return i
+        if i['op'].startswith('dpas'):
+            if d <= reg <= d + 15:
+                return i
+    return None
+
+
+def classify(i):
+    if i is None:
+        return 'none'
+    if i['op'].startswith('send'):
+        return i['op'] + ':' + P.msg_of(i).split('.')[1] if '.' in P.msg_of(i) else i['op']
+    return i['op']
+
+
+def main(path):
+    isa = P.parse(path)
+    for k, i in enumerate(isa):
+        i['idx'] = k
+    zips = find_zips(isa)
+    groups = blocks(zips)
+    print('zip instructions', len(zips), 'blocks', len(groups),
+          'sizes', collections.Counter(len(g) for g in groups))
+    rows = []
+    for g in groups:
+        srcs = sorted({z['src'] for z in g})
+        dsts = sorted({z['dst'] for z in g})
+        writers = [last_writer(isa, g[0]['idx'], s) for s in srcs]
+        kinds = [classify(w) for w in writers]
+        rows.append(dict(addr=g[0]['addr'], n=len(g), srcs=srcs, dsts=dsts,
+                         kinds=kinds,
+                         addresses=[w['addr'] if w else None for w in writers]))
+    return rows, isa
+
+
+if __name__ == '__main__':
+    rows, isa = main(sys.argv[1])
+    c = collections.Counter(tuple(sorted(set(r['kinds']))) for r in rows)
+    for k, v in c.most_common():
+        print(v, k)
+    print()
+    for r in rows:
+        print('0x%05X n=%d src=%s dst=%s feeders=%s' %
+              (r['addr'], r['n'], r['srcs'], r['dsts'], r['kinds']))

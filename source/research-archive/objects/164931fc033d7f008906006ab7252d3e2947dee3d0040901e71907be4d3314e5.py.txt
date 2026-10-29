@@ -1,0 +1,41 @@
+from pathlib import Path
+import json,hashlib,subprocess,struct,sys,shlex
+R=Path(__file__).resolve().parent;P=R/'f01-stream';N=R/'f01-direct';N.mkdir(exist_ok=True);B=Path('@NR_WORKSPACE@');S=B/'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1/source';sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def rd(p):return json.loads(p.read_text(encoding='utf-8-sig'))
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+v=[[(l//2,2*d+(l&1)) for d in range(8)] for l in range(32)];helper=['void nr_feat_to_A(NRH_B x,out NRH_A o0,out NRH_A o1){','uint lane=gl_SubgroupInvocationID;']+[f'float16_t v{d}=x[{d}];' for d in range(8)]
+for j in range(3):
+ pairs=[(a,a+(1<<j)) for a in range(8) if not a&(1<<j)];old=[x[:] for x in v];bit=1<<(j+2)
+ for l in range(32):
+  choose=bool(l&bit);peer=l^bit
+  for a,b in pairs:
+   recv=old[peer][a if peer&bit else b];v[l][a]=recv if choose else old[l][a];v[l][b]=old[l][b] if choose else recv
+ for k in range(0,4,2):
+  (a,b),(c,d)=pairs[k:k+2];helper+=['{',f'bool s=(lane&{bit}u)!=0u;',f'f16vec2 r=unpackFloat2x16(subgroupShuffleXor(packFloat2x16(f16vec2(s?v{a}:v{b},s?v{c}:v{d})),{bit}u));',f'v{a}=s?r.x:v{a};v{b}=s?v{b}:r.x;v{c}=s?r.y:v{c};v{d}=s?v{d}:r.y;','}']
+v=[v[(l&1)|((l>>3)&2)|((l&14)<<1)][:] for l in range(32)];assert all(v[l][d]==(8*(d//4)+2*(d%4)+(l>>4),l&15) for l in range(32) for d in range(8))
+helper+=['uint sl=(lane&1u)|((lane>>3u)&2u)|((lane&14u)<<1u);','o0=NRH_A(float16_t(0));o1=NRH_A(float16_t(0));']
+for d in range(0,8,2):helper+=[f'{{f16vec2 r=unpackFloat2x16(subgroupShuffle(packFloat2x16(f16vec2(v{d},v{d+1})),sl));o{d//4}[{d%4}]=r.x;o{d//4}[{d%4+1}]=r.y;}}']
+helper+=['}'];s=(P/'candidate.comp').read_text(encoding='utf-8-sig');s=s.replace('void nr_body_stage() {','\n'.join(helper)+'\nvoid nr_body_stage() {');a=s.index('NRH_CH nx00,nx01,nx10,nx11;');b=s.index('NRH_A xa00;',a);setup=['NRH_CH nx00,nx01,nx10,nx11;','{','NRH_B feats=nrf_prepare_B(sg);NRH_A fa0,fa1;nr_feat_to_A(feats,fa0,fa1);']
+for f in range(2):setup+=['{',f'NRH_B w;coopMatLoad(w,wb,pc.p7.x+{f*256}u,16u,LROW);',f'NRH_C c0=NRH_C(0.0),c1=NRH_C(0.0);c0=coopMatMulAdd(fa0,w,c0);c1=coopMatMulAdd(fa1,w,c1);nx0{f}=nrh_narrow(c0);nx1{f}=nrh_narrow(c1);','}']
+setup+=['}'];s=s[:a]+'\n'.join(setup)+'\n'+s[b:];src=N/'candidate.comp';src.write_text(s,encoding='utf-8');spv=N/'candidate.spv';run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(S),src,'-o',spv]);cm=ST.Module(spv);pm=ST.Module(P/'candidate.spv');keep=set(ST.no_contraction_ids(cm))
+def regions(mod):
+ ns={ops[0]:struct.pack('<'+'I'*len(ops[1:]),*ops[1:]).split(b'\0')[0].decode() for op,ops,*_ in mod.instructions if op==5};return {ns.get(mod.instructions[r[0]][1][1],'?'):r for r in ST.function_regions(mod)}
+for name,pr in regions(pm).items():
+ cr=regions(cm).get(name)
+ if not cr or name.startswith('nr_body_stage('):continue
+ if [(pm.instructions[i][0],pm.instructions[i][3]) for i in pr]!=[(cm.instructions[i][0],cm.instructions[i][3]) for i in cr]:continue
+ keep-={ST.result_id_of(cm.instructions[i][0],cm.instructions[i][1]) for i in cr}
+ for pos in ST.decoration_pattern(pm,pr):keep.add(ST.result_id_of(cm.instructions[cr[pos]][0],cm.instructions[cr[pos]][1]))
+ST.set_no_contraction(cm,keep,spv);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv]);m=rd(P/'CANDIDATE.json');text=(P/'plan.txt').read_text();push=next(shlex.split(l) for l in text.splitlines() if l.startswith('PUSH'));off=int(push[1+28]);pack0=Path(m['pack']['path']);raw=pack0.read_bytes();data=list(struct.unpack('<'+'H'*(len(raw)//2),raw));assert off+512<=len(data)
+for k in range(off,off+512,256):tile=data[k:k+256];data[k:k+256]=[tile[c*16+r] for r in range(16) for c in range(16)]
+pack=N/'weights.bin';pack.write_bytes(struct.pack('<'+'H'*len(data),*data));assert pack.read_bytes()[:2*off]==raw[:2*off] and pack.read_bytes()[2*(off+512):]==raw[2*(off+512):];plan=N/'plan.txt';plan.write_text(text.replace((P/'candidate.spv').as_posix(),spv.as_posix()).replace(pack0.as_posix(),pack.as_posix()),encoding='utf-8');m.update(label='f01-direct',source=ident(src),spv=ident(spv),plan=ident(plan),pack=ident(pack),lift_weight_offset=off,lift_transposed_halves=512,feature_B_to_A_coordinates=256,feature_B_to_A_shuffles=10,removed_input_transpose_shuffles=20);runner=Path(rd(P/'LUNA-GATES.json')['identities'][0]['path']);m['cpu_check']=run([runner,'--plan',plan,'--cpu-check']);(N/'CANDIDATE.json').write_text(json.dumps(m,indent=2));(N/'run').mkdir(exist_ok=True);(N/'captures').mkdir(exist_ok=True)
+for kind in ['GATES','NATIVE','ORDINARY']:
+ task=rd(P/f'LUNA-{kind}.json');task['output_root']=str(N);task['identities']=[m['spv'] if x['path']==str(P/'candidate.spv') else m['pack'] if x['path']==str(pack0) else x for x in task['identities']]
+ for j in task['jobs']:
+  j['id']=j['id'].replace('f01-stream','f01-direct');j['runner_output']=str(N/'run'/j['id']);j['argv'][j['argv'].index('--out')+1]=j['runner_output']
+  if j['candidate']!='parent':j['candidate']='f01-direct';j['plan']=m['plan'];j['argv'][j['argv'].index('--plan')+1]=m['plan']['path']
+  if kind=='NATIVE':j['argv'][5]=j['id'];j['argv'][7]=str(N/'captures');j['argv'][9]=str(N/(j['id']+'.log'));j['capture_output']=str(N/'captures'/j['id'])
+ (N/f'LUNA-{kind}.json').write_text(json.dumps(task,indent=2))
+print(m['cpu_check'],m['spv'])

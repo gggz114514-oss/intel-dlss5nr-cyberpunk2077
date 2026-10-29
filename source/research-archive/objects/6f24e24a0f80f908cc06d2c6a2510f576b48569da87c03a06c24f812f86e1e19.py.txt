@@ -1,0 +1,259 @@
+"""histodiff.py - multiset (class) diff between the parent and the B1 candidate SPV.
+
+Level 1: pure opcode histogram -- "only in parent" / "only in child" / count deltas.
+Level 2: class multiset where a class = opcode + the operands that identify *what*
+         the instruction does (type shape, constant value, storage class, resolved
+         index expression, call target+args).  Sets are compared as multisets.
+
+Every class that is not identical in both directions is printed with an explicit
+attribution tag.  Any class with attribution UNKNOWN sets verdict false: the card
+then reports FAIL instead of pretending the diff is understood.
+
+usage: python histodiff.py <parent.spv> <candidate.spv> [out.json]
+"""
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from spvlite import Mod  # noqa: E402
+
+ARITH = {"OpIAdd", "OpISub", "OpIMul", "OpUDiv", "OpShiftLeftLogical",
+         "OpShiftRightLogical", "OpBitwiseOr", "OpBitwiseAnd", "OpBitwiseXor",
+         "OpIEqual", "OpINotEqual", "OpULessThan", "OpUGreaterThanEqual", "OpUMod",
+         "OpSelect", "OpSNegate", "OpNot", "OpBitcast", "OpCopyObject",
+         "OpAccessChain", "OpInBoundsAccessChain", "OpLoad", "OpStore", "OpPhi",
+         "OpCompositeConstruct", "OpCompositeExtract", "OpFunctionCall",
+         "OpGroupNonUniformShuffle", "OpGroupNonUniformShuffleXor",
+         "OpGroupNonUniformBroadcastFirst", "OpGroupNonUniformBallot"}
+
+
+def shape(m, tid, depth=0):
+    """id-independent structural signature of a type id"""
+    if depth > 8 or tid not in m.types:
+        return "?"
+    t = m.types[tid]
+    k = t[0]
+    if k == "int":
+        return "i%d" % t[1]
+    if k == "float":
+        return "f%d" % t[1]
+    if k == "vec":
+        return "v%d<%s>" % (t[2], shape(m, t[1], depth + 1))
+    if k == "array":
+        return "a[%s]<%s>" % (m.consts.get(t[2], "?"), shape(m, t[1], depth + 1))
+    if k == "rarray":
+        st = m.decor.get(tid, {}).get(4)
+        return "ra<%s;stride=%s>" % (shape(m, t[1], depth + 1),
+                                     st[0][0] if st else "?")
+    if k == "struct":
+        return "st(%s)" % ",".join(shape(m, x, depth + 1) for x in t[1])
+    if k == "ptr":
+        return "p%d<%s>" % (t[1], shape(m, t[2], depth + 1))
+    return k
+
+
+def classes(m):
+    """Counter of class strings -> [inst_index...] for one module"""
+    cnt = Counter()
+    where = {}
+    for it in m.insts:
+        nm = it.name
+        key = None
+        if nm == "OpName":
+            key = "OpName %s" % m.names.get(it.a[0], "?")
+        elif nm == "OpMemberName":
+            key = "OpMemberName %d %s" % (it.a[1], m.names.get(it.a[0], "?"))
+        elif nm == "OpDecorate":
+            key = "OpDecorate %d %s" % (it.a[1], " ".join(str(x) for x in it.a[2:]))
+        elif nm == "OpMemberDecorate":
+            key = "OpMemberDecorate %d %d %s" % (it.a[1], it.a[2],
+                                                " ".join(str(x) for x in it.a[3:]))
+        elif nm == "OpConstant":
+            key = "OpConstant %s = %d" % (shape(m, it.a[0]), it.a[2])
+        elif nm.startswith("OpType"):
+            key = "%s %s" % (nm, shape(m, it.a[0]))
+        elif nm == "OpVariable":
+            key = "OpVariable %s %s" % (it.a[2], shape(m, it.a[0]))
+        elif nm in ("OpControlBarrier", "OpMemoryBarrier"):
+            key = "%s %s" % (nm, " ".join(m.resolve(x, it.idx)[0] for x in it.a))
+        elif nm in ("OpCooperativeMatrixLoadKHR", "OpCooperativeMatrixStoreKHR"):
+            if nm == "OpCooperativeMatrixLoadKHR":
+                ptr = it.a[2]
+                rshape = shape(m, it.a[0])
+            else:
+                ptr = it.a[0]
+                rshape = "-"
+            root = m.base_var(ptr)
+            chain = m.byid.get(ptr)
+            idx = "|".join(m.resolve(x, it.idx)[0] for x in chain.a[3:]) if chain else "-"
+            key = "%s %s root=%s idx=%s" % (nm, rshape, m.names.get(root) or "<anon>", idx)
+        elif nm == "OpFunctionCall":
+            key = "OpFunctionCall %s(%s)" % (
+                (m.funcs.get(it.a[2]) or "?").split("(")[0],
+                ",".join(m.resolve(x, it.idx)[0] for x in it.a[3:]))
+        elif nm in ARITH:
+            key = nm
+        elif nm in ("OpFunction", "OpFunctionParameter", "OpFunctionEnd", "OpLabel",
+                    "OpBranch", "OpBranchConditional", "OpSelectionMerge",
+                    "OpLoopMerge", "OpReturn", "OpReturnValue", "OpSwitch",
+                    "OpEntryPoint", "OpExecutionMode", "OpCapability", "OpExtension",
+                    "OpExtInstImport", "OpMemoryModel", "OpCooperativeMatrixMulAddKHR"):
+            key = nm if nm != "OpCooperativeMatrixMulAddKHR" else \
+                "OpCooperativeMatrixMulAddKHR %s" % shape(m, it.a[0])
+        else:
+            key = nm
+        cnt[key] += 1
+        where.setdefault(key, []).append(it.idx)
+    return cnt, where
+
+
+def attribute(key, side):
+    """explicit attribution of one non-identical class"""
+    k = key
+    if "sX8" in k:
+        return "shared_variable_removed: sX8[2048] deleted (X merged into the sE8 sg slot)"
+    if "a[2048]<i8>" in k:
+        return ("shared_variable_removed: sX8 array type / pointer / Workgroup variable "
+                "(the only 2048-byte int8 object in the module)")
+    if k.startswith("OpControlBarrier 3 3 3400"):
+        return "barrier_added: exactly one subgroupBarrier() (exec scope 3, sem 3400)"
+    if k.startswith("OpConstant i32 = 512") or k.startswith("OpConstant i32 = 1024"):
+        return "address_constant_folding: sg*512 no longer materialised"
+    if k.startswith("OpCooperativeMatrixLoadKHR") and "root=sE8" in k and "2048" in k:
+        return "address_rebase: X cooperative-matrix load now reads sE8 + sg*2048"
+    if k.startswith("OpCooperativeMatrixLoadKHR") and "root=sX8" in k:
+        return "address_rebase: parent read sX8 + sg*512 (array deleted)"
+    if k.startswith("OpFunctionCall nr_i8_put_x") and "2048" in k:
+        return "address_rebase: X publish base sg*2048 (was sg*512)"
+    if k.startswith("OpFunctionCall nr_i8_put_x") and "512" in k:
+        return "address_rebase: parent X publish base sg*512"
+    return "UNKNOWN"
+
+
+def main():
+    p = Mod(sys.argv[1])
+    c = Mod(sys.argv[2])
+    cp, wp = classes(p)
+    cc, wc = classes(c)
+    lvl1_p = Counter(i.name for i in p.insts)
+    lvl1_c = Counter(i.name for i in c.insts)
+    l1 = []
+    for k in sorted(set(lvl1_p) | set(lvl1_c)):
+        if lvl1_p.get(k, 0) != lvl1_c.get(k, 0):
+            l1.append({"opcode": k, "parent": lvl1_p.get(k, 0),
+                       "candidate": lvl1_c.get(k, 0),
+                       "delta": lvl1_c.get(k, 0) - lvl1_p.get(k, 0)})
+    only_p = [(k, cp[k]) for k in cp if k not in cc]
+    only_c = [(k, cc[k]) for k in cc if k not in cp]
+    delta = [(k, cp[k], cc[k]) for k in cp if k in cc and cp[k] != cc[k]]
+    rows = []
+    for k, n in sorted(only_p):
+        rows.append({"direction": "only_in_parent", "class": k, "parent": n,
+                     "candidate": 0, "attribution": attribute(k, "parent")})
+    for k, n in sorted(only_c):
+        rows.append({"direction": "only_in_candidate", "class": k, "candidate": n,
+                     "parent": 0, "attribution": attribute(k, "candidate")})
+    for k, a, b in sorted(delta):
+        rows.append({"direction": "count_delta", "class": k, "parent": a,
+                     "candidate": b, "attribution": attribute(k, "both")})
+    unknown = [r for r in rows if r["attribution"] == "UNKNOWN"]
+    # ---- word accounting: every changed word must belong to a named class ----
+    def word_totals(m):
+        out = Counter()
+        for it in m.insts:
+            out[it.name] += 1 + len(it.a)
+        return out
+    wp, wc_ = word_totals(p), word_totals(c)
+    WORD_ATTR = {
+        "OpControlBarrier": "barrier_added: the one new subgroupBarrier()",
+        "OpEntryPoint": "shared_variable_removed: the OpEntryPoint interface list "
+                        "loses the deleted sX8 variable id (1 word)",
+        "OpName": "shared_variable_removed: the OpName string \"sX8\"",
+        "OpTypeArray": "shared_variable_removed: OpTypeArray of the deleted slot",
+        "OpTypePointer": "shared_variable_removed: OpTypePointer to that array",
+        "OpVariable": "shared_variable_removed: the Workgroup OpVariable itself",
+    }
+    word_rows = []
+    for k in sorted(set(wp) | set(wc_)):
+        if wp[k] != wc_[k]:
+            word_rows.append({"opcode": k, "words_parent": wp[k],
+                              "words_candidate": wc_[k],
+                              "delta": wc_[k] - wp[k],
+                              "attribution": WORD_ATTR.get(k, "UNKNOWN")})
+    word_sum = sum(r["delta"] for r in word_rows)
+    word_unattributed = [r["opcode"] for r in word_rows
+                         if r["attribution"] == "UNKNOWN"]
+    rec = {
+        "parent": {"spv": p.path, "bytes": len(p.raw), "words": len(p.w),
+                   "bound": p.bound, "instructions": len(p.insts)},
+        "candidate": {"spv": c.path, "bytes": len(c.raw), "words": len(c.w),
+                      "bound": c.bound, "instructions": len(c.insts)},
+        "level1_opcode_histogram": {
+            "differing": l1,
+            "identical_classes": len([k for k in set(lvl1_p) | set(lvl1_c)
+                                      if lvl1_p.get(k, 0) == lvl1_c.get(k, 0)]),
+            "only_in_parent": sorted(k for k in lvl1_p if k not in lvl1_c),
+            "only_in_candidate": sorted(k for k in lvl1_c if k not in lvl1_p),
+        },
+        "level2_class_multiset": {
+            "n_classes_parent": len(cp), "n_classes_candidate": len(cc),
+            "identical_classes": len([k for k in cp if k in cc and cp[k] == cc[k]]),
+            "only_in_parent": [{"class": r["class"], "count": r["parent"],
+                                "attribution": r["attribution"]}
+                               for r in rows if r["direction"] == "only_in_parent"],
+            "only_in_candidate": [{"class": r["class"], "count": r["candidate"],
+                                   "attribution": r["attribution"]}
+                                  for r in rows if r["direction"] == "only_in_candidate"],
+            "count_deltas": [{"class": r["class"], "parent": r["parent"],
+                              "candidate": r["candidate"],
+                              "attribution": r["attribution"]}
+                             for r in rows if r["direction"] == "count_delta"],
+        },
+        "word_accounting": {
+            "words_total_parent": sum(wp.values()),
+            "words_total_candidate": sum(wc_.values()),
+            "delta": sum(wc_.values()) - sum(wp.values()),
+            "per_opcode": word_rows,
+            "sum_of_per_opcode_deltas": word_sum,
+            "sums_to_observed_delta": word_sum == (sum(wc_.values()) - sum(wp.values())),
+            "unattributed_opcodes": word_unattributed,
+        },
+        "n_differing_rows": len(rows),
+        "n_unattributed": len(unknown),
+        "unattributed": [r["class"] for r in unknown],
+        "verdict_no_unattributed_change": (len(unknown) == 0 and
+                                           not word_unattributed and
+                                           word_sum == (sum(wc_.values()) - sum(wp.values()))),
+        "raw_word_diff": {
+            "words_parent": len(p.w), "words_candidate": len(c.w),
+            "delta_words": len(c.w) - len(p.w),
+            "note": "raw word equality is meaningless once one OpVariable disappears "
+                    "(glslang renumbers every later id), so identity is argued on the "
+                    "class multiset above, not on the raw words",
+        },
+    }
+    txt = json.dumps(rec, indent=1) + "\n"
+    if len(sys.argv) > 3:
+        Path(sys.argv[3]).write_text(txt, encoding="utf-8")
+        print("wrote", sys.argv[3])
+    print("words %d -> %d (delta %d); bound %d -> %d; insts %d -> %d"
+          % (len(p.w), len(c.w), len(c.w) - len(p.w), p.bound, c.bound,
+             len(p.insts), len(c.insts)))
+    print("level1 differing opcodes:")
+    for r in l1:
+        print("   %-40s %d -> %d (%+d)" % (r["opcode"], r["parent"], r["candidate"],
+                                           r["delta"]))
+    print("level1 only_in_parent:", rec["level1_opcode_histogram"]["only_in_parent"])
+    print("level1 only_in_candidate:", rec["level1_opcode_histogram"]["only_in_candidate"])
+    print("level2 rows=%d unattributed=%d" % (len(rows), len(unknown)))
+    for r in rows:
+        print("   [%s] %s  (%s -> %s)  => %s" % (r["direction"], r["class"][:110],
+                                                 r["parent"], r["candidate"],
+                                                 r["attribution"]))
+    return 0 if not unknown else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

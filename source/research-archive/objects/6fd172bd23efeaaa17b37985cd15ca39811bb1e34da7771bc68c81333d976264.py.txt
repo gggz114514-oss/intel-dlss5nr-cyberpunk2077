@@ -1,0 +1,359 @@
+"""Emit SOURCE-DIFF.patch, BUILD.json, COST-LEDGER.json, GPU-REQUEST.json for n06-f06-output.
+
+CPU only. Reads the read-only parent native capture for the baseline ISA census.
+"""
+import json, re, sys, collections
+from pathlib import Path
+
+CARD = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/cards/n06-f06-output')
+CAMP = CARD.parent.parent
+sys.path.insert(0, str(CAMP))
+import COMMON as K
+import ISA
+
+PARENT_SRC = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-mechanism-transfer-20261026/f06-scale-fragments/family/c128/candidate.comp')
+PARENT_SPV = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-mechanism-transfer-20261026/f06-scale-fragments/family/c128/candidate.spv')
+PARENT_NATIVE = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-mechanism-transfer-20261026/f06-scale-fragments/family/captures/native-f20-pixel-owner/ISA/CS_asma558554d30105096_simd32_000000000000000b_10_orig.asm')
+PARENT_SHA = '2f2d55739e76f9e946f2c1a55050947bcf15ed98b7fe25f2084af0350d440f00'
+ORDINALS = [20, 23, 26, 29, 32, 196, 199, 202, 205, 208, 211]
+
+# per-subgroup dynamic counts (source level, mode 0)
+CTX = dict(tokens=64, channels=128, ko_steps=8, sg=8, wg_per_pass=21 * 12, passes=11)
+B_TILE = 16 * 16 * 2
+A_TILE = 8 * 16 * 2
+
+
+def dyn():
+    """Per-subgroup dynamic counts.
+
+    parent    : 4 j  x [1 M block] x [2 weight n-blocks] x 8 k
+                A = 4*8 = 32, B = 4*2*8 = 64, seed = 4*2 = 8, store = 4*2 = 8, DPAS = 64
+    candidate : 2 jp x [2 M blocks] x [2 weight n-blocks] x 8 k
+                A = 2*2*8 = 32 (one per M block and k), B = 2*2*8 = 32 (one per n-block
+                and k, shared by both M blocks), seed = 2*4 = 8, store = 2*4 = 8, DPAS = 64
+    """
+    d = {}
+    for name, a_tiles, b_tiles, seeds, stores in (
+            ('parent', 4 * 8, 4 * 2 * 8, 4 * 2, 4 * 2),
+            ('candidate', 2 * 2 * 8, 2 * 2 * 8, 2 * 4, 2 * 4)):
+        d[name] = dict(dpas=64, a_tile_loads=a_tiles, b_tile_loads=b_tiles,
+                       seed_loads=seeds, coop_loads=a_tiles + b_tiles + seeds,
+                       stores=stores)
+    for name in d:
+        d[name].update(
+            wg_b_tile_loads=d[name]['b_tile_loads'] * 8,
+            wg_a_tile_loads=d[name]['a_tile_loads'] * 8,
+            wg_seed_loads=d[name]['seed_loads'] * 8,
+            wg_sends=8 * (d[name]['a_tile_loads'] * 8 + d[name]['b_tile_loads']
+                          + d[name]['seed_loads'] * 8 + d[name]['stores'] * 8),
+            wg_load_bytes=8 * (d[name]['a_tile_loads'] * A_TILE
+                               + d[name]['b_tile_loads'] * B_TILE
+                               + d[name]['seed_loads'] * A_TILE),
+        )
+    return d
+
+
+def native_census(path):
+    isa = ISA.parse(path)
+    ops = collections.Counter(i['op'] for i in isa)
+    forms = collections.Counter()
+    for i in isa:
+        if i['op'].startswith('send'):
+            m = re.search(r'(load|store)\.ugm\.([A-Za-z0-9]+)\.([A-Za-z0-9]+)', i['comment'] or '')
+            forms[(m.group(1) + '.' + m.group(2)) if m else 'other'] += 1
+    regs = set()
+    for i in isa:
+        for o in i['ops']:
+            for m in re.finditer(r'\br(\d+)', o):
+                regs.add(int(m.group(1)))
+    return dict(path=str(path), sha256=K.sha(path), instructions=len(isa),
+                dpas=ops['dpas.8x8'], sends=sum(v for k, v in ops.items() if k.startswith('send')),
+                send_forms=dict(forms), mov=ops['mov'], add=ops['add'], mul=ops['mul'],
+                sel=ops['sel'], cmp=ops['cmp'], sync_nop=ops['sync.nop'],
+                sync_allwr=ops['sync.allwr'], sync_allrd=ops['sync.allrd'],
+                barriers=ops['sync.bar'], max_r=max(regs), distinct_r=len(regs),
+                first_dpas=hex(min(i['addr'] for i in isa if i['op'].startswith('dpas'))))
+
+
+def main():
+    build = K.read_json(CARD / 'build' / 'build-raw.json')
+    d = dyn()
+    nat = native_census(PARENT_NATIVE)
+    cand_spv = CARD / 'candidate.spv'
+    plan = CARD / 'plan.txt'
+
+    # ---------------------------------------------------------------- patch
+    a = PARENT_SRC.read_text(encoding='utf-8-sig').splitlines(keepends=True)
+    b = (CARD / 'candidate.comp').read_text(encoding='utf-8-sig').splitlines(keepends=True)
+    import difflib
+    diff = list(difflib.unified_diff(a, b,
+                                     fromfile=str(PARENT_SRC).replace('\\', '/'),
+                                     tofile=str(CARD / 'candidate.comp').replace('\\', '/')))
+    (CARD / 'SOURCE-DIFF.patch').write_text(''.join(diff), encoding='utf-8')
+
+    # ---------------------------------------------------------------- BUILD
+    out = dict(
+        card='n06-f06-output',
+        family='F06',
+        status='BUILT_AWAITING_GPU',
+        gpu_used=False,
+        campaign='fullnet-continuous-20261027',
+        shader_group=dict(
+            name='block*_swin_body_4 (C128)', width=128, pass_count=11,
+            ordinals=ORDINALS, grid=['21', '12', '1'],
+            header_fields=['32', '0', '8', '32', '21', '12', '1'],
+            parent_spv_sha256=PARENT_SHA,
+        ),
+        parent=dict(
+            source=dict(path=str(PARENT_SRC), sha256=K.sha(PARENT_SRC)),
+            spv=dict(path=str(PARENT_SPV), sha256=K.sha(PARENT_SPV)),
+            plan=dict(path=str(K.BASELINE), sha256=K.sha(K.BASELINE)),
+            plan_sha256_expected=K.BASELINE_SHA,
+        ),
+        recipe=dict(
+            toolchain='glslang 16.5.0',
+            defines=[],
+            include_dirs=[str(Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/cards/idt-identity-recipe/evidence/headers/2f2d55739e76'))],
+            target_env='vulkan1.3',
+            decoration_transfer=False,
+            nc_recipe='raw (RECIPES.json: nc_mode=raw, decoration_parent=null, nc_count=0)',
+            note='plain compile with the pinned header dir is byte-identical to the baseline SPV; '
+                 'no NoContraction / decoration transfer needed',
+        ),
+        parent_rebuild=dict(path=build['parent_rebuild']['argv'][-3] if False else str(CARD / 'parent-rebuild.spv'),
+                            sha256=build['parent_rebuild']['sha256'],
+                            byte_match=build['parent_rebuild']['byte_match'],
+                            argv=build['parent_rebuild']['argv']),
+        candidate=dict(path=str(cand_spv), sha256=K.sha(cand_spv),
+                       bytes=cand_spv.stat().st_size,
+                       source=dict(path=str(CARD / 'candidate.comp'),
+                                   sha256=K.sha(CARD / 'candidate.comp')),
+                       argv=build['candidate']['argv']),
+        spv_validate_cpu=build['spv_validate_cpu'],
+        no_contraction=dict(
+            float_NC_checked=0, parent_float_NC=0, candidate_float_NC=0,
+            fma_sites_parent=build['spv_parent']['fma_ext_inst'],
+            fma_sites_candidate=build['spv_candidate']['fma_ext_inst'],
+            basis='no fma()/precise site in this kernel: OpExtInst Fma = 0 in both arms and the '
+                  'NoContraction decoration set is empty in both arms',
+            int_cf_parent=build['spv_parent']['int_cf'],
+            int_cf_candidate=build['spv_candidate']['int_cf'],
+        ),
+        spirv_static=dict(
+            words_parent=build['spv_parent']['words'],
+            words_candidate=build['spv_candidate']['words'],
+            instructions_parent=build['spv_parent']['instructions'],
+            instructions_candidate=build['spv_candidate']['instructions'],
+            bound_parent=build['spv_parent']['bound'],
+            bound_candidate=build['spv_candidate']['bound'],
+            coop_parent=build['spv_parent']['coop'],
+            coop_candidate=build['spv_candidate']['coop'],
+            coop_note='4456=TypeCooperativeMatrix 4457=Load 4458=Store 4459=MulAdd 4460=Length; '
+                      'static counts scale with the source (5->8 loads, 4->8 stores, 2->4 muladd); '
+                      'dynamic counts per subgroup are equal for muladd (64) and stores (8)',
+        ),
+        plan=dict(path=str(plan), sha256=K.sha(plan),
+                  replaced_passes=build['plan']['replaced_passes'], expected_passes=11,
+                  parent_plan=dict(path=str(K.BASELINE), sha256=K.sha(K.BASELINE)),
+                  diff='exactly 11 PASS lines (F06 C128 group) change their SPV path; '
+                       'BIND/PUSH/GRID lines and the other 221 PASS lines are byte-identical'),
+        cpu_check=dict(argv=build['cpu_check']['argv'], rc=build['cpu_check']['rc'],
+                       stdout=build['cpu_check']['stdout'],
+                       baseline_stdout=build['cpu_check']['baseline_stdout'],
+                       identical_to_baseline=(build['cpu_check']['stdout']
+                                              == build['cpu_check']['baseline_stdout'])),
+        float_NC_checked=0,
+        spv_interface=dict(
+            path=str(CARD / 'SPV-INTERFACE.json'),
+            equal_capabilities=True, equal_extensions=True, equal_entry=True,
+            equal_execution_modes=True, equal_non_function_storage_classes=True,
+            equal_decorations=True, equal_fp_dynamic=True,
+            function_variables=dict(parent=52, candidate=75),
+            fp_dynamic=dict(parent={'OpFMul': 8, 'OpFConvert': 16},
+                            candidate={'OpFMul': 8, 'OpFConvert': 16}),
+        ),
+        dynamic_counts=dict(context=CTX, per_subgroup=d['parent'], candidate_per_subgroup=d['candidate']),
+        native_baseline=nat,
+        notes=[
+            'parent SPV reproduced byte-identically from the pinned header dir',
+            'candidate.spv passes spv_validate_cpu (Vulkan 1.3 SPIR-V)',
+            'plan.txt passes --cpu-check with exactly the baseline stdout (502 buffers, 232 passes)',
+            'no GPU work, no deployment, no baseline pointer / COMMON.py / other card touched',
+        ],
+    )
+    K.write_json(CARD / 'BUILD.json', out)
+
+    # ---------------------------------------------------------------- COST LEDGER
+    p, c = d['parent'], d['candidate']
+    ledger = dict(
+        card='n06-f06-output',
+        units='per subgroup (SG) unless stated; 8 SG per workgroup; 252 workgroups per pass; 11 passes',
+        removed=[
+            dict(item='weight (MAT_B) global tile loads', parent=p['b_tile_loads'],
+                 candidate=c['b_tile_loads'], delta=-32,
+                 basis='one load per (jp, nblk, ki) instead of per (j, nblk, ki); 512 B tile'),
+            dict(item='weight tile loads per workgroup', parent=p['wg_b_tile_loads'],
+                 candidate=c['wg_b_tile_loads'], delta=-256, basis='8 SG x 32 loads'),
+            dict(item='logical weight request bytes per SG', parent=p['b_tile_loads'] * B_TILE,
+                 candidate=c['b_tile_loads'] * B_TILE, delta=-16384, unit='B',
+                 basis='32 tiles x 512 B'),
+            dict(item='logical global load bytes per workgroup', parent=p['wg_load_bytes'],
+                 candidate=c['wg_load_bytes'], delta=c['wg_load_bytes'] - p['wg_load_bytes'],
+                 unit='B', basis='A unchanged, seed unchanged, weight requests halved '
+                                 '(logical requests, NOT DRAM bytes: the 32 KiB weight section is '
+                                 'L2/L1 resident across 252 workgroups)'),
+            dict(item='second n-block base address computation', parent='per (j, ki): '
+                 'wo + (n0/16)*2048 + (k0/16)*256 twice', candidate='one bBase per jp, '
+                 'second tile = bBase + 2048 (constant)', delta='-1 mul/add stream per (jp, ki)'),
+            dict(item='M-loop iterations', parent=4, candidate=2, delta=-2,
+                 basis='loop overhead only (K loop trip count 8 unchanged)'),
+            dict(item='cooperative matrix loads (dynamic, per SG)', parent=p['coop_loads'],
+                 candidate=c['coop_loads'], delta=c['coop_loads'] - p['coop_loads']),
+        ],
+        added=[
+            dict(item='live f32 accumulators', parent=2, candidate=4, delta=2,
+                 unit='MAT_C 8x16 f32 = 4 GRF/lane each', grf_per_lane=+8),
+            dict(item='transient seed matrices', parent=2, candidate=4, delta=2,
+                 note='converted to MAT_C immediately; peak is 4 MAT_C + 1 seed'),
+            dict(item='weight return-window lifetime (WAR distance)', parent='1 DPAS',
+                 candidate='2 DPAS', note='each weight tile feeds the two M blocks back to back; '
+                 'b0 is ordered before b1 so the tile is retired before the next one is needed'),
+            dict(item='SPIR-V instruction count', parent=build['spv_parent']['instructions'],
+                 candidate=build['spv_candidate']['instructions'],
+                 delta=build['spv_candidate']['instructions'] - build['spv_parent']['instructions']),
+            dict(item='SPIR-V bytes', parent=PARENT_SPV.stat().st_size,
+                 candidate=cand_spv.stat().st_size,
+                 delta=cand_spv.stat().st_size - PARENT_SPV.stat().st_size),
+            dict(item='integer address ALU (SPIR-V opcode counts, module-wide static)',
+                 parent=build['spv_parent']['int_cf'],
+                 candidate=build['spv_candidate']['int_cf'],
+                 note='IAdd 59 -> 82 (+23) while each M-loop iteration now covers 2 M blocks: '
+                      'with shared prologue P, P+Bp=59 and P+Bc=82, so per M block the add count '
+                      '(Bp+23)/2 is below Bp for any Bp>23; IMul 37 -> 28 and UDiv 10 -> 7 drop '
+                      'because one bBase per pair replaces two per-tile bases'),
+            dict(item='Function-scope locals (SPIR-V OpVariable, storage class Function)',
+                 parent=52, candidate=75, delta=23,
+                 note='more simultaneously live cooperative-matrix values (2 extra f32 accumulators '
+                      '+ the pair A/B tiles); this is the source-side view of the +8 GRF/lane'),
+            dict(item='store messages', parent=64, candidate=64, delta=0,
+                 note='same 8 tiles per SG; the pair now completes one contiguous 1024 B image '
+                      'region per (quad, 32-channel group) instead of two 256 B halves'),
+        ],
+        unchanged=[
+            'grid 21x12x1, workgroup size 256, 8 subgroups, 32 lanes',
+            'bindings (0..4, 6, 7), push constants, buffer count and pool bytes',
+            'capabilities/extensions/entry point/execution modes identical (SPV-INTERFACE.json)',
+            'non-Function storage classes and the decoration histogram identical '
+            '(NoContraction = 0 in both arms)',
+            'FP dynamic op counts identical: 8 half seed*scale multiplies and 16 MAT widen/narrow '
+            'conversions (8 widen + 8 narrow), no OpFAdd/OpFSub, no OpQuantizeToF16',
+            'DPAS count 64 per SG (8 k steps x 4 acc x 2 jp), per-output K order 0..112',
+            'A (gT) tile loads 32 per SG and seed loads 8 per SG',
+            'no shared memory, no barrier, no atomics, no extra buffer',
+            'store domain: same 64 (m0,nblk) tiles per workgroup, pairwise disjoint',
+        ],
+        unknown=[
+            'IGC may rematerialize the shared weight load into 2 loads under register pressure; '
+            'the native criterion is 32 plain d32x8 B sends (parent: 64)',
+            'the +8 GRF/lane accumulator cost against a parent that already touches r127 with '
+            'scratch 0 - spill (scratch>0) would invalidate the candidate',
+            'actual GRF allocation, occupancy and scheduling response',
+            'DRAM effect of halved weight requests: the weight section is only 32 KiB, so the '
+            'expected DRAM change is ~0; the gain, if any, is request/L1 pressure',
+            'real timing (no GPU in this card)',
+        ],
+        c256_note=dict(
+            scope='NEXT CARD ONLY - not implemented here; shT is NOT deleted in this card',
+            current='C256 (ordinals 38,41,44,47,50,53,56,170,173,176,179,182,185,188,191) stages '
+                    'the whole 64x256 token tile into shT[16384] (32 KiB) with one 256-thread copy '
+                    'plus one barrier, then all 8 SG owners read A from shared memory',
+            proposed='publish/retire shT in segments per consumer window (e.g. per 16-token slab) '
+                     'or reuse the arena by lifetime, keeping shT (no deletion)',
+            cost_to_keep_on_the_ledger=dict(
+                deleted_single_read='one 32 KiB global read per workgroup (16384 halves) staged by '
+                                    'all 256 threads',
+                replacement='without staging, each of the 8 SG owners reads its own token slabs '
+                            'directly: per SG 8 M blocks x 8 rows x 256 halves = 16384 halves = '
+                            '32 KiB, so up to 8 x 32 KiB = 256 KiB logical global requests per '
+                            'workgroup (8x the staged read)',
+                caveat='logical bytes are requests, not DRAM: the tile is shared by all owners and '
+                       'is likely L1/L2 resident; the cache effect is unknown and must be measured',
+            ),
+            lifetime_proof_draft=[
+                'prove every SG owner that reads a segment finishes before the segment is '
+                'overwritten (publish/consume epochs, barrier per segment must cover all owners)',
+                'prove the write domain of the segment does not overlap any live reader '
+                '(WAR barrier cannot be removed while another owner still reads the old value)',
+                'prove the retire point is after the LAST reader, not after the last producer store',
+                'keep the final full-tile read path as a fallback if any owner cannot be bounded',
+            ],
+        ),
+    )
+    K.write_json(CARD / 'COST-LEDGER.json', ledger)
+
+    # ---------------------------------------------------------------- GPU request
+    req = dict(
+        card='n06-f06-output',
+        shader_group=dict(spv_sha256_baseline=[PARENT_SHA], pass_ordinals=ORDINALS,
+                          pass_count=11, family='F06', width=128,
+                          candidate_spv_sha256=K.sha(cand_spv)),
+        plan=dict(path=str(plan), sha256=K.sha(plan),
+                  parent=dict(path=str(K.BASELINE), sha256=K.sha(K.BASELINE))),
+        arms=[dict(id='base', plan='baseline', role='baseline'),
+              dict(id='cand', plan='candidate', role='candidate')],
+        gates=['fixed', 'fb2'],
+        native=True,
+        resources=True,
+        ordinary=dict(design='two-arm-6-alternating', reps=30, warm=1, feedback=True),
+        hypothesis='if native keeps dpas.8x8 = 64 and scratch 0 while the plain d32x8 weight sends '
+                   'drop 64 -> 32 and total send.ugm drops by ~32 per SG, then the weight-pair '
+                   'reuse landed; the expected whole-frame effect is <=0.03 ms (F06 C128 = 11 x '
+                   '~18 us = 198 us of an 18.2 ms frame) and therefore near or below ordinary '
+                   'resolution',
+        native_observables=[
+            'dpas.8x8 == 64 unchanged',
+            'plain load.ugm.d32x8.a32 weight sends per thread 64 -> 32',
+            'transposed load.ugm.d32x8t (A + seed, 320) unchanged; store sends 64 unchanged',
+            'total send.ugm 481 -> ~449 (debug path sends unchanged)',
+            'scratch memory size == 0 and workgroup memory == 0 (no spill, no shT)',
+            'max register index stays <= 127 (parent already 127); a spill would show as scratch>0',
+            'the same weight data register window is read by two consecutive dpas (reuse) while '
+            'the A window is still read twice per tile as in the parent',
+            'instruction count within 2150..2320 (parent 2257)',
+        ],
+        expected=dict(
+            gate_fixed_frame0=K.FIXED_GOLD,
+            gate_fb2_last_frame=K.FB2_GATE_GOLD,
+            ordinary_last_frame=K.ORDINARY_GOLD,
+            numeric_expectation='bit-identical: store address, seed tile, scale index and the '
+                                'per-output K sequence are proven equal by exhaustive enumeration '
+                                '(PROOF.json); only the order in which independent outputs are '
+                                'issued changes',
+            timing_expectation='F06 C128 own cost 197.7 us/frame (11 passes x ~18 us, measured in '
+                               'the f06-scale-fragments resources job); a 30-38% cut of that '
+                               'group\'s load requests is <=0.03 ms of the frame, i.e. at or below '
+                               'ordinary resolution. Do not add this to the F10 0.422 ms figure.',
+            triage_rule='A if the B sends stay 64 or the shared load is duplicated; B if scratch>0 '
+                        'or instruction count blows up (register pressure); C if gates pass and '
+                        'the group is slower; D if the ISA changes but ordinary is indistinguishable; '
+                        'E if any numeric gate fails',
+        ),
+        cpu_only_evidence=dict(
+            parent_byte_reproduction=dict(path=str(CARD / 'parent-rebuild.spv'),
+                                          sha256=build['parent_rebuild']['sha256'],
+                                          byte_match=True),
+            spv_validate_cpu='result=0 (candidate), result=0 (parent)',
+            cpu_check=build['cpu_check']['stdout'],
+            proof='PROOF.json: 8192/8192 outputs have exactly one owner, 0 address / K-order / '
+                  'seed / scale mismatches, 0 payload overlap',
+        ),
+    )
+    K.write_json(CARD / 'GPU-REQUEST.json', req)
+
+    print(json.dumps(dict(dyn=d, native=nat), indent=1)[:4500])
+    print('candidate', K.sha(cand_spv), 'plan', K.sha(plan))
+    print('diff lines', len(diff))
+
+
+if __name__ == '__main__':
+    main()

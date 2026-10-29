@@ -1,0 +1,247 @@
+"""Index / mapping / boundary proof for n12b-f14-scale (CPU only, no GPU).
+
+Enumerates, not samples:
+  * the F14 producer write set   -> 288 live tokens x 3072 channels
+  * the F15 consumer read set    -> same set (Q/K/V chunk bases included)
+  * the Q scale factor map       -> every written Q element's factor is scale[p2.z + n/32]
+  * the scalar-load counts       -> per (gx, gy, sg, group) instance, parent vs candidate
+  * plan binding facts           -> p2.z = 0, Scales 128 B, QKV 1,769,472 B, distinct buffers
+
+Writes evidence/INDEX-PROOF.json.
+"""
+import json
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+CAMPAIGN = CARD.parent.parent
+sys.path.insert(0, str(CAMPAIGN))
+import COMMON as K  # noqa: E402
+
+EVID = CARD / 'evidence'
+
+P0X = 288          # live tokens, pc.p0.x in every F14 call
+K_STRIDE = 1024
+ROW = 3072
+GRID = (3, 96, 1)
+F14_PASS_LINES = [1516, 1571, 1626, 1681, 1736, 1791, 1846, 1901]
+
+
+def producer_set():
+    elems = {}
+    dup = 0
+    out_of_row = 0
+    padding_writes = 0
+    per_token = {}
+    for gx in range(GRID[0]):
+        for gy in range(GRID[1]):
+            n0 = gy * 32
+            for sg in range(8):
+                mA = gx * 128 + sg * 8
+                for group in range(2):
+                    m = mA if group == 0 else mA + 64
+                    if m >= P0X:
+                        continue
+                    for ci in range(4):
+                        for lane in range(32):
+                            t = m + 2 * ci + (lane >> 4)
+                            col = lane & 15
+                            if t >= 384:
+                                continue
+                            if t >= P0X:
+                                padding_writes += 1
+                                continue
+                            for side in range(2):
+                                n = n0 + side * 16 + col
+                                key = (t, n)
+                                dup += key in elems
+                                elems[key] = (gx, gy, sg, group, ci, lane, side)
+                                per_token.setdefault(t, set()).add(n)
+                                if n >= ROW:
+                                    out_of_row += 1
+    return elems, dup, out_of_row, padding_writes, per_token
+
+
+def consumer_set():
+    """F15 reads qkv[t*3072 + S + h*32 + c] for S in {0,1024,2048}, h 0..31, c 0..31."""
+    s = set()
+    for t in range(P0X):
+        for S in (0, K_STRIDE, 2 * K_STRIDE):
+            for h in range(32):
+                for c in range(32):
+                    s.add((t, S + h * 32 + c))
+    return s
+
+
+def scale_map(elems):
+    """Every Q-written element must be multiplied by scale[p2.z + n//32]."""
+    bad = []
+    heads = {}
+    per_head_elements = {}
+    for (t, n), w in elems.items():
+        if n >= 2048:
+            continue                      # V segment: no norm, no scale
+        head = n // 32
+        if n < 1024:
+            idx = head                    # p2.z = 0
+            heads.setdefault(head, set()).add(idx)
+            per_head_elements[head] = per_head_elements.get(head, 0) + 1
+        else:
+            heads.setdefault(head, set()).add('K:no_scale')
+        # the factor the Q element uses must be the one for its own head
+        if n < 1024 and n != head * 32 + (n % 32):
+            bad.append((t, n))
+    one_to_one = all(len(v) == 1 for v in heads.values())
+    return dict(
+        heads=len(heads), one_to_one=one_to_one,
+        per_head={str(h): sorted(v) for h, v in sorted(heads.items())},
+        bad=bad[:8],
+        q_elements_per_head=per_head_elements,
+        statement='for Q the factor index is n//32 == gy (n0=gy*32, side*16+col<32), '
+                  'so every output of head h is multiplied by scale[p2.z+h]; '
+                  'K/V outputs use vq_scale_k with no factor at all',
+    )
+
+
+def load_counts():
+    """Scalar-load instances per dispatch, unit = one (gx,gy,sg[,group]) execution."""
+    parent = 0
+    cand_exec = 0
+    cand_used = 0
+    cand_dead = 0
+    uses = 0
+    per_gy = {}
+    for gx in range(GRID[0]):
+        for gy in range(32):                       # Q segment
+            n0 = gy * 32
+            assert n0 < 1024
+            for sg in range(8):
+                mA = gx * 128 + sg * 8
+                live = [g for g in range(2) if (mA if g == 0 else mA + 64) < P0X]
+                parent += len(live)                # one read per live group
+                uses += len(live)                  # every live group uses the value
+                cand_exec += 1                     # one read per Q work-item
+                if live:
+                    cand_used += 1
+                else:
+                    cand_dead += 1
+                per_gy.setdefault(gy, dict(parent=0, cand=0))
+                per_gy[gy]['parent'] += len(live)
+                per_gy[gy]['cand'] += 1
+    kv_parent = 0
+    kv_cand = 0
+    return dict(
+        unit='one execution of the scalar coefficient load per (gx,gy,sg[,group]) instance; '
+             'K/V work-items execute it zero times in both arms',
+        q_workitems=GRID[0] * 32 * 8,
+        parent_q_loads=parent,
+        candidate_q_loads=cand_exec,
+        candidate_used=cand_used,
+        candidate_dead=cand_dead,
+        value_uses=uses,
+        saved=parent - cand_exec,
+        saved_pct=round(100.0 * (parent - cand_exec) / parent, 2),
+        kv_loads=dict(parent=kv_parent, candidate=kv_cand),
+        per_gy_first3={gy: per_gy[gy] for gy in (0, 1, 31)},
+        note='parent emits one scalar load per live group (the driver unrolls the 2-iteration '
+             'group loop); the candidate emits one per Q work-item and reuses it for both groups',
+    )
+
+
+def plan_facts():
+    plan = (CARD / 'plan.txt').read_text(encoding='utf-8-sig').splitlines()
+    facts = []
+    for ln in F14_PASS_LINES:
+        pass_line = plan[ln - 1]
+        assert pass_line.startswith('PASS '), pass_line[:60]
+        push = plan[ln - 2]
+        assert push.startswith('PUSH '), push[:60]
+        args = [int(x) for x in push.split()[1:]]
+        assert len(args) == 32, len(args)
+        p2 = args[8:12]
+        binds = {}
+        j = ln
+        while j < len(plan) and plan[j].startswith('BIND '):
+            b = plan[j].split()
+            binds[int(b[1])] = dict(buffer=int(b[2]), offset=int(b[3]), size=int(b[4]))
+            j += 1
+        facts.append(dict(
+            pass_line=ln, name=pass_line.split('"')[1],
+            p2=p2, p2z=p2[2], p0x=args[0],
+            scales_binding=binds[1], qkv_binding=binds[6],
+            scales_qkv_distinct=binds[1]['buffer'] != binds[6]['buffer'],
+            scales_bytes=binds[1]['size'], qkv_bytes=binds[6]['size'],
+        ))
+    return dict(
+        rows=facts,
+        all_p2z_zero=all(f['p2z'] == 0 for f in facts),
+        all_p0x_288=all(f['p0x'] == 288 for f in facts),
+        all_scales_128B=all(f['scales_bytes'] == 128 for f in facts),
+        all_distinct_buffers=all(f['scales_qkv_distinct'] for f in facts),
+        statement='scales has 32 float slots (128 B); p2.z = 0 in all eight calls; '
+                  'the Q factor index is 0..31 (in bounds); the QKV buffer is a different '
+                  'pool object, so hoisting the read above the qkv stores cannot alias',
+    )
+
+
+def main():
+    elems, dup, out_of_row, padding_writes, per_token = producer_set()
+    cons = consumer_set()
+    prod = set(elems)
+    scale = scale_map(elems)
+    loads = load_counts()
+    plan = plan_facts()
+    token_cov = {t: len(ns) for t, ns in per_token.items()}
+    out = dict(
+        schema='n12b-f14-scale/index-proof/v1',
+        card='n12b-f14-scale',
+        family='F14',
+        ordinals=[95, 100, 105, 110, 115, 120, 125, 130],
+        producer=dict(
+            elements=len(prod), expected=P0X * ROW, equals_expected=len(prod) == P0X * ROW,
+            duplicate_writes=dup, writes_outside_row=out_of_row,
+            padding_writes=padding_writes,
+            tokens_written=len(token_cov), token_min=min(token_cov), token_max=max(token_cov),
+            channels_per_token=sorted(set(token_cov.values())),
+            tokens_with_full_row=sum(1 for v in token_cov.values() if v == ROW),
+        ),
+        consumer=dict(
+            elements=len(cons),
+            producer_equals_consumer=prod == cons,
+            producer_only=sorted(prod - cons)[:8],
+            consumer_only=sorted(cons - prod)[:8],
+            statement='F15 reads qkv[t*3072 + S + h*32 + c] with S in {0,1024,2048}; '
+                      'the union over h,c is the whole 3072-channel row, so the set is '
+                      'exactly {0..287} x {0..3071}',
+        ),
+        scale=scale,
+        loads=loads,
+        plan=plan,
+        tail=dict(
+            live_tokens=P0X, fragment_rows=8, groups=P0X // 8,
+            group_guard_equivalent=(P0X % 8 == 0),
+            padding_first=288, padding_written=padding_writes,
+            key_chunk=64, key_chunks=(P0X + 63) // 64, full_key_chunks=P0X // 64,
+            tail_keys=P0X % 64, tail_body_taken=(P0X % 64) != 0,
+        ),
+        boundary=dict(
+            v_end=dict(n0=3040, c=31, n=3071, inside=True),
+            head31=dict(Q=[992, 1023], K=[2016, 2047], V=[3040, 3071]),
+            scale_index_max=31, scale_slots=32,
+        ),
+    )
+    K.write_json(EVID / 'INDEX-PROOF.json', out)
+    print(json.dumps({k: out[k] for k in ('producer', 'consumer', 'loads', 'tail')}, indent=2)[:3000])
+    print('scale one_to_one', scale['one_to_one'], 'heads', scale['heads'])
+    print('plan p2z0', plan['all_p2z_zero'], 'distinct', plan['all_distinct_buffers'],
+          'scalesB', sorted({f['scales_bytes'] for f in plan['rows']}))
+    assert out['producer']['equals_expected'] and out['producer']['duplicate_writes'] == 0
+    assert out['producer']['padding_writes'] == 0 and out['producer']['writes_outside_row'] == 0
+    assert out['consumer']['producer_equals_consumer']
+    assert scale['one_to_one'] and not scale['bad']
+    assert loads['candidate_q_loads'] < loads['parent_q_loads']
+    assert plan['all_p2z_zero'] and plan['all_distinct_buffers'] and plan['all_scales_128B']
+
+
+if __name__ == '__main__':
+    main()

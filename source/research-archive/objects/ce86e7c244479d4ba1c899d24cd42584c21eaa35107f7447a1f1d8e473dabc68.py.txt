@@ -1,0 +1,143 @@
+"""NoContraction transfer, aligned by FP-site ordinal per function.
+
+Provenance: this file is a copy of cards/n01b-f02-load-side/nc_transfer.py (same
+shader family, same recipe family).  It is card-local because the campaign
+helper `spv_tools_local.transfer_decoration_pattern_aligned` needs a difflib
+match over a (opcode, word-count) skeleton, which this family's repetitive
+OpLoad/OpFMul skeleton does not pin down; the ordinal transfer below does.
+
+Per function, per opcode class, the ordered list of sites and of their ID-free
+operand signatures must be identical between parent and child.  When that holds
+there is exactly one order-preserving bijection between the two lists, and that
+bijection is the correspondence.  Asserts:
+  A1 per (function, opcode class): same length,
+  A2 per (function, opcode class): identical ordered operand-signature sequence,
+  A3 per (function, opcode class): identical count of decorated sites.
+
+CPU only, card-local; COMMON.py is imported, never modified.
+"""
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+BASE = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+            'fullnet-continuous-20261027')
+sys.path.insert(0, str(BASE))
+import COMMON as K
+
+ST = K.ST
+
+NC_OPCODES = (12, 129, 131, 133, 136, 137)
+OPNAME = {12: 'Fma', 129: 'OpFAdd', 131: 'OpFSub', 133: 'OpFMul', 136: 'OpFDiv',
+          137: 'OpSRem'}
+
+
+def _sites(module, region, opcode):
+    out = []
+    for i in region:
+        op, ops, _, _ = module.instructions[i]
+        if op != opcode:
+            continue
+        if opcode == 12 and not (len(ops) >= 5 and ops[3] == 50):
+            continue
+        rid = ST.result_id_of(op, ops)
+        if rid is None:
+            continue
+        out.append((i, rid, module.operand_signature(rid, 3)))
+    return out
+
+
+def transfer(parent_path, child_path, out_path):
+    parent = ST.Module(Path(parent_path))
+    child = ST.Module(Path(child_path))
+    preg, creg = ST.function_regions(parent), ST.function_regions(child)
+    assert len(preg) == len(creg), ('function count changed', len(preg), len(creg))
+    pnc = set(ST.no_contraction_ids(parent))
+    keep = set()
+    rows = []
+    for fi, (pr, cr) in enumerate(zip(preg, creg)):
+        for opcode in NC_OPCODES:
+            ps = _sites(parent, pr, opcode)
+            cs = _sites(child, cr, opcode)
+            ndec_p = sum(1 for _, rid, _ in ps if rid in pnc)
+            if not ps and not cs:
+                continue
+            assert len(ps) == len(cs), ('site count changed', fi, OPNAME[opcode],
+                                        len(ps), len(cs))
+            assert [x[2] for x in ps] == [x[2] for x in cs], \
+                ('operand-signature sequence changed', fi, OPNAME[opcode])
+            for (_, prid, _), (_, crid, _) in zip(ps, cs):
+                if prid in pnc:
+                    keep.add(crid)
+            ndec_c = sum(1 for _, rid, _ in cs if rid in keep)
+            assert ndec_p == ndec_c, ('decorated count changed', fi, OPNAME[opcode],
+                                      ndec_p, ndec_c)
+            rows.append({'function_index': fi, 'opcode': OPNAME[opcode],
+                         'sites': len(ps), 'parent_decorated': ndec_p,
+                         'candidate_decorated': ndec_c,
+                         'signature_sequence_identical': True})
+    ST.set_no_contraction(child, keep, out_path)
+    info = {'method': 'per-(function, opcode-class) order-preserving bijection on '
+                      'identical operand-signature sequences',
+            'nc_count': len(keep), 'parent_nc': len(pnc), 'rows': rows}
+    return keep, info
+
+
+def _norm(sig):
+    """Drop the component index inside an access-chain signature.
+
+    'the k-th f32 add of this function reads a component access of some
+    cooperative-matrix variable' is what the ordinals pair; WHICH component of
+    WHICH variable is deliberately not part of the fingerprint, because n02d
+    re-indexes the bias operand from site-local 0..3 to band-local 4*b+c (a
+    within-lane permutation of the same 16x64 tile).  Every other opcode class
+    keeps the strict signature.
+    """
+    if isinstance(sig, tuple):
+        if (len(sig) == 2 and sig[0] == 'load' and isinstance(sig[1], tuple)
+                and len(sig[1]) == 2 and sig[1][0] == 'accesschain'
+                and isinstance(sig[1][1], tuple) and len(sig[1][1]) == 1
+                and isinstance(sig[1][1][0], tuple) and sig[1][1][0][0] == 'const'):
+            return ('load', ('accesschain', ('_',)))
+        return tuple(_norm(x) for x in sig)
+    return sig
+
+
+def transfer_relaxed(parent_path, child_path, out_path, relax_opcodes=(129,)):
+    """transfer() with the component index of an access-chain operand dropped for
+    `relax_opcodes` only; every other assertion stays (counts, order, decorated counts).
+    """
+    parent = ST.Module(Path(parent_path))
+    child = ST.Module(Path(child_path))
+    preg, creg = ST.function_regions(parent), ST.function_regions(child)
+    assert len(preg) == len(creg), ('function count changed', len(preg), len(creg))
+    pnc = set(ST.no_contraction_ids(parent))
+    keep = set()
+    rows = []
+    for fi, (pr, cr) in enumerate(zip(preg, creg)):
+        for opcode in NC_OPCODES:
+            ps = _sites(parent, pr, opcode)
+            cs = _sites(child, cr, opcode)
+            if not ps and not cs:
+                continue
+            ndec_p = sum(1 for _, rid, _ in ps if rid in pnc)
+            assert len(ps) == len(cs), ('site count changed', fi, OPNAME[opcode], len(ps), len(cs))
+            pseq = [_norm(x[2]) if opcode in relax_opcodes else x[2] for x in ps]
+            cseq = [_norm(x[2]) if opcode in relax_opcodes else x[2] for x in cs]
+            assert pseq == cseq, ('operand-signature sequence changed', fi, OPNAME[opcode])
+            for (_, prid, _), (_, crid, _) in zip(ps, cs):
+                if prid in pnc:
+                    keep.add(crid)
+            ndec_c = sum(1 for _, rid, _ in cs if rid in keep)
+            assert ndec_p == ndec_c, ('decorated count changed', fi, OPNAME[opcode],
+                                      ndec_p, ndec_c)
+            rows.append({'function_index': fi, 'opcode': OPNAME[opcode], 'sites': len(ps),
+                         'parent_decorated': ndec_p, 'candidate_decorated': ndec_c,
+                         'signature_relaxed': opcode in relax_opcodes,
+                         'signature_sequence_identical': True})
+    ST.set_no_contraction(child, keep, out_path)
+    info = {'method': 'per-(function, opcode-class) order-preserving bijection; the component '
+                      'index of an access-chain operand is dropped for OpFAdd only (n02d bias '
+                      'operand re-indexing), strict elsewhere',
+            'nc_count': len(keep), 'parent_nc': len(pnc), 'rows': rows}
+    return keep, info

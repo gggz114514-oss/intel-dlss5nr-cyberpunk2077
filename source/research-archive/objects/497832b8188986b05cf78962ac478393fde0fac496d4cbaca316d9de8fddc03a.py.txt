@@ -1,0 +1,71 @@
+"""S05 step 2: block9 CPU forward baseline with the bound pack, three teacher frames.
+
+Reports, against the FP16 teacher Y and under the *common teacher input* X:
+  * old local relL2 of the bound arm (qX residual, D = 1)
+  * the same arm with the parent half residual substituted for the qX residual
+    (DIAGNOSTIC ONLY: no such shader/buffer exists for block9, see STATUS.txt)
+  * qX / A / M saturation counts and per-frame numbers
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import s05_common as C
+
+TEACHERS = [('34189', C.D / 'dump-fp16'),
+            ('41444', C.D / 'teacher-diagnostics/teacher-41444'),
+            ('43654', C.D / 'teacher-diagnostics/teacher-43654')]
+
+data = C.rows()
+buf = data['buffers']
+r1 = C.row_by_name('block9_swin_body_1', data)
+b1 = {int(k): v for k, v in r1['bindings'].items()}
+push = [int(x) for x in r1['push']]
+pk = C.decode_pack(buf[b1[0][0]]['file'], buf[b1[1][0]]['file'], buf[46]['file'], push)
+sc = pk['sc']
+
+frames = []
+for tag, td in TEACHERS:
+    X = C.load_x(td / 'dump_block8_out.bin')
+    Y = C.load_y(td / 'dump_swin_9_Y.bin')
+    qX = C.code(X * np.float32(sc[1]))
+    de = np.rint(qX @ pk['we8'].astype(np.float32).T)
+    h = C.half(de * sc[16:528][None, :])
+    a = C.act(h)
+    qa = C.code(a * np.float32(sc[2]))
+    mo = np.empty((qa.shape[0], 128), np.float32)
+    for g in range(4):
+        mo[:, g * 32:(g + 1) * 32] = qa[:, g * 128:(g + 1) * 128] @ pk['wm8'][g * 32:(g + 1) * 32].astype(np.float32).T
+    mid = np.rint(mo) * np.float32(sc[528:656])[None, :]
+    qm = C.code(mid * np.float32(sc[3]))
+    dc = np.rint(qm @ pk['wc8'].astype(np.float32).T)
+    Yq = C.half(dc * np.float32(sc[656:784])[None, :] + qX * np.float32(sc[784:912])[None, :])
+    Yh = C.half(dc * np.float32(sc[656:784])[None, :] + X * np.float32(sc[784:912])[None, :])
+    frames.append(dict(
+        frame=tag,
+        tokens=int(X.shape[0]),
+        x_absmax=float(np.abs(X).max()), y_absmax=float(np.abs(Y).max()),
+        qx_at_127=int((np.abs(qX) == 127).sum()), qx_elements=int(qX.size),
+        a_at_127=int((np.abs(qa) == 127).sum()),
+        m_at_127=int((np.abs(qm) == 127).sum()),
+        old_rel_l2_qx_residual=C.rel(Yq, Y),
+        diag_rel_l2_half_residual=C.rel(Yh, Y),
+        old_rmse=float(np.sqrt(((Yq - Y) ** 2).mean())),
+        y_rms=float(np.sqrt((Y.astype(np.float64) ** 2).mean())),
+    ))
+    print(json.dumps(frames[-1]), flush=True)
+
+out = dict(
+    card='S05-c128', block=9, mode='CPU_ONLY',
+    input='teacher dump_block8_out.bin (FP16, image-half layout) -> token-major (16128,128)',
+    target='teacher dump_swin_9_Y.bin (FP16, token-major (w*64+m)*128+n)',
+    arm='bound plan block9_swin_body_1/2: C-d1/C-d2 (v4-m8col), qX residual, D=1',
+    scope='common FP16 teacher input; not the actual quantised upstream input; GPU not run',
+    frames=frames,
+    mean_old_rel_l2=float(np.mean([f['old_rel_l2_qx_residual'] for f in frames])),
+)
+(C.CARD / 'evidence' / 'BASELINE-CPU.json').write_text(json.dumps(out, indent=2))
+print('mean old relL2', out['mean_old_rel_l2'])

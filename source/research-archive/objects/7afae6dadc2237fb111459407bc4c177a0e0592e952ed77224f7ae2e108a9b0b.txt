@@ -1,0 +1,27 @@
+
+第三轮：QKV→QK→PV→输出投影生产消费（ATTENTION-CHAIN-CPU-PROOF.json）
+I-PC9：split16 l2最终context直接生成T/qT（当前inline父；16位置逐plan确认宏）
+源A/source/l2/split16_attention_qkv_int8_inline.comp末尾将CH写入已退休Q前缀qkv[sg*128]，随后标量读回。这不是矩阵消费者要求的重排。用row=2*ci+(lane>>4)、col=lane&15直接取CH[ci]，调用原window_token(wx,wy,sg*8+row,valid)，有效时按tiled(t,h*32+side*16+col,512)写gt和/或qt，保留L2_NO_T_WRITE、L2_INLINE_QT以及原half→invT/RNE/clamp边界。
+CPU每WG2048元素地址与原路径一致。删除每WG4096B共享写/同量读和32次SG barrier执行；qkv声明不能因此删除，Q/K/V前段仍使用它。R12改为转置register-P owner后输出坐标不同，此卡的row=token公式不得直接套转置片段；应使用key/query/dim语义重做映射。block30是否inline及是否有T读者单列。
+
+I-PC10 / R12实施补充：split16全INT8 QK/PV与同SG P→K32 B接口
+复用当前FP16 s22-register-p的四个SG×16query owner结构作为组织参考，但QK与PV必须换成INT8 MMA，不能只移植后宣称覆盖完成。QK取K8×32和Q^T32×16，INT32→本臂scale→原bias→half→exp；全部64key片段的原half den树完成后，保持H(P*inv)这一步，再量化P。
+P^T32×16由四个8×16 CH片段构成；直接量化每个CH分量并打包4字节word，不经SLM。沿已测B映射：frag=ci>>2，sourceLane=(lane>>2)+16*(lane&1)+8*(ci&1)，sourceByte=2*((ci>>1)&1)+((lane>>1)&1)。每lane每K32仅8个不同shuffle来源对，可沿现有generated adapter合并。CPU用该映射重建全部512 B槽，两个K32的V32×64·P64×16输出512分量整数一致。这个证明只覆盖量化后codes与矩阵角色，不证明scale/浮点/新shader。
+一次保留完整64key未归一化P的8个half片段是当前norm-before-PV合同需要，逻辑64B/lane；den完成后按前四片/后四片分别归一化→quant-pack→Bjoin→PV，尽快结束已消费P寿命。不要同时保留8个half P、全部归一化副本、全部INT8副本。ctx四个INT32片段逻辑64B/lane；压缩P与创建ctx的先后要在native峰值图上核对。
+PV操作数A是V^T8×32，split V物理布局[dim][key]，ROW stride64；两个K32按0、32消费，禁止把旧K16 Bjoin或ViT V物理布局直接套上。共同的K范围内scale因子不变时才能累加同一INT32后统一dequant；分chunk动态scale需另订本臂dequant/累加合同，不能把不同scale的INT32直接相加。|dot|上界K64为1032256，K32 QK为516128（codes绝对值≤127），这只是整数范围检查，不是画质资格。
+最终context按原最终half点生成qT，接已INT8投影；普通15位置与block30的pool/head后继分开。完成R12后phase若不再有P或debug临时读者可删除，但sy8输入缓存仍有自己的生命周期，不能按FP16 phase结论重复计节省。
+
+I-PC11 / R12：QKV从M16×N48改为M8×N96，完整norm owner
+现父sg偶数生产Q32+K前16，sg奇数生产K后16+V32；64行K均跨两个SG，直接套ViT norm-owner会漏半行。改为sg持有token[sg*8,sg*8+8)的全部Q32/K32/V32，每SG仍六个INT32累加器、逻辑96B/lane，不需要十二个累加器。K32步进/逐输出K顺序不变，A每K由2次load变1，B由3次变6：明确增加权重读取，不承诺提速。
+Q/K各由一对MH完成norm32相同half树，owner reciprocal广播；Q保持H(H(Q*nq)*scale)，K保持H(K*nk)，绝不照搬ViT的5.65625乘法。CPU64行norm树位级一致，rsqrt沿原路径仍需GPU门。
+先将六个INT32窄化到六个half片段再进入norm，可让宽值退休，half总payload48B/lane；与逐对窄化版本比较native，后者norm时可能还留四个宽累加器64B+两half16B。不通过动态coopmat数组管理，采用具名变量/编译期展开。
+归一化产生处直接写Q8/K8；V在原half窄化后直接量化写V8。保持必要的最终跨SG发布。FP16中间组织版本仅写normalized half Q/K/V，删raw Q/K共享写读各8192B及raw→norm发布barrier；诊断raw QKV从片段直接写原debug位置，不能删除诊断语义。最终全INT8采用独立QKV8[6144]布局时sy8[4096]可与其前4096字节阶段复用，前提保留最后kc输入读取退休WG barrier后才首次写QKV8，并保留最终发布；debug不再读被覆盖sy8。
+注意新QKV owner是8query/SG，而register-P消费者是16query/SG，二者仍不对齐，不能因此声称Q也零共享。先保留Q8桥；若为完全对齐改四SG×16token×N96，会把每活跃SG累加器升为十二个、192B/lane，且其它四SG闲置，不列为默认方案。
+
+R15接口落地补充：ViT P→PV采用同一K32 Bjoin但保持本核den时机
+ViT原P未归一化进入PV，最终reciprocal在全部5个64key chunk之后。每个K32收集两个连续16key组；每组先完成原half exp、原den更新、padding处理，再量化并打包，四个8×16片段形成B。不能拿split的H(P*inv)提前归一化路径套ViT。尾部padding在den内仍贡献exp(0)，PV代码必须为0，最后pad subtraction原位置保留。
+V^T来自ViT [key][dim]的sv8，A8×32用COL stride32；与split ROW stride64不同。共用K因子时可跨320key累加INT32（上界5161280），最终dequant→原numerator half→half inverse乘→qT；若用不同chunk scale，必须具名改变合成方式并重新定义本臂参考，不可悄悄统一累加。不要同时保留半精度与INT8全套sk/sv；QKV生产者输出独立consumer-format codes，注意5个query-WG都消费同一head K/V，不宜重复执行QKV。
+
+I-PC12：ViT attention PV与epilogue短寿命组织，配合F15-L
+在每个kb中把vf0..vf3同时load再MMA，改为单个MA vf依次load→对应ctx MMA，保持ctx0/1/2/3各自K顺序；源级四个A片段32B/lane→一个8B/lane，是否native原已调度等价先查。最终四个num、四个out、inverse及量化MF8同时定义的写法改成每个ctx依次narrow→原num debug→half inverse乘→quant→store，当前未消费ctx仍活，不把其64B假装消失。保留每个数值边界及debug坐标。
+最后一chunk的WAR barrier没有后继覆盖，可用WG一致条件j0+64<pc.p0.y保留前4次退休、去最后1次；5次publication均保留。每WG10→9，8位置共1280次WG barrier执行可删（源级）。条件不得置于score_owner分支内，不能删除跨chunk WAR。future双缓冲/arena复用若引入末尾共享读者，重新证明，不继承本裁定。

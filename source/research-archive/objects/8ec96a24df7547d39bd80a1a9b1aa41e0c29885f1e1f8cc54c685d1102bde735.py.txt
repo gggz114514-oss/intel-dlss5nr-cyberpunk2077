@@ -1,0 +1,107 @@
+"""n26-f08-order: read-only parser for the port-network plan format.
+
+Only reads plan files (accepted / card / queue copies) and prints the F08 l0
+dispatch block (BIND + PUSH + PASS) so the shader's index algebra can be
+checked against the grid that was actually dispatched.
+
+Never writes anything outside cards/n26-f08-order/.
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent.parent  # fullnet-continuous-20261027
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def parse(path):
+    bufs = []          # index -> {name, bytes, src}
+    passes = []        # list of dicts in file order
+    cur = None
+    for ln, line in enumerate(Path(path).read_text(encoding='utf-8', errors='replace').splitlines(), 1):
+        if not line.strip():
+            continue
+        tok = line.split()
+        kind = tok[0]
+        if kind == 'BUFFER':
+            # BUFFER "<name>" <bytes> "<src>"
+            name = line.split('"')[1]
+            rest = line.split('"')[2].split()
+            nbytes = int(rest[0])
+            src = line.split('"')[3] if line.count('"') >= 4 else ''
+            bufs.append({'name': name, 'bytes': nbytes, 'src': src})
+        elif kind == 'PASS':
+            cur = {'line': ln, 'row': int(tok[1]), 'name': tok[2], 'spv': tok[3],
+                   'fields': [int(x) for x in tok[4:]], 'binds': [], 'push': None}
+            passes.append(cur)
+        elif kind == 'BIND':
+            if cur is None:
+                continue
+            cur['binds'].append({'slot': int(tok[1]), 'buf': int(tok[2]),
+                                 'off': int(tok[3]), 'bytes': int(tok[4]), 'line': ln})
+        elif kind == 'PUSH':
+            if cur is None:
+                continue
+            cur['push'] = {'line': ln, 'count': int(tok[1]), 'words': [int(x) for x in tok[2:]]}
+    return bufs, passes
+
+
+def f08(passes):
+    return [p for p in passes if p['name'].startswith('split16_b') and p['name'].endswith('_l0')]
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 1
+    path = sys.argv[1]
+    bufs, passes = parse(path)
+    print('plan', path)
+    print('sha256', sha(path), 'bytes', Path(path).stat().st_size)
+    print('buffers', len(bufs), 'passes', len(passes))
+    f = f08(passes)
+    print('F08 l0 passes', len(f), 'rows', [p['row'] for p in f])
+    print('grids', sorted({tuple(p['fields'][4:7]) for p in f}))
+    grp = {}
+    for p in f:
+        grp.setdefault(p['spv'], []).append(p['row'])
+    for spv, rows in grp.items():
+        print('  spv', spv, 'sha', sha(spv) if Path(spv).exists() else 'MISSING', 'rows', rows)
+    p = f[0]
+    print('\n--- first F08 pass block (plan line %d) ---' % p['line'])
+    print('PASS', p['row'], p['name'], 'fields', p['fields'])
+    for b in p['binds']:
+        bi = b['buf']
+        nm = bufs[bi]['name'] if 0 <= bi < len(bufs) else '?'
+        print('  BIND slot=%d buf=%d off=%d bytes=%d  name=%s bufbytes=%s src=%s'
+              % (b['slot'], bi, b['off'], b['bytes'], nm,
+                 bufs[bi]['bytes'] if 0 <= bi < len(bufs) else '?',
+                 (bufs[bi]['src'][:60] if 0 <= bi < len(bufs) else '')))
+    if p['push']:
+        w = p['push']['words']
+        print('  PUSH count=%d words=%d' % (p['push']['count'], len(w)))
+        for i in range(0, min(len(w), 32), 4):
+            print('    p%d = %s' % (i // 4, w[i:i + 4]))
+    # alias check on every F08 pass
+    alias = []
+    for p in f:
+        m = {b['slot']: b['buf'] for b in p['binds']}
+        if m.get(2) == m.get(3):
+            alias.append((p['row'], 'input==ffwd'))
+        if m.get(0) == m.get(2):
+            alias.append((p['row'], 'weights==input'))
+        if m.get(9) == m.get(2):
+            alias.append((p['row'], 'debug==input'))
+        if m.get(9) == m.get(3):
+            alias.append((p['row'], 'debug==ffwd'))
+    print('\nalias findings (slot pairs on same buffer index):', alias[:20], 'n=', len(alias))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

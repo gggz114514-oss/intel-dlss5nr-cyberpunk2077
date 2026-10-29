@@ -1,0 +1,262 @@
+"""n08-f08-wg-map build + identity + plan + cpu-check.
+
+Only writes inside this card directory.  No GPU, no deployment, no baseline edit.
+"""
+import sys, json, hashlib, subprocess, difflib
+from pathlib import Path
+
+CAMPAIGN = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(CAMPAIGN))
+import COMMON as K
+
+CARD = CAMPAIGN / 'cards' / 'n08-f08-wg-map'
+D = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-mechanism-transfer-20261026')
+PARENT_SRC = D / 'f08-register-chain-20261027' / 'candidate.comp'
+PARENT_SPV = D / 'f08-register-chain-20261027' / 'candidate.spv'
+PARENT_SPV_SHA = '32291c7ea61b5a1762ba492474806e37376a51e88a8c9c72e286752676709491'
+PARENT_SRC_SHA = '46f693807bdb56baacec385309aa56d60ec73d4910ebac36c36fc444c9e0287e'
+ORDINALS = [60, 64, 68, 72, 76, 80, 84, 88, 134, 138, 142, 146, 150, 154, 158, 162]
+
+INC_PRIMARY = [CARD,
+               Path(r'@NR_WORKSPACE@/candidates/amd-netorg-t1-20261018/s20-stage2-a-reuse-v1/source'),
+               Path(r'@NR_WORKSPACE@/src/project/shaders/network')]
+INC_ALT = [CARD,
+           Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/f08-construction-20261025'),
+           Path(r'@NR_WORKSPACE@/src/project/shaders/network')]
+
+sha = K.sha
+report = {}
+
+
+def compile_to(comp, out, incs):
+    K.compile_glsl(comp, out, incs)
+    return out
+
+
+def opcode_hist(m):
+    h = {}
+    for op, ops, i, n in m.instructions:
+        h[op] = h.get(op, 0) + 1
+    return h
+
+
+FLOAT_ARITH = {127, 129, 131, 133, 136}          # FNegate FAdd FSub FMul FDiv
+INT_CFG = {128, 130, 132, 134, 135, 137, 138, 139}  # contract integer set
+OPCMULADD = 4457                                  # OpCooperativeMatrixMulAddKHR
+
+
+def analyze_pair(parent_spv, cand_spv):
+    pm = K.ST.Module(Path(parent_spv))
+    cm = K.ST.Module(Path(cand_spv))
+    out = {}
+
+    nc_p = K.ST.no_contraction_ids(pm)
+    nc_c = K.ST.no_contraction_ids(cm)
+    out['no_contraction_parent'] = len(nc_p)
+    out['no_contraction_candidate'] = len(nc_c)
+    out['no_contraction_ids_equal'] = sorted(nc_p) == sorted(nc_c)
+
+    hp, hc = opcode_hist(pm), opcode_hist(cm)
+    keys = sorted(set(hp) | set(hc))
+    hist = {}
+    for k in keys:
+        if hp.get(k, 0) != hc.get(k, 0):
+            hist[str(k)] = {'parent': hp.get(k, 0), 'candidate': hc.get(k, 0)}
+    out['opcode_histogram_delta'] = hist
+
+    fp = [op for op, *_ in pm.instructions if op in FLOAT_ARITH]
+    fc = [op for op, *_ in cm.instructions if op in FLOAT_ARITH]
+    out['float_arith_sites_parent'] = len(fp)
+    out['float_arith_sites_candidate'] = len(fc)
+    out['float_arith_opcode_sequence_equal'] = fp == fc
+
+    ip = [op for op, *_ in pm.instructions if op in INT_CFG]
+    ic = [op for op, *_ in cm.instructions if op in INT_CFG]
+    out['int_cfg_sites_parent'] = len(ip)
+    out['int_cfg_sites_candidate'] = len(ic)
+
+    fa_p = [pm.fma_signature(i) for i in pm.ext_inst_fma_ordinals()]
+    fa_c = [cm.fma_signature(i) for i in cm.ext_inst_fma_ordinals()]
+    out['ext_inst_fma_sites_parent'] = len(fa_p)
+    out['ext_inst_fma_sites_candidate'] = len(fa_c)
+    out['ext_inst_fma_signatures_equal'] = fa_p == fa_c
+    out['float_NC_checked'] = len(fa_p) + min(len(fp), len(fc))
+
+    # item-by-item float site correspondence (the "float_NC 逐条" requirement)
+    sites = []
+    ip = [i for i, (op, *_ ) in enumerate(pm.instructions) if op in FLOAT_ARITH or
+          (op == 12 and len(pm.instructions[i][1]) >= 5 and pm.instructions[i][1][3] == 50)]
+    ic = [i for i, (op, *_ ) in enumerate(cm.instructions) if op in FLOAT_ARITH or
+          (op == 12 and len(cm.instructions[i][1]) >= 5 and cm.instructions[i][1][3] == 50)]
+    assert len(ip) == len(ic)
+    for a_i, b_i in zip(ip, ic):
+        opa, oa, _, _ = pm.instructions[a_i]
+        opb, ob, _, _ = cm.instructions[b_i]
+        entry = {'parent_index': a_i, 'candidate_index': b_i,
+                 'opcode': opa, 'opcode_candidate': opb,
+                 'same_opcode': opa == opb,
+                 'parent_result_id': oa[1], 'candidate_result_id': ob[1],
+                 'no_contraction_parent': oa[1] in nc_p,
+                 'no_contraction_candidate': ob[1] in nc_c}
+        if opa == 12 and len(oa) >= 5 and oa[3] == 50:
+            entry['ext_inst'] = 'GLSL.std.450 Fma(50)'
+            entry['parent_signature'] = repr(pm.fma_signature(oa[1]))
+            entry['candidate_signature'] = repr(cm.fma_signature(ob[1]))
+            entry['signature_equal'] = entry['parent_signature'] == entry['candidate_signature']
+        sites.append(entry)
+    out['float_sites'] = sites
+
+    # full opcode stream diff (types/annotations + function bodies)
+    sp = [op for op, *_ in pm.instructions]
+    sc = [op for op, *_ in cm.instructions]
+    sm = difflib.SequenceMatcher(a=sp, b=sc, autojunk=False)
+    changes = []
+    n_eq = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            n_eq += i2 - i1
+            continue
+        changes.append({'tag': tag, 'parent_index': i1, 'parent_opcodes': sp[i1:i2],
+                        'candidate_index': j1, 'candidate_opcodes': sc[j1:j2]})
+    out['opcode_stream'] = {'parent_len': len(sp), 'candidate_len': len(sc),
+                            'equal_opcodes': n_eq, 'change_regions': len(changes)}
+    out['opcode_change_regions'] = changes[:40]
+    out['opcode_change_regions_total'] = len(changes)
+
+    # which changed parent opcodes are inside the allowed integer/address set
+    only_allowed = all(all(o in INT_CFG or o in (65, 61, 81, 84, 79, 80, 44, 43)
+                           for o in c['parent_opcodes'] + c['candidate_opcodes'])
+                       for c in changes)
+    out['all_changes_within_integer_address_opcodes'] = only_allowed
+
+    out['dpas_sites_parent'] = hp.get(OPCMULADD, 0)
+    out['dpas_sites_candidate'] = hc.get(OPCMULADD, 0)
+    out['spirv_words_parent'] = len(pm.words)
+    out['spirv_words_candidate'] = len(cm.words)
+    return out
+
+
+def build_plan(parent_sha):
+    plan = CARD / 'plan.txt'
+    replaced = K.make_plan(CARD / 'candidate.spv', plan, spv_shas={parent_sha})
+    raw = plan.read_bytes().decode('utf-8-sig')
+    lines = raw.split('\n')
+    changed = []
+    for i, line in enumerate(lines):
+        body = line.rstrip('\r')
+        if body.startswith('PASS ') and 'n08-f08-wg-map' in body:
+            parts = body.split(' ')
+            assert parts[-3:] == ['66', '2', '1'], parts[-6:]
+            new = ' '.join(parts[:-3] + ['33', '4', '1']) + ('\r' if line.endswith('\r') else '')
+            lines[i] = new
+            changed.append({'line': i + 1, 'pass': parts[1], 'name': parts[2],
+                            'old_grid': '66 2 1', 'new_grid': '33 4 1'})
+    assert len(changed) == 16, len(changed)
+    plan.write_bytes('\n'.join(lines).encode('utf-8'))
+    return replaced, changed, plan
+
+
+def plan_diff_lines(plan_path):
+    base = K.BASELINE.read_text(encoding='utf-8-sig').split('\n')
+    cand = plan_path.read_text(encoding='utf-8-sig').split('\n')
+    assert len(base) == len(cand), (len(base), len(cand))
+    out = []
+    for i, (a, b) in enumerate(zip(base, cand)):
+        if a != b:
+            out.append({'line': i + 1, 'baseline': a, 'candidate': b})
+    return out
+
+
+def main():
+    assert sha(PARENT_SPV) == PARENT_SPV_SHA, sha(PARENT_SPV)
+    assert sha(PARENT_SRC) == PARENT_SRC_SHA, sha(PARENT_SRC)
+
+    # 1. parent byte reproduction from the parent source bytes
+    parent_rebuild = CARD / 'parent-rebuild.spv'
+    compile_to(PARENT_SRC, parent_rebuild, INC_PRIMARY)
+    alt = CARD / 'parent-rebuild-altinclude.spv'
+    compile_to(PARENT_SRC, alt, INC_ALT)
+    parent_ok = sha(parent_rebuild) == PARENT_SPV_SHA
+    alt_ok = sha(alt) == PARENT_SPV_SHA
+
+    # 2. candidate
+    cand = CARD / 'candidate.spv'
+    compile_to(CARD / 'candidate.comp', cand, INC_PRIMARY)
+    K.validate_spv(cand)
+
+    # 3. numerical/opcode correspondence
+    analysis = analyze_pair(PARENT_SPV, cand)
+    analysis['parent_rebuild_sha256'] = sha(parent_rebuild)
+    analysis['parent_rebuild_matches'] = parent_ok
+    analysis['parent_rebuild_altinclude_sha256'] = sha(alt)
+    analysis['parent_rebuild_altinclude_matches'] = alt_ok
+
+    # 4. plan
+    replaced, changed, plan = build_plan(PARENT_SPV_SHA)
+    diff_lines = plan_diff_lines(plan)
+    cpu = K.cpu_check(plan)
+
+    build = {
+        'card': 'n08-f08-wg-map',
+        'status': 'BUILT_AWAITING_GPU',
+        'candidate': {
+            'source': K.ident(CARD / 'candidate.comp'),
+            'spv': K.ident(cand),
+            'spv_validate_cpu': 'OK',
+        },
+        'parent': {
+            'source': K.ident(PARENT_SRC),
+            'spv': K.ident(PARENT_SPV),
+            'spv_sha_expected': PARENT_SPV_SHA,
+            'ordinals': ORDINALS,
+            'note': 'parent SPV is the current baseline row SPV of these 16 PASSes (f08-register-chain accepted candidate)',
+        },
+        'parent_rebuild': {
+            'path': str(parent_rebuild),
+            'sha256': sha(parent_rebuild),
+            'byte_identical_to_parent': parent_ok,
+            'alt_include_dir_rebuild': {
+                'path': str(alt), 'sha256': sha(alt), 'byte_identical': alt_ok,
+                'include_dirs': [str(p) for p in INC_ALT]},
+            'include_dirs': [str(p) for p in INC_PRIMARY],
+            'recipe': 'glslang -V --target-env vulkan1.3, no decoration transfer, no NoContraction add (raw compile == parent bytes)',
+        },
+        'sources': [{
+            'width': 512, 'ordinal': 60, 'ordinals': ORDINALS,
+            'parent': K.ident(PARENT_SPV),
+            'parent_rebuilt': K.ident(parent_rebuild),
+            'candidate': K.ident(cand),
+            'source': K.ident(CARD / 'candidate.comp'),
+            'parent_source': K.ident(PARENT_SRC),
+        }],
+        'float_NC_checked': analysis['float_NC_checked'],
+        'float_NC_detail': analysis['float_sites'],
+        'baseline': K.ident(K.BASELINE),
+        'baseline_sha_expected': K.BASELINE_SHA,
+        'baseline_sha_matches': sha(K.BASELINE) == K.BASELINE_SHA,
+        'numerics': analysis,
+        'plan': {
+            'path': str(plan),
+            'sha256': sha(plan),
+            'passes_replaced': replaced,
+            'grid_lines_changed': changed,
+            'baseline_lines_changed': diff_lines,
+        },
+        'cpu': cpu,
+        'cpu_check': cpu,
+        'gpu': 'NONE (forbidden for this card; see GPU-REQUEST.json)',
+        'deployment': 'NONE',
+    }
+    K.write_json(CARD / 'BUILD.json', build)
+    print(json.dumps({'parent_rebuild_ok': parent_ok, 'alt_ok': alt_ok,
+                      'candidate_sha': sha(cand), 'plan_sha': sha(plan),
+                      'cpu': cpu.strip(),
+                      'numerics': {k: v for k, v in analysis.items()
+                                   if k not in ('opcode_change_regions',)}},
+                     indent=1))
+    print('CHANGE REGIONS:')
+    print(json.dumps(analysis['opcode_change_regions'], indent=1))
+
+
+if __name__ == '__main__':
+    main()

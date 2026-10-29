@@ -1,0 +1,193 @@
+// r16_b39_project_blend_i8mma.comp -- R16 card candidate for PASS 96
+// "t3_b39_project_blend" (block39 projection -> decups/blend, one dispatch).
+//
+// Parent (unchanged everywhere else): candidates/amd-netorg-t3-20261018/
+// b39-project-blend-fused-v1/source/t3_b39_project_blend.comp, deployed as
+// .../source/t3_b39_project_blend.raw.spv  sha256
+// c854dd4f8ae841a6c062aa412c88ac1f60892eee9cc420955426b531faad705f  (14,648 B),
+// which is what plan-g3-production.txt PASS 96 binds.  Reproduced byte-identically
+// from the parent source by this card (spv/parent_r16_repro.spv, -DPROJECT_PAIR=2).
+//
+// WHAT CHANGES (all of it; every other statement is the parent's)
+//   1. the two FP16 M8N16K16 cooperative MMAs (acc, acc1) -> two INT8 M8N16K32
+//      cooperative MMAs with an int32 accumulator.  The parent's K16 loop over
+//      pc.p1.x is paired into K32 steps; the k order and the pairing of the two
+//      B fragments (n0 group and n0+16 group = PROJECT_PAIR) are unchanged.
+//   2. the projection A operand is quantised on the fly: the parent loaded the
+//      8x16 A fragment straight out of the canonical-NHWC input (binding 2,
+//      row stride pc.p1.x = 1024).  Here the same 8 rows x K halves are gathered
+//      once into a shared INT8 tile with a PER-ROW (per-token) absmax, exactly
+//      the R17-fixed quantiser:
+//          inv3      = (m3 > 0) ? 127.0 / m3 : 0.0        (quantiser step)
+//          code      = int8_t(clamp(roundEven(float(h) * inv3), -127, 127))
+//          dequant   = 1.0 / inv3   <-- R17-FIX-A: the epilogue multiplies by
+//                      amax/127, NOT by inv3 (the pre-fix arm published inv3
+//                      into the row scale and was 127x over-scaled, 20.19 dB ->
+//                      34.47 dB once fixed; see run/gpu/WO-SWEEP.json).
+//   3. the projection weights come from the NEW binding 8 offline INT8 pack
+//      (r07 tile convention + per-output-channel f32 scale) instead of the FP16
+//      half matrix at w[p1.z ...].  Binding 0 stays bound for the two half gain
+//      records only (w[p1.w + c] skip gain, w[p1.w + p1.y + c] main gain).
+//   4. the epilogue dequantises INT32 -> f32 with ONE product
+//      (rowF[c] * colF[c]) and then stores the f32 fragment into the parent's
+//      own `tile_f` scratch, i.e. the narrow to half happens where it always
+//      happened: at `float16_t(tile_f[i])` inside the blend loop.
+//
+// WHAT DOES NOT CHANGE
+//   * blend_quad()'s arithmetic: the half gain multiply, the half skip read
+//     `io_skip(x,y,c)`, `precise` skip_v/value, and io_write_blend() addressing;
+//   * the 512 B float scratch `tile_f[128]` and the two-batch + barrier sequence
+//     that lets acc and acc1 share it;
+//   * the out-of-bounds/blend geometry (p0.z/p0.w projection, p5.x/p5.y decups);
+//   * all 32 push-constant words keep their meaning: no new push word.
+//
+// A-layout note (no layout trap here, unlike R19): the parent's A tile is 8
+// CONSECUTIVE canonical-NHWC rows (m0 = WG.x*8, each row K halves contiguous),
+// so the int8 tile [row][k] with row stride K is a literal re-encoding of the
+// parent's fragment addressing:
+//     parent elem (i,j) at  p4.x + (m0+i)*K + kc + j
+//     bridge elem (i,j) at  t3a[i*K + kc + j]  <- read from the same halves
+// Verified element-wise in evidence/R19-BRIDGE-PROOF.json (same generator is
+// used for the R19 stride-16 bridge) and against the recorded GPU gold in
+// evidence/ORACLE-*.json.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#include "t3_b39_common.glsl"
+layout(local_size_x=32) in;
+shared float tile_f[128];
+
+// ---- candidate shared (workgroup) additions -------------------------------
+// t3a    : the quantised A tile   [8 rows][K=1024]  = 8192 B
+// t3a_abs: per-row |A| partial maxima, 4 lanes per row (32 lanes = 8 rows x 4)
+// t3a_srow: per-row DEQUANT scale (amax/127 = 1/inv3), consumed by rowF
+shared int8_t t3a[8192];
+shared float  t3a_abs[32];
+shared float  t3a_srow[8];
+
+// ---- NEW binding 8: this projection's offline INT8 weight pack -------------
+//   0        int8  W[N=512][K=1024] in the r07 tile convention
+//            idx = (n/16)*(K/32)*512 + (k/32)*512 + (n%16)*32 + (k%32)
+//   524,288  f32   sW[n] = amax_k|W[n][k]| / 127   (0 for an all-zero channel)
+layout(set=0,binding=8,std430) readonly buffer PreW8 {
+    int8_t wq[524288];
+    float  wsc[512];
+};
+
+#define MAT_H coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define I8_A  coopmat<int8_t,   gl_ScopeSubgroup, 8, 32, gl_MatrixUseA>
+#define I8_B  coopmat<int8_t,   gl_ScopeSubgroup, 32, 16, gl_MatrixUseB>
+#define I32_C coopmat<int,      gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define F32_C coopmat<float,    gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define LROW  gl_CooperativeMatrixLayoutRowMajor
+#define LCOL  gl_CooperativeMatrixLayoutColumnMajor
+#define PROJECT_PAIR 2
+
+// One projection element (token px,py; channel n0 + ci) -> its four decups pixels.
+// Byte-identical to the parent's blend_quad.
+void blend_quad(uint px, uint py, uint c, float16_t main_v) {
+    uint ox = 2u * px, oy = 2u * py;
+    if (pc.p7.x == 1u) main_v = main_v * w[pc.p1.w + pc.p1.y + c];
+    precise float16_t skip_gain = w[pc.p1.w + c];
+    for (uint dy = 0u; dy < 2u; ++dy) {
+        uint y = oy + dy;
+        if (y >= pc.p5.y) continue;
+        for (uint dx = 0u; dx < 2u; ++dx) {
+            uint x = ox + dx;
+            if (x >= pc.p5.x) continue;
+            precise float16_t skip_v = io_skip(x, y, c) * skip_gain;
+            precise float16_t value = main_v + skip_v;
+            io_write_blend(x, y, c, value);
+        }
+    }
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x, m0 = gl_WorkGroupID.x * 8u;
+    const uint n0 = gl_WorkGroupID.y * (16u * PROJECT_PAIR);
+    const uint K3 = uint(pc.p1.x);          // 1024
+
+    // ---- A: gather the parent's 8 rows x K halves into int8 codes ----------
+    // thread mapping for a 32-lane workgroup: 4 lanes per projected row, each
+    // lane owns 256 contiguous channels, so the row max needs only 32 partials.
+    {
+        const uint r3 = lane / 4u;          // 0..7   projected row (m0 + r3)
+        const uint q3 = lane % 4u;          // 0..3   channel quarter
+        const uint kb = q3 * (K3 / 4u);     // 0,256,512,768
+        const uint ab = uint(pc.p4.x) + (m0 + r3) * K3 + kb;
+        float amax = 0.0;
+        for (uint i = 0u; i < K3 / 4u; ++i) {
+            amax = max(amax, abs(float(x[ab + i])));
+        }
+        t3a_abs[r3 * 4u + q3] = amax;
+        barrier();
+        float m3 = 0.0;
+        for (uint j = 0u; j < 4u; ++j) m3 = max(m3, t3a_abs[r3 * 4u + j]);
+        const float inv3 = (m3 > 0.0) ? 127.0 / m3 : 0.0;
+        for (uint i = 0u; i < K3 / 4u; ++i) {
+            precise float c3v = float(x[ab + i]) * inv3;
+            t3a[r3 * K3 + kb + i] = int8_t(clamp(roundEven(c3v), -127.0, 127.0));
+        }
+        // R17-FIX-A: publish the DEQUANT scale (amax/127), never the quantiser step.
+        if (q3 == 0u) t3a_srow[r3] = (inv3 > 0.0) ? (1.0 / inv3) : 0.0;
+        barrier();
+    }
+
+    // ---- projection: INT8 M8N16K32, int32 accumulate -----------------------
+    const uint kst = K3 / 32u;              // 32 K32 steps
+    const uint n16s = kst * 512u;           // per-n16 tile stride (= K*16 bytes)
+    const uint w16 = (n0 / 16u) * n16s;
+    I32_C acc = I32_C(0);
+    I32_C acc1 = I32_C(0);
+    for (uint ki = 0u; ki < kst; ++ki) {
+        I8_A aa;
+        coopMatLoad(aa, t3a, ki * 32u, K3, LROW);
+        {
+            I8_B bb;
+            coopMatLoad(bb, wq, w16 + ki * 512u, 32u, LCOL);
+            acc = coopMatMulAdd(aa, bb, acc);
+        }
+        {
+            I8_B bb1;
+            coopMatLoad(bb1, wq, w16 + n16s + ki * 512u, 32u, LCOL);
+            acc1 = coopMatMulAdd(aa, bb1, acc1);
+        }
+    }
+
+    F32_C rowF;
+    coopMatLoad(rowF, t3a_srow, 0u, 0u, LCOL);      // per-row, stride 0
+
+    // first B fragment -> tile_f (the parent's own scratch, first batch)
+    {
+        F32_C colF;
+        coopMatLoad(colF, wsc, n0, 0u, LROW);       // per-column, stride 0
+        F32_C f = F32_C(acc);
+        for (uint c = 0u; c < f.length(); ++c)
+            f[c] = f[c] * (rowF[c] * colF[c]);
+        coopMatStore(f, tile_f, 0u, 16u, LROW);
+    }
+    barrier();
+    for (uint i = lane; i < 128u; i += 32u) {
+        uint t = m0 + i / 16u, px = t % pc.p0.z, py = t / pc.p0.z;
+        if (py < pc.p0.w) blend_quad(px, py, n0 + i % 16u, float16_t(tile_f[i]));
+    }
+    // Finish reading the reused scratch tile before overwriting it.
+    barrier();
+    {
+        F32_C colF;
+        coopMatLoad(colF, wsc, n0 + 16u, 0u, LROW);
+        F32_C f = F32_C(acc1);
+        for (uint c = 0u; c < f.length(); ++c)
+            f[c] = f[c] * (rowF[c] * colF[c]);
+        coopMatStore(f, tile_f, 0u, 16u, LROW);
+    }
+    barrier();
+    for (uint i = lane; i < 128u; i += 32u) {
+        uint t = m0 + i / 16u, px = t % pc.p0.z, py = t / pc.p0.z;
+        if (py < pc.p0.w) blend_quad(px, py, n0 + 16u + i % 16u, float16_t(tile_f[i]));
+    }
+}

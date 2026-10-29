@@ -1,0 +1,148 @@
+"""S01 turn 2b: re-audit and re-calibrate block 4 on the REAL quantised upstream input.
+
+Input:  work/dsh-fullnet-static-20261029/gpu/runs/input-capture/xq-c32-b4.bin
+        (the resident INT8 chain's block3_out, fp16, 16515072 B, same format as the dumps)
+Teacher: real-int8-24/dump-fp16/dump_block3_out.bin
+
+Answers, in order:
+  1. is the real input really that far from the teacher input (elementwise, per channel)?
+  2. do the *teacher-calibrated* X and E inverses clip on the real input?
+  3. if they do, that is the mechanism of the network regression; recalibrate and compare.
+"""
+import sys, json
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+HERE = Path(__file__).resolve().parent.parent
+REAL = L.W / "gpu/runs/input-capture/xq-c32-b4.bin"
+TEACH = L.D / "dump-fp16/dump_block3_out.bin"
+assert REAL.is_file(), REAL
+r_flat = np.fromfile(REAL, dtype="<f2")
+t_flat = np.fromfile(TEACH, dtype="<f2")
+print("real halves", r_flat.size, "teacher halves", t_flat.size)
+print("elementwise flat relL2 %.6f  absmax real/teach %.5f/%.5f  rms %.5f/%.5f"
+      % (L.rel_l2(r_flat, t_flat), np.abs(r_flat.astype(np.float32)).max(),
+         np.abs(t_flat.astype(np.float32)).max(),
+         float(np.sqrt((r_flat.astype(np.float32) ** 2).mean())),
+         float(np.sqrt((t_flat.astype(np.float32) ** 2).mean()))))
+
+rng = np.random.default_rng(777)
+tiles = np.sort(rng.choice(168 * 96, size=2000, replace=False))
+TT, CC = np.meshgrid(tiles, np.arange(16), indexing="ij")
+TT = TT.ravel(); CC = CC.ravel()
+Xr = L.gather(r_flat, TT, CC)
+Xt = L.gather(t_flat, TT, CC)
+print("gathered relL2 %.6f" % L.rel_l2(Xr, Xt))
+am_r = np.abs(Xr.astype(np.float32)).max(axis=1)
+am_t = np.abs(Xt.astype(np.float32)).max(axis=1)
+print("per-channel absmax ratio real/teacher: min %.3f med %.3f max %.3f"
+      % ((am_r / np.maximum(am_t, 1e-9)).min(), np.median(am_r / np.maximum(am_t, 1e-9)),
+         (am_r / np.maximum(am_t, 1e-9)).max()))
+
+# ---------------------------------------------------------------- X inverses
+fsc_eq = L.load_fsc(L.D / "c32-equalized-b4/b4-scales.bin")
+invx_eq = fsc_eq[L.FSC_INVX:L.FSC_INVX + 32].copy()
+fsc_min = L.load_fsc(L.D / "c32-minmax/b4-scales.bin")
+invx_scalar = np.float32(fsc_min[L.FSC_INV_X])
+xout = {}
+for name, X in (("teacher", Xt), ("real", Xr)):
+    for tag, inv in (("scalar", np.full(32, invx_scalar, np.float32)), ("x_eq", invx_eq)):
+        q = L.code8_ch(X, inv)
+        sat = int(np.count_nonzero(np.abs(q) >= 127))
+        xout[f"{name}_{tag}"] = dict(saturated=sat, codes=int(q.size),
+                                     frac=sat / q.size,
+                                     codes_absmean=float(np.abs(q).mean()))
+        print(f"X {name:8s} {tag:7s} saturation {sat}/{q.size} = {sat / q.size:.3e} "
+              f"mean|code| {np.abs(q).mean():.2f}")
+
+# ---------------------------------------------------------------- E statistics
+info_min = L.block_bindings(L.D / "c32-minmax/local-b4.txt", ordinal=4)
+we_min, wc_min = L.load_w8(info_min["w8"])
+wb = np.fromfile(info_min["wb"], dtype="<f2")
+rs = wb[info_min["rs_base"] + 8:info_min["rs_base"] + 40].astype(np.float16)
+sE_min = np.float32(fsc_min[2])
+Wc_real = wc_min.astype(np.float32) * (fsc_min[132:164] / sE_min)[:, None]
+tap_e_min = fsc_min[4:132]
+
+
+def e_half(X, we, tap_e, invx):
+    q = L.code8_ch(X, invx)
+    acc = np.rint(we.astype(np.float64) @ q.astype(np.float64)).astype(np.int32)
+    return L.act_h(L.to_half(acc.astype(np.float32) * tap_e[:, None]))
+
+
+invE_mine = L.load_fsc(HERE / "PACK/c32_block4_xe_scales.f32.bin")[L.FSC_INVE:L.FSC_INVE + 128]
+E = {}
+for name, X in (("teacher", Xt), ("real", Xr)):
+    a = e_half(X, we_min, tap_e_min, np.full(32, invx_scalar, np.float32))
+    am = np.abs(a.astype(np.float32)).max(axis=1)
+    E[name] = dict(a=a, amax=am)
+    for tag, inv in (("scalar_sE", np.full(128, np.float32(fsc_min[L.FSC_INV_E]), np.float32)),
+                     ("mine_teacher_cal", invE_mine)):
+        q = L.code8_ch(a, inv)
+        sat = int(np.count_nonzero(np.abs(q) >= 127))
+        sat_ch = int(np.count_nonzero(np.count_nonzero(np.abs(q) >= 127, axis=1)))
+        print(f"E {name:8s} {tag:16s} absmax {am.max():7.3f} sat {sat}/{q.size} "
+              f"({sat / q.size:.2e}) channels_touched {sat_ch}")
+
+# how much does the real input push E past the teacher-calibrated range?
+head = (1.0 / invE_mine) * 127.0 / np.maximum(E["real"]["amax"], 1e-12)
+print("headroom of MY (teacher-calibrated) invE on the REAL E: min %.3f p05 %.3f, "
+      "channels below 1.0: %d/128" % (head.min(), np.quantile(head, 0.05), int((head < 1).sum())))
+np.save(HERE / "CPU" / "invE_teacher_cal.npy", invE_mine)
+
+# ---------------------------------------------------------------- pack variants
+def pack_metrics(name, w8p, scp, X, tap_e, invx_default=None):
+    we, wc = L.load_w8(w8p)
+    fsc = L.load_fsc(scp)
+    invx = (fsc[L.FSC_INVX:L.FSC_INVX + 32] if fsc.size >= L.FSC_INVX + 32
+            else np.full(32, np.float32(fsc[L.FSC_INV_X])))
+    inve = (fsc[L.FSC_INVE:L.FSC_INVE + 128] if fsc.size >= L.FSC_INVE + 128
+            else np.full(128, np.float32(fsc[L.FSC_INV_E])))
+    a = e_half(X, we, fsc[4:132], invx)
+    seed = L.widen(L.to_half(X * rs[:, None]))
+    y_ref = Wc_real @ a.astype(np.float32) + seed
+    eq = L.code8_ch(a, inve)
+    sat = int(np.count_nonzero(np.abs(eq) >= 127))
+    y = (np.rint(wc.astype(np.float64) @ eq.astype(np.float64)).astype(np.int32)
+         .astype(np.float32) * fsc[132:164][:, None] + seed)
+    return dict(variant=name, rel_l2=L.rel_l2(y, y_ref), saturated=sat, codes=int(eq.size),
+                e_absmax=float(np.abs(a.astype(np.float32)).max()),
+                headroom_min=float(((1.0 / inve) * 127.0 / np.maximum(
+                    np.abs(a.astype(np.float32)).max(axis=1), 1e-12)).min()))
+
+
+VARIANTS = {
+    "frozen_minmax": (L.D / "c32-minmax/../c32-minmax/b4-scales.bin", info_min["w8"]),
+}
+rows = []
+for feed_name, X in (("teacher_input", Xt), ("real_input", Xr)):
+    for name, (scp, w8p) in (
+            ("frozen_minmax", (L.D / "c32-minmax/b4-scales.bin", info_min["w8"])),
+            ("x_equalised", (L.D / "c32-equalized-b4/b4-scales.bin", L.D / "c32-equalized-b4/b4-weights.bin")),
+            ("mine_x_plus_e_teacher_cal", (HERE / "PACK/c32_block4_xe_scales.f32.bin",
+                                           HERE / "PACK/c32_block4_xe_weights.i8.bin"))):
+        m = pack_metrics(name, w8p, scp, X, tap_e_min)
+        m["feed"] = feed_name
+        rows.append(m)
+        print(f"{feed_name:14s} {name:26s} FFN-Y relL2 {m['rel_l2']:.5f} sat {m['saturated']:5d} "
+              f"E|max| {m['e_absmax']:7.3f} headroom_min {m['headroom_min']:.3f}")
+
+(HERE / "CPU" / "real_input_audit.json").write_text(json.dumps(dict(
+    inputs=dict(real=str(REAL).replace("\\", "/"), teacher=str(TEACH).replace("\\", "/"),
+                flat_rel_l2=L.rel_l2(r_flat, t_flat),
+                absmax=[float(np.abs(r_flat.astype(np.float32)).max()),
+                        float(np.abs(t_flat.astype(np.float32)).max())],
+                rms=[float(np.sqrt((r_flat.astype(np.float32) ** 2).mean())),
+                     float(np.sqrt((t_flat.astype(np.float32) ** 2).mean()))]),
+    x_codes=xout,
+    e_channel_amax_teacher=E["teacher"]["amax"].tolist(),
+    e_channel_amax_real=E["real"]["amax"].tolist(),
+    teacher_calibrated_invE_headroom_on_real=dict(
+        min=float(head.min()), p05=float(np.quantile(head, 0.05)),
+        channels_below_1=int((head < 1).sum())),
+    packs=rows), indent=2))
+print("written CPU/real_input_audit.json")

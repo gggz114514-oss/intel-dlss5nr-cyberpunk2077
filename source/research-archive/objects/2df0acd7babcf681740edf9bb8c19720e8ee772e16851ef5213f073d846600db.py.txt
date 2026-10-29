@@ -1,0 +1,210 @@
+"""S12 slice step 5: 3-frame calibration + per-frame evaluation for the C256 block15 WO pack.
+
+Frames (the construction book's three calibration teachers):
+  34189  real-int8-24/dump-fp16
+  41444  teacher-diagnostics/teacher-41444
+  43654  teacher-diagnostics/teacher-43654
+
+Arm A (unchanged): gT half -> per-window (64x64) in-kernel amax, RNE, clamp +-127.
+Arm B: the per-output-channel weight scale.  OLD = amax_k|W|/127 (deployed pack).
+      NEW = weighted grid search on sum_k (dW[n,k]*sigma_k)^2 with sigma_k pooled
+      over the three frames.
+
+Reported per frame and pooled; also the transfer check (fit on 34189 only -> the
+other two frames) to show the scale is not a single-frame artefact.
+"""
+import json
+import numpy as np
+import hashlib
+import os
+
+D_ = r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+CAND = r"@NR_WORKSPACE@/work/dsh-int8-fullnet-impl-20261024/candidates/r07-c256-wo-merged"
+PACKSRC = r"@NR_WORKSPACE@/candidates/amd-map-20261015/round4-integrated/candidate/packs/swin_15_weights.fp16.bin"
+WORK = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S12-proj/_work"
+OUTDIR = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S12-proj/PACK"
+
+FRAMES = {
+    "34189": f"{D_}/dump-fp16",
+    "41444": f"{D_}/teacher-diagnostics/teacher-41444",
+    "43654": f"{D_}/teacher-diagnostics/teacher-43654",
+}
+NW, NT, NC = 66, 64, 256
+TX, TY, GX = 21, 12, 11
+WO, ARS = 0, 98304
+
+
+def sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+pack = np.fromfile(PACKSRC, dtype=np.float16).astype(np.float32)
+Wf = pack[WO: WO + NC * NC].reshape(NC, NC)
+f_ar = pack[ARS: ARS + NC]
+Wq_raw = np.fromfile(f"{CAND}/packs/c256_b15_wo.codes.i8.bin", dtype=np.int8)
+Wsc_old = np.fromfile(f"{CAND}/packs/c256_b15_wo.sc.f32.bin", dtype=np.float32)
+_n, _k = np.arange(NC)[:, None], np.arange(NC)[None, :]
+widx = ((_n // 16) * 8 * 512 + (_k // 32) * 512 + (_n % 16) * 32 + (_k % 32))
+W8_old = Wq_raw[widx].astype(np.float32)
+
+tt = np.repeat(np.arange(NT), NC)
+keep_t = np.zeros((NW, NT), dtype=bool)
+for wx in range(GX):
+    for wy in range(TY // 2):
+        w = wy * GX + wx
+        q = tt >> 4
+        tx, ty = 2 * wx + (q & 1), 2 * wy + (q >> 1)
+        kt = (~((tx < 0) | (ty < 0) | (tx >= TX) | (ty >= TY))).reshape(NT, NC)
+        keep_t[w] = kt.all(axis=1)
+
+
+def load(fr):
+    d = FRAMES[fr]
+    T = np.fromfile(f"{d}/dump_swin_15_T.bin", dtype=np.float16).astype(np.float32).reshape(NW, NT, NC)
+    Y = np.fromfile(f"{d}/dump_swin_15_Y.bin", dtype=np.float16).astype(np.float32).reshape(NW, NT, NC)
+    return T, Y
+
+
+def q_r(x):
+    return np.clip(np.rint(x), -127.0, 127.0)
+
+
+def a_quant(X):
+    cA = np.empty_like(X)
+    sA = np.empty(NW, np.float32)
+    for w in range(NW):
+        m = float(np.abs(X[w]).max())
+        sA[w] = m / 127.0 if m > 0 else 0.0
+        cA[w] = q_r(X[w] * (127.0 / m if m > 0 else 0.0))
+    return cA, sA
+
+
+def stats(T):
+    s1 = np.zeros(NC); s2 = np.zeros(NC); n = 0
+    for w in range(NW):
+        b = T[w][keep_t[w]]
+        n += b.shape[0]
+        s1 += b.sum(axis=0, dtype=np.float64)
+        s2 += (b.astype(np.float64) ** 2).sum(axis=0)
+    return s1, s2, n
+
+
+data = {}
+for fr in FRAMES:
+    T, Y = load(fr)
+    cA, sA = a_quant(T)
+    Yhat = np.einsum("wtk,nk->wtn", T, Wf) + Y * f_ar[None, None, :]
+    data[fr] = dict(T=T, Y=Y, cA=cA, sA=sA, Yhat=Yhat,
+                    res=Y * f_ar[None, None, :],
+                    keep=keep_t, s1s2n=stats(T))
+
+# pooled sigma_k
+s1 = sum(data[f]["s1s2n"][0] for f in FRAMES)
+s2 = sum(data[f]["s1s2n"][1] for f in FRAMES)
+n = sum(data[f]["s1s2n"][2] for f in FRAMES)
+rms_k = np.sqrt(np.maximum(s2 / n - (s1 / n) ** 2, 1e-30))
+
+rowamax = np.abs(Wf).max(axis=1)
+base = np.where(rowamax > 0, rowamax / 127.0, 0.0)
+w2 = (rms_k ** 2)[None, :]
+
+
+def search(sig2, lo=0.35, hi=1.70, ng=271):
+    w2l = sig2[None, :]
+    bs = base.copy()
+    be = np.full(NC, np.inf)
+    for c in np.linspace(lo, hi, ng):
+        s = base * c
+        ss = np.where(s > 0, s, 1e-30)
+        q = np.clip(np.rint(Wf / ss[:, None]), -127, 127)
+        dw = q * ss[:, None] - Wf
+        e = (dw.astype(np.float64) ** 2 * w2l).sum(axis=1)
+        bt = e < be
+        be = np.where(bt, e, be)
+        bs = np.where(bt, s, bs)
+    return bs.astype(np.float32)
+
+
+sW_pool = search(rms_k ** 2)
+nz = rowamax > 0
+sW_pool[~nz] = 0.0
+codes = np.zeros((NC, NC), dtype=np.int8)
+codes[nz] = q_r(Wf[nz] / sW_pool[nz, None]).astype(np.int8)
+
+# also fit on 34189 alone (transfer check)
+r1, r2, nn1 = data["34189"]["s1s2n"]
+rms1 = np.sqrt(np.maximum(r2 / nn1 - (r1 / nn1) ** 2, 1e-30))
+sW_one = search(rms1 ** 2)
+sW_one[~nz] = 0.0
+
+os.makedirs(OUTDIR, exist_ok=True)
+p_codes = f"{OUTDIR}/r07m-c256-b15-wo.codes.i8.bin"
+p_sc = f"{OUTDIR}/r07m-c256-b15-wo.sc.f32.bin"
+raw = np.zeros(NC * NC, dtype=np.int8)
+raw[widx.reshape(-1)] = codes.reshape(-1)
+raw.tofile(p_codes)
+sW_pool.tofile(p_sc)
+r_raw = np.fromfile(p_codes, dtype=np.int8)
+r_sc = np.fromfile(p_sc, dtype=np.float32)
+rW = r_raw[widx].astype(np.float32)
+
+
+def evaluate(sW, cW):
+    out = {}
+    for fr in FRAMES:
+        d = data[fr]
+        keep = d["keep"]
+        Yn = np.einsum("wtk,nk->wtn", d["cA"], cW) * (sW[None, None, :] * d["sA"][:, None, None]) + d["res"]
+        num = float(np.linalg.norm((Yn - d["Yhat"])[keep]))
+        den = float(np.linalg.norm(d["Yhat"][keep]))
+        out[fr] = {"relL2": num / den}
+    return out
+
+
+ev_old = evaluate(Wsc_old, W8_old)
+ev_new = evaluate(r_sc, rW)
+ev_one = evaluate(sW_one, q_r(np.where(nz[:, None], Wf / np.where(sW_one[:, None] > 0, sW_one[:, None], 1e-30), 0)).astype(np.int8))
+
+# pooled relL2 over the three frames (energy-weighted)
+def pooled(ev):
+    num = den = 0.0
+    for fr in FRAMES:
+        d = data[fr]
+        keep = d["keep"]
+        den += float((np.linalg.norm(d["Yhat"][keep])) ** 2)
+    return None
+
+
+res = {
+    "frames": list(FRAMES),
+    "n_rows_written_per_frame": int(keep_t.sum()),
+    "old": ev_old,
+    "new_3frame_fit": ev_new,
+    "new_1frame_fit_34189": ev_one,
+    "pooled_relL2": {
+        "old": float(np.sqrt(sum(ev_old[f]["relL2"] ** 2 for f in FRAMES) / 3)),
+        "new_3frame_fit": float(np.sqrt(sum(ev_new[f]["relL2"] ** 2 for f in FRAMES) / 3)),
+        "new_1frame_fit_34189": float(np.sqrt(sum(ev_one[f]["relL2"] ** 2 for f in FRAMES) / 3)),
+    },
+    "files": {"codes": {"path": p_codes, "bytes": os.path.getsize(p_codes), "sha256": sha(p_codes)},
+              "scales": {"path": p_sc, "bytes": os.path.getsize(p_sc), "sha256": sha(p_sc)}},
+    "roundtrip_identical": bool(np.array_equal(r_raw, raw) and np.array_equal(r_sc, sW_pool)),
+    "scale_ratio_vs_amax_over_127": {
+        "mean": float(np.mean(r_sc[nz] / base[nz])), "min": float(np.min(r_sc[nz] / base[nz])),
+        "max": float(np.max(r_sc[nz] / base[nz])),
+        "n_at_grid_edge": int(((r_sc[nz] / base[nz] > 1.695) | (r_sc[nz] / base[nz] < 0.355)).sum()),
+    },
+    "codes_changed_frac_vs_deployed": float((codes != W8_old.astype(np.int8)).mean()),
+    "clipped_code_frac": float((np.abs(codes) >= 127).mean()),
+    "dead_output_channels": int((~nz).sum()),
+    "weighted_weight_error": {
+        "old": float(np.linalg.norm((W8_old * Wsc_old[:, None] - Wf) * rms_k[None, :]) / np.linalg.norm(Wf * rms_k[None, :])),
+        "new": float(np.linalg.norm((rW * r_sc[:, None] - Wf) * rms_k[None, :]) / np.linalg.norm(Wf * rms_k[None, :])),
+    },
+}
+print(json.dumps(res, indent=1))
+json.dump(res, open(f"{WORK}/slice5.json", "w", encoding="utf-8"), indent=1)

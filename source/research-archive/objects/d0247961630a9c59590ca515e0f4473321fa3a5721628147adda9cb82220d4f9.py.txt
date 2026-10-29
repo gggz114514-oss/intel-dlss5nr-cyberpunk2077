@@ -1,0 +1,63 @@
+"""Diagnose CPU/GPU mismatch per token column and per channel."""
+import sys
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+plan = L.D / "c32-equalized-b4/local-b4.txt"
+info = L.block_bindings(plan)
+x_flat = np.fromfile(info["input"], dtype="<f2")
+gpu = np.fromfile(L.D / "c32-equalized-b4/local-b4/replayed-network.bin", dtype="<f2")
+teach_flat = np.fromfile(L.D / "dump-fp16/dump_skip4.bin", dtype="<f2")
+we, wc = L.load_w8(info["w8"])
+fsc = L.load_fsc(info["fsc"])
+rs = L.load_rs(info["wb"], info["rs_base"])
+invx = fsc[L.FSC_INVX:L.FSC_INVX + 32] if fsc.size >= L.FSC_INVX + 32 else np.full(32, fsc[L.FSC_INV_X], np.float32)
+inve = fsc[L.FSC_INVE:L.FSC_INVE + 128] if fsc.size >= L.FSC_INVE + 128 else np.full(128, fsc[L.FSC_INV_E], np.float32)
+print("fsc[0:4]", fsc[:4].tolist(), "fsc[4:6]", fsc[4:6].tolist(), "fsc[132:134]", fsc[132:134].tolist())
+print("fsc[292:296]", fsc[292:296].tolist())
+print("rs", rs[:8].tolist())
+
+tiles = np.array([0, 1, 168, 169, 500, 15000])
+cols = np.arange(16)
+TT, CC = np.meshgrid(tiles, cols, indexing="ij")
+TT = TT.ravel(); CC = CC.ravel()
+x = L.gather(x_flat, TT, CC)
+got = L.forward(x, we, wc, rs, invx, inve, fsc[L.FSC_TAP_E:L.FSC_TAP_E + 128], fsc[L.FSC_TAP_C:L.FSC_TAP_C + 32])
+base = TT * 512 + CC * 16
+
+
+def take(flat):
+    out = np.empty((32, TT.size), np.float16)
+    for c in range(32):
+        off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+        out[c] = flat[base + off]
+    return out
+
+
+ref = take(gpu); te = take(teach_flat)
+seed = got["seed"]
+print("\ntotal cpu/gpu", L.rel_l2(got["y_half"], ref), "cpu/teacher", L.rel_l2(got["y_half"], te),
+      "gpu/teacher", L.rel_l2(ref, te))
+print("seed/gpu", L.rel_l2(seed, ref), "seed/teacher", L.rel_l2(seed, te))
+print("mean|gpu|", float(np.abs(ref.astype(np.float32)).mean()),
+      "mean|teach|", float(np.abs(te.astype(np.float32)).mean()),
+      "mean|cpu|", float(np.abs(got["y_half"].astype(np.float32)).mean()),
+      "mean|seed|", float(np.abs(seed).mean()))
+print("\nper-column  (col: cpu/gpu  gpu/teacher  mean|gpu|  bitexact)")
+for t in range(16):
+    m = CC == t
+    print(f"  {t:2d}: {L.rel_l2(got['y_half'][:, m], ref[:, m]):.4f}  {L.rel_l2(ref[:, m], te[:, m]):.4f}"
+          f"   {float(np.abs(ref[:, m].astype(np.float32)).mean()):.5f}"
+          f"   {float(np.mean(got['y_half'][:, m] == ref[:, m])):.3f}")
+print("\nper-channel (ch: cpu/gpu  gpu/teacher  mean|gpu| mean|F part|)")
+part = got["y_f32"] - seed
+for c in range(32):
+    print(f"  {c:2d}: {L.rel_l2(got['y_half'][c], ref[c]):.4f}  {L.rel_l2(ref[c], te[c]):.4f}"
+          f"   {float(np.abs(ref[c].astype(np.float32)).mean()):.5f} {float(np.abs(part[c]).mean()):.5f}")
+print("\nE per-channel absmax (sample):")
+ea = np.abs(got["a_h"].astype(np.float32)).max(axis=1)
+print(np.round(ea, 3).tolist())
+print("ratio max/min", float(ea.max() / max(ea.min(), 1e-9)))

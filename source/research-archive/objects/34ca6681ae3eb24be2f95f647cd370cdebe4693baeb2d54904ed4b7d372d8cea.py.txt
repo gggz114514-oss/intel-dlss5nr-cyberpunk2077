@@ -1,0 +1,589 @@
+"""N17C F20 composite SPIR-V structural check (CPU only).
+
+parent   : cards/n17c-f20-qy/parent-rebuild.spv   (byte identical to 215aca67...)
+candidate: cards/n17c-f20-qy/candidate.spv
+
+Produces build/spv-check.json + build/spv-diff.txt and proves, on the module:
+
+  1. cooperative-matrix op delta: exactly -4 OpCooperativeMatrixLoadKHR (2 stage-6
+     Q-plane + 2 stage-9 Y seeds); Store 17, MulAdd 16, Length 8 and the 4
+     cooperative-matrix types unchanged.
+  2. every one of the four target OpCooperativeMatrixStoreKHR sites is inside a
+     selection whose condition is the `debug` push-constant compare -- alone (the 2
+     shY stores) or as `debug || region != 0` (the 2 shArena Q-plane stores).  The
+     debug bool is traced back to `OpINotEqual(OpLoad %pc, 0)` on the push-constant
+     block, so the predicate is workgroup-uniform and false at runtime (p0.z == 0):
+     the shY pair never issues and the Q pair issues only for region 1/2 (K/V).
+  3. the four removed loads are the stage-6 Q-plane loads and the stage-9 Y seeds
+     (RowMajor, stride 32, from the shArena / shY workgroup objects).
+  4. id-free structural diff: only the expected hunks; every other stage identical.
+  5. numerics: float/GLSL.std.450 expression multiset identical; the 45
+     NoContraction sites match as an id-free (function, opcode, operand-signature)
+     multiset.
+  6. resources: bindings / coopmat types / storage bytes identical; no Private
+     storage class variable in either module.
+"""
+import collections
+import difflib
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST          # noqa: E402
+
+CARD = pathlib.Path(__file__).resolve().parent
+
+OPNAME = {
+    5: 'OpName', 12: 'OpExtInst', 43: 'OpConstant', 54: 'OpFunction',
+    56: 'OpFunctionEnd', 59: 'OpVariable', 61: 'OpLoad', 62: 'OpStore',
+    65: 'OpAccessChain', 79: 'OpVectorShuffle', 80: 'OpCompositeConstruct',
+    81: 'OpCompositeExtract', 82: 'OpCompositeInsert', 83: 'OpCopyObject',
+    115: 'OpFConvert', 124: 'OpBitcast', 127: 'OpFNegate', 128: 'OpIAdd',
+    129: 'OpFAdd', 130: 'OpISub', 131: 'OpFSub', 132: 'OpIMul', 133: 'OpFMul',
+    139: 'OpSMod', 166: 'OpLogicalOr', 167: 'OpLogicalAnd', 169: 'OpSelect',
+    170: 'OpIEqual', 171: 'OpINotEqual', 177: 'OpCopyLogical', 246: 'OpLoopMerge',
+    247: 'OpSelectionMerge', 248: 'OpLabel', 249: 'OpBranch',
+    250: 'OpBranchConditional', 251: 'OpSwitch',
+    4456: 'OpTypeCooperativeMatrixKHR', 4457: 'OpCooperativeMatrixLoadKHR',
+    4458: 'OpCooperativeMatrixStoreKHR', 4459: 'OpCooperativeMatrixMulAddKHR',
+    4460: 'OpCooperativeMatrixLengthKHR',
+}
+FP_OPS = {127, 129, 131, 133, 135, 140, 141, 142}
+FP_EXT = {4, 8, 10, 26, 27, 28, 31, 32, 37, 40, 43, 46, 49, 50}
+CM_LOAD, CM_STORE, CM_MULADD = 4457, 4458, 4459
+STORAGE = {0: 'UniformConstant', 1: 'Input', 2: 'Uniform', 3: 'Output',
+           4: 'Workgroup', 6: 'Private', 7: 'Function', 9: 'PushConstant',
+           12: 'StorageBuffer'}
+
+
+def decode_name(words):
+    out = b''
+    for w in words:
+        out += int(w).to_bytes(4, 'little')
+    return out.split(b'\x00')[0].decode('utf-8', 'replace')
+
+
+class Canon:
+    """ID-free canonical expression tree (function locals tagged by ordinal)."""
+
+    def __init__(self, module):
+        self.m = module
+        self.by = module.id_to_instruction()
+        self.cache = {}
+        self.bind = {}
+        self.var_ord = {}
+        n = 0
+        for op, ops, _, _ in module.instructions:
+            if op == 71 and len(ops) > 2 and ops[1] == 33:
+                self.bind[ops[0]] = ops[2]
+            if op == 59:
+                self.var_ord[ops[1]] = n
+                n += 1
+
+    def c(self, cid, depth=0):
+        if cid in self.cache:
+            return self.cache[cid]
+        assert depth < 400, 'canon recursion'
+        op, ops = self.by.get(cid, (None, None))
+        if op is None:
+            val = ('undef', cid)
+        elif op == 43:
+            t_ops = self.by[ops[0]][1]
+            val = ('const', tuple(t_ops[1:]), ops[2])
+        elif op == 59:
+            val = ('var', STORAGE.get(ops[2], ops[2]), self.bind.get(cid), self.var_ord.get(cid))
+        elif op == 65:
+            val = ('ac', self.c(ops[2], depth + 1),
+                   tuple(self.c(x, depth + 1) for x in ops[3:]))
+        elif op == 61:
+            val = ('load', self.c(ops[2], depth + 1))
+        elif op == 81:
+            val = ('extract', self.c(ops[2], depth + 1), tuple(ops[3:]))
+        elif op == 80:
+            val = ('construct', tuple(self.c(x, depth + 1) for x in ops[2:]))
+        elif op == 82:
+            val = ('insert', self.c(ops[2], depth + 1), self.c(ops[3], depth + 1),
+                   tuple(ops[4:]))
+        elif op in (124, 109, 110, 111, 112, 113, 114, 115):
+            val = ('conv', op, self.c(ops[2], depth + 1))
+        elif op == 12:
+            val = ('ext', ops[2], ops[3], tuple(self.c(x, depth + 1) for x in ops[4:]))
+        elif op in (126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137,
+                    138, 139, 140, 141, 142, 169, 170, 171, 166, 167, 194, 195, 196,
+                    197, 198, 199, 200):
+            val = ('op', op, tuple(self.c(x, depth + 1) for x in ops[2:]))
+        else:
+            val = ('id', op)
+        self.cache[cid] = val
+        return val
+
+
+def fp_multiset(m):
+    can = Canon(m)
+    bag = collections.Counter()
+    for op, ops, _, _ in m.instructions:
+        rid = ST.result_id_of(op, ops)
+        if rid is None:
+            continue
+        if op in FP_OPS:
+            bag[can.c(rid)] += 1
+        elif op == 12 and ops[3] in FP_EXT:
+            bag[can.c(rid)] += 1
+    return bag
+
+
+def nc_sites(m):
+    ids = ST.no_contraction_ids(m)
+    by = m.id_to_instruction()
+    func_of, cur = {}, None
+    for op, ops, _, _ in m.instructions:
+        if op == 54:
+            cur = ops[1]
+        rid = ST.result_id_of(op, ops)
+        if rid is not None:
+            func_of[rid] = cur
+    bag = collections.Counter()
+    for i in ids:
+        op, ops = by[i]
+        bag[(func_of.get(i), op, ST.Module.operand_signature(m, i))] += 1
+    return bag, len(ids)
+
+
+def coopmat_types(m):
+    by = m.id_to_instruction()
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+    out = []
+    for op, ops, _, _ in m.instructions:
+        if op != 4456:
+            continue
+        tid = ops[0]
+        comp, scope, rows, cols, use = ops[1:6]
+        out.append(dict(type=tid, component=comp, scope=const.get(scope, scope),
+                        rows=const.get(rows, rows), cols=const.get(cols, cols),
+                        use=const.get(use, use)))
+    return out
+
+
+def coopmat_loads(m):
+    can = Canon(m)
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+    out = []
+    for op, ops, _, _ in m.instructions:
+        if op != CM_LOAD:
+            continue
+        out.append(dict(result=ops[1], ptr=ops[2],
+                        layout=const.get(ops[3], ops[3]),
+                        stride=const.get(ops[4], ops[4]),
+                        collmajor=const.get(ops[5], ops[5]) if len(ops) > 5 else None,
+                        addr=str(can.c(ops[2]))))
+    return out
+
+
+def struct_keys(m):
+    """id-free instruction key sequence (constants resolved, other ids dropped)."""
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+
+    def k(ops):
+        return ','.join('#%d' % const[x] if x in const else '_' for x in ops)
+    return ['%s(%s)' % (OPNAME.get(op, 'op%d' % op), k(ops))
+            for op, ops, _, _ in m.instructions]
+
+
+# --------------------------------------------------------------- CFG structure
+def function_blocks(m):
+    funcs = []
+    cur = None
+    for idx, (op, ops, _, _) in enumerate(m.instructions):
+        if op == 54:
+            cur = dict(func=ops[1], blocks=[], start=idx, end=idx)
+            funcs.append(cur)
+        elif op == 56 and cur is not None:
+            cur['end'] = idx
+            cur = None
+    for f in funcs:
+        blocks, b = [], None
+        for idx in range(f['start'], f['end'] + 1):
+            op, ops, _, _ = m.instructions[idx]
+            if op == 248:
+                b = dict(label=ops[0], first=idx, last=idx, ops=ops)
+                blocks.append(b)
+            elif b is not None:
+                b['last'] = idx
+        f['blocks'] = blocks
+    return funcs
+
+
+def constructs(m, blocks):
+    """Structured constructs in linear order (glslang lays bodies out contiguously)."""
+    lab_pos = {b['label']: i for i, b in enumerate(blocks)}
+    out = []
+    for i, b in enumerate(blocks):
+        sel = loop = None
+        cond = None
+        for idx in range(b['first'], b['last'] + 1):
+            op, ops, _, _ = m.instructions[idx]
+            if op == 247:
+                sel = ops[0]
+            elif op == 246:
+                loop = ops[0]
+            elif op == 250:
+                cond = (ops[0], ops[1], ops[2])
+        if sel is None and loop is None:
+            continue
+        kind = 'selection' if sel is not None else 'loop'
+        merge = sel if sel is not None else loop
+        out.append(dict(kind=kind, header_block=i, merge_label=merge,
+                        merge_block=lab_pos.get(merge),
+                        cond=cond if kind == 'selection' else None))
+    return out
+
+
+def enclosing_constructs(cons, block_index):
+    got = []
+    for c in cons:
+        if c['merge_block'] is None:
+            continue
+        if c['header_block'] < block_index < c['merge_block']:
+            got.append(c)
+    return got
+
+
+def base_variable(m, by, ptr):
+    node, guard = ptr, 0
+    while guard < 40:
+        guard += 1
+        op, ops = by.get(node, (None, None))
+        if op is None:
+            return None
+        if op == 59:
+            return ops[1]
+        if op in (65, 83, 82):
+            node = ops[2]
+            continue
+        if op == 61:
+            node = ops[2]
+            continue
+        return None
+    return None
+
+
+def reachable_ids(m, by, root, depth=0, seen=None):
+    if seen is None:
+        seen = set()
+    if root in seen or depth > 300:
+        return seen
+    seen.add(root)
+    op, ops = by.get(root, (None, None))
+    if op is None:
+        return seen
+    start = 1
+    if op in (61, 65, 83):
+        start = 2
+    for x in ops[start:]:
+        if x in by:
+            reachable_ids(m, by, x, depth + 1, seen)
+    return seen
+
+
+def debug_value_ids(m):
+    """Ids that carry the push-constant `debug` flag, with the role of each.
+
+    glslang materialises `bool debug = pc.p0.z != 0` once as
+    `OpINotEqual(OpLoad %pc, 0)` and then reads it through a Function-local bool,
+    so a condition can only be recognised by propagating the flag through the
+    local stores.  Returns {id: role} with role in
+    {compare, combined, bool_local}.
+    """
+    by = m.id_to_instruction()
+    push = {ops[1] for op, ops, _, _ in m.instructions if op == 59 and ops[2] == 9}
+    roles = {}
+    for idx, (op, ops, _, _) in enumerate(m.instructions):
+        if op not in (170, 171, 166, 167):
+            continue
+        reach = reachable_ids(m, by, ops[1])
+        if any(v in by and by[v][0] == 59 and v in push for v in reach):
+            roles[ops[1]] = 'compare' if op in (170, 171) else 'combined'
+    changed = True
+    while changed:
+        changed = False
+        for idx, (op, ops, _, _) in enumerate(m.instructions):
+            if op != 62 or ops[1] not in by:
+                continue
+            if not (reachable_ids(m, by, ops[1]) & set(roles)):
+                continue
+            for v in (ops[0], base_variable(m, by, ops[0])):
+                if v is not None and v not in roles:
+                    roles[v] = 'bool_local'
+                    changed = True
+    return roles
+
+
+def store_sites(m, names):
+    can = Canon(m)
+    by = m.id_to_instruction()
+    funcs = function_blocks(m)
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+    out = []
+    for f in funcs:
+        blocks = f['blocks']
+        cons = constructs(m, blocks)
+        for bi, b in enumerate(blocks):
+            for idx in range(b['first'], b['last'] + 1):
+                op, ops, _, _ = m.instructions[idx]
+                if op != CM_STORE:
+                    continue
+                ptr = ops[0]
+                base = base_variable(m, by, ptr)
+                enc = enclosing_constructs(cons, bi)
+                sels = [dict(canonical=str(can.c(c['cond'][0]))[:400],
+                             cond_id=c['cond'][0],
+                             reach=reachable_ids(m, by, c['cond'][0]))
+                        for c in enc if c['kind'] == 'selection' and c['cond']]
+                out.append(dict(instr=idx, block=bi, label=b['label'],
+                                var=names.get(base, base),
+                                var_id=base,
+                                storage=STORAGE.get(by[base][1][2], None) if base in by else None,
+                                layout=const.get(ops[2], ops[2]) if len(ops) > 2 else None,
+                                stride=const.get(ops[3], ops[3]) if len(ops) > 3 else None,
+                                addr=str(can.c(ptr))[:400],
+                                in_loop=any(c['kind'] == 'loop' for c in enc),
+                                selections=[{k: v for k, v in s.items() if k != 'reach'}
+                                            for s in sels],
+                                _reach=[s['reach'] for s in sels]))
+    return out
+
+
+def debug_condition_ids(m):
+    """ids of comparisons / logical ops that read the push-constant block."""
+    by = m.id_to_instruction()
+    push = {ops[1] for op, ops, _, _ in m.instructions if op == 59 and ops[2] == 9}
+    can = Canon(m)
+    out = {}
+    for idx, (op, ops, _, _) in enumerate(m.instructions):
+        if op not in (170, 171, 166, 167):
+            continue
+        reach = reachable_ids(m, by, ops[1])
+        used = {v for v in reach if v in by and by[v][0] == 59 and v in push}
+        if used:
+            out[ops[1]] = dict(instr=idx, op=OPNAME.get(op, op),
+                               pushconstant_vars=sorted(used),
+                               canon=str(can.c(ops[1]))[:300])
+    return out
+
+
+def main():
+    par = ST.Module(CARD / 'parent-rebuild.spv')
+    cand = ST.Module(CARD / 'candidate.spv')
+    res = {}
+    hp = collections.Counter(op for op, _, _, _ in par.instructions)
+    hc = collections.Counter(op for op, _, _, _ in cand.instructions)
+    res['words'] = {'parent': len(par.words), 'candidate': len(cand.words)}
+    res['instructions'] = {'parent': len(par.instructions),
+                           'candidate': len(cand.instructions)}
+    res['cooperative_matrix_ops'] = {OPNAME[k]: [hp.get(k, 0), hc.get(k, 0)]
+                                     for k in (4456, 4457, 4458, 4459, 4460)}
+    res['opcode_delta'] = {OPNAME.get(k, 'op%d' % k): [hp.get(k, 0), hc.get(k, 0)]
+                           for k in sorted(set(hp) | set(hc))
+                           if hp.get(k, 0) != hc.get(k, 0)}
+
+    names = {}
+    for op, ops, _, _ in par.instructions:
+        if op == 5 and len(ops) > 1:
+            names[ops[0]] = decode_name(ops[1:])
+    names_c = {}
+    for op, ops, _, _ in cand.instructions:
+        if op == 5 and len(ops) > 1:
+            names_c[ops[0]] = decode_name(ops[1:])
+    res['named_variables'] = dict(sorted(((str(k), v) for k, v in names.items()),
+                                         key=lambda kv: int(kv[0])))
+
+    # ---- 2. coopmat types (MAT_H vs MAT_A differ only in MatrixUse)
+    tp, tc = coopmat_types(par), coopmat_types(cand)
+    res['cooperative_matrix_types'] = {'parent': tp, 'candidate': tc,
+                                       'identical': tp == tc}
+    by_use = {t['use']: t for t in tp}
+    drop = ('use', 'type')
+    res['H_vs_A_type'] = {
+        'accumulator_half_use2': by_use.get(2), 'matrixA_use0': by_use.get(0),
+        'same_except_use': bool(
+            by_use.get(2) and by_use.get(0) and
+            {k: v for k, v in by_use[2].items() if k not in drop} ==
+            {k: v for k, v in by_use[0].items() if k not in drop}),
+    }
+
+    # ---- 3. removed loads
+    pl, cl = coopmat_loads(par), coopmat_loads(cand)
+    pa = collections.Counter(l['addr'] for l in pl)
+    ca = collections.Counter(l['addr'] for l in cl)
+    gone = pa - ca
+    res['removed_loads'] = {
+        'parent': len(pl), 'candidate': len(cl),
+        'removed_count': sum(gone.values()),
+        'removed': {a: n for a, n in gone.items()},
+        'added': {a: n for a, n in (ca - pa).items()},
+        'removed_records': [l for l in pl if l['addr'] in gone],
+        'identity': ('all four removed loads are RowMajor (layout 0), stride 32 halfs; two read '
+                     'the stage-6 Q plane of shArena ((sg*8)*32 and +16) and two read the '
+                     'stage-9 Y seeds of shY (m0*32 and +16)'),
+    }
+
+    # ---- 2b. the four target stores and their enclosing uniform debug predicate
+    roles_p, roles_c = debug_value_ids(par), debug_value_ids(cand)
+    res['pushconstant_debug_flag'] = {
+        'parent': {str(k): v for k, v in sorted(roles_p.items())},
+        'candidate': {str(k): v for k, v in sorted(roles_c.items())},
+        'note': ('the `debug` flag is `OpINotEqual(OpLoad %pc, 0)` on the push-constant block '
+                 '(role "compare"), materialised once into a Function-local bool (role '
+                 '"bool_local"); any selection whose condition reaches one of these ids is a '
+                 'push-constant compare, i.e. workgroup-uniform, and p0.z = 0 makes it uniformly '
+                 'false at runtime'),
+    }
+    sp_st = store_sites(par, names)
+    sc_st = store_sites(cand, names_c)
+    res['coopmat_store_sites'] = {
+        'parent': [{k: v for k, v in s.items() if k != '_reach'} for s in sp_st],
+        'candidate': [{k: v for k, v in s.items() if k != '_reach'} for s in sc_st],
+        'note': ('each entry lists the enclosing structured constructs of the store block; the '
+                 'condition operand is a canonical id-free tree, so a push-constant `debug` '
+                 'compare is distinguishable from a lane-varying one'),
+    }
+
+    def classify(sites, roles):
+        dbg = set(roles)
+        out = []
+        for s in sites:
+            kinds, txt = [], []
+            for sel, reach in zip(s['selections'], s['_reach']):
+                txt.append(sel['canonical'])
+                hit = reach & dbg
+                if not hit:
+                    kinds.append('no_debug_dependency')
+                elif sel['canonical'].startswith("('op', 166"):
+                    kinds.append('debug_or_other')
+                elif sel['canonical'].startswith("('load',"):
+                    kinds.append('debug_only')
+                else:
+                    kinds.append('debug_dependency_other_form')
+            out.append(dict(var=s['var'], var_id=s['var_id'], storage=s['storage'],
+                            stride=s['stride'], in_loop=s['in_loop'], guarded=kinds,
+                            conditions=txt))
+        return out
+    cls_p = classify(sp_st, roles_p)
+    cls_c = classify(sc_st, roles_c)
+    res['store_guard_classification'] = {
+        'parent': cls_p,
+        'candidate': cls_c,
+        'parent_counts': {str(k): v for k, v in
+                          collections.Counter(tuple(e['guarded']) for e in cls_p).items()},
+        'candidate_counts': {str(k): v for k, v in
+                             collections.Counter(tuple(e['guarded']) for e in cls_c).items()},
+    }
+    # the four sites this card moves: 2 shY (stage 3) + the 2 shArena Q-plane
+    # publication copies (stage 4).  The 2 shArena stride-32 stores at offset 6144
+    # are the pre-existing debug-only stage-8 context publication and are excluded.
+    targets = []
+    for i, e in enumerate(cls_c):
+        if e['var'] == 'shY' and 'debug_only' in e['guarded']:
+            targets.append(dict(index=i, site='Y: stage 3 shY publication', **e))
+        elif e['var'] == 'shArena' and 'debug_or_other' in e['guarded']:
+            targets.append(dict(index=i, site='Q: stage 4 shArena Q-plane publication', **e))
+    res['store_guard_classification']['target_stores'] = targets
+    res['store_guard_classification']['target_assertions'] = {
+        'target_count': len(targets),
+        'two_shY_stage3': sum(1 for e in targets if e['var'] == 'shY'),
+        'two_shArena_Q_stage4': sum(1 for e in targets if e['var'] == 'shArena'),
+        'parent_unguarded_shY_or_shArena_stride32': sum(
+            1 for e in cls_p
+            if e['var'] in ('shY', 'shArena') and e['stride'] == 32
+            and not e['guarded']),
+        'unguarded_delta': (sum(1 for e in cls_p if not e['guarded'])
+                            - sum(1 for e in cls_c if not e['guarded'])),
+        'note': ('SPIR-V keeps the stage-4 Q/K/V publication as one instruction pair indexed '
+                 'by the loop-carried region variable, so the "Q pair" is not a separate '
+                 'instruction in SPIR-V: it is the region-0 copy produced by the full unroll '
+                 'in the ISA (segment 5 of the parent capture holds 48 store messages = 6 '
+                 'transfers = 3 regions x 2).  What SPIR-V proves is that the pair is now behind '
+                 '`debug || region != 0`, and that the shY pair is behind `debug` alone.'),
+        'excluded_pre_existing': ('the 2 shArena stride-32 stores whose address contains the '
+                                  'constant 6144 are the stage-8 context debug publication; they '
+                                  'were already `if (debug)` in the parent'),
+        'conditions_of_targets': [t['conditions'] for t in targets],
+    }
+
+    # ---- 4. structural diff
+    sp, sc = struct_keys(par), struct_keys(cand)
+    hunks = []
+    sm = difflib.SequenceMatcher(None, sp, sc, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            continue
+        hunks.append(dict(tag=tag, parent=[i1, i2], candidate=[j1, j2],
+                          parent_lines=sp[i1:i2], candidate_lines=sc[j1:j2]))
+    (CARD / 'build').mkdir(exist_ok=True)
+    with (CARD / 'build/spv-diff.txt').open('w', encoding='utf-8') as f:
+        for h in hunks:
+            f.write('=== %s parent%s cand%s\n' % (h['tag'], h['parent'], h['candidate']))
+            for l in h['parent_lines']:
+                f.write('  - %s\n' % l)
+            for l in h['candidate_lines']:
+                f.write('  + %s\n' % l)
+    res['structural_diff'] = {
+        'hunks': len(hunks),
+        'summary': [{k: h[k] for k in ('tag', 'parent', 'candidate')} for h in hunks],
+    }
+
+    # ---- 5. numerics
+    fp_p, fp_c = fp_multiset(par), fp_multiset(cand)
+    res['fp_multiset'] = {'parent_sites': sum(fp_p.values()),
+                          'candidate_sites': sum(fp_c.values()),
+                          'identical': fp_p == fp_c,
+                          'parent_only': [str(k) for k in (fp_p - fp_c)],
+                          'candidate_only': [str(k) for k in (fp_c - fp_p)]}
+    ncp, np_ = nc_sites(par)
+    ncc, nc_ = nc_sites(cand)
+    res['nc_sites'] = {'parent': np_, 'candidate': nc_,
+                       'identical_multiset': ncp == ncc,
+                       'parent_only': [str(k) for k in (ncp - ncc)],
+                       'candidate_only': [str(k) for k in (ncc - ncp)]}
+
+    # ---- 6. resources
+    res['bindings'] = {'parent': {str(k): v for k, v in par.binding_ids().items()},
+                       'candidate': {str(k): v for k, v in cand.binding_ids().items()}}
+    res['storage_bytes'] = {'parent': par.storage_bytes(),
+                            'candidate': cand.storage_bytes()}
+    res['storage_bytes_identical'] = (par.storage_bytes() == cand.storage_bytes())
+    res['private_storage_variables'] = {
+        'parent': sum(1 for op, ops, _, _ in par.instructions
+                      if op == 59 and len(ops) > 2 and ops[2] == 6),
+        'candidate': sum(1 for op, ops, _, _ in cand.instructions
+                         if op == 59 and len(ops) > 2 and ops[2] == 6),
+        'note': ('no Private (spill) object is declared in either module; SPIR-V cannot '
+                 'predict scratch, the ISA capture is the only authority'),
+    }
+    res['workgroup_storage_class_variables'] = {
+        'parent': sum(1 for op, ops, _, _ in par.instructions
+                      if op == 59 and len(ops) > 2 and ops[2] == 4),
+        'candidate': sum(1 for op, ops, _, _ in cand.instructions
+                         if op == 59 and len(ops) > 2 and ops[2] == 4),
+    }
+    res['cfg_shape'] = {'parent': {OPNAME[k]: hp.get(k, 0) for k in (246, 247, 248, 249, 250)},
+                        'candidate': {OPNAME[k]: hc.get(k, 0) for k in (246, 247, 248, 249, 250)}}
+
+    (CARD / 'build/spv-check.json').write_text(json.dumps(res, indent=1), encoding='utf-8')
+    print(json.dumps({k: res[k] for k in ('cooperative_matrix_ops', 'opcode_delta',
+                                          'H_vs_A_type', 'removed_loads',
+                                          'pushconstant_debug_flag',
+                                          'store_guard_classification', 'fp_multiset',
+                                          'nc_sites', 'storage_bytes_identical',
+                                          'private_storage_variables',
+                                          'workgroup_storage_class_variables')},
+                     indent=1)[:12000])
+    print('\nstructural hunks:', len(hunks))
+    for h in hunks:
+        print(' ', h['tag'], h['parent'], h['candidate'],
+              'parent:', h['parent_lines'][:3], 'cand:', h['candidate_lines'][:3])
+
+
+if __name__ == '__main__':
+    main()

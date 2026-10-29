@@ -1,0 +1,151 @@
+"""S12 slice step 2: offline per-output-channel weight scale + input-X equalisation.
+
+Local error is always "under the SAME FP16 inputs" (gT/gY dumps), measured in the
+kernel's own write domain (the 1032192 elements c256_img_half_index() actually
+writes; the 49152 padding-token elements are not written by the kernel and are
+excluded, exactly as the OOB rule does).
+
+Arms
+  FP16        exact half A/B, f32 accumulate                     = reference
+  OLD         deployed packs: dynamic per-window A scale, amax/127 per-output-channel W scale
+  OLD_Aonly   OLD with the exact FP16 weights                    (isolates A quantisation)
+  OLD_Bonly   OLD with an exact A                                (isolates W quantisation)
+  NEW_eq      same dynamic A rule + X equalisation D (power of 2) folded into W,
+              per-output-channel W scales recomputed from W' = W*D
+  NEW_static  NEW_eq but with ONE static per-tensor A scale (calibrated offline)
+"""
+import json
+import numpy as np
+
+D_ = r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+CAND = r"@NR_WORKSPACE@/work/dsh-int8-fullnet-impl-20261024/candidates/r07-c256-wo-merged"
+PACK = r"@NR_WORKSPACE@/candidates/amd-map-20261015/round4-integrated/candidate/packs/swin_15_weights.fp16.bin"
+WORK = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S12-proj/_work"
+
+NW, NT, NC = 66, 64, 256
+TX, TY, GX = 21, 12, 11
+WO, RS, ARS = 0, 655752, 98304
+
+pack = np.fromfile(PACK, dtype=np.float16).astype(np.float32)
+T = np.fromfile(f"{D_}/dump-fp16/dump_swin_15_T.bin", dtype=np.float16).astype(np.float32).reshape(NW, NT, NC)
+Y = np.fromfile(f"{D_}/dump-fp16/dump_swin_15_Y.bin", dtype=np.float16).astype(np.float32).reshape(NW, NT, NC)
+OUT = np.fromfile(f"{D_}/dump-fp16/dump_block15_out.bin", dtype=np.float16).astype(np.float32)
+Wq_raw = np.fromfile(f"{CAND}/packs/c256_b15_wo.codes.i8.bin", dtype=np.int8)
+Wsc = np.fromfile(f"{CAND}/packs/c256_b15_wo.sc.f32.bin", dtype=np.float32)
+
+Wf = pack[WO: WO + NC * NC].reshape(NC, NC)      # W[n,k]
+f_ar = pack[ARS: ARS + NC]
+_n = np.arange(NC)[:, None]
+_k = np.arange(NC)[None, :]
+widx = ((_n // 16) * (NC // 32) * 512 + (_k // 32) * 512 + (_n % 16) * 32 + (_k % 32))
+W8 = Wq_raw[widx].astype(np.float32)             # deployed codes, r07 tile convention
+f16 = np.float16
+
+
+def q_round(x):
+    return np.clip(np.rint(x), -127.0, 127.0)
+
+
+# ---- write-domain mask ------------------------------------------------------
+tt = np.repeat(np.arange(NT), NC)
+cc = np.tile(np.arange(NC), NT)
+wmask = np.zeros((NW, NT, NC), dtype=bool)
+for wx in range(GX):
+    for wy in range(TY // 2):
+        w = wy * GX + wx
+        q, s = tt >> 4, tt & 15
+        tx = 2 * wx + (q & 1)
+        ty = 2 * wy + (q >> 1)
+        oob = (tx < 0) | (ty < 0) | (tx >= TX) | (ty >= TY)
+        wmask[w] = (~oob).reshape(NT, NC)
+
+Yhat = np.einsum("wtk,nk->wtn", T, Wf)
+Yhat = Yhat + Y * f_ar[None, None, :]
+res = Y * f_ar[None, None, :]
+
+
+def rel(delta):
+    return float(np.linalg.norm(delta[wmask]) / np.linalg.norm(Yhat[wmask]))
+
+
+def dyn_codes(X, per_window=True):
+    """deployed A quantiser: amax of the window's own tile, RNE, clamp +-127."""
+    if not per_window:
+        m = float(np.max(np.abs(X)))
+        inv = 127.0 / m if m > 0 else 0.0
+        return q_round(X * inv), np.full((X.shape[0],), (m / 127.0 if m > 0 else 0.0), np.float32)
+    codes = np.empty_like(X)
+    sc = np.empty(X.shape[0], np.float32)
+    for w in range(X.shape[0]):
+        m = float(np.max(np.abs(X[w])))
+        inv = 127.0 / m if m > 0 else 0.0
+        sc[w] = m / 127.0 if m > 0 else 0.0
+        codes[w] = q_round(X[w] * inv)
+    return codes, sc
+
+
+out = {}
+
+# ===== OLD =================================================================
+cA_old, sA_old = dyn_codes(T)
+Yold = np.einsum("wtk,nk->wtn", cA_old, W8) * (Wsc[None, None, :] * sA_old[:, None, None])
+out["OLD"] = {"relL2": rel(Yold + res - Yhat)}
+
+# isolate A only (exact weights)
+YoldA = np.einsum("wtk,nk->wtn", cA_old, Wf) * (1.0 * sA_old[:, None, None])
+out["OLD_Aonly"] = {"relL2": rel(YoldA + res - Yhat)}
+
+# isolate W only (exact A)
+YoldB = np.einsum("wtk,nk->wtn", T, W8) * Wsc[None, None, :]
+out["OLD_Bonly"] = {"relL2": rel(YoldB + res - Yhat)}
+
+# ===== equalisation search =================================================
+# per-input-channel magnitudes; alpha moves dynamic range from X into W
+sig = np.sqrt((T[wmask] ** 2).mean(axis=0))              # (k,) RMS of the real input
+gam = np.sqrt((Wf ** 2).mean(axis=0))                    # (k,) RMS of the weight column
+best = None
+for alpha in [0.0, 0.25, 0.5, 0.75, 1.0]:
+    r = (sig ** alpha) / np.maximum(gam, 1e-30) ** (1.0 - alpha)
+    r = r / np.exp(np.mean(np.log(np.maximum(r, 1e-30))))
+    Dk = np.exp2(np.round(np.log2(np.maximum(r, 1e-30))))  # exact power of two
+    Dk = np.clip(Dk, 2.0 ** -8, 2.0 ** 8)
+    Xeq = T / Dk[None, None, :]
+    Weq = Wf * Dk[None, :]
+    cA, sA = dyn_codes(Xeq)
+    sW = np.maximum(np.abs(Weq).max(axis=1) / 127.0, 1e-30)
+    cW = q_round(Weq / sW[:, None])
+    Yeq = np.einsum("wtk,nk->wtn", cA, cW) * (sW[None, None, :] * sA[:, None, None])
+    rl = rel(Yeq + res - Yhat)
+    # weight-only part of the same arm
+    sW0 = np.maximum(np.abs(Wf).max(axis=1) / 127.0, 1e-30)
+    cW0 = q_round(Wf / sW0[:, None])
+    rl_wonly = rel(np.einsum("wtk,nk->wtn", cA, cW0) * (sW0[None, None, :] * sA[:, None, None]) + res - Yhat)
+    out[f"EQ_alpha{alpha}"] = {"relL2": rl, "relL2_unequalised_W": rl_wonly,
+                              "D_pow2_min": float(Dk.min()), "D_pow2_max": float(Dk.max()),
+                              "D_distinct": int(len(np.unique(Dk)))}
+    if best is None or rl < best[1]:
+        best = (alpha, rl, Dk, sW, cW, sA, Xeq, Weq)
+print(json.dumps(out, indent=1))
+
+alpha, rl, Dk, sW, cW, sA, Xeq, Weq = best
+print("best alpha", alpha, "relL2", rl)
+
+# ===== NEW_static: one static per-tensor A scale ============================
+cAs, sAs = dyn_codes(Xeq, per_window=False)
+Yst = np.einsum("wtk,nk->wtn", cAs, cW) * (sW[None, None, :] * sAs[:, None, None])
+out["NEW_static"] = {"relL2": rel(Yst + res - Yhat),
+                     "static_A_scale": float(sAs[0]),
+                     "codes_saturated_frac": float((np.abs(cAs) >= 127).mean())}
+out["OLD"]["codes_saturated_frac"] = float((np.abs(cA_old) >= 127).mean())
+
+json.dump({"arms": out, "alpha_best": alpha,
+           "D_pow2": [int(round(float(np.log2(v)))) for v in Dk],
+           "f_ar_sha_note": "residual factor pack[98304..98559]"},
+          open(f"{WORK}/slice2.json", "w", encoding="utf-8"), indent=1)
+
+# candidate pack artefacts
+np.save(f"{WORK}/cand_cW.npy", cW)
+np.save(f"{WORK}/cand_sW.npy", sW)
+np.save(f"{WORK}/cand_D.npy", Dk)
+np.save(f"{WORK}/cand_sA_static.npy", sAs)
+print(json.dumps({k: v for k, v in out.items()}, indent=1))

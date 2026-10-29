@@ -1,0 +1,306 @@
+"""Structural identity between a parent module and its INT8 candidate.
+
+Reports, per pass, only what can be read off the SPIR-V:
+  * interface: descriptor bindings (added / removed / kept), Workgroup arrays,
+    push-constant block size, entry point + local size, function count
+  * cooperative-matrix types added / removed
+  * every MulAdd site with its A/B/C/Result operand types and signedness
+  * opcode histogram deltas, with the derivation for the mechanically derived ones
+  * must-be-zero invariants (no new function, no cross-lane group op, no atomics,
+    unchanged extension set / memory model / entry point / execution modes) and
+    must-be-kept invariants (cooperative-matrix store count)
+
+usage: python tools/spv_identity.py <parent.spv> <candidate.spv> [--json out]
+"""
+import hashlib
+import json
+import struct
+import sys
+from collections import Counter
+from pathlib import Path
+
+OPS = {
+    5: "OpName", 6: "OpMemberName", 10: "OpExtension", 12: "OpExtInst",
+    14: "OpMemoryModel", 15: "OpEntryPoint", 16: "OpExecutionMode",
+    17: "OpCapability", 32: "OpTypePointer", 43: "OpConstant",
+    54: "OpFunction", 56: "OpFunctionEnd", 57: "OpFunctionCall",
+    59: "OpVariable", 61: "OpLoad", 62: "OpStore", 71: "OpDecorate",
+    72: "OpMemberDecorate", 80: "OpCompositeConstruct", 81: "OpCompositeExtract",
+    82: "OpCompositeInsert", 63: "OpAccessChain", 65: "OpInBoundsAccessChain",
+    109: "OpConvertFToU", 110: "OpConvertFToS", 111: "OpConvertSToF",
+    112: "OpConvertUToF", 113: "OpUConvert", 114: "OpSConvert", 115: "OpFConvert",
+    124: "OpBitcast", 128: "OpIAdd", 129: "OpFAdd", 131: "OpFSub", 132: "OpIMul",
+    133: "OpFMul", 136: "OpFDiv", 140: "OpFRem", 169: "OpSelect",
+    180: "OpFOrdEqual", 184: "OpFOrdLessThan", 186: "OpFOrdGreaterThan",
+    224: "OpControlBarrier", 225: "OpMemoryBarrier", 227: "OpAtomicLoad",
+    4456: "OpTypeCooperativeMatrixKHR", 4457: "OpCooperativeMatrixLoadKHR",
+    4458: "OpCooperativeMatrixStoreKHR", 4459: "OpCooperativeMatrixMulAddKHR",
+    5358: "OpCooperativeMatrixLengthKHR",
+}
+OP_DECORATE = 71
+DEC_BINDING_LITERAL = 33
+DEC_NOCONTRACTION = 4
+
+
+def parse(path):
+    raw = Path(path).read_bytes()
+    w = list(struct.unpack("<%dI" % (len(raw) // 4), raw))
+    assert w[0] == 0x07230203
+    ins, i = [], 5
+    while i < len(w):
+        op, n = w[i] & 0xFFFF, w[i] >> 16
+        ins.append((i, op, w[i + 1:i + n]))
+        i += n
+    return {"path": Path(path).as_posix(), "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(), "words": len(w),
+            "instructions": ins}
+
+
+def s32(v):
+    return v - (1 << 32) if v >= (1 << 31) else v
+
+
+class Mod:
+    def __init__(self, path):
+        self.m = parse(path)
+        ins = self.m["instructions"]
+        self.by_id = {}
+        self.order = {}
+        for k, (off, op, ops) in enumerate(ins):
+            rid = None
+            if op in (21, 22, 23, 28, 29, 30, 32, 4456) and ops:
+                rid = ops[0]                       # type declarations: result first
+            elif op in (4457, 4459, 5358) and len(ops) > 1:
+                rid = ops[1]
+            elif op in (43, 54, 59, 61, 80, 82, 128, 129, 131, 132, 133, 63, 65, 115):
+                if len(ops) > 1:
+                    rid = ops[1]
+            if rid is not None:
+                self.by_id[rid] = (off, op, ops)
+                self.order[rid] = k
+        self.ins = ins
+        self.hist = Counter(op for _, op, _ in ins)
+        self.consts = {ops[1]: ops[2] for _, op, ops in ins
+                       if op == 43 and len(ops) > 2}
+        self.names = {}
+        self.decor = {}
+        for off, op, ops in ins:
+            if op == 5 and len(ops) > 1:
+                raw = b"".join(struct.pack("<I", x) for x in ops[1:])
+                self.names[ops[0]] = raw.split(b"\x00")[0].decode("utf-8", "replace")
+            elif op == OP_DECORATE and len(ops) >= 3 and ops[1] == DEC_BINDING_LITERAL:
+                self.decor.setdefault(ops[0], {})["binding"] = ops[2]
+        # bindings -> variable name, storage class
+        self.bindings = {}
+        for off, op, ops in ins:
+            if op == 59 and len(ops) >= 3:
+                d = self.decor.get(ops[1], {})
+                if "binding" in d:
+                    self.bindings[d["binding"]] = {
+                        "name": self.names.get(ops[1], "id%d" % ops[1]),
+                        "storage_class": ops[2]}
+        # push constant size
+        self.push_bytes = None
+        tsize = self._type_sizes()
+        for off, op, ops in ins:
+            if op == 59 and len(ops) >= 3 and ops[2] == 9:
+                ptr = self.by_id.get(ops[0])
+                if ptr:
+                    self.push_bytes = tsize.get(ptr[2][2], None)
+        # local size / execution mode
+        self.local_size = None
+        for off, op, ops in ins:
+            if op == 16 and len(ops) >= 3 and ops[1] == 17:
+                self.local_size = list(ops[2:5])
+        self.functions = self.hist.get(54, 0)
+        self.cm_types = self._cm_types()
+        self.sites = self._sites()
+
+    def _type_sizes(self):
+        ints, floats, vecs, structs = {}, {}, {}, {}
+        consts = {}
+        for off, op, ops in self.ins:
+            if op == 21:
+                ints[ops[0]] = ops[1]
+            elif op == 22:
+                floats[ops[0]] = ops[1]
+            elif op == 23:
+                vecs[ops[0]] = (ops[1], ops[2])
+            elif op == 30:
+                structs[ops[0]] = list(ops[1:])
+            elif op == 43 and len(ops) > 2:
+                consts[ops[1]] = ops[2]
+
+        def sz(t, d=0):
+            if d > 8:
+                return 0
+            if t in ints:
+                return max(1, ints[t] // 8)
+            if t in floats:
+                return max(1, floats[t] // 8)
+            if t in vecs:
+                return sz(vecs[t][0], d + 1) * vecs[t][1]
+            if t in structs:
+                return sum(sz(x, d + 1) for x in structs[t])
+            return 0
+        return {t: sz(t) for t in set(list(ints) + list(floats) + list(vecs) + list(structs))}
+
+    def _cm_types(self):
+        out = Counter()
+        for off, op, ops in self.ins:
+            if op == 4456 and len(ops) >= 6:
+                comp = self.by_id.get(ops[1])
+                cn = "?"
+                if comp:
+                    cn = "f%d" % comp[2][1] if comp[1] == 22 else \
+                         "i%d%s" % (comp[2][1], "s" if comp[2][2] else "u")
+                def _v(x):
+                    return self.consts.get(x, x)
+                out[(cn, _v(ops[3]), _v(ops[4]), _v(ops[5]))] += 1
+        return out
+
+    def _scalar(self, rid, d=0):
+        if d > 8 or rid not in self.by_id:
+            return ("?", 0, "-")
+        off, op, ops = self.by_id[rid]
+        if op == 4457 or op == 4459:            # load / muladd -> result type
+            return self._ctype(ops[0])
+        if op == 4456:
+            return self._ctype(rid)
+        if op == 59:
+            return self._scalar_through_ptr(ops[0])
+        return self._ctype(ops[0]) if ops else ("?", 0, "-")
+
+    def _scalar_through_ptr(self, tid, d=0):
+        t = self.by_id.get(tid)
+        if t and t[1] == 32:
+            return self._ctype(t[2][2], d + 1)
+        return self._ctype(tid, d + 1)
+
+    def _ctype(self, tid, d=0):
+        if d > 8 or tid not in self.by_id:
+            return ("?", 0, "-")
+        off, op, ops = self.by_id[tid]
+        if op == 4456:
+            comp = self.by_id.get(ops[1])
+            if comp and comp[1] == 22:
+                return ("float", comp[2][1], "-")
+            if comp and comp[1] == 21:
+                return ("int", comp[2][1], "s" if comp[2][2] else "u")
+            return ("?", 0, "-")
+        if op == 32:
+            return self._ctype(ops[2], d + 1)
+        return ("?", 0, "-")
+
+    def _sites(self):
+        out = []
+        for off, op, ops in self.ins:
+            if op != 4459 or len(ops) < 5:
+                continue
+            out.append({"word_offset": off, "result_id": ops[1],
+                        "A": list(self._scalar(ops[2])), "B": list(self._scalar(ops[3])),
+                        "C": list(self._scalar(ops[4])), "Result": list(self._ctype(ops[0]))})
+        return out
+
+
+def main(argv):
+    js = None
+    args = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--json":
+            js = argv[i + 1]
+            i += 2
+        else:
+            args.append(argv[i])
+            i += 1
+    p, c = Mod(args[0]), Mod(args[1])
+    Bp, Bc = set(p.bindings), set(c.bindings)
+    bindings = {
+        "parent": {str(k): v for k, v in sorted(p.bindings.items())},
+        "candidate": {str(k): v for k, v in sorted(c.bindings.items())},
+        "added": {str(k): c.bindings[k] for k in sorted(Bc - Bp)},
+        "removed": {str(k): p.bindings[k] for k in sorted(Bp - Bc)},
+        "kept_identical_name": sorted(str(k) for k in Bp & Bc
+                                      if p.bindings[k] == c.bindings[k]),
+    }
+    cm_added = {str(k): v for k, v in (c.cm_types - p.cm_types).items()}
+    cm_removed = {str(k): v for k, v in (p.cm_types - c.cm_types).items()}
+    hist_delta = {}
+    for op in sorted(set(p.hist) | set(c.hist)):
+        a, b = p.hist.get(op, 0), c.hist.get(op, 0)
+        if a != b:
+            hist_delta[OPS.get(op, "op%d" % op)] = [a, b]
+    invariants = {
+        "OP_FUNCTION": [p.functions, c.functions],
+        "OP_FUNCTION_CALL": [p.hist.get(57, 0), c.hist.get(57, 0)],
+        "OP_GROUP_NON_UNIFORM_ANY": [sum(v for k, v in p.hist.items() if 333 <= k <= 374),
+                                     sum(v for k, v in c.hist.items() if 333 <= k <= 374)],
+        "OP_ATOMIC_ANY": [sum(v for k, v in p.hist.items() if 227 <= k <= 242),
+                          sum(v for k, v in c.hist.items() if 227 <= k <= 242)],
+        "OP_EXTENSION": [p.hist.get(10, 0), c.hist.get(10, 0)],
+        "OP_MEMORY_MODEL": [p.hist.get(14, 0), c.hist.get(14, 0)],
+        "OP_ENTRY_POINT": [p.hist.get(15, 0), c.hist.get(15, 0)],
+        "OP_EXECUTION_MODE": [p.hist.get(16, 0), c.hist.get(16, 0)],
+        "OP_COOPERATIVE_MATRIX_STORE": [p.hist.get(4458, 0), c.hist.get(4458, 0)],
+        "OP_COOPERATIVE_MATRIX_MULADD": [p.hist.get(4459, 0), c.hist.get(4459, 0)],
+        "OP_CONTROL_BARRIER": [p.hist.get(224, 0), c.hist.get(224, 0)],
+        "OP_MEMORY_BARRIER": [p.hist.get(225, 0), c.hist.get(225, 0)],
+    }
+    must_zero = ["OP_GROUP_NON_UNIFORM_ANY", "OP_ATOMIC_ANY"]
+    zero_ok = all(invariants[k][1] == 0 for k in must_zero)
+    zero_ok = zero_ok and (invariants["OP_FUNCTION_CALL"][0]
+                           == invariants["OP_FUNCTION_CALL"][1])
+    zero_ok = zero_ok and (invariants["OP_FUNCTION"][0] == invariants["OP_FUNCTION"][1])
+    kept_ok = (invariants["OP_COOPERATIVE_MATRIX_STORE"][0]
+               == invariants["OP_COOPERATIVE_MATRIX_STORE"][1])
+    rec = {
+        "parent": {"path": p.m["path"], "bytes": p.m["bytes"], "sha256": p.m["sha256"]},
+        "candidate": {"path": c.m["path"], "bytes": c.m["bytes"], "sha256": c.m["sha256"]},
+        "interface": {
+            "bindings": bindings,
+            "push_constant_bytes": [p.push_bytes, c.push_bytes],
+            "local_size": [p.local_size, c.local_size],
+            "functions": [p.functions, c.functions],
+            "cm_types_added": cm_added, "cm_types_removed": cm_removed,
+            "extensions_unchanged": invariants["OP_EXTENSION"][0] == invariants["OP_EXTENSION"][1],
+            "memory_model_unchanged": invariants["OP_MEMORY_MODEL"][0] == invariants["OP_MEMORY_MODEL"][1],
+            "entry_point_unchanged": invariants["OP_ENTRY_POINT"][0] == invariants["OP_ENTRY_POINT"][1],
+            "execution_modes_unchanged": invariants["OP_EXECUTION_MODE"][0] == invariants["OP_EXECUTION_MODE"][1],
+        },
+        "sites": {
+            "parent": {"fp16": sum(1 for s in p.sites if s["A"][0] == "float" and s["A"][1] == 16),
+                       "int8": sum(1 for s in p.sites if s["A"][0] == "int" and s["A"][1] == 8),
+                       "total": len(p.sites), "detail": p.sites},
+            "candidate": {"fp16": sum(1 for s in c.sites if s["A"][0] == "float" and s["A"][1] == 16),
+                          "int8": sum(1 for s in c.sites if s["A"][0] == "int" and s["A"][1] == 8),
+                          "total": len(c.sites), "detail": c.sites},
+        },
+        "opcode_delta": hist_delta,
+        "invariants": invariants,
+        "verdict": ("ATTRIBUTED" if zero_ok and kept_ok
+                    and bindings["removed"] == {} and c.sites
+                    and all(s["A"] == ["int", 8, "s"] and s["B"] == ["int", 8, "s"]
+                            and s["C"] == ["int", 32, "s"] and s["Result"] == ["int", 32, "s"]
+                            for s in c.sites) else "CHECK"),
+        "must_be_zero_violations": [k for k in must_zero if invariants[k][1] != 0],
+        "must_be_kept_store_stream": kept_ok,
+    }
+    if js:
+        Path(js).write_text(json.dumps(rec, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps({k: rec[k] for k in ("verdict", "must_be_zero_violations",
+                                          "must_be_kept_store_stream")}))
+    print("bindings +%d -%d kept %d | push %s | local %s | funcs %s | cm +%d -%d"
+          % (len(bindings["added"]), len(bindings["removed"]),
+             len(bindings["kept_identical_name"]), rec["interface"]["push_constant_bytes"],
+             rec["interface"]["local_size"], rec["interface"]["functions"],
+             len(cm_added), len(cm_removed)))
+    print("sites parent fp16=%d int8=%d -> candidate fp16=%d int8=%d"
+          % (rec["sites"]["parent"]["fp16"], rec["sites"]["parent"]["int8"],
+             rec["sites"]["candidate"]["fp16"], rec["sites"]["candidate"]["int8"]))
+    print("opcode delta: %s" % json.dumps(hist_delta))
+    return 0 if rec["verdict"] == "ATTRIBUTED" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

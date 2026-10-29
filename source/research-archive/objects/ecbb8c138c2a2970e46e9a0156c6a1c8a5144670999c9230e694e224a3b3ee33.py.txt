@@ -1,0 +1,144 @@
+"""S05 step 1: prove the block9 C128 FFN pack/scale layout from the bound files.
+
+Reference builder (read-only): candidates/codex-sol-int8-long-008-20261019/
+c128-diffusion-batch-v1/tools/build_batch.py  (its own asserts pin the layout:
+  wc_off+16384 == we_off, we_off+65536 == wm_off, wm_off+16384 == wq_off,
+  we = blocked 32x8x16x16 -> (512,128), wm = direct (128,128),
+  wc = blocked 8x8x16x16 -> (128,128), rs = 128,
+  int8 pack = [qe 65536][qmid 16384][qc 16384] = 98304).
+
+Gates:
+  G1  int8 codes == builder quantiser on the parent FP16 pack (per-row absmax/127)
+  G2  sc[16:528] == sX*sWe (512), sc[528:656] == sA*sWm (128), sc[656:784] == sM*sWc (128)
+  G3  sc[784:912] == sX*pack_rs, sX*invSX == 1
+  G4  sc[912:1040] is the DS producer's composed per-channel scale (= sP*sWds/sX semantics)
+  G5  int8 pack bytes 98304..106495 are the DS projection weight region the r09 producer reads
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import s05_common as C
+
+OUT = C.CARD / 'evidence'
+OUT.mkdir(exist_ok=True)
+data = C.rows()
+buf = data['buffers']
+r1 = C.row_by_name('block9_swin_body_1', data)
+r2 = C.row_by_name('block9_swin_body_2', data)
+r4 = C.row_by_name('block9_swin_body_4', data)
+rds = C.row_by_name('f3c64_body_ds', data)
+b1 = {int(k): v for k, v in r1['bindings'].items()}
+b2 = {int(k): v for k, v in r2['bindings'].items()}
+b4 = {int(k): v for k, v in r4['bindings'].items()}
+bds = {int(k): v for k, v in rds['bindings'].items()}
+p1 = [int(x) for x in r1['push']]
+p2 = [int(x) for x in r2['push']]
+p4 = [int(x) for x in r4['push']]
+pds = [int(x) for x in rds['push']]
+
+WEIGHT_RES, SCALE_RES = b1[0][0], b1[1][0]
+fp16_path = buf[46]['file']          # swin_9_weights (parent pack of this block)
+w8_path = buf[WEIGHT_RES]['file']    # chain_qweights_C 106496
+sc_path = buf[SCALE_RES]['file']     # chain_scales 4160
+
+ident = dict(
+    fp16_pack=C.file_meta(fp16_path),
+    weight_pack=C.file_meta(w8_path),
+    scale_pack=C.file_meta(sc_path),
+    weight_pack_resource=dict(index=WEIGHT_RES, name=buf[WEIGHT_RES]['name'], bytes=buf[WEIGHT_RES]['bytes']),
+    scale_pack_resource=dict(index=SCALE_RES, name=buf[SCALE_RES]['name'], bytes=buf[SCALE_RES]['bytes']),
+)
+
+wp = C.f16(fp16_path)
+w8 = C.i8(w8_path).astype(np.int32)
+sc = C.f32(sc_path)
+we_off, wm_off, wc_off, wq_off, rs_off = p1[12], p1[13], p1[14], p1[15], p1[17]
+
+
+def blk(a, nblk, kblk):
+    """16x16 blocked gather: ((n//16)*kblk + k//16)*256 + (n%16)*16 + k%16."""
+    n = nblk * 16
+    k = kblk * 16
+    idx = (((np.arange(n)[:, None] // 16) * kblk + (np.arange(k)[None, :] // 16)) * 256
+           + (np.arange(n)[:, None] % 16) * 16 + (np.arange(k)[None, :] % 16))
+    return a[idx]
+
+
+we = blk(wp[we_off:we_off + 32 * 8 * 256], 32, 8)      # (512,128)
+wm = wp[wm_off:wm_off + 128 * 128].reshape(128, 128)   # direct
+wc = blk(wp[wc_off:wc_off + 8 * 8 * 256], 8, 8)        # (128,128)
+rs_pack = wp[rs_off:rs_off + 128]
+
+we8 = w8[0:65536].reshape(512, 128)
+wm8 = w8[65536:81920].reshape(128, 128)
+wc8 = w8[81920:98304].reshape(128, 128)
+
+
+def builder_q(a):
+    """build_batch.qw: s = row absmax/127 (f32), codes = clip(rint(a * (1/s)))."""
+    s = np.max(np.abs(a), axis=1).astype(np.float32) / np.float32(127)
+    inv = (np.float32(1) / s).astype(np.float32)
+    return np.clip(np.rint(a.astype(np.float32) * inv[:, None]), -127, 127).astype(np.int32), s
+
+
+qe_r, sWe = builder_q(we)
+qm_r, sWm = builder_q(wm)
+qc_r, sWc = builder_q(wc)
+g1 = dict(
+    expand=dict(mismatches=int((qe_r != we8).sum()), elements=int(we8.size)),
+    mid=dict(mismatches=int((qm_r != wm8).sum()), elements=int(wm8.size)),
+    contract=dict(mismatches=int((qc_r != wc8).sum()), elements=int(wc8.size)),
+)
+
+sc0, inv0, invA, invM = (np.float32(x) for x in sc[0:4])
+sX, sMid, sCon, sRes, sP = sc[16:528], sc[528:656], sc[656:784], sc[784:912], sc[912:1040]
+
+
+def maxrel(a, b):
+    a = np.asarray(a, np.float64)
+    b = np.asarray(b, np.float64)
+    return float((np.abs(a - b) / np.maximum(np.abs(b), 1e-30)).max())
+
+
+g2 = dict(expand=maxrel(sX, sc0 * sWe), expand_exact=bool(np.array_equal(sX, (sc0 * sWe).astype(np.float32))),
+          mid=maxrel(sMid, sWm / invA), mid_exact=bool(np.array_equal(sMid, (sWm / invA).astype(np.float32))),
+          contract=maxrel(sCon, sWc / invM), contract_exact=bool(np.array_equal(sCon, (sWc / invM).astype(np.float32))),
+          sX=float(sc0), invSX=float(inv0), invSA=float(invA), invSM=float(invM))
+g3 = dict(residual=maxrel(sRes, sc0 * rs_pack), residual_exact=bool(np.array_equal(sRes, (sc0 * rs_pack).astype(np.float32))),
+          sX_times_invSX=float(np.float64(sc0) * np.float64(inv0)),
+          rs_range=[float(rs_pack.min()), float(rs_pack.max())])
+g4 = dict(range=[float(sP.min()), float(sP.max())],
+          ratio_to_invSX=[float(sP.min() / inv0), float(sP.max() / inv0)],
+          implies_sP_times_sWds_over_sX='sc[912+c] is the composed producer scale; the '
+          'implied qX quantiser for the FP16 teacher X is clip(rint(X*invSX),+-127) for D=1')
+ds = w8[98304:106496]
+g5 = dict(bytes=int(ds.size), absmax=int(np.abs(ds).max()), nonzero=int((ds != 0).sum()))
+
+rows_ident = {}
+for name in ['f3c64_body_ds', 'block9_swin_body_1', 'block9_swin_body_2', 'block9_swin_body_3',
+             'block9_swin_body_4', 'block10_swin_body_1']:
+    r = C.row_by_name(name, data)
+    bnd = {int(k): v for k, v in r['bindings'].items()}
+    spv = Path(r['spv'])
+    rows_ident[name] = dict(
+        ordinal=r['ordinal'], pass_number=r['pass_number'],
+        spv=dict(path=str(spv).replace('\\', '/'), bytes=spv.stat().st_size, sha256=C.sha256(spv)),
+        pass_tokens=r['pass_tokens'],
+        bindings={str(k): dict(res=v[0], name=buf[v[0]]['name'], offset=v[1], bytes=v[2]) for k, v in sorted(bnd.items())},
+        push=[int(x) for x in r['push']],
+    )
+
+report = dict(card='S05-c128', block=9, gates=dict(G1=g1, G2=g2, G3=g3, G4=g4, G5=g5),
+              identities=ident, rows=rows_ident,
+              source_reference='candidates/codex-sol-int8-long-008-20261019/c128-diffusion-batch-v1/tools/build_batch.py:98-214')
+(OUT / 'LAYOUT-PROOF.json').write_text(json.dumps(report, indent=2))
+
+ok = (g1['expand']['mismatches'] == 0 and g1['mid']['mismatches'] == 0 and g1['contract']['mismatches'] == 0
+      and g2['expand_exact'] and g2['mid_exact'] and g2['contract_exact']
+      and g3['residual_exact'] and abs(g3['sX_times_invSX'] - 1.0) < 1e-6)
+print(json.dumps(dict(G1=g1, G2=g2, G3=g3, G4=g4, G5=g5), indent=2))
+print('ALL_GATES', ok)

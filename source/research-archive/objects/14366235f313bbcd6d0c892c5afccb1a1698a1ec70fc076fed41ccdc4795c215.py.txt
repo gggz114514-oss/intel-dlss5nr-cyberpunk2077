@@ -1,0 +1,104 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,struct
+N=Path(__file__).resolve().parent;P=N.parent/'c32-fullchain-20261025/norm-contract';B=Path('@NR_WORKSPACE@');S=B/'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1/source';sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def ident(p):return {'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+def run(a):
+ p=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert p.returncode==0,p.stdout+p.stderr;return p.stdout
+base=(P/'candidate.comp').read_text(encoding='utf-8-sig')
+def tiled(s):
+ for t in range(2):
+  for f in range(2):
+   a=f'coopMatStore(k{t}{f},shK,{f*1024}u+t0+{t*8}u,64u,LCOL);';b=f'coopMatStore(k{t}{f},shK,{f*1024}u+sg*256u+{t*8}u,16u,LCOL);';assert a in s;s=s.replace(a,b)
+   a=f'coopMatStore(v{t}{f},shV,(t0+{t*8}u)*32u+{f*16}u,32u,LROW);';b=f'coopMatStore(v{t}{f},shV,sg*512u+{f*256+t*128}u,16u,LROW);';assert a in s;s=s.replace(a,b)
+ for g in range(4):
+  for f in range(2):
+   a=f'coopMatLoad(b,shV,{g*512+f*16}u,32u,LROW);';b=f'coopMatLoad(b,shV,{g*512+f*256}u,16u,LROW);';assert a in s;s=s.replace(a,b)
+ start=s.index('NRH_CH p00;');end=s.index('uint ds0;',start) if 'uint ds0;' in s else s.index('{\nprecise f16vec2 d=',start);out=[]
+ for g in range(4):
+  out += [f'NRH_CH p0{g},p1{g};','{','NRH_C sc0=NRH_C(0.0),sc1=NRH_C(0.0);']
+  for k in range(2):out+=['{',f'NRH_B b;coopMatLoad(b,shK,{k*1024+g*256}u,16u,LROW);',f'sc0=coopMatMulAdd(qa0{k},b,sc0);sc1=coopMatMulAdd(qa1{k},b,sc1);','}']
+  for t in range(2):
+   out+=['{',f'NRH_C bias;coopMatLoad(bias,fb,uint(pc.p2.w)+(t0+{t*8}u)*64u+{g*16}u,64u,LROW);']
+   for c in range(4):out+=[f'precise float biased{c}=sc{t}[{c}]+bias[{c}];sc{t}[{c}]=biased{c};']
+   out+=[f'p{t}{g}=nrh_narrow(sc{t});']
+   for c in [0,2]:out+=[f'{{f16vec2 e=nr_exp_h2(f16vec2(p{t}{g}[{c}],p{t}{g}[{c+1}]));p{t}{g}[{c}]=e.x;p{t}{g}[{c+1}]=e.y;}}']
+   out+=['}']
+  out+=['}']
+ return s[:start]+'\n'.join(out)+'\n'+s[end:]
+def coeff(s):
+ begin=s.index('return f16vec2(float16_t(inversesqrt');end=s.index('\nvoid main()',begin);s=s[:begin]+'return f16vec2(q,k);}\n'+s[end:]
+ begin=s.index('float16_t headscale=');end=s.index('}\nbarrier();',begin);out=[]
+ # Publish V before retaining the eight sum packets: no V/sum lifetime overlap.
+ for t in range(2):
+  for f in range(2):out += [f'coopMatStore(v{t}{f},shV,(t0+{t*8}u)*32u+{f*16}u,32u,LROW);']
+ for t in range(2):
+  for c in range(4):out += [f'uint ns{t*4+c}=packFloat2x16(full_norm(q{t}0[{c}],q{t}1[{c}],k{t}0[{c}],k{t}1[{c}]));']
+ out += ['uint pickN=(lane&8u)==0u?((lane&4u)==0u?((lane&2u)==0u?ns0:ns1):((lane&2u)==0u?ns2:ns3)):((lane&4u)==0u?((lane&2u)==0u?ns4:ns5):((lane&2u)==0u?ns6:ns7));','uint owner=(lane&14u)|((lane&1u)<<4u);','f16vec2 total=unpackFloat2x16(subgroupShuffle(pickN,owner));','float16_t nq=float16_t(inversesqrt(max(float(total.x),float(float16_t(0.000062)))));','float16_t nk=float16_t(inversesqrt(max(float(total.y),float(float16_t(0.000062)))));','uint norms=packFloat2x16(f16vec2(nq,nk));','float16_t headscale=float16_t(fb[uint(pc.p2.z)]);']
+ for t in range(2):
+  for c in range(4):
+   out += ['{',f'f16vec2 n=unpackFloat2x16(subgroupShuffle(norms,{t*8+c*2}u+(lane>>4u)));']
+   for f in range(2):out += [f'precise float16_t qr{f}=q{t}{f}[{c}]*n.x;qr{f}=qr{f}*headscale;q{t}{f}[{c}]=qr{f};k{t}{f}[{c}]=k{t}{f}[{c}]*n.y;']
+   out+=['}']
+  for f in range(2):
+   out += [f'coopMatStore(k{t}{f},shK,{f*1024}u+t0+{t*8}u,64u,LCOL);']
+   for name,offset in [('q',10240),('k',12288)]:out += [f'if(debug) coopMatStore({name}{t}{f},dbg,{offset}u+(t0+{t*8}u)*32u+{f*16}u,32u,LROW);']
+ s=s[:begin]+'\n'.join(out)+'\n'+s[end:]
+ begin=s.index('{\nprecise f16vec2 d=');end=s.index('NRH_C tc00=',begin);out=[]
+ for t in range(2):
+  for c in [0,2]:
+   out += [f'uint ds{t*2+c//2};','{','precise f16vec2 d=f16vec2(float16_t(0));']
+   for g in range(4):out += ['{',f'f16vec2 x=f16vec2(p{t}{g}[{c}],p{t}{g}[{c+1}]);','f16vec2 peer=unpackFloat2x16(subgroupShuffleXor(packFloat2x16(x),8u));','bool lower=(lane&8u)==0u;precise f16vec2 pair=(lower?x:peer)+(lower?peer:x);d=d+pair;','}']
+   for step in [2,4,1]:out += ['{',f'f16vec2 peer=unpackFloat2x16(subgroupShuffleXor(packFloat2x16(d),{step}u));bool lower=(lane&{step}u)==0u;d=(lower?d:peer)+(lower?peer:d);','}']
+   out += [f'ds{t*2+c//2}=packFloat2x16(d);','}']
+ out += ['uint pickD=(lane&8u)==0u?((lane&4u)==0u?ds0:ds1):((lane&4u)==0u?ds2:ds3);','f16vec2 gathered=unpackFloat2x16(subgroupShuffle(pickD,(lane&14u)|((lane&1u)<<4u)));','float16_t sum=(lane&2u)==0u?gathered.x:gathered.y;','float16_t inv=float16_t(1.0/max(float(sum),6.103515625e-05));','float16_t peerInv=unpackFloat2x16(subgroupShuffleXor(packFloat2x16(f16vec2(inv,inv)),2u)).x;','uint pairedInv=packFloat2x16((lane&2u)==0u?f16vec2(inv,peerInv):f16vec2(peerInv,inv));']
+ for t in range(2):
+  for c in [0,2]:
+   out += ['{',f'f16vec2 inv=unpackFloat2x16(subgroupShuffle(pairedInv,{t*8+c*2}u+(lane>>4u)));']
+   for g in range(4):out += [f'p{t}{g}[{c}]=p{t}{g}[{c}]*inv.x;p{t}{g}[{c+1}]=p{t}{g}[{c+1}]*inv.y;']
+   out+=['}']
+  for g in range(4):out += [f'if(debug) coopMatStore(p{t}{g},dbg,14336u+(t0+{t*8}u)*64u+{g*16}u,64u,LROW);']
+ return s[:begin]+'\n'.join(out)+'\n'+s[end:]
+# Prove coefficient gathering/distribution on symbolic query identities, all32 lanes.
+norms=[[(2*d+(l>>4)) for d in range(8)] for l in range(32)];pick=[norms[l][(l>>1)&7] for l in range(32)];gather=[pick[(l&14)|((l&1)<<4)] for l in range(32)];assert gather==[l%16 for l in range(32)]
+for l in range(32):
+ for d in range(8):assert gather[2*d+(l>>4)]==2*d+(l>>4)
+den=[[(4*d+(l>>4),4*d+2+(l>>4)) for d in range(4)] for l in range(32)];pick=[den[l][(l>>2)&3] for l in range(32)];g=[pick[(l&14)|((l&1)<<4)][(l>>1)&1] for l in range(32)];assert g==[l%16 for l in range(32)]
+pair=[(g[l],g[l^2]) if not l&2 else (g[l^2],g[l]) for l in range(32)]
+for l in range(32):
+ for d in range(4):assert pair[4*d+(l>>4)]==(4*d+(l>>4),4*d+2+(l>>4))
+# Prove tiled SLM producers and B consumers, including row/column orientation.
+kw={};vw={}
+for sg in range(4):
+ for t in range(2):
+  for f in range(2):
+   for r in range(8):
+    for c in range(16):
+     ka=f*1024+sg*256+t*8+c*16+r;va=sg*512+f*256+t*128+r*16+c;assert ka not in kw and va not in vw;kw[ka]=(sg*16+t*8+r,f*16+c);vw[va]=(sg*16+t*8+r,f*16+c)
+assert set(kw)==set(range(2048))==set(vw)
+for g0 in range(4):
+ for f in range(2):
+  for r in range(16):
+   for c in range(16):assert kw[f*1024+g0*256+r*16+c]==(g0*16+c,f*16+r);assert vw[g0*512+f*256+r*16+c]==(g0*16+r,f*16+c)
+(N/'MAPPING-PROOFS.json').write_text(json.dumps({'norm_coefficients':256,'den_coefficients':256,'K_unique':len(kw),'V_unique':len(vw),'K_and_V_B_reads_checked':4096,'mismatches':0},indent=2))
+def eager(s):
+ helper='uint owner_select(uint x,uint y,bool b){return mix(uvec2(x),uvec2(y),bvec2(b)).x;}\n'
+ s=s.replace('void main() {',helper+'void main() {')
+ lines=s.splitlines()
+ for i,l in enumerate(lines):
+  if l.startswith('uint pickN='):
+   lines[i]='uint pickN=owner_select(owner_select(owner_select(ns0,ns1,(lane&2u)!=0u),owner_select(ns2,ns3,(lane&2u)!=0u),(lane&4u)!=0u),owner_select(owner_select(ns4,ns5,(lane&2u)!=0u),owner_select(ns6,ns7,(lane&2u)!=0u),(lane&4u)!=0u),(lane&8u)!=0u);'
+  if l.startswith('uint pickD='):lines[i]='uint pickD=owner_select(owner_select(ds0,ds1,(lane&4u)!=0u),owner_select(ds2,ds3,(lane&4u)!=0u),(lane&8u)!=0u);'
+ return '\n'.join(lines)+'\n'
+labels=sys.argv[1:] or ['kv-tile','coeff-owner'];metadata=[]
+for label in labels:
+ folder=N/label;folder.mkdir(exist_ok=True);s=tiled(base) if label=='kv-tile' else coeff(base) if label=='coeff-owner' else eager(tiled(coeff(base)));src=folder/'candidate.comp';src.write_text(s,encoding='utf-8');dst=folder/'candidate.spv';run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(S),src,'-o',dst]);cm=ST.Module(dst);names={ops[0]:struct.pack('<'+'I'*len(ops[1:]),*ops[1:]).split(b'\0')[0].decode() for op,ops,*_ in cm.instructions if op==5};fid=next(k for k,v in names.items() if v.startswith('full_norm('));inside=False;fma=[]
+ for op,ops,*_ in cm.instructions:
+  if op==54:inside=ops[1]==fid
+  if inside and op==12 and ops[3]==50:fma.append(ops[1])
+  if op==56:inside=False
+ assert len(fma)==2;ST.set_no_contraction(cm,set(ST.no_contraction_ids(cm))|set(fma),dst);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',dst]);plan=folder/'plan.txt';old=(P/'plan.txt').read_text(encoding='utf-8-sig');assert old.count((P/'candidate.spv').as_posix())==7;plan.write_text(old.replace((P/'candidate.spv').as_posix(),dst.as_posix()),encoding='utf-8');runner=N.parent/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe';(folder/'CPU-CHECK.txt').write_text(run([runner,'--plan',plan,'--cpu-check']));m={'label':label,'baseline':ident(P/'plan.txt'),'source':ident(src),'spv':ident(dst),'plan':ident(plan),'fma_no_contraction_ids':fma,'static_mma':sum(x[0]==4459 for x in ST.Module(dst).instructions),'slm_bytes':8192};assert m['static_mma']==128;(folder/'CANDIDATE.json').write_text(json.dumps(m,indent=2));metadata.append(m);print(label,ident(dst))
+t=json.loads((P/'LUNA-GATES.json').read_text());template=t['jobs'];t['jobs']=[];t['output_root']=str(N);t['identities']=[x for x in t['identities'] if not x['path'].endswith('candidate.spv')]+[m['spv'] for m in metadata];(N/'run').mkdir(exist_ok=True)
+for m in metadata:
+ for oldj in template:
+  j=json.loads(json.dumps(oldj));j['id']='gate-'+m['label']+'-'+j['mode'];j['candidate']=m['label'];j['plan']=m['plan'];j['runner_output']=str(N/'run'/j['id']);j['argv'][2]=m['plan']['path'];j['argv'][4]=j['runner_output'];t['jobs'].append(j)
+(N/('LUNA-GATES-COMBO.json' if labels==['combo-eager'] else 'LUNA-GATES.json')).write_text(json.dumps(t,indent=2))

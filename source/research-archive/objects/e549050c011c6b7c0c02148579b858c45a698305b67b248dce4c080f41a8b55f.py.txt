@@ -1,0 +1,445 @@
+"""n37-f10-arena-shrink: exhaustive SLM layout / lifetime / hazard model (CPU only).
+
+F10 = C512 QKV + attention, one arena `shared float16_t smem[N]` (no per-head section
+stride; the workgroup is 256 threads = 8 subgroups and owns one head).
+
+The model re-derives every cooperative-matrix footprint from the deployment formula
+(never from a sample) and is parameterised by the arm's plane bases, so the parent
+(chain head n10) and the candidate (this card) are evaluated by the same code:
+
+  arm        arena   Q      K      V      window0/1
+  parent     10240   4096   6144   8192   [0,4096) odd slices, [4096,8192) even slices
+  candidate   8192   0      2048   4096   same two windows
+
+Produces build/lifetime.json:
+  regions    plane table (halves, bytes, layout formula, writer/reader SG sets)
+  coverage   exhaustive address -> (count, SG set) for every producer and consumer
+  hazards    per-address RAW / WAR / WAW classification + the barrier that closes it
+  liveness   ordered phase list with the live set and the peak live bytes
+  budget     staging / handoff / peak bytes and where the 4096 B come from
+  residency  SLM pool interval implied by the two measured reverse probes (L33)
+  dynamic    per-WG / per-frame message and barrier counts, parent vs candidate
+"""
+import collections
+import json
+import pathlib
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+
+# ------------------------------------------------------------------ geometry
+THREADS, LANES = 256, 32
+SGS = 8
+TOKENS, CHANNELS, DIMS, KEYS = 64, 32, 32, 64
+PLANE = TOKENS * CHANNELS                  # 2048 half = 4096 B per plane
+SLICE_CH = 64                              # channels staged per kc slice
+SLICES = 512 // SLICE_CH                   # 8
+SLICE = TOKENS * SLICE_CH                  # 4096 half = 8192 B staged per slice
+WINDOW = SLICE                             # one window == one slice
+
+ARMS = {
+    'parent': dict(arena=10240, Q=4096, K=6144, V=8192),
+    'candidate': dict(arena=8192, Q=0, K=2048, V=4096),
+}
+# slice i (kc = 64*i) stages into base 4096 for even i and 0 for odd i (both arms)
+WIN_BASE = lambda i: 4096 if i % 2 == 0 else 0
+
+
+def tiled(token, c, C=512):
+    return ((token // 16) * (C // 16) + c // 16) * 256 + (token % 16) * 16 + c % 16
+
+
+def qkv_a_offset(e):
+    r, k = e // 64, e % 64
+    return ((r // 8) * 4 + k // 16) * 128 + (k % 16) * 8 + r % 8
+
+
+def frag(base, stride, rows, cols, layout):
+    """Footprint of one cooperative-matrix fragment: row/col major, half addresses."""
+    if layout == 'ROW':
+        return {base + r * stride + c for r in range(rows) for c in range(cols)}
+    return {base + c * stride + r for r in range(rows) for c in range(cols)}
+
+
+# ------------------------------------------------------------------ producers
+def stage_writes(arm, i):
+    """{sg: set(addr)} of the staged slice i (addresses already include the window)."""
+    a = ARMS[arm]
+    b = WIN_BASE(i)
+    out = {sg: set() for sg in range(SGS)}
+    for lid in range(THREADS):
+        sg = lid // LANES
+        q, c0 = lid >> 6, lid & 63
+        for g in range(4):
+            for ip in range(4):
+                e = lid + 256 * ip + 1024 * g
+                assert qkv_a_offset(e) < SLICE
+                out[sg].add(b + qkv_a_offset(e))
+    return out
+
+
+def stage_reads(arm, i):
+    """{sg: set(addr)} of the staged slice i A-fragment reads (both M blocks)."""
+    b = WIN_BASE(i)
+    out = {sg: set() for sg in range(SGS)}
+    for sg in range(SGS):
+        mA = (sg // 2) * 16
+        mB = mA + 8
+        for j in range(4):
+            out[sg] |= frag(b + ((mA // 8) * 4 + j) * 128, 8, 8, 16, 'COL')
+            out[sg] |= frag(b + ((mB // 8) * 4 + j) * 128, 8, 8, 16, 'COL')
+    return out
+
+
+def handoff_writes(arm):
+    """{plane: {sg: set(addr)}} of the QKV publication stores (STORE_QKV, 6 calls)."""
+    a = ARMS[arm]
+    out = {p: {sg: set() for sg in range(SGS)} for p in ('Q', 'K', 'V')}
+    for sg in range(SGS):
+        mA, mB = (sg // 2) * 16, (sg // 2) * 16 + 8
+        n0 = (sg % 2) * 48
+        for M in (mA, mB):
+            for column in (n0 + 0, n0 + 16, n0 + 32):
+                if column < 64:
+                    base = a['Q'] + (column // 32) * 2048 + M * 32 + column % 32
+                    plane = 'Q' if column < 32 else 'K'
+                    out[plane][sg] |= frag(base, 32, 8, 16, 'ROW')
+                else:
+                    base = a['V'] + (column - 64) * 64 + M
+                    out['V'][sg] |= frag(base, 64, 8, 16, 'COL')
+    return out
+
+
+def handoff_reads(arm):
+    """{op: {sg: set(addr)}} of the consumers: score Q^T B, score K A, PV V A."""
+    a = ARMS[arm]
+    out = {op: {sg: set() for sg in range(SGS)} for op in ('Q', 'K', 'V')}
+    for sg in range(4):
+        qg = sg * 16
+        out['Q'][sg] |= frag(a['Q'] + qg * 32, 32, 16, 16, 'COL')            # bq0
+        out['Q'][sg] |= frag(a['Q'] + qg * 32 + 16, 32, 16, 16, 'COL')       # bq1
+        for KB in range(0, 64, 8):
+            out['K'][sg] |= frag(a['K'] + KB * 32, 32, 8, 16, 'ROW')         # channels 0..15
+            out['K'][sg] |= frag(a['K'] + KB * 32 + 16, 32, 8, 16, 'ROW')    # channels 16..31
+        for dimblk in range(4):
+            for keybase in (0, 16, 32, 48):
+                out['V'][sg] |= frag(a['V'] + dimblk * 8 * 64 + keybase, 64, 8, 16, 'ROW')
+    return out
+
+
+def echo_reads(arm):
+    """The gated raw echo reads all 6144 handoff halves through v_raw()."""
+    a = ARMS[arm]
+    def v_raw(e):
+        return e if e < 4096 else 4096 + ((e - 4096) % 32) * 64 + (e - 4096) // 32
+    return {a['Q'] + v_raw(e) for e in range(6144)}
+
+
+# ------------------------------------------------------------------ analysis
+def plane_of(arm, addr):
+    a = ARMS[arm]
+    for p in ('V', 'K', 'Q'):
+        if a[p] <= addr < a[p] + PLANE:
+            return p
+    return None
+
+
+def owners(rep):
+    m = collections.defaultdict(set)
+    for sg, s in rep.items():
+        for x in s:
+            m[x].add(sg)
+    return m
+
+
+def coverage_stats(arm, rep, label):
+    cnt = collections.Counter()
+    for s in rep.values():
+        cnt.update(s)
+    hist = collections.Counter(cnt.values())
+    per_sg = {sg: len(s) for sg, s in rep.items()}
+    return dict(label=label, distinct_addresses=len(cnt),
+                count_histogram={str(k): v for k, v in sorted(hist.items())},
+                per_sg=per_sg, total=sum(per_sg.values()))
+
+
+def hazard(arm, earlier, later, kind):
+    """Address-level SG-set relation between an earlier op and a later op."""
+    oe, ol = owners(earlier), owners(later)
+    intra = cross = 0
+    pairs = set()
+    for addr, who_l in ol.items():
+        who_e = oe.get(addr)
+        if not who_e:
+            continue
+        for x in who_e:
+            for y in who_l:
+                if x == y:
+                    intra += 1
+                else:
+                    cross += 1
+                pairs.add((x, y))
+    return dict(kind=kind, shared_addresses=len(set(ol) & set(oe)),
+                intra_sg_pairs=intra, cross_sg_pairs=cross)
+
+
+def liveness(arm):
+    """Ordered phases with the addresses that may still be read (live set, source order).
+
+    The peak simultaneously-live set is 2 staged slices (both windows) in both arms; what
+    differs is the *allocation* constraint: whether window 0 may alias the handoff.
+    """
+    a = ARMS[arm]
+    n = 'NEW barrier N retires window 0' if arm == 'candidate' else 'no barrier: window 0 must stay clear'
+    rows = []
+
+    def add(phase, live, note):
+        rows.append(dict(phase=phase, live_halves=len(live), live_bytes=2 * len(live),
+                         note=note))
+
+    W0, W1 = set(range(0, 4096)), set(range(4096, 8192))
+    hand = (set(range(a['Q'], a['Q'] + PLANE)) | set(range(a['K'], a['K'] + PLANE))
+            | set(range(a['V'], a['V'] + PLANE)))
+    add('P1 store slice 0 (kc=0) into window 1', W1, 'first staged slice')
+    add('P2 store slice 1 (kc=64) into window 0, slice 0 still readable', W0 | W1,
+        'two slices can be read concurrently: the windows must be disjoint')
+    add('P3 slices 2..6 alternate; slice i+1 publish retires slice i-1', W0 | W1,
+        'steady state; the peak live set is 8192 halves')
+    add('P4 publish barrier of slice 7 (kc=448)', W0 | W1,
+        'slices 6 (window 1) and 7 (window 0) are both readable here')
+    add('P5 A-fragment reads of slice 7', W0, 'window 1 is retired by the slice-7 barrier')
+    add('P6 retire window 0', set(), n)
+    add('P7 STORE_QKV publishes Q,K,V', hand, 'staging windows are dead')
+    add('P8 score reads (Q^T by sg<4, K by all sg<4) then PV reads V', hand,
+        'Q,K,V all live across the score/PV pair')
+    return dict(phases=rows,
+                peak_simultaneously_live_halves=max(r['live_halves'] for r in rows),
+                peak_simultaneously_live_bytes=2 * max(r['live_halves'] for r in rows),
+                handoff_halves=len(hand), arena_halves=a['arena'],
+                allocation_halves=a['arena'],
+                alias_forbidden_pairs=([] if arm == 'candidate'
+                                       else [['window0', 'QKV handoff']]),
+                allocation_note=('max(2 windows, handoff) = 8192 halves: window 0 may alias '
+                                 'Q+K because barrier N separates the last read from the stores'
+                                 if arm == 'candidate' else
+                                 'window0 + handoff = 4096 + 6144 = 10240 halves: the last '
+                                 'staged slice is still readable when the handoff stores run, '
+                                 'so window 0 cannot hold a plane'))
+
+
+def residency(arm_halves):
+    lo = max(2 * 24576, 2 * 32768)          # floor(P/W) == 2  =>  P >= 2W   (F05, F06)
+    hi = min(3 * 24576, 3 * 32768) - 1      # floor(P/W) == 2  =>  P <  3W
+    rows = []
+    for w in (24576, 20480, 16384, 13107, 8192):
+        rows.append(dict(workgroup_bytes=w, residents_min=lo // w, residents_max=hi // w,
+                         exact=lo // w == hi // w))
+    return dict(pool_bytes_interval=[lo, hi], basis=[
+        'F05 reverse probe: 24576 B -> 2 residents, 49152 B -> 1 resident',
+        'F06 reverse probe: 32768 B -> 2 residents, 49152 B -> 1 resident',
+        'evidence/LESSONS.json L33: pool in [65536, 73728), thresholds 32768/21845/16384/13107',
+    ], table=rows,
+        this_card=dict(parent_bytes=2 * arm_halves['parent'], parent_residents=3,
+                       candidate_bytes=2 * arm_halves['candidate'], candidate_residents=4))
+
+
+def dynamic(arm):
+    """Per-workgroup counts derived from the geometry (debug off)."""
+    proj = dict(
+        slices=SLICES, ksteps_per_slice=4,
+        global_half_reads=SLICES * 16,          # 16 STAGE per thread per slice
+        slm_stores=SLICES * 16,
+        slm_A_loads=SLICES * 4 * 2,             # a0,a1 per k-step
+        global_weight_loads=SLICES * 4 * 3,     # b0,b1,b2 per k-step
+        dpas=SLICES * 4 * 6,                    # 6 accumulators per k-step
+        barriers=SLICES + (1 if arm == 'candidate' else 0),
+        barrier_note=('8 publish + 1 new retire barrier N' if arm == 'candidate'
+                      else '8 publish, no retire barrier (n10)'))
+    score = dict(slm_loads=2 + 8 * 2, dpas=8 * 2, sgs=4,
+                 note='Q^T bq0/bq1 + 8 key blocks x 2 half-channel loads, sg<4 only')
+    pv = dict(slm_loads=4 * 4, dpas=4 * 4, sgs=4,
+              note='4 dim blocks x 4 key groups, sg<4 only')
+    handoff = dict(slm_stores=6, note='STORE_QKV: 3 N16 fragments x 2 M blocks')
+    other_barriers = 2                          # after STORE_QKV, after the norm
+    return dict(projection=proj, score=score, pv=pv, handoff=handoff,
+                other_barriers=other_barriers,
+                barriers_per_wg=proj['barriers'] + other_barriers,
+                dpas_per_wg=8 * proj['dpas'] + 4 * (score['dpas'] + pv['dpas']),
+                dpas_note='projection runs on all 8 SGs; score+PV on sg<4 only',
+                slm_loads_per_sg=proj['slm_A_loads'] + (score['slm_loads']
+                                                        + pv['slm_loads']),
+                slm_stores_per_sg=proj['slm_stores'] + handoff['slm_stores'])
+
+
+def main():
+    out = dict(geometry=dict(threads=THREADS, subgroups=SGS, tokens=TOKENS,
+                             channels=CHANNELS, keys=KEYS, slice_channels=SLICE_CH,
+                             slices=SLICES, plane_halves=PLANE, window_halves=WINDOW,
+                             window_bases=[WIN_BASE(i) for i in range(SLICES)]))
+    for arm in ('parent', 'candidate'):
+        a = ARMS[arm]
+        rec = dict(planes={}, arena_halves=a['arena'], arena_bytes=2 * a['arena'],
+                   free_after_loop=[])
+
+        # ---- plane table
+        for p, off, layout, prod, cons in (
+                ('Q', a['Q'], 'addr = base + token*32 + channel  (token<64, channel<32)',
+                 'STORE_QKV columns 0,16 by the 4 even SGs (each 16 tokens x 32 channels)',
+                 'score B operand Q^T, sg<4, own 16 queries x 32 channels'),
+                ('K', a['K'], 'addr = base + token*32 + channel  (token<64, channel<32)',
+                 'STORE_QKV columns 32,48 (channels 0..15 by the even SG, 16..31 by the odd SG)',
+                 'score A operand, all 8 key blocks x 32 channels, every sg<4'),
+                ('V', a['V'], 'addr = base + dim*64 + key       (dim<32, key<64)',
+                 'STORE_QKV columns 64,80 by the 4 odd SGs (16 keys x 32 dims)',
+                 'PV A operand V^T, 4 dim blocks x 4 key groups, every sg<4')):
+            rec['planes'][p] = dict(base=off, halves=PLANE, bytes=2 * PLANE, first=off,
+                                    last=off + PLANE - 1, layout=layout,
+                                    producer=prod, consumer=cons)
+        # free space after the loop (not covered by any plane)
+        covered = set()
+        for p in ('Q', 'K', 'V'):
+            covered |= set(range(a[p], a[p] + PLANE))
+        rec['free_after_loop'] = [i for i in range(a['arena']) if i not in covered]
+        rec['free_after_loop_halves'] = len(rec['free_after_loop'])
+        rec['free_after_loop_is_contiguous'] = (
+            rec['free_after_loop'] == list(range(min(rec['free_after_loop']),
+                                                 max(rec['free_after_loop']) + 1))
+            if rec['free_after_loop'] else True)
+
+        # ---- staging coverage (one slice, exhaustive) + partition
+        sw = stage_writes(arm, 1)
+        sr = stage_reads(arm, 1)
+        rec['staging'] = dict(
+            window_halves=WINDOW, window_bytes=2 * WINDOW,
+            slice_bases=[WIN_BASE(i) for i in range(SLICES)],
+            write=coverage_stats(arm, sw, 'staged slice writes'),
+            read=coverage_stats(arm, sr, 'A fragment reads'),
+            write_is_partition=(len({x for s in sw.values() for x in s}) == SLICE),
+            read_union_is_whole_slice=(set().union(*sr.values())
+                                       == set(range(WIN_BASE(1), WIN_BASE(1) + SLICE))),
+            read_per_address_multiplicity=dict(
+                collections.Counter(collections.Counter(
+                    [x for s in sr.values() for x in s]).values())))
+        # the two windows must be disjoint, else the alternation is not a retire scheme
+        w0, w1 = set(range(0, WINDOW)), set(range(WINDOW, 2 * WINDOW))
+        rec['staging']['windows_disjoint'] = not (w0 & w1)
+        rec['staging']['window_union'] = [0, 2 * WINDOW - 1]
+
+        # ---- handoff coverage
+        hw, hr = handoff_writes(arm), handoff_reads(arm)
+        rec['handoff'] = {
+            'write': {p: coverage_stats(arm, hw[p], p + ' stores') for p in hw},
+            'read': {p: coverage_stats(arm, hr[p], p + ' reads') for p in hr},
+            'partition': {p: len({x for s in hw[p].values() for x in s}) == PLANE
+                          for p in hw},
+            'read_union_is_plane': {p: set().union(*hr[p].values())
+                                    == set(range(a[p], a[p] + PLANE)) for p in hr},
+        }
+        echo = echo_reads(arm)
+        rec['echo'] = dict(halves=len(echo),
+                           equals_handoff_union=(echo ==
+                                                 set(range(a['Q'], a['Q'] + PLANE))
+                                                 | set(range(a['K'], a['K'] + PLANE))
+                                                 | set(range(a['V'], a['V'] + PLANE))))
+
+        # ---- hazards
+        haz = {}
+        # staging WAR/WAW: slice i writes vs slice i+2 writes (same window)
+        w_i = owners(stage_writes(arm, 7))
+        w_prev = owners(stage_writes(arm, 5))
+        haz['staging_waw_i5_i7'] = dict(shared=len(set(w_i) & set(w_prev)),
+                                        closed_by="slice 6's publish barrier")
+        r7 = owners(stage_reads(arm, 7))
+        haz['staging_war_read7_write_handoff'] = (
+            dict(shared_QK=len(set(r7) & set(range(a['Q'], a['Q'] + 2 * PLANE))),
+                 shared_V=len(set(r7) & set(range(a['V'], a['V'] + PLANE))),
+                 closed_by='NEW barrier N (candidate only; parent needs none because its '
+                           'last window [0,4096) holds no handoff plane)'))
+        r6 = owners(stage_reads(arm, 6))
+        haz['staging_war_read6_write_handoff'] = (
+            dict(shared_QK=len(set(r6) & set(range(a['Q'], a['Q'] + 2 * PLANE))),
+                 shared_V=len(set(r6) & set(range(a['V'], a['V'] + PLANE))),
+                 closed_by="slice 7's publish barrier (all sg<4 reads of slice 6 precede it)"))
+        haz['handoff_read7_vs_V'] = dict(
+            shared_vs_V=len(set(r7) & set(range(a['V'], a['V'] + PLANE))))
+        # handoff RAW
+        for p in ('Q', 'K', 'V'):
+            haz['raw_%s_store_to_read' % p] = hazard(arm, hw[p], hr[p],
+                                                     'RAW %s' % p)
+            haz['raw_%s_store_to_read' % p]['closed_by'] = 'barrier after QKV (existing)'
+        # in-place normalisation: read set == write set, one thread per element
+        norm_write = set(range(a['Q'], a['Q'] + PLANE)) | set(range(a['K'], a['K'] + PLANE))
+        haz['norm_in_place'] = dict(
+            elements=len(norm_write),
+            reader_set_equals_writer_set=True,
+            concurrent_readers_per_element=1,
+            note='lid<64 owns token lid: qr/kr reads and Q/K writes of the same 32 '
+                 'channels, same thread, program order; no cross-SG WAR')
+        rec['hazards'] = haz
+
+        rec['liveness'] = liveness(arm)
+        rec['dynamic'] = dynamic(arm)
+        out[arm] = rec
+
+    out['residency'] = residency({'parent': ARMS['parent']['arena'],
+                                  'candidate': ARMS['candidate']['arena']})
+    out['budget'] = dict(
+        parent=dict(arena_halves=ARMS['parent']['arena'],
+                    arena_bytes=2 * ARMS['parent']['arena'],
+                    staging=2 * WINDOW, handoff=3 * PLANE,
+                    overlap='the last staged window is deliberately placed so Q+K+V fits '
+                            'outside it: 4096 (window 0) + 6144 (QKV) = 10240 halves'),
+        candidate=dict(arena_halves=ARMS['candidate']['arena'],
+                       arena_bytes=2 * ARMS['candidate']['arena'],
+                       staging=2 * WINDOW, handoff=3 * PLANE,
+                       overlap='the handoff is re-based onto the two staging windows; the '
+                               'last window is retired by one new workgroup barrier, so '
+                               'the peak is max(2*4096, 3*2048) = 8192 halves'),
+        saved_bytes=2 * (ARMS['parent']['arena'] - ARMS['candidate']['arena']),
+        next_threshold=13107,
+        next_threshold_gap_bytes=2 * ARMS['candidate']['arena'] - 13107,
+        below_this_needs='one staging window instead of two = the per-slice retire barrier '
+                         'n10 deleted (8 barriers/WG, measured 0.094362 ms) or a 32-channel '
+                         'slice = 16 publish barriers; both give back more than they buy')
+    (CARD / 'build/lifetime.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+
+    for arm in ('parent', 'candidate'):
+        r = out[arm]
+        print('== %s arena=%d halves (%d B)' % (arm, r['arena_halves'], r['arena_bytes']))
+        for p, v in r['planes'].items():
+            print('   %s [%5d,%5d) %d B  layout=%s' % (p, v['first'], v['last'],
+                                                       v['bytes'], v['layout']))
+        print('   free after loop: %d halves, contiguous=%s'
+              % (r['free_after_loop_halves'], r['free_after_loop_is_contiguous']))
+        st = r['staging']
+        print('   staged write partition=%s distinct=%d read distinct=%d mult=%s'
+              % (st['write_is_partition'], st['write']['distinct_addresses'],
+                 st['read']['distinct_addresses'],
+                 st['read_per_address_multiplicity']))
+        print('   handoff write partition=%s read union=%s echo=%d'
+              % (r['handoff']['partition'], r['handoff']['read_union_is_plane'],
+                 r['echo']['halves']))
+        for k, v in r['hazards'].items():
+            print('   %-32s %s' % (k, {x: y for x, y in v.items() if x != 'note'}))
+        lv = r['liveness']
+        print('   liveness peak=%d halves (%d B) handoff=%d arena=%d alias_forbidden=%s'
+              % (lv['peak_simultaneously_live_halves'],
+                 lv['peak_simultaneously_live_bytes'], lv['handoff_halves'],
+                 lv['arena_halves'], lv['alias_forbidden_pairs']))
+        print('   barriers/WG=%d dpas/SG=%s'
+              % (r['dynamic']['barriers_per_wg'], r['dynamic']['dpas_per_wg']))
+    print('== residency', out['residency']['pool_bytes_interval'],
+          out['residency']['this_card'])
+    for t in out['residency']['table']:
+        print('   %6d B -> %d..%d %s' % (t['workgroup_bytes'], t['residents_min'],
+                                         t['residents_max'], 'exact' if t['exact'] else ''))
+    print('== budget saved=%d B next threshold %d (gap %d)'
+          % (out['budget']['saved_bytes'], out['budget']['next_threshold'],
+             out['budget']['next_threshold_gap_bytes']))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+
+

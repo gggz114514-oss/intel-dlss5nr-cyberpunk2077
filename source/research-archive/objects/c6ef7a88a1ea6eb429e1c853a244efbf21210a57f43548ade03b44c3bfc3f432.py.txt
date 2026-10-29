@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""F2 (`f2c32_block66_fused`) body-stage reference on captured dumps.
+
+Arms, all run on the SAME captured window:
+  P   = the deployed parent's body arithmetic.  `--ffn fp16` models the older
+        FP16 FFN that the 2026-10-16 capture was produced with; `--ffn int8`
+        models the deployed `c32_f2_i8.spv` FFN (shipped int8 codes + scales).
+  I   = the candidate's arithmetic: same FFN, then int8 QKV / score / PV / output
+        with per-output-channel static weight scales and per-tile self-calibrated
+        activation scales, dequantisation folded once per stage.
+  R   = float64 control (no half rounding anywhere).
+
+Inputs are all from one captured run (`amd-netorg-f1-l2-workbuddy-20261016`,
+`diag/out-parent-alldump-001`):
+  dump_ioport_block66_blend.bin = body input X   (16 515 072 B)
+  dump_block66_out.bin          = body output    (16 515 072 B)   <- gold
+plus the deployed packs and the G3 PASS 147 32-word PUSH.
+
+numpy only, read-only.
+"""
+import argparse
+import json
+
+import numpy as np
+
+H = np.float16
+FI = np.float32
+D = np.float64
+W_TILES = 168
+TILE_HALVES = 512
+
+PUSH = [168, 0, 0, 0, 9344, 5248, 13440, 0, 16512, 5120, 4096, 0, 0, 0, 96, 0,
+        8192, 0, 84, 64, 32, 18944, 0, 672, 384, 336, 192, 0, 0, 0, 0, 0]
+P0, P1, P2 = PUSH[0:4], PUSH[4:8], PUSH[8:12]
+C32 = "@NR_WORKSPACE@/candidates/int8-coverage-v2-20261020/C/"
+ROOT = "@NR_WORKSPACE@/"
+DUMP = ROOT + "build/amd-netorg-f1-l2-workbuddy-20261016/diag/out-parent-alldump-001"
+
+
+def h(x):
+    return np.asarray(x).astype(H)
+
+
+def rne(x, inv):
+    return np.clip(np.rint(np.asarray(x, D) * D(inv)), -127.0, 127.0).astype(np.int32)
+
+
+def rne_s(x, s):
+    return np.clip(np.rint(np.asarray(x, D) / D(s)), -127.0, 127.0).astype(np.int32)
+
+
+def act_h(x):
+    t = np.clip(x, H(-4.0), H(4.0)).astype(H)
+    u = h(-0.055908203125 * t.astype(D) + 0.447265625)
+    v = h(t.astype(D) * u.astype(D) + 0.89453125)
+    return h(x.astype(D) * v.astype(D))
+
+
+def exp_h2(x):
+    y = np.clip(h(x.astype(D) * 0.044921875 + 1.30078125), H(1.03125), H(1.5693359375))
+    b = y.view(np.uint16).astype(np.uint32)
+    return ((b & 0x03FF) << 5).astype(np.uint16).view(H)
+
+
+def rl2(a, b):
+    a = np.asarray(a, D).ravel(); b = np.asarray(b, D).ravel()
+    d = np.linalg.norm(b)
+    return float(np.linalg.norm(a - b) / d) if d else float("nan")
+
+
+def snr(a, b):
+    a = np.asarray(a, D).ravel(); b = np.asarray(b, D).ravel()
+    e = float(np.sum((a - b) ** 2)); s = float(np.sum(b * b))
+    return float(10 * np.log10(s / e)) if e > 0 else float("inf")
+
+
+class Fixture:
+    def __init__(self, d=DUMP):
+        self.blend = np.fromfile(d + "/dump_ioport_block66_blend.bin", dtype=H)
+        self.gold = np.fromfile(d + "/dump_block66_out.bin", dtype=H)
+        self.wb = np.fromfile(ROOT + "candidates/amd-map-20261015/s1-integrated/"
+                              "candidate/packs/swin_66_weights.fp16.bin", dtype=H)
+        self.aux = np.fromfile(ROOT + "src/project/artifacts/parallel-port-20261013/"
+                               "swin/network/block66/pack/c32_aux.bin", dtype=FI)
+        self.w8 = np.fromfile(C32 + "pack/c32_b66_weights.i8.bin", dtype=np.int8)
+        self.fsc = np.fromfile(C32 + "c32-scale-from-x-v2/pack/c32_b66_scales.f32.bin",
+                               dtype=FI)
+        self.rs = np.array([self.wb[P2[0] + 8 + ch] for ch in range(32)], D)
+        self.ars = np.array([self.wb[P2[1] + ch] for ch in range(32)], D)
+        self.scalar0 = D(self.aux[P2[2]])
+        self.Wq = self._mat(P1[2], 32, 32)
+        self.Wk = self._mat(P1[2] + 1024, 32, 32)
+        self.Wv = self._mat(P1[2] + 2048, 32, 32)
+        self.Wo = self._mat(P1[3], 32, 32)
+        self.We8 = self._we8()
+        self.Wc8 = self._wc8()
+
+    def _mat(self, base, nout, K):
+        W = np.zeros((nout, K), D)
+        for ch in range(nout):
+            for k in range(K):
+                ofs = base + 128 * (2 * (ch // 8) + k // 16) + (ch % 8) * 16 + k % 16
+                W[ch, k] = self.wb[ofs]
+        return W
+
+    def _we8(self):
+        W = np.zeros((128, 32), np.int32)
+        for ch in range(128):
+            for c in range(32):
+                W[ch, c] = self.w8[(ch // 8) * 1024 + c * 32 + (ch % 8)]
+        return W
+
+    def _wc8(self):
+        W = np.zeros((32, 128), np.int32)
+        for ch in range(32):
+            for e in range(128):
+                W[ch, e] = self.w8[16384 + ((ch // 8) * 4 + e // 32) * 1024
+                                   + (e % 32) * 32 + (ch % 8)]
+        return W
+
+
+def gather(buf, tile):
+    blk = buf[tile * TILE_HALVES:(tile + 1) * TILE_HALVES].reshape(2, 16, 16)
+    return np.transpose(blk, (0, 2, 1)).reshape(32, 16)
+
+
+def norm_pair(qf, kf, rnd):
+    def part(fr, hw):
+        qs = []
+        for j in range(4):
+            s = [rnd(fr[i][2 * j + hw].astype(D) ** 2) for i in range(4)]
+            qs.append(rnd(rnd(s[0] + s[2]) + rnd(s[1] + s[3])))
+        return rnd(rnd(qs[0] + qs[1]) + rnd(qs[2] + qs[3]))
+    qs = rnd(part(qf, 0) + part(qf, 1))
+    ks = rnd(part(kf, 0) + part(kf, 1))
+    nq = rnd(1.0 / np.sqrt(np.maximum(np.asarray(qs, D), 6.2e-5)))
+    nk = rnd(1.0 / np.sqrt(np.maximum(np.asarray(ks, D), 6.2e-5)))
+    return nq, nk
+
+
+def body_window(fx, wx, wy, arm, ffn="int8", we16=None, wc16=None, wo=None):
+    if arm == "R":
+        acc, rnd = D, (lambda x: np.asarray(x, D))
+    else:
+        acc, rnd = FI, (lambda x: np.asarray(x, H))
+    Wo = fx.Wo if wo is None else wo
+    if arm == "I":
+        def wq(Wm, s=None):
+            amax = np.abs(Wm).max(axis=1)
+            s = np.maximum(amax / 127.0, 1e-12) if s is None else s
+            return np.clip(np.rint(Wm / s[:, None]), -127, 127).astype(np.int32), s
+        qWq, sWq = wq(fx.Wq); qWk, sWk = wq(fx.Wk)
+        qWv, sWv = wq(fx.Wv); qWo, sWo = wq(Wo)
+
+    out = {k: [] for k in ("X", "Y", "Q", "K", "V", "S", "P", "Ctx", "O")}
+    i32 = {k: 0 for k in ("E", "Y", "QKV", "S", "PV", "O")}
+    rail = {k: [0, 0] for k in ("X", "Y", "Q", "K", "V", "P", "Ctx")}
+    tiles = []
+
+    # ---- X -> E -> Y -------------------------------------------------------
+    for sg in range(4):
+        tile = (2 * wy + (sg >> 1)) * W_TILES + (2 * wx + (sg & 1))
+        tiles.append(tile)
+        Xh = gather(fx.blend, tile)
+        out["X"].append(Xh)
+        seed = h(h(Xh * H(fx.rs[:, None])).astype(acc))
+        if ffn == "int8":
+            qX = rne(Xh, fx.fsc[1])
+            rail["X"][0] += int(np.sum(np.abs(qX) >= 127)); rail["X"][1] += qX.size
+            Ei = fx.We8 @ qX
+            i32["E"] = max(i32["E"], int(np.abs(Ei).max()))
+            eh = act_h(h(Ei.astype(acc) * fx.fsc[4:132][:, None]))
+            qE = rne(eh, fx.fsc[3])
+            rail["Y"][0] += int(np.sum(np.abs(qE) >= 127)); rail["Y"][1] += qE.size
+            Yi = fx.Wc8 @ qE
+            i32["Y"] = max(i32["Y"], int(np.abs(Yi).max()))
+            yh = h(Yi.astype(acc) * fx.fsc[132:164][:, None] + seed.astype(acc))
+        else:
+            eh = act_h(h(np.asarray(we16 @ Xh.astype(acc), acc)))
+            yh = h(np.asarray(wc16 @ eh.astype(acc), acc) + seed.astype(acc))
+        out["Y"].append(yh)
+
+    # ---- QKV ---------------------------------------------------------------
+    for sg in range(4):
+        yh = out["Y"][sg]
+        if arm == "I":
+            sY = max(float(np.abs(yh.astype(D)).max()) / 127.0, 1e-12)
+            qY = rne_s(yh, sY)
+            rail["Y"][0] += int(np.sum(np.abs(qY) >= 127))
+            qi, ki, vi = qWq @ qY, qWk @ qY, qWv @ qY
+            i32["QKV"] = max(i32["QKV"], *(int(np.abs(t).max()) for t in (qi, ki, vi)))
+            qh = h(qi.astype(acc) * (sWq * sY)[:, None])
+            kh = h(ki.astype(acc) * (sWk * sY)[:, None])
+            vh = h(vi.astype(acc) * (sWv * sY)[:, None])
+        else:
+            yt = yh.astype(acc)
+            qh, kh, vh = h(np.asarray(fx.Wq @ yt, acc)), \
+                         h(np.asarray(fx.Wk @ yt, acc)), \
+                         h(np.asarray(fx.Wv @ yt, acc))
+        out["Q"].append(qh); out["K"].append(kh); out["V"].append(vh)
+
+    # ---- norm + scalar0 ----------------------------------------------------
+    for sg in range(4):
+        qf = [out["Q"][sg][8 * i:8 * i + 8] for i in range(4)]
+        kf = [out["K"][sg][8 * i:8 * i + 8] for i in range(4)]
+        nq, nk = norm_pair(qf, kf, rnd)
+        out["Q"][sg] = rnd(rnd(out["Q"][sg] * nq[None, :]) * fx.scalar0)
+        out["K"][sg] = rnd(out["K"][sg] * nk[None, :])
+
+    Kal = np.concatenate(out["K"], axis=1).T
+    Val = np.concatenate(out["V"], axis=1).T
+    if arm == "I":
+        sK = max(float(np.abs(Kal.astype(D)).max()) / 127.0, 1e-12)
+        sV = max(float(np.abs(Val.astype(D)).max()) / 127.0, 1e-12)
+        qK, qV = rne_s(Kal, sK), rne_s(Val, sV)
+        rail["K"][0] += int(np.sum(np.abs(qK) >= 127)); rail["K"][1] += qK.size
+        rail["V"][0] += int(np.sum(np.abs(qV) >= 127)); rail["V"][1] += qV.size
+
+    # ---- score / exp / denominator -----------------------------------------
+    Pf = []
+    for sg in range(4):
+        q = out["Q"][sg]
+        if arm == "I":
+            sQ = max(float(np.abs(q.astype(D)).max()) / 127.0, 1e-12)
+            qQ = rne_s(q, sQ)
+            rail["Q"][0] += int(np.sum(np.abs(qQ) >= 127)); rail["Q"][1] += qQ.size
+            si = qK @ qQ
+            i32["S"] = max(i32["S"], int(np.abs(si).max()))
+            sc = si.astype(acc) * acc(sK * sQ)
+        else:
+            sc = np.asarray(Kal.astype(acc) @ q.astype(acc), acc)
+        for key in range(64):
+            sc[key] += fx.aux[(sg * 16 + np.arange(16)) * 64 + key]
+        out["S"].append(h(sc))
+        ph = exp_h2(h(sc))
+        pf = [ph[8 * i:8 * i + 8] for i in range(8)]
+
+        def lane(hw):
+            qs = []
+            for j in range(4):
+                a = rnd(H(0.0) + rnd(pf[0][2 * j + hw] + pf[1][2 * j + hw]))
+                for k in (1, 2, 3):
+                    a = rnd(a + rnd(pf[2 * k][2 * j + hw] + pf[2 * k + 1][2 * j + hw]))
+                qs.append(a)
+            return rnd(rnd(qs[0] + qs[1]) + rnd(qs[2] + qs[3]))
+        den = rnd(lane(0) + lane(1))
+        inv = rnd(acc(1.0) / np.maximum(den.astype(acc), acc(6.103515625e-05)))
+        Pf.append(rnd(ph * inv[None, :]))
+    out["P"] = Pf
+
+    # ---- PV ----------------------------------------------------------------
+    for sg in range(4):
+        ph = Pf[sg]
+        if arm == "I":
+            sP = max(float(np.abs(ph.astype(D)).max()) / 127.0, 1e-12)
+            qP = rne_s(ph, sP)
+            rail["P"][0] += int(np.sum(np.abs(qP) >= 127)); rail["P"][1] += qP.size
+            ci = qV.T @ qP
+            i32["PV"] = max(i32["PV"], int(np.abs(ci).max()))
+            ctx = h(ci.astype(acc) * acc(sV * sP))
+        else:
+            ctx = h(np.asarray(Val.T.astype(acc) @ ph.astype(acc), acc))
+        out["Ctx"].append(ctx)
+        seed2 = h(h(out["Y"][sg] * H(fx.ars[:, None])).astype(acc))
+        if arm == "I":
+            sC = max(float(np.abs(ctx.astype(D)).max()) / 127.0, 1e-12)
+            qC = rne_s(ctx, sC)
+            rail["Ctx"][0] += int(np.sum(np.abs(qC) >= 127)); rail["Ctx"][1] += qC.size
+            oi = qWo @ qC
+            i32["O"] = max(i32["O"], int(np.abs(oi).max()))
+            o = h(oi.astype(acc) * (sWo * sC)[:, None] + seed2.astype(acc))
+        else:
+            o = h(seed2.astype(acc) + np.asarray(Wo @ ctx.astype(acc), acc))
+        out["O"].append(o)
+    return out, i32, rail, tiles
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dump", default=DUMP)
+    ap.add_argument("--windows", default="40,20 10,5 70,40 3,60")
+    ap.add_argument("--ffn", default="fp16", choices=("fp16", "int8"))
+    ap.add_argument("--we16", default="1024,5152")
+    ap.add_argument("--json")
+    a = ap.parse_args()
+    fx = Fixture(a.dump)
+    eb, cb = (int(t) for t in a.we16.split(","))
+    we16 = fx._mat(eb, 128, 32)
+    wc16 = fx._mat(cb, 32, 128)
+    rep = {"fixture": {"dump": a.dump, "windows": a.windows, "ffn": a.ffn,
+                       "ffn16_bases": [eb, cb]}, "arms": {}}
+    arms = {}
+    for arm in ("P", "I", "R"):
+        arms[arm] = {}
+        for w in a.windows.split():
+            wx, wy = (int(t) for t in w.split(","))
+            arms[arm][w] = body_window(fx, wx, wy, arm, a.ffn, we16, wc16)
+
+    def cat(d, win, nm):
+        return np.concatenate(d[win][0][nm], 0).astype(D)
+
+    for arm in ("P", "I", "R"):
+        tot = np.zeros(0, D); g = np.zeros(0, D)
+        for w in a.windows.split():
+            o = cat(arms[arm], w, "O")
+            tiles = arms[arm][w][3]
+            gg = np.concatenate([gather(fx.gold, t) for t in tiles], 0).astype(D)
+            tot = np.concatenate([tot, o.ravel()]); g = np.concatenate([g, gg.ravel()])
+        i32 = arms[arm][a.windows.split()[0]][1]
+        rail = arms[arm][a.windows.split()[0]][2]
+        rep["arms"][arm] = {
+            "rel_L2_vs_gold": rl2(tot, g), "snr_vs_gold": snr(tot, g),
+            "absmax": float(np.abs(tot).max()), "absmax_gold": float(np.abs(g).max()),
+            "absmax_err": float(np.abs(tot - g).max()),
+            "corr": float(np.corrcoef(tot, g)[0, 1]),
+            "i32_peaks": i32, "rails": {k: v for k, v in rail.items() if v[1]}}
+        print(arm, json.dumps(rep["arms"][arm]))
+    # per-stage: I vs P
+    st = {}
+    for nm in ("Y", "Q", "S", "Ctx", "O"):
+        p = np.concatenate([cat(arms["P"], w, nm) for w in a.windows.split()]).ravel()
+        q = np.concatenate([cat(arms["I"], w, nm) for w in a.windows.split()]).ravel()
+        st[nm] = {"rel_L2": rl2(q, p), "snr": snr(q, p)}
+    rep["stage_I_vs_P"] = st
+    for nm, v in st.items():
+        print(f"  I vs P  {nm:4s} rel_L2 {v['rel_L2']*100:7.4f} %  SNR {v['snr']:7.3f} dB")
+    if a.json:
+        with open(a.json, "w", encoding="utf-8") as f:
+            json.dump(rep, f, indent=1)
+
+
+if __name__ == "__main__":
+    main()

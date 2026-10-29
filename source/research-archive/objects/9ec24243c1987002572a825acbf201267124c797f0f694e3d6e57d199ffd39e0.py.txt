@@ -1,0 +1,121 @@
+"""n22-f15-den-pv: renumbering-insensitive structural comparison, parent SPIR-V vs candidate.
+
+Renumbering makes a raw instruction-stream diff useless (every function's result ids shift
+because the now-unreachable nrh_unpack2 helper disappeared).  This check therefore compares,
+per function, only quantities that cannot depend on id numbering:
+
+  * instruction count,
+  * opcode histogram,
+  * the ordered "shape stream" [(opcode, operand_count), ...],
+  * the multiset of OpGroupNonUniformShuffle / ShuffleXor / CoopMat* opcodes,
+  * the NoContraction multiset (global).
+
+A function whose shape stream is identical has the same instructions with the same operand
+arities in the same order, i.e. nothing was added, deleted or reordered inside it.
+
+Output: build/IDENTITY-CHECK.json
+"""
+import sys, json
+from collections import Counter
+from pathlib import Path
+
+TOOLS = Path('@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+sys.path.insert(0, str(TOOLS))
+import spv_tools_local as ST  # noqa: E402
+
+BASE = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+CARD = BASE / 'cards/n22-f15-den-pv'
+PARENT = Path('@NR_WORKSPACE@/work/zcode-fp16-fullnet-handoff-20261024/candidates/f15l-vit-pv/spv/vit_attn_f15l.spv')
+CAND = CARD / 'candidate.spv'
+OUT = CARD / 'build/IDENTITY-CHECK.json'
+
+WATCH = {345: 'Shuffle', 346: 'ShuffleXor', 4457: 'CoopMatLoad', 4458: 'CoopMatStore',
+         4459: 'CoopMatMulAdd', 224: 'ControlBarrier', 57: 'FunctionCall',
+         61: 'Load', 62: 'Store', 124: 'Bitcast', 129: 'FAdd', 133: 'FMul'}
+
+
+def regions_of(module):
+    inst = module.instructions
+    names = {}
+    for op, ops, _o, _w in inst:
+        if op == 5:
+            s = b''.join(int(x).to_bytes(4, 'little') for x in ops[1:]).split(b'\x00')[0]
+            names[ops[0]] = s.decode('utf-8', 'replace')
+    out = {}
+    for region in ST.function_regions(module):
+        head = inst[region[0]]
+        nm = names.get(head[1][1], 'fn%d' % head[1][1]).split('(')[0]
+        out[nm] = dict(
+            instructions=len(region),
+            histogram={WATCH.get(op, 'op%d' % op): v for op, v in
+                       sorted(Counter(inst[i][0] for i in region).items()) if op in WATCH},
+            shape=[[inst[i][0], len(inst[i][1])] for i in region],
+            watch={WATCH[op]: sum(1 for i in region if inst[i][0] == op) for op in WATCH},
+        )
+    return out
+
+
+def nc_multiset(module):
+    ids = ST.no_contraction_ids(module)
+    rid2op = {}
+    for op, ops, _o, _w in module.instructions:
+        if len(ops) > 1:
+            rid2op.setdefault(ops[0] if op in ST.RESULT_AT_ZERO_OPS else ops[1], op)
+    c = Counter(rid2op.get(t, 0) for t in ids)
+    return {str(k): v for k, v in sorted(c.items())}, len(ids)
+
+
+def main():
+    pm, cm = ST.Module(PARENT), ST.Module(CAND)
+    pr, cr = regions_of(pm), regions_of(cm)
+    res = dict(parent=str(PARENT), candidate=str(CAND),
+               parent_total_instructions=len(pm.instructions),
+               candidate_total_instructions=len(cm.instructions),
+               functions_parent=sorted(pr), functions_candidate=sorted(cr),
+               per_function={})
+    for nm in sorted(set(pr) | set(cr)):
+        a, b = pr.get(nm), cr.get(nm)
+        if a is None or b is None:
+            res['per_function'][nm] = dict(parent=a['instructions'] if a else None,
+                                           candidate=b['instructions'] if b else None,
+                                           identical_shape=False,
+                                           absent_in='parent' if a is None else 'candidate',
+                                           watch_parent=a['watch'] if a else None,
+                                           watch_candidate=b['watch'] if b else None)
+            continue
+        res['per_function'][nm] = dict(
+            parent=a['instructions'], candidate=b['instructions'],
+            identical_shape=a['shape'] == b['shape'],
+            identical_histogram=a['histogram'] == b['histogram'],
+            watch_parent=a['watch'], watch_candidate=b['watch'],
+            watch_delta={k: b['watch'][k] - a['watch'][k] for k in a['watch']
+                         if b['watch'][k] != a['watch'][k]},
+            first_shape_diff=next((dict(index=i, parent=a['shape'][i], candidate=b['shape'][i])
+                                   for i in range(min(len(a['shape']), len(b['shape'])))
+                                   if a['shape'][i] != b['shape'][i]), None),
+        )
+    unchanged = ('main', 'vit_exp', 'vit_exp2', 'nrh_pack2', 'nrh_coord_C', 'nrh_coord_CH')
+    res['unchanged_functions_verified'] = [k for k in unchanged if k in res['per_function']
+                                           and res['per_function'][k]['identical_shape']]
+    res['all_expected_unchanged'] = all(res['per_function'][k]['identical_shape']
+                                        for k in unchanged if k in res['per_function'])
+    res['changed_functions'] = sorted(k for k, v in res['per_function'].items()
+                                      if v.get('identical_shape') is False)
+    res['dropped_functions'] = sorted(k for k, v in res['per_function'].items()
+                                      if v.get('candidate') is None)
+    res['nc_parent'], res['nc_parent_count'] = nc_multiset(pm)
+    res['nc_candidate'], res['nc_candidate_count'] = nc_multiset(cm)
+    res['nc_multiset_equal'] = res['nc_parent'] == res['nc_candidate']
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(json.dumps(res, indent=2), encoding='utf-8')
+    print(json.dumps({k: v for k, v in res.items() if k != 'per_function'}, indent=2)[:3000])
+    for k, v in res['per_function'].items():
+        print('%-24s parent=%-5s cand=%-5s shape_eq=%-5s watch_delta=%s' % (
+            k, v.get('parent'), v.get('candidate'), v.get('identical_shape'),
+            v.get('watch_delta')))
+        if v.get('first_shape_diff'):
+            print('    first shape diff', json.dumps(v['first_shape_diff']))
+
+
+if __name__ == '__main__':
+    main()

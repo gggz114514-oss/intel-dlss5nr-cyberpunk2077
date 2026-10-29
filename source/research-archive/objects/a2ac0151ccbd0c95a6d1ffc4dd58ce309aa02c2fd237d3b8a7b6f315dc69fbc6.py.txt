@@ -1,0 +1,374 @@
+"""Emit the card's identity documents from the measured artefacts (CPU only).
+
+Reads _build/{build,checks,provenance,plan}.json plus the ISA budget probe and
+writes, inside this card directory only:
+
+  BUILD.json          parent/child/plan identities, NoContraction count, cpu-check
+  PROOF.json          the six-contract proofs, each pointing at its computed table
+  COST-LEDGER.json    removed / added / unknown, with counts and basis
+  GPU-REQUEST.json    the manifest the main agent turns into a two-arm job
+
+Every hash is recomputed here from the file on disk, so the documents cannot
+drift from the artefacts.
+"""
+import json
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+BUILD = CARD / '_build'
+C = CARD.parent.parent
+sys.path.insert(0, str(C))
+import COMMON as K                                   # noqa: E402
+
+GROUP_SHA = '0d83192b5368cc6074e00bbefed67ec71f8f540a9088d4d96752887390459641'
+GROUP = [7, 10, 13, 16, 215, 218, 221, 224]
+
+
+def load(name):
+    return json.loads((BUILD / name).read_text(encoding='utf-8'))
+
+
+def main():
+    b = load('build.json')
+    ck = load('checks.json')
+    pv = load('provenance.json')
+    pl = load('plan.json')
+    budget = load('budget-isa.json')['C64']
+    isa = load('isa-probe.json')
+
+    rows = [r for r in K.rows() if r['spv_sha256'] == GROUP_SHA]
+    patch = CARD / 'SOURCE-DIFF.patch'
+    ptxt = patch.read_text(encoding='utf-8').splitlines()
+    hunks = sum(1 for l in ptxt if l.startswith('@@'))
+    added = sum(1 for l in ptxt if l.startswith('+') and not l.startswith('+++'))
+    removed = sum(1 for l in ptxt if l.startswith('-') and not l.startswith('---'))
+
+    ident = dict(
+        parent_spv=dict(path=str(Path(rows[0]['spv'])), sha256=K.sha(Path(rows[0]['spv']))),
+        parent_source=dict(path=str(Path(rows[0]['source'])),
+                           sha256=K.sha(Path(rows[0]['source']))),
+        parent_source_copy=dict(path=str(CARD / 'parent-rebuild.comp'),
+                                sha256=K.sha(CARD / 'parent-rebuild.comp')),
+        parent_rebuild_spv=dict(path=str(CARD / 'parent-rebuild.spv'),
+                                sha256=K.sha(CARD / 'parent-rebuild.spv')),
+        candidate_source=dict(path=str(CARD / 'candidate.comp'),
+                              sha256=K.sha(CARD / 'candidate.comp')),
+        candidate_spv=dict(path=str(CARD / 'candidate.spv'),
+                           sha256=K.sha(CARD / 'candidate.spv')),
+        plan=dict(path=str(CARD / 'plan.txt'), sha256=K.sha(CARD / 'plan.txt')),
+        diff=dict(path=str(patch), sha256=K.sha(patch)),
+    )
+    assert ident['parent_spv']['sha256'] == GROUP_SHA
+    assert ident['parent_source']['sha256'] == ident['parent_source_copy']['sha256'] == \
+        b['parent']['source_sha256']
+    assert ident['parent_rebuild_spv']['sha256'] == GROUP_SHA == b['parent']['rebuilt_sha256']
+    assert ident['candidate_spv']['sha256'] == b['candidate']['sha256']
+
+    dyn = dict(
+        parent=dict(weight_tile_msgs=48, a_row_msgs=64, dpas=80, dpas_qkv=48, dpas_attention=32,
+                    sends_total=isa['sends_total'], instructions=isa['instructions'],
+                    note='ISA-measured base arm (C64); the QKV loops are fully unrolled by IGC, so '
+                         'these static counts are also the per-subgroup dynamic counts'),
+        candidate=dict(weight_tile_msgs=24, a_row_msgs=128, dpas=80, dpas_qkv=48,
+                       dpas_attention=32, sends_total_expected=isa['sends_total'] - 24 + 64,
+                       note='predicted, not measured: -24 weight messages +64 A-row messages, '
+                            'DPAS unchanged'),
+    )
+
+    build_doc = dict(
+        card='n05d-f05-c64-mbatch',
+        status='BUILT_AWAITING_GPU',
+        date='2026-10-27',
+        baseline_plan=dict(path=str(K.BASELINE), sha256=K.BASELINE_SHA,
+                           role='contract §0 handoff baseline; kept only as the row identity source'),
+        chain_head_plan=dict(path=pl['chain_head']['path'], sha256=pl['chain_head']['sha256'],
+                             chain=pl['chain_head']['chain'],
+                             role='the plan this card rebases on (CURRENT.json best_plan)'),
+        shader_group=dict(
+            family='F05', width=64,
+            spv_sha256_baseline=GROUP_SHA,
+            source_sha256_baseline=ident['parent_source']['sha256'],
+            pass_count=len(rows),
+            pass_ordinals=GROUP,
+            pass_names=[r['name'] for r in rows],
+            pass_labels=[r.get('pass') for r in rows],
+        ),
+        parent=dict(
+            spv=ident['parent_spv'], spv_bytes=b['parent']['bytes'],
+            source=ident['parent_source'],
+            source_copy=ident['parent_source_copy'],
+        ),
+        include_headers=[dict(path=str(p), sha256=K.sha(p))
+                         for p in sorted(b['include_dirs'] and
+                                         Path(b['include_dirs'][0]).glob('*.glsl'))],
+        include_dir_policy='pinned header dir from evidence/RECIPES.json (0d83192b), sha-verified; '
+                           'no workspace search',
+        parent_reproduction=dict(
+            recipe=b['recipe'],
+            toolchain=str(K.GLSLANG),
+            argv=[str(K.GLSLANG), '-V', '--target-env', 'vulkan1.3',
+                  '-I' + b['include_dirs'][0],
+                  str(CARD / 'parent-rebuild.comp'), '-o', 'parent-raw.spv'],
+            rebuilt_sha256=b['parent']['rebuilt_sha256'],
+            expected_sha256=GROUP_SHA,
+            raw_match=b['parent']['raw_match'],
+            note='byte-identical; no decoration transfer and no build define needed, so the '
+                 'candidate/child difference can only come from the source edit',
+        ),
+        parent_rebuild_spv=ident['parent_rebuild_spv'],
+        candidate=dict(
+            source=ident['candidate_source'], spv=ident['candidate_spv'],
+            spv_bytes=b['candidate']['bytes'],
+            spv_bytes_delta_vs_parent=b['byte_delta'],
+            spv_validate_cpu=dict(exe=str(K.VALIDATE), exit=0),
+        ),
+        arithmetic_alignment=dict(
+            float_NC_checked=ck['nc']['float_NC_checked'],
+            parent_float_NC_sites=ck['nc']['parent_n'],
+            candidate_float_NC_sites=ck['nc']['candidate_n'],
+            nc_parent_ids_matched_into_candidate=ck['nc']['parent_ids_matched_into_candidate'],
+            candidate_own_decorations_outside_pattern=ck['nc']['info']
+            ['child_own_decorations_outside_pattern'],
+            functions_mapped=ck['nc']['info']['functions_mapped'],
+            precise_sites_in_source=ck['precise_sites_in_source'],
+            note='the only precise sites are the score-block bias adds, the c64 exp/scale loops and '
+                 'the sealed norm tree; the QKV block carries no NoContraction site in either arm '
+                 '(precise_sites_in_source.qkv_block is empty), so the M-batch rewrite adds none '
+                 'and moves none',
+        ),
+        instruction_delta=dict(static=b['static'],
+                               dynamic_per_sg=dyn['parent'], predicted_candidate=dyn['candidate']),
+        declaration_section=ck['declaration_section'],
+        resources=dict(workgroup_bytes=ck['inventory']['parent']['workgroup_bytes'],
+                       workgroup_bytes_candidate=ck['inventory']['candidate']['workgroup_bytes'],
+                       bindings=ck['inventory']['parent']['bindings'],
+                       bindings_candidate=ck['inventory']['candidate']['bindings'],
+                       note='one shared array of 24,576 B and 8 bindings in both arms'),
+        plan=dict(path=pl['plan']['path'], sha256=pl['plan']['sha256'],
+                  bytes=pl['plan']['bytes'], parent_plan=pl['chain_head'],
+                  replaced_passes=pl['plan']['replaced_passes'],
+                  expected_passes=pl['plan']['expected_passes'],
+                  differing_lines_vs_chain_head=pl['plan']['differing_lines_vs_chain_head'],
+                  only_spv_path_changed=pl['plan']['only_spv_path_changed']),
+        cpu_check=pl['cpu_check'],
+        source_diff=dict(hunks=hunks, added_lines=added, removed_lines=removed,
+                         bytes=patch.stat().st_size),
+        register_budget=dict(
+            acc_grf_per_acc=8,
+            c64_parent=dict(peak_qkv_live_grf=budget['peak_qkv']['n'],
+                            peak_pc=budget['peak_qkv']['pc'],
+                            acc_grf=budget['peak_qkv']['comp']['acc']['n'],
+                            non_acc=budget['peak_qkv']['n'] - budget['peak_qkv']['comp']['acc']['n'],
+                            acc_bases=isa['qkv_dpas_distinct_bases'],
+                            acc_base_gaps=isa['qkv_dpas_distinct_gaps'],
+                            max_reg_index=isa['max_reg_index']),
+            forms=budget['projection']['forms'],
+            verdict='D1 (12 accumulators, 96 GRF) does not fit 128 GRF (125 measured non-acc '
+                    'projection, 133..137 with the second A fragment); the implemented form is D2 '
+                    '(Q/K pass 8 acc + V pass 4 acc, projected peak 101/128)',
+            doc='BUDGET-C64.md'),
+        gpu='none in this card (no Vulkan task, no lock taken, no deployment)',
+    )
+    K.write_json(CARD / 'BUILD.json', build_doc)
+
+    proof = dict(
+        card='n05d-f05-c64-mbatch',
+        identity=ident,
+        scope='only the QKV projection block of family/c64/candidate.comp (parent lines 153-204 -> '
+              'candidate lines 153-275); every other byte of the file is untouched (single diff hunk)',
+        claims=dict(
+            mapping_one_to_one=dict(
+                statement='the 12 candidate accumulators partition the 96-channel x 64-token window '
+                          'that the 6 parent accumulators covered over two row_phase passes',
+                enumeration=pv['B_element_coverage']['per_accumulator'],
+                per_sg=pv['B_element_coverage']['per_sg'],
+                elements_per_head=pv['B_element_coverage']['elements_per_head'],
+                equal_as_sets=pv['B_element_coverage']['all_equal_and_disjoint'],
+                basis='_build/provenance.py section B; token blocks recomputed from the C64 owner '
+                      'formula m0q = (sg%4)*8 + row_phase*32 (not copied from C128)'),
+            no_missed_read_no_duplicate_write=dict(
+                store_coverage=pv['C_store_coverage']['per_sg'],
+                elements_per_sg=pv['C_store_coverage']['elements_per_sg'],
+                all_ok=pv['C_store_coverage']['all_ok'],
+                basis='_build/provenance.py section C: Q(+0)/K(+2048, col-major stride 8)/V(+4096) '
+                      'address sets of the two M blocks are disjoint and the parent union over its '
+                      'two phases is address-for-address the same set'),
+            k_order_and_accumulation_unchanged=dict(
+                k_steps=pv['D_k_order']['k_steps'],
+                per_accumulator_steps=pv['D_k_order']['per_accumulator_steps'],
+                order_identical=pv['D_k_order']['order_identical'],
+                chain=pv['D_k_order']['f32_chain'],
+                basis='both arms consume k0 = 0,16,32,48 in that order (K = 64 -> four steps); '
+                      'coopMatMulAdd keeps the same operands in the same order'),
+            rounding_points_unchanged=dict(
+                narrowings=pv['D_k_order']['rounding_points'],
+                one_narrowing_per_output_tile=True,
+                half_points_added=0,
+                basis='each output tile still has exactly one MAT_C -> MAT_H narrowing, and the '
+                      'sealed norm tree keeps its per-channel rounding points',
+                norm_call_invariance='nr_norm_qk_pair is called once per M block with the same '
+                                     'q0,q1,k0,k1 quad that the parent fed it per row_phase'),
+            reduction_tree_unchanged=dict(
+                tree='in-lane S4 balanced tree: t_ci = (q0^2 + q1^2) + (k0^2 + k1^2) per lane, then '
+                     'shuffle-xor 8/4/2/1 over the 16 columns, owner lane broadcasts the reciprocal',
+                changed=False,
+                basis='nr_norm_component / nr_norm_qk_pair are byte-identical to the parent; only '
+                      'the call sites moved (two calls instead of one per phase)'),
+            statement_provenance=dict(
+                all_buckets_ok=pv['A_statement_provenance']['all_buckets_ok'],
+                rules={k: dict(expected_multiplier=v['expected_multiplier'], ok=v['ok'])
+                       for k, v in pv['A_statement_provenance']['rules'].items()},
+                dynamic_per_sg=pv['A_statement_provenance']['dynamic_per_sg'],
+                removed_control_flow=pv['A_statement_provenance']['removed_control_flow'],
+                added_owner_constants=pv['A_statement_provenance']['added_owner_constants'],
+                basis='_build/provenance.py section A (normalised statement multisets)'),
+            lifetime_and_retirement=dict(
+                accumulators='8 Q/K accumulators live for pass 1 only; 4 V accumulators are born '
+                             'after the Q/K publication, so the peak co-residency is 8, not 12',
+                retirement_order='m0a epilogue then m0b epilogue (the parent row_phase 0 then 1 '
+                                 'order); each epilogue narrows four MAT_H fragments and retires '
+                                 'before the next block starts',
+                publication_order='Q stores, K stores (m0a), Q stores, K stores (m0b), then V '
+                                  'stores (m0a, m0b) - identical to the parent order per phase',
+                barrier_count=1,
+                barrier_note='the single existing barrier() is unchanged; no barrier is added '
+                             'between the two passes because they write disjoint regions and the '
+                             'Q/K normalisation lives entirely in registers',
+                basis='candidate.comp passes 1-2 and the parent row_phase loop'),
+            tail_block=dict(
+                tokens_per_window=64, token_blocks=8, blocks_per_sg=2,
+                remainder=0,
+                channels_per_head=96, channel_tiles=6, channels_per_tile=16,
+                k_channels=64, k_steps=4, k_remainder=0,
+                image_oob='production writes every canonical window slot including padded tokens; '
+                          'the QKV section applies no mask in either arm, so coverage of padded '
+                          'tokens is unchanged',
+                basis='_build/provenance.py sections B/C over sg%4 = 0..3'),
+            build_identity=dict(
+                parent_bytes_reproduced=b['parent']['raw_match'],
+                parent_rebuild_sha256=b['parent']['rebuilt_sha256'],
+                recipe=b['recipe'],
+                note='the parent source recompiles byte-identically with the pinned headers, so the '
+                     'candidate/child difference can only come from the source edit',
+            ),
+        ),
+        verdict='all claims pass on CPU; the only unproven items are the native landing (N1/N2/N5) and '
+                'the same-batch timing, both of which need the GPU arm and are pre-registered in '
+                'NATIVE-PREDICTION.md',
+    )
+    K.write_json(CARD / 'PROOF.json', proof)
+
+    ledger = dict(
+        card='n05d-f05-c64-mbatch',
+        unit='per subgroup, QKV projection window (2 row_phase x 4 k steps x 6 tiles in the parent)',
+        removed=[
+            dict(item='weight tile load messages load.ugm.d32x8.a32.bss[a0.2] (rd:8, 16-lane)',
+                 count=24, basis='48 -> 24: each tile is loaded once per (k step) instead of once per '
+                                '(phase, k step); source static sites unchanged (6), dynamic halves',
+                 measured_in='source (dynamic arithmetic) + ISA base arm 48; candidate value is a '
+                             'prediction (N1)'),
+            dict(item='second row_phase weight base arithmetic (wq + tile*256)',
+                 count=24,
+                 basis='one base expression per tile per phase in the parent, one per tile in the '
+                       'candidate; whether IGC issues fewer ALU ops is NOT claimed (addresses are '
+                       'already base+imm in the ISA)',
+                 measured_in='source only'),
+            dict(item='row_phase loop control', count=1,
+                 basis='the for(row_phase) disappears; the V pass adds one k loop, so OpLoopMerge is '
+                       '7 -> 7 (measured in SPIR-V)',
+                 measured_in='SPIR-V static: LoopMerge 7 -> 7'),
+        ],
+        added=[
+            dict(item='A row load messages load.ugm.d32x8t.a32.bss[a0.0] (rd:1)',
+                 count=64, basis='64 -> 128: the second pass re-reads the same Y rows; fragments '
+                                '8 -> 16, 8 messages per fragment',
+                 measured_in='source static sites 1 -> 4, dynamic 8 -> 16 fragments'),
+            dict(item='live QKV accumulators', count=2,
+                 basis='6 -> 8 (16 extra GRF); peak projected 70 -> 101 out of 128',
+                 measured_in='_build/budget-isa.json + _build/isa-probe.json'),
+            dict(item='second A fragment return/pack registers', count=1,
+                 basis='+8..12 GRF transient (8 rd:1 returns + 4 packed {row+4,row} operands)',
+                 measured_in='budget projection (+8 used)'),
+            dict(item='static cooperative-matrix load sites', count=3,
+                 basis='26 -> 29: Q/K pass 4 B + 2 A, V pass 2 B + 2 A (parent 6 B + 1 A)',
+                 measured_in='SPIR-V static'),
+            dict(item='static cooperative-matrix store sites', count=14,
+                 basis='25 -> 39: Q/K/V publication 6 -> 12, debug mirrors 8 -> 16; dynamic unchanged',
+                 measured_in='SPIR-V static'),
+            dict(item='static MMA sites', count=6,
+                 basis='23 -> 29: QKV loop body 6 -> 12 (Q/K 8 + V 4); dynamic still 48',
+                 measured_in='SPIR-V static'),
+            dict(item='SPIR-V bytes', count=7904,
+                 basis='52,312 -> 60,216 B',
+                 measured_in='_build/build.json'),
+            dict(item='static selection merges', count=4,
+                 basis='18 -> 22: the two debug blocks of the new V pass add merge points; dynamic '
+                       'unchanged (debug off in measurement runs)',
+                 measured_in='SPIR-V static'),
+            dict(item='weight-tile B live range', count=1,
+                 basis='each tile now feeds two MMAs instead of one, so its rd:8 return zone is live '
+                       'one MMA longer (same side-effect class as n05a)',
+                 measured_in='source; native check is N7'),
+        ],
+        unknown=[
+            dict(item='DRAM bytes moved by the halved weight tile loads',
+                 why='the parent already read the same address twice within a subgroup; these are '
+                     'almost all cache hits, so the logical 24 KiB/SG reduction is not a DRAM number'),
+            dict(item='allocator-level GRF residency of the 8 accumulators',
+                 why='no GPU-free allocator exists for modules with SPV_KHR_cooperative_matrix '
+                     '(ocloc-IGC ICE, recorded by n05c); only a native capture can show scratch/max_r'),
+            dict(item='ALU cost of the removed weight base arithmetic',
+                 why='the ISA already carries these as base+imm; a smaller instruction count is not '
+                     'the same as fewer issue slots'),
+            dict(item='whether the two passes serialise more than the parent',
+                 why='the passes have no data dependency, but only the native capture shows whether '
+                     'IGC interleaves them (N6/N7)'),
+            dict(item='net effect of -24 eight-GRF messages vs +64 one-GRF messages',
+                 why='the four metrics move in different directions (messages +35.7%, return GRF '
+                     '-28.6%, active-lane sends -38.5%, weight tiles -50%); only the same-batch '
+                     'two-arm ordinary measurement can price the net'),
+        ],
+    )
+    K.write_json(CARD / 'COST-LEDGER.json', ledger)
+
+    req = dict(
+        card='n05d-f05-c64-mbatch',
+        shader_group=dict(spv_sha256_baseline=[GROUP_SHA],
+                          pass_ordinals=GROUP,
+                          spv_sha256_candidate=[ident['candidate_spv']['sha256']]),
+        plan=dict(path=str(CARD / 'plan.txt'), sha256=ident['plan']['sha256']),
+        arms=[dict(id='base', plan='baseline', role='baseline'),
+              dict(id='cand', plan='candidate', role='candidate')],
+        gates=['fixed', 'fb2'],
+        native=True,
+        resources=True,
+        ordinary=dict(design='two-arm-6-alternating', reps=30, warm=1, feedback=True),
+        hypothesis='if native shows the QKV weight tile messages halve (load.ugm.d32x8.a32.bss[a0.2] '
+                   '48 -> 24) while the A-row messages double (64 -> 128), DPAS stays 80 and no '
+                   'scratch spill appears, the M-batched weight reuse landed in this width',
+        native_observables=[
+            'load.ugm.d32x8.a32.bss[a0.2] 48 -> 24 (weight tiles, rd:8)',
+            'load.ugm.d32x8t.a32.bss[a0.0] 64 -> 128 (A rows, rd:1)',
+            'dpas.8x8 total 80 -> 80 and QKV-section DPAS 48 -> 48',
+            'QKV-section DPAS destination bases become eight, all 8 GRF apart (parent: 35,43,51,59,67,75)',
+            'max_r stays 127 only if no spill; scratch must stay 0',
+            'send total 422 -> about 462 (-24 +64); first DPAS address may move later (longer prologue)',
+        ],
+        purpose='performance arm inside the F05 M-batch family package (this card is the C64 member; '
+                'the package arm replaces these 8 PASS plus the 12 F05 C128 PASS of n05c-f05-mbatch, '
+                '20 rows in total on the same chain head)',
+    )
+    K.write_json(CARD / 'GPU-REQUEST.json', req)
+
+    print('BUILD.json      plan', ident['plan']['sha256'])
+    print('                cand', ident['candidate_spv']['sha256'])
+    print('PROOF.json      claims', len(proof['claims']))
+    print('COST-LEDGER     removed %d added %d unknown %d' %
+          (len(ledger['removed']), len(ledger['added']), len(ledger['unknown'])))
+    print('GPU-REQUEST     passes', len(GROUP))
+    print('float_NC_checked', build_doc['arithmetic_alignment']['float_NC_checked'])
+
+
+if __name__ == '__main__':
+    main()

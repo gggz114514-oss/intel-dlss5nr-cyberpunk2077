@@ -1,0 +1,182 @@
+"""S13: independent verification of the corrected-feedback staging (no feedback_plan reuse).
+
+Re-parses the emitted plans as text, re-reads the staged bundles and checks, without using
+feedback_plan.py or planlib, that
+  * each staged pre.bin/post.bin is the frame's own capture with ONLY the history plane replaced,
+  * the injected plane is byte-identical to the corrected predecessor history plane,
+  * the plan differs from the frozen candidate plan only in the two BUFFER files and OUTPUT,
+  * no HISTORY directive is present and the PASS/PUSH/BIND/POLICY tables are unchanged.
+
+Writes CORRECTED-STAGING-VERIFY.json.  CPU only.
+"""
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+
+S13 = Path(__file__).resolve().parent
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029"
+QA = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+DS = QA / "dataset"
+C64 = QA / "real-int8-24/c64-family-static"
+SEQ = "day-street-static-formal-01"
+FRAMES = list(range(34190, 34197))
+
+HIST_OFFSET_IN_INPUT = 14745680
+HIST_BYTES = 14745600
+HIST_OFFSET_IN_OUTPUT = 14745600
+
+PLAN_DIR = S13 / "corrected-plans"
+STAGE_DIR = S13 / "corrected-staged"
+HISTORY_DIR = S13 / "corrected-history"
+
+PREFIXES = ("BUFFER", "POLICY", "PASS", "PUSH", "BIND", "OUTPUT", "HISTORY")
+
+
+def lines_of(path: Path) -> list[str]:
+    return path.read_text(encoding="utf-8-sig").splitlines()
+
+
+def prefix_counts(rows: list[str]) -> dict:
+    counts = {}
+    for row in rows:
+        key = row.split(" ", 1)[0]
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def buffer_paths(rows: list[str]) -> dict:
+    out = {}
+    for row in rows:
+        m = re.match(r'^BUFFER\s+"([^"]+)"\s+(\d+)\s+"([^"]*)"\s*$', row)
+        if m:
+            out[m.group(1)] = {"bytes": int(m.group(2)), "path": m.group(3)}
+    return out
+
+
+def output_of(rows: list[str]) -> str:
+    for row in rows:
+        m = re.match(r'^OUTPUT\s+(\d+)\s+(\S+)\s+"([^"]+)"\s*$', row)
+        if m:
+            return m.group(3)
+    return ""
+
+
+def check_bundle(capture: Path, staged: Path, expected_plane: bytes) -> dict:
+    raw = capture.read_bytes()
+    comp = staged.read_bytes()
+    res = {"capture": str(capture), "staged": str(staged),
+           "capture_bytes": len(raw), "staged_bytes": len(comp),
+           "size_equal": len(raw) == len(comp)}
+    head_ok = comp[:HIST_OFFSET_IN_INPUT] == raw[:HIST_OFFSET_IN_INPUT]
+    tail_ok = comp[HIST_OFFSET_IN_INPUT + HIST_BYTES:] == raw[HIST_OFFSET_IN_INPUT + HIST_BYTES:]
+    plane = comp[HIST_OFFSET_IN_INPUT:HIST_OFFSET_IN_INPUT + HIST_BYTES]
+    a = np.frombuffer(raw[HIST_OFFSET_IN_INPUT:HIST_OFFSET_IN_INPUT + HIST_BYTES], dtype=np.uint8)
+    b = np.frombuffer(plane, dtype=np.uint8)
+    changed = np.flatnonzero(a != b)
+    res.update({
+        "bytes_before_plane_identical": head_ok,
+        "bytes_after_plane_identical": tail_ok,
+        "history_plane_equals_corrected_predecessor": plane == expected_plane,
+        "changed_bytes_in_plane": int(changed.size),
+        "changed_span_in_plane": None if changed.size == 0 else [int(changed[0]), int(changed[-1]) + 1],
+        "plane_bytes": HIST_BYTES,
+        "plane_finite": bool(np.isfinite(np.frombuffer(plane, dtype="<f4")).all()),
+    })
+    res["ok"] = bool(res["size_equal"] and head_ok and tail_ok
+                     and res["history_plane_equals_corrected_predecessor"] and res["plane_finite"])
+    return res
+
+
+def main() -> int:
+    rows_out = []
+    ok_all = True
+    for f in FRAMES:
+        prev = f - 1
+        cand_plan = C64 / f"combo-{f}.txt"
+        plan = PLAN_DIR / f"plan-{f}.txt"
+        cand_rows = lines_of(cand_plan)
+        new_rows = lines_of(plan)
+
+        # ---- byte level
+        with open(HISTORY_DIR / f"run-{prev}/feedback-network.bin", "rb") as fh:
+            fh.seek(HIST_OFFSET_IN_OUTPUT)
+            expected_plane = fh.read(HIST_BYTES)
+        capture_dir = DS / SEQ / f"0-{f}"
+        pre = check_bundle(capture_dir / "pre.bin", STAGE_DIR / f"{SEQ}-{f}/pre.bin", expected_plane)
+        post = check_bundle(capture_dir / "post.bin", STAGE_DIR / f"{SEQ}-{f}/post.bin", expected_plane)
+
+        # ---- text level
+        cand_counts, new_counts = prefix_counts(cand_rows), prefix_counts(new_rows)
+        diffs = [i for i in range(min(len(cand_rows), len(new_rows))) if cand_rows[i] != new_rows[i]]
+        diff_kinds = sorted({cand_rows[i].split(" ", 1)[0] for i in diffs})
+        all_diffs_are_buffers_or_output = all(k in ("BUFFER", "OUTPUT") for k in diff_kinds)
+        cand_buffers, new_buffers = buffer_paths(cand_rows), buffer_paths(new_rows)
+        changed_buffers = sorted({name for name in cand_buffers
+                                  if cand_buffers[name]["path"] != new_buffers[name]["path"]})
+        expected_buffers = sorted(name for name, v in new_buffers.items()
+                                  if (STAGE_DIR / f"{SEQ}-{f}").as_posix() in v["path"].replace("\\", "/"))
+        block = "\n".join(new_rows)
+        row = {
+            "frame": f,
+            "plan": str(plan),
+            "plan_bytes": plan.stat().st_size,
+            "line_counts_candidate": cand_counts,
+            "line_counts_corrected": new_counts,
+            "changed_line_indices": diffs,
+            "changed_line_kinds": diff_kinds,
+            "all_changed_lines_are_buffer_or_output": all_diffs_are_buffers_or_output,
+            "changed_buffer_files": changed_buffers,
+            "staged_buffer_files": expected_buffers,
+            "changed_buffers_match_staged": changed_buffers == expected_buffers,
+            "output_name": output_of(new_rows),
+            "header_identical": cand_rows[0] == new_rows[0],
+            "has_history_directive": "HISTORY" in new_counts,
+            "policy_table_identical": cand_counts.get("POLICY") == new_counts.get("POLICY"),
+            "pass_count_identical": cand_counts.get("PASS") == new_counts.get("PASS"),
+            "push_count_identical": cand_counts.get("PUSH") == new_counts.get("PUSH"),
+            "bind_count_identical": cand_counts.get("BIND") == new_counts.get("BIND"),
+            "pre_bundle": pre,
+            "post_bundle": post,
+        }
+        row["ok"] = bool(
+            pre["ok"] and post["ok"] and row["all_changed_lines_are_buffer_or_output"]
+            and row["changed_buffers_match_staged"] and row["output_name"] == "feedback-network.bin"
+            and row["header_identical"] and not row["has_history_directive"]
+            and row["policy_table_identical"] and row["pass_count_identical"]
+            and row["push_count_identical"] and row["bind_count_identical"])
+        ok_all = ok_all and row["ok"]
+        rows_out.append(row)
+
+    report = {
+        "schema": 1,
+        "kind": "CORRECTED_FEEDBACK_STAGING_VERIFY",
+        "card": "S13",
+        "sequence": SEQ,
+        "frames": FRAMES,
+        "method": ("independent of feedback_plan.py/planlib: plan text is re-parsed with regular expressions and the "
+                   "bundles are compared byte-for-byte against the captures and the corrected predecessor planes"),
+        "geometry": {"input_history_offset": HIST_OFFSET_IN_INPUT, "output_history_offset": HIST_OFFSET_IN_OUTPUT,
+                     "history_bytes": HIST_BYTES},
+        "checks_per_frame": rows_out,
+        "ok": ok_all,
+        "gpu_executed": False,
+    }
+    out = S13 / "CORRECTED-STAGING-VERIFY.json"
+    out.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps({"out": str(out), "ok": ok_all,
+                      "frames": [{"frame": r["frame"], "changed_bytes_pre": r["pre_bundle"]["changed_bytes_in_plane"],
+                                  "changed_bytes_post": r["post_bundle"]["changed_bytes_in_plane"],
+                                  "changed_lines": len(r["changed_line_indices"]),
+                                  "kinds": r["changed_line_kinds"], "ok": r["ok"]} for r in rows_out]},
+                     indent=2))
+    return 0 if ok_all else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

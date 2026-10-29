@@ -1,0 +1,54 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,re,copy,shutil
+D=Path(__file__).resolve().parent;A=D.parent;B=A.parent.parent
+# Reuse only validated arithmetic-decoration helper definitions, never execute old builder.
+code=(D/'build_f04_family_package.py').read_text(encoding='utf-8');exec(code[code.index('read=lambda'):code.index('scan=read')])
+F=D/'f04-family-package-20261027/family';R=D/'f04-package-ablation-20261027';R.mkdir(exist_ok=True)
+b=read(F/'BUILD.json');packs=read(F/'PACKS.json');srcscan=read(D/'CURRENT-CENSUS.json')['rows'];built={};ids=[]
+for arm in ['no_weight_copy','no_scale']:
+ S=R/arm;S.mkdir(exist_ok=True);text=(F/'plan.txt').read_text(encoding='utf-8');rows=[]
+ for src in b['sources']:
+  C=src['width'];d=S/f'c{C}';d.mkdir(exist_ok=True);s=Path(src['source']['path']).read_text(encoding='utf-8')
+  if arm=='no_weight_copy':
+   for col in ['cg0','cg1']:
+    for side in [0,1]:
+     old=f'wm + ({col}/16u*8u+h0/16u+{side}u)*256u, 16u, LCOL';new=f'wm + {col} * 128u + h0'+('' if side==0 else ' + 16u')+', 128u, LCOL';assert s.count(old)==1;s=s.replace(old,new)
+  else:
+   pat=r'float16_t gain=pack\[\((rs\s*\+\s*cg[01])\)\+\(lane & 15u\)\];\s*for\(int ci=0;ci<scale.length\(\);\+\+ci\) scale\[ci\]=gain;'
+   s,n=re.subn(pat,lambda m:'coopMatLoad(scale, pack, '+m.group(1)+', 0u, LROW);',s);assert n==4
+  cp=d/'candidate.comp';sp=d/'candidate.spv';cp.write_text(s,encoding='utf-8');inc=Path(srcscan[src['ordinal']]['source']).parent
+  run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(inc),cp,'-o',sp]);alignment=restore(ST.Module(Path(src['parent']['path'])),ST.Module(sp),sp);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',sp]);text=text.replace(Path(src['candidate']['path']).as_posix(),sp.as_posix());rows.append(dict(width=C,ordinals=src['ordinals'],candidate=ident(sp),alignment=alignment));ids.append(ident(sp))
+ if arm=='no_weight_copy':
+  pd=S/'packs';pd.mkdir(exist_ok=True)
+  for q in packs['rows']:
+   dst=pd/f"pass-{q['ordinal']}-weights.bin";shutil.copyfile(q['original']['path'],dst);assert sha(dst)==q['original']['sha256'];text=text.replace(Path(q['candidate']['path']).as_posix(),dst.as_posix());ids.append(ident(dst))
+ plan=S/'plan.txt';plan.write_text(text,encoding='utf-8');cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check']);built[arm]=dict(plan=ident(plan),sources=rows,cpu=cpu)
+# Identical no-weight shader with original buffers isolates duplication/binding locality.
+S=R/'no_weight_original';S.mkdir(exist_ok=True);text=Path(b['parent']['path']).read_text(encoding='utf-8')
+for src,new in zip(b['sources'],built['no_weight_copy']['sources']):text=text.replace(Path(src['parent']['path']).as_posix(),Path(new['candidate']['path']).as_posix())
+plan=S/'plan.txt';plan.write_text(text,encoding='utf-8');built['no_weight_original']=dict(plan=ident(plan),sources=built['no_weight_copy']['sources'],cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check']))
+built['baseline']=dict(plan=b['parent']);built['full']=dict(plan=b['plan']);save(R/'BUILD.json',built)
+ids+=read(F/'LUNA-GATES.json')['identities'];ids=list({x['path']:x for x in ids}.values())
+(R/'run').mkdir(exist_ok=True)
+def job(template,arm,jid):
+ j=copy.deepcopy(template);j['id']=jid;j['candidate']=arm;j['plan']=built[arm]['plan'];j['runner_output']=str(R/'run'/jid);ar=j['argv'];ar[ar.index('--plan')+1]=j['plan']['path'];ar[ar.index('--out')+1]=j['runner_output'];return j
+for stage in ['GATES','RESOURCES','NATIVE','ORDINARY']:
+ t=read(F/f'LUNA-{stage}.json');templates=t['jobs'];t['jobs']=[];out=R/(stage.lower()+'-execution');out.mkdir(exist_ok=True);t['output_root']=str(out);t['identities']=ids
+ if stage=='ORDINARY':
+  arms=['baseline','full','no_weight_copy','no_scale','no_weight_original'];orders=[]
+  for k in range(3):
+   order=arms[k:]+arms[:k];orders.extend([order,order[::-1]])
+  for block,order in enumerate(orders):
+   for arm in order:t['jobs'].append(job(templates[0],arm,f'ordinary-{block}-{arm}'))
+  save(R/'ORDERS.json',orders)
+ else:
+  arms=['no_weight_copy','no_scale','no_weight_original'] if stage=='GATES' else ['no_weight_copy','no_scale']
+  for arm in arms:
+   for ix,tem in enumerate(templates):
+    j=job(tem,arm,f'{stage.lower()}-{arm}-{ix}')
+    if stage=='NATIVE':
+     cap=R/arm/'captures';j['argv'][j['argv'].index('--output_dir')+1]=str(cap);j['argv'][j['argv'].index('--msg_file')+1]=str(R/arm/'native.log');j['capture_output']=str(cap/j['argv'][j['argv'].index('--profile_dir')+1])
+    t['jobs'].append(j)
+ save(R/f'LUNA-{stage}.json',t)
+(R/'execute.ps1').write_text((F/'execute.ps1').read_text(encoding='utf-8').replace('F04 middle consumer tile','F04 controlled ablation').replace('LUNA-F04-MIDDLE-TILE','LUNA-F04-ABLATION'),encoding='utf-8')
+print(json.dumps({k:v['plan'] for k,v in built.items()},indent=2))

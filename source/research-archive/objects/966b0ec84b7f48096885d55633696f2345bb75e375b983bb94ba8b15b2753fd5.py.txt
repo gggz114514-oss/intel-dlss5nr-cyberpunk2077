@@ -1,0 +1,222 @@
+"""Structural audit of the parent and candidate modules for n09b-f09-sx-stage.
+
+Extracts the facts this card is judged on:
+  * the Workgroup variable (sx) and its byte size, the control barriers
+  * every OpCooperativeMatrixLoadKHR/StoreKHR with layout, stride and a
+    symbolic pointer expression
+  * the staging store into shared, if any
+  * the entry-point interface list
+  * per-function opcode multisets for `main`
+Writes SPV-AUDIT.json next to this script.
+"""
+from pathlib import Path
+import json, sys
+
+CARD = Path(__file__).resolve().parent
+sys.path.insert(0, str(CARD.parent.parent))
+import COMMON as K
+sys.path.insert(0, str(K.SPV_TOOLS))
+import spv_tools_local as ST
+
+OPNAME = {
+    12: 'OpExtInst', 21: 'OpTypeInt', 22: 'OpTypeFloat', 28: 'OpTypeArray',
+    29: 'OpTypeRuntimeArray', 30: 'OpTypeStruct', 32: 'OpTypePointer', 43: 'OpConstant',
+    44: 'OpConstantComposite', 59: 'OpVariable', 61: 'OpLoad', 62: 'OpStore',
+    65: 'OpAccessChain', 66: 'OpInBoundsAccessChain', 67: 'OpPtrAccessChain',
+    79: 'OpCompositeConstruct', 80: 'OpCompositeExtract', 96: 'OpSelect',
+    128: 'OpIAdd', 132: 'OpIMul', 134: 'OpUDiv', 137: 'OpUMod', 169: 'OpSelect',
+    194: 'OpShiftRightLogical', 197: 'OpBitwiseOr', 199: 'OpBitwiseAnd',
+    224: 'OpControlBarrier', 248: 'OpLabel', 249: 'OpBranch',
+    250: 'OpBranchConditional', 251: 'OpSwitch', 245: 'OpPhi',
+    4456: 'OpTypeCooperativeMatrixKHR', 4457: 'OpCooperativeMatrixLoadKHR',
+    4458: 'OpCooperativeMatrixStoreKHR', 4459: 'OpCooperativeMatrixMulAddKHR',
+    4460: 'OpCooperativeMatrixLengthKHR',
+}
+STORAGE = {0: 'UniformConstant', 1: 'Input', 3: 'Output', 4: 'Workgroup',
+           5: 'CrossWorkgroup', 6: 'Private', 7: 'Function', 9: 'PushConstant',
+           12: 'StorageBuffer'}
+# SPV_KHR_cooperative_matrix: CooperativeMatrixLayoutRowMajor = 0,
+# ColumnMajor = 1 (verified against this module: every load/store that the
+# source declares ROW carries 0, every COL carries 1, and that mapping holds in
+# both the parent and the candidate).
+LAYOUT = {0: 'RowMajor', 1: 'ColumnMajor', 2: 'RowBlockedInterleaved',
+          3: 'ColumnBlockedInterleaved'}
+NORESULT = {246, 247, 249, 250, 251, 224, 225, 62, 71, 72, 73, 16, 15, 14, 7,
+            3, 4, 5, 6, 10, 11, 127, 253, 254, 126, 199}
+
+
+class Mod:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.m = ST.Module(self.path)
+        self.ins = self.m.instructions
+        self.names = {}
+        self.consts = {}
+        self.types = {}
+        self.var_storage = {}
+        self.var_type = {}
+        self.defs = {}
+        self.var_names = {}
+        self._scan()
+
+    def _scan(self):
+        for op, ops, _, _ in self.ins:
+            if op == 5 and len(ops) >= 2:
+                self.var_names[ops[0]] = b''.join(w.to_bytes(4, 'little') for w in ops[1:]).split(b'\0')[0].decode('utf-8', 'replace')
+        for op, ops, _, _ in self.ins:
+            if op == 22 and len(ops) >= 2:
+                self.types[ops[0]] = 'f%d' % ops[1]
+            elif op == 21 and len(ops) >= 3:
+                self.types[ops[0]] = ('s' if ops[2] else 'u') + str(ops[1])
+            elif op == 28 and len(ops) >= 3:
+                self.types[ops[0]] = 'arr[%s x %s]' % (self.types.get(ops[1], '?'), ops[2])
+            elif op == 29:
+                self.types[ops[0]] = 'rtarr[%s]' % self.types.get(ops[1], '?')
+            elif op == 32 and len(ops) >= 3:
+                self.types[ops[0]] = 'ptr<%s,%s>' % (STORAGE.get(ops[1], ops[1]), self.types.get(ops[2], ops[2]))
+            elif op == 43 and len(ops) >= 3:
+                self.consts[ops[1]] = ops[2]
+            elif op == 59 and len(ops) >= 3:
+                self.var_storage[self.var_names.get(ops[1], 'v%d' % ops[1])] = STORAGE.get(ops[2], ops[2])
+                self.var_type[self.var_names.get(ops[1], 'v%d' % ops[1])] = self.types.get(ops[0], '?')
+            if ops and op not in NORESULT and op not in (5, 6, 71, 72):
+                rid = ST.result_id_of(op, ops)
+                if rid is not None:
+                    self.defs.setdefault(rid, (op, ops))
+
+    def name(self, i):
+        return self.var_names.get(i, '%%%d' % i) if not self.var_names.get(i, '').startswith('%') else self.var_names[i]
+
+    def expr(self, i, depth=0):
+        """Symbolic expression for a value id (constant folded, depth limited)."""
+        if i in self.consts:
+            return '#%d' % self.consts[i]
+        nm = self.var_names.get(i)
+        if depth > 3 or i not in self.defs:
+            return '%' + (nm if nm else str(i))
+        op, ops = self.defs[i]
+        tag = OPNAME.get(op, 'Op%d' % op)
+        if op in (65, 66, 67):
+            base = self.var_names.get(ops[2], '%%%d' % ops[2])
+            return '%s[%s]' % (base, ', '.join(self.expr(x, depth + 1) for x in ops[3:]))
+        if op == 61:
+            return 'load(%s)' % self.expr(ops[2], depth + 1)
+        if nm:
+            head = '%' + nm
+        else:
+            head = tag
+        if op in (128, 132, 134, 137, 197, 199, 194, 96, 169):
+            sym = {128: '+', 132: '*', 134: '/', 137: '%', 197: '|', 199: '&',
+                   194: '>>', 96: '?:', 169: '?:'}[op]
+            return '(%s %s %s)' % (self.expr(ops[2], depth + 1), sym,
+                                   self.expr(ops[3], depth + 1) if len(ops) > 3 else '?')
+        return '%s(%s)' % (head, ', '.join(self.expr(x, depth + 1) for x in ops[2:]))
+
+
+def audit(path):
+    M = Mod(path)
+    out = dict(path=str(path), sha256=K.sha(Path(path)), instructions=len(M.ins))
+    wg = {n: t for n, t in M.var_type.items() if M.var_storage.get(n) == 'Workgroup'}
+    out['workgroup_variables'] = wg
+    barriers = []
+    for op, ops, _, _ in M.ins:
+        if op == 224:
+            barriers.append(dict(execution_scope=M.expr(ops[0]), memory_scope=M.expr(ops[1]),
+                                 semantics='#%d' % M.consts.get(ops[2], ops[2])))
+    out['control_barriers'] = barriers
+    loads = []
+    for op, ops, _, _ in M.ins:
+        if op == 4457:
+            loads.append(dict(kind='load', result_type=M.types.get(ops[0], '?'),
+                              result=ops[1], pointer=M.expr(ops[2]),
+                              layout_raw=ops[3], layout_name=LAYOUT.get(M.consts.get(ops[3], -1), 'literal%d' % ops[3]),
+                              stride=M.expr(ops[4]), memory_operand=[M.expr(x) for x in ops[5:]]))
+        if op == 4458:
+            loads.append(dict(kind='store', result_type=M.types.get(ops[0], '?'),
+                              pointer=M.expr(ops[1]),
+                              layout_raw=ops[2], layout_name=LAYOUT.get(M.consts.get(ops[2], -1), 'literal%d' % ops[2]),
+                              stride=M.expr(ops[3]), memory_operand=[M.expr(x) for x in ops[4:]]))
+    out['cooperative_matrix_memory'] = loads
+    # stores whose base variable is the Workgroup array (the staging round trip)
+    staging = []
+    for op, ops, _, _ in M.ins:
+        if op == 62:
+            ptr = ops[0]
+            root = None
+            seen = 0
+            cur = ptr
+            while cur in M.defs and seen < 8:
+                dop, dops = M.defs[cur]
+                if dop in (65, 66, 67):
+                    root = dops[2]
+                    cur = dops[2]
+                else:
+                    break
+                seen += 1
+            if root is not None and M.var_storage.get(M.var_names.get(root, '')) == 'Workgroup':
+                staging.append(dict(store_pointer=M.expr(ptr), value=M.expr(ops[1])))
+    out['workgroup_stores'] = staging
+    # loads from the Workgroup array
+    wgl = []
+    for op, ops, _, _ in M.ins:
+        if op == 61:
+            ptr = ops[2]
+            root = None
+            cur = ptr
+            seen = 0
+            while cur in M.defs and seen < 8:
+                dop, dops = M.defs[cur]
+                if dop in (65, 66, 67):
+                    root = dops[2]
+                    cur = dops[2]
+                else:
+                    break
+                seen += 1
+            if root is not None and M.var_storage.get(M.var_names.get(root, '')) == 'Workgroup':
+                wgl.append(dict(load_pointer=M.expr(ptr)))
+    out['workgroup_loads'] = wgl
+    # entry point interface
+    for op, ops, _, _ in M.ins:
+        if op == 15:
+            out['entry_point'] = dict(model=ops[0], function=M.var_names.get(ops[1], ops[1]),
+                                      interface=[M.var_names.get(x, '%%%d' % x) for x in ops[3:]])
+    # per-function opcode multiset
+    hist = {}
+    depth = 0
+    for op, ops, _, _ in M.ins:
+        if op == 54:
+            depth += 1
+        if depth:
+            hist[OPNAME.get(op, 'Op%d' % op)] = hist.get(OPNAME.get(op, 'Op%d' % op), 0) + 1
+        if op == 56:
+            depth -= 1
+    out['function_opcode_histogram'] = dict(sorted(hist.items()))
+    return out
+
+
+def main():
+    a = audit(CARD / 'parent-rebuild.spv')
+    b = audit(CARD / 'candidate.spv')
+    delta = {}
+    keys = sorted(set(a['function_opcode_histogram']) | set(b['function_opcode_histogram']))
+    for k in keys:
+        d = b['function_opcode_histogram'].get(k, 0) - a['function_opcode_histogram'].get(k, 0)
+        if d:
+            delta[k] = d
+    out = dict(parent=a, candidate=b, function_opcode_delta=delta)
+    K.write_json(CARD / 'SPV-AUDIT.json', out)
+    for tag, d in (('parent', a), ('candidate', b)):
+        print('==', tag, d['sha256'][:16], 'instructions', d['instructions'])
+        print('   workgroup vars:', d['workgroup_variables'])
+        print('   barriers      :', d['control_barriers'])
+        print('   entry iface   :', d.get('entry_point', {}).get('interface'))
+        for L in d['cooperative_matrix_memory']:
+            print('   ', L['kind'], L['result_type'][:24], 'layout', L['layout_name'],
+                  'stride', L['stride'], 'ptr', L['pointer'], 'memop', L['memory_operand'])
+        print('   wg stores     :', len(d['workgroup_stores']), d['workgroup_stores'][:2])
+        print('   wg loads      :', len(d['workgroup_loads']), d['workgroup_loads'][:2])
+    print('== function opcode delta', json.dumps(delta, indent=1))
+
+
+if __name__ == '__main__':
+    main()

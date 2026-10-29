@@ -1,0 +1,97 @@
+"""Occupancy probe step 2: fix the SLM field and add the local-size dimension.
+
+PASS line tokens from the end: gz gy gx npush nbind shared subgroup "<spv>" "<name>" row
+so shared = toks[-6].
+"""
+import json, struct, sys
+from collections import Counter
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+import ISA
+from audit_card import pass_lines
+
+cur = K.read_json(K.C / 'CURRENT.json')
+recs = pass_lines(Path(cur['best_plan']['path']))
+p = list((K.C / 'queue' / 'counters-head2').rglob('hardware-counters.json'))[0]
+d = K.read_json(p)
+names = [m['name'] for m in d['metrics']]
+idx = {n: i for i, n in enumerate(names)}
+cnt = {x['name']: dict(gpu=x['values'][idx['GpuTime']] / 1e6,
+                       occ=x['values'][idx['XVE_THREADS_OCCUPANCY_ALL']],
+                       active=x['values'][idx['XVE_ACTIVE']],
+                       aluwr=x['values'][idx['XVE_STALL_ALUWR']]) for x in d['frames'][0]['passes']}
+
+
+def local_size(spv):
+    dd = Path(spv).read_bytes()
+    w = struct.unpack('<%dI' % (len(dd) // 4), dd[:len(dd) // 4 * 4])
+    i = 5
+    while i < len(w):
+        wc = w[i] >> 16
+        op = w[i] & 0xFFFF
+        if wc == 0:
+            break
+        if op == 16 and w[i + 2] == 17:
+            return w[i + 3] * w[i + 4] * w[i + 5]
+        i += wc
+    return None
+
+
+index = K.read_json(K.C / 'evidence' / 'NATIVE-INDEX.json')
+by_ord = {}
+def walk(n):
+    if isinstance(n, dict):
+        if 'ordinal' in n and 'baseline_kernel_hash' in n:
+            by_ord.setdefault(int(n['ordinal']), str(n['baseline_kernel_hash'])[:16])
+        for v in n.values():
+            walk(v)
+    elif isinstance(n, list):
+        for v in n:
+            walk(v)
+walk(index)
+want = set(by_ord.values())
+hit = {}
+for a in (K.C / 'queue').rglob('*.asm'):
+    for w in want:
+        if w in a.name:
+            hit.setdefault(w, a)
+
+rows = []
+for r in K.rows():
+    o = r['ordinal']
+    c = cnt.get(r['name'])
+    a = hit.get(by_ord.get(o, ''))
+    if not c or not a:
+        continue
+    toks = recs[o]['line'].split()
+    slm = int(toks[-6]) if toks[-6].isdigit() else 0
+    ls = local_size(recs[o]['spv']) or 0
+    rows.append(dict(name=r['name'], family=r['family'], max_r=ISA.summary(a)['max_r'], slm=slm,
+                     local=ls, occ=c['occ'], active=c['active'], aluwr=c['aluwr'], gpu=c['gpu']))
+print('passes:', len(rows))
+print('max_r histogram:', dict(sorted(Counter(x['max_r'] for x in rows).items())))
+print('slm histogram :', dict(sorted(Counter(x['slm'] for x in rows).items())))
+print('local sizes   :', dict(sorted(Counter(x['local'] for x in rows).items())))
+
+def show(key, label):
+    print('\nby %s:' % label)
+    print('  %-10s %3s %8s %8s %8s %8s' % (label, 'n', 'occ%', 'active%', 'gpu_ms', 'aluwr%'))
+    groups = {}
+    for x in rows:
+        if key == 'gpu':
+            g = 'large' if x['gpu'] > 0.1 else 'small'
+        else:
+            g = str(x[key])
+        groups.setdefault(g, []).append(x)
+    for g in sorted(groups, key=lambda k: -len(groups[k])):
+        sel = groups[g]
+        n = len(sel)
+        print('  %-10s %3d %8.1f %8.1f %8.3f %8.1f' % (g, n, sum(y['occ'] for y in sel) / n,
+                                                      sum(y['active'] for y in sel) / n,
+                                                      sum(y['gpu'] for y in sel) / n,
+                                                      sum(y['aluwr'] for y in sel) / n))
+show('local', 'local size')
+show('slm', 'shared memory')
+show('gpu', 'size class')
+K.write_json(K.C / 'evidence' / 'OCCUPANCY-PROBE.json', dict(rows=rows))

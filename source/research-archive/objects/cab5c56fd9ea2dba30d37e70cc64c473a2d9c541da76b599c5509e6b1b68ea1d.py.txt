@@ -1,0 +1,51 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys
+R=Path(__file__).resolve().parent;A=R.parent;B=A.parents[1];P=R/'f20-score-owner';T=R/'f20-q-producer-handoff';N=R/'f20-norm-compact-pairs';N.mkdir(exist_ok=True)
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+ return r.stdout
+s=(T/'candidate.comp').read_text(encoding='utf-8-sig');candidate=s.replace('shared float16_t shNorm[256];     // nq[64] nk[64] inv[64]        512 B','shared float16_t shNorm[128];     // Adjacent Q,K coefficients for each of64 rows.')
+candidate=candidate.replace('shNorm[t + (isQ ? 0u : 64u)] = n;','shNorm[2u*t + (isQ ? 0u : 1u)] = n;')
+start=candidate.index('    // ============ stage 5b:');end=candidate.index('    if (debug) {',start)
+new='''    // stage5b: original full-SG norm producers, compact paired consumers.
+    {
+        float16_t scalar0=float16_t(fb[uint(pc.p2.z)]);
+        for(int d=0;d<4;++d) {
+            uint row=sg*8u+2u*uint(d)+(gl_SubgroupInvocationID>>4u);
+            f16vec2 norms=f16vec2(shNorm[2u*row],shNorm[2u*row+1u]);
+            precise f16vec2 qr=f16vec2(score_q0[d],score_q1[d])*f16vec2(norms.x);
+            qr=qr*f16vec2(scalar0);
+            score_q0[d]=qr.x;score_q1[d]=qr.y;
+            uint e=2048u+row*32u+2u*(gl_SubgroupInvocationID&15u);
+            f16vec2 v=f16vec2(shArena[e],shArena[e+1u]);
+            precise f16vec2 kr=v*f16vec2(norms.y);
+            shArena[e]=kr.x;shArena[e+1u]=kr.y;
+        }
+    }
+'''
+candidate=candidate[:start]+new+candidate[end:]
+score=candidate.index('    // ============ stage 6:');a=candidate.index('    {\n        float16_t scalar0=',score);b=candidate.index('        if(debug) {',a);candidate=candidate[:a]+'    {\n'+candidate[b:]
+tree=lambda x:x[x.index('    if (t_local < 128u) {'):x.index('        shNorm[',x.index('    if (t_local < 128u) {'))]
+assert tree(candidate)==tree(s)
+assert len({2*t+q for t in range(64) for q in range(2)})==128
+src=N/'candidate.comp';spv=N/'candidate.spv';src.write_text(candidate,encoding='utf-8')
+run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv])
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+pm=ST.Module(P/'candidate.spv');cm=ST.Module(spv);pattern=N/'parent-pattern-only.spv';ST.set_no_contraction(pm,set(ST.no_contraction_ids(pm))-{1436,1444},pattern)
+ids=cm.id_to_instruction();raw_half2=[rid for rid in ST.no_contraction_ids(cm) if ids[rid][0]==133 and ids.get(ids[rid][1][0],(0,[]))[0]==23];assert len(raw_half2)==5
+keep,info=ST.transfer_decoration_pattern_aligned(ST.Module(pattern),cm,raw_half2);assert len(keep)==8;ST.set_no_contraction(cm,set(keep),spv)
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+plan=N/'plan.txt';plan.write_text((P/'plan.txt').read_text().replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8')
+for kind in ['GATES','NATIVE']:
+ t=json.loads((P/f'LUNA-{kind}.json').read_text().replace('f20-score-owner',N.name));t['identities']=[x for x in t['identities'] if not x['path'].endswith('.spv')]+[ident(spv)]
+ for j in t['jobs']:j['plan']=ident(plan)
+ (N/f'LUNA-{kind}.json').write_text(json.dumps(t,indent=2),encoding='utf-8')
+runner=json.loads((P/'LUNA-GATES.json').read_text())['identities'][0]['path']
+proof=dict(parent=ident(P/'plan.txt'),source_parent=ident(T/'candidate.spv'),source=ident(src),spv=ident(spv),plan=ident(plan),cpu=run([runner,'--plan',plan,'--cpu-check']),shared_bytes=24832,NC=sorted(keep),alignment=info,
+ norm='Original t_local<128 predicate, isQ/t mapping and entire scalar tree byte-identical. Four full SG execute norm; no source arithmetic split. Only norm store address changes to2*t+isK.',
+ mapping='Q/K coefficients for each row occupy adjacent half elements. 128 unique writes. Existing norm WG barrier publishes them. Each scaling owner reads its row pair, scales its retained Q fragment and K shared row; 2048 K elements unique as previous owner proof.',
+ lifetime='No norm scalar/carrier survives into consumer across WG: only compact shared pair256B. Q16B/lane survives as prior Q-producer. One pair coefficient temporary per scaling d retires immediately. No additional coefficient shuffle or raw norm cache.',
+ costs='Restore one WG barrier vs norm-local-owner; remove all8 coefficient shuffles/subgroupBarrier and half-active norm distribution. Versus accepted parent: WG barrier count unchanged, shared512→256B for norm, no added coefficient shuffle. Q producer handoff source12KiB deletion retained; no weight reread. Coefficient scalar byte count unchanged; message combining requires native evidence.',
+ stop='Exact gold gate required, no tolerance; no new scratch; one ordinary/resource batch only after native review.')
+(N/'PROOF.json').write_text(json.dumps(proof,indent=2),encoding='utf-8');print(ident(spv))

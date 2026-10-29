@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Build the F1 body INT8 pack from the deployed FP16 pack.
+
+Reads (read-only):
+  candidates/amd-map-20261015/s1-integrated/candidate/packs/ioport_0_ioport_pack.fp16.bin
+     34,656 B = 17,328 halves; holdout: lift @ p7.x=0, QKV @ p1.z=8832, outproj @ p1.w=16128
+  candidates/int8-coverage-v2-20261020/C/pack/c32_f1_weights.i8.bin  (32,768 B, FFN int8)
+Writes (card):
+  pack/f1_body_weights.i8.bin   53,248 B = [FFN int8 32768 | Wq | Wk | Wv | Wo | Wlift]
+  pack/f1_body_scales.f32.bin      640 B = sWq[32] sWk[32] sWv[32] sWo[32] sWlift[32]
+  evidence/PACK-F1.json
+"""
+import json
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path("@NR_WORKSPACE@")
+WB = ROOT / "candidates/amd-map-20261015/s1-integrated/candidate/packs/ioport_0_ioport_pack.fp16.bin"
+FFN = ROOT / "candidates/int8-coverage-v2-20261020/C/pack/c32_f1_weights.i8.bin"
+CARD = ROOT / "work/dsh-int8-fullnet-impl-20261024/candidates/c32-f1-f2"
+# G3 / cumulative-v14 PASS 0 PUSH fields used by the source.
+P1_Z, P1_W, P7_X = 8832, 16128, 8192
+
+
+def main():
+    wb = np.fromfile(WB, dtype=np.float16)
+    ffn = np.fromfile(FFN, dtype=np.uint8)
+    assert wb.size == 17328, wb.size
+    assert ffn.size == 32768, ffn.size
+
+    def mat(base, nout, K):
+        W = np.zeros((nout, K), np.float64)
+        for ch in range(nout):
+            for k in range(K):
+                ofs = base + 128 * (2 * (ch // 8) + k // 16) + (ch % 8) * 16 + k % 16
+                W[ch, k] = float(wb[ofs])
+        return W
+
+    def lift_mat(base, nout, K):
+        # A(m=ch within 8, k=feat within 16) at base + g*128 + (ch%8)*16 + k, LROW
+        W = np.zeros((nout, K), np.float64)
+        for ch in range(nout):
+            g, m = ch // 8, ch % 8
+            for k in range(K):
+                W[ch, k] = float(wb[base + g * 128 + m * 16 + k])
+        return W
+
+    mats = [("Wq", mat(P1_Z, 32, 32)), ("Wk", mat(P1_Z + 1024, 32, 32)),
+            ("Wv", mat(P1_Z + 2048, 32, 32)), ("Wo", mat(P1_W, 32, 32)),
+            ("Wlift", lift_mat(P7_X, 32, 16))]
+
+    body = bytearray(ffn.tobytes())
+    scales = np.zeros(160, np.float32)
+    rep = {"source": {"weights": str(WB), "ffn_prefix": str(FFN)},
+           "abi": {"p1_z": P1_Z, "p1_w": P1_W, "p7_x": P7_X},
+           "matrices": {}}
+    for i, (name, W) in enumerate(mats):
+        K = W.shape[1]
+        amax = np.abs(W).max(axis=1)
+        s = np.maximum(amax / 127.0, 1e-12)
+        q = np.clip(np.rint(W / s[:, None]), -127, 127).astype(np.int8)
+        scales[32 * i:32 * i + 32] = s
+        tile = bytearray(4096)     # 4 I8A tiles of 1024 B address space
+        for ch in range(32):
+            t = ch // 8
+            for k in range(K):
+                tile[t * 1024 + k * 32 + (ch % 8)] = int(q[ch, k]) & 0xFF
+        # k = 16..31 stay 0 for the lift: the zero padding is explicit
+        body += tile
+        deq = np.float64(q) * s[:, None]
+        rel = float(np.linalg.norm(deq - W) / np.linalg.norm(W))
+        rep["matrices"][name] = {
+            "shape": [32, K], "K_padded_to": 32 if K < 32 else K,
+            "zero_padded_columns": 32 - K if K < 32 else 0,
+            "byte_offset": 32768 + 4096 * i, "bytes": 4096,
+            "codes": int(q.size), "saturated": int(np.sum(np.abs(q) >= 127)),
+            "rel_L2_vs_fp16": rel,
+            "snr_dB": float(-20 * np.log10(max(rel, 1e-30))),
+            "absmax": float(np.abs(W).max()),
+            "scale_min": float(s.min()), "scale_max": float(s.max())}
+
+    # explicit check that the zero padding really is zero and that the integer
+    # dot over k=0..31 equals the dot over k=0..15
+    ql = np.frombuffer(bytes(body[32768 + 4096 * 4:32768 + 4096 * 5]), dtype=np.uint8).astype(np.int8)
+    ql = ql.reshape(4, 1024)
+    pad = []
+    for t in range(4):
+        for k in range(16, 32):
+            for m in range(8):
+                pad.append(int(ql[t][k * 32 + m]))
+    rep["lift_zero_padding"] = {"columns": [16, 32], "codes_checked": len(pad),
+                               "all_zero": all(v == 0 for v in pad)}
+
+    assert len(body) == 53248, len(body)
+    (CARD / "pack").mkdir(parents=True, exist_ok=True)
+    (CARD / "pack/f1_body_weights.i8.bin").write_bytes(bytes(body))
+    scales.astype("<f4").tofile(CARD / "pack/f1_body_scales.f32.bin")
+    rep["files"] = {"pack/f1_body_weights.i8.bin": len(body),
+                    "pack/f1_body_scales.f32.bin": int(scales.size * 4)}
+    rep["ffn_prefix_identical"] = bool(bytes(body[:32768]) == ffn.tobytes())
+    (CARD / "evidence").mkdir(parents=True, exist_ok=True)
+    (CARD / "evidence/PACK-F1.json").write_text(json.dumps(rep, indent=1), encoding="utf-8")
+    print(json.dumps(rep, indent=1))
+
+
+if __name__ == "__main__":
+    main()

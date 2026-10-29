@@ -1,0 +1,232 @@
+"""NoContraction reconstruction for the n19 candidate.
+
+The candidate adds/removes no floating-point operation, so the contract's
+requirement is: every parent NoContraction site must map 1:1 onto a candidate
+site whose ID-free `operand_signature` is equal.
+
+This module does that explicitly instead of relying on
+`transfer_decoration_pattern_aligned`, because that helper
+  * requires the whole parent function list to align 1:1, and
+  * requires *every* decorated parent position to fall inside a matching block.
+The candidate legitimately breaks both: `nrf2_io_at0` becomes unused and is not
+emitted (so the function list shrinks by one and shifts), and the blend region
+changes enough that difflib splits a block there.
+
+Method
+  1. match parent functions to candidate functions by difflib skeleton score
+     (globally greedy, one-to-one, unmatched functions are reported);
+  2. inside each matched pair run the skeleton alignment; for a decorated parent
+     position that difflib leaves uncovered, search a window around the aligned
+     neighbourhood for a candidate instruction with the same (opcode, word
+     count) and an equal ID-free operand signature, and require the choice to be
+     unique;
+  3. emit the candidate NC id set and verify: count, decorated-opcode histogram,
+     and one-to-one-ness.
+
+CPU only.
+"""
+import difflib
+import json
+import sys
+from pathlib import Path
+
+CAMP = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+CARD = CAMP / 'cards/n19-f19-root'
+sys.path.insert(0, str(CAMP))
+sys.path.insert(0, '@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import COMMON as K            # noqa: E402
+import spv_tools_local as ST  # noqa: E402
+
+WINDOW = 64
+# SPIR-V arithmetic opcodes.  NoContraction is only meaningful for the float
+# ones; the integer ones only inherit it because `precise` propagates through
+# the index expressions that feed a precise load.
+FP_OPS = {12, 129, 131, 133, 136, 140, 141}      # FAdd FSub FMul FDiv FRem FMod (+ExtInst)
+INT_OPS = {128, 130, 132, 134, 135, 137, 138, 139}  # IAdd ISub IMul UDiv SDiv UMod SRem SMod
+
+
+def _strict_seq(module, region):
+    """(position in region, opcode, word count) for the contraction-relevant ops."""
+    return [(pos, module.instructions[idx][0], module.instructions[idx][3])
+            for pos, idx in enumerate(region) if module.instructions[idx][0] in FP_OPS]
+
+
+def match_functions(pm, cm):
+    """Greedy one-to-one parent->child function assignment by skeleton score."""
+    preg = ST.function_regions(pm)
+    creg = ST.function_regions(cm)
+    psk = ST._skeleton_of(pm, preg)
+    csk = ST._skeleton_of(cm, creg)
+    cands = []
+    for pi in range(len(preg)):
+        for ci in range(len(creg)):
+            sm = difflib.SequenceMatcher(None, psk[pi], csk[ci], autojunk=False)
+            score = sum(b.size for b in sm.get_matching_blocks())
+            if score:
+                cands.append((score, pi, ci))
+    cands.sort(reverse=True)
+    p2c, used = {}, set()
+    for score, pi, ci in cands:
+        if pi in p2c or ci in used:
+            continue
+        p2c[pi] = ci
+        used.add(ci)
+    return preg, creg, p2c
+
+
+def map_nc(pm, cm, verbose=True):
+    preg, creg, p2c = match_functions(pm, cm)
+    keep, int_keep, detail = [], [], dict(
+        fp_mapped=0, int_mapped=0, int_dropped=[], unmapped=[], fp_sequence_ok=True)
+    for pi, ci in sorted(p2c.items()):
+        pat = ST.decoration_pattern(pm, preg[pi])
+        if not pat:
+            continue
+        # --- float sites: 1:1 on the filtered arithmetic sequence -------------
+        pseq = _strict_seq(pm, preg[pi])
+        cseq = _strict_seq(cm, creg[ci])
+        if len(pseq) != len(cseq) or [(o, w) for _, o, w in pseq] != [(o, w) for _, o, w in cseq]:
+            detail['fp_sequence_ok'] = False
+            detail['unmapped'].append(dict(fn=pi, why='fp sequence differs',
+                                           parent=len(pseq), child=len(cseq)))
+            continue
+        for (pp, pop, pcnt), (cp, cop, ccnt) in zip(pseq, cseq):
+            if pp not in pat:
+                continue
+            pidx = preg[pi][pp]
+            cidx = creg[ci][cp]
+            prid = ST.result_id_of(pop, pm.instructions[pidx][1])
+            crid = ST.result_id_of(cop, cm.instructions[cidx][1])
+            psig = pm.operand_signature(prid, 3)
+            csig = cm.operand_signature(crid, 3)
+            if psig != csig:
+                detail['unmapped'].append(dict(fn=pi, pos=pp, why='signature differs'))
+                continue
+            keep.append(crid)
+            detail['fp_mapped'] += 1
+        # --- integer sites: only where a 1:1 counterpart still exists ---------
+        ipat = {p: q for p, q in pat.items() if pm.instructions[preg[pi][p]][0] in INT_OPS}
+        if not ipat:
+            continue
+        want = ST._skeleton_of(pm, preg)[pi]
+        have = ST._skeleton_of(cm, creg)[ci]
+        pos = {}
+        for b in difflib.SequenceMatcher(None, want, have, autojunk=False).get_matching_blocks():
+            for k in range(b.size):
+                pos[b.a + k] = b.b + k
+        for p in sorted(ipat):
+            pidx = preg[pi][p]
+            pop = pm.instructions[pidx][0]
+            pcount = pm.instructions[pidx][3]
+            prid = ST.result_id_of(pop, pm.instructions[pidx][1])
+            psig = pm.operand_signature(prid, 3)
+            cidx = None
+            if p in pos:
+                cand = creg[ci][pos[p]]
+                crid = ST.result_id_of(cm.instructions[cand][0], cm.instructions[cand][1])
+                if cm.instructions[cand][0] == pop and cm.instructions[cand][3] == pcount \
+                        and crid is not None and cm.operand_signature(crid, 3) == psig:
+                    cidx = cand
+            if cidx is None:
+                anchor = pos.get(max([q for q in pos if q < p], default=-1), 0)
+                hits = []
+                for off in range(0, WINDOW):
+                    for s in (anchor + off, anchor - off):
+                        if 0 <= s < len(creg[ci]):
+                            cand = creg[ci][s]
+                            cur = cm.instructions[cand]
+                            if cur[0] != pop or cur[3] != pcount:
+                                continue
+                            crid = ST.result_id_of(cur[0], cur[1])
+                            if crid is not None and cm.operand_signature(crid, 3) == psig:
+                                hits.append(cand)
+                    if hits:
+                        break
+                if len(hits) == 1:
+                    cidx = hits[0]
+            if cidx is None:
+                detail['int_dropped'].append(dict(fn=pi, pos=p, op=pop))
+                continue
+            int_keep.append(ST.result_id_of(cm.instructions[cidx][0], cm.instructions[cidx][1]))
+            detail['int_mapped'] += 1
+        if verbose:
+            print('  fn %d -> fn %d: parent %d instrs, child %d instrs, decorated %d '
+                  '(fp-seq %d/%d)'
+                  % (pi, ci, len(want), len(have), len(pat), len(pseq), len(cseq)))
+    fp_unique = sorted(set(keep))
+    detail['fp_keep'] = len(fp_unique)
+    detail['fp_duplicate_targets'] = len(keep) - len(fp_unique)
+    detail['parent_nc'] = len(ST.no_contraction_ids(pm))
+    detail['parent_fp_nc'] = _count_ops(pm, FP_OPS)
+    detail['int_keep'] = len(sorted(set(int_keep)))
+    detail['unmatched_parent_functions'] = [i for i in range(len(preg)) if i not in p2c]
+    return sorted(set(keep) | set(int_keep)), detail
+
+
+def _count_ops(module, opset):
+    nc = set(ST.no_contraction_ids(module))
+    out = {}
+    for op, o, _, _ in module.instructions:
+        rid = ST.result_id_of(op, o)
+        if rid in nc and op in opset:
+            out[str(op)] = out.get(str(op), 0) + 1
+    return out
+
+
+def rebuild(parent_spv, child_raw, out_path):
+    pm = ST.Module(parent_spv)
+    cm = ST.Module(child_raw)
+    keep, detail = map_nc(pm, cm)
+    if detail['unmapped']:
+        raise SystemExit('unmapped NoContraction sites: %s' % json.dumps(detail['unmapped'][:8]))
+    info = ST.set_no_contraction(cm, keep, Path(out_path))
+    got = ST.no_contraction_ids(ST.Module(out_path))
+    hist_p = _hist(pm)
+    hist_c = _hist(ST.Module(out_path))
+    detail.update(out_sha256=K.sha(out_path), nc_written=len(got),
+                  opcode_hist_parent=hist_p, opcode_hist_child=hist_c,
+                  opcode_hist_equal=hist_p == hist_c,
+                  added=len(info['added']), removed=len(info['removed']))
+    return detail
+
+
+def _hist(module):
+    nc = set(ST.no_contraction_ids(module))
+    out = {}
+    for op, ops, _, _ in module.instructions:
+        rid = ST.result_id_of(op, ops)
+        if rid in nc:
+            out[str(op)] = out.get(str(op), 0) + 1
+    return out
+
+
+def main():
+    which = sys.argv[1] if len(sys.argv) > 1 else 'parent'
+    build = CARD / 'build'
+    build.mkdir(parents=True, exist_ok=True)
+    if which == 'parent':
+        # parent chain: baseline source -> raw -> nc from the recorded decoration
+        # parent (f2-direct) with the full_norm region dropped  (RECIPES.json)
+        import build as B
+        raw = build / 'parent-raw.spv'
+        K.compile_glsl(B.BASE_SRC, raw, [B.HEADER])
+        res = B.f19_recipe(raw, build / 'parent-rebuild.spv')
+        res['raw_sha256'] = K.sha(raw)
+        res['baseline_sha256'] = K.sha(B.BASE_SPV)
+        res['rebuilt_matches_baseline'] = res['out_sha256'] == res['baseline_sha256']
+    else:
+        raw = build / 'candidate-raw.spv'
+        K.compile_glsl(CARD / 'candidate.comp', raw, [Path('@NR_WORKSPACE@/work/'
+                                                           'codex-astra-fp16-int8-audit-20261024/'
+                                                           'fullnet-continuous-20261027/cards/'
+                                                           'idt-identity-recipe/evidence/headers/'
+                                                           '7f1ad115cb46')])
+        res = rebuild(build / 'parent-rebuild.spv', raw, CARD / 'candidate.spv')
+        res['raw_sha256'] = K.sha(raw)
+        res['baseline_nc_sha256'] = K.sha(build / 'parent-rebuild.spv')
+    K.write_json(CARD / ('build-%s.json' % which), res)
+    print(json.dumps(res, indent=2))
+
+
+if __name__ == '__main__':
+    main()

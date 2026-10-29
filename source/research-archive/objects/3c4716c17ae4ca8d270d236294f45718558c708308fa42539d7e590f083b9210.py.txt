@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Merge the validated card deltas into one cumulative G3-derived plan.
+
+Each card plan is a G3 derivative with the same 287 passes; only a handful of PASS
+blocks change and new BUFFERs are appended at the tail.  Merging therefore means:
+  * for each card, take the PASS block (PASS + BIND... + PUSH) wherever it differs from G3;
+  * remap the card's tail BUFFER ids (>= the G3 buffer count) onto a running counter so two
+    cards never collide;
+  * append the remapped BUFFER lines; everything else stays byte-identical to G3.
+
+Cards are merged in a fixed order; a pass claimed by two cards is a hard error (the script
+refuses rather than silently overwriting).
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+W = Path(r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024")
+G3 = Path(r"@NR_WORKSPACE@/candidates/int8-coverage-v2-20261020/plan-g3-production.txt")
+
+CARDS = [
+    ("R03", W / "candidates/r03-ioport4/plan-r03-ioport4-g3.txt"),
+    ("R07", W / "candidates/r07-output-proj/plan-r07-c64-output-i8.txt"),
+    ("R08", W / "candidates/r08-c128-ffn/plan-r08-c128-ffn.txt"),
+    ("R09", W / "candidates/r09-r11-f3ds/plan-r09-f3ds.txt"),
+    ("C2", W / "candidates/c2-c32-regk32/plan-c2-regk32-g3.txt"),
+]
+
+
+def parse(path):
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    header = lines[0].split()
+    bufs, passes, rest = {}, {}, []
+    i = 1
+    buf_id = 0
+    ordinal = 0
+    while i < len(lines):
+        l = lines[i]
+        if l.startswith("BUFFER "):
+            bufs[buf_id] = l
+            buf_id += 1
+            i += 1
+            continue
+        if l.startswith("PASS "):
+            f = l.split()
+            nb = int(f[6])
+            block = lines[i:i + nb + 2]
+            passes[(f[2].strip('"'), ordinal)] = block
+            ordinal += 1
+            i += nb + 2
+            continue
+        rest.append(l)
+        i += 1
+    return header, bufs, passes, rest
+
+
+def main():
+    h, gbufs, gpasses, grest = parse(G3)
+    base_nbuf = len(gbufs)
+    merged_bufs = dict(gbufs)
+    merged_passes = dict(gpasses)
+    next_buf = base_nbuf
+    report = {"g3": {"path": str(G3), "sha256": hashlib.sha256(G3.read_bytes()).hexdigest(),
+                     "buffers": base_nbuf, "passes": len(gpasses)},
+              "cards": [], "collisions": []}
+    owner = {}
+    for card, plan in CARDS:
+        ch, cbufs, cpasses, crest = parse(plan)
+        assert len(cpasses) == len(gpasses), (card, len(cpasses), len(gpasses))
+        remap = {}
+        for bid in sorted(cbufs):
+            if bid >= base_nbuf:
+                remap[bid] = next_buf
+                next_buf += 1
+        changed = []
+        for key, block in cpasses.items():
+            if key not in gpasses:
+                raise SystemExit(f"pass {key} not in G3")
+            if block == gpasses[key]:
+                continue
+            if key in owner:
+                report["collisions"].append({"pass": key, "cards": [owner[key], card]})
+                continue
+            owner[key] = card
+            newblock = []
+            for ln in block:
+                if ln.startswith("BIND "):
+                    f = ln.split()
+                    rid = int(f[2])
+                    if rid in remap:
+                        f[2] = str(remap[rid])
+                    newblock.append(" ".join(f))
+                else:
+                    newblock.append(ln)
+            merged_passes[key] = newblock
+            changed.append({"pass": key[0], "ordinal": key[1],
+                            "spv": Path(block[0].split()[3].strip('"')).name,
+                            "shared": block[0].split()[5]})
+        for bid in sorted(remap):
+            merged_bufs[remap[bid]] = cbufs[bid]
+        report["cards"].append({"card": card, "plan": str(plan),
+                                "plan_sha256": hashlib.sha256(Path(plan).read_bytes()).hexdigest(),
+                                "changed_passes": changed,
+                                "added_buffers": {str(bid): cbufs[bid].split()[1].strip('"')
+                                                  for bid in sorted(remap)}})
+    out = [" ".join([h[0], h[1], str(len(merged_bufs)), str(len(merged_passes)), h[4]])]
+    for bid in sorted(merged_bufs):
+        out.append(merged_bufs[bid])
+    for key in sorted(merged_passes, key=lambda k: k[1]):
+        out.extend(merged_passes[key])
+    out.extend(grest)
+    dst = W / "candidates/cumulative-v1/plan-cumulative-v1.txt"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text("\n".join(out) + "\n", encoding="utf-8", newline="\n")
+    report["cumulative"] = {"path": str(dst),
+                            "sha256": hashlib.sha256(dst.read_bytes()).hexdigest(),
+                            "buffers": len(merged_bufs), "passes": len(merged_passes),
+                            "changed_passes_total": len(owner)}
+    (W / "candidates/cumulative-v1/MERGE.json").write_text(
+        json.dumps(report, indent=1, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    print(json.dumps({"buffers": len(merged_bufs), "passes": len(merged_passes),
+                      "changed": len(owner), "collisions": len(report["collisions"]),
+                      "plan_sha": report["cumulative"]["sha256"][:16]}, ensure_ascii=False))
+    for c in report["cards"]:
+        print(" ", c["card"], "changed", len(c["changed_passes"]), "added bufs", len(c["added_buffers"]))
+
+
+if __name__ == "__main__":
+    main()

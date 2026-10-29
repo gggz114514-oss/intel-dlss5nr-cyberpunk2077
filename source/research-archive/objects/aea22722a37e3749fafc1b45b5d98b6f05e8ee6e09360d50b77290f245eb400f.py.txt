@@ -1,0 +1,173 @@
+"""S01 C32 body4: E-channel range analysis + X/E joint static scale calibration.
+
+CPU only.  Errors are measured against a fixed float reference built from the same
+dequantised weights, so old/new differ only in the activation quantisers:
+
+  ref_Y = Wc_real @ a_h + seed                       (no E quantiser, f32)
+  old_Y = tap_c_old * (wc_old @ round(a_h*invE_old)) + seed
+  new_Y = tap_c_new * (wc_new @ round(a_h*invE_new)) + seed
+
+a_h is the kernel's own half SiLU output; the X path (per-channel inverse + folded
+expand weights) is byte-identical in both arms, so the X quantiser error is common
+and cancels in the old/new delta.  Calibration tiles and evaluation tiles are
+disjoint (same three frames), so the reported number is out-of-sample.
+"""
+import sys, json
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+OUT = Path(__file__).resolve().parent.parent
+FRAMES = [("34189", L.D / "dump-fp16"),
+          ("41444", L.D / "teacher-diagnostics/teacher-41444"),
+          ("43654", L.D / "teacher-diagnostics/teacher-43654")]
+SRC_PLAN = L.D / "c32-equalized-b4/local-b4.txt"     # X-equalised block-4 pack + SPV
+N_CAL, N_EVAL = 5000, 2000
+
+info = L.block_bindings(SRC_PLAN, ordinal=4)
+we, wc = L.load_w8(info["w8"])
+fsc_old = L.load_fsc(info["fsc"])
+wb = np.fromfile(info["wb"], dtype="<f2")
+rs = wb[info["rs_base"] + 8:info["rs_base"] + 40].astype(np.float16)
+sX = np.float32(fsc_old[0]); sE_old = np.float32(fsc_old[2])
+invX = fsc_old[L.FSC_INVX:L.FSC_INVX + 32].copy()
+tap_e = fsc_old[4:132].astype(np.float32)
+tap_c_old = fsc_old[132:164].astype(np.float32)
+sWe = tap_e / sX
+sWc_old = tap_c_old / sE_old
+Wc_real = wc.astype(np.float32) * sWc_old[:, None]
+invE_old = np.float32(fsc_old[L.FSC_INV_E])
+
+
+def tile_cols(seed, n):
+    rng = np.random.default_rng(seed)
+    tl = np.sort(rng.choice(168 * 96, size=n, replace=False))
+    TT, CC = np.meshgrid(tl, np.arange(16), indexing="ij")
+    return TT.ravel(), CC.ravel()
+
+
+def activation_codes(TT, CC, folder, invx):
+    x_flat = np.fromfile(folder / "dump_block3_out.bin", dtype="<f2")
+    x = L.gather(x_flat, TT, CC)
+    xq = L.code8_ch(x, invx)
+    acc = np.rint(we.astype(np.float64) @ xq.astype(np.float64)).astype(np.int32)
+    a_h = L.act_h(L.to_half(acc.astype(np.float32) * tap_e[:, None]))
+    seed = L.widen(L.to_half(x * rs[:, None]))
+    return a_h, seed
+
+
+# ------------------------------------------------------------------ calibrate
+cal = [tile_cols(20261029, N_CAL) for _ in FRAMES]
+ev = [tile_cols(777, N_EVAL) for _ in FRAMES]
+amax_E = np.zeros(128, np.float64)
+x_absmax = np.zeros(32, np.float64)
+e_absmax_frames = []
+for (tag, folder), (TT, CC) in zip(FRAMES, cal):
+    a_h, seed = activation_codes(TT, CC, folder, invX)
+    amax_E = np.maximum(amax_E, np.abs(a_h.astype(np.float32)).max(axis=1))
+    e_absmax_frames.append(float(np.abs(a_h.astype(np.float32)).max()))
+    x_flat = np.fromfile(folder / "dump_block3_out.bin", dtype="<f2")
+    x = L.gather(x_flat, TT, CC)
+    x_absmax = np.maximum(x_absmax, np.abs(x.astype(np.float32)).max(axis=1))
+    print(f"cal frame {tag}: E absmax={e_absmax_frames[-1]:.3f}")
+
+amax_ref = float(amax_E.max())
+D_E = np.exp2(np.rint(np.log2(np.maximum(amax_E, 1e-12) / amax_ref)))
+D_E = np.clip(D_E, 2.0 ** -10, 1.0)
+D_E[amax_E <= 0] = 1.0
+sE_g = float((amax_E / D_E).max() / 127.0)
+sE_new = (D_E * sE_g).astype(np.float32)
+invE_new = (1.0 / sE_new).astype(np.float32)
+Wp = Wc_real * sE_new[None, :]
+sWc_new = (np.abs(Wp).max(axis=1) / 127.0).astype(np.float32)
+wc_new = np.clip(np.rint(Wp / sWc_new[:, None]), -127, 127).astype(np.int16)
+tap_c_new = sWc_new.astype(np.float32)
+
+
+def fwd(a_h, seed, wcq, tapc, invE):
+    eq = L.code8_ch(a_h, invE)
+    sat = int(np.count_nonzero(np.abs(eq) >= 127))
+    acc = np.rint(wcq.astype(np.float64) @ eq.astype(np.float64)).astype(np.int32)
+    return acc.astype(np.float32) * tapc[:, None] + seed, eq, sat
+
+
+metrics = []
+for (tag, folder), (TT, CC), (TTc, CCc) in zip(FRAMES, ev, cal):
+    a_h, seed = activation_codes(TT, CC, folder, invX)
+    y_ref = Wc_real @ a_h.astype(np.float32) + seed
+    y_old, eq_old, sat_old = fwd(a_h, seed, wc, tap_c_old, invE_old)
+    y_new, eq_new, sat_new = fwd(a_h, seed, wc_new, tap_c_new, invE_new)
+    # per-frame per-channel exact scale, with the weights re-quantised for it
+    am_f = np.abs(a_h.astype(np.float32)).max(axis=1)
+    sE_f = (np.maximum(am_f, 1e-12) / 127.0).astype(np.float32)
+    Wp_f = Wc_real * sE_f[None, :]
+    sWc_f = (np.abs(Wp_f).max(axis=1) / 127.0).astype(np.float32)
+    wc_f = np.clip(np.rint(Wp_f / sWc_f[:, None]), -127, 127).astype(np.int16)
+    y_fc, _, sat_fc = fwd(a_h, seed, wc_f, sWc_f, (1.0 / sE_f).astype(np.float32))
+    # in-sample (calibration tiles) number for the same pack
+    a_hc, seedc = activation_codes(TTc, CCc, folder, invX)
+    y_refc = Wc_real @ a_hc.astype(np.float32) + seedc
+    y_newc, _, sat_newc = fwd(a_hc, seedc, wc_new, tap_c_new, invE_new)
+    m = dict(frame=tag, eval_columns=int(TT.size),
+             old_rel_l2=L.rel_l2(y_old, y_ref), new_rel_l2=L.rel_l2(y_new, y_ref),
+             per_frame_exact_scale_rel_l2=L.rel_l2(y_fc, y_ref),
+             old_saturated_codes=sat_old, new_saturated_codes=sat_new,
+             per_frame_exact_saturated_codes=sat_fc,
+             codes=int(eq_old.size),
+             rms_y=float(np.sqrt(np.mean(y_ref ** 2))),
+             in_sample_new_rel_l2=L.rel_l2(y_newc, y_refc),
+             in_sample_saturated=sat_newc)
+    metrics.append(m)
+    print(f"eval frame {tag}: old={m['old_rel_l2']:.6f} new={m['new_rel_l2']:.6f} "
+          f"exact-scale={m['per_frame_exact_scale_rel_l2']:.6f} sat={sat_old}/{sat_new} "
+          f"in-sample={m['in_sample_new_rel_l2']:.6f}")
+
+sens_old = (float(sE_old) * np.linalg.norm(Wc_real, axis=0))
+sens_new = (sE_new * np.linalg.norm(Wc_real, axis=0))
+summary = dict(
+    scope="C32 block4 FFN contract (expand -> half SiLU -> contract + original half residual); "
+          "CPU only, GPU_VERIFICATION=NOT_RUN",
+    metric_definition="relL2(candidate_Y, ref_Y) with ref_Y = Wc_real@a_h + seed (no E quantiser). "
+                      "The X path is identical in both arms, so this isolates the E quantiser. "
+                      "It is NOT the block-exit error: this dispatch also runs QKV/QK/PV/WO.",
+    frames=[t for t, _ in FRAMES],
+    calibration_tiles_per_frame=N_CAL, evaluation_tiles_per_frame=N_EVAL,
+    eval_tiles_disjoint_from_calibration=True,
+    x_channel_absmax=x_absmax.tolist(), x_channel_ratio=float(x_absmax.max() / x_absmax.min()),
+    e_channel_absmax_3frames=amax_E.tolist(),
+    e_channel_ratio=float(amax_E.max() / max(amax_E.min(), 1e-12)),
+    e_global_absmax=amax_ref,
+    e_absmax_per_cal_frame=e_absmax_frames,
+    old_sE=float(sE_old), new_sE_global=float(sE_g),
+    new_sE_range=[float(sE_new.min()), float(sE_new.max())],
+    diagonal_D_E=D_E.tolist(),
+    invE_new=invE_new.tolist(),
+    old_sWc=[float(v) for v in sWc_old], new_sWc=[float(v) for v in sWc_new],
+    contract_sensitivity_old=sens_old.tolist(), contract_sensitivity_new=sens_new.tolist(),
+    metrics=metrics,
+)
+(OUT / "CPU" / "calibration_e_b4.json").write_text(json.dumps(summary, indent=2))
+
+tail = L.load_w8_tail(info["w8"])
+new_w8 = L.pack_w8(we, wc_new)
+new_w8[32768:49152] = tail
+fsc_new = fsc_old.copy()
+fsc_new[2] = np.float32(sE_g); fsc_new[3] = np.float32(1.0 / sE_g)
+fsc_new[132:164] = tap_c_new
+fsc_new = np.concatenate([fsc_new[:324], invE_new.astype(np.float32)]).astype("<f4")
+PACK = OUT / "PACK"; PACK.mkdir(exist_ok=True)
+new_w8.astype(np.int8).tofile(PACK / "c32_block4_xe_weights.i8.bin")
+fsc_new.tofile(PACK / "c32_block4_xe_scales.f32.bin")
+(OUT / "CPU" / "pack_meta.json").write_text(json.dumps({
+    "weights_bytes": int(new_w8.size), "scales_bytes": int(fsc_new.size * 4),
+    "scales_entries": int(fsc_new.size),
+    "weights_layout": "0..16383 expand tiles (g*1024 + k*32 + m; 24 of every 32 bytes unused), "
+                      "16384..32767 contract tiles ((g*4+step)*1024 + (e%32)*32 + m), "
+                      "32768..49151 QKV/WO copied verbatim",
+    "scales_layout": "0 sX, 1 invX, 2 sE_global, 3 1/sE_global, 4..131 expand taps (unchanged), "
+                     "132..163 contract taps = sWc' (E diagonal folded into the tile bytes), "
+                     "164..291 QKV/WO taps (unchanged), 292..323 per-input-channel inverse, "
+                     "324..451 per-E-channel inverse"}, indent=2))
+print("pack weights", new_w8.size, "scales", fsc_new.nbytes)

@@ -1,0 +1,209 @@
+"""S08 CPU audit of ViT block31 FFN (expand -> cubic GELU -> contract).
+
+Reads ONLY (never writes outside the S08 dir):
+  * INT8 pack actually named by combo-34189.txt (v1 pack, sha 9166f9c8...)
+  * FP16 source weights  .../vit/block31/vit_weights.fp16.bin (sha 174bf517...)
+  * FP16 teacher dumps   dump_block30_out.bin / dump_vit_block31_{A,Y}.bin
+
+Reproduces, element-wise:
+  FP16 path : E = half(X @ WE^T); A = vit_cubic(E); Y = half(fma(gain, X, A @ WC^T))
+  INT8 path : qX = rne(X*ws[8]); E = half(qX @ WEq^T * ew); A = vit_cubic(E);
+              qA = rne(A*ws[9]); Y = half(fma(gain, X, qA @ WCq^T * ac))
+and reports relative L2 of each edge against the FP16 teacher.
+
+All arithmetic follows the sealed shader semantics:
+  * products of two half values are exact in fp32; int32 accumulate is exact
+  * int32 -> float32 conversion rounds once (MF8(acc))
+  * every explicit `float16_t(...)` is a round-to-nearest-even narrowing
+  * `precise float` multiplies are single-rounded fp32
+Only the fp32 accumulation ORDER differs from the GPU (documented in the report).
+"""
+from pathlib import Path
+import hashlib
+import json
+import sys
+
+import numpy as np
+
+R = Path(r"@NR_WORKSPACE@")
+W = R / "work/dsh-fullnet-static-20261029/S08-vit"
+Q = R / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+
+PACK = R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-v1/pack/vit_block31_weights.int8.bin"
+FP16W = R / "src/project/artifacts/parallel-port-20261013/vit/block31/vit_weights.fp16.bin"
+PLAN = D / "c64-family-static/combo-34189.txt"
+
+M_ROWS = 288          # live tokens (pc.p0.x)
+K_X = 1024
+N_E = 4096
+N_Y = 1024
+
+# pack byte map (pack_vit_block31.py, verified against the on-disk bytes below)
+WE8, WC8, WO8 = 0, 4194304, 8388608
+WS_OFF, EW_OFF, AC_OFF, AP_OFF, WG_OFF = 9437184, 9437248, 9453632, 9457728, 9461824
+WQKV8_OFF, AQ_OFF = 9465920, 12611648
+GAIN_BYTE = 25165824
+W_HALF = dict(WE=(0, 4096, 1024), WC=(4194304, 1024, 4096), WO=(11534336, 1024, 1024))
+GAIN_HALF_OFF = 12582912   # pc.p2.x
+
+
+def sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def sha_file(p):
+    return sha(Path(p).read_bytes())
+
+
+def idx_half(n, k, N, K):
+    return (n // 32) * (K // 16) * 512 + (k // 16) * 512 + (n % 32) * 16 + (k % 16)
+
+
+def idx_int8(n, k, N, K):
+    return (n // 32) * (K // 32) * 1024 + (k // 32) * 1024 + (n % 32) * 32 + (k % 32)
+
+
+def unpack_half(flat, off, N, K):
+    n = np.arange(N)[:, None]
+    k = np.arange(K)[None, :]
+    return flat[off + idx_half(n, k, N, K)]
+
+
+def unpack_int8(flat, off, N, K):
+    n = np.arange(N)[:, None]
+    k = np.arange(K)[None, :]
+    return flat[off + idx_int8(n, k, N, K)]
+
+
+def half(x):
+    return np.asarray(x, np.float32).astype(np.float16).astype(np.float32)
+
+
+def cubic(z):
+    """vit_cubic in half precision, step by step (vit_common.glsl:123-128)."""
+    z = np.float16(z)
+    t = np.clip(z, np.float16(-4.0), np.float16(4.0)).astype(np.float32)
+    u = half(np.float32(-0.055908203125) * np.abs(t) + np.float32(0.447265625))   # fma, 1 rounding
+    v = half(t * u + np.float32(0.89453125))                                      # fma
+    return half(z.astype(np.float32) * v)
+
+
+def code(x, inv):
+    """precise float c = v*inv; clamp(roundEven(c), -127, 127)"""
+    c = np.asarray(x, np.float32) * np.float32(inv)
+    return np.clip(np.rint(c.astype(np.float32)), -127, 127).astype(np.int32)
+
+
+def rel(a, b):
+    a = np.asarray(a, np.float64)
+    b = np.asarray(b, np.float64)
+    return float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-30))
+
+
+def main():
+    out = {}
+    pack = PACK.read_bytes()
+    fp16 = FP16W.read_bytes()
+    out["inputs"] = {
+        "pack": dict(path=str(PACK), bytes=len(pack), sha256=sha(pack)),
+        "fp16_weights": dict(path=str(FP16W), bytes=len(fp16), sha256=sha(fp16)),
+        "plan": dict(path=str(PLAN), sha256=sha_file(PLAN)),
+        "pack_is_fp16_source": bool(pack == fp16),
+    }
+    assert not out["inputs"]["pack_is_fp16_source"], "plan pack must be a real int8 pack"
+
+    p8 = np.frombuffer(pack, dtype=np.int8)
+    ws = np.frombuffer(pack[WS_OFF:WS_OFF + 64], dtype="<f4").astype(np.float64)
+    ew = np.frombuffer(pack[EW_OFF:EW_OFF + 4096 * 4], dtype="<f4").astype(np.float32)
+    ac = np.frombuffer(pack[AC_OFF:AC_OFF + 1024 * 4], dtype="<f4").astype(np.float32)
+    wg = np.frombuffer(pack[WG_OFF:WG_OFF + 4096], dtype="<f2").astype(np.float32)
+
+    flat16 = np.frombuffer(fp16, dtype="<f2")
+    WE16 = unpack_half(flat16, *W_HALF["WE"]).astype(np.float32)
+    WC16 = unpack_half(flat16, *W_HALF["WC"]).astype(np.float32)
+    gain16 = flat16[GAIN_HALF_OFF:GAIN_HALF_OFF + 1024].astype(np.float32)
+
+    # ---- pack self-consistency (independent re-derivation from the FP16 file) ----
+    sWE = np.where(np.abs(WE16).max(axis=1) > 0, np.abs(WE16).max(axis=1) / np.float32(127.0), 1.0)
+    sWC = np.where(np.abs(WC16).max(axis=1) > 0, np.abs(WC16).max(axis=1) / np.float32(127.0), 1.0)
+    qWE = np.clip(np.rint(WE16 / sWE[:, None]), -127, 127).astype(np.int32)
+    qWC = np.clip(np.rint(WC16 / sWC[:, None]), -127, 127).astype(np.int32)
+    WEq_disk = unpack_int8(p8, WE8, 4096, 1024).astype(np.int32)
+    WCq_disk = unpack_int8(p8, WC8, 1024, 4096).astype(np.int32)
+    sX, sA = np.float32(ws[3]), np.float32(ws[4])
+    out["pack_consistency"] = {
+        "WE_codes_equal_recomputed": bool(np.array_equal(WEq_disk, qWE)),
+        "WC_codes_equal_recomputed": bool(np.array_equal(WCq_disk, qWC)),
+        "max_abs_ew_err_vs_sX_sWE": float(np.max(np.abs(ew - sX * sWE))),
+        "max_abs_ac_err_vs_sA_sWC": float(np.max(np.abs(ac - sA * sWC))),
+        "gain_equal_fp16_copy": bool(np.array_equal(wg[:1024], gain16)),
+        "ws": {f"ws[{i}]": float(ws[i]) for i in range(16)},
+        "ws_direction": "ws[8..10]=127/absmax(inverse step, quantiser multiplier); "
+                        "ws[3..5]=absmax/127(step); ws[11]=sY; ws[12]=127/absmax(Y)",
+    }
+
+    # ---- activation edges from the FP16 teacher dumps (common FP16 input) ----
+    teachers = [D / "dump-fp16",
+                D / "teacher-diagnostics/teacher-41444",
+                D / "teacher-diagnostics/teacher-43654"]
+    out["teachers"] = []
+    per_teacher = {}
+    for td in teachers:
+        x_raw = np.fromfile(td / "dump_block30_out.bin", dtype="<f2")
+        X = x_raw[:M_ROWS * K_X].reshape(M_ROWS, K_X).astype(np.float32)
+        A_t = np.fromfile(td / "dump_vit_block31_A.bin", dtype="<f2")[:M_ROWS * N_E].reshape(M_ROWS, N_E).astype(np.float32)
+        Y_t = np.fromfile(td / "dump_vit_block31_Y.bin", dtype="<f2")[:M_ROWS * N_Y].reshape(M_ROWS, N_Y).astype(np.float32)
+
+        # ---------- FP16 reference path (produces the dumps) ----------
+        E_ref = half(X @ WE16.T)
+        A_ref = cubic(E_ref)
+        Y_ref = half(np.float64(gain16[None, :]) * X.astype(np.float64) + (A_ref @ WC16.T).astype(np.float64)).astype(np.float32)
+
+        # ---------- INT8 path with the pack the plan actually binds ----------
+        invX = np.float32(ws[8])
+        qX = code(X, invX)
+        E8 = half(qX.astype(np.float32) @ WEq_disk.astype(np.float32).T * ew[None, :])
+        A8 = cubic(E8)
+        qA = code(A8, np.float32(ws[9]))
+        Y8 = half(np.float64(gain16[None, :]) * X.astype(np.float64) +
+                  (qA.astype(np.float32) @ WCq_disk.astype(np.float32).T * ac[None, :]).astype(np.float64)).astype(np.float32)
+
+        # ---------- requantisation of the Y edge (documented, not measured here) ----------
+        d = dict(
+            teacher=str(td),
+            x_absmax=float(np.abs(X).max()),
+            x_saturation_frac=float(np.mean(np.abs(X * invX) > 127.0)),
+            a_teacher_absmax=float(np.abs(A_t).max()),
+            y_teacher_absmax=float(np.abs(Y_t).max()),
+            fp16_ref_vs_dump=dict(A=rel(A_ref, A_t), Y=rel(Y_ref, Y_t),
+                                  A_maxabs=float(np.abs(A_ref - A_t).max()),
+                                  Y_maxabs=float(np.abs(Y_ref - Y_t).max())),
+            int8_vs_fp16_teacher=dict(
+                A=rel(A8, A_t), Y=rel(Y8, Y_t),
+                Y_maxabs=float(np.abs(Y8 - Y_t).max()),
+                E=rel(E8, A_t)),
+            int8_vs_fp16_ref=dict(A=rel(A8, A_ref), Y=rel(Y8, Y_ref)),
+            saturation=dict(
+                qX=int(np.count_nonzero(np.abs(X * invX) > 127.0)),
+                qX_frac=float(np.mean(np.abs(X * invX) > 127.0)),
+                qA=int(np.count_nonzero(np.abs(A8 * np.float32(ws[9])) > 127.0)),
+                qA_frac=float(np.mean(np.abs(A8 * np.float32(ws[9])) > 127.0)),
+                qA_gt120=int(np.count_nonzero(np.abs(A8 * np.float32(ws[9])) > 120.0)),
+            ),
+        )
+        per_teacher[str(td.name)] = dict(X=X, A_t=A_t, Y_t=Y_t, A_ref=A_ref, Y_ref=Y_ref, A8=A8, Y8=Y8)
+        out["teachers"].append(d)
+        print(td.name, "fp16ref A/Y relL2", round(d["fp16_ref_vs_dump"]["A"], 6), round(d["fp16_ref_vs_dump"]["Y"], 6),
+              "| int8 A/Y relL2", round(d["int8_vs_fp16_teacher"]["A"], 6), round(d["int8_vs_fp16_teacher"]["Y"], 6), flush=True)
+
+    (W / "AUDIT/audit-b31-ffn.json").write_text(json.dumps(out, indent=1) + "\n", encoding="utf-8")
+    np.savez_compressed(W / "AUDIT/b31-tensors.npz",
+                        **{f"{k}__{f}": v[f] for k, v in per_teacher.items()
+                           for f in ("X", "A_t", "Y_t", "A_ref", "Y_ref", "A8", "Y8")})
+    print(json.dumps(out["pack_consistency"], indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

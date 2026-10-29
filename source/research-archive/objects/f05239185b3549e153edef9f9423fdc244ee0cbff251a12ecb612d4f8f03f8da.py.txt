@@ -1,0 +1,280 @@
+"""Minimal SPIR-V scanner: types, cooperative-matrix inventory, integer-dot inventory.
+
+Decodes only what the ledger needs:
+ * scalar/vector/cooperative-matrix types and their component types
+ * every OpCooperativeMatrixMulAdd(.*) with the resolved A/B/accumulator dtype
+ * float constants (to spot in-kernel quantizers such as *127 or /127)
+ * GLSL.std.450 ext-inst tallies (FAbs/FMin/FMax/Fma) -- the amax machinery
+ * descriptor variables with their binding numbers
+
+Every instruction carries its own word count, so unknown opcodes are skipped safely.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import struct
+import sys
+from pathlib import Path
+
+OPNAME = {
+    5: "OpName", 6: "OpMemberName", 7: "OpString", 10: "OpExtension", 11: "OpExtInstImport",
+    12: "OpExtInst", 19: "OpTypeVoid", 20: "OpTypeBool", 21: "OpTypeInt", 22: "OpTypeFloat",
+    23: "OpTypeVector", 24: "OpTypeMatrix", 25: "OpTypeImage", 26: "OpTypeSampler",
+    27: "OpTypeSampledImage", 28: "OpTypeArray", 29: "OpTypeRuntimeArray", 30: "OpTypeStruct",
+    32: "OpTypePointer", 33: "OpTypeFunction",
+    41: "OpConstantTrue", 42: "OpConstantFalse", 43: "OpConstant", 44: "OpConstantComposite",
+    46: "OpConstantNull", 48: "OpSpecConstantTrue", 49: "OpSpecConstantFalse",
+    50: "OpSpecConstant", 51: "OpSpecConstantComposite", 52: "OpSpecConstantOp",
+    54: "OpFunction", 57: "OpFunctionCall", 59: "OpVariable", 61: "OpLoad", 62: "OpStore",
+    65: "OpAccessChain", 66: "OpInBoundsAccessChain", 67: "OpPtrAccessChain",
+    71: "OpDecorate", 72: "OpMemberDecorate", 248: "OpLabel",
+    133: "OpFMul", 136: "OpFDiv", 129: "OpFAdd", 131: "OpFSub",
+    190: "OpFOrdEqual", 196: "OpFOrdGreaterThan", 200: "OpFOrdGreaterThanEqual",
+    194: "OpFOrdLessThan",
+    109: "OpConvertFToS", 110: "OpConvertSToF", 111: "OpConvertFToU", 112: "OpConvertUToF",
+    113: "OpUConvert", 114: "OpSConvert", 115: "OpFConvert",
+    4450: "OpSDot", 4451: "OpUDot", 4452: "OpSUDot",
+    4456: "OpTypeCooperativeMatrixKHR", 4457: "OpCooperativeMatrixLoadKHR",
+    4458: "OpCooperativeMatrixStoreKHR", 4459: "OpCooperativeMatrixMulAddKHR",
+    4460: "OpCooperativeMatrixLengthKHR",
+    5356: "OpCooperativeMatrixLoadNV", 5357: "OpCooperativeMatrixStoreNV",
+    5358: "OpTypeCooperativeMatrixNV", 5359: "OpCooperativeMatrixMulAddNV",
+}
+DECOR = {2: "Block", 6: "ArrayStride", 33: "Binding", 34: "DescriptorSet", 35: "Offset",
+         44: "NoContraction", 49: "NonWritable", 50: "NonReadable", 52: "Uniform",
+         61: "SpecId", 62: "BuiltIn"}
+SC = {0: "UniformConstant", 1: "Input", 2: "Uniform", 3: "Output", 4: "Workgroup",
+      5: "CrossWorkgroup", 6: "Private", 7: "Function", 8: "Generic", 9: "PushConstant",
+      10: "AtomicCounter", 11: "Image", 12: "StorageBuffer"}
+# GLSL.std.450 literals
+G = {1: "Round", 2: "RoundEven", 3: "Trunc", 4: "FAbs", 5: "SAbs", 6: "FSign", 8: "Floor",
+     9: "Ceil", 10: "Fract", 13: "Sin", 14: "Cos", 15: "Tan", 26: "Pow", 27: "Exp", 28: "Log",
+     29: "Exp2", 30: "Log2", 31: "Sqrt", 32: "InverseSqrt", 33: "Determinant", 35: "FMin",
+     37: "FMin", 38: "FMax", 39: "FClamp", 40: "FMix", 41: "FStep", 42: "FSmoothStep",
+     43: "Fma", 50: "FMax3", 79: "NMin", 80: "NMax", 81: "NClamp"}
+# opcodes that do NOT carry (result type, result id) as the first two operands
+NO_RESULT = {5, 6, 7, 10, 11, 71, 72, 73, 74, 248, 249, 250, 251, 252, 253, 254, 62, 63,
+             56, 55}
+
+
+def scan(path: Path) -> dict:
+    data = path.read_bytes()
+    n = len(data) // 4
+    words = struct.unpack("<%dI" % n, data[: n * 4])
+    if not words or words[0] != 0x07230203:
+        raise SystemExit(f"{path}: not a SPIR-V module")
+    version = f"{words[1] >> 16}.{(words[1] >> 8) & 0xFF}"
+    i = 5
+    names: dict[int, str] = {}
+    types_int: dict[int, tuple[int, bool]] = {}
+    types_float: dict[int, int] = {}
+    types_struct: dict[int, list[int]] = {}
+    types_ptr: dict[int, tuple[int, int]] = {}
+    types_coop: dict[int, dict] = {}
+    const_ints: dict[int, int] = {}
+    const_floats: dict[int, float] = {}
+    decorations: dict[int, dict] = {}
+    variables: dict[int, tuple[int, int]] = {}
+    value_type: dict[int, int] = {}
+    muladds: list[dict] = []
+    dots: list[dict] = []
+    chain_base: dict[int, int] = {}
+    written_ids: set[int] = set()
+    ext: dict[str, int] = {}
+    counts: dict[str, int] = {}
+    while i < n:
+        w = words[i]
+        wc = w >> 16
+        op = w & 0xFFFF
+        if wc == 0:
+            break
+        ops = words[i + 1 : i + wc]
+        counts[op] = counts.get(op, 0) + 1
+        if op == 5:
+            raw = struct.pack("<%dI" % len(ops[1:]), *ops[1:])
+            names[ops[0]] = raw.split(b"\x00")[0].decode("utf-8", "replace")
+        elif op == 11:
+            raw = struct.pack("<%dI" % len(ops[1:]), *ops[1:])
+            names.setdefault(-2, "")
+        elif op in (21, 22, 23, 24, 28, 29, 30, 32, 33):
+            if op == 21:
+                types_int[ops[0]] = (ops[1], bool(ops[2]))
+            elif op == 22:
+                types_float[ops[0]] = ops[1]
+            elif op == 30:
+                types_struct[ops[0]] = list(ops[1:])
+            elif op == 32:
+                types_ptr[ops[0]] = (ops[1], ops[2])  # (storage class, pointee type)
+            value_type[ops[0]] = -1  # type ids are not values
+        elif op in (5358, 4456):
+            types_coop[ops[0]] = {"comp": ops[1], "scope": ops[2], "rows": ops[3], "cols": ops[4]}
+        elif op == 43:
+            vtype, vid = ops[0], ops[1]
+            if vtype in types_int:
+                width = types_int[vtype][0]
+                val = ops[2]
+                if width == 32 and not types_int[vtype][1] and ops[2] >= 1 << 31:
+                    val = ops[2] - (1 << 32)
+                const_ints[vid] = val
+            elif vtype in types_float and types_float[vtype] == 32:
+                const_floats[vid] = struct.unpack("<f", struct.pack("<I", ops[2]))[0]
+            elif vtype in types_float and types_float[vtype] == 16:
+                const_floats[vid] = struct.unpack("<e", struct.pack("<H", ops[2] & 0xFFFF))[0]
+            value_type[vid] = vtype
+        elif op == 71:
+            d = decorations.setdefault(ops[0], {})
+            d[DECOR.get(ops[1], str(ops[1]))] = ops[2] if len(ops) > 2 else True
+        elif op in (65, 66, 67):
+            chain_base[ops[1]] = ops[2]
+            value_type[ops[1]] = ops[0]
+        elif op == 62:
+            ptr = ops[0]
+            for _ in range(8):
+                if ptr in chain_base:
+                    ptr = chain_base[ptr]
+                else:
+                    break
+            written_ids.add(ptr)
+        elif op == 59:
+            variables[ops[1]] = (ops[0], ops[2])
+            value_type[ops[1]] = ops[0]
+        elif op in (4458, 5357):
+            ptr = ops[0]
+            for _ in range(8):
+                if ptr in chain_base:
+                    ptr = chain_base[ptr]
+                else:
+                    break
+            written_ids.add(ptr)
+            value_type[ops[1] if len(ops) > 1 else 0] = 0
+        elif op in (5359, 4459):
+            muladds.append({"rtype": ops[0], "a": ops[2], "b": ops[3], "c": ops[4]})
+        elif op in (4450, 4451, 4452):
+            dots.append({"rtype": ops[0], "a": ops[1], "b": ops[2]})
+        elif op == 12:
+            lit = ops[3]
+            ext[G.get(lit, f"#{lit}")] = ext.get(G.get(lit, f"#{lit}"), 0) + 1
+            if len(ops) > 1:
+                value_type[ops[1]] = ops[0]
+        else:
+            if op not in NO_RESULT and len(ops) >= 2:
+                value_type[ops[1]] = ops[0]
+        i += wc
+
+    def resolve(tid):
+        """Follow pointer types down to the stored type (access chains yield pointers)."""
+        depth = 0
+        while tid in types_ptr and depth < 6:
+            tid = types_ptr[tid][1]
+            depth += 1
+        return tid
+
+    def comp_of(tid):
+        if tid is None or tid < 0:
+            return None
+        tid = resolve(tid)
+        c = types_coop.get(tid)
+        if not c:
+            return None
+        ct = c["comp"]
+        if ct in types_int:
+            w, s = types_int[ct]
+            return {"kind": "int", "bits": w, "signed": s}
+        if ct in types_float:
+            return {"kind": "float", "bits": types_float[ct]}
+        return {"kind": "unknown", "type_id": ct}
+
+    def coop_const(tid, key):
+        if tid is None or tid < 0:
+            return None
+        t = types_coop.get(resolve(tid))
+        if not t:
+            return None
+        return const_ints.get(t[key])
+
+    mma = []
+    for m in muladds:
+        at = value_type.get(m["a"], -1)
+        bt = value_type.get(m["b"], -1)
+        mma.append({
+            "dtype": comp_of(m["rtype"]),
+            "a": comp_of(at) if at >= 0 else None,
+            "b": comp_of(bt) if bt >= 0 else None,
+            "acc": comp_of(value_type.get(m["c"], -1)),
+            "M": coop_const(m["rtype"], "rows"), "N": coop_const(m["rtype"], "cols"),
+            "a_rows": coop_const(at, "rows"), "a_cols": coop_const(at, "cols"),
+            "b_rows": coop_const(bt, "rows"), "b_cols": coop_const(bt, "cols"),
+        })
+
+    def cls(m):
+        a = m["a"]
+        if a and a["kind"] == "float" and a["bits"] == 16:
+            return "fp16"
+        if a and a["kind"] == "int" and a["bits"] == 8:
+            return "int8"
+        if a and a["kind"] == "int" and a["bits"] == 4:
+            return "int4"
+        return "other"
+
+    classes = [cls(m) for m in mma]
+    dot_classes = []
+    for d in dots:
+        at = value_type.get(d["a"], -1)
+        if at in types_int:
+            dot_classes.append(("int", types_int[at][0]))
+        elif at in types_float:
+            dot_classes.append(("float", types_float[at]))
+        else:
+            dot_classes.append(("other", None))
+    interface = []
+    for vid, (vtype, sc) in variables.items():
+        deco = decorations.get(vid, {})
+        if sc not in (0, 2, 12, 9):
+            continue
+        ptr = types_ptr.get(vtype)
+        interface.append({
+            "id": vid, "name": names.get(vid), "storage": SC.get(sc, str(sc)),
+            "set": deco.get("DescriptorSet"), "binding": deco.get("Binding"),
+            "pointee": names.get(ptr[1]) if ptr else None,
+            "array_stride": deco.get("ArrayStride"),
+            "non_writable": deco.get("NonWritable") is True,
+            "written_by_kernel": vid in written_ids,
+        })
+    fl = sorted(set(round(v, 8) for v in const_floats.values()))
+    return {
+        "path": str(path).replace("\\", "/"),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "bytes": len(data),
+        "version": version,
+        "muladd_count": len(mma),
+        "mma_fp16": classes.count("fp16"),
+        "mma_int8": classes.count("int8"),
+        "mma_other": classes.count("other"),
+        "mma_shapes": sorted({(m["a_rows"], m["a_cols"], m["M"], m["N"]) for m in mma},
+                             key=lambda t: tuple(-1 if x is None else x for x in t)),
+        "mma_detail": mma,
+        "int_dots": len(dots),
+        "dot_classes": dot_classes[:12],
+        "float_widths": sorted(set(types_float.values())),
+        "int_widths": sorted({(w, s) for (w, s) in types_int.values()}),
+        "ext_inst": dict(sorted(ext.items(), key=lambda kv: -kv[1])),
+        "float_constants": fl[:48],
+        "has_float_127": any(abs(x - 127.0) < 1e-3 for x in fl),
+        "has_float_inv127": any(abs(x - 1.0 / 127.0) < 1e-7 for x in fl),
+        "interface": interface[:26],
+        "interface_count": len(interface),
+        "opcounts_f64": counts.get(133, 0),
+        "function_names": [names.get(k) for k in names if k > 0 and names[k] and k in ()][:4],
+    }
+
+
+if __name__ == "__main__":
+    out = {}
+    for arg in sys.argv[1:]:
+        p = Path(arg)
+        try:
+            out[str(p).replace("\\", "/")] = scan(p)
+        except Exception as e:  # noqa: BLE001
+            out[str(p).replace("\\", "/")] = {"error": f"{type(e).__name__}: {e}"}
+    print(json.dumps(out, indent=1, ensure_ascii=False))

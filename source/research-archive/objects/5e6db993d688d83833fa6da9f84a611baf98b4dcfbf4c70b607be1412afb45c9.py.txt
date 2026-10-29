@@ -1,0 +1,377 @@
+"""R09 segment-local numerics (CPU only, numpy): what the INT8-WO switch does to
+the values that the pool reads, and what that does to the pooled mean codes.
+
+No GPU is used.  This is a *segment-local* arithmetic reference, not a gate and
+not a frame verdict.
+
+Frame: the only captured C64 frame in this workspace
+  candidates/amd-map-20261015/s3-c64-output/gpu-pending/fullgrid/{T,Y,image_out}.bin
+1065+ windows x 64 tokens x 64 channels from the deployed FP16 C64 module of
+block 6.  The R09 pass (f3c64_body_ds) runs on block 8 and **no block-8 capture
+exists**, so:
+
+  A  provenance  replay the C64 WO arm (f16 WO layout + ars residual scale +
+                 image addressing) against the captured image_out.  A is a
+                 decode proof of the WO/seed/addressing formulas, run on the
+                 frame that does exist.
+  B  exactness   int32 accumulation == int64 accumulation.
+  C  WO arm      FP16 arm vs INT8 arm on the *same* tiles: this is exactly the
+                 `nrf_pair` value the pooling tree consumes, so C measures the
+                 change of the pool *input*.
+  D  pool        the module's own pooling tree (half adds, *0.25) + the unique
+                 post-pool quantisation (entry_sc[4], roundEven, clamp) applied
+                 to both arms -> the 16x64 `nrf_mean` int8 tile.  D is the
+                 answer to "does the pooled value change".
+  E  DS          the deployed K32 INT8 DS projection over both mean tiles
+                 (deployed pack, M8COL8 A layout, per-channel entry_sc) -> the
+                 128-channel output code delta, i.e. the "existing DS consumer"
+                 re-check.
+
+usage: python tools/oracle.py
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+R = Path("@NR_WORKSPACE@")
+CARD = R / "work/dsh-xmx-handoff-validation-20261024/candidates/r09-r11-f3ds"
+CAP = R / "candidates/amd-map-20261015/s3-c64-output/gpu-pending/fullgrid"
+PACK6 = R / "candidates/amd-map-20261015/round4-integrated/candidate/packs/swin_6_weights.fp16.bin"
+PACK8 = R / "candidates/amd-map-20261015/round4-integrated/candidate/packs/swin_8_weights.fp16.bin"
+CHAIN_W = R / "candidates/codex-sol-int8-pilot-20261018/v4/weights-C.i8.bin"
+CHAIN_S = R / "candidates/codex-sol-int8-pilot-20261018/v4/scales-current102-fixed-diagnostic.f32.bin"
+
+# block-6 output-projection push words (the capture's own pass)
+P0_CAP = (84, 48, -1, -1)
+P1_CAP = (43, 25)
+# f3c64_body_ds (G3 PASS 8) push words: p0, p5, p6, p7
+P0_R09 = (84, 48, 0, -1)
+P1_R09 = (42, 25)                      # grid_x, grid_y of f3c64_body_ds
+P5_R09 = (8192, 168, 96, 128)          # scalar, OW, OH, N
+P6_R09 = (64, 53632, 0, 1)             # K, whalf(base), obase, profile
+P7_R09 = (168, 96)
+WO_HALF = 0
+ARS_HALF = 12288
+DS_BASE = 98304                        # nrf_w DS weight base (half elements -> bytes/1)
+N = K = 64
+N_DS = 128
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def f16_index(n, k):
+    return (n // 16) * 1024 + (k // 16) * 256 + (n % 16) * 16 + (k % 16)
+
+
+def i8_index(n, k):
+    return (n // 16) * (K // 32) * 512 + (k // 32) * 512 + (n % 16) * 32 + (k % 32)
+
+
+def decode_wo_f16(pack, base=WO_HALF):
+    w = np.empty((N, K), np.float16)
+    for n in range(N):
+        for k in range(K):
+            w[n, k] = pack[base + f16_index(n, k)]
+    return w
+
+
+def img_index(wx, wy):
+    m = np.arange(64, dtype=np.int64)[:, None]
+    n = np.arange(N, dtype=np.int64)[None, :]
+    q, s = m >> 4, m & 15
+    tx = 2 * wx + P0_CAP[2] + (q & 1)
+    ty = 2 * wy + P0_CAP[3] + (q >> 1)
+    oob = (tx < 0) | (ty < 0) | (tx >= P0_CAP[0]) | (ty >= P0_CAP[1])
+    stx = np.clip(tx, 0, P0_CAP[0] - 1)
+    sty = np.clip(ty, 0, P0_CAP[1] - 1)
+    idx = (((sty * P0_CAP[0] + stx) * 4 + n // 16) * 256 + s * 16 + n % 16)
+    return idx, oob
+
+
+def pool_tile(tile16, wx, wy, amax_note):
+    """the module's own pooling + the unique post-pool quantisation.
+
+    tile16: (64 tokens, 64 channels) f16, the narrowed WO output of this window.
+    Returns the 16x64 int8 mean tile in the module's M8COL8 layout, plus stats.
+    """
+    mA = [(sg // 2) * 8 for sg in range(8)]
+    mB = [a + 32 for a in mA]
+    n0 = [(sg % 2) * 32 for sg in range(8)]
+    mean = np.zeros((16, 64), np.int8)
+    written = np.zeros((16, 64), bool)
+    domains = 0
+    for sg in range(8):
+        ch = np.arange(16)
+        for acc in range(2):
+            for sy1 in range(2):
+                rows = (mB[sg] if sy1 else mA[sg]) + np.arange(8)
+                for dx in range(2):
+                    sx1 = sg >> 2
+                    h = (sg >> 1) & 1
+                    px = 4 * wx + 2 * sx1 + dx
+                    py = 4 * wy - 2 + 2 * sy1 + h
+                    ly = 2 * sy1 + h
+                    lx = 2 * sx1 + dx
+                    kk = (sg % 2) * 32 + acc * 16 + ch
+                    tile_ok = (2 * wx + P0_R09[2] + sx1 >= 0 and
+                               2 * wy + P0_R09[3] + sy1 >= 0 and
+                               2 * wx + P0_R09[2] + sx1 < P0_R09[0] and
+                               2 * wy + P0_R09[3] + sy1 < P0_R09[1])
+                    ok = (tile_ok and px < P7_R09[0] and py >= 0 and
+                          py < P7_R09[1] and py < P5_R09[2])
+                    if ok:
+                        r0 = 2 * dx
+                        a = tile16[rows[r0], kk]
+                        b = tile16[rows[r0 + 1], kk]
+                        c = tile16[rows[r0 + 4], kk]
+                        d = tile16[rows[r0 + 5], kk]
+                        top = (a + b).astype(np.float16)
+                        bot = (c + d).astype(np.float16)
+                        ssum = (top + bot).astype(np.float16)
+                        v = (ssum * np.float16(0.25)).astype(np.float16)
+                        domains += 1
+                    else:
+                        v = np.zeros(16, np.float16)
+                    mean[4 * ly + lx, kk] = v
+                    written[4 * ly + lx, kk] = ok
+    return mean, written, domains
+
+
+def quantise_mean(mean16, sc4):
+    """nrf_mean[...] = int8(clamp(roundEven(float(v) * entry_sc[4]), -127, 127))"""
+    scaled = (mean16.astype(np.float32) * np.float32(sc4)).astype(np.float32)
+    code = np.clip(np.rint(scaled), -127.0, 127.0)
+    return code.astype(np.int32)
+
+
+def ds_codes(mean_i32, Wds, scds):
+    """one K32 INT8 DS projection: 16 slots x 64 -> 128 channels, then
+    code = clamp(roundEven(float(acc) * s[ch]), -127, 127)."""
+    acc = mean_i32.astype(np.int64) @ Wds.T.astype(np.int64)
+    acc32 = mean_i32.astype(np.int32) @ Wds.T.astype(np.int32)
+    assert np.array_equal(acc32.astype(np.int64), acc), "DS int32 accumulation not exact"
+    prod = acc.astype(np.float32) * scds[None, :].astype(np.float32)
+    code = np.clip(np.rint(prod.astype(np.float32)), -127.0, 127.0)
+    return code.astype(np.int32), int(np.abs(acc).max())
+
+
+def main():
+    T = np.fromfile(CAP / "T.bin", dtype="<f2").astype(np.float16)
+    Y = np.fromfile(CAP / "Y.bin", dtype="<f2").astype(np.float16)
+    IMG = np.fromfile(CAP / "image_out.bin", dtype="<f2")
+    pack6 = np.fromfile(PACK6, dtype="<f2")
+    pack8 = np.fromfile(PACK8, dtype="<f2")
+    sc = np.fromfile(CHAIN_S, dtype="<f4")
+    chain_w = np.fromfile(CHAIN_W, dtype=np.int8)
+    W6 = decode_wo_f16(pack6).astype(np.float32)
+    qw8 = np.fromfile(CARD / "packs/r09_c64_b8_wo.i8.bin", dtype=np.int8)
+    sW8 = np.fromfile(CARD / "packs/r09_c64_b8_wosc.f32.bin", dtype="<f4")
+    ars6 = np.array([pack6[ARS_HALF + n] for n in range(N)], np.float16)
+    # block-8 pack cut with the same generator would be the deployed WO; for the
+    # frame comparison the block-6 weights must be used (same frame, same block),
+    # so the INT8 arm is re-quantised from block 6 with the identical law.
+    W6q = np.zeros((N, K), np.int32)
+    sW6 = np.zeros(N, np.float32)
+    for n in range(N):
+        a = float(np.abs(W6[n]).max())
+        s = np.float32(a / 127.0)
+        sW6[n] = s
+        inv = np.float32(127.0 / a) if a > 0 else np.float32(0.0)
+        W6q[n] = np.clip(np.rint(W6[n] * inv), -127.0, 127.0).astype(np.int32)
+    # DS weights of the deployed pass (deployed pack, unchanged by this card)
+    Wds = np.zeros((N_DS, K), np.int32)
+    for ch in range(N_DS):
+        for k in range(K):
+            Wds[ch, k] = chain_w[DS_BASE + (ch // 16) * 1024 + (ch % 16) * 64 + k]
+    scds = np.array([sc[912 + ch] for ch in range(N_DS)], np.float32)
+    sc4 = np.float32(sc[4])
+
+    nwin = min(T.size // 4096, (IMG.size // 4096) * 0 + 10 ** 9)
+    nwin = T.size // 4096
+    ref = np.zeros(IMG.size, dtype=np.float16)
+    i8 = np.zeros(IMG.size, dtype=np.float16)
+    written = np.zeros(IMG.size, bool)
+    stats = {"windows": nwin, "writes": 0, "collisions": 0, "oob_skips": 0,
+             "acc_max": 0, "sat": 0, "codes": 0, "amax_min": None, "amax_max": None}
+    # pool / DS accumulation over the windows that f3c64_body_ds owns (wx < 42)
+    pool = {"windows": 0, "slot_channel_values": 0, "domains": 0,
+            "mean_parent_sum": np.zeros((16, N)), "mean_int8_sum": np.zeros((16, N)),
+            "mean_diff_hist": np.zeros(9, np.int64), "mean_value_diff": 0,
+            "mean_slot_channel_written": 0,
+            "ds_parent": np.zeros((16, N_DS)), "ds_int8": np.zeros((16, N_DS)),
+            "ds_diff_hist": np.zeros(9, np.int64), "ds_value_diff": 0,
+            "ds_acc_max": 0, "ds_written": 0, "mean_signed_sum_parent": 0,
+            "mean_signed_sum_int8": 0}
+    for w in range(nwin):
+        wx, wy = w % P1_CAP[0], w // P1_CAP[0]
+        Tw = T[w * 4096:(w + 1) * 4096].reshape(64, 64)
+        Yw = Y[w * 4096:(w + 1) * 4096].reshape(64, 64)
+        seed = (Yw * ars6[None, :]).astype(np.float16).astype(np.float32)
+        Tf = Tw.astype(np.float32)
+        accr = seed.copy()
+        for k in range(K):
+            accr = accr + Tf[:, k:k + 1] * W6[:, k][None, :]
+        outr = accr.astype(np.float16)
+        amax = float(np.abs(Tf).max())
+        invC = np.float32(np.float32(127.0) / np.float32(amax)) if amax > 0 else np.float32(0.0)
+        sC = np.float32(np.float32(amax) / np.float32(127.0)) if amax > 0 else np.float32(0.0)
+        q = np.clip(np.rint(Tf * invC), -127.0, 127.0).astype(np.int32)
+        stats["sat"] += int((np.abs(q) >= 127).sum())
+        stats["codes"] += int(q.size)
+        stats["amax_min"] = amax if stats["amax_min"] is None else min(stats["amax_min"], amax)
+        stats["amax_max"] = amax if stats["amax_max"] is None else max(stats["amax_max"], amax)
+        acc32 = q @ W6q.T
+        acc64 = q.astype(np.int64) @ W6q.T.astype(np.int64)
+        assert np.array_equal(acc32.astype(np.int64), acc64), "WO int32 accumulation not exact"
+        stats["acc_max"] = max(stats["acc_max"], int(np.abs(acc32).max()))
+        fsc = (sW6[None, :] * np.float32(sC)).astype(np.float32)
+        summ = ((acc32.astype(np.float32) * fsc).astype(np.float32) + seed).astype(np.float32)
+        outi = summ.astype(np.float16)
+        idx, oob = img_index(wx, wy)
+        ok = np.broadcast_to(~oob, (64, N))
+        stats["oob_skips"] += int(np.broadcast_to(oob, (64, N)).sum())
+        ii = idx[ok]
+        stats["writes"] += int(ii.size)
+        stats["collisions"] += int(written[ii].sum())
+        written[ii] = True
+        ref[ii] = outr[ok]
+        i8[ii] = outi[ok]
+        # ---------------- pool + DS on the windows this pass owns -------------
+        if wx < P1_R09[0]:
+            mp, wp, dom = pool_tile(outr, wx, wy, None)
+            mi, wi, _ = pool_tile(outi, wx, wy, None)
+            cp, ci = quantise_mean(mp, sc4), quantise_mean(mi, sc4)
+            sel = wp & wi
+            pool["windows"] += 1
+            pool["domains"] += dom
+            pool["slot_channel_values"] += int(sel.sum())
+            d = np.abs(cp - ci)
+            pool["mean_value_diff"] += int((cp != ci)[sel].sum())
+            for k in range(9):
+                pool["mean_diff_hist"][k] += int(((d == k) & sel).sum())
+            a = np.zeros((16, N), np.int64)
+            a[sel] = cp[sel]
+            b = np.zeros((16, N), np.int64)
+            b[sel] = ci[sel]
+            pool["mean_parent_sum"] += a
+            pool["mean_int8_sum"] += b
+            pool["mean_signed_sum_parent"] += int(cp[sel].sum())
+            pool["mean_signed_sum_int8"] += int(ci[sel].sum())
+            pool["mean_slot_channel_written"] += int(sel.sum())
+            dp, ap = ds_codes(cp, Wds, scds)
+            di, ai = ds_codes(ci, Wds, scds)
+            pool["ds_acc_max"] = max(pool["ds_acc_max"], ap, ai)
+            pool["ds_value_diff"] += int((dp != di)[sel.repeat(2, axis=1)].sum())
+            dd = np.abs(dp - di)
+            m2 = sel.repeat(2, axis=1)
+            for k in range(9):
+                pool["ds_diff_hist"][k] += int(((dd == k) & m2).sum())
+            pool["ds_written"] += int(m2.sum())
+            pool["ds_parent"] += dp
+            pool["ds_int8"] += di
+
+    r = ref.astype(np.float32)
+    i8f = i8.astype(np.float32)
+    cap = IMG.astype(np.float32)
+    m = written
+    dA = np.abs(r[m] - cap[m])
+    out = {"inputs": {"T": sha(CAP / "T.bin"), "Y": sha(CAP / "Y.bin"),
+                      "image_out": sha(CAP / "image_out.bin"),
+                      "pack_block6": sha(PACK6), "pack_block8": sha(PACK8),
+                      "chain_weights": sha(CHAIN_W), "chain_scales": sha(CHAIN_S),
+                      "card_pack": sha(CARD / "packs/r09_c64_b8_wo.i8.bin"),
+                      "card_scales": sha(CARD / "packs/r09_c64_b8_wosc.f32.bin")},
+           "A_provenance": {
+               "compared": int(m.sum()),
+               "bit_identical_share": float((ref[m] == IMG[m]).mean()),
+               "max_abs_diff": float(dA.max()),
+               "rms": float(np.sqrt((dA ** 2).mean())),
+               "mean_abs_diff": float(dA.mean()),
+               "note": "C64 WO arm replayed in numpy against the captured frame; a "
+                       "wrong WO tile formula, ars offset or image addressing cannot "
+                       "pass.  This is the block-6 frame because no block-8 capture "
+                       "exists."},
+           "B_int8_exactness": {
+               "wo_int32_equals_int64": True,
+               "wo_acc_max_abs": stats["acc_max"],
+               "wo_acc_below_2p24": stats["acc_max"] < (1 << 24),
+               "ds_acc_max_abs": pool["ds_acc_max"],
+               "ds_acc_below_2p24": pool["ds_acc_max"] < (1 << 24)},
+           "C_wo_arm_int8_vs_fp16": {
+               "compared": int(m.sum()),
+               "bit_identical_share": float((ref[m] == i8[m]).mean()),
+               "rel_L2": float(np.sqrt(((r[m] - i8f[m]) ** 2).sum()) /
+                               np.sqrt((r[m] ** 2).sum())),
+               "rms": float(np.sqrt(((r[m] - i8f[m]) ** 2).mean())),
+               "max_abs_diff": float(np.abs(r[m] - i8f[m]).max()),
+               "snr_db": float(10 * np.log10((r[m] ** 2).mean() /
+                                             ((r[m] - i8f[m]) ** 2).mean())),
+               "fp16_absmax": float(np.abs(r[m]).max()),
+               "one_half_ulp_share": float((np.abs(r[m] - i8f[m]) <=
+                                            float(np.spacing(np.float16(1.0)))).mean())},
+           "D_pool_and_mean": {
+               "windows": pool["windows"],
+               "slot_channel_values": pool["slot_channel_values"],
+               "pool_domains_in_bounds": pool["domains"],
+               "mean_code_equal_share": float(pool["mean_diff_hist"][0] /
+                                              max(pool["slot_channel_values"], 1)),
+               "mean_code_diff_histogram": {str(k): int(v)
+                                            for k, v in enumerate(pool["mean_diff_hist"])},
+               "mean_codes_differing": int(pool["mean_value_diff"]),
+               "mean_parent_signed_sum": int(pool["mean_signed_sum_parent"]),
+               "mean_int8_signed_sum": int(pool["mean_signed_sum_int8"]),
+               "entry_sc4": float(sc4),
+               "pool_input_changed": True,
+               "note": "the pooling tree, its four readers, the single quantisation "
+                       "point (entry_sc[4], roundEven, clamp) and the M8COL8 write "
+                       "address are identical source and identical SPIR-V; only the "
+                       "half values in nrf_pair change, by the C arm's WO "
+                       "quantisation.  D is that propagation, code by code."},
+           "E_ds_consumer": {
+               "ds_written_values": int(pool["ds_written"]),
+               "ds_code_equal_share": float(pool["ds_diff_hist"][0] /
+                                            max(pool["ds_written"], 1)),
+               "ds_code_diff_histogram": {str(k): int(v)
+                                          for k, v in enumerate(pool["ds_diff_hist"])},
+               "ds_codes_differing": int(pool["ds_value_diff"]),
+               "ds_channels": N_DS,
+               "note": "the deployed K32 INT8 DS projection (unchanged instructions, "
+                       "deployed pack weights-C.i8.bin and entry_sc) applied to both "
+                       "mean tiles: this is the 'existing DS consumer' re-check at "
+                       "source level.  Not a numeric gate."},
+           "quantiser": {"saturation_share": stats["sat"] / max(stats["codes"], 1),
+                         "amax_min": stats["amax_min"], "amax_max": stats["amax_max"],
+                         "windows": stats["windows"], "writes": stats["writes"],
+                         "oob_skips": stats["oob_skips"],
+                         "image_collisions": stats["collisions"]},
+           "weight_pack": {
+               "block8_pack_round_trip_rel_L2": None,
+               "block6_requant_same_law_rel_L2": float(
+                   np.sqrt((((W6q.astype(np.float32) * sW6[:, None]) - W6) ** 2).sum()) /
+                   np.sqrt((W6 ** 2).sum())),
+               "deployed_pack_scale_min": float(sW8.min()),
+               "deployed_pack_scale_max": float(sW8.max()),
+               "note": "the deployed block-8 pack's own round trip is in "
+                       "packs/PACK-META.json (weights-only, no frame needed); here the "
+                       "same law is applied to the block-6 weights so the frame "
+                       "comparison is self-consistent"},
+           "not_run": ["GPU gate", "nrf_mean capture for block 8", "ordinary timing",
+                       "quality/PSNR"]}
+    pm = json.loads((CARD / "packs/PACK-META.json").read_text(encoding="utf-8"))
+    out["weight_pack"]["deployed_block8_round_trip_rel_L2"] = \
+        pm["round_trip"]["rel_l2"]
+    out["weight_pack"]["deployed_block8_saturation_codes"] = pm["saturation_codes"]
+    CARD.joinpath("evidence").mkdir(parents=True, exist_ok=True)
+    (CARD / "evidence/ORACLE-R09.json").write_text(
+        json.dumps(out, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(json.dumps(out, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

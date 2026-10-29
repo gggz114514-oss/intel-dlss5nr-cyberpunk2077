@@ -1,0 +1,214 @@
+"""n37-f10-arena-shrink: SPIR-V facts for the parent and the candidate (CPU only).
+
+Writes build/build.json.  Everything the contract asks for:
+  - Workgroup storage bytes (the hard acceptance criterion of L35)
+  - OpControlBarrier sites and their scopes/semantics
+  - cooperative-matrix load/store counts and stride histograms (A/B/acc footprints)
+  - the floating-point expression multiset with operand signatures (must be identical)
+  - NoContraction ids, their opcode histogram, and the paired operand signatures
+  - integer opcode deltas, DPAS count
+  - a static independent-chain root count for the FP graph (L25 proxy)
+"""
+import collections
+import hashlib
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST          # noqa: E402
+
+CARD = pathlib.Path(__file__).resolve().parent
+
+OPNAME = {12: 'OpExtInst', 43: 'OpConstant', 59: 'OpVariable', 61: 'OpLoad', 62: 'OpStore',
+          65: 'OpAccessChain', 224: 'OpControlBarrier', 225: 'OpMemoryBarrier',
+          246: 'OpLoopMerge', 247: 'OpSelectionMerge', 4456: 'OpTypeCooperativeMatrixKHR',
+          4457: 'OpCooperativeMatrixLoadKHR', 4458: 'OpCooperativeMatrixStoreKHR',
+          4459: 'OpCooperativeMatrixMulAddKHR'}
+SCOPE = {0: 'CrossDevice', 1: 'Device', 2: 'Workgroup', 3: 'Subgroup', 4: 'Invocation'}
+CM_LOAD, CM_STORE, CM_MULADD, BARRIER = 4457, 4458, 4459, 224
+# float ops that can carry NoContraction, and the integer side tracked separately
+FP_OPS = {127, 129, 131, 133, 135, 140, 141, 142}
+FP_EXT = {4, 8, 10, 26, 27, 28, 31, 32, 37, 40, 43, 46, 49, 50}
+INT_TRACKED = {128, 130, 132, 134, 137, 138, 139}
+ARITH = FP_OPS | INT_TRACKED
+
+
+def sha(p):
+    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+
+
+def barriers(m):
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+    out = []
+    for i, (op, ops, _, _) in enumerate(m.instructions):
+        if op != BARRIER:
+            continue
+        out.append(dict(index=i,
+                        execution_scope=SCOPE.get(const.get(ops[0], ops[0])),
+                        memory_scope=SCOPE.get(const.get(ops[1], ops[1])),
+                        semantics=const.get(ops[2], ops[2])))
+    return out
+
+
+def movement(m):
+    const = {ops[1]: ops[2] for op, ops, _, _ in m.instructions if op == 43}
+    loads, stores = [], []
+    for op, ops, _, _ in m.instructions:
+        if op not in (CM_LOAD, CM_STORE):
+            continue
+        rec = dict(layout=const.get(ops[3], ops[3]), stride=const.get(ops[4], ops[4]))
+        (loads if op == CM_LOAD else stores).append(rec)
+    return loads, stores
+
+
+def fp_multiset(m):
+    bag = collections.Counter()
+    for op, ops, _, _ in m.instructions:
+        rid = ST.result_id_of(op, ops)
+        if rid is None:
+            continue
+        if op in FP_OPS:
+            bag[('op', op, ST.Module.operand_signature(m, rid, 3))] += 1
+        elif op == 12 and len(ops) > 3 and ops[3] in FP_EXT:
+            bag[('ext', ops[3], tuple(ST.Module.operand_signature(m, x, 2)
+                                      for x in ops[4:7]))] += 1
+    return bag
+
+
+def nc_detail(m):
+    ids = ST.no_contraction_ids(m)
+    by_id = m.id_to_instruction()
+    hist = collections.Counter()
+    sigs = collections.Counter()
+    for rid in ids:
+        op, ops = by_id[rid]
+        hist[op] += 1
+        sigs[(op, ST.Module.operand_signature(m, rid, 2))] += 1
+    return dict(ids=len(ids), histogram={str(k): v for k, v in sorted(hist.items())},
+                signature_multiset_hash=hashlib.sha256(
+                    repr(sorted(sigs.items())).encode()).hexdigest())
+
+
+def chain_roots(m):
+    """Number of arithmetic instructions whose operands contain no arithmetic result.
+
+    With an identical FP multiset + operand signatures this number must match the parent:
+    it is the static proxy for 'independent chains per lane' (L25), and the only new
+    instruction in the candidate is a control barrier, which is not an arithmetic node.
+    """
+    fp_roots = int_roots = 0
+    for op, ops, _, _ in m.instructions:
+        rid = ST.result_id_of(op, ops)
+        if rid is None or op not in ARITH:
+            continue
+        has_fp = has_int = False
+        for cid in ops:
+            if cid == rid:                    # the result id is not an operand
+                continue
+            d = m.defining_instruction(cid)
+            if d is None:
+                continue
+            if d[0] in FP_OPS:
+                has_fp = True
+            elif d[0] in INT_TRACKED:
+                has_int = True
+        if op in FP_OPS and not has_fp:
+            fp_roots += 1
+        if op in INT_TRACKED and not has_int:
+            int_roots += 1
+    return dict(fp_chain_roots=fp_roots, int_chain_roots=int_roots,
+                note='root = an arithmetic instruction with no arithmetic operand')
+
+
+def main():
+    par = ST.Module(CARD / 'parent-rebuild.spv')
+    cand = ST.Module(CARD / 'candidate.spv')
+    out = dict(card='n37-f10-arena-shrink', family='F10')
+    out['parent'] = dict(spv=dict(path=str(CARD / 'parent-rebuild.spv'),
+                                  sha256=sha(CARD / 'parent-rebuild.spv')),
+                         source=dict(path=str(CARD.parent / 'n10-f10-next/candidate.comp'),
+                                     sha256=sha(CARD.parent / 'n10-f10-next/candidate.comp')))
+    out['candidate'] = dict(spv=dict(path=str(CARD / 'candidate.spv'),
+                                     sha256=sha(CARD / 'candidate.spv')),
+                            source=dict(path=str(CARD / 'candidate.comp'),
+                                        sha256=sha(CARD / 'candidate.comp')))
+
+    out['spirv_static'] = dict(parent_instructions=len(par.instructions),
+                               candidate_instructions=len(cand.instructions),
+                               parent_words=len(par.words), candidate_words=len(cand.words))
+    sp, sc = par.storage_bytes(), cand.storage_bytes()
+    out['storage_bytes'] = dict(parent=sp, candidate=sc,
+                                workgroup_parent_bytes=sp['Workgroup']['bytes'],
+                                workgroup_candidate_bytes=sc['Workgroup']['bytes'],
+                                reduction_bytes=sp['Workgroup']['bytes'] - sc['Workgroup']['bytes'])
+    bp, bc = barriers(par), barriers(cand)
+    out['barriers'] = dict(
+        parent=len(bp), candidate=len(bc), delta=len(bc) - len(bp),
+        parent_signature=sorted({(b['execution_scope'], b['memory_scope'], b['semantics'])
+                                 for b in bp}),
+        candidate_signature=sorted({(b['execution_scope'], b['memory_scope'], b['semantics'])
+                                    for b in bc}),
+        parent_sites=bp, candidate_sites=bc,
+        memory_barriers=dict(parent=sum(1 for o, _, _, _ in par.instructions if o == 225),
+                             candidate=sum(1 for o, _, _, _ in cand.instructions if o == 225)))
+
+    lp, sps = movement(par)
+    lc, scs = movement(cand)
+    out['coopmat'] = dict(
+        parent=dict(loads=len(lp), stores=len(sps)),
+        candidate=dict(loads=len(lc), stores=len(scs)),
+        parent_load_stride_hist=dict(collections.Counter(x['stride'] for x in lp)),
+        candidate_load_stride_hist=dict(collections.Counter(x['stride'] for x in lc)),
+        parent_store_stride_hist=dict(collections.Counter(x['stride'] for x in sps)),
+        candidate_store_stride_hist=dict(collections.Counter(x['stride'] for x in scs)),
+        identical_loads=len(lp) == len(lc), identical_stores=len(sps) == len(scs))
+
+    fp, fc = fp_multiset(par), fp_multiset(cand)
+    out['fp_multiset'] = dict(parent=sum(fp.values()), candidate=sum(fc.values()),
+                              identical=fp == fc,
+                              parent_only=[str(k) for k in (fp - fc)][:20],
+                              candidate_only=[str(k) for k in (fc - fp)][:20])
+    out['no_contraction'] = dict(parent=nc_detail(par), candidate=nc_detail(cand))
+    out['no_contraction']['identical_ids'] = (out['no_contraction']['parent']['ids']
+                                              == out['no_contraction']['candidate']['ids'])
+    out['no_contraction']['identical_histogram'] = (
+        out['no_contraction']['parent']['histogram'] == out['no_contraction']['candidate']['histogram'])
+    out['no_contraction']['identical_signature_multiset'] = (
+        out['no_contraction']['parent']['signature_multiset_hash']
+        == out['no_contraction']['candidate']['signature_multiset_hash'])
+    out['float_NC_checked'] = out['no_contraction']['candidate']['ids']
+
+    out['chain_roots'] = dict(parent=chain_roots(par), candidate=chain_roots(cand))
+
+    hp = collections.Counter(op for op, _, _, _ in par.instructions)
+    hc = collections.Counter(op for op, _, _, _ in cand.instructions)
+    out['opcode_delta'] = {OPNAME.get(k, 'op%d' % k): [hp.get(k, 0), hc.get(k, 0)]
+                           for k in sorted(set(hp) | set(hc)) if hp.get(k, 0) != hc.get(k, 0)}
+    out['int_opcode_delta'] = {OPNAME.get(k, 'op%d' % k): [hp.get(k, 0), hc.get(k, 0)]
+                               for k in sorted(INT_TRACKED)}
+    out['dpas'] = dict(parent=hp.get(CM_MULADD, 0), candidate=hc.get(CM_MULADD, 0))
+
+    print('insn %d -> %d   words %d -> %d' % (len(par.instructions), len(cand.instructions),
+                                              len(par.words), len(cand.words)))
+    print('Workgroup bytes %d -> %d  (reduction %d)'
+          % (out['storage_bytes']['workgroup_parent_bytes'],
+             out['storage_bytes']['workgroup_candidate_bytes'],
+             out['storage_bytes']['reduction_bytes']))
+    print('barriers %d -> %d  dpas %d -> %d' % (len(bp), len(bc), out['dpas']['parent'],
+                                                out['dpas']['candidate']))
+    print('fp multiset identical=%s (%d entries)  NC %d -> %d identical_hist=%s'
+          % (out['fp_multiset']['identical'], sum(fp.values()),
+             out['no_contraction']['parent']['ids'],
+             out['no_contraction']['candidate']['ids'],
+             out['no_contraction']['identical_histogram']))
+    print('chain roots parent=%s candidate=%s' % (out['chain_roots']['parent'],
+                                                  out['chain_roots']['candidate']))
+    print('coopmat loads %d -> %d stores %d -> %d' % (len(lp), len(lc), len(sps), len(scs)))
+    print('opcode delta', out['opcode_delta'])
+    (CARD / 'build/build.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

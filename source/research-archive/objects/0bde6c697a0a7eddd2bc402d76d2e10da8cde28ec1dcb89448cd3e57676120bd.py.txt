@@ -1,0 +1,222 @@
+"""Minimal SPIR-V reader for the n06d card.
+
+No GPU, no disassembler: the module is parsed straight from the word stream, so the
+counters below are exact for the file that gets validated and put into the plan.
+
+n06d fix vs the copy inherited from n06c: the opcode->name table is now read from the
+toolchain's own enum header (spirv.hpp11 next to glslang.exe) instead of a hand-typed
+dict. The inherited dict was off by +3 in the 191..197 block (it called 194
+"OpBitwiseOr" and 196 "OpBitwiseAnd", while SPIR-V defines 194 = OpShiftRightLogical,
+196 = OpShiftLeftLogical, 199 = OpBitwiseAnd). Counting by opcode number is unaffected;
+only the printed names were wrong. `self.defs`/`self.const` added for address-chain and
+stride-constant resolution.
+"""
+import hashlib
+import re
+import struct
+from collections import Counter
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+CAMP = CARD.parent.parent
+
+SPIRV_HPP = Path('@NR_WORKSPACE@/src/project/tools/glslang-16.5.0/'
+                 'include/glslang/SPIRV/spirv.hpp11')
+
+# Minimal fallback (authoritative values, cross-checked against spirv.hpp11).
+OPS_FALLBACK = {
+    5: 'OpName', 6: 'OpMemberName', 7: 'OpString', 11: 'OpExtInstImport',
+    12: 'OpExtInst', 14: 'OpMemoryModel', 15: 'OpEntryPoint', 16: 'OpExecutionMode',
+    17: 'OpCapability', 19: 'OpTypeVoid', 20: 'OpTypeBool', 21: 'OpTypeInt',
+    22: 'OpTypeFloat', 23: 'OpTypeVector', 24: 'OpTypeMatrix', 28: 'OpTypeArray',
+    29: 'OpTypeRuntimeArray', 30: 'OpTypeStruct', 32: 'OpTypePointer',
+    33: 'OpTypeFunction', 43: 'OpConstant', 44: 'OpConstantComposite',
+    54: 'OpFunction', 55: 'OpFunctionEnd', 56: 'OpFunctionCall',
+    57: 'OpFunctionParameter', 59: 'OpVariable', 61: 'OpLoad', 62: 'OpStore',
+    65: 'OpAccessChain', 66: 'OpInBoundsAccessChain', 71: 'OpDecorate',
+    72: 'OpMemberDecorate', 79: 'OpVectorShuffle', 80: 'OpCompositeConstruct',
+    81: 'OpCompositeExtract', 82: 'OpCompositeInsert', 83: 'OpCopyObject',
+    84: 'OpTranspose', 109: 'OpConvertFToU', 110: 'OpConvertFToS', 111: 'OpConvertSToF',
+    112: 'OpConvertUToF', 113: 'OpUConvert', 114: 'OpSConvert', 115: 'OpFConvert',
+    116: 'OpQuantizeToF16', 124: 'OpBitcast', 126: 'OpSNegate', 127: 'OpFNegate',
+    128: 'OpIAdd', 129: 'OpFAdd', 130: 'OpISub', 131: 'OpFSub', 132: 'OpIMul',
+    133: 'OpFMul', 134: 'OpUDiv', 135: 'OpSDiv', 136: 'OpFDiv', 137: 'OpUMod',
+    138: 'OpSRem', 139: 'OpSMod', 140: 'OpFRem', 141: 'OpFMod', 168: 'OpSelect',
+    169: 'OpIEqual', 170: 'OpINotEqual', 171: 'OpUGreaterThan', 172: 'OpSGreaterThan',
+    173: 'OpSGreaterThanEqual', 175: 'OpULessThan', 176: 'OpSLessThan',
+    177: 'OpSLessThanEqual', 194: 'OpShiftRightLogical', 195: 'OpShiftRightArithmetic',
+    196: 'OpShiftLeftLogical', 197: 'OpBitwiseOr', 198: 'OpBitwiseXor',
+    199: 'OpBitwiseAnd', 200: 'OpNot', 224: 'OpControlBarrier', 225: 'OpMemoryBarrier',
+    245: 'OpLoopMerge', 246: 'OpSelectionMerge', 247: 'OpLabel', 248: 'OpBranch',
+    249: 'OpBranchConditional', 250: 'OpSwitch', 253: 'OpReturn', 254: 'OpReturnValue',
+    255: 'OpUnreachable', 256: 'OpLifetimeStart', 257: 'OpLifetimeStop',
+    4423: 'OpGroupNonUniformBroadcast', 4424: 'OpGroupNonUniformBallot',
+    4456: 'OpTypeCooperativeMatrixKHR', 4457: 'OpCooperativeMatrixLoadKHR',
+    4458: 'OpCooperativeMatrixStoreKHR', 4459: 'OpCooperativeMatrixMulAddKHR',
+    4460: 'OpCooperativeMatrixLengthKHR', 5366: 'OpCooperativeMatrixLoadNV',
+    5367: 'OpCooperativeMatrixStoreNV', 5368: 'OpCooperativeMatrixMulAddNV',
+}
+
+
+def _load_ops():
+    """opcode -> name, taken from the `enum class Op` block of the toolchain header.
+
+    Only that block is parsed: a plain `^Op\\w+ = n` scan also picks up `OpenCL_C_*`
+    enumerators (`Op` is a prefix of `OpenCL`), which would shadow real opcodes.
+    """
+    if not SPIRV_HPP.exists():
+        return dict(OPS_FALLBACK), None
+    pat = re.compile(r'^\s+(Op[A-Z]\w*)\s*=\s*(\d+),')
+    table = {}
+    inside = False
+    for line in SPIRV_HPP.read_text(encoding='utf-8', errors='replace').splitlines():
+        if not inside:
+            if re.search(r'enum\s+class\s+Op\s*:\s*unsigned', line):
+                inside = True
+            continue
+        if line.strip().startswith('};'):
+            break
+        m = pat.match(line)
+        if m:
+            table.setdefault(int(m.group(2)), m.group(1))
+    if len(table) < 200:
+        return dict(OPS_FALLBACK), None
+    return table, hashlib.sha256(SPIRV_HPP.read_bytes()).hexdigest()
+
+
+OPS, OPS_SOURCE_SHA = _load_ops()
+
+STORAGE = {0: 'UniformConstant', 1: 'Input', 2: 'Uniform', 3: 'Output', 4: 'Workgroup',
+           5: 'CrossWorkgroup', 6: 'Private', 7: 'Function', 8: 'Generic',
+           9: 'PushConstant', 10: 'AtomicCounter', 11: 'Image', 12: 'StorageBuffer'}
+NC = 43                      # Decoration NoContraction
+INT_OPS = (128, 130, 132, 134, 135, 137, 138, 139)   # contract's integer control-flow set
+
+
+class Mod:
+    def __init__(self, path):
+        raw = Path(path).read_bytes()
+        assert len(raw) % 4 == 0, 'not a word stream'
+        self.path = str(path)
+        self.words = list(struct.unpack('<%dI' % (len(raw) // 4), raw))
+        w = self.words
+        assert w[0] == 0x07230203, 'bad magic'
+        self.version, self.generator, self.bound, self.schema = w[1], w[2], w[3], w[4]
+        self.instr = []
+        self.offsets = []                      # word offset of each instruction
+        i = 5
+        while i < len(w):
+            op = w[i] & 0xFFFF
+            n = w[i] >> 16
+            assert n >= 1, 'zero wordcount at word %d' % i
+            self.instr.append((op, w[i + 1:i + n]))
+            self.offsets.append(i)
+            i += n
+        self.hist = Counter(op for op, _ in self.instr)
+        self.decos = [(o[0], o[1], o[2:]) for op, o in self.instr if op == 71]
+        self.caps = [o[0] for op, o in self.instr if op == 17]
+        self.entry_points = [(o[1], o[3]) for op, o in self.instr if op == 15]
+        self.exec_modes = [(o[0], o[1]) for op, o in self.instr if op == 16]
+        self.mem_model = [(o[0], o[1]) for op, o in self.instr if op == 14]
+        self.exts = []
+        for op, o in self.instr:
+            if op == 11:
+                s = b''.join(struct.pack('<I', x) for x in o[1:]).split(b'\0')[0]
+                self.exts.append(s.decode('ascii', 'replace'))
+        self.func_locals = sum(1 for op, o in self.instr if op == 59 and len(o) >= 3
+                               and o[2] == 7)
+        # result id -> defining instruction index. SPIR-V puts the result id at o[1] for
+        # every instruction that has both a result type and a result, at o[0] for the
+        # result-only forms (types, constants, labels) and nowhere for the rest.
+        NO_RESULT = {3, 4, 5, 6, 7, 14, 15, 16, 17, 62, 71, 72, 224, 225, 246, 247,
+                     249, 250, 251, 253, 254, 255, 256, 257, 317, 318, 330, 331, 332}
+        RESULT_AT_0 = set(range(19, 51)) | {11, 248}
+        self.defs = {}
+        for idx, (op, o) in enumerate(self.instr):
+            if op in NO_RESULT or op < 11 or not o:
+                continue
+            if op in RESULT_AT_0:
+                self.defs.setdefault(o[0], idx)
+            elif len(o) > 1:
+                self.defs.setdefault(o[1], idx)
+        self.const = {}
+        for op, o in self.instr:
+            if op == 43 and len(o) >= 3:
+                self.const[o[1]] = o[2]
+        self.varnames = {}
+        for op, o in self.instr:
+            if op == 5 and len(o) >= 2:
+                s = b''.join(struct.pack('<I', x) for x in o[1:]).split(b'\0')[0]
+                self.varnames[o[0]] = s.decode('ascii', 'replace')
+
+    # ---------------------------------------------------------------- views
+    def opname(self, op):
+        return OPS.get(op, 'Op%d' % op)
+
+    def hist_named(self):
+        return {self.opname(op): n for op, n in sorted(self.hist.items())}
+
+    def storage_hist(self):
+        c = Counter()
+        for op, o in self.instr:
+            if op == 59 and len(o) >= 3:
+                c[STORAGE.get(o[2], str(o[2]))] += 1
+        return dict(sorted(c.items()))
+
+    def non_function_storage(self):
+        return {k: v for k, v in self.storage_hist().items() if k != 'Function'}
+
+    def deco_hist(self):
+        c = Counter()
+        for tgt, dec, lit in self.decos:
+            c[dec] += 1
+        return dict(sorted(c.items()))
+
+    def no_contraction(self):
+        return sorted(t for t, d, l in self.decos if d == NC)
+
+    def float_ops(self):
+        names = ('OpFMul', 'OpFAdd', 'OpFSub', 'OpFDiv', 'OpFNegate', 'OpFConvert',
+                 'OpQuantizeToF16', 'OpConvertSToF', 'OpConvertUToF', 'OpExtInst')
+        inv = {v: k for k, v in OPS.items()}
+        return {n: self.hist.get(inv[n], 0) for n in names}
+
+    def ext_inst_calls(self):
+        """(set_id, instruction_number) for every OpExtInst, e.g. GLSL.std.450 Fma = 50."""
+        return [(o[2], o[3]) for op, o in self.instr if op == 12 and len(o) >= 4]
+
+    def coop_mat(self):
+        names = ('OpCooperativeMatrixLoadKHR', 'OpCooperativeMatrixStoreKHR',
+                 'OpCooperativeMatrixMulAddKHR', 'OpCooperativeMatrixLengthKHR')
+        inv = {v: k for k, v in OPS.items()}
+        return {n: self.hist.get(inv[n], 0) for n in names}
+
+    def int_ops(self):
+        return {str(op): self.hist.get(op, 0) for op in INT_OPS}
+
+    def control_flow(self):
+        return {self.opname(op): self.hist[op] for op in
+                (245, 246, 247, 248, 249, 250, 253, 254, 255) if self.hist.get(op)}
+
+    def summary(self):
+        return dict(
+            bytes=len(self.words) * 4, words=len(self.words), bound=self.bound,
+            instructions=len(self.instr), capabilities=sorted(set(self.caps)),
+            extensions=sorted(set(self.exts)),
+            entry_points=[list(e) for e in self.entry_points],
+            execution_modes=sorted(set(self.exec_modes)),
+            memory_model=self.mem_model,
+            storage=self.storage_hist(),
+            non_function_storage=self.non_function_storage(),
+            function_locals=self.func_locals,
+            decorations=self.deco_hist(),
+            no_contraction=len(self.no_contraction()),
+            float_ops=self.float_ops(),
+            ext_inst=self.ext_inst_calls(),
+            cooperative_matrix=self.coop_mat(),
+            int_ops=self.int_ops(),
+            control_flow=self.control_flow(),
+            opcodes_top=dict(sorted(((self.opname(op), n) for op, n in self.hist.items()),
+                                    key=lambda kv: -kv[1])[:30]),
+        )
+

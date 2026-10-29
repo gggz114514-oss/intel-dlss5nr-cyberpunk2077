@@ -1,0 +1,415 @@
+"""n26-f08-order: static model of the F08 l0 (split16_b*_l0) WG->(tile,group)
+algebra, and of the write set it produces.
+
+CPU only, no GPU, no toolchain call except the opcode calibration done once in
+opcode_calibration.py (result: 132=OpIMul, 134=OpUDiv, 137=OpUMod, 196=OpShiftLeftLogical,
+199=OpBitwiseAnd, 128=OpIAdd, 234=OpAtomicIAdd, 224=OpControlBarrier).
+
+Two independent things are computed:
+
+1. SPIR-V side: from the module bytes, follow the two `gl_WorkGroupID` component
+   reads forward until they are stored into the `token` / `g` variables, and
+   record the integer algebra (multiplier, modulo, divisor) actually present.
+   Compare that tuple with the grid field of the plan that was really dispatched.
+
+2. Coverage side: enumerate all 132 workgroups x 8 subgroups for each
+   (grid, algebra) pair and compute the exact set of `gf` half-element addresses
+   written, with multiplicity and with the (token, channel) source of every
+   write.  From that: bijection check, first address that can differ from the
+   parent value, first address that is definitely never written, weight-read
+   extent.
+
+No writes outside cards/n26-f08-order/.
+"""
+import json
+import struct
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+T = 1056          # tokens per PASS
+G = 8             # channel groups (64 channels each)
+C = 512           # channels per token
+TILE = 8          # tokens per (tile, group) work item
+
+OPNAME = {
+    12: 'OpExtInst', 43: 'OpConstant', 57: 'OpFunctionCall', 59: 'OpVariable',
+    61: 'OpLoad', 62: 'OpStore', 65: 'OpAccessChain', 66: 'OpInBoundsAccessChain',
+    124: 'OpBitcast', 128: 'OpIAdd', 129: 'OpFAdd', 130: 'OpISub', 131: 'OpFSub',
+    132: 'OpIMul', 133: 'OpFMul', 134: 'OpUDiv', 135: 'OpSDiv', 136: 'OpFDiv',
+    137: 'OpUMod', 138: 'OpSRem', 139: 'OpSMod', 140: 'OpFRem', 141: 'OpFMod',
+    169: 'OpSelect', 194: 'OpShiftRightLogical', 195: 'OpShiftRightArithmetic',
+    196: 'OpShiftLeftLogical', 199: 'OpBitwiseAnd', 200: 'OpBitwiseOr',
+    201: 'OpBitwiseXor', 224: 'OpControlBarrier', 225: 'OpMemoryBarrier',
+    234: 'OpAtomicIAdd',
+}
+# calibrated family: 227..242 are the OpAtomic* instructions (234 = OpAtomicIAdd
+# measured with this glslang; the whole block is contiguous in SPIR-V).
+ATOMICS = set(range(227, 243)) | {318, 319, 320, 321}
+
+TYPE_OPS = {19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33}
+NO_RESULT = {5, 6, 71, 72, 17, 56, 62, 63, 224, 225, 246, 247, 249, 250, 251,
+             252, 253, 254, 255}
+
+
+def words_of(path):
+    data = Path(path).read_bytes()
+    assert struct.unpack('<I', data[:4])[0] == 0x07230203
+    return list(struct.unpack('<%dI' % (len(data) // 4), data))
+
+
+def instructions(words):
+    i, out = 5, []
+    while i < len(words):
+        w = words[i]
+        op, n = w & 0xFFFF, w >> 16
+        out.append((op, words[i + 1:i + n]))
+        i += n
+    return out
+
+
+class Mod:
+    def __init__(self, path):
+        self.path = str(path)
+        self.ins = instructions(words_of(path))
+        self.rid = {}
+        for op, ops in self.ins:
+            if op in NO_RESULT or not ops:
+                continue
+            if op in TYPE_OPS or op in (11, 16, 248):
+                self.rid[ops[0]] = (op, ops)
+            elif len(ops) >= 2:
+                self.rid[ops[1]] = (op, ops)
+        self.uses = {}
+        for op, ops in self.ins:
+            if op in NO_RESULT or len(ops) < 2:
+                continue
+            for o in ops[2:] if op not in TYPE_OPS else ops[1:]:
+                if o in self.rid:
+                    self.uses.setdefault(o, []).append((op, ops))
+        self.builtin, self.names, self.const = {}, {}, {}
+        for op, ops in self.ins:
+            if op == 5 and len(ops) >= 2:
+                b = b''.join(struct.pack('<I', w) for w in ops[1:]).split(b'\0')[0]
+                self.names[ops[0]] = b.decode('utf-8', 'replace')
+            elif op == 71 and len(ops) >= 3 and ops[1] == 11:
+                self.builtin[ops[0]] = ops[2]
+            elif op == 43 and len(ops) >= 3:
+                self.const[ops[1]] = ops[2]
+
+    def cv(self, i):
+        return self.const.get(i)
+
+    def hist(self):
+        h = {}
+        for op, _ in self.ins:
+            h[op] = h.get(op, 0) + 1
+        return h
+
+
+def algebra_of(mod):
+    """Follow each gl_WorkGroupID component read to the variable it lands in."""
+    wgid = [v for v, b in mod.builtin.items() if b == 26]
+    assert len(wgid) == 1, wgid
+    wgid = wgid[0]
+    out = {'spv': mod.path, 'wgid_var': wgid, 'reads': []}
+    for op, ops in mod.ins:
+        if op not in (65, 66) or len(ops) < 4 or ops[2] != wgid:
+            continue
+        comp = mod.cv(ops[3])
+        ptr = ops[1]
+        # find the load of that pointer
+        loads = mod.uses.get(ptr, [])
+        load = [u for u in loads if u[0] == 61]
+        if not load:
+            continue
+        val = load[0][1][1]
+        steps = []
+        frontier, seen = [val], {val}
+        target = None
+        for _ in range(8):
+            nxt = []
+            for v in frontier:
+                for uop, uops in mod.uses.get(v, []):
+                    name = OPNAME.get(uop, 'Op#%d' % uop)
+                    if uop == 62:                       # OpStore
+                        tname = mod.names.get(uops[0], str(uops[0]))
+                        if tname in ('token', 'g'):
+                            target = tname
+                        steps.append('OpStore->%s' % tname)
+                        continue
+                    if uop in (132, 134, 137, 128, 130, 196, 197, 198, 199):
+                        other = [o for o in uops[2:4] if o != v]
+                        c = mod.cv(other[0]) if other else None
+                        steps.append('%s(%s)' % (name, c))
+                    else:
+                        steps.append(name)
+                    if len(uops) >= 2 and uops[1] not in seen:
+                        seen.add(uops[1])
+                        nxt.append(uops[1])
+            frontier = nxt
+            if not frontier:
+                break
+        out['reads'].append({'component': comp, 'target_var': target, 'steps': steps})
+    return out
+
+
+def gf_offset(token, c):
+    return ((token // 16) * (C // 16) + c // 16) * 256 + (token % 16) * 16 + c % 16
+
+
+def enumerate_cfg(gx, gy, tok_fn, grp_fn):
+    items = []
+    for y in range(gy):
+        for x in range(gx):
+            for sg in range(8):
+                items.append({'x': x, 'y': y, 'sg': sg,
+                              'token': tok_fn(x, y, sg), 'g': grp_fn(x, y, sg)})
+    return items
+
+
+def coverage(items):
+    writer = {}
+    for i, it in enumerate(items):
+        tok, g = it['token'], it['g']
+        in_dom = (tok % TILE == 0) and (0 <= tok < T) and (0 <= g < G)
+        for r in range(8):
+            for t in range(4):
+                for c in range(16):
+                    ch = 64 * g + 16 * t + c
+                    off = gf_offset(tok + r, ch)
+                    writer.setdefault(off, []).append((tok + r, ch, in_dom, i))
+    return writer
+
+
+def analyse(name, gx, gy, tok_fn, grp_fn):
+    items = enumerate_cfg(gx, gy, tok_fn, grp_fn)
+    w = coverage(items)
+    n_in = sum(1 for it in items
+               if it['token'] % TILE == 0 and 0 <= it['token'] < T and 0 <= it['g'] < G)
+    offsets = sorted(w)
+    multi = {o: len(v) for o, v in w.items() if len(v) > 1}
+    res = {
+        'config': name,
+        'grid': [gx, gy, 1],
+        'workgroups': gx * gy,
+        'slots': len(items),
+        'in_domain_slots': n_in,
+        'out_of_domain_slots': len(items) - n_in,
+        'token_min': min(it['token'] for it in items),
+        'token_max': max(it['token'] for it in items),
+        'group_min': min(it['g'] for it in items),
+        'group_max': max(it['g'] for it in items),
+        'distinct_offsets': len(offsets),
+        'offset_min': offsets[0],
+        'offset_max': offsets[-1],
+        'domain_elements': T * C,
+        'never_written': T * C - len(offsets),
+        'offsets_written_twice_or_more': len(multi),
+        'max_multiplicity': max(multi.values()) if multi else 1,
+    }
+    first_racy = None
+    for o in offsets:
+        srcs = w[o]
+        doms = [s for s in srcs if s[2]]
+        nondom = [s for s in srcs if not s[2]]
+        if nondom:
+            first_racy = {
+                'offset_half': o, 'byte': o * 2, 'writers': len(srcs),
+                'in_domain_writers': len(doms), 'out_of_domain_writers': len(nondom),
+                'canonical_element': element_of(o),
+                'writers_detail': [
+                    {'wg': [items[s[3]]['x'], items[s[3]]['y']], 'sg': items[s[3]]['sg'],
+                     'source_token': s[0], 'source_channel': s[1], 'in_domain': s[2]}
+                    for s in srcs]}
+            break
+    first_stale = None
+    for o in range(T * C):
+        if o not in w:
+            first_stale = {'offset_half': o, 'byte': o * 2,
+                           'canonical_element': element_of(o)}
+            break
+    res['first_racy_offset'] = first_racy
+    res['first_stale_offset'] = first_stale
+    res['_writer'] = w
+    return res
+
+
+def element_of(off):
+    """Inverse of gf_offset: element -> (token, channel)."""
+    blk = off // 256
+    token = (blk // 32) * 16 + (off % 256) // 16
+    ch = (blk % 32) * 16 + off % 16
+    return {'token': token, 'channel': ch}
+
+
+def weight_extent(group_max):
+    s1 = 0 + group_max * 32768
+    s1_max = s1 + 24576 + 31 * 256 + 256 - 1
+    ex = 262144 + ((group_max * 256 + 224) // 16) * 1024
+    ex_max = ex + 1024 + 3 * 256 + 256 - 1
+    co = 393216 + group_max * 4 * 4096 + (224 // 16) * 256
+    co_max = co + 12288 + 256 + 256 - 1
+    return {'group_max': group_max, 'stage1_max_half': s1_max,
+            'expand_max_half': ex_max, 'contract_max_half': co_max,
+            'max_half': max(s1_max, ex_max, co_max)}
+
+
+def main():
+    root = HERE.parents[1]
+    parent = (root.parent / 'fullnet-mechanism-transfer-20261026' /
+              'f08-register-chain-20261027' / 'candidate.spv')
+    n08 = root / 'cards' / 'n08-f08-wg-map' / 'candidate.spv'
+    n08b = root / 'cards' / 'n08b-f08-order' / 'candidate.spv'
+
+    spv = {n: algebra_of(Mod(p)) for n, p in
+           [('parent', parent), ('n08', n08), ('n08b', n08b)]}
+    for n, p in [('parent', parent), ('n08', n08), ('n08b', n08b)]:
+        m = Mod(p)
+        h = m.hist()
+        spv[n]['atomics_present'] = sorted(k for k in h if k in ATOMICS)
+        spv[n]['control_barriers'] = h.get(224, 0)
+        spv[n]['memory_barriers'] = h.get(225, 0)
+        spv[n]['instructions'] = len(m.ins)
+        spv[n]['words'] = len(words_of(p))
+
+    parent_a = analyse('parent (66,2,1) + algebra P', 66, 2,
+                       lambda x, y, sg: x * 16 + (sg % 2) * 8,
+                       lambda x, y, sg: y * 4 + sg // 2)
+    n08_a = analyse('n08 (33,4,1) + algebra N', 33, 4,
+                    lambda x, y, sg: x * 32 + (sg % 4) * 8,
+                    lambda x, y, sg: y * 2 + sg // 4)
+    authored = analyse('n08b as authored (4,33,1) + algebra T', 4, 33,
+                       lambda x, y, sg: y * 32 + (sg % 4) * 8,
+                       lambda x, y, sg: x * 2 + sg // 4)
+    asrun = analyse('n08b as RUN (66,2,1) + algebra T', 66, 2,
+                    lambda x, y, sg: y * 32 + (sg % 4) * 8,
+                    lambda x, y, sg: x * 2 + sg // 4)
+
+    def same_set(a, b):
+        if set(a.keys()) != set(b.keys()):
+            return False
+        return all({(s[0], s[1]) for s in a[o]} == {(s[0], s[1]) for s in b[o]}
+                   for o in a)
+
+    summary = {
+        'opcode_calibration': 'OPCODE-CALIBRATION.json (132=OpIMul,134=OpUDiv,'
+                              '137=OpUMod,196=OpShiftLeftLogical,199=OpBitwiseAnd,'
+                              '128=OpIAdd,234=OpAtomicIAdd,224=OpControlBarrier)',
+        'spirv_algebra': spv,
+        'configs': [{k: v for k, v in c.items() if not k.startswith('_')}
+                    for c in (parent_a, n08_a, authored, asrun)],
+        'checks': {
+            'parent_is_bijection_over_domain':
+                parent_a['distinct_offsets'] == T * C and
+                parent_a['offsets_written_twice_or_more'] == 0 and
+                parent_a['in_domain_slots'] == parent_a['slots'],
+            'n08_is_bijection_over_domain':
+                n08_a['distinct_offsets'] == T * C and
+                n08_a['offsets_written_twice_or_more'] == 0 and
+                n08_a['in_domain_slots'] == n08_a['slots'],
+            'n08b_authored_equals_n08_write_set': same_set(n08_a['_writer'],
+                                                           authored['_writer']),
+            'asrun_equals_n08_write_set': same_set(n08_a['_writer'], asrun['_writer']),
+        },
+        'weight_read_extent': {'parent_and_authored': weight_extent(7),
+                               'asrun': weight_extent(asrun['group_max'])},
+        'weights_buffer': {'name': 'split16_b23_weights', 'bytes': 3672064,
+                           'half_elements': 3672064 // 2,
+                           'semantic_region_half': 524288},
+        'gf_buffer': {'name': 'split16_b23_F', 'bytes': 1179648,
+                      'half_elements': 1179648 // 2, 'domain_half': T * C},
+    }
+    out = {
+        'card': 'n26-f08-order',
+        'scope': 'CPU-only reconstruction from the SPIR-V bytes, the plan grid field and '
+                 'the PUSH constants; no GPU, no --dump-intermediates (GPU is forbidden '
+                 'for this card), no candidate.',
+        'plan_actually_dispatched': {
+            'path': 'queue/n08b-f08-order/plan-rebased.txt',
+            'sha256': 'fa2033aad1127f23a772d47440f658948617840850a6b3f4e62f691b3711351e',
+            'grid_on_the_16_F08_lines': [66, 2, 1],
+            'source_of_truth': 'queue/n08b-f08-order/gates/spec-gates.json (jobs gates-cand-fixed/'
+                               'gates-cand-fb2) and .../gates/LUNA-DIRECT-CLOCK-RESULTS.json line 134',
+            'card_plan_that_was_not_used': {
+                'path': 'cards/n08b-f08-order/plan.txt',
+                'sha256': '98a26cfa41babb7092a36b68646a656e03df14b9b34f58f734d0f6c4526ea84b',
+                'grid_on_the_16_F08_lines': [4, 33, 1]},
+            'diff_between_the_two_plans': '16 lines, only the grid triplet 4 33 1 <-> 66 2 1 '
+                                          '(same byte length, 167194 B both)',
+        },
+        'summary': summary,
+        'first_divergence': {
+            'plan_pass_row': 23,
+            'plan_line_in_accepted_plan': 1098,
+            'pass_name': 'split16_b23_l0',
+            'buffer': 'split16_b23_F',
+            'binding': 3,
+            'first_f08_pass_in_execution_order': True,
+            'first_racy': asrun['first_racy_offset'],
+            'first_stale': asrun['first_stale_offset'],
+            'prefix_identical_half_elements': (asrun['first_racy_offset'] or {}).get('offset_half'),
+        },
+    }
+    out['arms'] = {
+        'base': {
+            'plan': 'accepted/n06-f06-output-20261027/plan.txt (ae9fe38d...)',
+            'spv': 'f08-register-chain-20261027/candidate.spv (32291c7e...)',
+            'grid': [66, 2, 1],
+            'algebra': 'token = WGID.x*16 + (sg%2)*8 ; g = WGID.y*4 + sg/2',
+            'at_byte_16384': 'value f(token=16, channel=0) of split16_b23_l0, written once by '
+                             'WG(1,0)/sg0; equals the gold-frame value for that element',
+        },
+        'candidate_as_run': {
+            'plan': 'queue/n08b-f08-order/plan-rebased.txt (fa2033aa...)',
+            'spv': 'cards/n08b-f08-order/candidate.spv (d846f99b...)',
+            'grid': [66, 2, 1],
+            'algebra': 'token = WGID.y*32 + (sg%4)*8 ; g = WGID.x*2 + sg/4',
+            'at_byte_16384': 'not a function of the intended domain element: two writers land on '
+                             'it (in-domain f(token=16,channel=0) from WG(0,0)/sg2 and '
+                             'out-of-domain f(token=0,channel=512) from WG(4,0)/sg0); the value '
+                             'stored is whichever workgroup retires last -> undefined',
+        },
+        'candidate_as_authored': {
+            'plan': 'cards/n08b-f08-order/plan.txt (98a26cfa...) - never dispatched',
+            'grid': [4, 33, 1],
+            'status': 'write set identical to the n08 arm, which passed both gold frames; this is '
+                      'the configuration the card meant to test',
+        },
+    }
+    out['witnesses'] = {
+        'plan_sha_used_by_the_run': ['queue/n08b-f08-order/gates/spec-gates.json',
+                                     'queue/n08b-f08-order/gates/LUNA-DIRECT-CLOCK-RESULTS.json'],
+        'frame_hash_candidate': '443559e8ab8cbdfe5c02ce875768f62e281c659704f8bebba09f9fb61a19346f',
+        'frame_hash_gold_fixed': '1755e9c2fadba97f08cb5b02b7a4294cde3675379bdec75352287505f7e129d6',
+        'spv_algebra_extracted_from': 'OPCODE-CALIBRATION.json + model.py algebra_of()',
+        'isa_parent': 'queue/n08b-f08-order/native/captures/native-native-base/ISA/'
+                      'CS_asm3b9ac75d1eef0887_simd32_0000000000000011_16_orig.asm',
+        'isa_candidate': 'queue/n08b-f08-order/native/captures/native-native-cand/ISA/'
+                         'CS_asm432df3e38b664c87_simd32_0000000000000011_16_orig.asm',
+        'isa_witness': 'parent [0060] shl r4.0 <- r69.6 << 2 (x4) and [0120] shl r2.1 <- r69.1 << 4 '
+                       '(x16); candidate [0040] shl r2.1 <- r69.6 << 5 (x32) and [0090] '
+                       'shl r4.0 <- r69.1 << 1 (x2) => the shader axis swap landed, the grid did not',
+    }
+    out['prediction_for_a_future_gpu_dump'] = {
+        'if_gpu_were_allowed': 'run --dump-intermediates on both arms and diff split16_b23_F of '
+                               'PASS 23 (plan line 1098): the first differing byte must be >= 16384 '
+                               'and < 319488; bytes [0,16384) must be identical. Nothing below '
+                               '16384 can differ, and everything at/after 319488 is never written '
+                               'by the candidate arm (stale pool content).',
+        'why_this_card_did_not_do_it': 'GPU work is forbidden for n26-f08-order; the divergence is '
+                                       'already pinned exactly by the plan grid + SPIR-V algebra.',
+    }
+    (HERE / 'FIRST-DIVERGENCE.json').write_text(
+        json.dumps(out, indent=1, ensure_ascii=False), encoding='utf-8')
+    print(json.dumps(summary['configs'], indent=1, ensure_ascii=False))
+    print(json.dumps(summary['checks'], indent=1, ensure_ascii=False))
+    print(json.dumps(summary['weight_read_extent'], indent=1, ensure_ascii=False))
+    print(json.dumps(out['first_divergence'], indent=1, ensure_ascii=False))
+    for n in spv:
+        print(n, json.dumps(spv[n]['reads'], ensure_ascii=False))
+
+
+if __name__ == '__main__':
+    sys.exit(main())

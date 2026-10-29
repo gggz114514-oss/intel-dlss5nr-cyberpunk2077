@@ -1,0 +1,94 @@
+"""Generate candidate-v2.comp = v1 with the measured side effect removed.
+
+Measured v1 result (main-agent GPU round, native + resources stages):
+  body dispatch: instructions 4958 -> 5107 (+149), mov 2245 -> 2421 (+176),
+  and the f32->f16 narrow class `mov (16|M0) ...:hf <- :f` 432 -> 592 (+160)
+  = exactly 20 sites x 8.  Cause: v1 recomputes the pre-activation half
+  narrowing inside each `if(debug)` block, so the debug publish is paid for
+  twice instead of once.
+
+v2 keeps ONE narrowing per site and writes it straight into the consumer A
+fragment, then publishes the debug buffer from that same A fragment and applies
+the activation in place on it:
+
+  v1 : NRH_A ea0=nrh_act_to_A(ec0);  if(debug){NRH_CH d=nrh_narrow(ec0); store(d);}
+  v2 : NRH_A ea0=nrh_cvt_to_A(ec0);  if(debug) store(ea0);  ea0[i]=nr_act_h(ea0[i]);
+
+Bytes into dbg stay identical: the store writes an 8x16 half matrix element
+(r,c) -> dbg[base + r*stride + c], and A-use and accumulator-use have the same
+per-lane element map on this driver (that identity is what makes the parent's
+nrh_to_A a copy, and the parent's gold frame proves it).  Rounding and activation
+order are unchanged: f32->f16 once, then the same nr_act_h on the same values.
+"""
+from pathlib import Path
+
+CARD = Path(__file__).parent
+PARENT = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+              'c32-rest-20261026/body-pv-den-overlap/candidate.comp')
+
+HELPERS = '''
+// --- n01-c32-chain -------------------------------------------------------
+// One narrowing per producer site, written straight into the consumer A
+// fragment; the pre-activation debug publish reads the same fragment (A-use and
+// accumulator-use share the per-lane element map on this driver, so the stored
+// bytes are unchanged), and the activation runs in place on the A fragment.
+NRH_A nrh_cvt_to_A(NRH_C x){NRH_A o=NRH_A(float16_t(0.0));
+ o[0]=float16_t(x[0]);o[1]=float16_t(x[1]);o[2]=float16_t(x[2]);o[3]=float16_t(x[3]);
+ return o;}
+'''
+
+ANCHOR = ("float16_t nr_act_h(float16_t x) {\n"
+          "    float16_t t = clamp(x, float16_t(-4.0), float16_t(4.0));\n"
+          "    float16_t u = fma(float16_t(-0.055908203125), abs(t), float16_t(0.447265625));\n"
+          "    return x * fma(t, u, float16_t(0.89453125));\n"
+          "}\n")
+
+
+def main():
+    text = PARENT.read_text(encoding='utf-8')
+    assert text.count(ANCHOR) == 1
+    text = text.replace(ANCHOR, ANCHOR + HELPERS, 1)
+
+    n_act = 0
+    for b in range(8):
+        for name, off in (('e0', b * 16), ('e1', 1024 + b * 16)):
+            comp = name[1]
+            old = ("NRH_CH {n}=nrh_narrow(ec{c});\n"
+                   "if(debug) coopMatStore({n},dbg,t0*128u+{o}u,128u,LROW);\n"
+                   "{n}[0]=nr_act_h({n}[0]);\n"
+                   "{n}[1]=nr_act_h({n}[1]);\n"
+                   "{n}[2]=nr_act_h({n}[2]);\n"
+                   "{n}[3]=nr_act_h({n}[3]);\n"
+                   "NRH_A ea{c}=nrh_to_A({n});\n").format(n=name, c=comp, o=off)
+            new = ("NRH_A ea{c}=nrh_cvt_to_A(ec{c});\n"
+                   "if(debug) coopMatStore(ea{c},dbg,t0*128u+{o}u,128u,LROW);\n"
+                   "ea{c}[0]=nr_act_h(ea{c}[0]);\n"
+                   "ea{c}[1]=nr_act_h(ea{c}[1]);\n"
+                   "ea{c}[2]=nr_act_h(ea{c}[2]);\n"
+                   "ea{c}[3]=nr_act_h(ea{c}[3]);\n").format(n=name, c=comp, o=off)
+            assert text.count(old) == 1, (name, off, text.count(old))
+            text = text.replace(old, new, 1)
+            n_act += 1
+    assert n_act == 16
+
+    n_ctx = 0
+    for name, src, row in (('ctx00', 'tc00', '(t0+0u)*32u+0u'), ('ctx01', 'tc01', '(t0+0u)*32u+16u'),
+                           ('ctx10', 'tc10', '(t0+8u)*32u+0u'), ('ctx11', 'tc11', '(t0+8u)*32u+16u')):
+        ca = 'ca' + name[3:]
+        old = ("NRH_CH {n}=nrh_narrow({s});\n"
+               "if(debug) coopMatStore({n},dbg,18432u+{r},32u,LROW);\n"
+               "NRH_A {ca}=nrh_to_A({n});\n").format(n=name, s=src, ca=ca, r=row)
+        new = ("NRH_A {ca}=nrh_cvt_to_A({s});\n"
+               "if(debug) coopMatStore({ca},dbg,18432u+{r},32u,LROW);\n").format(
+                   n=name, s=src, ca=ca, r=row)
+        assert text.count(old) == 1, (name, text.count(old))
+        text = text.replace(old, new, 1)
+        n_ctx += 1
+    assert n_ctx == 4
+
+    (CARD / 'candidate-v2.comp').write_text(text, encoding='utf-8')
+    print('candidate-v2.comp written: 20 sites, one narrowing each, no duplicate debug narrow')
+
+
+if __name__ == '__main__':
+    main()

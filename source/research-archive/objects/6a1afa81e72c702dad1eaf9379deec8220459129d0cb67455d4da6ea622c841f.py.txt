@@ -1,0 +1,96 @@
+"""census.py - shared-memory access census for one SPIR-V module.
+
+Counts and classifies every read/write site of every Workgroup variable, in program
+order, with the resolved index expression.  This is the CPU-only tool behind the B1
+"X is read exactly once" claim and the four-subgroup barrier placement proof.
+
+usage: python census.py <spv> [out.json]
+"""
+import json
+import sys
+from collections import OrderedDict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from spvlite import Mod, OP  # noqa: E402
+
+
+def census(path):
+    m = Mod(path)
+    rec = OrderedDict()
+    rec["spv"] = m.path
+    rec["bytes"] = len(m.raw)
+    rec["words"] = len(m.w)
+    rec["bound"] = m.bound
+    rec["lds"] = [{"name": v["name"], "id": v["id"], "bytes": v["bytes"]}
+                  for v in m.wg_vars()]
+    rec["lds_bytes"] = sum(v["bytes"] for v in m.wg_vars())
+    rec["n_workgroup_vars"] = len(m.wg_vars())
+
+    per = OrderedDict()
+    for v in m.wg_vars():
+        acc = m.accesses(v["id"])
+        kinds = OrderedDict()
+        for a in acc:
+            kinds[a["kind"]] = kinds.get(a["kind"], 0) + 1
+        # collapse the index expressions to a multiset; that is what a reviewer
+        # has to read (count of identical expressions)
+        exprs = OrderedDict()
+        for a in acc:
+            key = (a["kind"], " | ".join(a["index"]) if a.get("index") else "-")
+            exprs[key] = exprs.get(key, 0) + 1
+        sites = []
+        for a in acc:
+            s = OrderedDict()
+            s["kind"] = a["kind"]
+            s["inst_index"] = a["idx"]
+            s["word_offset"] = a["woff"]
+            if a.get("index"):
+                s["index_expr"] = " | ".join(a["index"])
+                s["index_const_parts"] = [v2 for v2 in a["index_const"]
+                                          if v2 is not None]
+            if a.get("res"):
+                s["result_id"] = a["res"]
+            sites.append(s)
+        per[v["name"]] = OrderedDict([
+            ("id", v["id"]), ("bytes", v["bytes"]),
+            ("counts", kinds),
+            ("distinct_index_expressions",
+             [{"kind": k[0], "expr": k[1], "count": c} for k, c in exprs.items()]),
+            ("sites", sites),
+        ])
+    rec["vars"] = per
+    rec["barriers"] = m.barriers()
+    rec["cooperative_matrix"] = {
+        "loads": sum(1 for i in m.insts if i.name == "OpCooperativeMatrixLoadKHR"),
+        "stores": sum(1 for i in m.insts if i.name == "OpCooperativeMatrixStoreKHR"),
+        "muladd": sum(1 for i in m.insts if i.name == "OpCooperativeMatrixMulAddKHR"),
+    }
+    rec["histogram"] = m.histogram()
+    # helper-function call sites: glslang keeps nr_i8_put_x / nr_i8_put_e as real
+    # SPIR-V functions, so the *static* store count is 1 each and the byte traffic
+    # is 1 store x (loop trip count 4) x (number of call sites).
+    calls = OrderedDict()
+    for fn in ("nr_i8_put_x", "nr_i8_put_e", "nr_i8_deq", "nr_i8_deq_add"):
+        sites = m.call_sites(fn)
+        if sites:
+            calls[fn] = {"n_call_sites": len(sites), "sites": sites}
+    rec["helper_calls"] = calls
+    return rec
+
+
+if __name__ == "__main__":
+    r = census(sys.argv[1])
+    txt = json.dumps(r, indent=1) + "\n"
+    if len(sys.argv) > 2:
+        Path(sys.argv[2]).write_text(txt, encoding="utf-8")
+        print("wrote", sys.argv[2])
+        # short console view
+        print("lds_bytes=%d vars=%d" % (r["lds_bytes"], r["n_workgroup_vars"]))
+        for n, v in r["vars"].items():
+            print("  %-4s %5d B  %s" % (n, v["bytes"], dict(v["counts"])))
+        print("barriers: %d" % len(r["barriers"]))
+        for b in r["barriers"]:
+            print("  idx=%-5d woff=%-6d %s" % (b["idx"], b["woff"], b))
+    else:
+        print(txt)

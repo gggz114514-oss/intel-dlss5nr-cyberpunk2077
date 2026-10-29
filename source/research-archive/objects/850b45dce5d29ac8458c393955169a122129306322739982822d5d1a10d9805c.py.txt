@@ -1,0 +1,132 @@
+"""n39-f06-c256-slack: build the three candidate sources from their parents, plus the patch.
+
+1. candidate.comp      F06 C256 (15 PASS): delete the 32 KiB staging array + copy + barriers,
+                       load the DPAS A operand straight from the read-only gT tile.
+2. candidate-f18.comp  F18 C256 (1 PASS, 9057283f): same mechanism on its own staging array shM.
+3. candidate-padback.comp  the F06 candidate + a 32768 B shared array that is written once per
+                       thread and read in the debug branch: the pad-back CONTROL that restores the
+                       old declaration without restoring the old copy work (L38).
+
+Every edit is asserted to occur exactly once, so each candidate is its parent minus the
+staging array and nothing else.  Writes SOURCE-DIFF.patch (all three, unified).
+"""
+import difflib
+import pathlib
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+D26 = pathlib.Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024'
+                   r'/fullnet-mechanism-transfer-20261026')
+
+F06_PARENT = D26 / 'f06-scale-fragments/family/c256/candidate.comp'
+F18_PARENT = D26 / 'contract-scale-fragments/family/c256/candidate.comp'
+
+F06_EDITS = [
+    ('shared float16_t shT[16384];\n', ''),
+    ("""
+    for (uint e = t_local; e < 16384u; e += 256u)
+        shT[e] = gT[w * 16384u + e];
+    barrier();
+""", '\n'),
+    ("""            dbg[425984u + e] = shT[e];
+        }
+        barrier();
+""", """            dbg[425984u + e] = gT[w * 16384u + e];
+        }
+"""),
+    ("""            MAT_A a;  coopMatLoad(a, shT, m0 * 256u + k0, 256u, LROW);""",
+     """            MAT_A a;  coopMatLoad(a, gT, w * 16384u + m0 * 256u + k0, 256u, LROW);"""),
+]
+F06_NOTE = """// n39-f06-c256-slack: the 32768 B staging array is deleted.  shT was a byte-for-byte
+// copy of the read-only gT tile, and the DPAS A operand is now loaded straight out of
+// gT with the same offsets / row-major stride / order, exactly like the in-chain
+// F05 C256 kernel loads its A operand from gY.  Workgroup memory 32768 B -> 0 B.
+"""
+
+F18_EDITS = [
+    ('shared float16_t shM[16384];\n', ''),
+    ("""
+    for (uint e = t_local; e < 16384u; e += 256u)
+        shM[e] = gM[w * 16384u + e];
+    barrier();
+""", '\n'),
+    ("""            MAT_A a; coopMatLoad(a, shM, abaseA + k0, 256u, LROW);""",
+     """            MAT_A a; coopMatLoad(a, gM, w * 16384u + abaseA + k0, 256u, LROW);"""),
+    ("""            coopMatLoad(a, shM, abaseB + k0, 256u, LROW);""",
+     """            coopMatLoad(a, gM, w * 16384u + abaseB + k0, 256u, LROW);"""),
+]
+F18_NOTE = """// n39-f06-c256-slack: same mechanism as the F06 C256 candidate in this card -- the
+// 32768 B shM staging array was a byte-for-byte copy of the read-only gM (weights input)
+// tile, so the DPAS A operand is loaded straight out of gM at the same offsets.
+// Workgroup memory 32768 B -> 0 B.  Nothing else changes.
+"""
+
+# pad-back control: only the *declaration* comes back (plus one store per thread and a
+# debug-gated read so the array cannot be optimised away); the copy work stays deleted.
+PAD_DECL = 'shared float16_t shPad[16384];   // pad-back control: 32768 B declared, NOT copied\n'
+PAD_ANCHOR = '\n    if (debug) {\n        for (uint e = t_local;'
+PAD_CODE = """
+    // pad-back control (n39): restore the 32768 B declaration without restoring the copy
+    shPad[t_local] = gT[w * 16384u + t_local];
+    const bool pad_live = (shPad[t_local] == shPad[t_local]);
+    if (debug && !pad_live) dbg[425984u] = float16_t(0.0);   // never taken; keeps shPad live
+"""
+
+
+def apply(src, edits, note):
+    out = src
+    for old, new in edits:
+        assert out.count(old) == 1, ('edit not unique', out.count(old), old[:70])
+        out = out.replace(old, new)
+    i = out.index('#version 450')
+    return out[:i] + note + out[i:]
+
+
+def write_diff(path, a_name, b_name, a, b):
+    path.write_text(''.join(difflib.unified_diff(a.splitlines(True), b.splitlines(True),
+                                                 fromfile=a_name, tofile=b_name, n=3)),
+                    encoding='utf-8')
+
+
+def main():
+    f06 = F06_PARENT.read_text(encoding='utf-8')
+    f18 = F18_PARENT.read_text(encoding='utf-8')
+    (CARD / 'parent.comp').write_text(f06, encoding='utf-8')
+    (CARD / 'parent-f18.comp').write_text(f18, encoding='utf-8')
+
+    cand = apply(f06, F06_EDITS, F06_NOTE)
+    assert 'shT' not in cand[cand.index('#version 450'):]
+    (CARD / 'candidate.comp').write_text(cand, encoding='utf-8')
+
+    cf18 = apply(f18, F18_EDITS, F18_NOTE)
+    assert 'shM' not in cf18[cf18.index('#version 450'):]
+    (CARD / 'candidate-f18.comp').write_text(cf18, encoding='utf-8')
+
+    # pad-back: F06 candidate + declaration + one store/thread + a debug-gated read
+    ars_line = next(l for l in cand.splitlines(True) if 'const uint ars' in l)
+    assert cand.count(ars_line) == 1
+    pad = cand.replace(ars_line, ars_line + PAD_CODE, 1)
+    assert pad.count('shPad[t_local] = ') == 1
+    pad = pad.replace('#define MAT_H coopmat<float16_t, gl_ScopeSubgroup, 8, 16, '
+                      'gl_MatrixUseAccumulator>',
+                      PAD_DECL + '#define MAT_H coopmat<float16_t, gl_ScopeSubgroup, 8, 16, '
+                      'gl_MatrixUseAccumulator>', 1)
+    assert 'shPad[16384]' in pad
+    (CARD / 'candidate-padback.comp').write_text(pad, encoding='utf-8')
+
+    chunks = []
+    for a, b, an, bn in ((f06, cand, 'parent.comp (F06 C256, sha c3efee68)', 'candidate.comp'),
+                         (f18, cf18, 'parent-f18.comp (F18 C256, sha 7ef6e586)', 'candidate-f18.comp'),
+                         (cand, pad, 'candidate.comp', 'candidate-padback.comp (control)')):
+        chunks.append(''.join(difflib.unified_diff(a.splitlines(True), b.splitlines(True),
+                                                  fromfile=an, tofile=bn, n=3)))
+    (CARD / 'SOURCE-DIFF.patch').write_text(''.join(chunks), encoding='utf-8')
+    for name in ('candidate.comp', 'candidate-f18.comp', 'candidate-padback.comp'):
+        p = CARD / name
+        print('%-26s %5d B' % (name, p.stat().st_size))
+    print('patch %d B' % (CARD / 'SOURCE-DIFF.patch').stat().st_size)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

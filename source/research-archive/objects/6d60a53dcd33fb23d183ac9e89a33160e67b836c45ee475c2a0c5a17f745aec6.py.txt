@@ -1,0 +1,65 @@
+"""Decisive check: is the *decode* (X gather + weight/tap unpacking) right?
+
+Compute an unquantised-activation float path from the same unpacked weights
+  Y_clean = Wc~ @ act(We~ @ X) + seed
+and compare it with the FP16 teacher.  If the decode is correct this must land
+within the int8 *weight* quantisation error (a few %), because the only things
+removed are the X and E code quantisers.
+"""
+import sys
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+which = sys.argv[1] if len(sys.argv) > 1 else "B"
+plan = L.D / ("c32-minmax/local-b4.txt" if which == "A" else "c32-equalized-b4/local-b4.txt")
+gpu_path = L.D / ("c32-minmax/local-b4/replayed-network.bin" if which == "A"
+                  else "c32-equalized-b4/local-b4/replayed-network.bin")
+info = L.block_bindings(plan)
+x_flat = np.fromfile(info["input"], dtype="<f2")
+gpu = np.fromfile(gpu_path, dtype="<f2")
+teach_flat = np.fromfile(L.D / "dump-fp16/dump_skip4.bin", dtype="<f2")
+we, wc = L.load_w8(info["w8"])
+fsc = L.load_fsc(info["fsc"])
+rs = L.load_rs(info["wb"], info["rs_base"])
+
+rng = np.random.default_rng(11)
+tiles = np.sort(rng.choice(168 * 96, size=200, replace=False))
+TT, CC = np.meshgrid(tiles, np.arange(16), indexing="ij")
+TT = TT.ravel(); CC = CC.ravel()
+x = L.gather(x_flat, TT, CC)
+base = TT * 512 + CC * 16
+
+
+def take(flat):
+    out = np.empty((32, TT.size), np.float16)
+    for c in range(32):
+        off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+        out[c] = flat[base + off]
+    return out
+
+
+ref = take(gpu).astype(np.float32)
+te = take(teach_flat).astype(np.float32)
+tap_e = np.asarray(fsc[4:132], np.float32)
+tap_c = np.asarray(fsc[132:164], np.float32)
+sX = np.float32(fsc[0]); sE = np.float32(fsc[2])
+sWe = tap_e / sX
+sWc = tap_c / sE
+We_f = we.astype(np.float32) * sWe[:, None]     # [128,32]
+Wc_f = wc.astype(np.float32) * sWc[:, None]     # [32,128]
+x32 = L.widen(x)
+seed = L.widen(L.to_half(x * rs[:, None]))
+
+e_pre = We_f @ x32
+a_h = L.act_h(L.to_half(e_pre))
+y_clean = Wc_f @ L.widen(a_h) + seed
+
+print("arm", which, "N", TT.size)
+print("y_clean vs teacher  :", L.rel_l2(y_clean, te))
+print("y_clean vs gpu      :", L.rel_l2(y_clean, ref))
+print("gpu     vs teacher  :", L.rel_l2(ref, te))
+print("mean|y_clean|", float(np.abs(y_clean).mean()), "mean|gpu|", float(np.abs(ref).mean()),
+      "mean|teacher|", float(np.abs(te).mean()))

@@ -1,0 +1,161 @@
+"""S05 step 7: diagnose the GPU qX gate (3.17% code agreement) without running a GPU.
+
+Questions:
+  Q1 is block9_qx.bin a valid qX field at all (layout/channel order), or stale pool memory?
+  Q2 what per-input-channel step does the GPU producer actually use, and how does it compare
+     with (a) the bound pack's uniform step sX_old, (b) the step my shipped scale table asks
+     for, (c) the step my CPU model assumed?
+  Q3 if the shipped step is off by a global factor, does the CPU forward with that step
+     reproduce the dumped block9_Y.bin?
+
+Evidence used: GPU/gate-34189/{block9_qx,block9_M,block9_Y}.bin (read-only dumps),
+the bound pack + my shipped pack, the FP16 teacher dumps.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import s05_common as C
+
+G = C.CARD / 'GPU/gate-34189'
+QW = C.CARD / 'PACK/c128_b9_weights.i8.bin'
+QS = C.CARD / 'PACK/c128_b9_scales.f32.bin'
+data = C.rows()
+buf = data['buffers']
+r1 = C.row_by_name('block9_swin_body_1', data)
+b1 = {int(k): v for k, v in r1['bindings'].items()}
+push = [int(x) for x in r1['push']]
+OLD_W = buf[b1[0][0]]['file']
+OLD_S = buf[b1[1][0]]['file']
+pk = C.decode_pack(OLD_W, OLD_S, buf[46]['file'], push)
+sc_old = pk['sc']
+sc_new = C.f32(QS)
+w_new = C.i8(QW).astype(np.int32)
+
+TEACH = C.D / 'dump-fp16'
+X = C.load_x(TEACH / 'dump_block8_out.bin')
+Y = C.load_y(TEACH / 'dump_swin_9_Y.bin')
+
+qx_gpu = C.i8(G / 'block9_qx.bin')
+y_gpu = C.f16(G / 'block9_Y.bin').reshape(C.TOK, 128)
+m_gpu = C.i8(G / 'block9_M.bin')
+
+out = dict(card='S05-c128', step='gate diagnosis', gpu_dir=str(G))
+
+# ---------------------------------------------------------------- raw statistics
+def stats_i8(a):
+    return dict(elements=int(a.size), zero=int((a == 0).sum()), at_127=int((a == 127).sum()),
+                at_m127=int((a == -127).sum()), at_m128=int((a == -128).sum()),
+                absmax=int(np.abs(a).max()), mean=float(a.mean()), std=float(a.std()),
+                histogram_top=[[int(v), int(n)] for v, n in
+                               sorted(zip(*np.unique(a, return_counts=True)), key=lambda t: -t[1])[:8]])
+
+
+def stats_h(a):
+    a = a.astype(np.float64)
+    return dict(elements=int(a.size), zero=int((a == 0).sum()), absmax=float(np.abs(a).max()),
+                rms=float(np.sqrt((a ** 2).mean())), mean=float(a.mean()),
+                finite=bool(np.isfinite(a).all()))
+
+
+out['raw'] = dict(qx=stats_i8(qx_gpu), mid=stats_i8(m_gpu), y=stats_h(y_gpu),
+                  teacher_y=stats_h(Y), teacher_x=stats_h(X))
+
+# ---------------------------------------------------------------- layout probes
+idx_m8 = ((np.arange(C.WIN_X * C.WIN_Y)[:, None, None] * 8192
+           + (np.arange(64)[None, :, None] >> 3) * 1024
+           + np.arange(128)[None, None, :] * 8
+           + (np.arange(64)[None, :, None] & 7)).reshape(-1))
+qx_m8 = qx_gpu[idx_m8].reshape(C.TOK, 128)                       # my assumed layout
+qx_tok = qx_gpu[:C.TOK * 128].reshape(C.TOK, 128)                # token-major
+out['layouts'] = dict(
+    m8col=dict(nonzero=int((qx_m8 != 0).sum()), absmax=int(np.abs(qx_m8).max())),
+    token_major=dict(nonzero=int((qx_tok != 0).sum()), absmax=int(np.abs(qx_tok).max())),
+)
+
+# per-channel regression of the dump against the teacher X: slope ~ 1/step
+def slope_per_channel(q, x, mask_hi=0.0):
+    num = (q * x).sum(axis=0)
+    den = (x * x).sum(axis=0)
+    return num / np.maximum(den, 1e-12)
+
+
+sl_m8 = slope_per_channel(qx_m8, X)
+sl_tok = slope_per_channel(qx_tok, X)
+out['per_channel_slope'] = dict(
+    m8col=dict(median=float(np.median(sl_m8)), p10=float(np.percentile(sl_m8, 10)),
+               p90=float(np.percentile(sl_m8, 90)), first8=[float(v) for v in sl_m8[:8]]),
+    token_major=dict(median=float(np.median(sl_tok)), p10=float(np.percentile(sl_tok, 10)),
+                     p90=float(np.percentile(sl_tok, 90)), first8=[float(v) for v in sl_tok[:8]]),
+)
+# a valid field must have the same slope on every channel up to the packed per-channel part
+best = 'm8col' if np.std(np.log2(np.maximum(np.abs(sl_m8), 1e-12))) < np.std(np.log2(np.maximum(np.abs(sl_tok), 1e-12))) else 'token_major'
+out['layout_verdict'] = dict(chosen=best, note='lower spread of log2 slope across channels wins')
+
+# ---------------------------------------------------------------- step hypotheses
+e = np.rint(np.log2(np.abs(X).max(axis=0))).astype(np.int64)
+D = np.exp2(e.astype(np.float64)).astype(np.float32)
+sX_old = np.float32(sc_old[0])
+f0 = 0.8
+sx_base = np.float32(np.max(np.abs(X).max(axis=0) / D) / 127)
+steps = dict(
+    old_uniform=float(sX_old),
+    shipped=np.round((sX_old * f0 * D).astype(np.float64), 5).tolist()[:8],
+    cpu_model=np.round((sx_base * f0 * D).astype(np.float64), 5).tolist()[:8],
+)
+out['steps_first8'] = dict(old_uniform=steps['old_uniform'], shipped_D=steps['shipped'],
+                           cpu_D=steps['cpu_model'], D=[float(v) for v in D[:8]],
+                           ratio_shipped_over_cpu=float((sX_old * f0) / (sx_base * f0)))
+
+# agreement for each step hypothesis with the m8col layout
+q_sel = qx_m8
+hyp = {}
+for name, step in [('old_uniform', np.full(128, sX_old, np.float32)),
+                   ('shipped_sXold_f0_D', (sX_old * np.float32(f0) * D).astype(np.float32)),
+                   ('cpu_model_sxbase_f0_D', (sx_base * np.float32(f0) * D).astype(np.float32))]:
+    qc = C.code(X / step[None, :])
+    hyp[name] = dict(equal_frac=float((qc == q_sel).mean()),
+                     maxdiff=int(np.abs(qc.astype(np.int32) - q_sel.astype(np.int32)).max()),
+                     code_absmax=float(np.abs(qc).max()))
+out['hypotheses'] = hyp
+
+# ---------------------------------------------------------------- Y closure with the shipped step
+we_new = w_new[0:65536].reshape(512, 128)
+wm_new = w_new[65536:81920].reshape(128, 128)
+wc_new = w_new[81920:98304].reshape(128, 128)
+y_cpu_shipped = C.ffn_forward(X, we_new, wm_new, wc_new, sc_new,
+                              invX=(1.0 / (sX_old * np.float32(f0) * D)).astype(np.float32))
+y_cpu_model = C.ffn_forward(X, we_new, wm_new, wc_new, sc_new,
+                            invX=(np.float32(sc_new[1]) / D).astype(np.float32))
+out['y_closure'] = dict(
+    dump_vs_cpu_shipped_step=dict(rel_l2=C.rel(y_gpu, y_cpu_shipped),
+                                  byte_equal_frac=float((y_gpu == y_cpu_shipped).mean())),
+    dump_vs_cpu_model_step=dict(rel_l2=C.rel(y_gpu, y_cpu_model)),
+    dump_vs_teacher=dict(rel_l2=C.rel(y_gpu, Y)),
+    cpu_shipped_vs_teacher=dict(rel_l2=C.rel(y_cpu_shipped, Y)),
+    cpu_model_vs_teacher=dict(rel_l2=C.rel(y_cpu_model, Y)),
+    scale_ratio=dict(dump_over_teacher_rms=float(np.sqrt((y_gpu.astype(np.float64) ** 2).mean())
+                                                 / np.sqrt((Y.astype(np.float64) ** 2).mean()))),
+)
+
+# ---------------------------------------------------------------- M closure (d1 output)
+i8_w = we_new
+qa_model = C.code(C.act(C.half((C.code(X * (np.float32(sc_new[1]) / D)[None, :]) @ i8_w.astype(np.float32).T)
+                               * sc_new[16:528][None, :])) * np.float32(sc_new[2]))
+mo = np.empty((C.TOK, 128), np.float32)
+for g in range(4):
+    mo[:, g * 32:(g + 1) * 32] = qa_model[:, g * 128:(g + 1) * 128] @ wm_new[g * 32:(g + 1) * 32].astype(np.float32).T
+qm_model = C.code(np.rint(mo) * np.float32(sc_new[528:656])[None, :] * np.float32(sc_new[3]))
+m_m8 = m_gpu[idx_m8].reshape(C.TOK, 128)
+out['m_closure'] = dict(equal_frac_model_step=float((qm_model == m_m8).mean()),
+                        equal_frac_model_vs_dump_token_major=float((qm_model == m_gpu[:C.TOK * 128].reshape(C.TOK, 128)).mean()),
+                        dump_absmax=int(m_gpu.absmax()) if hasattr(m_gpu, 'absmax') else int(np.abs(m_gpu).max()),
+                        model_absmax=float(np.abs(qm_model).max()))
+
+(C.CARD / 'evidence').mkdir(exist_ok=True)
+(C.CARD / 'evidence/GATE-DIAG.json').write_text(json.dumps(out, indent=2))
+print(json.dumps({k: out[k] for k in ('raw', 'layouts', 'per_channel_slope', 'layout_verdict',
+                                     'steps_first8', 'hypotheses', 'y_closure', 'm_closure')}, indent=2))

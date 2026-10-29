@@ -1,0 +1,142 @@
+"""CPU headroom probe for C32 body4 E-channel equalization.
+
+Decodes the unified C32 weight pack (expand We, contract Wc), reproduces the
+half activation chain used by the kernel, and compares four paths:
+
+  ref     : exact X -> exact E -> contract (activation-only reference)
+  current : per-channel X codes -> per-tensor E codes -> contract
+  E-eq    : per-channel X codes -> per-channel E codes, D folded into Wc
+  tok-E   : per-tensor E with per-token scale (upper bound, not allowed)
+
+Scale conventions from c32_i8_common.glsl:
+  fsc[0]=sX, fsc[1]=invX, fsc[2]=sE, fsc[3]=invE
+  fsc[4..131]   = sX*sWe[128]   (per-output expand tap)
+  fsc[132..163] = sE*sWc[32]    (per-output contract tap)
+  fsc[292..323] = per-input-channel invX (X/D)
+The int32 accumulator times the folded tap is the kernel's dequant.
+This is a CPU estimate on captured FP16 teacher inputs, not a GPU result.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+
+D = Path(r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24")
+TEACHERS = [D / "dump-fp16", D / "teacher-diagnostics/teacher-41444", D / "teacher-diagnostics/teacher-43654"]
+OUT = D / "c32-equalized-b4"
+BLOCK = 4
+
+
+def half(x):
+    return x.astype(np.float16).astype(np.float32)
+
+
+def code(x, inv):
+    return np.clip(np.rint(x * inv), -127, 127)
+
+
+def act(e):
+    t = np.clip(e, -4.0, 4.0)
+    u = half(-0.055908203125 * np.abs(t) + 0.447265625)
+    v = half(t * u + 0.89453125)
+    return half(e * v)
+
+
+def decode_unified(w8: np.ndarray):
+    we = np.zeros((128, 32), np.float32)
+    for o in range(128):
+        for k in range(32):
+            we[o, k] = w8[(o // 8) * 1024 + k * 32 + (o % 8)]
+    wc = np.zeros((32, 128), np.float32)
+    for o in range(32):
+        for e in range(128):
+            wc[o, e] = w8[16384 + ((o // 8) * 4 + (e // 32)) * 1024 + (e % 32) * 32 + (o % 8)]
+    return we, wc
+
+
+def encode_wc(wc: np.ndarray):
+    sw = np.maximum(np.abs(wc).max(axis=1) / 127.0, 1e-12).astype(np.float32)
+    q = np.clip(np.rint(wc / sw[:, None]), -127, 127).astype(np.float32)
+    return q, sw
+
+
+def load_x(td: Path):
+    raw = np.fromfile(td / f"dump_block{BLOCK-1}_out.bin", dtype="<f2").astype(np.float32)
+    return raw.reshape(-1, 2, 16, 16).transpose(0, 2, 1, 3).reshape(-1, 32)
+
+
+def main():
+    w8 = np.fromfile(OUT / f"b{BLOCK}-weights.bin", dtype=np.int8)
+    sc = np.fromfile(OUT / f"b{BLOCK}-scales.bin", dtype="<f4")
+    assert w8.size == 49152 and sc.size == 324, (w8.size, sc.size)
+    qwe, qwc = decode_unified(w8)
+    sx, invx, se, inve = (float(v) for v in sc[:4])
+    invx_ch = sc[292:324].astype(np.float32)
+    swe = sc[4:132].astype(np.float32)        # sX*sWe
+    swc_tap = sc[132:164].astype(np.float32)  # sE*sWc
+    # Real dequant weights implied by the pack.
+    we_real = qwe * (swe / sx)[:, None]
+    wc_real = qwc * (swc_tap / se)[:, None]
+
+    rows = []
+    for td in TEACHERS:
+        x = load_x(td)
+        x = x[np.arange(0, len(x), 4)]
+        # activation-only reference (exact X, exact E)
+        e_ref = half(x @ we_real.T)
+        a_ref = act(e_ref)
+        y_ref = half(a_ref @ wc_real.T)
+
+        # current path
+        qx = code(x, invx_ch[None, :])
+        e_cur = half((qx @ qwe.T) * swe[None, :])
+        a_cur = act(e_cur)
+        qe = code(a_cur, inve)
+        y_cur = half((qe @ qwc.T) * swc_tap[None, :])
+
+        # E-equalized path
+        amax_e = np.max(np.abs(a_cur), axis=0)
+        pos = amax_e[amax_e > 0]
+        target = float(np.exp(np.mean(np.log(pos)))) if len(pos) else 1.0
+        d = np.exp2(np.rint(np.log2(np.maximum(amax_e, 1e-30) / target)))
+        d[amax_e == 0] = 1.0
+        a_eq = a_cur / d[None, :]
+        se2 = np.float32(np.max(np.abs(a_eq)) / 127.0)
+        qwc2, swc2 = encode_wc(wc_real * d[None, :])
+        qe2 = code(a_eq, 1.0 / se2)
+        y_eq = half((qe2 @ qwc2.T) * (se2 * swc2)[None, :])
+
+        # per-token E upper bound
+        row = np.maximum(np.max(np.abs(a_cur), axis=1), 1e-30)
+        qe3 = code(a_cur, (127.0 / row)[:, None])
+        y_tok = half((qe3 @ qwc.T) * (row[:, None] / 127.0 * (swc_tap / se)[None, :]))
+
+        def rel(y):
+            return float(np.linalg.norm(y - y_ref) / np.linalg.norm(y_ref))
+
+        r = {
+            "frame_dir": str(td),
+            "samples": int(len(x)),
+            "e_channel_absmax_ratio": float(amax_e.max() / max(amax_e.min(), 1e-30)),
+            "current_rel": rel(y_cur),
+            "e_eq_rel": rel(y_eq),
+            "tok_e_rel": rel(y_tok),
+            "se": float(se), "se_e_eq": float(se2),
+            "d_min": float(d.min()), "d_max": float(d.max()),
+        }
+        rows.append(r)
+        print(r)
+
+    out = {
+        "scope": "CPU estimate, captured FP16 teacher inputs, body4 expand+activation+contract; not GPU",
+        "block": BLOCK,
+        "rows": rows,
+        "interpretation": "current vs e_eq isolates E-channel imbalance; tok_e is an upper bound that static candidates may not use",
+    }
+    (OUT / "E-HEADROOM.json").write_text(json.dumps(out, indent=2), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

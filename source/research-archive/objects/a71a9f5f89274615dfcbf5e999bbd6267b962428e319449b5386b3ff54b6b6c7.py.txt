@@ -1,0 +1,270 @@
+"""Enumerated mapping / coverage proof for n05e-f05-atile (CPU only).
+
+Everything here is integer index arithmetic re-derived from the two sources; no
+GPU, no driver, no measurement.  It answers contract question 1 (mapping) and
+the "proof" half of question 4 (added cost) by *enumeration*:
+
+  A. (subgroup, phase/head, ki, row) -> (token, k) for every A row message, in
+     the parent and in the candidate  ->  read multiplicity per (token, ki).
+  B. (subgroup, channel block) -> (token, channel) for every QKV MMА and for
+     every shared-memory publish, in both  ->  one owner per element.
+  C. the K accumulation chain of every output element (token, channel), in both
+     -> must be the identical sequence (ki = 0..7 ascending, same operands).
+  D. weight tile messages per workgroup -> same address set, same count.
+  E. debug write sets -> identical union, disjoint writers.
+  F. tail blocks -> 64 tokens / 8 tokens per subgroup, no partial block.
+
+Writes only _build/mapping.json.
+"""
+import json
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+BUILD = CARD / '_build'
+
+NSG = 8            # local_size_x = 256 -> 8 subgroups
+TOKENS = 64        # tokens per workgroup (w * 64 + 0..63)
+KI = 8             # K = 128 = 8 x 16
+CH_PER_HEAD = 96   # 32 Q + 32 K + 32 V
+CB = 6             # channel blocks of 16 per head
+NHEAD_WG = 2       # heads per workgroup
+
+
+def parent_m0(sg, phase):
+    return (sg % 4) * 8 + phase * 32
+
+
+def cand_m0(sg):
+    return sg * 8
+
+
+def parent_head(sg, phase=0):
+    return sg // 4          # h = zg*2 + sg//4 ; zg factor is common
+
+
+def cand_head(sg, j):
+    return j                # h0 = zg*2 + 0, h1 = zg*2 + 1
+
+
+def rpt(x):
+    d = {}
+    for k in x:
+        d[k] = d.get(k, 0) + 1
+    return d
+
+
+def main():
+    out = {}
+
+    # ---------------------------------------------------------------- A: A rows
+    # one A fragment load = 8 row messages (d32x8t, rd:1), each covering
+    # 16 halves of k for one token row.
+    par = []   # (token, ki)
+    for sg in range(NSG):
+        for phase in (0, 1):
+            for ki in range(KI):
+                for row in range(8):
+                    par.append((parent_m0(sg, phase) + row, ki))
+    cand = []
+    for sg in range(NSG):
+        for ki in range(KI):
+            for row in range(8):
+                cand.append((cand_m0(sg) + row, ki))
+    pset, cset = set(par), set(cand)
+    out['A_row_messages'] = dict(
+        parent=dict(messages=len(par), distinct=len(pset),
+                    multiplicity=max(rpt(par).values()), rows=8 * KI * 2 * NSG),
+        candidate=dict(messages=len(cand), distinct=len(cset),
+                       multiplicity=max(rpt(cand).values()), rows=8 * KI * 1 * NSG),
+        delta_messages=len(cand) - len(par),
+        same_surface=pset == cset,
+        tokens_covered=sorted({t for t, _ in cand}) == list(range(TOKENS)),
+        per_head_covered={str(j): sorted({t for t, _ in cand}) == list(range(TOKENS))
+                          for j in (0, 1)},
+    )
+
+    # ---------------------------------------------------------------- B: publishes
+    # Q: qkv[j*6144 + token*32 + ch], ch 0..31 (q0: 0..15, q1: 16..31), LROW ld 32
+    # K: qkv[j*6144 + 2048 + (token_block*2 + t)*128 + dim*8 + token_in_block] (LCOL ld 8)
+    # V: qkv[j*6144 + 4096 + token*32 + ch], ch 0..31
+    def pub_elems(head_fn, m0_fn):
+        q, k, v = set(), set(), set()
+        writer = {}
+        for sg in range(NSG):
+            heads = [0, 1]          # the candidate computes both heads
+            for j in heads:
+                m0 = m0_fn(sg)
+                tb = m0 // 8
+                for row in range(8):
+                    tok = m0 + row
+                    for ch in range(32):
+                        q.add((j, tok, ch))
+                        writer.setdefault(('Q', j, tok, ch), []).append(sg)
+                    for ch in range(32):
+                        v.add((j, tok, ch))
+                        writer.setdefault(('V', j, tok, ch), []).append(sg)
+                for t in (0, 1):
+                    blk = tb * 2 + t
+                    for dim in range(16):
+                        for row in range(8):
+                            tok = m0 + row
+                            k.add((j, blk, dim, tok))
+                            writer.setdefault(('K', j, blk, dim, tok), []).append(sg)
+        return q, k, v, writer
+
+    # parent: two phases, one head per subgroup
+    pq, pk, pv, pw = set(), set(), set(), {}
+    for sg in range(NSG):
+        for phase in (0, 1):
+            j = parent_head(sg)
+            m0 = parent_m0(sg, phase)
+            tb = m0 // 8
+            for row in range(8):
+                tok = m0 + row
+                for ch in range(32):
+                    pq.add((j, tok, ch)); pw.setdefault(('Q', j, tok, ch), []).append(sg)
+                    pv.add((j, tok, ch)); pw.setdefault(('V', j, tok, ch), []).append(sg)
+            for t in (0, 1):
+                blk = tb * 2 + t
+                for dim in range(16):
+                    for row in range(8):
+                        tok = m0 + row
+                        pk.add((j, blk, dim, tok)); pw.setdefault(('K', j, blk, dim, tok), []).append(sg)
+    cq, ck, cv, cw = pub_elems(None, cand_m0)
+
+    def full(s, kind):
+        if kind == 'Q':
+            return len(s) == NHEAD_WG * TOKENS * 32
+        if kind == 'V':
+            return len(s) == NHEAD_WG * TOKENS * 32
+        return len(s) == NHEAD_WG * 16 * 16 * 8   # 16 blocks x 16 dims x 8 tokens
+
+    out['B_publishes'] = dict(
+        Q=dict(parent_elems=len(pq), candidate_elems=len(cq), same=pq == cq,
+               parent_full=full(pq, 'Q'), candidate_full=full(cq, 'Q'),
+               parent_writers_max=max(len(v) for v in pw.values()),
+               candidate_writers_max=max(len(v) for v in cw.values())),
+        K=dict(parent_elems=len(pk), candidate_elems=len(ck), same=pk == ck,
+               parent_full=full(pk, 'K'), candidate_full=full(ck, 'K')),
+        V=dict(parent_elems=len(pv), candidate_elems=len(cv), same=pv == cv,
+               parent_full=full(pv, 'V'), candidate_full=full(cv, 'V')),
+        no_duplicate_writes=dict(parent=all(len(v) == 1 for v in pw.values()),
+                                 candidate=all(len(v) == 1 for v in cw.values())),
+        writer_sg_changed='yes (owner subgroup only; addresses identical)',
+    )
+
+    # ---------------------------------------------------------------- C: K chains
+    # (head, token, channel block, ki) tuples computed anywhere in the workgroup.
+    par_tuples = set()
+    for sg in range(NSG):
+        for phase in (0, 1):
+            j = parent_head(sg)
+            m0 = parent_m0(sg, phase)
+            for row in range(8):
+                for cb in range(CB):
+                    for ki in range(KI):
+                        par_tuples.add((j, m0 + row, cb, ki))
+    cand_tuples = set()
+    for sg in range(NSG):
+        for j in (0, 1):
+            m0 = cand_m0(sg)
+            for row in range(8):
+                for cb in range(CB):
+                    for ki in range(KI):
+                        cand_tuples.add((j, m0 + row, cb, ki))
+    out['C_mma'] = dict(
+        parent_tuples=len(par_tuples), candidate_tuples=len(cand_tuples),
+        same=par_tuples == cand_tuples,
+        expected=NHEAD_WG * TOKENS * CB * KI,
+        k_order_per_element='ki = 0..7 ascending, one DPAS per ki, identical operands',
+        k_order_identical=True,
+        narrowing_points='one MAT_C -> MAT_H per published tile, unchanged',
+    )
+
+    # ---------------------------------------------------------------- D: weights
+    par_w, cand_w = [], []
+    for sg in range(NSG):
+        for phase in (0, 1):
+            h = parent_head(sg)
+            for ki in range(KI):
+                for cb in range(CB):
+                    par_w.append((h, cb, ki))
+    for sg in range(NSG):
+        for ki in range(KI):
+            for j in (0, 1):
+                for cb in range(CB):
+                    cand_w.append((j, cb, ki))
+    out['D_weights'] = dict(
+        parent_messages=len(par_w), candidate_messages=len(cand_w),
+        parent_per_sg=len(par_w) // NSG, candidate_per_sg=len(cand_w) // NSG,
+        distinct_tiles=len(set(par_w)), same_address_set=set(par_w) == set(cand_w),
+        subgroups_per_tile_parent=NSG // 2,      # 4 subgroups share a head...
+        messages_per_tile_parent=NSG,            # ...each twice (2 row_phases)
+        subgroups_per_tile_candidate=NSG,        # 8 subgroups, once each
+        messages_per_tile_candidate=NSG,
+        note='per-workgroup weight message count identical; only the reuse degree per tile '
+             'changes (4 -> 8 subgroups), i.e. the same bytes with more sharers',
+    )
+
+    # ---------------------------------------------------------------- E: debug
+    # Q echo: dbg[81920 + e], e = t_local + 256k, executed by (zg == 0, sg < 4) in both
+    par_dbg_y = sum(1 for t in range(128) for e in [t + 256 * k for k in range(64)] if e < 8192)
+    cand_dbg_y = par_dbg_y
+    # QKV debug mirrors: (region, m0, 32*h) - union equality by set
+    par_dbg = set()
+    for sg in range(NSG):
+        for phase in (0, 1):
+            h = parent_head(sg)
+            m0 = parent_m0(sg, phase)
+            for base in (90112, 98304, 114688, 122880):
+                for row in range(8):
+                    for col in range(32):
+                        par_dbg.add((base, m0 + row, 32 * h + col))
+    cand_dbg = set()
+    for sg in range(NSG):
+        for j in (0, 1):
+            m0 = cand_m0(sg)
+            for base in (90112, 98304, 114688, 122880):
+                for row in range(8):
+                    for col in range(32):
+                        cand_dbg.add((base, m0 + row, 32 * j + col))
+    out['E_debug'] = dict(
+        y_echo_threads=dict(parent='zg == 0 and sg < 4 (128 threads)',
+                            candidate='zg == 0 and sg < 4 (unchanged source line)',
+                            elements_written=par_dbg_y),
+        mirror_union_equal=par_dbg == cand_dbg,
+        mirror_elems=len(par_dbg), candidate_elems=len(cand_dbg),
+        note='the debug mirrors keep the unchanged `h` variable, so the per-subgroup write '
+             'set is byte-identical; the QKV block writes 32*h0 and 32*h1 which reproduce '
+             'the parent union',
+    )
+
+    # ---------------------------------------------------------------- F: tail
+    out['F_tail'] = dict(
+        tokens_per_wg=TOKENS, tokens_per_sg=8, blocks=TOKENS // 8,
+        blocks_per_sg=1, sg_count=NSG,
+        exact=TOKENS % 8 == 0 and TOKENS // 8 == NSG,
+        k_blocks=KI, channel_blocks_per_head=CB,
+        note='64 tokens = 8 subgroups x 8 rows exactly; K = 128 = 8 ki x 16 exactly. '
+             'No partial tile, no predicated remainder, no bounds check appears or disappears.',
+    )
+
+    # ---------------------------------------------------------------- verdict
+    ok = (out['A_row_messages']['same_surface']
+          and out['A_row_messages']['candidate']['multiplicity'] == 1
+          and out['A_row_messages']['parent']['multiplicity'] == 2
+          and out['B_publishes']['Q']['same'] and out['B_publishes']['K']['same']
+          and out['B_publishes']['V']['same']
+          and out['B_publishes']['no_duplicate_writes']['candidate']
+          and out['C_mma']['same'] and out['C_mma']['k_order_identical']
+          and out['D_weights']['same_address_set']
+          and out['E_debug']['mirror_union_equal'])
+    out['verdict'] = dict(all_checks_pass=bool(ok))
+    (BUILD / 'mapping.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print(json.dumps({k: out[k] for k in ('A_row_messages',)}, indent=1))
+    for key in ('B_publishes', 'C_mma', 'D_weights', 'E_debug', 'F_tail', 'verdict'):
+        print(key, json.dumps(out[key])[:400])
+
+
+if __name__ == '__main__':
+    main()

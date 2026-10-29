@@ -1,0 +1,375 @@
+"""N30 F20 arena window rotation (ord 230, s37_fold_body_r1a_v1) build.
+
+Mechanism (one class: shared-arena buffering strategy, zero extra WG memory):
+  The 16 KiB `shArena` block is used twice in the lifetime of one workgroup:
+    * stages 1/3: A[64][128]            (expand output / contract input, stride 128)
+    * stages 4..9: Q,K,V,CTX planes     (four 64x32 planes, stride 32)
+  Because the plane base = 2048*plane and a plane row is 32 halves, plane row t
+  lands inside A row t/4, so the *writer* of plane row 8*sg (stage 4, subgroup sg)
+  lands in A rows 2*sg..2*sg+1 -- which subgroup sg read only if sg==0.  The
+  parent therefore needs a workgroup WAR barrier between stage 3 (A reads) and
+  stage 4 (Q/K/V writes)  ->  `barrier()` at src line 336.
+
+  Candidate: interleave the four planes inside A row-major, one plane row per A
+  row (plane `p` = A columns 32*p..32*p+31, stride 128).  The element->(row,col)
+  map of every producer/consumer pair is unchanged (verified element by element
+  in _arena_check.py), the byte footprint is unchanged (still shArena[8192] halfs
+  = 16384 B; total WG memory stays 24576 B), and now stage 4 subgroup sg writes
+  exactly A rows 8*sg..8*sg+7 -- the rows it read at stage 3.  The WAR is
+  intra-owner, so the workgroup barrier is removed.
+
+Steps (CPU only; no GPU, no deployment; writes only inside this card directory):
+  1. parent byte reproduction from the baseline source + the recorded recipe
+     (glslang 16.5.0 + NoContraction pattern transfer from the f20-pixel-owner
+     decoration parent) -> must be byte identical to 215aca67...
+  2. candidate source (10 hunks: 4 plane macros, 5 producer/consumer address
+     forms, 1 removed workgroup barrier)
+  3. candidate compile + the same NoContraction transfer -> candidate.spv, then
+     spv_validate_cpu
+  4. plan.txt on the CURRENT chain head, replacing only the ord-230 PASS line
+  5. cpu-check of both plans
+  6. read-only structural accounting (build/spv-check.json, build/arena-check.json)
+
+Run:  @NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe build.py
+"""
+import hashlib
+import json
+import pathlib
+import subprocess
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+CAMP = pathlib.Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+W = pathlib.Path(r'@NR_WORKSPACE@')
+GLSLANG = W / 'src/project/tools/glslang-16.5.0/bin/glslang.exe'
+VALIDATE = W / 'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'
+RUNNER = W / 'work/codex-astra-fp16-int8-audit-20261024/phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe'
+SPVTOOLS = W / 'build/zcode-fp16-compute-backend-20261021/scripts'
+
+PARENT_SRC = W / 'work/codex-astra-fp16-int8-audit-20261024/f20-coarse-owner-20261026/candidate.comp'
+PARENT_SRC_SHA = '3e0879b37a7f7a8a49b70fd7d6bc771eebd184b3233506e892442678db5672d4'
+PARENT_SPV = W / 'work/codex-astra-fp16-int8-audit-20261024/f20-coarse-owner-20261026/candidate.spv'
+PARENT_SPV_SHA = '215aca679aaa2d5c36329ae45514efadae221ef4e8631121388b25052a7f7e32'
+DECOR_PARENT = W / 'work/codex-astra-fp16-int8-audit-20261024/c32-boundary-followup-20261026/f20-pixel-owner/candidate.spv'
+PINNED_INC = CAMP / 'cards/idt-identity-recipe/evidence/headers/215aca679aaa'
+RECIPE_INC = W / 'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1/source'
+
+sys.path.insert(0, str(SPVTOOLS))
+sys.path.insert(0, str(CAMP))
+import spv_tools_local as ST          # noqa: E402
+import COMMON as K                    # noqa: E402
+
+# ------------------------------------------------------------------ the hunks
+HUNKS = [
+    # (name, old bytes, new bytes)
+    ('header-note',
+     b'// K order, barrier or allocation change.\r\n',
+     b'// K order, barrier or allocation change.\r\n'
+     b'//\r\n'
+     b'// N30-F20 (2026-10-28): shared-arena window rotation, zero extra WG memory.\r\n'
+     b'// The four 64x32 planes (Q,K,V,CTX) are column-interleaved inside the A block\r\n'
+     b'// (plane p = A columns 32p..32p+31, stride 128) instead of standing in their own\r\n'
+     b'// 2048-half banks, so stage 4 subgroup sg writes exactly the A rows (8*sg..8*sg+7)\r\n'
+     b'// that stage 3 subgroup sg read.  The read->write WAR stops spanning subgroups\r\n'
+     b'// and the workgroup barrier between stage 3 and stage 4 is removed (16 -> 15\r\n'
+     b'// static OpControlBarrier, 5 -> 4 executed per workgroup: exactly one of the 16\r\n'
+     b'// source barrier sites is gone).  Allocation, bytes,\r\n'
+     b'// staged element->(row,col) maps, arithmetic, K order and rounding are unchanged.\r\n'),
+
+    ('macro-Q', b'#define NR_Q(t, c)    shArena[(t) * 32 + (c)]',
+                b'#define NR_Q(t, c)    shArena[(t) * 128 + (c)]'),
+    ('macro-K', b'#define NR_K(t, c)    shArena[2048 + (t) * 32 + (c)]',
+                b'#define NR_K(t, c)    shArena[(t) * 128 + 32 + (c)]'),
+    ('macro-V', b'#define NR_V(t, c)    shArena[4096 + (t) * 32 + (c)]',
+                b'#define NR_V(t, c)    shArena[(t) * 128 + 64 + (c)]'),
+    ('macro-CTX', b'#define NR_CTX(t, c)  shArena[6144 + (t) * 32 + (c)]',
+                  b'#define NR_CTX(t, c)  shArena[(t) * 128 + 96 + (c)]'),
+
+    ('stage4-store',
+     b'        coopMatStore(half0, shArena, region*2048u+m0*32u,32u,LROW);\r\n'
+     b'        coopMatStore(half1, shArena, region*2048u+m0*32u+16u,32u,LROW);\r\n',
+     b'        // N30-F20: plane `region` lives in A columns 32*region..+31 at stride 128,\r\n'
+     b'        // so this store lands in the rows this subgroup itself read at stage 3.\r\n'
+     b'        coopMatStore(half0, shArena, m0*128u+region*32u,128u,LROW);\r\n'
+     b'        coopMatStore(half1, shArena, m0*128u+region*32u+16u,128u,LROW);\r\n'),
+
+    ('stage6-Q-load',
+     b'    MAT_A score_q0,score_q1;\r\n'
+     b'    coopMatLoad(score_q0,shArena,sg*8u*32u,32u,LROW);\r\n'
+     b'    coopMatLoad(score_q1,shArena,sg*8u*32u+16u,32u,LROW);\r\n',
+     b'    MAT_A score_q0,score_q1;\r\n'
+     b'    // N30-F20: same Q elements, now A columns 0..31 of the same rows, stride 128.\r\n'
+     b'    coopMatLoad(score_q0,shArena,sg*8u*128u,128u,LROW);\r\n'
+     b'    coopMatLoad(score_q1,shArena,sg*8u*128u+16u,128u,LROW);\r\n'),
+
+    ('stage6-K-load',
+     b'            MAT_B b0; coopMatLoad(b0, shArena, 2048u + n0 * 32u + k0, 32u, LCOL);  // K^T\r\n'
+     b'            MAT_B b1; coopMatLoad(b1, shArena, 2048u + (n0 + 16u) * 32u + k0, 32u, LCOL);\r\n',
+     b'            MAT_B b0; coopMatLoad(b0, shArena, n0 * 128u + 32u + k0, 128u, LCOL);  // K^T\r\n'
+     b'            MAT_B b1; coopMatLoad(b1, shArena, (n0 + 16u) * 128u + 32u + k0, 128u, LCOL);\r\n'),
+
+    ('stage8-V-load',
+     b'            MAT_B b0; coopMatLoad(b0, shArena, 4096u + k0 * 32u + 0u, 32u, LROW);\r\n'
+     b'            MAT_B b1; coopMatLoad(b1, shArena, 4096u + k0 * 32u + 16u, 32u, LROW);\r\n',
+     b'            MAT_B b0; coopMatLoad(b0, shArena, k0 * 128u + 64u + 0u, 128u, LROW);\r\n'
+     b'            MAT_B b1; coopMatLoad(b1, shArena, k0 * 128u + 64u + 16u, 128u, LROW);\r\n'),
+
+    ('stage8-CTX-store',
+     b'        if (debug) coopMatStore(ctx_half0, shArena, 6144u + m0 * 32u, 32u, LROW);\r\n',
+     b'        if (debug) coopMatStore(ctx_half0, shArena, m0 * 128u + 96u, 128u, LROW);\r\n'),
+    ('stage8-CTX-store1',
+     b'        if (debug) coopMatStore(ctx_half1, shArena, 6144u + m0 * 32u + 16u, 32u, LROW);\r\n',
+     b'        if (debug) coopMatStore(ctx_half1, shArena, m0 * 128u + 96u + 16u, 128u, LROW);\r\n'),
+
+    ('remove-WAR-barrier',
+     b'        for (uint e = t_local; e < 2048u; e += 256u) dbg[8192u + e] = shY[e];\r\n'
+     b'        barrier();\r\n'
+     b'    }\r\n'
+     b'    barrier();\r\n',
+     b'        for (uint e = t_local; e < 2048u; e += 256u) dbg[8192u + e] = shY[e];\r\n'
+     b'        barrier();\r\n'
+     b'    }\r\n'
+     b'    // N30-F20: no workgroup barrier here any more.  Stage 3 subgroup sg read A\r\n'
+     b'    // rows 8*sg..8*sg+7 (all 128 columns) and stage 4 subgroup sg writes exactly\r\n'
+     b'    // those rows (columns 0..95 = Q,K,V), so the read->write WAR is intra-owner:\r\n'
+     b'    // every store below is data-dependent on the fragment loads it overwrites\r\n'
+     b'    // (A -> H(Y) handoff -> Q/K/V), and a warp issues its own shared stores after\r\n'
+     b'    // its own shared loads.  The cross-SG publications that remain are stage 1 ->\r\n'
+     b'    // stage 3 (A, barrier above) and stage 4 -> stages 6/8 (K,V; barrier below).\r\n'),
+]
+
+
+def sha(p):
+    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+
+
+def run(argv):
+    r = subprocess.run([str(x) for x in argv], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    return r.returncode, (r.stdout or '').strip(), (r.stderr or '').strip()
+
+
+def compile_glsl(src, out, incs):
+    argv = [GLSLANG, '-V', '--target-env', 'vulkan1.3']
+    for d in incs:
+        argv.append('-I' + str(d))
+    argv += [str(src), '-o', str(out)]
+    return argv, run(argv)
+
+
+def build_spv(src, raw, final, incs):
+    """compile + NoContraction pattern transfer from the recorded decoration parent."""
+    argv, (rc, so, se) = compile_glsl(src, raw, incs)
+    assert rc == 0, 'glslang failed\n%s\n%s' % (so, se)
+    pm = ST.Module(DECOR_PARENT)
+    cm = ST.Module(raw)
+    keep, info = ST.transfer_decoration_pattern_aligned(pm, cm, set())
+    ST.set_no_contraction(cm, keep, final)
+    return dict(argv=[str(x) for x in argv], glslang_rc=rc, glslang_stderr=se[-400:],
+                raw_sha256=sha(raw), raw_bytes=pathlib.Path(raw).stat().st_size,
+                nc_count=len(keep), nc_parent=len(ST.no_contraction_ids(pm)),
+                nc_info={k: info[k] for k in ('alignment', 'functions_mapped',
+                                              'child_functions_without_parent_counterpart',
+                                              'parent_decorations_total')},
+                spv_sha256=sha(final), spv_bytes=pathlib.Path(final).stat().st_size)
+
+
+def unified_diff(old_bytes, new_bytes, a_name, b_name):
+    import difflib
+    a = old_bytes.decode('utf-8-sig').replace('\r\n', '\n').split('\n')
+    b = new_bytes.decode('utf-8-sig').replace('\r\n', '\n').split('\n')
+    lines = [l.rstrip('\n') for l in difflib.unified_diff(a, b, fromfile=a_name,
+                                                          tofile=b_name, n=4)]
+    return '\n'.join(lines) + '\n'
+
+
+def main():
+    out = {'card': 'n30-f20-arena-rotate', 'family': 'F20', 'ordinal': 230,
+           'gpu_used': False, 'deployed': False}
+    (CARD / 'build').mkdir(exist_ok=True)
+
+    # ---------------- 0. identity of the inputs ----------------
+    src_bytes = PARENT_SRC.read_bytes()
+    assert sha(PARENT_SRC) == PARENT_SRC_SHA, 'parent source sha changed'
+    assert sha(PARENT_SPV) == PARENT_SPV_SHA, 'baseline parent SPV sha changed'
+    out['parent'] = {
+        'source': K.ident(PARENT_SRC), 'source_sha_expected': PARENT_SRC_SHA,
+        'spv': K.ident(PARENT_SPV), 'spv_sha_expected': PARENT_SPV_SHA,
+        'decoration_parent': K.ident(DECOR_PARENT),
+        'recipe': {'include_dirs': [str(PINNED_INC), str(RECIPE_INC)],
+                   'pinned_include_dir': str(PINNED_INC),
+                   'nc': 'transfer_decoration_pattern_aligned(decoration_parent -> child), keep_ids=empty',
+                   'source': 'evidence/RECIPES.json entry 215aca67... (nc_recipe mode=parent)'},
+        'plan_row_header_fields': '32 29184 6 32 169 97 1  (ISA + SPIR-V both say 24576 B: see STAGE-BLOCK-MATRIX.md §1)',
+    }
+
+    # ---------------- 1. parent byte reproduction ----------------
+    incs = [d for d in (PINNED_INC, RECIPE_INC) if pathlib.Path(d).exists()]
+    out['parent_rebuild'] = build_spv(PARENT_SRC, CARD / 'build/parent-raw.spv',
+                                      CARD / 'parent-rebuild.spv', incs)
+    out['parent_rebuild']['byte_match'] = (out['parent_rebuild']['spv_sha256'] == PARENT_SPV_SHA)
+    assert out['parent_rebuild']['byte_match'], 'parent did not reproduce byte for byte'
+
+    # ---------------- 2. candidate source (minimal patch) ----------------
+    cand = src_bytes
+    applied = []
+    for name, old, new in HUNKS:
+        n = cand.count(old)
+        assert n == 1, 'anchor %r occurs %d times' % (name, n)
+        cand = cand.replace(old, new)
+        applied.append(name)
+    assert cand.count(b'barrier();') == src_bytes.count(b'barrier();') - 1, 'barrier count'
+    (CARD / 'parent.comp').write_bytes(src_bytes)
+    (CARD / 'candidate.comp').write_bytes(cand)
+    patch = unified_diff(src_bytes, cand,
+                         'a/f20-coarse-owner-20261026/candidate.comp',
+                         'b/cards/n30-f20-arena-rotate/candidate.comp')
+    (CARD / 'SOURCE-DIFF.patch').write_text(patch, encoding='utf-8')
+    out['candidate_source'] = {
+        'path': str(CARD / 'candidate.comp'), 'sha256': sha(CARD / 'candidate.comp'),
+        'bytes': len(cand), 'hunks': len(applied), 'hunk_names': applied,
+        'diff_lines': {'removed': sum(1 for l in patch.splitlines()
+                                      if l.startswith('-') and not l.startswith('---')),
+                       'added': sum(1 for l in patch.splitlines()
+                                    if l.startswith('+') and not l.startswith('+++'))},
+        'barrier_calls': {'parent': src_bytes.count(b'barrier();'),
+                          'candidate': cand.count(b'barrier();')},
+        'only_site': ('ord 230: shArena plane placement (stage 1/3 A stay, stage 4 Q/K/V/CTX '
+                      'stores, stage 6 Q and K^T loads, stage 8 V loads + debug CTX store, the '
+                      'four NR_* debug macros) and the workgroup barrier between stage 3 and '
+                      'stage 4 (src line 336)'),
+    }
+
+    # ---------------- 3. candidate compile + validate ----------------
+    out['candidate'] = build_spv(CARD / 'candidate.comp', CARD / 'build/candidate-raw.spv',
+                                 CARD / 'candidate.spv', incs)
+    out['candidate']['spv'] = str(CARD / 'candidate.spv')
+    out['candidate']['nc_equal_to_parent'] = (out['candidate']['nc_count']
+                                              == out['parent_rebuild']['nc_count'])
+    rc, so, se = run([VALIDATE, CARD / 'candidate.spv'])
+    out['spv_validate_cpu'] = {'candidate': {'rc': rc, 'stdout': so, 'stderr': se}}
+    rc2, so2, se2 = run([VALIDATE, CARD / 'parent-rebuild.spv'])
+    out['spv_validate_cpu']['parent_rebuild'] = {'rc': rc2, 'stdout': so2, 'stderr': se2}
+    assert rc == 0, 'candidate failed spv_validate_cpu: %s %s' % (so, se)
+
+    # ---------------- 4. plan on the current chain head ----------------
+    base_plan, base_sha, chain = K.current_best()
+    base_text = pathlib.Path(base_plan).read_text(encoding='utf-8-sig')
+    n = K.make_plan(CARD / 'candidate.spv', CARD / 'plan.txt', parent_plan=base_plan,
+                    spv_shas={PARENT_SPV_SHA})
+    assert n == 1, 'replaced %d passes, expected 1' % n
+    base_lines = base_text.splitlines()
+    cand_lines = (CARD / 'plan.txt').read_text(encoding='utf-8-sig').splitlines()
+    assert len(base_lines) == len(cand_lines), 'plan line count changed'
+    diff_lines = [i for i, (a, b) in enumerate(zip(base_lines, cand_lines)) if a != b]
+    assert len(diff_lines) == 1, 'plan differs on %d lines: %s' % (len(diff_lines), diff_lines)
+    changed = diff_lines[0]
+    assert base_lines[changed] == K.pass_lines_of(base_plan)[230]['line'], 'changed line is not ord 230'
+    out['plan'] = {
+        'path': str(CARD / 'plan.txt'), 'sha256': sha(CARD / 'plan.txt'),
+        'parent_plan': {'path': str(base_plan), 'sha256': base_sha},
+        'chain_head_label': chain[-1]['label'] if chain else None,
+        'replaced_passes': n, 'expected_passes': 1,
+        'diff_lines': diff_lines, 'line_count': len(cand_lines),
+        'changed_line_ordinal': 230,
+        'old_line': base_lines[changed], 'new_line': cand_lines[changed],
+        'pass_label_151_occurrences': sum(1 for l in cand_lines if l.startswith('PASS 151 ')),
+    }
+    assert out['plan']['pass_label_151_occurrences'] == 2, 'PASS 151 must appear twice (ord 230+231)'
+
+    # ---------------- 5. CPU plan check ----------------
+    rc, so, se = run([RUNNER, '--plan', CARD / 'plan.txt', '--cpu-check'])
+    out['cpu_check'] = {'argv': [str(RUNNER), '--plan', str(CARD / 'plan.txt'), '--cpu-check'],
+                        'rc': rc, 'stdout': so, 'stderr': se}
+    rc2, so2, se2 = run([RUNNER, '--plan', base_plan, '--cpu-check'])
+    out['cpu_check']['parent_stdout'] = so2
+    out['cpu_check']['identical_to_parent'] = (so == so2)
+    assert rc == 0 and out['cpu_check']['identical_to_parent'], 'cpu-check differs from chain head'
+
+    out['float_NC_checked'] = out['parent_rebuild']['nc_count']
+    out['float_NC_note'] = ('the same 45 NoContraction decorations are transferred from the recorded '
+                            'decoration parent onto the same FP instructions in both modules; the '
+                            'float/GLSL.std.450 expression multiset is identical (build/spv-check.json)')
+
+    # ---------------- 6. ord 230 plan row: BIND / PUSH audit ----------------
+    recs = K.pass_lines_of(CARD / 'plan.txt')
+    lines = (CARD / 'plan.txt').read_text(encoding='utf-8-sig').splitlines()
+    i0 = lines.index(recs[230]['line'])
+    binds, push = [], None
+    for l in lines[i0 + 1:]:
+        if l.startswith('PASS '):
+            break
+        if l.startswith('BIND '):
+            binds.append([int(x) for x in l.split()[1:]])
+        elif l.startswith('PUSH '):
+            push = [int(x) for x in l.split()[1:]]
+    out['ord230_bind'] = [{'set': b[0], 'buffer_id': b[1], 'offset': b[2], 'size_bytes': b[3]}
+                          for b in binds]
+    out['ord230_push_dwords'] = push
+    out['ord230_push_pc'] = {('p%d' % (k // 4)): push[k:k + 4] for k in range(0, len(push), 4)}
+    out['ord230_push_dwords_as_i32'] = [x - (1 << 32) if x >= (1 << 31) else x for x in push]
+    out['ord230_pass_header'] = recs[230]['line']
+
+    # ---------------- 7. CPU-only structural checks, regenerated in place -------
+    out['checks'] = run_checks()
+
+    K.write_json(CARD / 'BUILD.json', out)
+    print(json.dumps({k: out[k] for k in ('parent_rebuild', 'candidate', 'spv_validate_cpu',
+                                          'plan', 'cpu_check', 'float_NC_checked',
+                                          'checks')}, indent=1)[:6000])
+
+
+def run_checks():
+    """Re-run the three read-only analysers and digest their JSON output."""
+    py = sys.executable
+    res = {}
+    for name, script, artifact in (
+            ('spv_check', '_spv_check.py', 'build/spv-check.json'),
+            ('isa', '_isa.py', 'build/isa.json'),
+            ('arena_check', '_arena_check.py', 'build/arena-check.json')):
+        r = subprocess.run([py, str(CARD / script)], capture_output=True, text=True,
+                           encoding='utf-8', errors='replace', cwd=str(CARD))
+        art = CARD / artifact
+        res[name] = dict(script=script, rc=r.returncode, artifact=artifact,
+                         artifact_sha256=sha(art) if art.exists() else None,
+                         stderr_tail=(r.stderr or '').strip()[-400:])
+        d = json.loads(art.read_text(encoding='utf-8')) if art.exists() else {}
+        if name == 'spv_check' and d:
+            res[name]['summary'] = dict(
+                instructions=d['instructions'], words=d['words'],
+                opcode_delta=d['opcode_delta'],
+                workgroup_barriers={k: d['workgroup_barriers'][k]
+                                    for k in ('parent', 'candidate', 'delta',
+                                              'scope_relaxed',
+                                              'no_subgroup_barrier_introduced')},
+                workgroup_storage_bytes={
+                    k: d['storage_bytes'][k]['Workgroup'] for k in ('parent', 'candidate')},
+                storage_identical=d['storage_bytes']['identical'],
+                coopmat_movement=d['coopmat_movement']['identical_transfer_count'],
+                fp_multiset_identical=d['fp_multiset']['identical'],
+                nc_sites=d['nc_sites']['identical_multiset'],
+                cfg_shape_identical=d['cfg_shape']['parent'] == d['cfg_shape']['candidate'])
+        elif name == 'isa' and d:
+            res[name]['summary'] = dict(instructions=d['instructions'],
+                                        barriers=d['barrier_count'],
+                                        messages=d['messages'],
+                                        census_barriers=d['census'].get('sync.bar'),
+                                        census_fence=d['census'].get('fence.slm'),
+                                        dpas=d['census'].get('dpas.8x8'))
+        elif name == 'arena_check' and d:
+            res[name]['summary'] = dict(
+                total_bytes=d['blocks']['parent']['total_bytes'],
+                total_bytes_equal=d['blocks']['total_bytes_equal'],
+                layout_identical=d['blocks']['identical_layout'],
+                element_slots=d['element_mapping']['checked'],
+                element_mismatches=d['element_mapping']['mismatches'],
+                element_verdict=d['element_mapping']['verdict'],
+                war_parent_cross=d['hazards']['stage3_read -> stage4_write (PARENT layout)']['cross_owner_matches'],
+                war_candidate_cross=d['hazards']['stage3_read -> stage4_write (CANDIDATE layout)']['cross_owner_matches'],
+                barriers=d['barriers'],
+                planes=d['planes'])
+    return res
+
+
+if __name__ == '__main__':
+    main()

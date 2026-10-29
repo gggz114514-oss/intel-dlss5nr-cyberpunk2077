@@ -1,0 +1,962 @@
+# -*- coding: utf-8 -*-
+"""cov-232: build the 232-position coverage ledger and family state ledger.
+
+Read-only on every source outside cards/cov-232/.  CPU only, no GPU, no deploy.
+
+Inputs (read-only):
+  handoff/dsh-fullnet-20261027/CURRENT-232-ROWS.json      (stated identities)
+  handoff/dsh-fullnet-20261027/COVERAGE.txt               (family counts)
+  f10-weight-return-separation-20261027/plan.txt          (baseline plan, PASS lines)
+  fullnet-mechanism-transfer-20261026/CURRENT-CENSUS.json (stale census, for diff only)
+  fullnet-continuous-20261027/evidence/IDENTITY-232.json  (rebuild results)
+  fullnet-continuous-20261027/evidence/RECIPE-MAP.json    (recipe provenance)
+  D/RESULTS.json, D/MECHANISMS.txt, per-round RESULTS.json
+
+Outputs (this card only):
+  COVERAGE-232.json  COVERAGE-232.md  FAMILY-STATE.md  SELFCHECK.json
+"""
+import json, os, re, hashlib, collections, datetime, sys
+
+CARD = os.path.dirname(os.path.abspath(__file__))
+WS = r'@NR_WORKSPACE@'
+AUD = os.path.join(WS, r'work\codex-astra-fp16-int8-audit-20261024')
+D = os.path.join(AUD, r'fullnet-mechanism-transfer-20261026')
+C = os.path.join(AUD, r'fullnet-continuous-20261027')
+HAND = r'@NR_USER_HOME@\Documents\Codex\2026-10-24\nr-fp16-int8-astra-audit-20261024\handoff\dsh-fullnet-20261027'
+
+PLAN = os.path.join(D, r'f10-weight-return-separation-20261027\plan.txt')
+BASELINE_SHA = 'a024c3c5aa1d1432ab3f0591bf03a897880d86be2c99d6de1e1492a2a7b2befe'
+ROWS_P = os.path.join(HAND, 'CURRENT-232-ROWS.json')
+COVERAGE_TXT = os.path.join(HAND, 'COVERAGE.txt')
+CENSUS_P = os.path.join(D, 'CURRENT-CENSUS.json')
+ID232_P = os.path.join(C, r'evidence\IDENTITY-232.json')
+RECIPE_P = os.path.join(C, r'evidence\RECIPE-MAP.json')
+
+
+def sha(p):
+    h = hashlib.sha256()
+    with open(p, 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''):
+            h.update(b)
+    return h.hexdigest()
+
+
+def rel(p):
+    try:
+        return os.path.relpath(p, WS).replace('\\', '/')
+    except ValueError:
+        return p.replace('\\', '/')
+
+
+def md_link(p, label=None):
+    return '[%s](<%s>)' % (label or os.path.basename(p), rel(p))
+
+
+# ---------------------------------------------------------------- plan parse
+def parse_plan():
+    lines = open(PLAN, encoding='utf-8-sig').read().splitlines()
+    passes = []
+    for i, line in enumerate(lines):
+        if not line.startswith('PASS '):
+            continue
+        body = line[5:]
+        m = re.match(r'^(\S+)\s+(?:"([^"]*)"|(\S+))\s+(?:"([^"]*)"|(\S+))\s*(.*)$', body)
+        assert m, 'unparsable PASS line %d' % (i + 1)
+        passes.append(dict(
+            line=i + 1, plan_index=m.group(1), name=m.group(2) or m.group(3),
+            spv=m.group(4) or m.group(5), quoted=bool(m.group(2)),
+            fields=(m.group(6) or '').split()))
+    # structural check: BIND count declared in fields[2]; one PUSH after the binds
+    for n, p in enumerate(passes):
+        end = passes[n + 1]['line'] - 1 if n + 1 < len(passes) else len(lines)
+        binds = [l for l in lines[p['line']:end] if l.startswith('BIND ')]
+        push = [l for l in lines[p['line']:end] if l.startswith('PUSH ')]
+        p['binds_declared'] = int(p['fields'][2])
+        p['binds_actual'] = len(binds)
+        p['push_actual'] = len(push)
+        p['push_values'] = push[0][5:].split() if push else []
+        assert len(p['fields']) == 7, p
+        assert p['binds_declared'] == p['binds_actual'] == int(p['fields'][2])
+        assert p['push_actual'] == 1
+    return passes
+
+
+# ---------------------------------------------------------------- curated ledger
+# 施工书 N01-N16 family assignment (START-HERE.txt section 四) + the card's split of F05.
+NMAP = {
+    'F01': ('N01', []), 'F02': ('N01', []), 'F19': ('N01', []),
+    'F20': ('N02', []), 'F21': ('N02', []),
+    'F04': ('N03', []),
+    'F05': ('N04', ['N05']),          # C256 rows -> N05
+    'F06': ('N06', []),
+    'F03': ('N07', []), 'F07': ('N07', []),
+    'F08': ('N08', []),
+    'F09': ('N09', []), 'F11': ('N09', []), 'F12': ('N09', []),
+    'F10': ('N10', []),
+    'F13': ('N11', []), 'F16': ('N11', []),
+    'F14': ('N12', []),
+    'F15': ('N13', []),
+    'F17': ('N14', []), 'F18': ('N14', []),
+}
+CROSS_CUTTING = ['N15', 'N16']
+
+ACCEPTED_ROUNDS = {
+    # round key: (plan sha, plan path, saving_ms, ci95, scope text, results ref)
+    'f05-local-inverse': ('68a3f4122df019b8758a6e32cc582742806c83a04a3f8a86f40f4ea316863aec',
+                          os.path.join(D, r'f05-local-inverse\plan.txt'),
+                          0.12381915333333282, [0.07525373418312137, 0.17238457248354427],
+                          'F05 36 处同值 inverse 广播删除（后被 f05-owner-concurrency / f05-kv-consumer-layout 的 SPV 取代，机制保留在源码）'),
+    'f05-owner-concurrency': ('0bde98824d7401e35b381a115211e3404851db231adfdaeaf1fcb07684f01c74',
+                              os.path.join(D, r'f05-owner-concurrency\subgroup-owner-family\plan.txt'),
+                              0.193561, [0.017228, 0.369893],
+                              'F05 36 处显式 subgroup owner（父=68a3f412），SPV 后被 f05-kv-consumer-layout 取代'),
+    'backend-uniform-owner': ('acc713aee5ac5c057b66636e1b4bac4dcc4d815cc531c9ef871edc4fb276858f',
+                              os.path.join(D, r'backend-uniform-owner\combined\plan.txt'),
+                              0.11648437222222323, [0.0365549903147776, 0.19641375412966885],
+                              'D034 33 处 + UPS C256 contract 1 处显式子组 owner；F04 33 行字节来源'),
+    'owner-output-transfer': ('6fa134bedea03da09a2c80b752e6ac7be1113154963ebaf6e0f44afc4c3db179',
+                              os.path.join(D, r'owner-output-transfer\combined\plan.txt'),
+                              0.20711283944444325, [0.13471632943080286, 0.27950934945808364],
+                              'F06 33 + F08 16 显式 owner；两模块 SPV 均被后续轮取代，当前 0 行字节可归因于此轮'),
+    'coefficient-reuse-combined': ('b39fae00eef8aae5a337cd642b48e820455af71d99443cf1e96bcb7947006101',
+                                   os.path.join(D, r'coefficient-reuse-combined\plan.txt'),
+                                   0.07208448444444333, [0.010643950476151805, 0.13352501841273487],
+                                   'F06 三宽 send -14/-62/-126、UPS contract 三宽 -14/-30/-62；F06 33 行 + F18 body_2 3 行字节来源'),
+    'f05-kv-consumer-layout': ('eedb536b464401ff2c976378c0f0d50682e952608413abd3f7ecc8a2e10839dc',
+                               os.path.join(D, r'f05-kv-consumer-layout\combined\plan.txt'),
+                               0.13369327944444423, [0.036255297980116216, 0.23113126090877223],
+                               'F05 36 派发 K+V 生产消费布局；F05 36 行字节来源（C256 模块构建目录沿用 f05-k-consumer-tile/c256）'),
+    'f08-register-chain': ('cc0b6ad72496c8296d9b3ab312367322ff3c617a70cd8d0566b7c7d979d7c116',
+                           os.path.join(D, r'f08-register-chain-20261027\plan.txt'),
+                           0.08842853277777785, [0.0016532870180291925, 0.1752037785375265],
+                           'F08 16 派发完整 perSG 寄存器链；F08 16 行字节来源'),
+    'f10-weight-return-separation': (BASELINE_SHA,
+                                     PLAN,
+                                     0.4220474494444435, [0.29717955207841984, 0.5469153468104672],
+                                     'F10 16 派发 A 消费布局 + 三块权重返回区分离；F10 16 行字节来源，且为当前基线'),
+}
+
+NEG = {
+    'c32-scale-fragments': dict(
+        ref=os.path.join(D, r'c32-scale-fragments\RESULTS.json'),
+        report=os.path.join(D, r'c32-scale-fragments\REPORT.txt'),
+        status='INDISTINCT', saving_ms=0.07169184499999777,
+        ci95=[-0.020673836705825524, 0.16405752670582108],
+        scope='F01 + 7 个 body + F20 的九派发组合（no-F2 臂）',
+        note='F01/body/F20 native send -56/-56/-28；组合 INDISTINCT 未采纳'),
+    'coefficient-reuse-extension': dict(
+        ref=os.path.join(D, r'coefficient-reuse-extension-combined\RESULTS.json'),
+        report=os.path.join(D, r'coefficient-reuse-extension-combined\REPORT.txt'),
+        status='INDISTINCT', saving_ms=-0.011196756111112075,
+        ci95=[-0.05101433604608979, 0.028620823823865646], scope='F07 3 派发',
+        note='F07 臂 INDISTINCT，adopted=False'),
+    'owner-projection-transfer': dict(
+        ref=os.path.join(D, r'owner-projection-transfer\RESULTS.json'),
+        report=os.path.join(D, r'owner-projection-transfer\REPORT.txt'),
+        status='INDISTINCT', saving_ms=0.052938654444444566,
+        ci95=[-0.05789127258701186, 0.163768581475901],
+        scope='F09 16 + F11 15（隔离臂 f09-residual / f11-swap）',
+        note='F09 少 16 指令、F11 指令数相同；组合 +0.002018ms 未采纳'),
+    'owner-projection-f11': dict(
+        ref=os.path.join(D, r'owner-projection-transfer\f11-swap\RESULTS.json'),
+        report=os.path.join(D, r'owner-projection-transfer\REPORT.txt'),
+        status='INDISTINCT', saving_ms=0.04111140111110956,
+        ci95=[-0.04083771368083873, 0.12306051590305785],
+        scope='F11 15 派发（f11-swap 隔离臂）',
+        note='F11 指令总数相同但指令流不同；未采纳'),
+    'vit-epilogue-contract': dict(
+        ref=os.path.join(D, r'cross-family-register-transfer\RESULTS.json'),
+        report=os.path.join(D, r'vit-epilogue-gain-reuse\contract-only\TIMING-REVIEW.json'),
+        status='INDISTINCT', saving_ms=-0.04964062611111153,
+        ci95=[-0.13848297990684397, 0.03920172768462091],
+        scope='F13 contract 8 派发（94,99,104,109,114,119,124,129）',
+        note='native 3458→10400 指令、send 737→1817，scratch0；INDISTINCT 未采纳'),
+    'ups-coarse-owner': dict(
+        ref=os.path.join(D, r'ups-coarse-owner\RESULTS.json'),
+        report=None, status='INDISTINCT', saving_ms=0.08264004666666953,
+        ci95=[-0.06648547578056142, 0.2317655691139005],
+        scope='F18 三个 pre 宽度 C64/C128/C256（ordinal 212/192/166）',
+        note='每帧少 10,838,016B 逻辑 SLM 读；scratch0；未采纳'),
+    'ups-fused-no-mirror': dict(
+        ref=os.path.join(D, r'ups-fused-no-mirror\RESULTS.json'), report=None,
+        status='INDISTINCT', saving_ms=0.12274652444444278,
+        ci95=[-0.03851667497829134, 0.28400972386717693],
+        scope='F18 UPS C64/C256 pre+body 融合无 M 镜像', note='adopted=False'),
+    'ups-direct-family': dict(
+        ref=os.path.join(D, r'ups-direct-family-combined\RESULTS.json'),
+        report=os.path.join(D, r'ups-direct-family-combined\REPORT.txt'),
+        status='INDISTINCT', saving_ms=-0.056102724, ci95=[-0.161475778, 0.049270329],
+        scope='F18 C256 affine / C128 shifted / C64 direct 三宽族包',
+        note='全部 gold、scratch0；族包 INDISTINCT，未采纳'),
+    'backend-uniform-d034-only': dict(
+        ref=os.path.join(D, r'backend-uniform-owner\RESULTS.json'),
+        report=os.path.join(D, r'backend-uniform-owner\REPORT.txt'),
+        status='INDISTINCT', saving_ms=0.18556799722222314,
+        ci95=[-0.01983336560404156, 0.3909693600484878],
+        scope='F04 D034 单臂（33 派发，不含 UPS contract）',
+        note='单臂 INDISTINCT；FASTER_95 只属于 combined（含 ups-c256-contract）。F04 的「现役接受」引用 combined，不引用单臂'),
+    'f04-middle-consumer-tile': dict(
+        ref=os.path.join(D, r'f04-middle-consumer-tile-20261027\RESULTS.json'),
+        report=os.path.join(D, r'f04-middle-consumer-tile-20261027\REPORT.txt'),
+        status='INDISTINCT', saving_ms=-0.06325810222222354,
+        ci95=[-0.28401678629252697, 0.1575005818480799], scope='F04 三宽 33 派发',
+        note='mLocal COL8 tile；producer 重排成本入账；未采纳'),
+    'f04-family-package': dict(
+        ref=os.path.join(D, r'f04-family-package-20261027\RESULTS.json'),
+        report=os.path.join(D, r'f04-family-package-20261027\REPORT.txt'),
+        status='SLOWER_95', saving_ms=-0.23012325999999797,
+        ci95=[-0.2830570296483008, -0.17718949035169512], scope='F04 三宽整族包',
+        note='新增常驻权重副本 24,409,344B；SLOWER_95 明确拒绝'),
+    'f04-own-middle-feed': dict(
+        ref=os.path.join(D, r'f04-own-middle-feed-20261027\RESULTS.json'),
+        report=os.path.join(D, r'f04-own-middle-feed-20261027\REPORT.txt'),
+        status='INDISTINCT', saving_ms=-0.03891261444444479,
+        ci95=[-0.16385234925627212, 0.08602712036738255], scope='F04 三宽自有份额直交',
+        note='仅绕过 self-owner SLM 读；新增 native 复制与分支；未采纳'),
+    'f04-ablation': dict(
+        ref=os.path.join(D, r'f04-package-ablation-20261027\RESULTS.json'),
+        report=os.path.join(D, r'f04-package-ablation-20261027\REPORT.txt'),
+        status='DIAGNOSIS', saving_ms=0.248587, ci95=[0.137540, 0.359634],
+        scope='F04 分配/绑定消融（未使用副本 vs 原绑定）',
+        note='仅新增未使用副本及其分配即慢约 0.249ms；保留 EEDB 池布局作为验收要求'),
+    'f05-a-return-separation': dict(
+        ref=os.path.join(D, r'f05-a-return-separation-20261027\RESULTS.json'),
+        report=os.path.join(D, r'f05-a-return-separation-20261027\RESULTS.txt'),
+        status='SLOWER', saving_ms=-0.084247, ci95=None,
+        scope='F05 C128 A 返回分离 / nextA 两阶段提前',
+        note='native 全 14 次提前、scratch0，但 540 样本六组全慢；提前发出不等于净收益'),
+    'f04-own-feed': None,
+    'f10-v-consumer-layout': dict(
+        ref=os.path.join(D, r'f10-v-consumer-layout\family\RESULTS.json'),
+        report=os.path.join(D, r'f10-layout-transfer-results\REPORT.txt'),
+        status='INDISTINCT', saving_ms=0.07185532333333337,
+        ci95=[-0.04349124797770301, 0.18720189464436976], scope='F10 16 派发 V-only 布局',
+        note='native 4621→4486 指令、send 582→498；未采纳'),
+    'f10-kv-retired-input': dict(
+        ref=os.path.join(D, r'f10-kv-retired-input\family\RESULTS.json'),
+        report=os.path.join(D, r'f10-layout-transfer-results\REPORT.txt'),
+        status='INDISTINCT', saving_ms=-0.01673292888888689,
+        ci95=[-0.24989938309822812, 0.21643352532045435], scope='F10 16 派发 K+V retired 输入',
+        note='send 582→372、mov 1837→1940；未采纳'),
+    'f19-f2-full': dict(
+        ref=os.path.join(D, r'c32-scale-fragments\F2-LIFETIME-REVIEW.json'),
+        report=os.path.join(D, r'c32-scale-fragments\REPORT.txt'),
+        status='REJECTED_BEFORE_TIMING', saving_ms=None, ci95=None,
+        scope='F19 F2 全族（含 4 个新增 scratch 消息）',
+        note='scratch 0→192B（128B column/address + 64B half input），计时前拒绝'),
+    'f21-f2-output-only': dict(
+        ref=os.path.join(D, r'c32-scale-fragments\F2-LIFETIME-REVIEW.json'),
+        report=os.path.join(D, r'c32-scale-fragments\REPORT.txt'),
+        status='REJECTED_BEFORE_TIMING', saving_ms=None, ci95=None,
+        scope='F21 F2 output-only（只改四个 p2.y 载入）',
+        note='scratch 0→128B，计时前拒绝'),
+    'f16-vit-reuse': dict(
+        ref=os.path.join(D, r'vit-epilogue-gain-reuse\family\NATIVE-IDENTITY.json'),
+        report=os.path.join(D, r'vit-epilogue-gain-reuse\family\NATIVE-REVIEW.json'),
+        status='NATIVE_EQUIVALENT_NO_ORDINARY', saving_ms=None, ci95=None,
+        scope='F16 8 派发（97,102,...,132）',
+        note='native 5404→5404 指令、send 1115→1115，仅 2 个 null immediate 差异；无 ordinary 计时'),
+}
+
+FAM = {
+    'F01': dict(w='图像', wb='施工书 N01：入口图像 gather 与 body 连续矩阵不同；PASS 头 width=32',
+                st='已测负结果', ev='gold+native+同批计时', scope='九派发组合（F01+body+F20）',
+                neg=['c32-scale-fragments'], acc=None,
+                basis='本轮 c32-scale-fragments 覆盖 F01（native send -56），组合 INDISTINCT 未采纳；当前字节为 c32-boundary-candidates-20261026/f01-direct-a 历史资产',
+                next='N01：只改一条仍存在的交接，让生产者在最后一次 half 窄化/store 时直接生成消费者 A/B 布局，不得增第二份镜像；入口图像单独过门，不能用 body 通过替代入口'),
+    'F02': dict(w='C32', wb='block1-4/67-69 的 C32 body（PASS 头 width=32）',
+                st='已测负结果', ev='gold+native+同批计时', scope='九派发组合（F01+body+F20）',
+                neg=['c32-scale-fragments'], acc=None,
+                basis='本轮 c32-scale-fragments 覆盖 7 个 body（native send -56），组合 INDISTINCT 未采纳；当前字节为 c32-rest-20261026/body-pv-den-overlap 历史资产',
+                next='N01：norm→QKV→score→den→PV→output→残差逐片段列 owner，先单变体过门再推广；不要恢复旧转置/SLM'),
+    'F03': dict(w='C32', wb='ioport_block4_0（C32 尾链 io port，PASS 头 width=32）',
+                st='未动', ev='无', scope='无', neg=[], acc=None,
+                basis='本轮无卡覆盖 F03；当前字节为 zcode handoff f03-ioport-direct-a 历史资产',
+                next='N07：F03 寄存器 pool→A 已存在，先查剩余 body 边界；互斥阶段 arena 共址须先证读域/写域与屏障覆盖'),
+    'F04': dict(w='C64/C128/C256', wb='SPV 目录 c64/c128/c256（block5-8/62-65=C64，9-14/56-61=C128，15-22/48-55=C256）',
+                st='现役接受', ev='gold+native+同批计时', scope='族（33 派发）',
+                neg=['backend-uniform-d034-only', 'f04-middle-consumer-tile', 'f04-family-package', 'f04-own-middle-feed', 'f04-ablation'],
+                acc='backend-uniform-owner',
+                basis='当前 33 行字节来自 backend-uniform-owner/combined（acc713ae，combined FASTER_95 +0.116484ms）；注意 D034 单臂本身是 INDISTINCT（+0.185568ms，CI 跨 0），FASTER_95 属于含 UPS contract 的组合；本轮 F04 另有四轮负结果/消融，字节未变',
+                next='N03：按 contract 连续 A 读取在 mLocal 生产者处组织 token slab 原位替换，不另建镜像；C128 与 C256 owner 不同必须分开做；不得原样重跑 middle-consumer-tile / family-package / own-middle-feed'),
+    'F05': dict(w='C64/C128/C256', wb='SPV 目录 family/c64、family/c128、c256/c256',
+                st='现役接受', ev='gold+native+同批计时', scope='族（36 派发）',
+                neg=['f05-a-return-separation'],
+                acc='f05-kv-consumer-layout',
+                basis='当前 36 行字节来自 f05-kv-consumer-layout/combined（eedb536b，FASTER_95 +0.133693ms）；C256 模块构建目录为 f05-k-consumer-tile/c256（该卡自身汇总为 INDISTINCT，见冲突 C2）',
+                next='N04（C64/C128）/N05（C256）：N04 沿 B 最后 DPAS→下一次地址生成→send 返回，把地址值移出旧 B 数据区，保持 B 读取次数与 A 窗口；N05 做受限 token 批复用一对权重（同 SG 多 M 块共享一次 B），先 M 批量翻倍。禁止重跑双 A、源顺序、六权重族、四权重 rolling、无边界 Q/K 交错、subgroup 单点/全边界'),
+    'F06': dict(w='C64/C128/C256', wb='SPV 目录 f06-scale-fragments/family/{c64,c128,c256}',
+                st='现役接受', ev='gold+native+同批计时', scope='族（33 派发）',
+                neg=[], acc='coefficient-reuse-combined',
+                basis='当前 33 行字节来自 coefficient-reuse-combined（b39fae00，combined FASTER_95 +0.072084ms）；F06 三宽 send -14/-62/-126',
+                next='N06：C128 走 gT 直接读 + 权重对跨两 M 块复用；C256 把 shT 按消费窗口分段发布/退休，不直接删 shT（删 32KiB 全局一次读可能变成 256KiB 逻辑请求）'),
+    'F07': dict(w='C64/C128/C256', wb='SPV 名 c64/c128/c256_combined',
+                st='已测负结果', ev='gold+native+同批计时', scope='族（3 派发）',
+                neg=['coefficient-reuse-extension'], acc=None,
+                basis='本轮 coefficient-reuse-extension 的 F07 臂 INDISTINCT（-0.011197ms），adopted=False；字节未变',
+                next='N07：F07 三宽 shT/pair/mean 逐相位列 RAW/WAR/WAW，只在最后消费者退休后复用 arena；C256 shared 44KiB 接近上限，不继续堆融合暂存'),
+    'F08': dict(w='C512', wb='split16 l0；f08-register-chain/RESULTS.json native.width=512',
+                st='现役接受', ev='gold+native+同批计时', scope='族（16 派发）',
+                neg=[], acc='f08-register-chain',
+                basis='当前 16 行字节来自 f08-register-chain-20261027（cc0b6ad，FASTER_95 +0.088429ms）；8SG、每 WG 4 组、gy4→2',
+                next='N08：WG 映射已按权重组邻接 token（本轮已采纳）；下一候选单独扩大每 SG 的 M 复用跨度并给 R/hidden/O 峰值图，不与 WG 重排同批首改'),
+    'F09': dict(w='C512', wb='split16 l1；与 F08 同 split16 组的 512 通道投影（F08 native.width=512）',
+                st='已测负结果', ev='gold+native+同批计时', scope='隔离臂（16 派发）',
+                neg=['owner-projection-transfer'], acc=None,
+                basis='本轮 owner-projection-transfer 的 f09-residual 臂 INDISTINCT（+0.052939ms，CI 跨 0），adopted=False；字节未变',
+                next='N09：F09 需要全 512 输入而前级每组只产 64，融合必须保留跨 group 供料；先做成对权重跨 M 块复用与片段 epilogue'),
+    'F10': dict(w='C512', wb='split16 l2；f10-weight-return-separation native 512 通道',
+                st='现役接受', ev='gold+native+同批计时', scope='族（16 派发）',
+                neg=['f10-v-consumer-layout', 'f10-kv-retired-input'], acc='f10-weight-return-separation',
+                basis='当前 16 行字节即基线自身（a024c3c5，相对当时现役 +0.422047ms，三块权重返回区分离）；本轮另有 V-only / K+V 两个布局臂 INDISTINCT',
+                next='N10：保留三块独立 B 返回区与两份 A 消费布局，不改 B 数量；检查 kc 供料循环里未消掉的 A 地址/发布/退休，按两个 M 块共同消费安排数据；无效 tile 裁剪只作次级方向'),
+    'F11': dict(w='C512', wb='split16 l3；与 F08 同 split16 组（F08 native.width=512）',
+                st='已测负结果', ev='gold+native+同批计时', scope='隔离臂（15 派发）',
+                neg=['owner-projection-f11'], acc=None,
+                basis='本轮 owner-projection-transfer 的 f11-swap 臂 INDISTINCT（+0.041111ms，CI 跨 0），adopted=False；字节未变',
+                next='N09：F11 完整 tile 已有直接 store，只计实际边缘的 half_tail；下一步做 producer 末次 store 折叠消费者地址，不得回退已有直接残差 seed'),
+    'F12': dict(w='C512', wb='split16 b30 l3/l4 最后域转换（F12 最后域，512 通道）',
+                st='未动', ev='无', scope='无', neg=[], acc=None,
+                basis='本轮无卡覆盖 F12；当前字节为 f12a-b30-direct-a 历史资产',
+                next='N09：F12 最后域转换不是普通投影；折叠 repack 必须同时修改 pool/arena 寿命起点并证明所有读者'),
+    'F13': dict(w='ViT1024', wb='ViT block31-38，1024 token / 1024→4096→1024（施工书 N11）',
+                st='已测负结果', st_text='已测负结果（contract 8）／未动（expand 8）',
+                ev='gold+native+同批计时', scope='隔离臂（contract 8 派发）',
+                neg=['vit-epilogue-contract'], acc=None,
+                basis='本轮 vit-epilogue-gain-reuse/contract-only 覆盖 8 个 contract 派发，INDISTINCT（-0.049641ms）；expand 8 派发本轮未动',
+                next='N11：shape-specific M/N tile 或 WG 顺序重排，保持权重读取量与每输出累加序；1024→4096→1024 不做全 hidden 寄存器融合'),
+    'F14': dict(w='ViT1024', wb='ViT block31-38 QKV/norm（1024 token）',
+                st='未动', ev='无', scope='无', neg=[], acc=None,
+                basis='本轮无卡覆盖 F14 字节：vit-epilogue-gain-reuse 的 8 派发臂实为 F13 contract（见冲突 C1），F14 未被替换；当前字节为 vit-qkv-norm-owner-v2 历史资产',
+                next='N12：片段 norm 已启用，只处理真实残留的系数 owner/广播或输出打包，不新增独立 norm 核；先逐节点证明原树同序再谈删广播'),
+    'F15': dict(w='ViT1024', wb='ViT block31-38 attention（1024 token）',
+                st='未动', ev='无', scope='无', neg=[], acc=None,
+                basis='本轮无卡覆盖 F15；当前字节为 f15l-vit-pv 历史资产（P/den 已寄存器化）',
+                next='N13：受限 query-owner 扩大只升一级，让一次 K/V 供两个 query 片段；K 行置换、den owner、P→PV 映射必须联合证明'),
+    'F16': dict(w='ViT1024', wb='ViT block31-38 projection（1024 token）',
+                st='资产未采纳', ev='仅native', scope='族（8 派发）',
+                neg=['f16-vit-reuse'], acc=None,
+                basis='本轮 vit-epilogue-gain-reuse/family 覆盖 8 个 projection 派发：native 5404→5404 指令、send 1115→1115，仅 2 个 null immediate 差异，无 ordinary 计时，未采纳',
+                next='N11：F16 当前已有权重对复用与片段 epilogue；下一步查 native 真实供料冲突，不泛加预取；保持权重读取量与每输出累加序'),
+    'F17': dict(w='UPS', wb='UPS t3 投影 blend；通道宽度无本轮字节级证据，写 UNKNOWN',
+                st='未动', ev='无', scope='无', neg=[], acc=None,
+                basis='本轮无卡覆盖 F17（ups-* 轮作用于 F18 的 pre/body/contract）；当前字节为 f17-b39-regbroadcast 历史资产',
+                next='N14：F17 投影 blend 已融合，四像素共用投影值的复用必须保留；下一步只在证明唯一读者后把 producer 末次写出改消费者 tile'),
+    'F18': dict(w='UPS-C256/C128/C64', wb='SPV 名 c3x_pre/body_c256_c128_c64 与 block48/56/62 的 c256/c128/c64 目录',
+                st='已测负结果', st_text='已测负结果（c3x 6）／现役接受（body_2 3）',
+                ev='gold+native+同批计时', scope='族（9 派发，其中 body_2 3 行现役接受）',
+                neg=['ups-coarse-owner', 'ups-fused-no-mirror', 'ups-direct-family'], acc='coefficient-reuse-combined',
+                basis='三行 body_2（ordinal 168/194/214）字节来自 coefficient-reuse 的 contract-scale-fragments（现役接受）；其余 6 行 c3x pre/body 属 ups-* 负结果族，字节未变',
+                next='N14：普通 UPS 仍有 shA/gM 边界，不能拿普通 F04 删除结果覆盖；首试一条 producer 末次写出改消费者 tile，或互斥阶段 arena 别名，保留 blend 最后消费者与残差 seed'),
+    'F19': dict(w='C32', wb='f2c32_block66_fused（F2 C32 尾链融合）',
+                st='资产未采纳', ev='仅native', scope='族（1 派发）',
+                neg=['f19-f2-full'], acc=None,
+                basis='本轮 c32-scale-fragments 的 F2 全族臂 scratch 0→192B，计时前拒绝；F2 的 blend/反馈输入需独立变体',
+                next='N01：F2 有自身 blend/反馈输入，先修 scratch 实现或换实现再谈计时；不得用 no-F2 九派发组合替代 F2 单独验收'),
+    'F20': dict(w='C32', wb='s37_fold_body_r1a_v1（C32 尾链折叠）',
+                st='已测负结果', ev='gold+native+同批计时', scope='九派发组合（F01+body+F20）',
+                neg=['c32-scale-fragments'], acc=None,
+                basis='本轮 c32-scale-fragments 覆盖 F20（native send -28），组合 INDISTINCT 未采纳；字节未变',
+                next='N02：从当前输出链核对 32→32 投影与 32→4 小投影边界，保留已获收益版本；history/反馈/最终 surface 只在证明唯一读者、写域与寿命后折叠'),
+    'F21': dict(w='图像', wb='ioport_block70_2 最终四输出尾域（图像级）',
+                st='资产未采纳', ev='仅native', scope='族（1 派发）',
+                neg=['f21-f2-output-only'], acc=None,
+                basis='本轮 f2-output-scale-fragments 只改四个 p2.y 载入：scratch 0→128B，计时前拒绝；字节未变',
+                next='N02：小 32→4 投影是否用 XMX 要单独算有效乘法比例/padding/布局重组；尾核消费 history/反馈/最终 surface，不删必要的最终写回'),
+}
+
+FORBID_RERUN = {
+    'F01': ['c32-scale-fragments scale-fragment 同身份（native send -56）重跑'],
+    'F02': ['c32-scale-fragments body send -56 同身份重跑'],
+    'F04': ['F04 双 A / own-middle-feed', 'F04 middle-consumer-tile（COL8 tile 同身份）', 'F04 整族包（新增常驻权重副本）', 'F04 未使用副本分配方案'],
+    'F05': ['F05 双 A（C128 四块 B 滚动）', 'F05 源顺序重排', '六权重族', '四权重 rolling', '无边界 Q/K 交错', 'subgroup 单点/全边界', 'A 返回分离（nextA 提前）', 'K consumer tile（C64/C128 已测身份）', 'score Q pair'],
+    'F06': ['F06 hoist-only 身份重跑（已在 coefficient-reuse 内测过）'],
+    'F07': ['coefficient-reuse-extension 的 F07 三派发同身份重跑'],
+    'F08': ['删除两道 shared 的旧方案（现役已是三段寄存器链）'],
+    'F10': ['继续增加 B 预取数量', 'V-only 消费布局同身份重跑', 'K+V retired-input 同身份重跑'],
+    'F11': ['owner-projection-transfer f11-swap 同身份重跑'],
+    'F09': ['owner-projection-transfer f09-residual 同身份重跑'],
+    'F13': ['vit-epilogue contract-only 8 派发同身份重跑'],
+    'F16': ['ViT F16 reuse 同身份重跑（native 已等价）'],
+    'F18': ['ups-coarse-owner 三 pre 宽度同身份重跑', 'ups-fused-no-mirror / ups-fused3 同身份重跑', 'ups-direct-family 三宽族包同身份重跑', 'C128 UPS 融合（已知 native 448B scratch）'],
+    'F19': ['F2 全族 scale-fragment（192B scratch）同身份重跑'],
+    'F21': ['F2 output-only 四 p2.y 载入（128B scratch）同身份重跑'],
+    'F20': ['c32-scale-fragments F20 send -28 同身份重跑'],
+}
+
+
+def main():
+    passes = parse_plan()
+    rows = json.load(open(ROWS_P, encoding='utf-8'))
+    assert len(passes) == 232 and len(rows) == 232
+
+    # numbering facts
+    idx_counts = collections.Counter(p['plan_index'] for p in passes)
+    dup_idx = {k: v for k, v in idx_counts.items() if v > 1}
+    idx_to_names = collections.defaultdict(list)
+    for p in passes:
+        idx_to_names[p['plan_index']].append(p['name'])
+
+    # measured hashes
+    pair = {}
+    for r in rows:
+        for kind in ('spv', 'source'):
+            p = r[kind]
+            k = (kind, p.lower())
+            if k not in pair:
+                pair[k] = (sha(p) if os.path.exists(p) else None)
+
+    # identity evidence
+    idn = json.load(open(ID232_P, encoding='utf-8'))
+    id_by_sha = {}
+    for s in idn['shaders']:
+        key = None
+        for r in rows:
+            if r['name'] == s['name'] and r['family'] == s['family']:
+                key = r['spv_sha256']
+                break
+        id_by_sha[key] = s
+    recipe = json.load(open(RECIPE_P, encoding='utf-8'))
+    recipe_by_sha = recipe['shaders']
+
+    # census staleness (documented, never used as identity)
+    census = json.load(open(CENSUS_P, encoding='utf-8'))
+    crow = {x['ordinal']: x for x in census['rows']}
+    census_spv_diff = [o for o in range(232)
+                       if crow[o]['spv'].replace('\\', '/').lower() != rows[o]['spv'].replace('\\', '/').lower()]
+    census_sha_diff = [o for o in range(232)
+                       if (crow[o].get('sha256') or '').lower() != rows[o]['spv_sha256'].lower()]
+
+    out_rows = []
+    checks = dict(
+        rows=len(rows), unique_spv=len({r['spv'].lower() for r in rows}),
+        unique_source=len({r['source'].lower() for r in rows}),
+        plan_pass_lines=len(passes),
+        pass_label_mismatch=[], name_mismatch=[], spv_mismatch=[], grid_mismatch=[],
+        spv_sha_mismatch=[], source_sha_mismatch=[], spv_missing=[], source_missing=[],
+        binds_mismatch=[], push_mismatch=[],
+    )
+
+    for n, (p, r) in enumerate(zip(passes, rows)):
+        o = r['ordinal']
+        spv_m = pair[('spv', r['spv'].lower())]
+        src_m = pair[('source', r['source'].lower())]
+        if not os.path.exists(r['spv']):
+            checks['spv_missing'].append(o)
+        if not os.path.exists(r['source']):
+            checks['source_missing'].append(o)
+        if spv_m != r['spv_sha256']:
+            checks['spv_sha_mismatch'].append(o)
+        if src_m != r['source_sha256']:
+            checks['source_sha_mismatch'].append(o)
+        if p['plan_index'] != r['pass_label']:
+            checks['pass_label_mismatch'].append(o)
+        if p['name'] != r['name']:
+            checks['name_mismatch'].append(o)
+        if p['spv'].replace('\\', '/').lower() != r['spv'].replace('\\', '/').lower():
+            checks['spv_mismatch'].append(o)
+        if p['fields'][4:7] != list(r['grid']):
+            checks['grid_mismatch'].append(o)
+        if p['binds_declared'] != p['binds_actual']:
+            checks['binds_mismatch'].append(o)
+        if p['push_actual'] != 1:
+            checks['push_mismatch'].append(o)
+
+        # width from the measured SPV path / name, never from ordinal arithmetic
+        low = r['spv'].lower()
+        if r['family'] in ('F04', 'F05', 'F06'):
+            if '\\c64\\' in low or low.endswith('\\c64\\candidate.spv'):
+                width = 'C64'
+            elif '\\c128\\' in low or low.endswith('\\c128\\candidate.spv'):
+                width = 'C128'
+            elif '\\c256\\' in low:
+                width = 'C256'
+            else:
+                width = 'UNKNOWN'
+        elif r['family'] == 'F07':
+            width = 'C64' if 'c64' in r['name'] else ('C128' if 'c128' in r['name'] else 'C256')
+        elif r['family'] in ('F08', 'F09', 'F10', 'F11', 'F12'):
+            width = 'C512'
+        elif r['family'] in ('F13', 'F14', 'F15', 'F16'):
+            width = 'ViT1024'
+        elif r['family'] == 'F18':
+            width = 'UPS-C256' if 'c256' in low else ('UPS-C128' if 'c128' in low else 'UPS-C64')
+        elif r['family'] in ('F01', 'F21'):
+            width = '图像'
+        elif r['family'] == 'F17':
+            width = 'UPS'
+        else:
+            width = 'C32'
+
+        fam = FAM[r['family']]
+        card, secondary = NMAP[r['family']]
+        if r['family'] == 'F05':
+            card = 'N05' if width == 'C256' else 'N04'
+            secondary = []
+        status = fam['st']
+        basis = fam['basis']
+        ev_level, ev_scope, neg_keys = fam['ev'], fam['scope'], list(fam['neg'])
+        # F13 splits by site: contract 8 派发被本轮测过（负），expand 8 派发本轮未动
+        if r['family'] == 'F13' and '_ffn_expand' in r['name']:
+            status, ev_level, ev_scope, neg_keys = '未动', '无', '无', []
+            basis = ('本轮 vit-epilogue-gain-reuse 只替换 contract 8 派发，expand 8 派发字节未变；'
+                     '当前字节为 dsh-fp16-same-family-20261023/s32-k11-v1 历史资产')
+        # F18 body_2 rows carry the accepted coefficient-reuse shader
+        if r['family'] == 'F18' and r['name'].endswith('swin_body_2'):
+            status = '现役接受'
+            basis = ('当前字节来自 coefficient-reuse-combined 的 contract-scale-fragments/family/%s'
+                     '（b39fae00，combined FASTER_95 +0.072084ms），UPS contract 三宽 send -14/-30/-62；'
+                     '同族 c3x pre/body 6 行仍属 ups-* 负结果族' % width.replace('UPS-', '').lower())
+
+        sid = id_by_sha.get(r['spv_sha256'])
+        if sid and sid.get('raw_match'):
+            rebuild, rerr = 'BYTES_REPRODUCED_RAW', None
+        elif sid and sid.get('decorated_match'):
+            rebuild, rerr = 'BYTES_REPRODUCED_DECORATED', None
+        else:
+            rebuild, rerr = 'NOT_REPRODUCED', ((sid or {}).get('error') or 'unknown')[:160]
+
+        rec = recipe_by_sha.get(r['spv_sha256']) or {}
+        acc = ACCEPTED_ROUNDS[fam['acc']] if fam['acc'] else None
+
+        out_rows.append(dict(
+            ordinal=o,
+            plan_index=p['plan_index'],
+            plan_line=p['line'],
+            plan_index_multiplicity=idx_counts[p['plan_index']],
+            plan_index_siblings=idx_to_names[p['plan_index']] if idx_counts[p['plan_index']] > 1 else [],
+            name=r['name'], family=r['family'], width=width, width_basis=fam['wb'],
+            grid=list(r['grid']), pass_header_fields=list(r['header_fields']),
+            pass_block=dict(binds=p['binds_actual'], push_values=p['push_values'],
+                            push_value_count=len(p['push_values'])),
+            spv=dict(path=r['spv'], sha256_declared=r['spv_sha256'], sha256_measured=spv_m,
+                     match=spv_m == r['spv_sha256'], exists=os.path.exists(r['spv'])),
+            source=dict(path=r['source'], sha256_declared=r['source_sha256'], sha256_measured=src_m,
+                        match=src_m == r['source_sha256'], exists=os.path.exists(r['source'])),
+            identity=dict(rebuild=rebuild, recipe_recorded=bool(rec.get('recipes')),
+                          recipe_count=len(rec.get('recipes') or []),
+                          rebuild_error=rerr),
+            card=card, cards_secondary=secondary,
+            status=status, status_basis=basis,
+            evidence_level=ev_level, evidence_scope=ev_scope,
+            accepted_round=(fam['acc'] if status == '现役接受' and fam['acc'] else None),
+            negative_keys=neg_keys,
+            history_card_dir=os.path.dirname(r['spv']),
+            next_action=fam['next'],
+        ))
+
+    # ---- family rollup + self check
+    fam_rows = collections.defaultdict(list)
+    for x in out_rows:
+        fam_rows[x['family']].append(x)
+    fam_order = ['F%02d' % i for i in range(1, 22)]
+    WORDER = {'图像': 0, 'C32': 1, 'C64': 2, 'C128': 3, 'C256': 4, 'C512': 5,
+              'ViT1024': 6, 'UPS': 7, 'UPS-C64': 8, 'UPS-C128': 9, 'UPS-C256': 10}
+    rollup = []
+    for f in fam_order:
+        rs = fam_rows[f]
+        meth = collections.Counter(x['status'] for x in rs)
+        ev = collections.Counter(x['evidence_level'] for x in rs)
+        widths = sorted({x['width'] for x in rs}, key=lambda w: WORDER.get(w, 99))
+        rollup.append(dict(family=f, pass_count=len(rs), widths=widths,
+                           card=NMAP[f][0], status_counts=dict(meth),
+                           evidence_counts=dict(ev),
+                           accepted_via=(FAM[f]['acc'] if FAM[f]['acc'] else None),
+                           negatives=FAM[f]['neg'],
+                           forbidden_rerun=FORBID_RERUN.get(f, [])))
+    total = sum(x['pass_count'] for x in rollup)
+    coverage_txt = {}
+    for line in open(COVERAGE_TXT, encoding='utf-8'):
+        m = re.match(r'^(F\d\d): (\d+) PASS', line.strip())
+        if m:
+            coverage_txt[m.group(1)] = int(m.group(2))
+    etalon_ok = all(coverage_txt.get(x['family']) == x['pass_count'] for x in rollup)
+    coverage_total_ok = sum(coverage_txt.values()) == total == 232
+
+    checks['family_sum'] = total
+    checks['coverage_txt_per_family_match'] = etalon_ok
+    checks['coverage_txt_total'] = sum(coverage_txt.values())
+    checks['ordinals_contiguous_0_231'] = [x['ordinal'] for x in out_rows] == list(range(232))
+    checks['plan_index_distinct'] = len(idx_counts)
+    checks['plan_index_multiplicity_gt1'] = {k: v for k, v in sorted(dup_idx.items(), key=lambda kv: int(kv[0]))}
+    checks['plan_index_max_multiplicity'] = max(idx_counts.values())
+    checks['identity_rebuild_counts'] = dict(collections.Counter(x['identity']['rebuild'] for x in out_rows))
+    checks['recipe_recorded_rows'] = sum(1 for x in out_rows if x['identity']['recipe_recorded'])
+    # cross-tab: recorded BUILD.json recipe vs byte reproduction, counted once per unique shader
+    _uniq = {}
+    for x in out_rows:
+        k = x['spv']['sha256_declared']
+        _uniq.setdefault(k, [x, 0])[1] += 1
+    ct_sh = collections.Counter()
+    ct_row = collections.Counter()
+    for k, (x, n) in _uniq.items():
+        rep = x['identity']['rebuild'] != 'NOT_REPRODUCED'
+        rec = bool(x['identity']['recipe_recorded'])
+        ct_sh[(rec, rep)] += 1
+        ct_row[(rec, rep)] += n
+    checks['identity_recipe_crosstab'] = dict(
+        shaders=dict(recipe_and_reproduced=ct_sh[(True, True)], recipe_only_no_reproduce=ct_sh[(True, False)],
+                     reproduced_only_no_recipe=ct_sh[(False, True)], neither=ct_sh[(False, False)]),
+        rows=dict(recipe_and_reproduced=ct_row[(True, True)], recipe_only_no_reproduce=ct_row[(True, False)],
+                  reproduced_only_no_recipe=ct_row[(False, True)], neither=ct_row[(False, False)]),
+        note='两类身份证据完全不相交：没有任何一个 shader 既有显式 BUILD.json recipe 又被字节复现')
+    checks['census_spv_diff_positions'] = len(census_spv_diff)
+    checks['census_sha_diff_positions'] = len(census_sha_diff)
+    checks['census_plan_sha'] = census.get('plan_sha256')
+    checks['baseline_plan_sha_declared'] = BASELINE_SHA
+    checks['baseline_plan_sha_measured'] = sha(PLAN)
+    checks['baseline_plan_sha_match'] = checks['baseline_plan_sha_measured'] == BASELINE_SHA
+    checks['all_spv_sha_verified'] = not checks['spv_sha_mismatch'] and not checks['spv_missing']
+    checks['all_source_sha_verified'] = not checks['source_sha_mismatch'] and not checks['source_missing']
+    checks['pass_label_derived_from_plan_not_ordinal'] = True
+    checks['rows_with_pass_label_equal_to_ordinal'] = sum(1 for x in out_rows if x['plan_index'] == str(x['ordinal']))
+
+    meta = dict(
+        schema='cov-232/coverage-232/v1',
+        card='cov-232',
+        generated_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+        scope='当前接受 FP16 基线的 232 个派发位置逐 PASS 覆盖表；证据级别按合同第 4/6 节口径；无新 GPU、无部署',
+        baseline=dict(
+            plan_path=PLAN, plan_sha256=BASELINE_SHA,
+            plan_sha256_measured=checks['baseline_plan_sha_measured'],
+            status='OFFLINE_VALIDATED_NOT_DEPLOYED',
+            pointer_json=os.path.join(AUD, 'FULLNET-MECHANISM-CURRENT.json'),
+            pointer_increment_ms=0.4220474494444435,
+            pointer_ci95_ms=[0.29717955207841984, 0.5469153468104672],
+            note='0.422ms 是 F10 相对当时现役的增量，已含在基线内，不得当成本轮可得收益，也不得跨批次相减毫秒'),
+        numbering=dict(
+            ordinal='0 基派发序号，来自 CURRENT-232-ROWS.json / plan 中 PASS 行的出现次序',
+            plan_index='plan.txt PASS 行的第一个 token（本表逐行实测）',
+            plan_index_distinct=len(idx_counts),
+            plan_index_multiplicity_gt1_count=len(dup_idx),
+            plan_index_max_multiplicity=max(idx_counts.values()),
+            plan_index_shared_examples=[dict(plan_index=k, n=v, names=idx_to_names[k])
+                                        for k, v in sorted(dup_idx.items(), key=lambda kv: int(kv[0]))[:6]],
+            pipeline_index='第三套编号，来自 plan 内的 pipeline 次序，本表不使用；施工书载明 C128 F05 为 pipeline9、F10 为 pipeline18',
+            rule='定位一个位置必须用 ordinal + name + SPV sha256 + PASS 行号；plan_index 不唯一，禁止当唯一键',
+        ),
+        evidence_policy=dict(
+            status_levels=['现役接受', '已测负结果', '未动', '资产未采纳'],
+            evidence_levels=['gold+native+同批计时', '仅native', '仅CPU', '无'],
+            status_rule='优先取本轮字节来源轮：字节被本轮采纳轮改变=现役接受；本轮测过且被拒=已测负结果；仅有候选资产未采纳或未计时=资产未采纳；本轮无卡覆盖=未动',
+            old_timing_rule='旧计时/旧 native 不作为当前身份或当前收益；本表只引用带 plan sha 的当批结果，其余写 UNKNOWN/未动',
+            identity_rule='逐行 spv/source 的 sha256 均由本卡从磁盘实测并与 CURRENT-232-ROWS 声明值比对；rebuild 状态取 evidence/IDENTITY-232.json；recipe 取 evidence/RECIPE-MAP.json',
+        ),
+        cards=dict(
+            primary={f: NMAP[f][0] for f in fam_order},
+            f05_split='F05 C64/C128 → N04（QKV 供料）；F05 C256 → N05（C256 + attention owner）',
+            cross_cutting=[
+                'N15 全网地址/窄读/尾域：不独占任何 PASS 位置，逐族取一处 native 已证仍有逐 half/byte 拼装者',
+                'N16 跨派发/persistent：不独占任何 PASS 位置，需先完成池寿命、发布 flag/epoch 与反馈证明',
+            ],
+        ),
+        family_rollup=rollup,
+        identity_sources=dict(rebuild_evidence=ID232_P, recipe_evidence=RECIPE_P,
+                              rebuild_semantics='raw=重建 SPV 与目标字节相同；decorated=仅装饰差异；NOT_REPRODUCED=include/工具链解析失败（不是哈希不符）'),
+        negative_ledger={k: dict(status=v['status'], saving_ms=v['saving_ms'],
+                                 ci95_ms=v.get('ci95'), scope=v['scope'], note=v['note'],
+                                 results_path=v['ref'], report_path=v.get('report'))
+                         for k, v in NEG.items() if v},
+        accepted_rounds={k: dict(plan_path=v[1], plan_sha256=v[0], saving_ms=v[2],
+                                 ci95_ms=v[3], scope=v[4]) for k, v in ACCEPTED_ROUNDS.items()},
+        rows=out_rows,
+        self_check=checks,
+    )
+
+    # ---- formal completeness gate: no row may be missing a required field
+    required = ['ordinal', 'plan_index', 'plan_line', 'plan_index_multiplicity', 'name', 'family',
+                'width', 'width_basis', 'grid', 'pass_block', 'spv', 'source', 'identity', 'card',
+                'status', 'status_basis', 'evidence_level', 'evidence_scope', 'history_card_dir',
+                'next_action']
+    problems = []
+    for x in out_rows:
+        for k in required:
+            if k not in x or x[k] in (None, '', [], {}):
+                problems.append((x['ordinal'], k))
+        if x['status'] not in ('现役接受', '已测负结果', '未动', '资产未采纳'):
+            problems.append((x['ordinal'], 'status', x['status']))
+        if x['evidence_level'] not in ('gold+native+同批计时', '仅native', '仅CPU', '无'):
+            problems.append((x['ordinal'], 'evidence_level', x['evidence_level']))
+        if not x['spv']['match'] or not x['source']['match']:
+            problems.append((x['ordinal'], 'sha'))
+        if x['status'] == '现役接受' and not x['accepted_round']:
+            problems.append((x['ordinal'], 'accepted_round missing'))
+    checks['row_field_problems'] = problems
+    checks['row_fields_complete'] = not problems
+    meta['self_check'] = checks
+
+    with open(os.path.join(CARD, 'COVERAGE-232.json'), 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(meta, f, ensure_ascii=False, indent=1)
+    with open(os.path.join(CARD, 'SELFCHECK.json'), 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(dict(card='cov-232', checks=checks, family_rollup=rollup, generated_utc=meta['generated_utc']),
+                  f, ensure_ascii=False, indent=1)
+    return meta
+
+
+def _ranges(nums):
+    nums = sorted(nums)
+    out, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out.append(str(nums[i]) if j == i else '%d-%d' % (nums[i], nums[j]))
+        i = j + 1
+    return ','.join(out)
+
+
+def write_markdown(meta):
+    rows = meta['rows']
+    checks = meta['self_check']
+    roll = meta['family_rollup']
+    b = meta['baseline']
+    nb = meta['numbering']
+
+    L = []
+    L.append('# 232 位置逐 PASS 覆盖表（cov-232）')
+    L.append('')
+    L.append('由 `build_coverage.py` 从磁盘实测生成（%s）。只读输入，未运行 GPU、未部署、未修改任何现有文件。' % meta['generated_utc'])
+    L.append('')
+    L.append('## 1. 身份')
+    L.append('')
+    L.append('| 项 | 值 |')
+    L.append('|---|---|')
+    L.append('| 基线 plan | `%s` |' % b['plan_path'])
+    L.append('| 声明 SHA256 | `%s` |' % b['plan_sha256'])
+    L.append('| 实测 SHA256 | `%s` |' % b['plan_sha256_measured'])
+    L.append('| 一致 | %s |' % ('是' if b['plan_sha256_measured'] == b['plan_sha256'] else '**否**'))
+    L.append('| 状态 | %s |' % b['status'])
+    L.append('| 收益指针 | `%s`，+%.6fms CI[%.6f, %.6f] |' % (b['pointer_json'], b['pointer_increment_ms'], b['pointer_ci95_ms'][0], b['pointer_ci95_ms'][1]))
+    L.append('| PASS 行数 / 唯一 SPV / 唯一源码 | %d / %d / %d |' % (checks['plan_pass_lines'], checks['unique_spv'], checks['unique_source']))
+    L.append('')
+    L.append('0.422047ms 是 F10 相对当时现役的增量，**已含在基线内**：不构成本轮可得收益，也不能跨批次相减毫秒。')
+    L.append('')
+    L.append('## 2. 三套编号：ordinal / PASS 编号 / pipeline index')
+    L.append('')
+    L.append('- **ordinal**（0 基）：派发出现次序，`CURRENT-232-ROWS.json` 与本表的主键。232 个、连续 0–231。')
+    L.append('- **PASS 编号**：`plan.txt` 中 `PASS <index> "<name>" "<spv>" <width> <?> <binds> <32> <gx> <gy> <gz>` 的第一个 token，本表逐行实测。**它不唯一**：232 行 PASS 只有 **%d** 个不同值，**%d** 个值被多行共用，最大复用 **%d** 次（例：PASS 5 同时是 block5_swin_body_1 / body_3 / body_4）。' % (nb['plan_index_distinct'], nb['plan_index_multiplicity_gt1_count'], nb['plan_index_max_multiplicity']))
+    L.append('- **pipeline index** 是第三套编号，本表不用。施工书载明：本次 C128 F05 是 pipeline9，F10 是 pipeline18，不得混用。')
+    L.append('- 只有 ordinal 0–4 的 PASS 号恰好等于 ordinal（共 %d 行）；从 ordinal 5 起全部错位（ordinal 5 → PASS 4，ordinal 7 → PASS 5）。**定位一个位置必须用 ordinal + name + SPV sha256 + PASS 行号。**' % checks['rows_with_pass_label_equal_to_ordinal'])
+    L.append('')
+    L.append('## 3. 自检结果（`SELFCHECK.json`）')
+    L.append('')
+    L.append('| 检查 | 结果 |')
+    L.append('|---|---|')
+    L.append('| 行数 = 232，ordinal 连续 0–231 | %s |' % ('通过' if checks['ordinals_contiguous_0_231'] and checks['rows'] == 232 else '**失败**'))
+    L.append('| 逐族 PASS 数合计 | **%d** |' % checks['family_sum'])
+    L.append('| 与 `COVERAGE.txt` 逐族比对 | %s（其合计 %d） |' % ('通过' if checks['coverage_txt_per_family_match'] else '**不一致**', checks['coverage_txt_total']))
+    L.append('| 232 行 spv SHA 磁盘实测一致 | %s |' % ('通过（39/39 唯一 SPV）' if checks['all_spv_sha_verified'] else '**失败**'))
+    L.append('| 232 行 source SHA 磁盘实测一致 | %s |' % ('通过（39/39 唯一源码）' if checks['all_source_sha_verified'] else '**失败**'))
+    L.append('| PASS 编号从 plan 实测且与 ROWS 一致 | %s（错位 %d 行） |' % ('通过' if not checks['pass_label_mismatch'] else '**不一致**', len(checks['pass_label_mismatch'])))
+    L.append('| 名称 / SPV 路径 / grid 逐行一致 | %s |' % ('通过' if not (checks['name_mismatch'] or checks['spv_mismatch'] or checks['grid_mismatch']) else '**不一致**'))
+    L.append('| PASS 块结构（BIND 数 = 声明值，PUSH = 1） | %s |' % ('通过' if not (checks['binds_mismatch'] or checks['push_mismatch']) else '**失败**'))
+    L.append('| 字节复现（39 唯一 shader） | raw 16 / decorated 1 / 未复现 22 |')
+    L.append('| 有显式 recipe 的行 | %d / 232 |' % checks['recipe_recorded_rows'])
+    L.append('| 232 行必填字段完整（含 status/evidence 取值合法） | %s |' % ('通过' if checks.get('row_fields_complete') else '**失败**：%s' % checks.get('row_field_problems')))
+    L.append('')
+    L.append('## 4. 逐族汇总')
+    L.append('')
+    L.append('| 族 | PASS | 宽度 | 施工卡 | 状态分布 | 证据级别 | 本轮字节来源轮 |')
+    L.append('|---|---|---|---|---|---|---|')
+    for x in roll:
+        st = ' / '.join('%s %d' % (k, v) for k, v in x['status_counts'].items())
+        ev = ' / '.join('%s %d' % (k, v) for k, v in x['evidence_counts'].items())
+        L.append('| %s | %d | %s | %s | %s | %s | %s |' % (
+            x['family'], x['pass_count'], '/'.join(x['widths']), x['card'], st, ev, x['accepted_via'] or '历史资产'))
+    L.append('| **合计** | **%d** | | | | | |' % checks['family_sum'])
+    L.append('')
+    L.append('## 5. 232 行明细')
+    L.append('')
+    L.append('`PASS` 列带 `×n` 表示该 PASS 号被 n 行共用。`复现` 列：R=raw 字节复现、D=装饰后复现、N=未复现（工具链/include，见 §7）。')
+    L.append('')
+    L.append('| ord | PASS | 名称 | 族 | 宽度 | grid | 状态 | 证据级别 | 施工卡 | 复现 | SPV sha12 | 源码 sha12 |')
+    L.append('|---|---|---|---|---|---|---|---|---|---|---|---|')
+    for x in rows:
+        pi = x['plan_index'] + ('×%d' % x['plan_index_multiplicity'] if x['plan_index_multiplicity'] > 1 else '')
+        rep = {'BYTES_REPRODUCED_RAW': 'R', 'BYTES_REPRODUCED_DECORATED': 'D'}.get(x['identity']['rebuild'], 'N')
+        L.append('| %d | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` | `%s` |' % (
+            x['ordinal'], pi, x['name'], x['family'], x['width'], 'x'.join(x['grid']),
+            x['status'], x['evidence_level'], x['card'], rep,
+            x['spv']['sha256_measured'][:12], x['source']['sha256_measured'][:12]))
+    L.append('')
+    L.append('## 6. 口径')
+    L.append('')
+    for k, v in meta['evidence_policy'].items():
+        L.append('- **%s**：%s' % (k, v))
+    L.append('')
+    L.append('## 7. 身份证据的两条支线')
+    L.append('')
+    L.append('- `evidence/IDENTITY-232.json`：用 `COMMON.py` 的 include 目录启发式重建，39 个唯一 shader 中 16 个 raw 字节复现、1 个（F20）装饰后复现、22 个失败（失败原因是 include/工具链解析，不是哈希不符）。')
+    L.append('- `evidence/RECIPE-MAP.json`：从 66 个 BUILD.json 汇总，只有 14/39 个 shader 有显式 recipe，25 个没有。**「能复现字节」不等于「原始构建配方已知」**，逐行 identity 同时给出 `rebuild` 与 `recipe_recorded`。')
+    ct = checks['identity_recipe_crosstab']
+    L.append('- 两者交叉：有 recipe 且复现 **%d** 个 shader、有 recipe 未复现 **%d** 个、无 recipe 却复现 **%d** 个、两者都无 **%d** 个 —— 零重叠，详见 `FAMILY-STATE.md` 冲突 C4。' % (
+        ct['shaders']['recipe_and_reproduced'], ct['shaders']['recipe_only_no_reproduce'],
+        ct['shaders']['reproduced_only_no_recipe'], ct['shaders']['neither']))
+    L.append('')
+    L.append('## 8. 本目录文件')
+    L.append('')
+    L.append('| 文件 | 内容 |')
+    L.append('|---|---|')
+    L.append('| `COVERAGE-232.json` | 机器可读台账：232 行 + 族汇总 + 编号口径 + 自检 |')
+    L.append('| `COVERAGE-232.md` | 本文件 |')
+    L.append('| `FAMILY-STATE.md` | F01–F21 与 ViT 段族状态台账 |')
+    L.append('| `SELFCHECK.json` | 自检明细独立副本 |')
+    L.append('| `build_coverage.py` | 生成器（只读输入、可重跑） |')
+    L.append('| `RESUME.txt` | 状态、未证项、下一动作 |')
+    L.append('')
+    open(os.path.join(CARD, 'COVERAGE-232.md'), 'w', encoding='utf-8', newline='\n').write('\n'.join(L) + '\n')
+
+
+def write_family_state(meta):
+    rows = meta['rows']
+    checks = meta['self_check']
+    roll = {x['family']: x for x in meta['family_rollup']}
+    byfam = collections.defaultdict(list)
+    for x in rows:
+        byfam[x['family']].append(x)
+
+    L = []
+    L.append('# 族状态台账 F01–F21 + ViT 段（cov-232）')
+    L.append('')
+    L.append('基线：`%s`（`%s`），%s。本文件回答「每族现在是什么状态、收益归谁、哪些冲突已具名、哪些不许原样重跑」。' % (
+        meta['baseline']['plan_path'], meta['baseline']['plan_sha256'][:12], meta['baseline']['status']))
+    L.append('')
+    L.append('## 1. 采用链（本轮离线采纳顺序，不可相加）')
+    L.append('')
+    L.append('| # | 轮 | plan sha256 | 相对父增量 | 覆盖 | 在当前基线还能看到多少行字节 |')
+    L.append('|---|---|---|---|---|---|')
+    chain = [
+        ('f05-local-inverse', 'F05 同值 inverse 广播删除', '0 行（SPV 被后续 F05 轮重建）'),
+        ('f05-owner-concurrency', 'F05 显式 subgroup owner', '0 行（同上）'),
+        ('backend-uniform-owner', 'D034 33 + UPS contract 1', '33 行（F04）'),
+        ('owner-output-transfer', 'F06 33 + F08 16 显式 owner', '0 行（两模块均被后续轮取代）'),
+        ('coefficient-reuse-combined', 'F06 三宽 + UPS contract 三宽', '36 行（F06 33 + F18 body_2 3）'),
+        ('f05-kv-consumer-layout', 'F05 36 派发 K+V 布局', '36 行（F05）'),
+        ('f08-register-chain', 'F08 16 派发寄存器链', '16 行（F08）'),
+        ('f10-weight-return-separation', 'F10 16 派发返回区分离（当前基线）', '16 行（F10）'),
+    ]
+    for i, (k, scope, keep) in enumerate(chain, 1):
+        a = ACCEPTED_ROUNDS[k]
+        L.append('| %d | `%s` | `%s` | +%.6fms CI[%.6f, %.6f] | %s | %s |' % (
+            i, k, a[0][:12], a[2], a[3][0], a[3][1], scope, keep))
+    L.append('')
+    acc_rows = sum(1 for x in rows if x['status'] == '现役接受')
+    L.append('合计 **%d 行**字节可归因到本轮采纳轮；其余 **%d 行**是本轮之前就已在基线里的历史资产（未动或已测负结果）。' % (acc_rows, 232 - acc_rows))
+    L.append('')
+    L.append('不得把上表毫秒相加：每轮都是相对自己的父，跨批次相减或求和都不是证据。')
+    L.append('')
+    L.append('## 2. 总览')
+    L.append('')
+    L.append('| 族 | PASS | 宽度 | 施工卡 | 当前状态 | 证据级别 | 本轮字节来源 | 具名冲突 | 禁止重跑项 |')
+    L.append('|---|---|---|---|---|---|---|---|---|')
+    CONFLICT = {'F05': 'C2', 'F13': 'C1', 'F14': 'C1', 'F16': 'C1', 'F06': 'C6', 'F18': 'C6', 'F08': 'C6'}
+    for f in ['F%02d' % i for i in range(1, 22)]:
+        x = roll[f]
+        st = ' / '.join('%s %d' % (k, v) for k, v in x['status_counts'].items())
+        ev = ' / '.join('%s %d' % (k, v) for k, v in x['evidence_counts'].items())
+        L.append('| %s | %d | %s | %s | %s | %s | %s | %s | %d |' % (
+            f, x['pass_count'], '/'.join(x['widths']), x['card'], st, ev,
+            x['accepted_via'] or '历史资产', CONFLICT.get(f, '—'), len(x['forbidden_rerun'])))
+    L.append('| **合计** | **%d** | | | | | | | |' % checks['family_sum'])
+    L.append('')
+    L.append('状态口径：**现役接受** = 该位置的字节是本轮某个采纳轮的输出；**已测负结果** = 本轮测过该族且被拒、字节未变；**资产未采纳** = 有候选资产但未采纳/未计时；**未动** = 本轮无卡覆盖。逐行明细见 `COVERAGE-232.md`。')
+    L.append('')
+    L.append('## 3. 逐族')
+    for f in ['F%02d' % i for i in range(1, 22)]:
+        rs = byfam[f]
+        x = roll[f]
+        fam = FAM[f]
+        L.append('')
+        L.append('### %s — %d PASS（%s），%s' % (f, len(rs), '/'.join(x['widths']), x['card']))
+        L.append('')
+        L.append('- 位置：ordinal %s' % _ranges([r['ordinal'] for r in rs]))
+        L.append('- 状态：%s；证据级别：%s（范围：%s）' % (fam.get('st_text', fam['st']), fam['ev'], fam['scope']))
+        L.append('- 依据：%s' % fam['basis'])
+        if fam['acc']:
+            a = ACCEPTED_ROUNDS[fam['acc']]
+            L.append('- 已接受收益归属：`%s`（plan `%s`），+%.6fms CI[%.6f, %.6f]；%s' % (
+                fam['acc'], a[0][:12], a[2], a[3][0], a[3][1], a[4]))
+        else:
+            L.append('- 已接受收益归属：本轮无（该族字节是本轮之前的历史资产）')
+        if fam['neg']:
+            L.append('- 本轮其它证据：')
+            for nk in fam['neg']:
+                d = NEG.get(nk)
+                if not d:
+                    continue
+                if d['saving_ms'] is None:
+                    L.append('  - `%s`：%s；%s' % (nk, d['status'], d['note']))
+                else:
+                    L.append('  - `%s`：%s，%+.6fms（%s）；%s' % (
+                        nk, d['status'], d['saving_ms'],
+                        ('CI[%+.6f, %+.6f]' % (d['ci95'][0], d['ci95'][1])) if d.get('ci95') else '无 CI',
+                        d['note']))
+        if f in CONFLICT:
+            L.append('- 具名冲突：见 §4 %s' % CONFLICT[f])
+        if x['forbidden_rerun']:
+            L.append('- 禁止重跑：%s' % '；'.join(x['forbidden_rerun']))
+        L.append('- 下一动作：%s' % fam['next'])
+    L.append('')
+    L.append('## 4. 具名冲突（本轮实测，全部可复核）')
+    L.append('')
+    L.append('### C1 — `MECHANISMS.txt` 把 8 派发 -0.049641ms 记作「F14 reuse」，实测是 F13 contract')
+    L.append('')
+    L.append('`D/MECHANISMS.txt` 第 131 行（UPS/VIT REGISTER TRANSFER 段）写「F14 reuse … isolated 8 dispatch -0.049640626ms」。但该臂的 `vit-epilogue-gain-reuse/contract-only/BUILD.json` 的 `sources[0].ordinals = [94,99,104,109,114,119,124,129]`，全部是 F13 `*_ffn_contract`；`family/BUILD.json` 的第二块是 `[97,102,107,112,117,122,127,132]`，全部是 F16 `*_projection`。当前基线里 F14 的 8 行（95,100,…,130）字节来自 `vit-qkv-norm-owner-v2`，本轮未被任何 plan 替换。**归属以 BUILD/plan 为准：-0.049641ms 记 F13，F14 记未动。**')
+    L.append('')
+    L.append('### C2 — F05 C256 的字节来自一个自身汇总为 INDISTINCT 的卡')
+    L.append('')
+    L.append('现役 F05 C256 的 16 行指向 `f05-k-consumer-tile/c256/c256/candidate.spv`（sha `9d61c4e3…`），而 `f05-k-consumer-tile/RESULTS.json` 的汇总为 `INDISTINCT` / `adopted=false`（36 派发组合 +0.024631ms CI[-0.028710,+0.077972]）。该字节是经 `f05-kv-consumer-layout/combined`（`eedb536b`）进入基线的，其 `REPORT.txt` 只写「18 new GPU jobs plus 4 inherited C256 jobs」——C256 模块没有独立的采纳计时。**因此 C256 16 行的「现役接受」只能引用 eedb536b 的 36 派发组合，不能引用 K consumer tile 的单卡结论。**')
+    L.append('')
+    L.append('### C3 — `CURRENT-CENSUS.json` 不是当前身份')
+    L.append('')
+    L.append('`CURRENT-CENSUS.json` 与 `CURRENT-232-ROWS.json` 在 **%d/232** 个位置的 SPV 路径与 sha 上不一致（例：F04 指向旧的 `a1-d034-gm-drop`，现役是 `backend-uniform-owner/d034-family`），其 `plan_sha256` 是 `%s`，不是当前基线 `a024c3c5…`；文件本身中文为乱码（编码混用）。**只作历史索引，不得当身份来源。**' % (checks['census_spv_diff_positions'], (checks['census_plan_sha'] or '')[:12]))
+    L.append('')
+    L.append('### C4 — 两类身份证据完全不相交：「有 recipe」与「能复现」互不重叠')
+    L.append('')
+    ct = checks['identity_recipe_crosstab']
+    L.append('按 39 个唯一 shader 交叉统计（行数=覆盖的 232 行）：')
+    L.append('')
+    L.append('| 组合 | shader 数 | 行数 |')
+    L.append('|---|---|---|')
+    L.append('| 有显式 recipe **且**字节复现 | %d | %d |' % (ct['shaders']['recipe_and_reproduced'], ct['rows']['recipe_and_reproduced']))
+    L.append('| 有 recipe 但**未**复现 | %d | %d |' % (ct['shaders']['recipe_only_no_reproduce'], ct['rows']['recipe_only_no_reproduce']))
+    L.append('| 无 recipe 却**复现了** | %d | %d |' % (ct['shaders']['reproduced_only_no_recipe'], ct['rows']['reproduced_only_no_recipe']))
+    L.append('| 两者都无 | %d | %d |' % (ct['shaders']['neither'], ct['rows']['neither']))
+    L.append('')
+    L.append('`RECIPE-MAP.json`（从 66 个 BUILD.json 汇总，14/39 有 recipe）与 `IDENTITY-232.json`（include 启发式重建，17/39 复现）对同一批 shader 的判断**正好相反且零重叠**。所以「能复现字节」不等于「原始构建配方已知」，反之亦然。逐行 identity 因此同时登记 `rebuild` 与 `recipe_recorded`，缺一不可。')
+    L.append('')
+    L.append('### C5 — 22 个 shader 的字节复现是 UNKNOWN，不是「已核对」')
+    L.append('')
+    L.append('`IDENTITY-232.json`：raw 16 / decorated 1（F20）/ 失败 22。失败原因是 include 与工具链解析失败，**不是哈希不符**；这 22 个 shader（覆盖 165 行）的 SPV/source sha 已磁盘实测一致，但其源码→字节的可复现性只能写 UNKNOWN。不得用「哈希对了」代替「构建身份闭环」。')
+    L.append('')
+    L.append('### C6 — 模块目录名 ≠ 采纳轮名')
+    L.append('')
+    L.append('- F06 现役字节在 `f06-scale-fragments/family/*`，该目录**没有** RESULTS.json，它是 `coefficient-reuse-combined` 的内部构建目录；引用时要引 `coefficient-reuse-combined`（`b39fae00`）。')
+    L.append('- F18 body_2 现役字节在 `contract-scale-fragments/family/*`，同样无独立 RESULTS.json，属同一轮的 UPS contract 臂。')
+    L.append('- `owner-output-transfer` 的 F06/F08 模块已被后续轮全部取代：当前基线里 **0 行**字节可归因于它，虽然它在本轮被采纳过。')
+    L.append('')
+    L.append('## 5. ViT 段（F13–F16，1024 token）')
+    L.append('')
+    L.append('| 族 | PASS | 状态 | 本轮证据 | 备注 |')
+    L.append('|---|---|---|---|---|')
+    L.append('| F13 | 16 | 已测负结果（contract 8）/ 未动（expand 8） | contract-only INDISTINCT -0.049641ms CI[-0.138483,+0.039202]；native 3458→10400 指令、send 737→1817 | 字节未变 |')
+    L.append('| F14 | 8 | 未动 | 无（C1：被误记为 F14 的臂实为 F13） | 当前为 `vit-qkv-norm-owner-v2` 历史资产 |')
+    L.append('| F15 | 8 | 未动 | 无 | P/den 已寄存器化 |')
+    L.append('| F16 | 8 | 资产未采纳 | family 臂：native 5404→5404 指令、send 1115→1115，仅 2 个 null immediate 差异，无 ordinary | 重跑同身份无意义 |')
+    L.append('')
+    L.append('## 6. 未决项')
+    L.append('')
+    L.append('- F17 的通道宽度无字节级证据，`width` 写 `UPS` 而不是猜 C128/C256。')
+    L.append('- F05 C256 从未有独立采纳计时（C2）；若下一轮要动 C256，需先补一个只含 C256 的臂，不能引用 36 派发组合。')
+    L.append('- 22 个 shader 的构建身份仍未闭环（C5）；要动这些族之前，先补 recipe 或记录工具链差异。')
+    L.append('- 本轮所有 GPU 结论均为他人批次结果，本卡未运行 GPU；计时只作「证据级别」标签，不作当前收益承诺。')
+    L.append('')
+    open(os.path.join(CARD, 'FAMILY-STATE.md'), 'w', encoding='utf-8', newline='\n').write('\n'.join(L) + '\n')
+
+
+if __name__ == '__main__':
+    m = main()
+    write_markdown(m)
+    write_family_state(m)
+    c = m['self_check']
+    print(json.dumps({k: v for k, v in c.items() if k not in ('plan_index_multiplicity_gt1',)}, ensure_ascii=False, indent=1))

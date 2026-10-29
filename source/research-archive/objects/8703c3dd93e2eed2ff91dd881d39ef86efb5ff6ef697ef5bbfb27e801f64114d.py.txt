@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""R12 split16-l2 SPIR-V tool: MMA census (audit grammar) + module delta.
+
+Opcode grammar is the one TOOL-DEFECTS.md D2 and tools/verify_mma_dtype.py settle, and it
+is *calibrated* here: every site this tool prints for the two parent modules lands on the
+same word offset / result id as FULLNET-RESIDUAL-MMA-SITES.json.
+
+  4456 OpTypeCooperativeMatrixKHR   [result, component, scope, rows, cols, use]
+  4457 OpCooperativeMatrixLoadKHR   [type, result, pointer, layout, stride, memop]
+  4458 OpCooperativeMatrixStoreKHR  [pointer, object, layout, stride, memop]   (no result)
+  4459 OpCooperativeMatrixMulAddKHR [type, result, A, B, C]
+
+glslang materialises local cooperative matrices in Function-storage variables, so a MulAdd
+operand is an OpLoad of that variable; this tool follows the last OpStore to the same
+pointer to report the real producer (a 4457 load and its layout/stride, or a 5358 convert).
+
+Sub-commands
+  census <spv> [<spv> ...]        per-module MMA sites with dtype/function/operands
+  diff   <parent> <child> <out>   opcode/ID-agnostic delta + per-function multisets
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, r"@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts")
+import spv_tools_local as S  # noqa: E402
+
+OPNAME = {
+    3: "OpSource", 4: "OpSourceExtension", 5: "OpName", 6: "OpMemberName", 7: "OpString",
+    8: "OpLine", 10: "OpExtension", 11: "OpExtInstImport", 12: "OpExtInst",
+    14: "OpMemoryModel", 15: "OpEntryPoint", 16: "OpExecutionMode", 17: "OpCapability",
+    19: "OpTypeVoid", 20: "OpTypeBool", 21: "OpTypeInt", 22: "OpTypeFloat",
+    23: "OpTypeVector", 24: "OpTypeMatrix", 25: "OpTypeImage", 26: "OpTypeSampler",
+    27: "OpTypeSampledImage", 28: "OpTypeArray", 29: "OpTypeRuntimeArray",
+    30: "OpTypeStruct", 31: "OpTypeOpaque", 32: "OpTypePointer", 33: "OpTypeFunction",
+    41: "OpConstantTrue", 42: "OpConstantFalse", 43: "OpConstant",
+    44: "OpConstantComposite", 45: "OpConstantSampler", 46: "OpConstantNull",
+    48: "OpSpecConstantTrue", 49: "OpSpecConstantFalse", 50: "OpSpecConstant",
+    51: "OpSpecConstantComposite", 52: "OpSpecConstantOp",
+    54: "OpFunction", 55: "OpFunctionParameter", 56: "OpFunctionEnd", 57: "OpFunctionCall",
+    59: "OpVariable", 61: "OpLoad", 62: "OpStore", 65: "OpAccessChain",
+    66: "OpInBoundsAccessChain", 67: "OpPtrAccessChain", 71: "OpDecorate",
+    72: "OpMemberDecorate", 73: "OpDecorationGroup", 74: "OpGroupDecorate",
+    75: "OpGroupMemberDecorate",
+    77: "OpVectorExtractDynamic", 78: "OpVectorInsertDynamic", 79: "OpVectorShuffle",
+    80: "OpCompositeConstruct", 81: "OpCompositeExtract", 82: "OpCompositeInsert",
+    83: "OpCopyObject", 84: "OpTranspose",
+    109: "OpConvertFToU", 110: "OpConvertFToS", 111: "OpConvertSToF", 112: "OpConvertUToF",
+    113: "OpUConvert", 114: "OpSConvert", 115: "OpFConvert", 116: "OpQuantizeToF16",
+    117: "OpConvertPtrToU", 118: "OpSatConvertSToU", 119: "OpSatConvertUToS",
+    120: "OpConvertUToPtr", 124: "OpBitcast", 126: "OpSNegate", 127: "OpFNegate",
+    128: "OpIAdd", 129: "OpFAdd", 130: "OpISub", 131: "OpFSub", 132: "OpIMul",
+    133: "OpFMul", 134: "OpUDiv", 135: "OpSDiv", 136: "OpFDiv", 137: "OpUMod",
+    138: "OpSRem", 139: "OpSMod", 140: "OpFRem", 141: "OpFMod", 142: "OpVectorTimesScalar",
+    143: "OpMatrixTimesScalar", 144: "OpVectorTimesMatrix", 145: "OpMatrixTimesVector",
+    146: "OpMatrixTimesMatrix", 147: "OpOuterProduct", 148: "OpDot",
+    149: "OpIAddCarry", 150: "OpISubBorrow", 151: "OpUMulExtended", 152: "OpSMulExtended",
+    154: "OpAny", 155: "OpAll", 156: "OpIsNan", 157: "OpIsInf", 158: "OpIsFinite",
+    159: "OpIsNormal", 160: "OpSignBitSet", 161: "OpLessOrGreater", 162: "OpOrdered",
+    163: "OpUnordered", 164: "OpLogicalEqual", 165: "OpLogicalNotEqual",
+    166: "OpLogicalOr", 167: "OpLogicalAnd", 168: "OpLogicalNot", 169: "OpSelect",
+    170: "OpIEqual", 171: "OpINotEqual", 172: "OpUGreaterThan", 173: "OpSGreaterThan",
+    174: "OpUGreaterThanEqual", 175: "OpSGreaterThanEqual", 176: "OpULessThan",
+    177: "OpSLessThan", 178: "OpULessThanEqual", 179: "OpSLessThanEqual",
+    180: "OpFOrdEqual", 181: "OpFUnordEqual", 182: "OpFOrdNotEqual",
+    183: "OpFUnordNotEqual", 184: "OpFOrdLessThan", 185: "OpFUnordLessThan",
+    186: "OpFOrdGreaterThan", 187: "OpFUnordGreaterThan", 188: "OpFOrdLessThanEqual",
+    189: "OpFUnordLessThanEqual", 190: "OpFOrdGreaterThanEqual",
+    191: "OpFUnordGreaterThanEqual",
+    194: "OpShiftRightLogical", 195: "OpShiftRightArithmetic", 196: "OpShiftLeftLogical",
+    197: "OpBitwiseOr", 198: "OpBitwiseXor", 199: "OpBitwiseAnd",
+    200: "OpNot", 201: "OpBitFieldInsert", 202: "OpBitFieldSExtract", 203: "OpBitFieldUExtract",
+    204: "OpBitReverse", 205: "OpBitCount",
+    209: "OpDPdx", 210: "OpDPdy", 211: "OpFwidth", 212: "OpDPdxFine", 213: "OpDPdyFine",
+    214: "OpFwidthFine", 215: "OpDPdxCoarse", 216: "OpDPdyCoarse", 217: "OpFwidthCoarse",
+    224: "OpControlBarrier", 225: "OpMemoryBarrier",
+    227: "OpAtomicLoad", 228: "OpAtomicStore", 229: "OpAtomicExchange",
+    230: "OpAtomicCompareExchange", 231: "OpAtomicCompareExchangeWeak",
+    232: "OpAtomicIIncrement", 233: "OpAtomicIDecrement", 234: "OpAtomicIAdd",
+    235: "OpAtomicISub", 236: "OpAtomicSMin", 237: "OpAtomicUMin", 238: "OpAtomicSMax",
+    239: "OpAtomicUMax", 240: "OpAtomicAnd", 241: "OpAtomicOr", 242: "OpAtomicXor",
+    245: "OpPhi", 246: "OpLoopMerge", 247: "OpSelectionMerge", 248: "OpLabel",
+    249: "OpBranch", 250: "OpBranchConditional", 251: "OpSwitch", 252: "OpKill",
+    253: "OpReturn", 254: "OpReturnValue", 255: "OpUnreachable",
+    256: "OpLifetimeStart", 257: "OpLifetimeStop",
+    259: "OpGroupAsyncCopy", 260: "OpGroupWaitEvents", 261: "OpGroupAll",
+    262: "OpGroupAny", 263: "OpGroupBroadcast", 264: "OpGroupIAdd", 265: "OpGroupFAdd",
+    266: "OpGroupFMin", 267: "OpGroupUMin", 268: "OpGroupSMin", 269: "OpGroupFMax",
+    270: "OpGroupUMax", 271: "OpGroupSMax",
+    322: "OpGroupNonUniformShuffle", 323: "OpGroupNonUniformShuffleXor",
+    400: "OpCopyLogical",
+    4456: "OpTypeCooperativeMatrixKHR", 4457: "OpCooperativeMatrixLoadKHR",
+    4458: "OpCooperativeMatrixStoreKHR", 4459: "OpCooperativeMatrixMulAddKHR",
+    4460: "OpCooperativeMatrixLengthKHR",
+    5358: "OpCooperativeMatrixConvertKHR",
+}
+# Opcodes whose operand grammar this tool relies on. A wrong table entry would show up
+# immediately as a failed structural check in `selfcheck()`, which is run on every
+# module before any census is trusted (see the "grammar_selfcheck" field).
+BRANCH_OPS = (249, 250)
+MERGE_OPS = (246, 247)
+STORAGE = {0: "UniformConstant", 1: "Input", 2: "Uniform", 3: "Output", 4: "Workgroup",
+           5: "CrossWorkgroup", 6: "Private", 7: "Function", 8: "Generic",
+           9: "PushConstant", 10: "AtomicCounter", 12: "StorageBuffer"}
+
+
+def rid_of(op, ops):
+    """Result id, cooperative-matrix opcodes corrected (TOOL-DEFECTS.md D2)."""
+    if op == 4458:                       # Store carries no result
+        return None
+    if op == 4456:                       # Type: result is operand 0
+        return ops[0]
+    if op in (4457, 4459, 5358):         # Load / MulAdd / Convert: result is operand 1
+        return ops[1] if len(ops) > 1 else None
+    return S.result_id_of(op, ops)
+
+
+class Mod:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.m = S.Module(self.path)
+        self.by = {}
+        for idx, (op, ops, _, _) in enumerate(self.m.instructions):
+            r = rid_of(op, ops)
+            if r is not None:
+                self.by.setdefault(r, idx)
+        self.names = {}
+        for op, ops, _, _ in self.m.instructions:
+            if op == 5 and ops:
+                try:
+                    self.names.setdefault(ops[0], ops[1].to_bytes(4, "little").split(b"\0")[0].decode())
+                except Exception:
+                    pass
+        # OpLine tracking: instruction index -> source line in effect
+        self.line = {}
+        cur = None
+        for idx, (op, ops, _, _) in enumerate(self.m.instructions):
+            if op == 8 and len(ops) >= 3:
+                cur = ops[1]
+                continue
+            self.line[idx] = cur
+        self.sha = hashlib.sha256(self.path.read_bytes()).hexdigest()
+        self.bytes = self.path.stat().st_size
+
+    def ins(self, i):
+        return self.m.instructions[i][0], self.m.instructions[i][1]
+
+    def const(self, cid, depth=0):
+        i = self.by.get(cid)
+        if i is None or depth > 6:
+            return None
+        op, ops = self.ins(i)
+        if op == 43:
+            return ops[2] if len(ops) > 2 else None
+        if op == 44:
+            return self.const(ops[2], depth + 1) if len(ops) > 2 else None
+        if op == 46:
+            return 0
+        if op == 41:
+            return 1
+        if op == 42:
+            return 0
+        return None
+
+    def ctype(self, tid, depth=0):
+        i = self.by.get(tid)
+        if i is None or depth > 6:
+            return ("?", 0)
+        op, ops = self.ins(i)
+        if op == 22:
+            return ("f", ops[1])
+        if op == 21:
+            return ("i", ops[1])
+        if op == 4456:
+            return self.ctype(ops[1], depth + 1)
+        if op == 32:
+            return self.ctype(ops[2], depth + 1)
+        if op == 23:
+            return self.ctype(ops[1], depth + 1)
+        return ("?", 0)
+
+    def coopmat_type(self, tid):
+        i = self.by.get(tid)
+        if i is None:
+            return None
+        op, ops = self.ins(i)
+        if op == 32:
+            return self.coopmat_type(ops[2])
+        if op != 4456 or len(ops) < 6:
+            return None
+        kind, width = self.ctype(ops[1])
+        use = self.const(ops[5])
+        return {"component": "%s%d" % (kind, width), "rows": self.const(ops[3]),
+                "cols": self.const(ops[4]), "use": use,
+                "use_name": {0: "A", 1: "B", 2: "Accumulator", 3: "Accumulator"}.get(use)}
+
+    def pointee(self, ptr_type_id):
+        i = self.by.get(ptr_type_id)
+        if i is None:
+            return None
+        op, ops = self.ins(i)
+        return ops[2] if op == 32 else None
+
+    def pointer_base(self, ptr, depth=0):
+        if depth > 12:
+            return (None, None, None)
+        i = self.by.get(ptr)
+        if i is None:
+            return (None, None, None)
+        op, ops = self.ins(i)
+        if op in (65, 66, 67):
+            return self.pointer_base(ops[2], depth + 1)
+        if op == 59:
+            return (self.names.get(ops[1], "?"), STORAGE.get(ops[2], str(ops[2])), ops[1])
+        return (None, None, None)
+
+    def function_of(self, idx):
+        fid = None
+        for j in range(idx, -1, -1):
+            op, ops = self.ins(j)
+            if op == 54:
+                fid = ops[1]
+                break
+        return (fid, self.names.get(fid, "func_%d" % fid)) if fid is not None else (None, None)
+
+    def resolve_value(self, vid, idx=None, depth=0):
+        """Follow OpLoad/OpCopyObject to the value that produced it (Function-var roundtrip)."""
+        if depth > 8:
+            return vid
+        i = self.by.get(vid)
+        if i is None:
+            return vid
+        op, ops = self.ins(i)
+        if op in (83, 400):                  # OpCopyObject / OpCopyLogical
+            return self.resolve_value(ops[2], i, depth + 1)
+        if op != 61:                         # OpLoad
+            return vid
+        ptr = ops[2]
+        for j in range(i - 1, -1, -1):
+            o2, p2 = self.ins(j)
+            if o2 in (54, 56):
+                break
+            if o2 == 62 and p2[0] == ptr:    # OpStore to the same pointer
+                return self.resolve_value(p2[1], j, depth + 1)
+        return vid
+
+    def producer(self, vid, idx=None):
+        i = self.by.get(vid)
+        if i is None:
+            return {"defined_by": None}
+        op, ops = self.ins(i)
+        base = {"defined_by": OPNAME.get(op, str(op)), "line": self.line.get(i)}
+        if op == 4457:
+            name, storage, _ = self.pointer_base(ops[2])
+            base.update({"type": self.coopmat_type(ops[0]), "array": name, "storage": storage,
+                         "layout": {0: "RowMajor", 1: "ColumnMajor"}.get(self.const(ops[3]),
+                                                                        str(self.const(ops[3]))),
+                         "stride": self.const(ops[4]),
+                         "pointer_chain": self.chain(ops[2])})
+        elif op == 5358:
+            base.update({"type": self.coopmat_type(ops[0])})
+        elif op == 4459:
+            base.update({"accumulator": self.coopmat_type(ops[0])})
+        elif op == 81:                       # OpCompositeConstruct
+            base.update({"components": len(ops) - 2})
+        return base
+
+    def chain(self, ptr, depth=0):
+        if depth > 8:
+            return []
+        i = self.by.get(ptr)
+        if i is None:
+            return []
+        op, ops = self.ins(i)
+        if op in (65, 66, 67):
+            return [OPNAME.get(op)] + [self.const(x) for x in ops[3:]] + self.chain(ops[2], depth + 1)
+        if op == 59:
+            return [self.names.get(ops[1], "?")]
+        return [OPNAME.get(op, str(op))]
+
+    def load_info(self, operand_id):
+        v = self.resolve_value(operand_id)
+        p = self.producer(v)
+        p["operand_id"] = operand_id
+        p["resolved_id"] = v
+        return p
+
+    def census(self):
+        sites = []
+        for idx, (op, ops, woff, wc) in enumerate(self.m.instructions):
+            if op != 4459:
+                continue
+            acc = self.coopmat_type(ops[0])
+            fid, fname = self.function_of(idx)
+            kind = ("FP16" if (acc or {}).get("component") == "f32"
+                    else ("INT8" if (acc or {}).get("component") == "i32" else "?"))
+            sites.append({"word_offset": woff, "result_id": ops[1], "word_count": wc,
+                          "function_id": fid, "function": fname, "line": self.line.get(idx),
+                          "accumulator": acc, "A_id": ops[2], "B_id": ops[3], "C_id": ops[4],
+                          "A": self.load_info(ops[2]), "B": self.load_info(ops[3]),
+                          "C": self.producer(self.resolve_value(ops[4])),
+                          "class": kind})
+        hist = {}
+        for s in sites:
+            hist[s["class"]] = hist.get(s["class"], 0) + 1
+        return {"path": str(self.path), "sha256": self.sha, "bytes": self.bytes,
+                "words": len(self.m.words), "instructions": len(self.m.instructions),
+                "muladd_total": len(sites), "muladd_by_class": hist,
+                "fp16_mma": hist.get("FP16", 0), "int8_mma": hist.get("INT8", 0),
+                "grammar_selfcheck": self.selfcheck(),
+                "coopmat_types": self.coopmat_types(),
+                "workgroup_bytes": self.workgroup_bytes(),
+                "workgroup_vars": self.workgroup_vars(),
+                "barriers": self.barriers(),
+                "mma_stores": self.mma_store_count(), "sites": sites}
+
+    def barriers(self):
+        out = {"OpControlBarrier": 0, "OpMemoryBarrier": 0,
+               "OpAtomicUMax": 0, "OpAtomicLoad": 0, "OpAtomicStore": 0,
+               "OpGroupNonUniformShuffle": 0, "OpGroupNonUniformShuffleXor": 0}
+        for op, ops, _, _ in self.m.instructions:
+            n = OPNAME.get(op)
+            if n in out:
+                out[n] += 1
+        return out
+
+    def coopmat_types(self):
+        out = {}
+        for op, ops, _, _ in self.m.instructions:
+            if op != 4456:
+                continue
+            t = self.coopmat_type(ops[0])
+            key = "%s %sx%s use=%s" % (t["component"], t["rows"], t["cols"], t["use_name"])
+            out[key] = out.get(key, 0) + 1
+        return dict(sorted(out.items()))
+
+    def mma_store_count(self):
+        n = 0
+        for op, ops, _, _ in self.m.instructions:
+            if op == 4458:
+                n += 1
+        return n
+
+    def selfcheck(self):
+        """Structural certificate that the opcode table decodes this module correctly.
+
+        Every rule below is a SPIR-V grammar invariant, so a mis-numbered entry in
+        OPNAME (the failure mode of TOOL-DEFECTS.md D2) shows up as a violation rather
+        than as a silently wrong count.
+        """
+        problems = []
+        ins = self.m.instructions
+        funcs = []
+        for i, (op, ops, wo, wc) in enumerate(ins):
+            if op == 54:
+                if len(ops) != 4:
+                    problems.append("OpFunction@%d arity %d" % (wo, len(ops)))
+                funcs.append(wo)
+            if op == 55 and len(ops) != 2:
+                problems.append("OpFunctionParameter@%d arity %d" % (wo, len(ops)))
+            if op == 56 and ops:
+                problems.append("OpFunctionEnd@%d has operands" % wo)
+            if op == 248 and len(ops) != 1:
+                problems.append("OpLabel@%d arity %d" % (wo, len(ops)))
+            if op == 249 and len(ops) != 1:
+                problems.append("OpBranch@%d arity %d" % (wo, len(ops)))
+            if op == 250 and len(ops) not in (3, 4):
+                problems.append("OpBranchConditional@%d arity %d" % (wo, len(ops)))
+            if op == 253 and ops:
+                problems.append("OpReturn@%d has operands" % wo)
+            if op == 254 and len(ops) != 1:
+                problems.append("OpReturnValue@%d arity %d" % (wo, len(ops)))
+            if op in MERGE_OPS:
+                # a merge instruction must be immediately followed by a branch
+                nxt = ins[i + 1] if i + 1 < len(ins) else (None, None, None, None)
+                if nxt[0] not in BRANCH_OPS:
+                    problems.append("%s@%d not followed by a branch (got %s)" % (
+                        OPNAME.get(op, op), wo, OPNAME.get(nxt[0], nxt[0])))
+            if op == 224 and len(ops) != 3:
+                problems.append("OpControlBarrier@%d arity %d" % (wo, len(ops)))
+            if op == 225 and len(ops) != 2:
+                problems.append("OpMemoryBarrier@%d arity %d" % (wo, len(ops)))
+            if op in (227, 228, 229, 234, 235, 238, 239) and len(ops) < 4:
+                problems.append("%s@%d arity %d" % (OPNAME.get(op, op), wo, len(ops)))
+            if op == 4456 and len(ops) != 6:
+                problems.append("OpTypeCooperativeMatrixKHR@%d arity %d" % (wo, len(ops)))
+            if op == 4457 and len(ops) not in (5, 6, 7, 8):
+                problems.append("OpCooperativeMatrixLoadKHR@%d arity %d" % (wo, len(ops)))
+            if op == 4458 and len(ops) not in (4, 5, 6, 7):
+                problems.append("OpCooperativeMatrixStoreKHR@%d arity %d" % (wo, len(ops)))
+            if op == 4459 and len(ops) not in (5, 6, 7):
+                problems.append("OpCooperativeMatrixMulAddKHR@%d arity %d" % (wo, len(ops)))
+            if op == 169 and len(ops) not in (4, 5):
+                problems.append("OpSelect@%d arity %d" % (wo, len(ops)))
+            if op == 61 and len(ops) not in (3, 4, 5, 6):
+                problems.append("OpLoad@%d arity %d" % (wo, len(ops)))
+            if op == 62 and len(ops) not in (2, 3, 4):
+                problems.append("OpStore@%d arity %d" % (wo, len(ops)))
+        # every instruction must be decodable (no zero-length / runaway)
+        if any(not (1 <= wc) for _, _, _, wc in ins):
+            problems.append("zero-word instruction")
+        # function nesting
+        depth = 0
+        for op, ops, wo, wc in ins:
+            if op == 54:
+                depth += 1
+            elif op == 56:
+                depth -= 1
+                if depth < 0:
+                    problems.append("OpFunctionEnd without OpFunction@%d" % wo)
+        if depth != 0:
+            problems.append("unbalanced function nesting (%d)" % depth)
+        return {"functions": len(funcs), "problems": problems, "ok": not problems}
+
+    def opcode_arity_check(self):
+        """Global rule: no instruction may have more operands than its opcode allows.
+
+        Uses the SPIR-V operand-count maxima for the opcodes present here; a wrong
+        opcode name would almost never change operands, but a wrong *word count* would,
+        so this doubles as a module-integrity check.
+        """
+        return self.selfcheck()
+
+    def workgroup_vars(self):
+        out = []
+        for op, ops, _, _ in self.m.instructions:
+            if op == 59 and ops[2] == 4:
+                try:
+                    b = self.m.type_size_bytes(self.pointee(ops[0]))
+                except Exception:
+                    b = None
+                out.append({"name": self.names.get(ops[1], "?"), "bytes": b})
+        return sorted(out, key=lambda x: x["name"])
+
+    def workgroup_bytes(self):
+        return sum(v["bytes"] or 0 for v in self.workgroup_vars())
+
+
+def hist_of(mod):
+    gi = next((i for i, (op, _, _, _) in enumerate(mod.m.instructions) if op == 54),
+              len(mod.m.instructions))
+    h = {}
+    for op, ops, _, _ in mod.m.instructions[gi:]:
+        if op in (54, 55, 56):
+            continue
+        h[op] = h.get(op, 0) + 1
+    return h
+
+
+def functions_multiset(mod):
+    out = {}
+    cur = None
+    for op, ops, _, _ in mod.m.instructions:
+        if op == 54:
+            cur = mod.names.get(ops[1], "func_%d" % ops[1])
+            out.setdefault(cur, {})
+        elif op == 56:
+            cur = None
+        elif cur is not None:
+            out[cur][op] = out[cur].get(op, 0) + 1
+    return out
+
+
+def decoration_delta(P, C):
+    def counts(mod):
+        out = {}
+        for op, ops, _, _ in mod.m.instructions:
+            if op == 71 and len(ops) >= 2:
+                out["OpDecorate"] = out.get("OpDecorate", 0) + 1
+                key = "OpDecorate:%d" % ops[1]
+                out[key] = out.get(key, 0) + 1
+            if op == 72:
+                out["OpMemberDecorate"] = out.get("OpMemberDecorate", 0) + 1
+        return out
+    a, b = counts(P), counts(C)
+    d = {}
+    for k in sorted(set(a) | set(b), key=lambda x: (x.isdigit(), x)):
+        x = b.get(k, 0) - a.get(k, 0)
+        if x:
+            d[k] = x
+    return d
+
+
+def globals_view(mod):
+    gi = next((i for i, (op, _, _, _) in enumerate(mod.m.instructions) if op == 54),
+              len(mod.m.instructions))
+    h = {}
+    for op, ops, _, _ in mod.m.instructions[:gi]:
+        h[OPNAME.get(op, str(op))] = h.get(OPNAME.get(op, str(op)), 0) + 1
+    return {"opcode_hist": dict(sorted(h.items())), "workgroup_bytes": mod.workgroup_bytes()}
+
+
+def bindings(mod):
+    dec = {}
+    for op, ops, _, _ in mod.m.instructions:
+        if op == 71 and len(ops) >= 3 and ops[1] in (33, 34):
+            dec.setdefault(ops[0], {})["binding" if ops[1] == 33 else "set"] = ops[2]
+    out = []
+    for op, ops, _, _ in mod.m.instructions:
+        if op == 59 and ops[2] in (2, 12):
+            d = dec.get(ops[1], {})
+            out.append({"name": mod.names.get(ops[1], "?"), "storage": STORAGE.get(ops[2]),
+                        "set": d.get("set"), "binding": d.get("binding")})
+    return sorted(out, key=lambda x: (x["set"] if x["set"] is not None else -1,
+                                      x["binding"] if x["binding"] is not None else -1))
+
+
+def diff(parent_path, child_path):
+    P, C = Mod(parent_path), Mod(child_path)
+    hp, hc = hist_of(P), hist_of(C)
+    delta = {}
+    for op in sorted(set(hp) | set(hc)):
+        d = hc.get(op, 0) - hp.get(op, 0)
+        if d:
+            delta[OPNAME.get(op, str(op))] = d
+    fp, fc = functions_multiset(P), functions_multiset(C)
+    fn = {}
+    for name in sorted(set(fp) | set(fc)):
+        a, b = fp.get(name), fc.get(name)
+        if a == b:
+            fn[name] = {"identical_multiset": True}
+        else:
+            d = {}
+            for op in sorted(set(a or {}) | set(b or {})):
+                x = (b or {}).get(op, 0) - (a or {}).get(op, 0)
+                if x:
+                    d[OPNAME.get(op, str(op))] = x
+            fn[name] = {"identical_multiset": False, "delta": d,
+                        "in_parent": a is not None, "in_child": b is not None}
+    pc, cc = P.census(), C.census()
+    return {"parent": {"path": str(P.path), "sha256": P.sha, "bytes": P.bytes,
+                       "words": len(P.m.words), "instructions": len(P.m.instructions),
+                       "fp16_mma": pc["fp16_mma"], "int8_mma": pc["int8_mma"],
+                       "muladd_total": pc["muladd_total"]},
+            "child": {"path": str(C.path), "sha256": C.sha, "bytes": C.bytes,
+                      "words": len(C.m.words), "instructions": len(C.m.instructions),
+                      "fp16_mma": cc["fp16_mma"], "int8_mma": cc["int8_mma"],
+                      "muladd_total": cc["muladd_total"]},
+            "word_delta": len(C.m.words) - len(P.m.words),
+            "instruction_delta": len(C.m.instructions) - len(P.m.instructions),
+            "opcode_delta": delta,
+            "functions": fn,
+            "decorations": decoration_delta(P, C),
+            "globals": {"parent": globals_view(P), "child": globals_view(C)},
+            "workgroup_bytes": {"parent": P.workgroup_bytes(), "child": C.workgroup_bytes()},
+            "workgroup_vars": {"parent": P.workgroup_vars(), "child": C.workgroup_vars()},
+            "bindings": {"parent": bindings(P), "child": bindings(C)},
+            "sites": {"parent": pc["sites"], "child": cc["sites"]}}
+
+
+def site_pattern(s):
+    """ID-free structural fingerprint of one MMA site (what the instruction *is*)."""
+    def side(x):
+        t = x.get("type") or {}
+        return (t.get("component"), t.get("rows"), t.get("cols"), x.get("layout"),
+                x.get("stride"), x.get("array"), x.get("storage"))
+    acc = s.get("accumulator") or {}
+    return (s["class"], acc.get("component"), acc.get("rows"), acc.get("cols"),
+            side(s["A"]), side(s["B"]), s["function"])
+
+
+def sites_compare(parent_path, child_path):
+    from collections import Counter
+    P, C = Mod(parent_path).census(), Mod(child_path).census()
+    cp = Counter(site_pattern(s) for s in P["sites"])
+    cc = Counter(site_pattern(s) for s in C["sites"])
+    matched, removed, added = cp & cc, cp - cc, cc - cp
+    def show(c):
+        return [{"count": n, "class": k[0], "acc": "%s %sx%s" % (k[1], k[2], k[3]),
+                 "A": "%s %sx%s %s stride %s in %s" % (k[4][0], k[4][1], k[4][2], k[4][3], k[4][4], k[4][5]),
+                 "B": "%s %sx%s %s stride %s in %s" % (k[5][0], k[5][1], k[5][2], k[5][3], k[5][4], k[5][5]),
+                 "function": k[6]} for k, n in sorted(c.items(), key=lambda x: str(x[0]))]
+    return {"parent": {"sha256": P["sha256"], "fp16_mma": P["fp16_mma"], "int8_mma": P["int8_mma"]},
+            "child": {"sha256": C["sha256"], "fp16_mma": C["fp16_mma"], "int8_mma": C["int8_mma"]},
+            "matched_patterns": show(matched), "removed_patterns": show(removed),
+            "added_patterns": show(added),
+            "removed_total": sum(removed.values()), "added_total": sum(added.values()),
+            "unchanged_total": sum(matched.values()),
+            "verdict": ("ONLY_THE_PV_SEGMENT_CHANGED"
+                        if sum(removed.values()) == 2 and sum(added.values()) == 4 else "CHECK")}
+
+
+def main(argv):
+    if not argv:
+        raise SystemExit(__doc__)
+    cmd = argv[0]
+    if cmd == "census":
+        args = argv[1:]
+        dest = None
+        if "--out" in args:
+            k = args.index("--out")
+            dest = args[k + 1]
+            args = args[:k] + args[k + 2:]
+        out = [Mod(p).census() for p in args]
+        blob = json.dumps({"tool": "build/r12-split16-l2/spv_r12.py census", "modules": out},
+                          indent=1) + "\n"
+        if dest:
+            Path(dest).write_text(blob, encoding="utf-8", newline="\n")
+            print("wrote", dest)
+        else:
+            print(blob)
+        return 0
+    if cmd == "diff":
+        r = diff(argv[1], argv[2])
+        Path(argv[3]).write_text(json.dumps(r, indent=1) + "\n", encoding="utf-8", newline="\n")
+        print("words %+d instructions %+d fp16 %d->%d int8 %d->%d wg_bytes %d->%d" % (
+            r["word_delta"], r["instruction_delta"],
+            r["parent"]["fp16_mma"], r["child"]["fp16_mma"],
+            r["parent"]["int8_mma"], r["child"]["int8_mma"],
+            r["workgroup_bytes"]["parent"], r["workgroup_bytes"]["child"]))
+        print("opcode delta:", json.dumps(r["opcode_delta"]))
+        print("wrote", argv[3])
+        return 0
+    if cmd == "sites":
+        r = sites_compare(argv[1], argv[2])
+        Path(argv[3]).write_text(json.dumps(r, indent=1) + "\n", encoding="utf-8", newline="\n")
+        print("verdict", r["verdict"], "removed", sum(x["count"] for x in r["removed_patterns"]),
+              "added", sum(x["count"] for x in r["added_patterns"]))
+        print("removed:", [(x["count"], x["class"], x["A"], x["B"]) for x in r["removed_patterns"]])
+        print("added:", [(x["count"], x["class"], x["A"], x["B"]) for x in r["added_patterns"]])
+        print("matched:", [(x["count"], x["class"], x["A"], x["B"]) for x in r["matched_patterns"]])
+        print("wrote", argv[3])
+        return 0
+    raise SystemExit(__doc__)
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

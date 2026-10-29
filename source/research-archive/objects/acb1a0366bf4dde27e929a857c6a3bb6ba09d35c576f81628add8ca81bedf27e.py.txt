@@ -1,0 +1,357 @@
+"""CPU reference model of the block66 ("F2") fused C32 kernel - two implementations.
+
+Read-only inputs (no writes outside this card directory):
+  FP16 packs : swin_66_weights.fp16.bin (b0), c32_aux.bin (b1), ioport_66 pack (b2)
+  INT8 packs : c32_b66_weights.i8.bin (b7), c32_b66_scales.f32.bin (b8),
+               f2-weights.bin (b9), f2-body-scales.bin (b10)
+  Dumps      : FP16 teacher (dump_block65_out/skip4/block66_out) and the INT8 same-run
+               chain dump (chain-block65_out / chain-block66_out)
+
+Weights: "fp16" = incumbent FP16 parent (root-f2), "i8" = deployed INT8 packs.
+quant=True  -> every int8 code point / dequant exactly as the shader text says
+quant=False -> same weights, activation quantisation bypassed (exact identity)
+proj:  "parent" A[k,i] = x65[base + (k//16)*256 + i*16 + k%16]   (FP16 parent addressing)
+       "source" A[k,i] = x65[base + i*16 + k]                    (INT8 source as written)
+scale_dim: "col" (per output channel, correct) | "row" (per token, INT8 source as written)
+"""
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import numpy as np
+
+B = Path(r"@NR_WORKSPACE@")
+A = B / "work/codex-astra-fp16-int8-audit-20261024"
+Q = A / "int8-quality-first-20261029"
+D = Q / "real-int8-24"
+CORR = A / "int8-v15-offline-20261028/corrected-20261029"
+CH = B / "work/dsh-fullnet-static-20261029/C00-downstream-replace/runs2/c00-chain-dump"
+
+RES = {
+    "b0": B / "candidates/amd-map-20261015/s1-integrated/candidate/packs/swin_66_weights.fp16.bin",
+    "b1": B / "src/project/artifacts/parallel-port-20261013/swin/network/block66/pack/c32_aux.bin",
+    "b2": B / "candidates/amd-map-20261015/round4-integrated/candidate/packs/ioport_66_ioport_pack.fp16.bin",
+    "b7": B / "candidates/int8-coverage-v2-20261020/C/pack/c32_b66_weights.i8.bin",
+    "b8": B / "candidates/int8-coverage-v2-20261020/C/c32-scale-from-x-v2/pack/c32_b66_scales.f32.bin",
+    "b9": CORR / "assets/f2-weights.bin",
+    "b10": CORR / "assets/f2-body-scales.bin",
+    "t_x65": D / "dump-fp16/dump_block65_out.bin",
+    "t_skip": D / "dump-fp16/dump_skip4.bin",
+    "t_out": D / "dump-fp16/dump_block66_out.bin",
+    "c_x65": CH / "chain-block65_out.bin",
+    "c_out": CH / "chain-block66_out.bin",
+}
+
+P2 = (16512, 5120, 4096, 0)
+P4 = (0, 8192, 0, 84)
+P5 = (64, 32, 18944, 0)
+P6 = (672, 384, 336, 192)
+NGX, NGY, NWG, TILES_X = 84, 48, 84 * 48, 168
+C32 = 32
+
+
+def sha(p: Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for c in iter(lambda: f.read(1 << 20), b""):
+            h.update(c)
+    return h.hexdigest()
+
+
+def load() -> dict:
+    r = {}
+    r["b0"] = np.fromfile(RES["b0"], dtype="<f2").astype(np.float32)
+    r["b1"] = np.fromfile(RES["b1"], dtype="<f4").astype(np.float32)
+    r["b2"] = np.fromfile(RES["b2"], dtype="<f2").astype(np.float32)
+    r["b7"] = np.fromfile(RES["b7"], dtype=np.int8)
+    r["b8"] = np.fromfile(RES["b8"], dtype="<f4").astype(np.float32)
+    r["b9"] = np.fromfile(RES["b9"], dtype=np.int8)
+    r["b10"] = np.fromfile(RES["b10"], dtype="<f4").astype(np.float32)
+    for k in ("t_x65", "t_skip", "t_out", "c_x65", "c_out"):
+        r[k] = np.fromfile(RES[k], dtype="<f2")
+    return r
+
+
+R = load()
+
+
+def decode() -> dict:
+    b7, b9, b8, b10 = R["b7"], R["b9"], R["b8"], R["b10"]
+    w = {}
+    p1z = 13440
+    w["fp16_proj"] = np.array([[R["b0"][P4[1] + (n // 16) * 1024 + (k // 16) * 256 + (n % 16) * 16 + (k % 16)]
+                                for k in range(64)] for n in range(32)], np.float32)
+    w["fp16_exp"] = np.array([[R["b0"][P4[1] + 256 * ((f // 16) * 2 + (c // 16)) + (c % 16) * 16 + (f % 16)]
+                               for c in range(32)] for f in range(128)], np.float32)
+    w["fp16_con"] = np.array([[R["b0"][P4[1] + 256 * ((o // 16) * 8 + (e // 16)) + (e % 16) * 16 + (o % 16)]
+                               for e in range(128)] for o in range(32)], np.float32)
+    planes = {}
+    for nm, base in (("q", p1z), ("k", p1z + 512), ("v", p1z + 1024), ("o", p1z + 1536)):
+        planes[nm] = np.array([[R["b0"][base + 256 * ((o // 16) * 2 + (k // 16)) + (k % 16) * 16 + (o % 16)]
+                                for k in range(32)] for o in range(32)], np.float32)
+    w["fp16_qkvwo"] = planes
+    w["i8_proj"] = np.array([[b9[49152 + (n // 16) * 1024 + (k // 32) * 512 + (n % 16) * 32 + (k % 32)]
+                              for k in range(64)] for n in range(32)], np.float32)
+    w["i8_exp"] = np.array([[b7[(f // 16) * 2048 + ((f % 16) // 8) * 1024 + c * 32 + (f % 8)]
+                             for c in range(32)] for f in range(128)], np.float32)
+    w["i8_con"] = np.array([[b7[16384 + ((o // 8) * 4 + e // 32) * 1024 + (e % 32) * 32 + (o % 8)]
+                             for e in range(128)] for o in range(32)], np.float32)
+    planes = {}
+    for nm, base in (("q", 32768), ("k", 36864), ("v", 40960), ("o", 45056)):
+        planes[nm] = np.array([[b9[base + (o // 8) * 1024 + (k % 32) * 32 + (o % 8)]
+                                for k in range(32)] for o in range(32)], np.float32)
+    w["i8_qkvwo"] = planes
+    w["fsc"] = b8[:164].copy()
+    w["fsc2"] = b10.copy()
+    w["rs_ch"] = R["b0"][P2[0] + 8:P2[0] + 8 + 32].copy()      # per-channel X residual scale
+    w["ars_ch"] = R["b0"][P2[1]:P2[1] + 32].copy()             # per-channel Y residual scale
+    w["rs_tok"] = R["b0"][P2[0] + 8:P2[0] + 8 + 16].copy()     # INT8: row index == token
+    w["ars_tok"] = R["b0"][P2[1]:P2[1] + 16].copy()
+    w["scalar0"] = float(R["b1"][P2[2]])
+    w["bias"] = R["b1"][:4096].astype(np.float32).copy()
+    w["skip_gain"] = R["b2"][P5[2]:P5[2] + 32].astype(np.float32).copy()
+    return w
+
+
+W = decode()
+SETS = {
+    "fp16": {"Wproj": W["fp16_proj"], "Wexp": W["fp16_exp"], "Wcon": W["fp16_con"],
+             "Wqkvwo": W["fp16_qkvwo"],
+             "sw_proj": np.ones(32, np.float32),
+             "sw_qkvwo": {k: np.ones(32, np.float32) for k in "qkvo"}},
+    "i8": {"Wproj": W["i8_proj"], "Wexp": W["i8_exp"], "Wcon": W["i8_con"],
+           "Wqkvwo": W["i8_qkvwo"],
+           "sw_proj": W["fsc2"][128:160].copy(),
+           "sw_qkvwo": {"q": W["fsc2"][0:32], "k": W["fsc2"][32:64],
+                        "v": W["fsc2"][64:96], "o": W["fsc2"][96:128]}},
+}
+
+
+# ------------------------------------------------------------------ fp16 ops
+def f16(x):
+    return np.asarray(x).astype(np.float16).astype(np.float32)
+
+
+def code(v, inv):
+    v = np.asarray(v, np.float32)
+    inv = np.asarray(inv, np.float32)
+    while inv.ndim < v.ndim:
+        inv = inv[..., None]
+    c = np.rint(v * inv)
+    return np.clip(c, -127.0, 127.0).astype(np.float32)
+
+
+def act_h(x):
+    x16 = f16(x)
+    t = f16(np.clip(x16, -4.0, 4.0))
+    u = f16(np.float32(-0.055908203125) * np.abs(t) + np.float32(0.447265625))
+    return f16(x16 * f16(t * u + np.float32(0.89453125)))
+
+
+def exp_h2(x):
+    y = f16(np.float32(x) * np.float32(0.044921875) + np.float32(1.30078125))
+    y = np.clip(y, np.float32(np.float16(1.03125)), np.float32(np.float16(1.5693359375)))
+    h = f16(y).astype(np.float16).view(np.uint16)
+    out = ((h & np.uint16(0x03FF)) << np.uint16(5)).astype(np.uint16)
+    return out.view(np.float16).astype(np.float32)
+
+
+def norm_pair(q, k):
+    def half_sum(v):
+        parts = []
+        for par in (0, 1):
+            s = []
+            for comp in range(4):
+                sq = [f16(np.float32(v[..., 8 * fr + 2 * comp + par]) ** 2) for fr in range(4)]
+                s.append(f16(f16(f16(sq[0]) + f16(sq[2])) + f16(f16(sq[1]) + f16(sq[3]))))
+            parts.append(f16(f16(s[0] + s[2]) + f16(s[1] + s[3])))
+        return f16(parts[0] + parts[1])
+    qsum, ksum = half_sum(q), half_sum(k)
+    qmx = np.maximum(qsum, np.float32(np.float16(0.000062)))
+    kmx = np.maximum(ksum, np.float32(np.float16(0.000062)))
+    return f16(1.0 / np.sqrt(qmx)), f16(1.0 / np.sqrt(kmx))
+
+
+def token_maps():
+    wg = np.repeat(np.arange(NWG), 64)
+    sg = (np.arange(NWG * 64) % 64) // 16
+    slot = np.arange(NWG * 64) % 16
+    wy, wx = wg // NGX, wg % NGX
+    qx = 2 * wx + (sg % 2)
+    qy = 2 * wy + (sg // 2)
+    return wg, sg, slot, qx * 4 + (slot % 4), qy * 4 + (slot // 4)
+
+
+WG, SG, SLOT, PX, PY = token_maps()
+CT = ((2 * (SG // 2) + (SLOT // 4) // 2) * 4 + 2 * (SG % 2) + (SLOT % 4) // 2)
+OUT_OFF = ((PY // 4) * TILES_X + PX // 4) * 512 + SLOT * 16
+SKIP_OFF = ((PY // 4) * (P6[0] // 4) + PX // 4) * 512 + SLOT * 16
+
+
+def project(x65, ws, quant, proj, scale_dim):
+    reg = x65.astype(np.float32).reshape(NWG, 1024)
+    blk = reg.reshape(NWG, 4, 16, 16)          # [wg][channel group][16 coarse tokens][16 channels]
+    A = np.zeros((NWG, 4, 8, 64), np.float32)
+    for sg in range(4):
+        rh = sg // 2
+        if proj == "parent":
+            A[:, sg] = np.transpose(blk[:, :, rh * 8:rh * 8 + 8, :], (0, 2, 1, 3)).reshape(NWG, 8, 64)
+        else:
+            idx = rh * 128 + np.arange(8)[:, None] * 16 + np.arange(64)[None, :]
+            A[:, sg] = reg[:, idx]
+    amax = np.abs(A).max(axis=(2, 3))
+    aq = np.maximum(amax, 1e-12)
+    sA = (aq / 127.0).astype(np.float32)
+    Ac = code(A, (127.0 / aq)[:, :, None, None]) if quant else A
+    main = np.zeros((NWG, 16, 32), np.float32)
+    for sg in range(4):
+        rh, cg = sg // 2, sg % 2
+        acc = Ac[:, sg] @ ws["Wproj"][cg * 16:cg * 16 + 16].T
+        if quant:
+            sc = ws["sw_proj"][cg * 16:cg * 16 + 16]
+            if scale_dim == "row":                     # INT8 source: fsc2[.. + rc.x], row == token
+                tap = sc[:8][None, :] * sA[:, sg][:, None]      # [wg][8]
+                acc = acc * tap[:, :, None]
+            else:                                      # per output channel (column)
+                tap = sc[None, :] * sA[:, sg][:, None]          # [wg][16]
+                acc = acc * tap[:, None, :]
+        main[:, rh * 8:rh * 8 + 8, cg * 16:cg * 16 + 16] = f16(acc)
+    return main, sA
+
+
+def blend(main, skip4, use_skip=True):
+    sk = skip4.astype(np.float32)[SKIP_OFF[:, None] + np.arange(32)[None, :]]
+    skv = f16(sk * W["skip_gain"][None, :]) if use_skip else np.zeros_like(sk)
+    m = main[WG, CT, :]
+    return f16(m + skv).reshape(NWG, 4, 16, C32)
+
+
+def body(X, ws, quant, seed_mode="channel", bias_mode="qk", xe_dynamic=False):
+    fsc = W["fsc"]
+    invX, invE = float(fsc[1]), float(fsc[3])
+    if quant and xe_dynamic:
+        ax = np.maximum(np.abs(X).max(axis=(2, 3)), 1e-12)              # per [wg][sg]
+        Xc = code(X, 127.0 / ax)
+        xdeq = ((ax / 127.0) / fsc[0])[:, :, None, None]
+    else:
+        Xc = code(X, invX) if quant else X
+        xdeq = 1.0
+    E = np.matmul(ws["Wexp"], np.transpose(Xc, (0, 1, 3, 2)))          # [wg][sg][128][16]
+    if quant:
+        E = E * fsc[4:132][None, None, :, None] * xdeq
+    Ea = act_h(f16(E))
+    if quant and xe_dynamic:
+        ae = np.maximum(np.abs(Ea).max(axis=(2, 3)), 1e-12)
+        Ec = code(Ea, 127.0 / ae)
+        edeq = ((ae / 127.0) / fsc[2])[:, :, None, None]
+    else:
+        Ec = code(Ea, invE) if quant else Ea
+        edeq = 1.0
+    Y32 = np.matmul(ws["Wcon"], Ec)                                  # [wg][sg][32][16]
+    if quant:
+        Y32 = Y32 * fsc[132:164][None, None, :, None] * edeq
+    if seed_mode == "channel":
+        seedx = np.transpose(f16(X * W["rs_ch"][None, None, None, :]), (0, 1, 3, 2))
+    else:                                                            # INT8: scale row == token
+        seedx = np.transpose(f16(X * W["rs_tok"][None, None, :, None]), (0, 1, 3, 2))
+    Y = f16(Y32 + seedx)                                              # [wg][sg][32][16]
+    Yq = np.transpose(Y, (0, 1, 3, 2))                                # [wg][sg][16][32]
+    amx = np.maximum(np.abs(Yq).max(axis=(2, 3)), 1e-12)
+    sY = (amx / 127.0).astype(np.float32)
+    Yc = code(Yq, 127.0 / amx) if quant else Yq
+
+    def qkv(nm):
+        Z = np.matmul(ws["Wqkvwo"][nm], np.transpose(Yc, (0, 1, 3, 2)))
+        if quant:
+            Z = Z * (ws["sw_qkvwo"][nm][None, None, :, None] * sY[:, :, None, None])
+        return f16(np.transpose(Z, (0, 1, 3, 2)))
+    q, k, v = qkv("q"), qkv("k"), qkv("v")
+    nq, nk = norm_pair(q, k)
+    q = f16(f16(q * nq[..., None]) * W["scalar0"])
+    k = f16(k * nk[..., None])
+    qa = np.maximum(np.abs(q).max(axis=(2, 3)), 1e-12)
+    ka = np.maximum(np.abs(k).max(axis=(2, 3)), 1e-12)
+    va = np.maximum(np.abs(v).max(axis=(2, 3)), 1e-12)
+    gk = np.maximum(ka.max(axis=1), 1e-12)
+    gv = np.maximum(va.max(axis=1), 1e-12)
+    sQ = (qa / 127.0).astype(np.float32)
+    sK = (gk / 127.0).astype(np.float32)
+    sV = (gv / 127.0).astype(np.float32)
+    Qc = code(q, 127.0 / qa) if quant else q
+    Kc = code(k, (127.0 / gk)[:, None, None, None]) if quant else k
+    Vc = code(v, (127.0 / gv)[:, None, None, None]) if quant else v
+    Kf = Kc.reshape(NWG, 64, C32)
+    Vf = Vc.reshape(NWG, 64, C32)
+    Qf = Qc.reshape(NWG, 64, C32)
+    S = np.einsum("wkd,wqd->wqk", Kf, Qf)                             # [wg][q][k]
+    if quant:
+        sQq = np.repeat(sQ, 16, axis=1)                               # [wg][64 queries]
+        S = S * (sK[:, None] * sQq)[:, :, None]
+    S = S + (W["bias"].reshape(1, 64, 64) if bias_mode == "qk" else W["bias"].reshape(1, 64, 64).transpose(0, 2, 1))
+    S16 = f16(S)
+    P = exp_h2(S16)                                                   # [wg][64][64]
+    # denominator: exact fp16 tree of the shader (lane parity = key parity)
+    den = None
+    for par in (0, 1):
+        ds = []
+        for comp in range(4):
+            d = f16(P[:, :, [0 * 8 + 2 * comp + par]] + P[:, :, [1 * 8 + 2 * comp + par]])
+            for fr in (2, 4, 6):
+                d = f16(d + f16(P[:, :, [fr * 8 + 2 * comp + par]] + P[:, :, [(fr + 1) * 8 + 2 * comp + par]]))
+            ds.append(d)
+        part = f16(f16(ds[0] + ds[1]) + f16(ds[2] + ds[3]))
+        den = part if den is None else f16(den + part)
+    inv = f16(1.0 / np.maximum(den, np.float32(6.103515625e-05)))
+    Pn = f16(P * inv)
+    sp = np.maximum(np.abs(Pn).reshape(NWG, 4, 16, 64).max(axis=(2, 3)), 1e-12)   # per sg
+    sP = (sp / 127.0).astype(np.float32)
+    Pc = code(Pn, np.repeat(127.0 / sp, 16, axis=1)[:, :, None]) if quant else Pn
+    ctx = np.einsum("wkd,wqk->wqd", Vf, Pc).reshape(NWG, 4, 16, C32)
+    if quant:
+        ctx = ctx * (sV[:, None, None, None] * sP[:, :, None, None])
+    C16 = f16(ctx)
+    cs = np.maximum(np.abs(C16).max(axis=(2, 3)), 1e-12)
+    sC = (cs / 127.0).astype(np.float32)
+    Cc = code(C16, 127.0 / cs) if quant else C16
+    O = np.matmul(ws["Wqkvwo"]["o"], np.transpose(Cc, (0, 1, 3, 2)))
+    if quant:
+        O = O * (ws["sw_qkvwo"]["o"][None, None, :, None] * sC[:, :, None, None])
+    if seed_mode == "channel":
+        seedy = f16(Yq * W["ars_ch"][None, None, None, :])
+    else:
+        seedy = f16(Yq * W["ars_tok"][None, None, :, None])
+    seedy = np.transpose(seedy, (0, 1, 3, 2))
+    O = f16(O + seedy)
+    return {"X": X, "E": Ea, "Y": Yq, "q": q, "k": k, "v": v, "S": S16,
+            "P": Pn, "ctx": C16, "O": np.transpose(O, (0, 1, 3, 2))}
+
+
+def run(src="teacher", weights="fp16", quant=True, proj="parent", scale_dim="col", use_skip=True, seed_mode=None, bias_mode="qk"):
+    x65 = R["t_x65"] if src == "teacher" else R["c_x65"]
+    skip = R["t_skip"] if src == "teacher" else R["t_skip"]
+    main, sA = project(x65, SETS[weights], quant, proj, scale_dim)
+    X = blend(main, skip, use_skip)
+    st = body(X, SETS[weights], quant, seed_mode or ("channel" if weights == "fp16" else "token"), bias_mode)
+    st["X"] = X
+    st["main"] = main
+    st["sA"] = sA
+    return st
+
+
+def to_io(t, dtype=np.float32):
+    """[NWG,4,16,32] logical -> flat io_at0-layout half tensor (channel-major split)."""
+    out = np.zeros(NWG * 4 * 16 * 32, np.float32)
+    for c in range(32):
+        out[OUT_OFF + (c // 16) * 256 + (c % 16)] = t.reshape(-1, 32)[:, c]
+    return out
+
+
+def rel(a, b):
+    a = np.asarray(a, np.float32).ravel()
+    b = np.asarray(b, np.float32).ravel()
+    return float(np.sqrt(((a - b) ** 2).sum() / max((b * b).sum(), 1e-30)))
+
+
+
+

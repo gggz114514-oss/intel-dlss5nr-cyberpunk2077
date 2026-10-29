@@ -1,0 +1,145 @@
+"""n06c-f06-c256-sht build: parent byte reproduction, candidate compile, validate,
+plan replacement (15 PASS), CPU plan check, SPIR-V accounting.
+
+CPU only. No GPU, no deployment, no baseline/pointer edits.
+"""
+import json, sys, subprocess, hashlib
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+CAMP = CARD.parent.parent
+sys.path.insert(0, str(CAMP))
+sys.path.insert(0, str(CARD / 'scratch'))
+import COMMON as K
+import spvstat
+
+TARGET_SPV_SHA = '881dff8c51454f79181a567d6b976ea21ec7c81174bf075ca7be723b09c4a3f0'
+TARGET_SRC_SHA = 'c3efee68a1935d28fbcbbadcfb5d44381277c6936401b464cf37b132f6221c16'
+PARENT_SRC = K.D / 'f06-scale-fragments/family/c256/candidate.comp'
+PARENT_SPV = K.D / 'f06-scale-fragments/family/c256/candidate.spv'
+PINNED = CAMP / 'cards/idt-identity-recipe/evidence/headers/881dff8c5145'
+BUILD = CARD / 'build'
+
+
+def run(argv):
+    r = subprocess.run([str(x) for x in argv], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    return r
+
+
+def main():
+    BUILD.mkdir(parents=True, exist_ok=True)
+    out = {'card': CARD.name, 'kind': 'build+plan+cpu-check (CPU only)'}
+
+    # ---- parent identity
+    assert K.sha(PARENT_SRC) == TARGET_SRC_SHA, 'parent source sha drifted'
+    assert K.sha(PARENT_SPV) == TARGET_SPV_SHA, 'parent spv sha drifted'
+    row = K.row_by_ordinal(38)
+    assert row['spv_sha256'] == TARGET_SPV_SHA
+    ordinals = sorted(r['ordinal'] for r in K.rows() if r['spv_sha256'] == TARGET_SPV_SHA)
+    out['group'] = dict(family='F06 C256', spv_sha256=TARGET_SPV_SHA,
+                        source_sha256=TARGET_SRC_SHA, ordinals=ordinals,
+                        n_passes=len(ordinals))
+    assert len(ordinals) == 15, ordinals
+
+    # ---- 1. parent byte reproduction (plain compile, pinned header dir, no defines)
+    parent_rebuild = CARD / 'parent-rebuild.spv'
+    r = run([K.GLSLANG, '-V', '--target-env', 'vulkan1.3', '-I' + str(PINNED),
+             PARENT_SRC, '-o', parent_rebuild])
+    (BUILD / 'parent-rebuild-stdout.txt').write_text(r.stdout + r.stderr, encoding='utf-8')
+    assert r.returncode == 0, r.stdout + r.stderr
+    out['parent_rebuild'] = dict(path=str(parent_rebuild), sha256=K.sha(parent_rebuild),
+                                 target=str(PARENT_SPV), target_sha256=TARGET_SPV_SHA,
+                                 matches_parent_bytes=K.sha(parent_rebuild) == TARGET_SPV_SHA,
+                                 recipe='glslang -V --target-env vulkan1.3 -I pinned_headers '
+                                        '(no -D, no NoContraction transfer, '
+                                        'evidence/RECIPES.json says raw_match)')
+    assert out['parent_rebuild']['matches_parent_bytes'], 'parent bytes not reproduced'
+    # explicit parent ident (the baseline row SPV this card builds on) for the auditor
+    out['parent'] = dict(path=str(PARENT_SPV), sha256=TARGET_SPV_SHA,
+                         source=str(PARENT_SRC), source_sha256=TARGET_SRC_SHA,
+                         ordinals=ordinals)
+
+    # ---- 2. candidate compile + validate
+    cand_spv = CARD / 'candidate.spv'
+    r = run([K.GLSLANG, '-V', '--target-env', 'vulkan1.3', '-I' + str(PINNED),
+             CARD / 'candidate.comp', '-o', cand_spv])
+    (BUILD / 'candidate-stdout.txt').write_text(r.stdout + r.stderr, encoding='utf-8')
+    assert r.returncode == 0, r.stdout + r.stderr
+    vr = run([K.VALIDATE, cand_spv])
+    (BUILD / 'validate-stdout.txt').write_text(vr.stdout + vr.stderr, encoding='utf-8')
+    out['candidate'] = dict(path=str(cand_spv), sha256=K.sha(cand_spv),
+                            bytes=cand_spv.stat().st_size,
+                            validate_returncode=vr.returncode,
+                            validate_stdout=(vr.stdout + vr.stderr).strip()[:400])
+    assert vr.returncode == 0, 'candidate.spv failed spv_validate_cpu'
+
+    # ---- 3. plan: replace only this group's 15 PASS lines
+    plan = CARD / 'plan.txt'
+    replaced = K.make_plan(cand_spv, plan, spv_shas={TARGET_SPV_SHA})
+    out['plan'] = dict(path=str(plan), sha256=K.sha(plan), replaced_passes=replaced,
+                       expected_passes=15, baseline_plan=str(K.BASELINE),
+                       baseline_plan_sha256=K.sha(K.BASELINE))
+    assert replaced == 15, replaced
+    assert K.sha(K.BASELINE) == K.BASELINE_SHA
+
+    # ---- 4. CPU plan check
+    cc = K.cpu_check(plan)
+    (BUILD / 'cpu-check.txt').write_text(cc, encoding='utf-8')
+    out['cpu_check'] = cc.strip()
+    base_cc = K.cpu_check(K.BASELINE)
+    out['cpu_check_baseline'] = base_cc.strip()
+    out['cpu_check_identical_to_baseline'] = cc.strip() == base_cc.strip()
+
+    # ---- 5. SPIR-V accounting parent vs candidate
+    pm, cm = spvstat.Mod(parent_rebuild), spvstat.Mod(cand_spv)
+    ps, cs = pm.summary(), cm.summary()
+    K.write_json(BUILD / 'spv-stats.json', dict(parent=ps, candidate=cs))
+    out['spirv'] = dict(
+        parent=dict(sha256=TARGET_SPV_SHA, words=ps['words'], bytes=ps['bytes'],
+                    instructions=ps['instructions'], function_locals=ps['function_locals'],
+                    no_contraction=ps['no_contraction'], float_ops=ps['float_ops'],
+                    cooperative_matrix=ps['cooperative_matrix'], int_ops=ps['int_ops'],
+                    control_flow=ps['control_flow']),
+        candidate=dict(sha256=cs['sha256'] if 'sha256' in cs else K.sha(cand_spv),
+                       words=cs['words'], bytes=cs['bytes'],
+                       instructions=cs['instructions'], function_locals=cs['function_locals'],
+                       no_contraction=cs['no_contraction'], float_ops=cs['float_ops'],
+                       cooperative_matrix=cs['cooperative_matrix'], int_ops=cs['int_ops'],
+                       control_flow=cs['control_flow']),
+        interface_equal=dict(
+            capabilities=ps['capabilities'] == cs['capabilities'],
+            extensions=ps['extensions'] == cs['extensions'],
+            entry_points=ps['entry_points'] == cs['entry_points'],
+            execution_modes=ps['execution_modes'] == cs['execution_modes'],
+            memory_model=ps['memory_model'] == cs['memory_model'],
+            non_function_storage=ps['non_function_storage'] == cs['non_function_storage'],
+            decorations=ps['decorations'] == cs['decorations'],
+            float_ops=ps['float_ops'] == cs['float_ops'],
+            cooperative_matrix=ps['cooperative_matrix'] == cs['cooperative_matrix'],
+        ),
+        float_NC_checked=cs['no_contraction'],
+        float_NC_note='0 is the true count, not a missing measurement: neither arm contains an'
+                      ' OpExtInst Fma call nor any NoContraction decoration (spv-stats.json'
+                      ' decorations histogram has no key 43), so there is no FP site to align',
+    )
+    out['spirv']['interface_all_equal'] = all(out['spirv']['interface_equal'].values())
+
+    K.write_json(CARD / 'BUILD.json', out)
+    print(json.dumps({k: out[k] for k in ('group', 'parent_rebuild', 'candidate', 'plan',
+                                          'cpu_check', 'cpu_check_identical_to_baseline')},
+                     indent=2))
+    print('cpu-check:', out['cpu_check'])
+    print('interface all equal:', out['spirv']['interface_all_equal'])
+    print('cand spv sha', out['candidate']['sha256'])
+    print('plan sha', out['plan']['sha256'])
+    print('spv instr %d -> %d, words %d -> %d' % (ps['instructions'], cs['instructions'],
+                                                  ps['words'], cs['words']))
+    print('float ops', ps['float_ops'], '->', cs['float_ops'])
+    print('coop', ps['cooperative_matrix'], '->', cs['cooperative_matrix'])
+    print('int ops', ps['int_ops'], '->', cs['int_ops'])
+    print('control flow', ps['control_flow'], '->', cs['control_flow'])
+
+
+if __name__ == '__main__':
+    main()

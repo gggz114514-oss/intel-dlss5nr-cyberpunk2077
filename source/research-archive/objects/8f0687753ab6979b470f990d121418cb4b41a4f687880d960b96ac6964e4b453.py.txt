@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""R07 C64 segment-local numerics: FP16 reference arm vs the INT8 WO arm.
+
+CPU only (numpy).  No GPU is used; this is a *segment-local* reference over a real
+captured frame, exactly the qualification the GUIDE asks an R card for.
+
+Inputs (all read-only, from the parent work):
+  candidates/amd-map-20261015/s3-c64-output/gpu-pending/fullgrid/T.bin
+      the deployed module's context buffer, 1075 windows x 64 tokens x 64 channels
+      (half) captured from the deployed FP16 module on a real frame
+  .../Y.bin            the residual input, same geometry
+  .../image_out.bin    the deployed module's image output, 4 128 768 half
+  candidates/amd-map-20261015/round4-integrated/candidate/packs/swin_6_weights.fp16.bin
+      the pack bound by the plan for block6; WO tile base wo = p4.x = 0,
+      per-output-channel residual scale base ars = p4.z = 12288 (half elements)
+  candidates/r07-output-proj/packs/r07_c64_b6_wo.i8.bin + _wosc.f32.bin
+      this card's INT8 WO pack and per-output-channel scales
+
+Three checks, in increasing strength:
+
+  A  layout/provenance: the parent arm is replayed in numpy from the captured T
+     and Y with the module's own addressing, and compared with the captured
+     image_out.bin.  This validates the decode of T, Y, ars and WO (a wrong tile
+     formula or a wrong ars offset cannot pass).
+  B  INT8 exactness: the int32 accumulator equals an int64 accumulation, so the
+     integer sum is exact and the only error is the A/B quantization.
+  C  INT8 vs FP16: per-element rel L2 / RMS / max abs / SNR and the share of
+     bit-identical half outputs, plus the saturation share of the code points.
+
+usage: python oracle.py [--window N]
+"""
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+R = Path("@NR_WORKSPACE@")
+CARD = R / "work/dsh-xmx-handoff-validation-20261024/candidates/r07-output-proj"
+CAP = R / "candidates/amd-map-20261015/s3-c64-output/gpu-pending/fullgrid"
+PACK = R / "candidates/amd-map-20261015/round4-integrated/candidate/packs/swin_6_weights.fp16.bin"
+P0 = (84, 48, -1, -1)      # tiles_x, tiles_y, shift_x, shift_y  (block6 PUSH p0)
+P1 = (43, 25, 0, 0)        # grid_x, grid_y, single_mode, debug  (block6 PUSH p1)
+WO_HALF = 0                # p4.x
+ARS_HALF = 12288           # p4.z
+N = K = 64
+
+
+def f32(x):
+    return np.float32(x)
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def decode_w(half, wo):
+    w = np.empty((N, K), np.float16)
+    for n in range(N):
+        for k in range(K):
+            w[n, k] = half[wo + (n // 16) * 1024 + (k // 16) * 256 + (n % 16) * 16 + (k % 16)]
+    return w
+
+
+def img_index(m, n, wx, wy):
+    """c64_img_half_index, plus the parent's OOB rule"""
+    q, s = m >> 4, m & 15
+    tx = 2 * wx + P0[2] + (q & 1)
+    ty = 2 * wy + P0[3] + (q >> 1)
+    oob = tx < 0 or ty < 0 or tx >= P0[0] or ty >= P0[1]
+    stx = min(max(tx, 0), P0[0] - 1)
+    sty = min(max(ty, 0), P0[1] - 1)
+    return (((sty * P0[0] + stx) * 4 + n // 16) * 256 + s * 16 + n % 16), oob
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--window", type=int, default=None)
+    a = ap.parse_args()
+
+    T = np.fromfile(CAP / "T.bin", dtype="<f2")
+    Y = np.fromfile(CAP / "Y.bin", dtype="<f2")
+    IMG = np.fromfile(CAP / "image_out.bin", dtype="<f2")
+    pack = np.fromfile(PACK, dtype="<f2")
+    w16 = decode_w(pack, WO_HALF)
+    W = w16.astype(np.float32)
+    ars = np.array([pack[ARS_HALF + n] for n in range(N)], np.float16)
+    ars32 = ars.astype(np.float32)
+
+    qw8 = np.fromfile(CARD / "packs/r07_c64_b6_wo.i8.bin", dtype=np.int8)
+    sW = np.fromfile(CARD / "packs/r07_c64_b6_wosc.f32.bin", dtype="<f4")
+    QW = np.zeros((N, K), np.int32)
+    for n in range(N):
+        for k in range(K):
+            QW[n, k] = qw8[(n // 16) * 1024 + (k // 32) * 512 + (n % 16) * 32 + (k % 32)]
+    # the pack must decode back to the FP16 weights under its own scale
+    wq = QW.astype(np.float32) * sW[:, None]
+    nw = int(4096 if a.window is None else 0)
+    nwin = T.size // 4096 if a.window is None else 0
+    wins = range(nwin) if a.window is None else [a.window]
+
+    ref = np.zeros(IMG.size, dtype=np.float16)
+    int8 = np.zeros(IMG.size, dtype=np.float16)
+    written = np.zeros(IMG.size, dtype=bool)
+    stat = {"windows": 0, "writes": 0, "oob_skips": 0, "collisions": 0,
+            "acc_int32_max": 0, "sat_codes": 0, "codes": 0,
+            "amax_min": None, "amax_max": None, "invC_max": 0.0}
+    for w in wins:
+        wx, wy = w % P1[0], w // P1[0]
+        Tw = T[w * 4096:(w + 1) * 4096].reshape(64, 64)
+        Yw = Y[w * 4096:(w + 1) * 4096].reshape(64, 64)
+        seed = (Yw * ars[None, :]).astype(np.float16).astype(np.float32)
+        # ---- A: parent arm, sequential float32 accumulation, seed first ------
+        accr = seed.copy()
+        Tf = Tw.astype(np.float32)
+        for k in range(K):
+            accr = accr + Tf[:, k:k + 1] * W[:, k][None, :]
+        outr = accr.astype(np.float16)
+        # ---- C: INT8 arm, per-workgroup per-tensor activation scale ---------
+        amax = float(np.abs(Tf).max())
+        sC = f32(f32(amax) / f32(127.0)) if amax > 0 else f32(0.0)
+        invC = f32(f32(127.0) / f32(amax)) if amax > 0 else f32(0.0)
+        q = np.clip(np.rint(Tf * invC), -127.0, 127.0).astype(np.int32)
+        stat["sat_codes"] += int((np.abs(q) >= 127).sum())
+        stat["codes"] += int(q.size)
+        stat["invC_max"] = max(stat["invC_max"], float(invC))
+        stat["amax_min"] = amax if stat["amax_min"] is None else min(stat["amax_min"], amax)
+        stat["amax_max"] = amax if stat["amax_max"] is None else max(stat["amax_max"], amax)
+        acc32 = q @ QW.T                                   # int32
+        acc64 = q.astype(np.int64) @ QW.T.astype(np.int64)  # exactness check
+        assert np.array_equal(acc32.astype(np.int64), acc64), "int32 accumulation not exact"
+        stat["acc_int32_max"] = max(stat["acc_int32_max"], int(np.abs(acc32).max()))
+        fsc = (sW[None, :] * np.float32(sC)).astype(np.float32)
+        prod = (acc32.astype(np.float32) * fsc).astype(np.float32)
+        summ = (prod + seed).astype(np.float32)
+        outi = summ.astype(np.float16)
+        # ---- write both arms through the module's own image addressing ------
+        mm = np.arange(64, dtype=np.int64)[:, None]
+        nn = np.arange(N, dtype=np.int64)[None, :]
+        q_, s_ = mm >> 4, mm & 15
+        tx = 2 * wx + P0[2] + (q_ & 1)
+        ty = 2 * wy + P0[3] + (q_ >> 1)
+        oobm = (tx < 0) | (ty < 0) | (tx >= P0[0]) | (ty >= P0[1])
+        stx = np.clip(tx, 0, P0[0] - 1)
+        sty = np.clip(ty, 0, P0[1] - 1)
+        idx = (((sty * P0[0] + stx) * 4 + nn // 16) * 256 + s_ * 16 + nn % 16)
+        ok = np.broadcast_to(~oobm, (64, N))
+        idx = idx[ok]
+        stat["oob_skips"] += int(np.broadcast_to(oobm, (64, N)).sum())
+        stat["writes"] += int(idx.size)
+        stat["collisions"] += int(written[idx].sum())
+        written[idx] = True
+        ref[idx] = outr[ok]
+        int8[idx] = outi[ok]
+        stat["windows"] += 1
+
+    # ---- A: captured image vs the replayed parent arm ------------------------
+    r = ref.astype(np.float32)
+    i8 = int8.astype(np.float32)
+    cap = IMG.astype(np.float32)
+    m = written
+    diffA = np.abs(r[m] - cap[m])
+    denomA = np.maximum(np.abs(cap[m]), np.float32(1e-6))
+    stats = {"A_replay_vs_capture": {
+        "compared": int(m.sum()),
+        "bit_identical_share": float((ref[m] == IMG[m]).mean()),
+        "max_abs_diff": float(diffA.max()),
+        "rms": float(np.sqrt((diffA ** 2).mean())),
+        "max_rel_diff": float((diffA / denomA).max()),
+        "p99_abs_diff": float(np.percentile(diffA, 99)),
+    }}
+    # ---- C: INT8 arm vs FP16 arm -------------------------------------------
+    d = np.abs(r[m] - i8[m])
+    ref_l2 = float(np.sqrt((r[m] ** 2).sum()))
+    err_l2 = float(np.sqrt((d ** 2).sum()))
+    sig = float((r[m] ** 2).mean())
+    noise = float((d ** 2).mean())
+    stats["C_int8_vs_fp16"] = {
+        "compared": int(m.sum()),
+        "bit_identical_share": float((ref[m] == int8[m]).mean()),
+        "rel_L2": err_l2 / ref_l2 if ref_l2 else None,
+        "rms": float(np.sqrt(noise)),
+        "max_abs_diff": float(d.max()),
+        "snr_db": float(10.0 * np.log10(sig / noise)) if noise > 0 else None,
+        "fp16_arm_absmax": float(np.abs(r[m]).max()),
+        "int8_arm_absmax": float(np.abs(i8[m]).max()),
+        "one_code_ulp_share": float((d <= float(np.spacing(np.float16(1.0)))).mean()),
+    }
+    stats["B_int8_exactness"] = {
+        "int32_equals_int64": True,
+        "acc_int32_max_abs": stat["acc_int32_max"],
+        "int32_exact_below_2p24": stat["acc_int32_max"] < (1 << 24),
+    }
+    stats["quantiser"] = {
+        "saturation_share": stat["sat_codes"] / max(stat["codes"], 1),
+        "amax_min": stat["amax_min"], "amax_max": stat["amax_max"],
+        "invC_max": stat["invC_max"],
+        "windows": stat["windows"], "writes": stat["writes"],
+        "oob_skips": stat["oob_skips"], "image_collisions": stat["collisions"],
+    }
+    stats["weight_pack_roundtrip"] = {
+        "dequant_vs_fp16_rel_L2": float(
+            np.sqrt(((wq - W) ** 2).sum()) / np.sqrt((W ** 2).sum())),
+        "dequant_vs_fp16_max_abs": float(np.abs(wq - W).max()),
+        "zero_channels": int((np.abs(W).max(axis=1) == 0).sum()),
+        "sW_max": float(sW.max()), "sW_min_nonzero": float(sW[sW < 1.0].min())
+        if (sW < 1.0).any() else None,
+    }
+    stats["inputs"] = {"T": str(CAP / "T.bin"), "T_sha256": sha(CAP / "T.bin"),
+                       "Y_sha256": sha(CAP / "Y.bin"),
+                       "image_out_sha256": sha(CAP / "image_out.bin"),
+                       "pack": str(PACK), "pack_sha256": sha(PACK),
+                       "half_bytes": int(T.size * 2)}
+    out = CARD / "evidence/ORACLE-C64.json"
+    out.write_text(json.dumps(stats, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps(stats, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

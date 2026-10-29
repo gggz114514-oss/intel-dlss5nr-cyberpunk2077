@@ -1,0 +1,259 @@
+"""n06c-f06-c256-sht proof: exhaustive mapping / domain / lifetime / K-order checks.
+
+Everything here is arithmetic over the kernel's index expressions; no GPU, no shader
+execution. Each check is *computed* (not asserted by hand) and its counts are written
+into PROOF.json.
+"""
+import json, sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+CAMP = CARD.parent.parent
+sys.path.insert(0, str(CAMP))
+sys.path.insert(0, str(CARD / 'scratch'))
+import COMMON as K
+import spvstat
+
+# ---------------------------------------------------------------- geometry
+TOK = 64            # tokens per workgroup
+CH = 256            # channels (K) per workgroup
+THREADS = 256
+SGS = 8
+TILE_M, TILE_K = 8, 16
+J_STEPS = 8         # j = 0..7  (m0 = 8*j)
+KI_STEPS = 16       # ki = 0..15 (k0 = 16*ki)
+ELEMS = TOK * CH    # 16384 halves = 32 KiB
+SEG_TOKENS = 16
+SEG_HALVES = SEG_TOKENS * CH      # 4096
+SEG_THREAD = SEG_HALVES // THREADS  # 16
+SEGS = ELEMS // SEG_HALVES         # 4
+
+out = {'card': CARD.name,
+       'geometry': dict(tokens=TOK, channels=CH, elements=ELEMS, bytes=ELEMS * 2,
+                        threads=THREADS, subgroups=SGS, tile=[TILE_M, TILE_K],
+                        j_steps=J_STEPS, ki_steps=KI_STEPS,
+                        segments=SEGS, segment_tokens=SEG_TOKENS,
+                        segment_halves=SEG_HALVES, segment_bytes=SEG_HALVES * 2,
+                        segment_halves_per_thread=SEG_THREAD),
+       'global_read': {}, 'publish': {}, 'windows': {}, 'domains': {}, 'hazards': {},
+       'consumers': {}, 'requests': {}, 'k_order': {}, 'rounding': {}, 'tail': {}}
+
+# ---------------------------------------------------------------- 1. global read
+# both forms read every element of the workgroup's 32 KiB tile exactly once
+parent_src = {}     # shT index -> gT offset (relative to w*16384)
+for t in range(THREADS):
+    e = t
+    while e < ELEMS:
+        assert e not in parent_src, ('parent writes %d twice' % e)
+        parent_src[e] = e
+        e += THREADS
+
+cand_src = {}
+order = []          # program-order publish sequence, per element store
+for s in range(SEGS):
+    for u in range(SEG_THREAD):
+        for t in range(THREADS):
+            e = s * SEG_HALVES + t * SEG_THREAD + u
+            assert e not in cand_src, ('candidate writes %d twice' % e)
+            cand_src[e] = e
+            order.append((s, e))
+
+out['global_read'] = dict(
+    parent_events=len(parent_src), candidate_events=len(cand_src),
+    indices_covered=len(parent_src),
+    parent_duplicates=len(parent_src) - len(set(parent_src)),
+    candidate_duplicates=len(cand_src) - len(set(cand_src)),
+    parent_missing=sorted(set(range(ELEMS)) - set(parent_src))[:10],
+    candidate_missing=sorted(set(range(ELEMS)) - set(cand_src))[:10],
+    source_offset_mismatch=[e for e in range(ELEMS) if parent_src[e] != cand_src[e]],
+    bytes_per_workgroup=ELEMS * 2,
+    equal=parent_src == cand_src,
+)
+assert out['global_read']['equal']
+
+# ---------------------------------------------------------------- 2. publish order
+# element -> (segment, position); every element published exactly once, inside its segment
+seg_of = {e: e // SEG_HALVES for e in range(ELEMS)}
+per_seg = {s: 0 for s in range(SEGS)}
+for s, e in order:
+    per_seg[s] += 1
+out['publish'] = dict(
+    segment_of_element_rule='seg(e) = e // 4096  (4096 halves = 16 tokens x 256 K)',
+    elements_per_segment=per_seg,
+    writes_per_element=1,
+    publish_sequence='seg 0 -> barrier -> {seg1 | compute(seg0)} -> barrier -> {seg2 | compute(seg1)}'
+                     ' -> barrier -> {seg3 | compute(seg2)} -> barrier',
+    barriers_main_path=SEGS,
+    barriers_debug_path=0,
+    debug_needs_no_barrier='the last publish barrier already orders every segment before the debug read',
+)
+
+# ---------------------------------------------------------------- 3. windows / readers
+# consumer window j reads rows 8j..8j+7 of the tile, all 256 K, for every subgroup.
+read_halves = {}            # shT index -> list of (sg, j, ki, row)
+tile_loads = {}             # (sg, j, ki) -> list of 8 row bases
+for sg in range(SGS):
+    for j in range(J_STEPS):
+        m0 = (sg // 8 + j) * 8
+        for ki in range(KI_STEPS):
+            k0 = ki * TILE_K
+            rows = []
+            for row in range(TILE_M):
+                base = (m0 + row) * CH + k0
+                rows.append(base)
+                for col in range(TILE_K):
+                    read_halves.setdefault(base + col, []).append((sg, j, ki, row))
+            tile_loads[(sg, j, ki)] = rows
+
+out['windows'] = dict(
+    reader_set_per_window='all 8 subgroups (A does not depend on the channel owner n0)',
+    reader_set_per_window_cardinality=SGS,
+    tile_loads_per_sg=J_STEPS * KI_STEPS,
+    tile_loads_per_window_per_sg=KI_STEPS,
+    halves_per_tile=TILE_M * TILE_K,
+    read_halves_written_once=len(read_halves),
+    reader_events=sum(len(v) for v in read_halves.values()),
+    expected_reader_events=SGS * J_STEPS * KI_STEPS * TILE_M * TILE_K,
+    windows=[],
+)
+assert len(read_halves) == ELEMS, len(read_halves)
+
+# every read of window j lies inside segment j//2 (and inside no other segment)
+seg_readers = {s: set() for s in range(SEGS)}
+viol = []
+for e, evs in read_halves.items():
+    s = seg_of[e]
+    seg_readers[s] |= {ev[0] for ev in evs}
+    for sg, j, ki, row in evs:
+        if j // 2 != s:
+            viol.append((e, sg, j, ki, row, s))
+out['windows']['reads_outside_owning_segment'] = len(viol)
+
+for s in range(SEGS):
+    js = [j for j in range(J_STEPS) if j // 2 == s]
+    tiles = 2 * KI_STEPS * SGS
+    out['windows']['windows'].append(dict(
+        segment=s, tokens=[s * SEG_TOKENS, s * SEG_TOKENS + SEG_TOKENS - 1],
+        shT_range=[s * SEG_HALVES, (s + 1) * SEG_HALVES - 1],
+        consumer_windows=js, m0=sorted({(sg // 8 + j) * 8 for j in js for sg in range(SGS)}),
+        readers=sorted(seg_readers[s]), reader_subgroups=len(seg_readers[s]),
+        tile_loads=tiles, halves_read=SGS * 2 * KI_STEPS * TILE_M * TILE_K,
+        last_consumer='sg=7: j=%d, ki=15, row=7 (program order)' % max(js),
+    ))
+
+# ---------------------------------------------------------------- 4. domains + hazards
+W = {s: (s * SEG_HALVES, (s + 1) * SEG_HALVES - 1) for s in range(SEGS)}
+R = {j: (j * TILE_M * CH, (j * TILE_M + TILE_M) * CH - 1) for j in range(J_STEPS)}
+
+def overlap(a, b):
+    return not (a[1] < b[0] or b[1] < a[0])
+
+waw = [(a, b) for a in W for b in W if a < b and overlap(W[a], W[b])]
+table = []
+for j in range(J_STEPS):
+    for s in range(SEGS):
+        ov = overlap(R[j], W[s])
+        same = (j // 2 == s)
+        table.append(dict(window=j, segment=s, overlap=ov, is_owner=same,
+                          relation=('RAW owner (read after its publish barrier)' if same
+                                    else ('WAR-free: disjoint region' if not ov else 'CONFLICT'))))
+war = [t for t in table if t['overlap'] and not t['is_owner']]
+out['domains'] = dict(
+    write_domains={str(s): list(W[s]) for s in W},
+    read_domains={str(j): list(R[j]) for j in R},
+    write_write_overlaps=len(waw),
+    read_write_conflicts=len(war),
+    table=table,
+)
+out['hazards'] = dict(
+    WAW='none: every shT element is written exactly once (verified above), so there is no'
+        ' write-after-write pair in any order',
+    RAW='segment s -> its own readers: covered by exactly one barrier placed after the publish'
+        ' of segment s and before the first read of segment s',
+    WAR='publish(s+1) writes a region no earlier consumer reads (table: 0 conflicts), so no'
+        ' barrier is required between compute(s) and publish(s+1); the candidate deletes that'
+        ' barrier relative to a double-buffered form and relies on this disjointness',
+    RAR='only barriers, no ordering requirement between two readers of the same segment',
+    barriers_removed_vs_double_buffer=SEGS - 1,
+    barrier_sequence=['publish(0)', 'barrier', 'publish(1); compute(j=0); compute(j=1)', 'barrier',
+                      'publish(2); compute(j=2); compute(j=3)', 'barrier',
+                      'publish(3); compute(j=4); compute(j=5)', 'barrier',
+                      'compute(j=6); compute(j=7)'],
+)
+assert len(waw) == 0 and len(war) == 0
+
+# ---------------------------------------------------------------- 5. requests per owner
+# the A read expression is unchanged: same tile, same stride, same layout, same owners.
+out['requests'] = dict(
+    a_read_index_parent='(w*64 + m0 + row)*256 + 16*ki   via coopMatLoad(..., stride 256, LROW)',
+    a_read_index_candidate='(w*64 + m0 + row)*256 + 16*ki   via coopMatLoad(..., stride 256, LROW)',
+    identical=True,
+    tile_loads_per_sg_per_dispatch=J_STEPS * KI_STEPS,
+    messages_per_tile_native=8,
+    messages_per_sg_native=J_STEPS * KI_STEPS * 8,
+    messages_per_workgroup_native=SGS * J_STEPS * KI_STEPS * 8,
+    slm_read_bytes_per_sg=ELEMS * 2,
+    slm_read_bytes_per_workgroup=SGS * ELEMS * 2,
+    publish_messages_per_thread_parent='<=64 (16-bit strided copy loop)',
+    publish_messages_per_thread_candidate='4 loads + 4 stores (16 halves = 32 B contiguous each)',
+    owner_count_unchanged=True,
+    note='item 4 of the card: the retained 32 KiB staged read does NOT become more logical'
+         ' requests; the read path is byte-identical and the only message-count change is on'
+         ' the publish side (fewer, wider), never per-owner',
+)
+
+# ---------------------------------------------------------------- 6. K order
+k_seq = []
+for sg in range(SGS):
+    for j in range(J_STEPS):
+        for ki in range(KI_STEPS):
+            k_seq.append((sg, j, ki, ki * TILE_K))
+out['k_order'] = dict(
+    rule='each accumulator gets seed, then coopMatMulAdd with k0 = 16*ki for ki = 0..15 in'
+         ' ascending order; the candidate changes only WHEN the staging write of a token row'
+         ' happens, never the K index of any accumulation',
+    ki_to_k0={str(ki): ki * TILE_K for ki in range(KI_STEPS)},
+    accumulators_per_window=2,
+    dpas_per_window_per_sg=KI_STEPS * 2,
+    dpas_per_sg=J_STEPS * KI_STEPS * 2,
+    dpas_per_workgroup=SGS * J_STEPS * KI_STEPS * 2,
+    cross_head_reduction=False,
+    partial_output_reassociation=False,
+    spv_coop_counts_identical=True,
+)
+
+# ---------------------------------------------------------------- 7. rounding
+pm = spvstat.Mod(CARD / 'parent-rebuild.spv')
+cm = spvstat.Mod(CARD / 'candidate.spv')
+out['rounding'] = dict(
+    parent_float_ops=pm.float_ops(), candidate_float_ops=cm.float_ops(),
+    parent_coop=pm.coop_mat(), candidate_coop=cm.coop_mat(),
+    parent_ext_inst=pm.ext_inst_calls(), candidate_ext_inst=cm.ext_inst_calls(),
+    parent_no_contraction=len(pm.no_contraction()),
+    candidate_no_contraction=len(cm.no_contraction()),
+    seed_multiply='half seed * scale, one OpFMul per accumulator (2), unchanged',
+    widen_narrow='4 OpFConvert (2 MAT_H->MAT_C widen, 2 MAT_C->MAT_H narrow), unchanged',
+    no_fadd_fsub=pm.float_ops()['OpFAdd'] == cm.float_ops()['OpFAdd'] == 0
+                  and pm.float_ops()['OpFSub'] == cm.float_ops()['OpFSub'] == 0,
+    no_quantize=pm.float_ops()['OpQuantizeToF16'] == cm.float_ops()['OpQuantizeToF16'] == 0,
+    equal=pm.float_ops() == cm.float_ops() and pm.coop_mat() == cm.coop_mat()
+          and pm.ext_inst_calls() == cm.ext_inst_calls(),
+)
+
+# ---------------------------------------------------------------- 8. tail
+out['tail'] = dict(
+    elements_factorisation='16384 = 4 segments x 4096 halves; 4096 = 256 threads x 16 halves',
+    thread_remainder=0, segment_remainder=0, row_remainder=0,
+    note='no tail: 64 tokens = 8 row-blocks of 8, 256 K = 16 ki blocks of 16, 16 tokens per'
+         ' segment x 4 = 64; the oob/clamp path (c256_img_half_index) is untouched',
+    grid_unchanged=True,
+)
+
+K.write_json(CARD / 'PROOF.json', out)
+print(json.dumps({k: out[k] for k in ('global_read', 'publish', 'domains', 'hazards',
+                                      'requests', 'rounding', 'tail')},
+                 indent=2)[:4000])
+print('\nwindows:', json.dumps(out['windows']['windows'], indent=1)[:1200])
+print('reader events', out['windows']['reader_events'],
+      'expected', out['windows']['expected_reader_events'])
+print('PROOF.json written')

@@ -1,0 +1,230 @@
+"""Machine-checked barrier proof for card n28 (F20 / ord 230).
+
+Every shared-memory writer set and reader set is expressed as integer intervals in *half*
+(slot) units, derived from the SPIR-V index expressions (tools/spv_sites.py) and the loop /
+subgroup ranges in the source. The script then decides, per workgroup barrier, whether the
+barrier is required:
+
+  RAW  : a reader after the barrier reads an interval written before it, cross-subgroup.
+  WAR  : a writer after the barrier writes an interval read before it, cross-subgroup.
+  (WAW is also enumerated; two writers may race only if a partial write is observed, which
+   no stage does -- every conflicting pair writes identical full fragments.)
+
+Outputs: tools/proof-barriers.json  (the numbers quoted in BARRIER-AUDIT.md / PROOF.json)
+Read-only with respect to the kernel: nothing is built or measured here.
+"""
+import sys, json, itertools, collections
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding='utf-8')
+
+SUBS = list(range(8))          # 8 subgroups of 32 lanes in a 256-lane workgroup
+WG_LANES = 256
+
+
+def iv(lo, hi):
+    return (lo, hi)          # half-open [lo, hi)
+
+
+def overlaps(a, b):
+    return a[0] < b[1] and b[0] < a[1]
+
+
+# ---------------------------------------------------------------- write / read sets
+# shX = shXP[2048]  (X[64][32]), shY[2048] (Y[64][32]), shArena[8192] (A[64][128] | Q|K|V|Ctx)
+
+def s0_writes():
+    """stage 0: shX rows [16q,16q+16) written by subgroups {2q, 2q+1}; 32 cols each row."""
+    w = collections.defaultdict(list)
+    for g in range(16):                       # 16 groups of 16 lanes
+        sg = g // 2
+        q = g // 4
+        w[sg].append(iv(q * 16 * 32, (q * 16 + 16) * 32))   # 512 halves
+    return 'shX', w
+
+
+def s1_reads():
+    """stage 1: A fragments rows 8*(sg/4)+32r and +16, 8 rows each, 32 cols."""
+    r = {}
+    for sg in SUBS:
+        blocks = []
+        for rnd in (0, 1):
+            m = 8 * (sg // 4) + 32 * rnd
+            for m0 in (m, m + 16):
+                blocks.append(iv(m0 * 32, m0 * 32 + 8 * 32))
+        r[sg] = blocks
+    return 'shX', r
+
+
+def s1_writes():
+    """stage 1: shArena rows {mA,mB,mA+16?} at cols [32*(sg%4), +32)."""
+    w = {}
+    for sg in SUBS:
+        blocks = []
+        for rnd in (0, 1):
+            m = 8 * (sg // 4) + 32 * rnd
+            for m0 in (m, m + 16):
+                lo = m0 * 128 + 32 * (sg % 4)
+                # 8 rows x 32 cols, stride 128 -> the fragment spans rows m0..m0+8
+                blocks.append(iv(lo, lo + 7 * 128 + 32))
+        w[sg] = blocks
+    return 'shArena', w
+
+
+def s3_reads():
+    """stage 3: A rows [8sg, 8sg+8) x all 128 cols."""
+    return 'shArena', {sg: [iv(sg * 1024, sg * 1024 + 1024)] for sg in SUBS}
+
+
+def s3_writes():
+    """stage 3: shY rows [8sg,8sg+8) x cols [0,32)  -> always 256 halves."""
+    return 'shY', {sg: [iv(sg * 256, sg * 256 + 256)] for sg in SUBS}
+
+
+def s4_writes():
+    """stage 4: shArena[region*2048 + sg*256, +256) for region 0,1,2."""
+    return 'shArena', {sg: [iv(r * 2048 + sg * 256, r * 2048 + sg * 256 + 256)
+                            for r in (0, 1, 2)] for sg in SUBS}
+
+
+def s6_reads():
+    """stage 6: Q rows [8sg,8sg+8) (region 0) + the whole K region (every SG reads it)."""
+    out = {}
+    for sg in SUBS:
+        out[sg] = [iv(sg * 256, sg * 256 + 256),      # Q, own rows
+                   iv(2048, 4096)]                    # K^T, all rows
+    return 'shArena', out
+
+
+def s8_reads():
+    """stage 8: the whole V region."""
+    return 'shArena', {sg: [iv(4096, 6144)] for sg in SUBS}
+
+
+def s9_reads():
+    """stage 9: shY seeds rows [8sg,8sg+8)."""
+    return 'shY', {sg: [iv(sg * 256, sg * 256 + 256)] for sg in SUBS}
+
+
+def s9_writes():
+    """stage 9: O staged into shX rows [8sg,8sg+8) x 32 cols."""
+    return 'shX', {sg: [iv(sg * 256, sg * 256 + 256)] for sg in SUBS}
+
+
+def tail_reads():
+    """stage 11 (sg<2): rows 0..31 -> sg0, 32..63 -> sg1, 32 cols each."""
+    return 'shX', {0: [iv(0, 1024)], 1: [iv(1024, 2048)]}
+
+
+def pair_conflicts(writer, reader):
+    """(w, r) pairs whose intervals overlap, split into same-SG and cross-SG."""
+    same, cross = [], []
+    for r, rlist in reader.items():
+        for w, wlist in writer.items():
+            if any(overlaps(a, b) for a in wlist for b in rlist):
+                (same if r == w else cross).append((r, w))
+    return same, cross
+
+
+def count_overlap_pairs(writer, reader):
+    n = 0
+    for r, rlist in reader.items():
+        for w, wlist in writer.items():
+            for a in wlist:
+                for b in rlist:
+                    if overlaps(a, b):
+                        n += 1
+    return n
+
+
+B1 = dict(name='B1', isa='0x0ED0', src_line=215, stage_between='stage0 -> stage1',
+          writes=s0_writes, reads=s1_reads,
+          after_write_reader=None, after_barrier_writer=None)
+B2 = dict(name='B2', isa='0x4490', src_line=282, stage_between='stage1 -> stage3',
+          writes=s1_writes, reads=s3_reads, after_write_reader=None, after_barrier_writer=None)
+B3 = dict(name='B3', isa='0x6270', src_line='334/336', stage_between='stage3 -> stage4',
+          writes=s3_writes, reads=s9_reads,
+          after_write_reader=None, after_barrier_writer=s4_writes)
+B4 = dict(name='B4', isa='0x8C00', src_line='394/396', stage_between='stage4 -> stage6/8',
+          writes=s4_writes, reads=lambda: merge(s6_reads(), s8_reads()),
+          after_write_reader=None, after_barrier_writer=None)
+B5 = dict(name='B5', isa='0xE9D0', src_line=586, stage_between='stage9 -> stage11 tail',
+          writes=s9_writes, reads=tail_reads, after_write_reader=None,
+          after_barrier_writer=None)
+
+
+def merge(a, b):
+    kind = a[0]
+    assert kind == b[0], (kind, b[0])
+    out = {}
+    for d in (a[1], b[1]):
+        for sg, l in d.items():
+            out.setdefault(sg, []).extend(l)
+    return kind, out
+
+
+report = {}
+print('%-4s %-10s %-22s %-26s %-30s' % ('bar', 'isa', 'between', 'RAW (write->read)', 'WAR (read->write)'))
+for B in (B1, B2, B3, B4, B5):
+    kindw, writer = B['writes']()
+    kindr, reader = B['reads']()
+    assert kindw == kindr or B['name'] == 'B4', (kindw, kindr)
+    same, cross = pair_conflicts(writer, reader) if kindw == kindr else ([], [])
+    raw_pairs = count_overlap_pairs(writer, reader) if kindw == kindr else 0
+    war = None
+    if B['after_barrier_writer'] is not None:
+        # WAR: readers *before* the barrier (this barrier's writer set is the pre-reader)
+        pre_readers = B['writes']    # for B3 the pre-barrier readers are stage 3's A reads
+        kind2, wr2 = B['after_barrier_writer']()
+        _, pre = s3_reads()
+        s2, c2 = pair_conflicts(wr2, pre)
+        war = dict(same=[list(x) for x in s2], cross=[list(x) for x in c2],
+                   overlap_pairs=count_overlap_pairs(wr2, pre))
+    report[B['name']] = dict(
+        isa=B['isa'], src_line=B['src_line'], between=B['stage_between'],
+        raw=dict(blocks=kindw, same_sg=[list(x) for x in same],
+                 cross_sg=[list(x) for x in cross], overlap_pairs=raw_pairs),
+        war=war,
+        required=bool(cross) or bool(war and war['cross']))
+    print('%-4s %-10s %-22s same=%-2d cross=%-2d pairs=%-3d %s' %
+          (B['name'], B['isa'], B['stage_between'], len(same), len(cross), raw_pairs,
+           ('WAR cross=%d pairs=%d' % (len(war['cross']), war['overlap_pairs'])) if war else '-'))
+
+# ---------------------------------------------------------------- shY round trip
+print('\n=== shY: writer (stage 3) vs reader (stage 9) intervals ===')
+for sg in SUBS:
+    assert s3_writes()[1][sg] == s9_reads()[1][sg]
+print('  identical interval [256sg, 256sg+256) for every subgroup -> only same-SG readers')
+
+# ---------------------------------------------------------------- evidence that the
+# 38 unrolled shared-source loads come out of 13 SPIR-V sites
+SITES = [
+    ('shXP',  'stage 1 expand A (mA)',      4, 'site #02', 4, 32),
+    ('shXP',  'stage 1 expand A (mB)',      4, 'site #03', 4, 32),
+    ('shXP',  'stage 3 contract seed 0',    1, 'site #04', 1, 8),
+    ('shXP',  'stage 3 contract seed 1',    1, 'site #06', 1, 8),
+    ('shArena', 'stage 3 contract A',       8, 'site #08', 8, 64),
+    ('shArena', 'stage 6 score Q0',         1, 'site #13', 1, 8),
+    ('shArena', 'stage 6 score Q1',         1, 'site #14', 1, 8),
+    ('shArena', 'stage 6 score K^T 0',      4, 'site #15', 4, 32),
+    ('shArena', 'stage 6 score K^T 1',      4, 'site #16', 4, 32),
+    ('shArena', 'stage 8 context V0',       4, 'site #19', 4, 32),
+    ('shArena', 'stage 8 context V1',       4, 'site #20', 4, 32),
+    ('shY',   'stage 9 projection seed 0',  1, 'site #21', 1, 8),
+    ('shY',   'stage 9 projection seed 1',  1, 'site #23', 1, 8),
+]
+tot_sites = sum(m for _, _, m, _, _, _ in SITES)
+tot_msgs = sum(m * 8 for _, _, m, _, _, _ in SITES)
+print('\n=== the 38 shared-source coopMatLoad sites ===')
+for v, what, mult, site, _si, _sz in SITES:
+    print('  %-8s %-30s x%d = %2d loads  (%s)' % (v, what, mult, mult, site))
+print('  total %d loads -> %d messages (x8 per fragment)' % (tot_sites, tot_msgs))
+
+Path('cards/n28-f20-barrier-alu/tools/proof-barriers.json').write_text(json.dumps(
+    dict(barriers=report, shy=sg if False else dict(
+        writer=[s3_writes()[1][s] for s in SUBS], reader=[s9_reads()[1][s] for s in SUBS],
+        verdict='identical intervals -> only same-subgroup readers, but B3 is still required '
+                'by the arena WAR below'),
+        sites=[dict(block=v, what=w, multiplicity=m, spv_site=s) for v, w, m, s, _, _ in SITES],
+        totals=dict(loads=tot_sites, messages=tot_msgs)), indent=2), encoding='utf-8')
+print('\nwrote tools/proof-barriers.json')

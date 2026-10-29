@@ -1,0 +1,96 @@
+"""n13b-f13-contract: mov(32) provenance census on the parent ISA (read only).
+
+Splits every mov (32|M0) by destination type suffix and by the source register
+window, so the ANALYSIS table can say *where* the transported values come from
+(message return windows, loop-carried accumulator homes, address splats).
+"""
+import json
+import re
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+import ISA  # noqa: E402
+
+LABEL = re.compile(r'^L(\d+):\s*$')
+REG = re.compile(r'^r(\d+)')
+SFX = re.compile(r'r\d+\.\d+<[^>]*>:(ud|f|hf|uw|w|ub|b|d|df)')
+
+
+def label_map(text):
+    lab, pending = {}, []
+    for line in text.splitlines():
+        if LABEL.match(line.strip()):
+            pending.append(int(LABEL.match(line.strip()).group(1)))
+        else:
+            m = ISA.LINE.match(line)
+            if m and pending:
+                a = int(m.group('addr'), 16)
+                for p in pending:
+                    lab[p] = a
+                pending = []
+    return lab, sorted(lab.items(), key=lambda kv: kv[1])
+
+
+def main(path, out_json):
+    text = Path(path).read_text(encoding='utf-8-sig', errors='replace')
+    isa = ISA.parse(path)
+    lab, ordered = label_map(text)
+    idx = 0
+    for i in isa:
+        while idx + 1 < len(ordered) and ordered[idx + 1][1] <= i['addr']:
+            idx += 1
+        i['label'] = ordered[idx][0] if ordered and ordered[0][1] <= i['addr'] else None
+    # send destination windows (loads only)
+    wins = []
+    for i in isa:
+        if i['op'].startswith('send') and 'load' in (i['comment'] or '') and i['ops']:
+            m = REG.match(i['ops'][0])
+            if not m:
+                continue
+            base = int(m.group(1))
+            rd = int((re.search(r'rd:(\d+)', i['comment']) or [0, 1])[1])
+            wins.append((base, base + rd - 1, i['label'], i['addr']))
+    win_of = lambda r: [w for w in wins if w[0] <= r <= w[1]]
+
+    per_block = defaultdict(Counter)
+    detail = []
+    for i in isa:
+        if not i['op'].startswith('mov') or '(32|' not in i['raw']:
+            continue
+        ops = i['ops']
+        src = int(REG.match(ops[1]).group(1)) if len(ops) > 1 and REG.match(ops[1]) else None
+        sfx = None
+        for o in ops:
+            m = SFX.search(o)
+            if m:
+                sfx = m.group(1)
+                break
+        w = win_of(src) if src is not None else []
+        kind = 'send_window' if w else 'reg'
+        per_block[i['label']][sfx] += 1
+        per_block[i['label']]['send_window' if w else 'other_src'] += 1
+        detail.append(dict(addr=i['addr'], label=i['label'], dst=ops[0], src=ops[1],
+                           sfx=sfx, src_window=w[0][:2] if w else None, raw=i['raw'].strip()))
+    tot = Counter()
+    for b, c in per_block.items():
+        for k, v in c.items():
+            tot[k] += v
+    out = dict(path=str(path), mov32=len(detail), by_suffix=dict(tot),
+               blocks={str(k): dict(v) for k, v in per_block.items()},
+               send_windows=sorted({(w[0], w[1]) for w in wins}),
+               first20=detail[:20])
+    Path(out_json).write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print('mov(32) total', len(detail), 'by suffix', dict(tot))
+    print('send return windows', sorted({(w[0], w[1]) for w in wins}))
+    for b, c in per_block.items():
+        print('  L%-6s %s' % (b, dict(c)))
+    print('--- first 24 ---')
+    for d in detail[:24]:
+        print('   ', d['label'], d['sfx'], d['src'], '->', d['dst'],
+              'win=%s' % (d['src_window'],))
+
+
+if __name__ == '__main__':
+    main(sys.argv[1], sys.argv[2])

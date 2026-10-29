@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""R07 C64 INT8 WO weight packs (CPU only, offline).
+
+Source of truth: the G3 production plan `plan-g3-production.txt`
+(d0bb75cf70f5def98fab66883f4d4e13099a2823655d34f15e11482cf4610cd4).  For each of
+the seven C64 output-projection passes it reads
+
+  * the pack buffer actually bound at binding 0 (BUFFER ... swin_<block>_weights),
+  * the push-constant words, which give wo = p4.x (WO tile base, in half elements)
+    and ars = p4.z (per-output-channel residual scale base),
+
+decodes the FP16 WO tile exactly the way the deployed shader addresses it
+
+    W[n][k] = pack[wo + (n/16)*1024 + (k/16)*256 + (n%16)*16 + (k%16)]
+
+and emits, per block:
+
+  * `r07_c64_b<block>_wo.i8.bin`  4096 int8, tile layout
+        (n/16)*1024 + (k/32)*512 + (n%16)*32 + (k%32)
+    which is what `coopMatLoad(b, gWo8, (n0/16)*1024 + ki*512, 32, LCOL)` reads
+    for the 32x16 B fragment (element (k,n) at base + n*32 + k);
+  * `r07_c64_b<block>_wosc.f32.bin`  64 f32, sWo[n] = amax_k|W[n][k]| / 127.
+
+Independent cross-check: the same 8192 B FP16 WO region exists as a standalone
+patch in the parent work (resource-patches/swin_<block>_weights.WO.uint16.bin);
+the decoded weights must agree byte for byte.
+
+usage: python gen_r07_c64_packs.py [--check]
+"""
+import argparse
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+
+R = Path("@NR_WORKSPACE@")
+CARD = R / "work/dsh-xmx-handoff-validation-20261024/candidates/r07-output-proj"
+PACKS = CARD / "packs"
+PLAN = R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt"
+PATCHDIR = R / "candidates/amd-map-20261015/s3-c64-output/resource-patches"
+
+K = N = 64
+TOKEN = re.compile(r'"[^"]*"|\S+')
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def f32(x):
+    return np.float32(x)
+
+
+def parse_plan():
+    lines = PLAN.read_text(encoding="utf-8").splitlines()
+    nb, npass = int(lines[0].split()[2]), int(lines[0].split()[3])
+    bufs = {}
+    for ln in lines[1:1 + nb]:
+        m = re.match(r'BUFFER "([^"]+)" (\d+) "([^"]*)"', ln)
+        bufs[m.group(1)] = {"bytes": int(m.group(2)), "path": m.group(3)}
+    rest = lines[1 + nb:]
+    out, i = {}, 0
+    for _ in range(npass):
+        t = TOKEN.findall(rest[i])
+        t = [x[1:-1] if x.startswith('"') else x for x in t]
+        name, spv = t[2], t[3]
+        row, sg, sh, nbind, npush = (int(t[1]), int(t[4]), int(t[5]),
+                                    int(t[6]), int(t[7]))
+        binds = {}
+        for b in range(nbind):
+            w = rest[i + 1 + b].split()
+            binds[int(w[1])] = {"res": int(w[2]), "off": int(w[3]), "len": int(w[4])}
+        pw = [int(x) for x in rest[i + 1 + nbind].split()[1:]]
+        if spv.endswith("output-c64.spv"):
+            names = list(bufs)
+            out[name] = {"row": row, "spv": spv, "shared": sh, "grid": (int(t[8]), int(t[9])),
+                         "pack_buffer": names[binds[0]["res"]],
+                         "pack_path": bufs[names[binds[0]["res"]]]["path"],
+                         "pack_bytes": bufs[names[binds[0]["res"]]]["bytes"],
+                         "wo": pw[16], "rs": pw[17], "ars": pw[18],
+                         "p0": pw[0:4], "p1": pw[4:8], "push_words": pw}
+        i += 1 + nbind + 1
+    return out, bufs
+
+
+def decode_w(half, wo):
+    """W[n][k] exactly as the deployed FP16 shader addresses it"""
+    w = np.empty((N, K), np.float16)
+    for n in range(N):
+        for k in range(K):
+            w[n, k] = half[wo + (n // 16) * 1024 + (k // 16) * 256 + (n % 16) * 16 + (k % 16)]
+    return w
+
+
+def build_block(info):
+    pack = np.fromfile(info["pack_path"], dtype="<f2")
+    assert pack.size * 2 == info["pack_bytes"], (pack.size, info["pack_bytes"])
+    w = decode_w(pack, info["wo"])
+    amax = np.abs(w.astype(np.float32)).max(axis=1)
+    sW = np.array([f32(f32(a) / f32(127.0)) if a > 0 else f32(1.0) for a in amax],
+                  np.float32)
+    q = np.empty((N, K), np.int32)
+    for n in range(N):
+        q[n] = np.clip(np.rint(w[n].astype(np.float32) / sW[n]), -127.0, 127.0).astype(np.int32)
+    i8 = np.zeros(N * K, np.uint8)
+    for n in range(N):
+        for k in range(K):
+            i8[(n // 16) * 1024 + (k // 32) * 512 + (n % 16) * 32 + (k % 32)] = \
+                np.uint8(q[n, k] & 0xFF)
+    ars = np.array([pack[info["ars"] + n] for n in range(N)], np.float16)
+    return i8.tobytes(), sW.astype(np.float32).tobytes(), {
+        "wo_half_offset": info["wo"], "ars_half_offset": info["ars"],
+        "rs_half_offset": info["rs"],
+        "pack_path": info["pack_path"], "pack_sha256": sha(info["pack_path"]),
+        "pack_bytes": info["pack_bytes"],
+        "weight_amax_max": float(amax.max()), "sW_max": float(sW.max()),
+        "sW_min": float(sW.min()),
+        "codes_at_full_scale": int(np.count_nonzero(np.abs(q) >= 127)),
+        "code_points": int(q.size),
+        "w_max_abs": float(np.abs(w.astype(np.float32)).max()),
+        "ars_absmax": float(np.abs(ars.astype(np.float32)).max()),
+        "push_words": info["push_words"], "grid": list(info["grid"]),
+        "shared_declared_parent": info["shared"],
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check", action="store_true")
+    a = ap.parse_args()
+    passes, bufs = parse_plan()
+    blocks = sorted(passes, key=lambda n: int(re.search(r'block(\d+)', n).group(1)))
+    meta = {"scheme": "static_symmetric_int8_per_output_channel",
+            "family": "C64", "K": K, "N": N,
+            "plan": str(PLAN), "plan_sha256": sha(PLAN),
+            "tile_layout": "i8[(n//16)*1024 + (k//32)*512 + (n%16)*32 + (k%32)]",
+            "fp16_layout": "pack[wo + (n//16)*1024 + (k//16)*256 + (n%16)*16 + (k%16)]",
+            "code_point": "roundEven(w / sW[n]), clamp +-127, sW[n] = amax_k|W[n][k]|/127",
+            "blocks": {}}
+    ok = True
+    for name in blocks:
+        info = passes[name]
+        i8b, scb, rec = build_block(info)
+        blk = int(re.search(r'block(\d+)', name).group(1))
+        wp = PACKS / ("r07_c64_b%d_wo.i8.bin" % blk)
+        sp = PACKS / ("r07_c64_b%d_wosc.f32.bin" % blk)
+        # independent cross-check against the standalone FP16 WO patch
+        patch = PATCHDIR / ("swin_%d_weights.WO.uint16.bin" % blk)
+        rec["wo_patch"] = str(patch) if patch.exists() else None
+        if patch.exists():
+            pa = np.frombuffer(patch.read_bytes(), dtype="<f2")
+            pk = np.fromfile(info["pack_path"], dtype="<f2")[info["wo"]:info["wo"] + 4096]
+            rec["wo_patch_matches_pack_region"] = (pa.tobytes() == pk.tobytes())
+            rec["wo_patch_sha256"] = sha(patch)
+            ok = ok and rec["wo_patch_matches_pack_region"]
+        rec["pass_name"] = name
+        rec["weights_sha256"] = hashlib.sha256(i8b).hexdigest()
+        rec["weights_bytes"] = len(i8b)
+        rec["scales_sha256"] = hashlib.sha256(scb).hexdigest()
+        rec["scales_bytes"] = len(scb)
+        meta["blocks"]["block%d" % blk] = rec
+        if a.check:
+            same = (wp.read_bytes() == i8b) and (sp.read_bytes() == scb)
+            print("block%-3d shipped==recomputed %s" % (blk, same))
+            ok = ok and same
+        else:
+            wp.write_bytes(i8b)
+            sp.write_bytes(scb)
+    if not a.check:
+        (PACKS / "PACK-META.json").write_text(json.dumps(meta, indent=1) + "\n",
+                                              encoding="utf-8")
+    print(json.dumps({b: {"sW_max": v["sW_max"], "amax": v["weight_amax_max"],
+                          "patch_ok": v.get("wo_patch_matches_pack_region"),
+                          "ars_absmax": v["ars_absmax"]}
+                      for b, v in meta["blocks"].items()}, indent=1))
+    print("all_ok", ok, "blocks", len(blocks))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

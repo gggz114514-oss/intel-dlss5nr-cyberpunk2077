@@ -1,0 +1,99 @@
+"""S01 step B (redo with the real oracle): align the CPU FFN model to the GPU debug dump.
+
+dbg layout, straight from c32_body1_i8.comp (`if (debug)` stores, stride is the LCOL
+MemoryStride, so element (row, col) sits at base + col*stride + row):
+    [0      .. 8192)  E post-activation   sg*2048 + col*128 + f      (f = 0..127 channel)
+    [8192   .. 10240) Y contract output   sg*512  + col*32  + c      (c = 0..31)
+    [10240  .. 12288) Q                   [12288..14336) K
+    [14336  .. 18432) P                   [18432..20480) ctx
+    [20480  .. 22528) O (block exit)      [22528..22784) X
+    [24576..24580]    wx, wy, p3.y, p0.w, p3.x  (written by tid==0 of every workgroup)
+Every workgroup writes the *same* offsets, so the buffer holds the last workgroup; the
+wx/wy words say which one.
+"""
+import sys, json
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+HERE = Path(__file__).resolve().parent.parent
+dbg_path = HERE / "runs/S01-B4-ORACLE/swin_4_debug.bin"
+dbg = np.fromfile(dbg_path, dtype="<f2")
+print("dbg halves", dbg.size)
+wx, wy = int(dbg[24576]), int(dbg[24577])
+print("last workgroup wx=%d wy=%d p3y=%s p0w=%s p3x=%s"
+      % (wx, wy, dbg[24578], dbg[24579], dbg[24580]))
+
+info = L.block_bindings(L.D / "c32-minmax/local-b4.txt", ordinal=4)
+TILES_X, TILES_Y = info["tiles_x"], info["tiles_y"]
+shift_x, shift_y = info["shift_x"], info["shift_y"]
+print("tiles", TILES_X, TILES_Y, "shift", shift_x, shift_y)
+we, wc = L.load_w8(info["w8"])
+fsc = L.load_fsc(info["fsc"])
+rs = L.load_rs(info["wb"], info["rs_base"])
+invx = np.full(32, np.float32(fsc[L.FSC_INV_X]))
+inve = np.full(128, np.float32(fsc[L.FSC_INV_E]))
+x_flat = np.fromfile(info["input"], dtype="<f2")
+out_flat = np.fromfile(HERE / "runs/S01-B4-ORACLE/replayed-network.bin", dtype="<f2")
+
+rows = []
+for sg in range(4):
+    tx = 2 * wx + shift_x + (sg & 1)
+    ty = 2 * wy + shift_y + (sg >> 1)
+    oob = tx < 0 or ty < 0 or tx >= TILES_X or ty >= TILES_Y
+    print(f"sg={sg} tile=({tx},{ty}) oob={oob}")
+    if oob:
+        continue
+    tile = ty * TILES_X + tx
+    cols = np.arange(16)
+    # GPU dump blocks
+    E_gpu = np.empty((128, 16), np.float16)
+    for col in range(16):
+        E_gpu[:, col] = dbg[sg * 2048 + col * 128: sg * 2048 + col * 128 + 128]
+    Y_gpu = np.empty((32, 16), np.float16)
+    for col in range(16):
+        Y_gpu[:, col] = dbg[8192 + sg * 512 + col * 32: 8192 + sg * 512 + col * 32 + 32]
+    X_gpu = np.empty((32, 16), np.float16)
+    for col in range(16):
+        X_gpu[:, col] = dbg[22528 + sg * 512 + col * 32: 22528 + sg * 512 + col * 32 + 32]
+    O_dbg = np.empty((32, 16), np.float16)
+    for col in range(16):
+        O_dbg[:, col] = dbg[20480 + sg * 512 + col * 32: 20480 + sg * 512 + col * 32 + 32]
+    # my gather from the same flat addresses
+    TT = np.full(16 * 16, tile)
+    CC = np.repeat(np.arange(16), 16)
+    # column-major per tile: sample (tile, col) pairs
+    TT = np.repeat(np.array([tile]), 16)
+    CC = np.arange(16)
+    X_cpu = L.gather(x_flat, TT, CC)
+    got = L.forward(X_cpu, we, wc, rs, invx, inve,
+                    fsc[L.FSC_TAP_E:L.FSC_TAP_E + 128], fsc[L.FSC_TAP_C:L.FSC_TAP_C + 32])
+    Y_cpu = got["y_half"]
+    E_cpu = got["a_h"]
+    # the real output buffer at the same addresses
+    O_flat = np.empty((32, 16), np.float16)
+    for c in range(32):
+        off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+        O_flat[c] = out_flat[tile * 512 + np.arange(16) * 16 + off]
+    r = dict(
+        sg=sg, tile=int(tile), tx=int(tx), ty=int(ty),
+        X_cpu_vs_dbg=L.rel_l2(X_cpu, X_gpu),
+        X_dbg_vs_buffer_absmax=[float(np.abs(X_gpu.astype(np.float32)).max()),
+                                float(np.abs(O_flat.astype(np.float32)).max())],
+        E_cpu_vs_dbg=L.rel_l2(E_cpu, E_gpu),
+        E_bitexact=float(np.mean(E_cpu == E_gpu)),
+        Y_cpu_vs_dbg=L.rel_l2(Y_cpu, Y_gpu),
+        Y_bitexact=float(np.mean(Y_cpu == Y_gpu)),
+        O_dbg_vs_buffer=L.rel_l2(O_dbg, O_flat),
+        Y_dbg_absmax=float(np.abs(Y_gpu.astype(np.float32)).max()),
+        E_dbg_absmax=float(np.abs(E_gpu.astype(np.float32)).max()),
+        Y_buf_absmax=float(np.abs(O_flat.astype(np.float32)).max()),
+    )
+    rows.append(r)
+    print(json.dumps(r, indent=1))
+
+(HERE / "CPU" / "oracle_alignment.json").write_text(json.dumps(dict(
+    dump=str(dbg_path).replace("\\", "/"), workgroup=[wx, wy], rows=rows), indent=2))
+print("written CPU/oracle_alignment.json")

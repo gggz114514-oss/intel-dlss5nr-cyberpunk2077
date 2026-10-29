@@ -1,0 +1,142 @@
+"""S08 GPU-arm CPU recheck (v2). Run this AFTER the GPU job in JOBS.json.
+
+Usage:
+  python recheck_gpu_arm.py <run-dir> [plan-file]
+
+Expects <run-dir> to contain the three diag outputs:
+  x31.bin  -> vit_block30_out (the INT8 network's own X, fp16, 589824 B live)
+  A31.bin  -> vit_block31_A raw (2359296 B): qA[0..1179648) | qX[1179648..1474560) | qY[1474560..1769472)
+  Y31.bin  -> vit_block31_Y (fp16, 589824 B)
+
+TWO PRE-CONDITIONS (both learned the hard way on the 2026-10-29 arm):
+ 1. the three resources MUST be resident=1 in the plan, otherwise the pool reuses their
+    allocations and the end-of-run dump is another tenant's bytes. This script reports
+    the plan's POLICY residency and marks the comparison untrustworthy if it is not 1.
+ 2. codes are compared as SIGNED int8 (two's complement). Comparing the raw bytes as
+    uint8 reports ~50% mismatch on perfectly good data.
+"""
+from pathlib import Path
+import hashlib
+import json
+import re
+import sys
+
+import numpy as np
+
+R = Path("@NR_WORKSPACE@")
+S = R / "work/dsh-fullnet-static-20261029/S08-vit"
+PACK = S / "PACK/vit_block31_weights.int8.s08.bin"
+M_ROWS, K_X, N_E, N_Y = 288, 1024, 4096, 1024
+WC8 = 4194304
+WS_OFF, EW_OFF, AC_OFF, WG_OFF = 9437184, 9437248, 9453632, 9461824
+NEW_X, NEW_A = 12623936, 12628032
+SCRATCH, QY = 1179648, 1474560
+DUMPED = {343: "block30_out", 395: "vit_block31_A", 396: "vit_block31_Y"}
+
+
+def idx_int8(n, k, N, K):
+    return (n // 32) * (K // 32) * 1024 + (k // 32) * 1024 + (n % 32) * 32 + (k % 32)
+
+
+def half(x):
+    return np.asarray(x, np.float32).astype(np.float16).astype(np.float32)
+
+
+def cubic(z):
+    z = np.float16(z)
+    t = np.clip(z, np.float16(-4.0), np.float16(4.0)).astype(np.float32)
+    u = half(np.float32(-0.055908203125) * np.abs(t) + np.float32(0.447265625))
+    v = half(t * u + np.float32(0.89453125))
+    return half(z.astype(np.float32) * v)
+
+
+def residency(plan: Path):
+    """POLICY <idx> <resident> <first> <last> <clear> -> resident is field index 2."""
+    out = {}
+    for line in plan.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^POLICY\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)", line)
+        if m and int(m.group(1)) in DUMPED:
+            out[int(m.group(1))] = dict(name=DUMPED[int(m.group(1))], resident=int(m.group(2)),
+                                        first=int(m.group(3)), last=int(m.group(4)),
+                                        clear=int(m.group(5)))
+    return out
+
+
+def main(run: Path, plan: Path):
+    pack = PACK.read_bytes()
+    p8 = np.frombuffer(pack, np.int8)
+    ws = np.frombuffer(pack[WS_OFF:WS_OFF + 64], dtype="<f4")
+    ew = np.frombuffer(pack[EW_OFF:EW_OFF + 16384], dtype="<f4")
+    ac = np.frombuffer(pack[AC_OFF:AC_OFF + 4096], dtype="<f4")
+    wg = np.frombuffer(pack[WG_OFF:WG_OFF + 2048], dtype="<f2").astype(np.float32)
+    invx = np.frombuffer(pack[NEW_X:NEW_X + 4096], dtype="<f4")
+    inva = np.frombuffer(pack[NEW_A:NEW_A + 16384], dtype="<f4")
+    cE = p8[idx_int8(np.arange(4096)[:, None], np.arange(1024)[None, :], 4096, 1024)].astype(np.float32)
+    cC = p8[WC8 + idx_int8(np.arange(1024)[:, None], np.arange(4096)[None, :], 1024, 4096)].astype(np.float32)
+
+    X = np.fromfile(run / "x31.bin", dtype="<f2")[:M_ROWS * K_X].reshape(M_ROWS, K_X).astype(np.float32)
+    A = np.fromfile(run / "A31.bin", dtype=np.uint8)
+    Y = np.fromfile(run / "Y31.bin", dtype="<f2")[:M_ROWS * N_Y].reshape(M_ROWS, N_Y)
+
+    qX_ref = np.clip(np.rint(X * invx[None, :]), -127, 127).astype(np.int16)
+    E = half((qX_ref.astype(np.float64) @ cE.astype(np.float64).T).astype(np.float32) * ew[None, :])
+    Ah = cubic(E)
+    qA_ref = np.clip(np.rint(Ah * inva[None, :]), -127, 127).astype(np.int16)
+    lin = (qA_ref.astype(np.float64) @ cC.astype(np.float64).T).astype(np.float32) * ac[None, :]
+    Y_ref = half(wg.astype(np.float64)[None, :] * X + lin.astype(np.float64)).astype(np.float32)
+    qY_ref = np.clip(np.rint(np.float32(ws[12]) * Y_ref), -127, 127).astype(np.int16)
+
+    def seg(buf, start, rows, cols):
+        return buf[start:start + rows * cols].reshape(rows, cols).view(np.int8).astype(np.int16)
+
+    got = dict(qX=seg(A, SCRATCH, M_ROWS, K_X), qA=seg(A, 0, M_ROWS, N_E), qY=seg(A, QY, M_ROWS, K_X))
+    ref = dict(qX=qX_ref, qA=qA_ref, qY=qY_ref)
+    cmp = {}
+    for k in got:
+        d = got[k] != ref[k]
+        pos = np.argwhere(d)
+        cmp[k] = dict(n=int(d.size), n_diff=int(np.count_nonzero(d)),
+                      max_abs_diff=int(np.abs(got[k] - ref[k]).max()),
+                      gpu_code_range=[int(got[k].min()), int(got[k].max())],
+                      ref_code_range=[int(ref[k].min()), int(ref[k].max())],
+                      gpu_has_minus_128=bool((got[k] == -128).any()),
+                      first_diff=(dict(row=int(pos[0][0]), col=int(pos[0][1]),
+                                       gpu=int(got[k][tuple(pos[0])]), expected=int(ref[k][tuple(pos[0])]))
+                                  if pos.size else None),
+                      first5=[dict(row=int(r), col=int(c), gpu=int(got[k][r, c]), expected=int(ref[k][r, c]))
+                              for r, c in pos[:5]])
+    yb = int(np.count_nonzero(Y.view(np.uint16) != Y_ref.astype(np.float16).view(np.uint16)))
+    out = dict(run_dir=str(run), plan=str(plan), plan_sha256=hashlib.sha256(plan.read_bytes()).hexdigest(),
+               pack_sha256=hashlib.sha256(pack).hexdigest(),
+               dump_residency=residency(plan),
+               inputs={f: hashlib.sha256((run / f).read_bytes()).hexdigest()
+                       for f in ("x31.bin", "A31.bin", "Y31.bin") if (run / f).is_file()},
+               compare=cmp,
+               Y=dict(n=int(Y.size), n_diff_bits=yb,
+                      rel_l2=float(np.linalg.norm(Y.astype(np.float64) - Y_ref.astype(np.float64))
+                                   / np.linalg.norm(Y_ref.astype(np.float64))),
+                      gpu_absmax=float(np.abs(Y).max()), ref_absmax=float(np.abs(Y_ref).max())))
+    pre = {v["name"]: v["resident"] for v in out["dump_residency"].values()}
+    out["preconditions"] = dict(
+        dumps_resident=pre, all_resident=bool(pre and all(v == 1 for v in pre.values())),
+        note="resident=0 means the pool may have reused the allocation; the dump is then NOT this "
+             "tensor and no code-level conclusion is allowed (see GPU-ARM-MISMATCH.json)")
+    out["verdict"] = dict(
+        qX_bit_exact=cmp["qX"]["n_diff"] == 0, qA_bit_exact=cmp["qA"]["n_diff"] == 0,
+        qY_bit_exact=cmp["qY"]["n_diff"] == 0, Y_bit_exact=yb == 0,
+        trustworthy=out["preconditions"]["all_resident"])
+    (S / "GPU-ARM-RECHECK.json").write_text(json.dumps(out, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps(dict(verdict=out["verdict"], preconditions=out["preconditions"], Y=out["Y"],
+                          summary={k: {kk: vv for kk, vv in v.items()
+                                       if kk in ("n_diff", "max_abs_diff", "gpu_has_minus_128",
+                                                 "gpu_code_range", "ref_code_range")}
+                                   for k, v in cmp.items()}), indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(__doc__)
+        raise SystemExit(2)
+    plan = Path(sys.argv[2]) if len(sys.argv) > 2 else S / "candidate-34189-diag2.txt"
+    raise SystemExit(main(Path(sys.argv[1]), plan))

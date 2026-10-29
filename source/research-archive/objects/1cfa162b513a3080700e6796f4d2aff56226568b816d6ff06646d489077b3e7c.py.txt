@@ -1,0 +1,159 @@
+"""Single cost table for F01 (read-only ISA + driver statistics).
+
+Emits tools/cost-table.json, the numbers quoted in COST-BREAKDOWN.md.
+"""
+import re, sys, json, collections
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parents[1]
+ISA = Path(sys.argv[1] if len(sys.argv) > 1 else
+           r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+           r'fullnet-continuous-20261027/queue/n09c-f09-b-share/native/captures/'
+           r'native-native-base/ISA/CS_asm5bd64f2b0906027c_simd32_0000000000000001_0_orig.asm')
+STATS = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+             r'c32-boundary-candidates-20261026/f01-direct-a/run/resources-f01-direct-a/pipeline-statistics.json')
+
+INSN = re.compile(r'^/\* \[(?P<addr>[0-9A-F]+)\]\s+\*/\s*(?P<pre>\([^)]*\))?\s*(?P<op>[a-z][a-z0-9.]*)\s*(?P<rest>.*)$')
+LABEL = re.compile(r'^(L\d+):$')
+
+CLASS = [
+    ('send', lambda o: o.startswith('send')),
+    ('dpas', lambda o: o.startswith('dpas')),
+    ('mov', lambda o: o == 'mov'),
+    ('math', lambda o: o.startswith('math')),
+    ('sync', lambda o: o.startswith('sync') or o.startswith('fence') or o.startswith('signal')),
+    ('ctrl', lambda o: o in ('jmpi', 'goto', 'join', 'brc', 'illegal') or o.startswith('send.gtwy')),
+    ('sel', lambda o: o == 'sel'),
+    ('add', lambda o: o in ('add', 'add3', 'addc', 'subb')),
+    ('mul', lambda o: o in ('mul', 'macl', 'mach', 'mad', 'madm')),
+    ('bit', lambda o: o in ('and', 'or', 'xor', 'shl', 'shr', 'asr', 'bfn', 'fbl', 'not', 'bswap')),
+    ('cmp', lambda o: o in ('cmp', 'cmpn')),
+]
+
+
+def cls(op):
+    for n, f in CLASS:
+        if f(op):
+            return n
+    return 'other'
+
+
+def parse(path):
+    ins, labels = [], {}
+    for line in open(path, encoding='utf-8', errors='replace'):
+        s = line.strip()
+        m = LABEL.match(s)
+        if m:
+            labels[m.group(1)] = len(ins)
+            continue
+        m = INSN.match(s)
+        if not m:
+            continue
+        ins.append(dict(addr=m.group('addr'), pre=(m.group('pre') or ''), op=m.group('op'),
+                        rest=m.group('rest').strip(), text=s))
+    for i, r in enumerate(ins):
+        r['i'] = i
+        r['cls'] = cls(r['op'])
+        mm = re.search(r'//\s*wr:\S+,\s*rd:\S+;\s*(.*)$', r['text'])
+        r['msg'] = mm.group(1).strip() if mm else None
+    return ins, labels
+
+
+def msg_bytes(desc):
+    """Payload bytes for one message, from the IGA mnemonic.
+
+    d32            -> 4 B/lane x 32 lanes = 128 B (per-lane address)
+    d<w>x<N>t      -> N x (w/8) B for the whole (transposed) block
+    """
+    if desc is None:
+        return 0, 'none'
+    if 'end of thread' in desc:
+        return 0, 'eot'
+    m = re.search(r'\.d(\d+)(?:x(\d+))?([t])?\.', desc)
+    if not m:
+        return 0, 'unknown'
+    w = int(m.group(1)) // 8
+    n = int(m.group(2) or 1)
+    if m.group(3) == 't':
+        return n * w, 'block'
+    return w * 32 if 'ugm' in desc or 'slm' in desc else w * 32, 'perlane'
+
+
+def main():
+    ins, labels = parse(ISA)
+    spans = []
+    for r in ins:
+        if r['op'] == 'jmpi' and 'f1.0' in r['pre'] and 'W' in r['pre']:
+            m = re.search(r'L(\d+)', r['rest'])
+            if m and 'L' + m.group(1) in labels:
+                t = labels['L' + m.group(1)]
+                if t > r['i']:
+                    spans.append((r['i'] + 1, t - 1))
+    outer = []
+    for s in sorted(spans, key=lambda x: (x[0], -x[1])):
+        if any(o[0] <= s[0] and s[1] <= o[1] for o in outer):
+            continue
+        outer.append(s)
+    cov = set()
+    for a, b in outer:
+        cov.update(range(a, b + 1))
+
+    regions = {'prologue': (0, 205), 'entry_gather_pack': (206, 2066), 'block_body': (2067, len(ins) - 1)}
+
+    def block(idx):
+        hot = [i for i in idx if i not in cov]
+        msgs = collections.Counter(ins[i]['msg'] for i in hot if ins[i]['msg'])
+        by = collections.Counter()
+        for i in hot:
+            if ins[i]['op'] == 'mov':
+                toks = re.findall(r'>:([a-z0-9]+)', ins[i]['rest'])
+                by['%s<-%s' % (toks[0] if toks else '?', toks[-1] if len(toks) > 1 else '?')] += 1
+        return dict(n=len(idx), hot=len(hot), debug=len(idx) - len(hot),
+                    classes=dict(collections.Counter(ins[i]['cls'] for i in hot).most_common()),
+                    ops=dict(collections.Counter(ins[i]['op'] for i in hot).most_common(20)),
+                    messages=dict(msgs.most_common()),
+                    msg_bytes=sum(msg_bytes(k)[0] * v for k, v in msgs.items()),
+                    mov_pairs=dict(by.most_common(10)))
+
+    out = dict(isa=str(ISA), n_parsed=len(ins), n_debug_spans=len(outer),
+               n_debug=len(cov), n_hot=len(ins) - len(cov))
+    st = json.loads(STATS.read_text(encoding='utf-8'))
+    ex = st['pipelines'][0]['executables'][0]
+    out['driver_statistics'] = {x['name']: x['value'] for x in ex['statistics']}
+    out['driver_statistics']['subgroup_size'] = ex['subgroup_size']
+    out['regions'] = {k: block(list(range(a, b + 1))) for k, (a, b) in regions.items()}
+    out['whole'] = block(list(range(len(ins))))
+    # message census over the whole hot path
+    mc = collections.Counter()
+    mb = collections.Counter()
+    for i, r in enumerate(ins):
+        if i in cov or not r['msg']:
+            continue
+        mc[r['msg']] += 1
+        mb[r['msg']] = msg_bytes(r['msg'])[0]
+    out['messages'] = [dict(desc=d, count=c, bytes_each=mb[d], bytes_total=mb[d] * c)
+                       for d, c in mc.most_common()]
+    # scalar gather loads: exec size + immediate offsets
+    scal = [r for i, r in enumerate(ins)
+            if i not in cov and 'load.ugm.d32.a32.bss' in r['text']]
+    es = collections.Counter(re.search(r'send\.ugm\s+\((\d+)\|', r['text']).group(1)
+                             if re.search(r'send\.ugm\s+\((\d+)\|', r['text']) else '?' for r in scal)
+    off = collections.Counter((re.search(r'\[A\+0x([0-9A-F]+)\]', r['text']).group(1)
+                               if re.search(r'\[A\+0x([0-9A-F]+)\]', r['text']) else '0') for r in scal)
+    out['scalar_gather_loads'] = dict(count=len(scal), exec_size=dict(es), offsets=dict(off),
+                                      bytes_each=128)
+    (CARD / 'tools' / 'cost-table.json').write_text(json.dumps(out, indent=1), encoding='utf-8')
+    print(json.dumps({k: out[k] for k in ('n_parsed', 'n_debug', 'n_hot', 'driver_statistics',
+                                          'scalar_gather_loads')}, indent=1))
+    print('regions:')
+    for k, v in out['regions'].items():
+        print(' ', k, 'n', v['n'], 'hot', v['hot'], 'msgs', sum(v['messages'].values()),
+              'msg_bytes', v['msg_bytes'])
+    print('whole hot', out['whole']['hot'], 'msgs', sum(out['whole']['messages'].values()),
+          'bytes', out['whole']['msg_bytes'])
+    print('messages:'); [print('  %4d x %5dB = %7dB  %s' % (m['count'], m['bytes_each'], m['bytes_total'], m['desc']))
+                         for m in out['messages']]
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,118 @@
+"""n13b-f13-contract build + identity tool (CPU only, no GPU, card-local writes).
+
+Steps:
+  parent   : reproduce the contract SPV bytes from the recorded recipe
+  cand     : compile the candidate from the card dir (headers shadowed locally)
+  validate : spv_validate_cpu
+  plan     : rebase the 8 contract PASS lines on the current chain head
+  check    : clock_runner --cpu-check
+  census   : SPIR-V opcode/NoContraction census for both modules
+"""
+import json
+import re
+import shutil
+import sys
+from collections import Counter
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parents[1]
+CAMP = CARD.parents[1]
+sys.path.insert(0, str(CAMP))
+import COMMON as K            # noqa: E402
+import spv_tools_local as ST  # noqa: E402  (COMMON puts it on the path)
+
+CONTRACT = dict(
+    spv=Path('@NR_WORKSPACE@/candidates/codex-fp16-continuation-20261021/'
+             'C/t01-f17-contract-fastpath-v1/vit_nb04_contract_fp16.spv'),
+    source=Path('@NR_WORKSPACE@/candidates/codex-fp16-continuation-20261021/'
+                'C/t01-f17-contract-fastpath-v1/source/vit_nb04_contract_fp16.comp'),
+    pin=Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+             'fullnet-continuous-20261027/cards/idt-identity-recipe/evidence/headers/bc629c9b8e24'),
+    ordinals=[94, 99, 104, 109, 114, 119, 124, 129],
+    spv_sha='bc629c9b8e24651dde19de3cba45520b5c5fa899bb991ceb69dac559675ac23f',
+    source_sha='446f8696cb7e1f94e83236f0ff4fd9382c2c33670041a7591707473992e3647a',
+    plan_indices=[57, 62, 67, 72, 77, 82, 87, 92],
+)
+
+
+def cmd_parent():
+    out = CARD / 'build'
+    out.mkdir(parents=True, exist_ok=True)
+    raw = out / 'parent-raw.spv'
+    K.compile_glsl(CONTRACT['source'], raw, [CONTRACT['pin']])
+    res = dict(source=str(CONTRACT['source']), source_sha256=K.sha(CONTRACT['source']),
+               source_sha_matches=(K.sha(CONTRACT['source']) == CONTRACT['source_sha']),
+               include_dir=str(CONTRACT['pin']),
+               raw_sha256=K.sha(raw), target_sha256=K.sha(CONTRACT['spv']),
+               raw_match=(K.sha(raw) == CONTRACT['spv_sha']))
+    if res['raw_match']:
+        shutil.copyfile(raw, CARD / 'parent-rebuild.spv')
+    print(json.dumps(res, indent=2))
+    return res
+
+
+def cmd_cand():
+    out = CARD / 'build'
+    out.mkdir(parents=True, exist_ok=True)
+    spv = CARD / 'candidate.spv'
+    K.compile_glsl(CARD / 'candidate.comp', spv, [CARD, CONTRACT['pin']])
+    sha = K.sha(spv)
+    print('candidate sha256', sha, 'bytes', spv.stat().st_size)
+    try:
+        K.validate_spv(spv)
+        print('validate: OK')
+    except Exception as e:
+        print('validate: FAIL', e)
+    # swap back to the pinned dir only -> must NOT reproduce (header shadow proof)
+    alt = out / 'noshaodow.spv'
+    K.compile_glsl(CARD / 'candidate.comp', alt, [CONTRACT['pin'], CARD])
+    print('sha with pinned headers first:', K.sha(alt),
+          '(must differ from candidate unless the edit is inert)')
+    return dict(sha256=sha, bytes=spv.stat().st_size)
+
+
+def cmd_plan():
+    base, base_sha, _ = K.current_best()
+    out = CARD / 'plan.txt'
+    shas = {CONTRACT['spv_sha']}
+    n = K.make_plan(CARD / 'candidate.spv', out, parent_plan=base, spv_shas=shas)
+    print('chain head', base, base_sha)
+    print('replaced', n)
+    info = dict(parent_plan=str(base), parent_plan_sha256=base_sha,
+                out_plan=str(out), out_plan_sha256=K.sha(out), replaced=n)
+    print(json.dumps(info, indent=2))
+    return info
+
+
+def cmd_check():
+    txt = K.cpu_check(CARD / 'plan.txt')
+    print(txt)
+    (CARD / 'build').mkdir(exist_ok=True)
+    (CARD / 'build' / 'cpu-check.txt').write_text(txt, encoding='utf-8')
+    return txt
+
+
+def spv_census(path):
+    m = ST.Module(Path(path))
+    ops = Counter()
+    nc = set()
+    body = m.words if hasattr(m, 'words') else None
+    # use the library's own instruction walk if available
+    try:
+        nc = set(ST.no_contraction_ids(m))
+    except Exception:
+        nc = set()
+    try:
+        for ins in m.instructions():
+            ops[ins.opcode] += 1
+    except Exception:
+        # fallback: scan words naively (opcode = word & 0xffff)
+        for w in (body or []):
+            ops[w & 0xFFFF] += 1
+    return dict(instructions=sum(ops.values()), opcodes={str(k): v for k, v in sorted(ops.items())},
+                no_contraction=sorted(nc), nc_count=len(nc))
+
+
+if __name__ == '__main__':
+    cmd = sys.argv[1]
+    globals()['cmd_' + cmd]()

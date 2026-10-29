@@ -1,0 +1,145 @@
+"""Build C32-I8 v1 cold packs (int8 weights + static symmetric scale vectors).
+
+Scheme (inherits the validated INT8 template identity):
+  weight  : per-output-channel absmax/127, RNE, symmetric clamp [-127,127]
+  code    : roundEven(real * inv), inv = 127/absmax; symmetric, no zero point
+  activation: per-tensor static step; provisional single-frame proxy values are
+            marked PROVISIONAL_IMPLEMENTATION_SCALE, never calibration.
+
+Pack layout in the int8 weight file (32768 B):
+  expand   : 16 tiles of 1024 B; tile t=(feature/8) holds A[8 feature][32 K]
+             with byte k*32 + (feature%8)   (column-major, ld=32)
+  contract : 16384 + (out_group*4 + k_chunk)*1024 + k*32 + (out%8)
+Scale file (164 float32):
+  0 sX, 1 invX, 2 sE, 3 invE, 4..131 sX*sWe[n], 132..163 sE*sWc[n].
+"""
+import argparse
+import hashlib
+import json
+import struct
+from pathlib import Path
+
+R = Path("@NR_WORKSPACE@")
+OUT = R / "candidates/int8-coverage-v2-20261020/C/pack"
+OUT.mkdir(parents=True, exist_ok=True)
+
+# name: (fp16 pack, expand base half, contract base half, rs base half)
+POSITIONS = {
+    "b1": (R / "candidates/amd-map-20261015/s1-integrated/candidate/packs/swin_1_weights.fp16.bin", 9344, 5248, 16512),
+    "b2": (R / "candidates/amd-map-20261015/s1-integrated/candidate/packs/swin_2_weights.fp16.bin", 9344, 5248, 16512),
+    "b3": (R / "candidates/amd-map-20261015/s1-integrated/candidate/packs/swin_3_weights.fp16.bin", 9344, 5248, 16512),
+    "b4": (R / "candidates/amd-map-20261015/s1-integrated/candidate/packs/swin_4_weights.fp16.bin", 9344, 5248, 16512),
+    "b66": (R / "candidates/amd-map-20261015/s1-integrated/candidate/packs/swin_66_weights.fp16.bin", 9344, 5248, 16512),
+    "b67": (R / "candidates/amd-map-20261015/s1-integrated/candidate/packs/swin_67_weights.fp16.bin", 9344, 5248, 16512),
+    "b68": (R / "candidates/amd-map-20261015/s1-integrated/candidate/packs/swin_68_weights.fp16.bin", 9344, 5248, 16512),
+    "b69": (R / "candidates/amd-map-20261015/s1-integrated/candidate/packs/swin_69_weights.fp16.bin", 9344, 5248, 16512),
+    "f1": (R / "candidates/amd-map-20261015/s1-integrated/candidate/packs/ioport_0_ioport_pack.fp16.bin", 0, 4096, 17280),
+}
+RS_OFFSET = 8
+# Provisional implementation scales (not calibration): X covers +-4, E covers +-8.
+SX = 4.0 / 127.0
+SE = 8.0 / 127.0
+
+
+def f32(x):
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def rne(x):
+    # Python round() is round-half-even; x is a float32-representable value.
+    return int(round(x))
+
+
+def pack_weights(v, ebase, cbase):
+    """Return (int8 bytes, expand per-channel amax, contract per-channel amax)."""
+    buf = bytearray(32768)
+    amax_e = []
+    amax_c = []
+    for f in range(128):
+        w = [float(v[ebase + (f // 16) * 512 + ((f % 16) // 8) * 128 + (c // 16) * 256 + (f % 8) * 16 + (c % 16)])
+              for c in range(32)]
+        amax_e.append(max(abs(x) for x in w))
+    for o in range(32):
+        w = [float(v[cbase + (o // 16) * 2048 + (e // 16) * 256 + ((o % 16) // 8) * 128 + (o % 8) * 16 + (e % 16)])
+              for e in range(128)]
+        amax_c.append(max(abs(x) for x in w))
+
+    se = [f32(a / 127.0) if a else 1.0 for a in amax_e]
+    sc = [f32(a / 127.0) if a else 1.0 for a in amax_c]
+    for f in range(128):
+        for k in range(32):
+            w = float(v[ebase + (f // 16) * 512 + ((f % 16) // 8) * 128 + (k // 16) * 256 + (f % 8) * 16 + (k % 16)])
+            q = max(-127, min(127, rne(f32(w / se[f]))))
+            buf[(f // 8) * 1024 + k * 32 + (f % 8)] = q & 0xFF
+    for o in range(32):
+        for e in range(128):
+            w = float(v[cbase + (o // 16) * 2048 + (e // 16) * 256 + ((o % 16) // 8) * 128 + (o % 8) * 16 + (e % 16)])
+            q = max(-127, min(127, rne(f32(w / sc[o]))))
+            buf[16384 + ((o // 8) * 4 + e // 32) * 1024 + (e % 32) * 32 + (o % 8)] = q & 0xFF
+    return bytes(buf), amax_e, amax_c, se, sc
+
+
+def scale_bytes(sx, se, se_scale, sc_scale):
+    invx = f32(127.0 / sx)
+    inve = f32(127.0 / se)
+    vals = [f32(sx), invx, f32(se), inve]
+    vals += [f32(f32(sx) * s) for s in se_scale]
+    vals += [f32(f32(se) * s) for s in sc_scale]
+    return struct.pack("<164f", *vals), vals
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--scales-json", help="optional {key: [sx, se]} per-position static steps")
+    ap.add_argument("--out", default=str(OUT))
+    args = ap.parse_args()
+    outdir = Path(args.out); outdir.mkdir(parents=True, exist_ok=True)
+    overrides = json.loads(Path(args.scales_json).read_text(encoding="utf-8")) if args.scales_json else {}
+    report = {"label": "C32_I8_PACKS_V1", "scheme": "static_symmetric_int8_per_output_channel",
+              "scale_status": "SINGLE_FRAME_DIAGNOSTIC_NOT_CALIBRATION" if overrides else "PROVISIONAL_IMPLEMENTATION_SCALE_NOT_CALIBRATION",
+              "scale_overrides": str(args.scales_json) if args.scales_json else None,
+              "positions": {}}
+    for name, (path, ebase, cbase, rsbase) in POSITIONS.items():
+        raw = path.read_bytes()
+        n = len(raw) // 2
+        v = struct.unpack("<%de" % n, raw)
+        ib, amax_e, amax_c, se, sc = pack_weights(v, ebase, cbase)
+        sx_step, se_step = overrides.get(name, [SX, SE])
+        sb, vals = scale_bytes(sx_step, se_step, se, sc)
+        wp = outdir / f"c32_{name}_weights.i8.bin"
+        sp = outdir / f"c32_{name}_scales.f32.bin"
+        wp.write_bytes(ib)
+        sp.write_bytes(sb)
+        # quantisation error per channel (relative to channel amax)
+        rel = []
+        for f in range(128):
+            if amax_e[f] == 0:
+                continue
+            for k in range(32):
+                w = float(v[ebase + (f // 16) * 512 + ((f % 16) // 8) * 128 + (k // 16) * 256 + (f % 8) * 16 + (k % 16)])
+                q = ib[(f // 8) * 1024 + k * 32 + (f % 8)]
+                q = q - 256 if q >= 128 else q
+                rel.append(abs(w - q * se[f]) / amax_e[f])
+        report["positions"][name] = {
+            "source_pack": str(path), "source_pack_sha256": hashlib.sha256(raw).hexdigest(),
+            "source_halves": n,
+            "expand_base_half": ebase, "contract_base_half": cbase, "rs_base_half": rsbase, "rs_offset": RS_OFFSET,
+            "weights": str(wp), "weights_bytes": len(ib), "weights_sha256": hashlib.sha256(ib).hexdigest(),
+            "scales": str(sp), "scales_bytes": len(sb), "scales_sha256": hashlib.sha256(sb).hexdigest(),
+            "sx": vals[0], "invx": vals[1], "se": vals[2], "inve": vals[3],
+            "expand_amax_max": max(amax_e), "contract_amax_max": max(amax_c),
+            "expand_zero_channels": sum(1 for a in amax_e if a == 0.0),
+            "contract_zero_channels": sum(1 for a in amax_c if a == 0.0),
+            "weight_quant_rel_err_max": max(rel) if rel else 0.0,
+            "weight_quant_rel_err_mean": (sum(rel) / len(rel)) if rel else 0.0,
+        }
+    out = R / "candidates/int8-coverage-v2-20261020/C/evidence/C32-I8-PACKS.json"
+    out.write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
+    print(out)
+    for k, vv in report["positions"].items():
+        print(k, vv["weights_sha256"][:12], vv["scales_sha256"][:12],
+              "relmax=%.5f" % vv["weight_quant_rel_err_max"], "amaxE=%.3f amaxC=%.3f" % (vv["expand_amax_max"], vv["contract_amax_max"]))
+
+
+if __name__ == "__main__":
+    main()

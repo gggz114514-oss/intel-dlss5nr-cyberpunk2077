@@ -1,0 +1,80 @@
+"""Reclaim disk space without losing verifiable evidence.
+
+E: was at 0.01 GB free; every card kept ~700 MB of frame binaries and full ISA dumps.
+
+What is kept
+  - port_network_receipt.json for every job (the timing samples)
+  - the ISA of the kernel(s) that differ between the two arms (the actual native evidence)
+  - a hash manifest covering every deleted file, so any deletion is auditable
+What is deleted
+  - frame_0/frame_1/frame_out binaries after their sha256 is recorded (the gold check is
+    already recorded in STAGE-SUMMARY.json; the bytes are reproducible from the plan)
+  - ISA files that are byte-identical between the two arms (their identity is in the manifest)
+
+Usage: python slim_campaign.py [--apply]
+"""
+import hashlib, json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+
+APPLY = '--apply' in sys.argv
+report = dict(apply=APPLY, cards={}, reclaimed_bytes=0)
+
+
+def sha(p):
+    h = hashlib.sha256()
+    with open(p, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+for card_dir in sorted((K.C / 'queue').iterdir()):
+    if not card_dir.is_dir():
+        continue
+    ent = dict(frames_deleted=0, frame_bytes=0, isa_deleted=0, isa_bytes=0, kept_changed_isa=[])
+    # 1) frame binaries
+    for stage_dir in card_dir.glob('*/run'):
+        hashes = {}
+        for f in list(stage_dir.rglob('frame_*.bin')):
+            rel = str(f.relative_to(card_dir))
+            hashes[rel] = dict(sha256=sha(f), bytes=f.stat().st_size)
+            ent['frames_deleted'] += 1
+            ent['frame_bytes'] += f.stat().st_size
+            if APPLY:
+                f.unlink()
+        if hashes:
+            K.write_json(stage_dir.parent / 'FRAME-HASHES.json', hashes)
+    # 2) ISA dumps
+    for cap_root in list(card_dir.glob('captures')) + list(card_dir.glob('*/captures')):
+        arms = [d for d in cap_root.iterdir() if d.is_dir() and (d / 'ISA').exists()] if cap_root.exists() else []
+        if len(arms) < 2:
+            continue
+        maps = {}
+        for a in arms:
+            maps[a.name] = {p.name: sha(p) for p in (a / 'ISA').glob('*.asm')}
+        common = set.intersection(*[set(m) for m in maps.values()])
+        changed = set.union(*[set(m) for m in maps.values()]) - common
+        manifest = dict(captures=str(cap_root), arms={k: dict(files=len(v)) for k, v in maps.items()},
+                        identical_files=sorted(common), changed_files=sorted(changed),
+                        hashes=maps)
+        K.write_json(cap_root / 'CAPTURE-MANIFEST.json', manifest)
+        for a in arms:
+            for p in (a / 'ISA').glob('*.asm'):
+                if p.name in common:
+                    ent['isa_deleted'] += 1
+                    ent['isa_bytes'] += p.stat().st_size
+                    if APPLY:
+                        p.unlink()
+                else:
+                    ent['kept_changed_isa'].append(str(p.relative_to(card_dir)))
+    report['cards'][card_dir.name] = ent
+    report['reclaimed_bytes'] += ent['frame_bytes'] + ent['isa_bytes']
+
+K.write_json(K.C / 'evidence' / 'SLIM-REPORT.json', report)
+print('reclaim %.1f MB (frames %.1f MB, identical ISA %.1f MB), apply=%s' % (
+    report['reclaimed_bytes'] / 1e6,
+    sum(c['frame_bytes'] for c in report['cards'].values()) / 1e6,
+    sum(c['isa_bytes'] for c in report['cards'].values()) / 1e6, APPLY))
+print('changed-ISA files kept:', sum(len(c['kept_changed_isa']) for c in report['cards'].values()))

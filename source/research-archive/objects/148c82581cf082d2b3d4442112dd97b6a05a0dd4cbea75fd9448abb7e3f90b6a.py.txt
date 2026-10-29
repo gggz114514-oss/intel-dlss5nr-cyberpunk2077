@@ -1,0 +1,150 @@
+"""Task 3b/4: CPU reference of the block65 D4 (WO output projection) pass.
+
+Tests, on a COMMON FP16 input (teacher Y and T dumps):
+  A) FP16 D4 layout/model validation:  t65 ?= WO_fp16(T_t) + ars*Y_t
+  B) INT8 D4 (r07 pack, per-window dynamic amax):  D4_int8(T_t, Y_t) ?= t65
+  C) WO pack tap audit: is r07 i8 + wosc a faithful quantisation of the FP16 WO?
+
+WO fp16 layout (PACK-META): pack[wo + (n//16)*1024 + (k//16)*256 + (n%16)*16 + (k%16)]
+WO i8   layout (PACK-META): i8[(n//16)*1024 + (k//32)*512 + (n%16)*32 + (k%32)]
+"""
+import json
+import numpy as np
+from pathlib import Path
+
+B = Path("@NR_WORKSPACE@")
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+TEACH = Q / "real-int8-24/dump-fp16"
+PACK = B / "candidates/amd-map-20261015/round4-integrated/candidate/packs/swin_65_weights.fp16.bin"
+R07 = B / "work/dsh-xmx-handoff-validation-20261024/candidates/r07-output-proj/packs"
+WO_I8 = R07 / "r07_c64_b65_wo.i8.bin"
+WO_SC = R07 / "r07_c64_b65_wosc.f32.bin"
+
+TILES_X, TILES_Y = 84, 48
+GRID_X, GRID_Y = 42, 25
+SHIFT_X, SHIFT_Y = 0, -1
+WO_HALF, ARS_HALF, RS_HALF = 0, 12288, 53384
+
+
+def f16(a):
+    return np.asarray(a, dtype=np.float16)
+
+
+def wo_fp16(pk):
+    n = np.arange(64)[:, None]; k = np.arange(64)[None, :]
+    return pk[WO_HALF + (n // 16) * 1024 + (k // 16) * 256 + (n % 16) * 16 + (k % 16)]
+
+
+def wo_i8(w8):
+    n = np.arange(64)[:, None]; k = np.arange(64)[None, :]
+    return w8[(n // 16) * 1024 + (k // 32) * 512 + (n % 16) * 32 + (k % 32)].astype(np.int32)
+
+
+def win_map():
+    """(w,m) -> canonical element index tile*1024 + g*256 + slot*16 + k, per channel."""
+    out = []
+    for wy in range(GRID_Y):
+        for wx in range(GRID_X):
+            for m in range(64):
+                q, sl = m >> 4, m & 15
+                tx = 2 * wx + SHIFT_X + (q & 1)
+                ty = 2 * wy + SHIFT_Y + (q >> 1)
+                if 0 <= tx < TILES_X and 0 <= ty < TILES_Y:
+                    out.append((wy * GRID_X + wx, m, (ty * TILES_X + tx) * 1024 + sl * 16))
+                else:
+                    out.append((wy * GRID_X + wx, m, -1))
+    return out
+
+
+def gather(a, mp):
+    """a: canonical flat fp16 (4032*1024,). -> [nmap,64] window-major ordered"""
+    idx = np.array([t for _, _, t in mp])
+    ok = idx >= 0
+    n = np.arange(64)[None, :]
+    base = idx[ok][:, None] + (n // 16) * 256 + (n % 16)
+    return base, ok
+
+
+def main():
+    pk = np.fromfile(PACK, dtype="<f2").astype(np.float32)
+    w8 = np.fromfile(WO_I8, dtype="i1")
+    wsc = np.fromfile(WO_SC, dtype="<f4")
+    Wf = wo_fp16(pk).astype(np.float32)          # [n,k]
+    Wi = wo_i8(w8)                               # [n,k] int32
+    res = {}
+
+    # ---- C) WO tap audit ---------------------------------------------------
+    amax_row = np.abs(Wf).max(1)
+    sW_expect = np.maximum(amax_row / 127.0, 1e-12)
+    res["wo_pack_audit"] = {
+        "wosc_vs_amax_over_127_maxrel": float(np.max(np.abs(wsc - sW_expect) / np.maximum(sW_expect, 1e-30))),
+        "recon_relL2": float(np.linalg.norm(Wi.astype(np.float32) * wsc[:, None] - Wf) / np.linalg.norm(Wf)),
+        "w8_absmax": int(np.abs(Wi).max()), "w8_sat_frac": float(np.mean(np.abs(Wi) == 127)),
+        "w_fp16_absmax": float(np.abs(Wf).max()),
+        "wosc_min_max": [float(wsc.min()), float(wsc.max())],
+    }
+
+    Yt = np.fromfile(TEACH / "dump_swin_65_Y.bin", dtype="<f2").astype(np.float32).reshape(-1, 64)
+    Tt = np.fromfile(TEACH / "dump_swin_65_T.bin", dtype="<f2").astype(np.float32).reshape(-1, 64)
+    t65 = np.fromfile(TEACH / "dump_block65_out.bin", dtype="<f2").astype(np.float32)
+    assert Yt.shape[0] == GRID_X * GRID_Y * 64, Yt.shape
+    ars = pk[ARS_HALF:ARS_HALF + 64]
+
+    mp = win_map()
+    base, ok = gather(t65, mp)
+    # reference values at the canonical positions, ordered by valid (w,m)
+    ref = t65[base]                                # [Nv,64]
+    Yv = Yt[np.array([(w * 64 + m) for w, m, t in mp if t >= 0])]
+    Tv = Tt[np.array([(w * 64 + m) for w, m, t in mp if t >= 0])]
+    res["n_valid"] = int(Yv.shape[0])
+
+    # ---- A) FP16 D4 --------------------------------------------------------
+    A = f16(Tv @ Wf.T)                             # attention projection
+    seedA = f16(Yv * f16(ars)[None, :])
+    outA = f16(A.astype(np.float32) + seedA.astype(np.float32))
+    res["fp16_d4"] = {
+        "relL2": float(np.linalg.norm(outA.astype(np.float64) - ref.astype(np.float64)) / np.linalg.norm(ref.astype(np.float64))),
+        "corr": float(np.corrcoef(outA.ravel(), ref.ravel())[0, 1]),
+        "ratio": float(np.sqrt((outA.astype(np.float64) ** 2).mean() / (ref.astype(np.float64) ** 2).mean())),
+    }
+
+    # ---- B) INT8 D4 --------------------------------------------------------
+    T2 = Tt.reshape(GRID_Y, GRID_X, 64, 64)
+    Y2 = Yt.reshape(GRID_Y, GRID_X, 64, 64)
+    outB = np.empty_like(T2)
+    amax = np.abs(T2).reshape(GRID_Y, GRID_X, -1).max(2)
+    invC = np.where(amax > 0, 127.0 / np.maximum(amax, 1e-30), 0.0).astype(np.float32)
+    sC = np.where(amax > 0, amax / 127.0, 0.0).astype(np.float32)
+    for wy in range(GRID_Y):
+        for wx in range(GRID_X):
+            codes = np.clip(np.rint(T2[wy, wx].astype(np.float32) * invC[wy, wx]), -127, 127).astype(np.int32)
+            acc = codes @ Wi.T
+            prod = acc.astype(np.float32) * (wsc[None, :] * sC[wy, wx])
+            seed = f16(Y2[wy, wx] * f16(ars)[None, :]).astype(np.float32)
+            outB[wy, wx] = f16(prod + seed)
+    outB = outB.reshape(-1, 64)
+    keep = np.array([(w * 64 + m) for w, m, t in mp if t >= 0])
+    outB = outB[keep]
+    res["int8_d4"] = {
+        "relL2": float(np.linalg.norm(outB.astype(np.float64) - ref.astype(np.float64)) / np.linalg.norm(ref.astype(np.float64))),
+        "corr": float(np.corrcoef(outB.ravel(), ref.ravel())[0, 1]),
+        "ratio": float(np.sqrt((outB.astype(np.float64) ** 2).mean() / (ref.astype(np.float64) ** 2).mean())),
+        "slope": float((outB.astype(np.float64) * ref.astype(np.float64)).sum() / (ref.astype(np.float64) ** 2).sum()),
+    }
+    ch = np.sqrt((outB.astype(np.float64) ** 2).mean(0)) / np.sqrt((ref.astype(np.float64) ** 2).mean(0))
+    res["int8_d4"]["ch_ratio_min"] = float(ch.min())
+    res["int8_d4"]["ch_ratio_max"] = float(ch.max())
+    # ---- how much of the output is the residual seed vs the WO term? -------
+    seedall = f16(Yv * f16(ars)[None, :]).astype(np.float64)
+    res["energy"] = {
+        "rms_ref_t65": float(np.sqrt((ref.astype(np.float64) ** 2).mean())),
+        "rms_seed": float(np.sqrt((seedall ** 2).mean())),
+        "rms_wo_fp16": float(np.sqrt((A.astype(np.float64) ** 2).mean())),
+        "rms_Y": float(np.sqrt((Yv.astype(np.float64) ** 2).mean())),
+        "rms_T": float(np.sqrt((Tv.astype(np.float64) ** 2).mean())),
+    }
+    print(json.dumps(res, indent=1))
+
+
+if __name__ == "__main__":
+    main()

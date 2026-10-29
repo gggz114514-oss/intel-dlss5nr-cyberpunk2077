@@ -1,0 +1,173 @@
+"""n02c-f02-fb-bias build/identity stage.  CPU only, no GPU, no deployment.
+
+The card's mechanism (SLM 8x64 transpose cache for the fb bias gathers) was
+priced and rejected; this script therefore stops at the identity stage:
+
+  [1] reproduce the parent SPV bytes from the parent source + recorded recipe
+  [2] opcode / shape census of the reproduced parent (for the cost ledger)
+  [3] verify the 7 F02 PASS rows of the CURRENT CHAIN HEAD still point at that
+      parent SPV (the card must price the chain head's bytes, not the handoff's)
+  [4] write BUILD.json with status BLOCKED
+
+Never writes outside cards/n02c-f02-fb-bias/.
+"""
+import sys, json, hashlib, collections
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+CARD = Path(__file__).parent
+C = CARD.parent.parent
+sys.path.insert(0, str(C))
+sys.path.insert(0, str(CARD))
+import COMMON as K
+
+PARENT_SHA = '4c034a532ce60f5fa608d1ce67f6368819c052c3d5268eb51f7f680ea83aaf10'
+PARENT_SRC = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                  'c32-rest-20261026/body-pv-den-overlap/candidate.comp')
+PARENT_SPV = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                  'c32-rest-20261026/body-pv-den-overlap/candidate.spv')
+ORDINALS = [1, 2, 3, 4, 227, 228, 229]
+REC = K.read_json(C / 'evidence' / 'RECIPES.json')[PARENT_SHA]
+PINNED = Path(REC['compile']['pinned_include_dir'])
+ORIGIN = Path(REC['compile']['include_dirs'][0])
+DECO_PARENT = Path(REC['decoration_parent'])
+BUILD = CARD / 'BUILD.json'
+
+FLOAT_ARITH = {129: 'OpFAdd', 131: 'OpFSub', 133: 'OpFMul', 136: 'OpFDiv', 12: 'OpExtInstFma'}
+INT_CTRL = {128: 'OpIAdd', 130: 'OpISub', 132: 'OpIMul', 134: 'OpUDiv', 135: 'OpSDiv',
+            137: 'OpUMod', 138: 'OpSRem', 139: 'OpSMod'}
+NAMED = {4457: 'OpCooperativeMatrixLoadKHR', 4458: 'OpCooperativeMatrixStoreKHR',
+         4459: 'OpCooperativeMatrixMulAddKHR', 224: 'OpControlBarrier',
+         61: 'OpLoad', 62: 'OpStore', 59: 'OpVariable', 65: 'OpAccessChain'}
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def fp_census(m):
+    c = collections.Counter()
+    for op, ops, _, _ in m.instructions:
+        if op in (129, 131, 133, 136):
+            c[FLOAT_ARITH[op]] += 1
+        elif op == 12 and len(ops) >= 5 and ops[3] == 50:
+            c['Fma'] += 1
+        elif op == 115:
+            c['OpFConvert'] += 1
+    return dict(c)
+
+
+def named_census(m):
+    c = collections.Counter(op for op, _, _, _ in m.instructions)
+    return {NAMED[k]: c.get(k, 0) for k in NAMED}
+
+
+def main():
+    build = {'card': 'n02c-f02-fb-bias', 'family': 'F02',
+             'gpu': 'NONE (CPU only; no Vulkan device task, no lock, no deploy)',
+             'deliverable_stage': 'BLOCKED-priced (no candidate, no plan, no GPU request)'}
+    head_plan, head_sha, _chain = K.current_best()
+    build['chain_head'] = {'plan': str(head_plan), 'sha256': head_sha,
+                           'sha_ok': sha(head_plan) == head_sha}
+    build['handoff_baseline_plan_sha256'] = K.BASELINE_SHA
+
+    # ---- [1] parent byte reproduction ------------------------------------
+    raw = CARD / 'parent-raw.spv'
+    K.compile_glsl(PARENT_SRC, raw, [PINNED, ORIGIN, PARENT_SRC.parent])
+    rec = {'source': str(PARENT_SRC), 'source_sha256': sha(PARENT_SRC),
+           'target': str(PARENT_SPV), 'target_sha256': sha(PARENT_SPV),
+           'pinned_include_dir': str(PINNED),
+           'header_pin_sha256': sha(PINNED / 'register_handoff.glsl'),
+           'raw_sha256': sha(raw), 'raw_match': sha(raw) == PARENT_SHA}
+    print('[1] raw compile %s raw_match=%s' % (rec['raw_sha256'][:12], rec['raw_match']))
+    if rec['raw_match']:
+        rec['recipe'] = 'raw'
+        rebuild = raw
+    else:
+        import nc_transfer
+        keep, info = nc_transfer.transfer(DECO_PARENT, raw, CARD / 'parent-rebuild.spv')
+        rebuild = CARD / 'parent-rebuild.spv'
+        rec['recipe'] = 'no-contraction-transfer'
+        rec['nc_from'] = str(DECO_PARENT)
+        rec['nc_from_sha256'] = sha(DECO_PARENT)
+        rec['nc_count'] = len(keep)
+        rec['nc_parent'] = len(K.ST.no_contraction_ids(K.ST.Module(DECO_PARENT)))
+        rec['nc_info'] = {k: info[k] for k in ('method', 'nc_count', 'parent_nc')}
+        rec['rebuild_sha256'] = sha(rebuild)
+    rec['byte_match'] = sha(rebuild) == PARENT_SHA
+    build['parent'] = rec
+    build['parent_spv'] = {'path': str(PARENT_SPV), 'sha256': sha(PARENT_SPV)}
+    build['parent_source'] = {'path': str(PARENT_SRC), 'sha256': sha(PARENT_SRC)}
+    build['parent_rebuild'] = {'path': str(rebuild), 'sha256': sha(rebuild)}
+    print('[1] parent rebuild sha=%s byte_match=%s' % (sha(rebuild)[:12], rec['byte_match']))
+
+    # ---- [2] census of the reproduced parent -----------------------------
+    pm = K.ST.Module(rebuild)
+    build['parent_census'] = {
+        'module_instructions': len(pm.instructions),
+        'named': named_census(pm),
+        'fp': fp_census(pm),
+        'int_ctrl': dict(collections.Counter(INT_CTRL[op] for op, _, _, _ in pm.instructions
+                                             if op in INT_CTRL)),
+        'nc_sites': len(K.ST.no_contraction_ids(pm)),
+        'spv_bytes': Path(rebuild).stat().st_size}
+
+    # float NoContraction bookkeeping.  CONTRACT section 2 asks for this on every
+    # card; this card built no candidate, so there is no parent<->candidate
+    # alignment to check.  The parent side is recorded so a follow-up card can
+    # reuse it as the reference sequence.
+    fpc = build['parent_census']['fp']
+    parent_float_sites = sum(v for k, v in fpc.items()
+                             if k in ('OpFAdd', 'OpFSub', 'OpFMul', 'OpFDiv', 'Fma'))
+    build['float_NC_alignment'] = {
+        'method': 'not applicable: BLOCKED, no candidate SPV was built',
+        'float_NC_checked': 0,
+        'candidate_float_sites': None,
+        'parent_float_sites': parent_float_sites,
+        'parent_NC_sites': build['parent_census']['nc_sites'],
+        'note': 'the parent carries 185 NoContraction sites; this card only '
+                'reproduced the parent bytes, it did not move any rounding point'}
+
+    # ---- [3] chain head rows for this shader group -----------------------
+    recs = K.pass_lines_of(head_plan)
+    rows = []
+    for o in ORDINALS:
+        r = recs[o]
+        rows.append({'ordinal': o, 'name': r['name'], 'spv': r['spv'],
+                     'spv_sha256': sha(r['spv']) if Path(r['spv']).exists() else None})
+    build['chain_head_rows'] = {
+        'pass_rows': rows,
+        'distinct_spv_sha256': sorted({r['spv_sha256'] for r in rows if r['spv_sha256']}),
+        'all_equal_parent': all(r['spv_sha256'] == PARENT_SHA for r in rows),
+    }
+    print('[3] chain-head rows -> %s (all parent: %s)'
+          % (build['chain_head_rows']['distinct_spv_sha256'],
+             build['chain_head_rows']['all_equal_parent']))
+
+    build['status'] = 'BLOCKED'
+    build['candidate'] = None
+    build['audit_note'] = (
+        'BLOCKED card: candidate.comp / candidate.spv / plan.txt deliberately do not '
+        'exist, so audit_card.py reports them missing and will also read the parent '
+        'ident as a candidate ident (the parent file is literally named candidate.spv). '
+        'candidate_identity_ok=false in AUDIT-main.json is therefore expected here; '
+        'the meaningful lines are parent_is_baseline_row_spv=true and '
+        'parent_rebuilt_equals_parent=true. float_NC_checked=0 because no candidate SPV '
+        'exists to align (the parent itself carries 185 NC sites).')
+    build['status_reason'] = ('SLM transpose cache for the 64 fb-bias gathers prices at net <= 0 '
+                              'messages and needs 16 KiB of SLM (f32) plus a second workgroup '
+                              'barrier in the score->softmax critical path; see ANALYSIS.md / '
+                              'COST-LEDGER.json. No candidate was built, so there is no '
+                              'candidate.spv / plan.txt / GPU-REQUEST arm.')
+    build['isa_evidence'] = {
+        'isa_message_census': str(CARD / 'isa-message-census.json'),
+        'bias_clusters': str(CARD / 'bias-clusters.json'),
+        'capture': 'queue/n10-f10-next/native/captures/native-native-base/ISA',
+        'native_hash': '7a38a17947f21ae6',
+        'generator': [str(CARD / 'make_census.py'), str(CARD / 'find_kernel.py')]}
+    K.write_json(BUILD, build)
+    print('[4] BUILD.json written; status', build['status'])
+
+
+if __name__ == '__main__':
+    main()

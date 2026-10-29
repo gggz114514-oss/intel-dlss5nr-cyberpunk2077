@@ -1,0 +1,250 @@
+"""n39-f06-c256-slack: static address audit for the "delete the staging copy" candidate.
+
+n36's E-class failure was a plane literal that stayed behind when a stride moved; n37's
+equivalent was a plane base that did not move with the arena.  The failure shape for THIS card is
+the same family and even easier to get wrong: the DPAS A operand changed *source object*, so the
+tile base `w*16384` has to appear in the new address.  If it is missing (or the offset keeps the
+old SLM-relative form), the shader silently reads tile 0 for every workgroup -- Workgroup bytes,
+spv_validate, parent byte reproduction, coopmat/NC multisets and plan cpu-check all stay green
+and only the gold frame goes red.
+
+Checks (source level + compiled modules), driven by a per-case spec:
+  A1  family completeness: the parent declares exactly one `shared float16_t <array>[16384]`, has
+      exactly one staging copy and the expected number of A-load sites; the candidate has the
+      expected declaration (none for the deletion), zero copies, the same number of A-load sites
+      and the A operand points at the global tile
+  A2  tile base: every candidate A-load / echo offset carries the `w * 16384u` tile base exactly
+      once, and residual offset + fragment footprint < 16384 (stays inside its own tile)
+  A3  max index equality: the candidate's maximum gT half index equals the parent's maximum
+      (the copy loop's last element = 16383), i.e. the deletion reads nothing new
+  A4  removal completeness: module Workgroup bytes == 2 * declared halves on both sides; for the
+      deletion the candidate module declares no Workgroup object at all
+  A5  debug echo equivalence (parents that have one): same destination, value read from the same
+      bytes of the same tile
+  A6  no residual shared-memory access when the array is deleted, so no barrier is required
+  A7  module/source agreement: module Workgroup bytes == 2 * halves declared in the source
+
+Exit 0 only when A1..A7 hold for every audited source.  Writes build/addr-audit.json.
+`_audit_negcontrol.py` proves the gate fails on five doctored variants.
+"""
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST           # noqa: E402
+
+TILE = 16384
+STRIDE = 256
+FRAG_MAX = (8 - 1) * STRIDE + (16 - 1)      # footprint of one 8x16 LROW fragment = 1807
+SHARED = re.compile(r'shared\s+float16_t\s+(\w+)\[(\d+)\]')
+BARRIER = re.compile(r'\bbarrier\s*\(\s*\)')
+A_LOAD = re.compile(r'coopMatLoad\(a,\s*(\w+),\s*(.+?),\s*256u,\s*LROW\)')
+ECHO = re.compile(r'dbg\[425984u \+ e\] = (\w+)\[([^\]]*)\]')
+
+SPECS = {
+    'f06': dict(label='f06-c256', parent='parent.comp', candidate='candidate.comp',
+                parent_spv='parent-rebuild.spv', candidate_spv='candidate.spv',
+                parent_decl=('shT', TILE), candidate_decl=None, parent_copy=1,
+                n_a_loads=1, parent_a_src='shT', candidate_a_src='gT', echo=True),
+    'f18': dict(label='f18-c256', parent='parent-f18.comp', candidate='candidate-f18.comp',
+                parent_spv='parent-f18-rebuild.spv', candidate_spv='candidate-f18.spv',
+                parent_decl=('shM', TILE), candidate_decl=None, parent_copy=1,
+                n_a_loads=2, parent_a_src='shM', candidate_a_src='gM', echo=False),
+    # the pad-back CONTROL inverts the direction: the candidate re-adds the declaration only
+    'padback': dict(label='padback-control', parent='candidate.comp',
+                    candidate='candidate-padback.comp',
+                    parent_spv='candidate.spv', candidate_spv='candidate-padback.spv',
+                    parent_decl=None, candidate_decl=('shPad', TILE), parent_copy=0,
+                    n_a_loads=1, parent_a_src='gT', candidate_a_src='gT', echo=True),
+}
+
+
+def sha(p):
+    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+
+
+def residual_max(expr):
+    """Symbolic maximum of a tile-local offset expression (halves), before the fragment footprint.
+
+    Handles exactly the shapes these kernels use: `m0 * 256u + k0`, `abaseA + k0`, `abaseB + k0`,
+    `e`, plain literals, and `X * 256` with X <= 56 rows.
+    """
+    s = expr.replace('u', '').replace(' ', '')
+    total = 0
+    for term in re.split(r'\+', s):
+        if not term:
+            continue
+        if re.fullmatch(r'\d+', term):
+            total += int(term)
+        elif re.fullmatch(r'\w+\*256', term):
+            total += 56 * STRIDE
+        elif re.fullmatch(r'a\w+|m\w+', term):
+            total += 56 * STRIDE
+        elif term == 'k0':
+            total += 240
+        elif term == 'e':
+            total += TILE - 1
+        else:
+            raise AssertionError('unmodelled offset term %r in %r' % (term, expr))
+    return total
+
+
+def audit(label, parent, candidate, parent_spv, candidate_spv, parent_decl, candidate_decl,
+          parent_copy, n_a_loads, parent_a_src, candidate_a_src, echo):
+    pt = (CARD / parent).read_text(encoding='utf-8')
+    ct = (CARD / candidate).read_text(encoding='utf-8')
+    pspv, cspv = CARD / parent_spv, CARD / candidate_spv
+    cbody = ct[ct.index('#version 450'):]
+    bad, rows = [], []
+
+    def fail(rule, why):
+        bad.append(dict(rule=rule, why=why))
+
+    # ---- A1 family completeness -------------------------------------------------
+    p_shared = SHARED.findall(pt)
+    c_shared = SHARED.findall(ct)
+    p_a, c_a = A_LOAD.findall(pt), A_LOAD.findall(ct)
+    p_copy = len(re.findall(r'%s\[e\] = \w+\[w \* 16384u \+ e\]' % (parent_decl[0] if parent_decl else r'\bNEVER\b'), pt))
+    c_copy = len(re.findall(r'%s\[e\] = \w+\[w \* 16384u \+ e\]' % (candidate_decl[0] if candidate_decl else r'\bNEVER\b'), ct))
+
+    def want_decl(have, decl, who):
+        if decl is None:
+            if have:
+                fail('A1', '%s declares %s but the spec says none' % (who, have))
+        elif len(have) != 1 or have[0][0] != decl[0] or int(have[0][1]) != decl[1]:
+            fail('A1', '%s shared declaration %s != %s[%d]' % (who, have, decl[0], decl[1]))
+
+    want_decl(p_shared, parent_decl, 'parent')
+    want_decl(c_shared, candidate_decl, 'candidate')
+    if p_copy != parent_copy:
+        fail('A1', 'parent has %d staging copies, expected %d' % (p_copy, parent_copy))
+    if c_copy != 0:
+        fail('A1', 'candidate has %d staging copies, expected 0' % c_copy)
+    if len(p_a) != n_a_loads or any(x[0] != parent_a_src for x in p_a):
+        fail('A1', 'parent A-loads %s != %d x coopMatLoad(a, %s, ...)'
+             % (p_a, n_a_loads, parent_a_src))
+    if len(c_a) != n_a_loads or any(x[0] != candidate_a_src for x in c_a):
+        fail('A1', 'candidate A-loads %s != %d x coopMatLoad(a, %s, ...)'
+             % (c_a, n_a_loads, candidate_a_src))
+    # a deleted array must be gone from the candidate code; one the control re-adds must be there
+    if candidate_decl is None and parent_decl and parent_decl[0] in cbody:
+        fail('A1', 'deleted array name `%s` still appears in the candidate code' % parent_decl[0])
+    if candidate_decl is not None and candidate_decl[0] not in cbody:
+        fail('A1', 'pad-back array `%s` is missing from the candidate code' % candidate_decl[0])
+
+    # ---- A2 tile base / A3 max index -------------------------------------------
+    parents_max = TILE - 1                     # the staging copy reads gT up to e = 16383
+    acc_max = -1
+    for name, off in c_a:
+        base_hits = len(re.findall(r'w \* 16384u', off))
+        if base_hits != 1:
+            fail('A2', 'A-load offset `%s` carries the tile base %d times, expected 1'
+                 % (off, base_hits))
+        residual = off.replace('w * 16384u +', '').strip()
+        v = residual_max(residual) + FRAG_MAX
+        rows.append(dict(site='A fragment load (%s)' % name, offset=off, residual=residual,
+                         index_max=v, footprint=FRAG_MAX, base_hits=base_hits))
+        acc_max = max(acc_max, v)
+        if v >= TILE:
+            fail('A2', 'A-load index max %d >= tile size %d (would read another tile)' % (v, TILE))
+    if echo:
+        pe, ce = ECHO.findall(pt), ECHO.findall(ct)
+        if len(pe) != 1 or len(ce) != 1:
+            fail('A5', 'echo sites parent %d candidate %d, expected 1/1' % (len(pe), len(ce)))
+        else:
+            if not pe[0][1].strip().endswith('e'):
+                fail('A5', 'parent echo does not read element `e`')
+            name, off = ce[0][0], ce[0][1].strip()
+            if name != candidate_a_src:
+                fail('A5', 'candidate echo reads `%s`, expected `%s`' % (name, candidate_a_src))
+            if len(re.findall(r'w \* 16384u', off)) != 1:
+                fail('A2', 'echo offset `%s` lacks the tile base' % off)
+            residual = off.replace('w * 16384u +', '').strip()
+            v = residual_max(residual)
+            rows.append(dict(site='debug echo', offset=off, residual=residual, index_max=v,
+                             footprint=0, base_hits=1))
+            acc_max = max(acc_max, v)
+    if acc_max != parents_max:
+        fail('A3', 'candidate max gT index %d != parent max %d' % (acc_max, parents_max))
+
+    # ---- A4 removal completeness ------------------------------------------------
+    pm, cm = ST.Module(pspv), ST.Module(cspv)
+    pw = (pm.storage_bytes().get('Workgroup') or {})
+    cw = (cm.storage_bytes().get('Workgroup') or {})
+    want_p = 0 if parent_decl is None else 2 * parent_decl[1]
+    want_c = 0 if candidate_decl is None else 2 * candidate_decl[1]
+    if (pw.get('bytes') or 0) != want_p:
+        fail('A4', 'parent module Workgroup %s B != %d B from its source'
+             % (pw.get('bytes'), want_p))
+    if (cw.get('bytes') or 0) != want_c:
+        fail('A4', 'candidate module Workgroup %s B != %d B from its source'
+             % (cw.get('bytes'), want_c))
+    if candidate_decl is None and (cw.get('count') or 0) != 0:
+        fail('A4', 'candidate module still declares %s Workgroup vars' % cw.get('count'))
+
+    # ---- A6 no residual shared access / barrier ---------------------------------
+    n_shared_body = len(re.findall(r'^\s*shared\s+float16_t\s', cbody, re.M))
+    want_body = 0 if candidate_decl is None else 1
+    if n_shared_body != want_body:
+        fail('A6', 'candidate body has %d shared declarations, expected %d'
+             % (n_shared_body, want_body))
+    if candidate_decl is None:
+        if BARRIER.search(cbody):
+            fail('A6', 'candidate still calls barrier() with no shared memory to publish')
+        if sum(1 for o, _, _, _ in cm.instructions if o == 224):
+            fail('A6', 'candidate module still has OpControlBarrier')
+
+    # ---- A7 module/source agreement ---------------------------------------------
+    if (cw.get('bytes') or 0) != 2 * sum(int(n) for _, n in c_shared):
+        fail('A7', 'candidate module Workgroup %s B != source %d B'
+             % (cw.get('bytes'), 2 * sum(int(n) for _, n in c_shared)))
+
+    return dict(label=label, spec=dict(parent_decl=parent_decl, candidate_decl=candidate_decl,
+                                       parent_copy=parent_copy, n_a_loads=n_a_loads,
+                                       parent_a_src=parent_a_src, candidate_a_src=candidate_a_src,
+                                       echo=echo),
+                parent_source=dict(path=parent, sha256=sha(CARD / parent)),
+                candidate_source=dict(path=candidate, sha256=sha(CARD / candidate)),
+                parent_spv=dict(path=parent_spv, sha256=sha(pspv)),
+                candidate_spv=dict(path=candidate_spv, sha256=sha(cspv)),
+                parent_shared=p_shared, candidate_shared=c_shared,
+                parent_a_load=p_a, candidate_a_load=c_a,
+                parent_staging_copies=p_copy, candidate_staging_copies=c_copy,
+                parent_max_gT_index=parents_max, candidate_max_gT_index=acc_max,
+                module=dict(parent_workgroup_bytes=pw.get('bytes') or 0,
+                            parent_workgroup_vars=pw.get('count') or 0,
+                            candidate_workgroup_bytes=cw.get('bytes') or 0,
+                            candidate_workgroup_vars=cw.get('count') or 0,
+                            candidate_barriers=sum(1 for o, _, _, _ in cm.instructions if o == 224),
+                            candidate_instructions=len(cm.instructions),
+                            parent_instructions=len(pm.instructions)),
+                offsets=rows, violations=bad, verdict='PASS' if not bad else 'FAIL')
+
+
+def main():
+    out, ok = {}, True
+    for key, spec in SPECS.items():
+        rec = audit(**spec)
+        out[key] = rec
+        ok = ok and rec['verdict'] == 'PASS'
+        print('%-16s %-4s decl %s -> %s  A %s -> %s  max gT idx %d -> %d  WG %d -> %d B  bar %d'
+              % (rec['label'], rec['verdict'], rec['parent_shared'], rec['candidate_shared'],
+                 rec['parent_a_load'], rec['candidate_a_load'],
+                 rec['parent_max_gT_index'], rec['candidate_max_gT_index'],
+                 rec['module']['parent_workgroup_bytes'],
+                 rec['module']['candidate_workgroup_bytes'],
+                 rec['module']['candidate_barriers']))
+        for v in rec['violations']:
+            print('   VIOLATION %-3s %s' % (v['rule'], v['why']))
+    (CARD / 'build' / 'addr-audit.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print('ADDRESS AUDIT', 'PASS' if ok else 'FAIL')
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

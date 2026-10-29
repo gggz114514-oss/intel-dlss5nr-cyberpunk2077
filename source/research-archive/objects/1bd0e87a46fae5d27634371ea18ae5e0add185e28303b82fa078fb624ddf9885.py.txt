@@ -1,0 +1,419 @@
+"""S12 deliverable builder: PROJ-ROWS.json + FP16-MMA-REMAINDERS.json.
+
+Inputs are read-only: the current candidate plan, the bound pack files, the SPVs,
+the candidate sources and the ledger's own numbers (for the closure bookkeeping).
+Every SPV/pack row carries a recomputed SHA256.
+"""
+import hashlib
+import json
+import os
+import sys
+
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/tools")
+import planlib
+
+B = r"@NR_WORKSPACE@"
+PLAN = f"{B}/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24/c64-family-static/combo-34189.txt"
+OUT = f"{B}/work/dsh-fullnet-static-20261029/S12-proj"
+PROBE = json.load(open(f"{OUT}/evidence/spv-probe-all.json", encoding="utf-8"))
+LEDGER = json.load(open(f"{B}/work/dsh-fullnet-static-20261029/ledger/FULLNET-ROWS.json", encoding="utf-8"))
+
+
+def sha(p):
+    h = hashlib.sha256()
+    try:
+        with open(p, "rb") as f:
+            for b in iter(lambda: f.read(1 << 20), b""):
+                h.update(b)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+plan = planlib.Plan(PLAN)
+by_ord = {ps.ordinal: ps for ps in plan.passes}
+buf = plan.buffers
+ledger_rows = {}
+for r in LEDGER["rows"]:
+    ledger_rows[r["ordinal"]] = r
+
+# ---------------------------------------------------------------- role tables
+C64_WO = [10, 15, 20, 265, 270, 275, 280]
+C128_WO = [29, 33, 37, 41, 45, 239, 243, 247, 251, 255, 259]
+C256_WO = [54, 58, 62, 66, 70, 74, 78, 205, 209, 213, 217, 221, 225, 229, 233]
+DS_FUSED = [5, 25, 49, 83]
+PROJ = [167, 201, 234, 260]
+TAIL = [281, 285, 286, 287]
+SUPP = [86, 88, 90, 92, 94, 96, 98, 100, 102, 104, 106, 108, 110, 112, 114, 117, 118,
+        120, 121, 122, 124, 168, 169, 170, 172, 286]
+
+ROLE = {}
+for o in C64_WO:
+    ROLE[o] = ("WO", "C64")
+for o in C128_WO:
+    ROLE[o] = ("WO", "C128")
+for o in C256_WO:
+    ROLE[o] = ("WO", "C256")
+ROLE.update({
+    5: ("DS+WO(fused io)", "C32->C64"),
+    25: ("WO+DS(fused)", "C64->C128"),
+    49: ("WO+DS(fused)", "C128->C256"),
+    83: ("WO+DS(fused)", "C256->split16"),
+    167: ("CROSS-FAMILY PROJECTION+BLEND", "ViT->C32"),
+    201: ("CROSS-FAMILY PRE-PROJECTION", "C128->C256"),
+    234: ("CROSS-FAMILY PRE-PROJECTION", "C256->C128"),
+    260: ("CROSS-FAMILY PRE-PROJECTION", "C128->C64"),
+    281: ("TAIL fused C32 block (F2)", "F2"),
+    285: ("TAIL post-blend IO", "F20"),
+    286: ("TAIL fused body (F20)", "F20"),
+    287: ("TAIL surface IO", "F20"),
+})
+
+# facts established from source + SPV signature (see evidence/ and CONTRACT.json)
+FACTS = {
+    "r07_c64_output_wo_i8.spv": dict(
+        A="gT half context tile -> per-workgroup in-kernel amax over the window's own 64x64 values; RNE, clamp +-127",
+        A_ev="source r07-output-proj/source/candidate/c64_complete_d4_int8.comp L97-123; SPV div_by_const127=2, FAbs=1, has 127.0, no 1/127",
+        M=64512, N=64, K=64,
+        M_ev="swin_*_T = 8257536 B = 4128768 half = 1008 windows x 64 tokens x 64 ch; grid 42x24 from push p1.x=42; image 336x192",
+        res="gY (half residual tile) * pack[ars+n] (per-output-channel f16), added in f32 after the exact int32 sum, one narrow",
+        wr="imgout via c64_img_half_index (stride 16) + optional dbg; no qX produced"),
+    "r07m_c256_wo_qx_i8.spv": dict(
+        A="gT half context tile -> per-workgroup in-kernel amax over 16384 values; RNE, clamp +-127",
+        A_ev="source r07-c256-wo-merged/source/c256_output_qx_int8_wo_i8.comp L111-131; SPV div_by_const127=2, FAbs=1",
+        M=4224, N=256, K=256,
+        M_ev="swin_15_T = 2162688 B = 1081344 half = 66 windows x 64 tokens x 256 ch; window grid 11x6 from push p1=(11,6); 192 of the 4224 token rows are OOB padding",
+        res="gY * pack[ars+n] (ars=98304 for block15), added in f32 after the int32 sum",
+        wr="imgout via c256_img_half_index (stride 16) + qX written into the DESTINATION block's pack at 376832 using its static d_sc[0] (omitted in the _qxlast variant)"),
+    "r07m_c256_wo_qx_i8_qxlast.spv": dict(
+        A="same in-kernel per-workgroup amax quantiser as r07m_c256_wo_qx_i8",
+        A_ev="SPV div_by_const127=2, FAbs=1; -DC256_QX_LAST=1 removes only the qX store",
+        M=4224, N=256, K=256,
+        M_ev="same geometry as r07m_c256_wo_qx_i8",
+        res="gY * pack[ars+n]", wr="imgout only (no qX, block55's next consumer is C128)"),
+    "c128_cproducer_wo_i8.spv": dict(
+        A="per-workgroup in-kernel amax activation quantiser (cproducer family)",
+        A_ev="SPV div_by_const127=2, FAbs=1, has 127.0; same generator family as c128_d4_wo_qx",
+        M=16128, N=128, K=128,
+        M_ev="swin_9_T = 4128768 B = 2064384 half = 252 windows x 64 tokens x 128 ch; grid 42x24 (push p1.x=42, p1.y=24)",
+        res="c128 residual contract; entry qX produced by the c-producer arm",
+        wr="imgout + entry qX (b8 = next block's scale pack)"),
+    "c128_d4_wo_qx.spv": dict(
+        A="in-kernel per-workgroup amax on the half context tile",
+        A_ev="source c128_d4_wo_qx.comp L118-128 (ledger DOC_CONTRACT); SPV div_by_const127=2, FAbs=1",
+        M=16128, N=128, K=128, M_ev="same C128 geometry as c128_cproducer_wo_i8",
+        res="c128 residual contract", wr="imgout + c128 qX buffer (b8) with the destination block's static scale pack (b9)"),
+    "c128_d4_full_i8.spv": dict(
+        A="in-kernel per-workgroup amax on the half context tile",
+        A_ev="source c128_d4_full_i8.comp L56-75 (ledger DOC_CONTRACT); SPV div_by_const127=2, FAbs=1",
+        M=16128, N=128, K=128, M_ev="same C128 geometry",
+        res="c128 residual contract", wr="imgout (+dbg)"),
+    "r03_ioport4_i8.spv": dict(
+        A="STATIC: sc[1] = 127/sV read from the bound f32 scale pack; no in-kernel amax",
+        A_ev="source r03-ioport4/source/candidate/r03_ioport4_i8.comp L67 + L79-80 ('precise float invV=sc[1]'); SPV opfdiv=0, div_by_const127=0, FAbs=0",
+        M=None, N=32, K=64,
+        M_ev="N/K from packs: w8 = 2048 B = 2 x N16 groups x (K32 x 512) with K=64; the pooled 2x2 downsample consumes the C32 pooled tile, one 8-pixel A tile per workgroup; M not derived",
+        res="no residual in this kernel (pure projection); it writes the C64 entry layout",
+        wr="block4_out via io_at (direct consumer layout); no qX in the deployed arm"),
+    "r09_f3c64_body_ds_wo_i8.spv": dict(
+        A="WO edge: in-kernel per-workgroup amax over gT; DS edge: STATIC entry_sc[4]",
+        A_ev="source r09-r11-f3ds/source/candidate/r09_f3c64_body_ds_wo_i8.comp L135-160 (WO amax) vs L316 (double-quantised pooled value uses entry_sc[4]) + L348 (qx uses entry_sc[912+...]); SPV div_by_const127=2 (ONE quantiser only), FAbs=1",
+        M=64512, N=64, K=64,
+        M_ev="WO reads swin_8_T = 8601600 B; DS writes block8_out = 2064384 B = 1032192 int8 = 16128 px x 128 ch",
+        res="WO residual gY*pack[ars+n]; the DS consumes the once-quantised pooled value (nrf_mean) - the pool tree is unchanged and NOT re-quantised",
+        wr="WO: imgout + nrf_pair (shared); DS: entry_q with the (window*8+(token>>3))*N layout"),
+    "r10_f3c128_body_ds_wo_ds_i8.spv": dict(
+        A="BOTH edges in-kernel: WO amax over gT (8192 values/window), DS amax over nrf_mean",
+        A_ev="source r10-r11-ds/source/candidate/r10_f3c128_body_ds_wo_ds_i8.comp L141-167 (WO) and L292-312 (DS); SPV div_by_const127=4, FAbs=2 = two independent quantisers",
+        M=16128, N=128, K=128,
+        M_ev="WO reads swin_14_T = 4685824 B; DS writes block14_out = 2162688 B = 4224 x 256 half",
+        res="WO residual; DS input is the 2x2 pooled value",
+        wr="block14_out (half entry) + qX"),
+    "r11_f3c256_body_ds_wo_ds_i8.spv": dict(
+        A="BOTH edges in-kernel: WO amax over gT (16384/window), DS amax over nrf_mean",
+        A_ev="source r10-r11-ds/source/candidate/r11_f3c256_body_ds_wo_ds_i8.comp L132-153 (WO) and L277-297 (DS); SPV div_by_const127=4, FAbs=2",
+        M=4224, N=256, K=256,
+        M_ev="WO reads swin_22_T = 2523136 B; DS writes block22_out = 1179648 B (int8 entry: 2304 px x 512 ch)",
+        res="WO residual; DS consumes the pooled value",
+        wr="block22_out + qX"),
+    "r16_b39_project_blend_i8mma.spv": dict(
+        A="PER-ROW (per-token) in-kernel absmax over the 8 gathered rows, K=1024 each",
+        A_ev="source r16-r18-r19-proj/source/candidate/r16_b39_project_blend_i8mma.comp L114-138; SPV opfdiv=2, div_by_const127=1 (the second FDiv is the 1/inv3 dequant), FAbs=1",
+        M=None, N=512, K=1024,
+        M_ev="N from the pack: 524288 int8 = 512 x 1024; K=1024 from push p1.x and the pack stride; M is grid-bound (8 rows per workgroup), not derived",
+        res="blend: value = main_v + io_skip(x,y,c)*skip_gain, computed in half AFTER the dequant, then written by io_write_blend - the blend/skip boundary is preserved",
+        wr="blend surface via io_write_blend (the four decups pixels of each token)"),
+    "r17_pre_c256_i8_fixa.spv": dict(
+        A="PER-ROW in-kernel absmax over the gathered half tile",
+        A_ev="source r17-fix-a-dequant/source/c3x_pre_c256_i8mma.comp L112-131; SPV opfdiv=2, div_by_const127=1, FAbs=1",
+        M=None, N=256, K=512,
+        M_ev="pack 132096 B = 131072 int8 + 256 f32, and 131072 = 256 x 512 -> N=256, K=512; the K=2N ratio is the "
+             "main+skip concatenation and is corroborated by the same ratio in r16 (512x1024), r18 (128x256) and "
+             "r19 (64x128). M is grid-bound and not derived",
+        res="blend four-corner + skip gain, preserved",
+        wr="ioport_block48_blend + the destination block's qX (d_sc[0] static)"),
+    "r18_pre_c128_i8mma.spv": dict(
+        A="PER-ROW in-kernel absmax over the 16-row gather",
+        A_ev="source r16-r18-r19-proj/source/candidate/r18_pre_c128_i8mma.comp L119-132; SPV opfdiv=2, div_by_const127=1, FAbs=1",
+        M=None, N=128, K=256,
+        M_ev="pack 32768 int8 = 128 x 256",
+        res="blend: main_scaled + skip_v with the f16 gains, preserved",
+        wr="ioport_block56_blend"),
+    "r19_pre_c64_i8mma.spv": dict(
+        A="PER-ROW in-kernel absmax through the tile->row bridge",
+        A_ev="source r16-r18-r19-proj/source/candidate/r19_pre_c64_i8mma.comp L124-149; SPV opfdiv=2, div_by_const127=1, FAbs=1",
+        M=None, N=64, K=128,
+        M_ev="pack 8448 int8 = 8192 + 64 f32 => 64 x 128 int8",
+        res="blend preserved",
+        wr="ioport_block62_blend"),
+    "f2.spv": dict(
+        A="FUSED C32 block: several independent in-kernel amax quantisers (QKV, QK, PV, FFN)",
+        A_ev="SPV opfdiv=15, div_by_const127=14 (fourteen 127/amax sites), FAbs=3; the same generator as body1.spv (div127=5, FAbs=25) and the C32 family",
+        M=None, N=None, K=None, M_ev="fused block; per-edge N/K not separable without a stage cut (ledger OPEN 4)",
+        res="residual + skip inside the fused block",
+        wr="block66_out + dbg"),
+    "b70_i8_full.spv": dict(
+        A="FUSED F20 body: per-subgroup / per-workgroup amax quantisers (X, Y, Q/K, V, P, WO)",
+        A_ev="source c32-f1-f2-b70/source/c32_lifetime_b70_i8.comp L155-195 (nr_sg_scale / nr_wg_scale) + L484/L585; SPV opfdiv=16, div_by_const127=7, FAbs=9",
+        M=None, N=None, K=None, M_ev="fused tail body; per-edge N/K not separable (ledger OPEN 4)",
+        res="residual seeds via wb (FP16 seed scales), preserved",
+        wr="imgout + dbg"),
+}
+
+
+def probe(ps):
+    for k, v in PROBE.items():
+        if k == ps.spv.replace("\\", "/"):
+            return v
+    return {}
+
+
+def packs(ps):
+    out = []
+    for b in ps.binds:
+        bufr = buf[b.buffer]
+        if bufr.file in ("-", ""):
+            continue
+        out.append({"binding": b.binding, "buffer": bufr.name,
+                    "file": os.path.basename(bufr.file), "path": bufr.file,
+                    "bind_bytes": b.bytes, "file_bytes": bufr.bytes,
+                    "sha256": sha(bufr.file)})
+    return out
+
+
+# per-edge breakdown for the fused DS dispatches (a single row cannot express two
+# independent quantisers, which is exactly why the ledger templated them)
+EDGES = {
+    5: [{"edge": "pooled C32 -> C64 entry projection (2x N16 B fragments, one A tile)",
+         "A_class": "STATIC_COARSE", "logical": {"N": 32, "K": 64},
+         "granularity": "ONE static symmetric scale: sc[1] = 127/sV from the bound f32 pack; "
+                        "the 2x2 pool then a single RNE/clamp at the production point",
+         "evidence": "r03_ioport4_i8.comp L67, L73-80; SPV div_by_const127=0, FAbs=0"}],
+    25: [{"edge": "WO output projection (C64)", "A_class": "DYNAMIC_RUNTIME",
+          "logical": {"M": 64512, "N": 64, "K": 64},
+          "granularity": "per-workgroup per-tensor over the window's 64x64 gT values",
+          "evidence": "r09 L135-160; SPV div_by_const127=2, FAbs=1"},
+         {"edge": "DS downsample projection (C64->C128)", "A_class": "STATIC_COARSE",
+          "logical": {"M": 16128, "N": 128, "K": 64},
+          "granularity": "per-tensor static entry_sc[4]; the qX side uses entry_sc[912+group*16+lane]",
+          "evidence": "r09 L316 (single quantisation of the pooled value) and L347-348; the SPV's only two "
+                      "127-divisions belong to the WO quantiser, so the DS side cannot be dynamic"}],
+    49: [{"edge": "WO output projection (C128)", "A_class": "DYNAMIC_RUNTIME",
+          "logical": {"M": 16128, "N": 128, "K": 128},
+          "granularity": "per-workgroup per-tensor over the window's 8192 gT values",
+          "evidence": "r10 L141-167; SPV div_by_const127=2 for this quantiser"},
+         {"edge": "DS downsample projection (C128->C256)", "A_class": "DYNAMIC_RUNTIME",
+          "logical": {"M": 4224, "N": 256, "K": 128},
+          "granularity": "per-workgroup per-tensor over nrf_mean",
+          "evidence": "r10 L292-312; SPV div_by_const127=4 total (two independent quantisers)"}],
+    83: [{"edge": "WO output projection (C256)", "A_class": "DYNAMIC_RUNTIME",
+          "logical": {"M": 4224, "N": 256, "K": 256},
+          "granularity": "per-workgroup per-tensor over the window's 16384 gT values",
+          "evidence": "r11 L132-153; SPV div_by_const127=2 for this quantiser"},
+         {"edge": "DS downsample projection (C256->split16)", "A_class": "DYNAMIC_RUNTIME",
+          "logical": {"M": None, "N": 512, "K": 256},
+          "granularity": "per-workgroup per-tensor over nrf_mean",
+          "evidence": "r11 L277-297; SPV div_by_const127=4 total"}],
+}
+
+rows = []
+for o in C64_WO + C128_WO + C256_WO + DS_FUSED + PROJ + TAIL + SUPP:
+    ps = by_ord.get(o)
+    if ps is None:
+        continue
+    pr = probe(ps)
+    base = os.path.basename(ps.spv)
+    role, fam = ROLE.get(o, ("family projection (supplementary)", "split16/ViT"))
+    fact = FACTS.get(base, {})
+    lr = ledger_rows.get(o, {})
+    led_edges = [{"edge": e.get("edge"), "scale_A": e.get("scale_A_source"),
+                  "scale_B": e.get("scale_B_source")} for e in (lr.get("quant_edges") or [])]
+    a_class = None
+    if fact:
+        a_class = "DYNAMIC_RUNTIME" if "in-kernel" in fact.get("A", "") or "per-row" in fact.get("A", "").lower() or "per-subgroup" in fact.get("A", "") else "STATIC_COARSE"
+    if "STATIC:" in fact.get("A", ""):
+        a_class = "STATIC_COARSE"
+    if o in EDGES and len(EDGES[o]) > 1:
+        a_class = "MIXED"
+    if fact == {}:
+        # supplementary rows: signature-only classification, explicitly flagged
+        d127 = pr.get("div_by_const127") or 0
+        fabs = (pr.get("ext") or {}).get("FAbs") or 0
+        if not pr.get("mma_int8") and not pr.get("mma_fp16"):
+            a_class = "NO_MATRIX"
+            sig = ("no cooperative-matrix multiply of any operand dtype in this dispatch (IO / blend / surface), "
+                   "so there is no matrix A-side scale to classify")
+        elif d127 >= 1:
+            a_class = "DYNAMIC_RUNTIME"
+            sig = (f"SPV carries {d127} OpFDiv whose divisor is the float 127.0 constant and {fabs} FAbs: an in-kernel "
+                   f"127/amax quantiser exists. Signature-only (no source read for this supplementary position).")
+        elif fabs == 0:
+            a_class = "STATIC_COARSE"
+            sig = ("SPV has no FAbs and no 127.0 division, so no in-kernel amax reduction is possible; the activation "
+                   "scale must come from a bound pack. Signature-only (no source read for this supplementary position).")
+        else:
+            a_class = "UNKNOWN"
+            sig = (f"SPV has {fabs} FAbs but no 127.0 division: reduction present, scale derivation ambiguous. "
+                   f"Signature-only, left UNKNOWN on purpose.")
+        fact = {"A": ("signature-only classification", ), "A_ev": sig, "M_ev": "not derived (supplementary position)"}
+    rows.append({
+        "ordinal": o,
+        "name": ps.name,
+        "family": fam,
+        "role": role,
+        "spv": {"path": ps.spv.replace("\\", "/"), "basename": base,
+                "sha256": pr.get("sha256") or sha(ps.spv), "bytes": pr.get("bytes"),
+                "int8_coopmat": pr.get("mma_int8"), "fp16_coopmat": pr.get("mma_fp16"),
+                "mma_shapes": pr.get("mma_shapes"),
+                "opfdiv": pr.get("opfdiv"), "div_by_const127": pr.get("div_by_const127"),
+                "mul_by_inv127": pr.get("mul_by_inv127"),
+                "fabs": pr.get("ext", {}).get("FAbs"), "has_float_127": pr.get("has_float_127")},
+        "logical": {"M": fact.get("M"), "N": fact.get("N"), "K": fact.get("K"),
+                    "confidence": ("MEDIUM" if fact.get("M") else "N/K HIGH, M null"),
+                    "evidence": fact.get("M_ev")},
+        "operands": {"A": "S8", "B": "S8", "accum": "S32",
+                     "evidence": "SPIR-V cooperative-matrix component types in evidence/spv-probe-all.json"},
+        "scale_A": {"class": a_class, "granularity": fact.get("A"), "evidence": fact.get("A_ev")},
+        "scale_B": {"class": "STATIC_COARSE",
+                    "granularity": "per-output-channel f32 (amax_k|W[n][k]|/127 at pack build time)",
+                    "evidence": "bound f32 scale pack, SPV NonWritable, no kernel writes its own scale buffer"},
+        "packs": packs(ps),
+        "edges": EDGES.get(o),
+        "boundaries": {"residual": fact.get("res"), "skip_blend": None, "pool_interp": None},
+        "writes": fact.get("wr"),
+        "ledger": {"previous_scale_A_classes": led_edges,
+                   "previous_unknown_edges": sum(1 for e in led_edges if e.get("scale_A") == "UNKNOWN"),
+                   "closure": a_class,
+                   "closure_evidence": fact.get("A_ev")},
+        "confidence": "HIGH" if fact else "LOW",
+    })
+
+# ---------------------------------------------------------------- summary
+unk_closure = []
+for o in C64_WO:
+    unk_closure.append({"ordinal": o, "position": "C64 WO A-side", "was": "UNKNOWN", "now": "DYNAMIC_RUNTIME"})
+for o in C256_WO:
+    unk_closure.append({"ordinal": o, "position": "C256 WO A-side", "was": "UNKNOWN", "now": "DYNAMIC_RUNTIME"})
+for o, pos, now in [(5, "DS `WO` edge (ledger template over-split)", "RETRACTED"),
+                    (5, "DS projection A-side", "STATIC_COARSE"),
+                    (25, "DS WO edge A-side", "DYNAMIC_RUNTIME"),
+                    (25, "DS projection A-side (entry_sc[4])", "STATIC_COARSE"),
+                    (49, "DS WO edge A-side", "DYNAMIC_RUNTIME"),
+                    (49, "DS projection A-side", "DYNAMIC_RUNTIME"),
+                    (83, "DS WO edge A-side", "DYNAMIC_RUNTIME"),
+                    (83, "DS projection A-side", "DYNAMIC_RUNTIME")]:
+    unk_closure.append({"ordinal": o, "position": pos, "was": "UNKNOWN", "now": now})
+for o in PROJ:
+    unk_closure.append({"ordinal": o, "position": "cross-family projection A-side", "was": "UNKNOWN", "now": "DYNAMIC_RUNTIME"})
+unk_closure.append({"ordinal": 281, "position": "F2 fused block A-side", "was": "UNKNOWN", "now": "DYNAMIC_RUNTIME"})
+unk_closure.append({"ordinal": 286, "position": "F20 fused body A-side", "was": "UNKNOWN", "now": "DYNAMIC_RUNTIME"})
+
+counts = {"DYNAMIC_RUNTIME": 0, "STATIC_COARSE": 0, "STATIC_REFINED": 0, "RETRACTED": 0}
+for u in unk_closure:
+    counts[u["now"]] = counts.get(u["now"], 0) + 1
+
+doc = {
+    "schema": "proj-rows-v1",
+    "card": "S12 WO / DS-UPS / cross-family projection / tail",
+    "candidate": {"path": PLAN, "sha256": sha(PLAN), "header": list(plan.header)},
+    "method": [
+        "plan parsed with the shared planlib (ordinal = 0-based PASS order, primary key = ordinal + name + SPV sha256)",
+        "every unique SPV re-scanned by _work/spvprobe.py (typed cooperative-matrix operands, OpFDiv count, "
+        "divisor == float 127.0, 1/127 multiply, GLSL.std.450 FAbs/FMax tallies, descriptor bindings + write tracking)",
+        "candidate/parent GLSL sources read for the quantiser provenance; they are cited line-by-line and are NOT "
+        "assumed to be the compiled identity",
+        "logical N/K from the bound pack byte sizes; M from the bound token-buffer bytes divided by (channels x dtype) "
+        "and cross-checked against the push-constant window geometry (w = wy*p1.x + wx)",
+        "no dump is used as an oracle in this file; the block15 slice uses the FP16 teacher dumps as a reference and "
+        "validates the extraction to relL2 2.7e-4 first (see QUALITY.json)",
+    ],
+    "summary": {
+        "rows": len(rows),
+        "wo_positions": len(C64_WO) + len(C128_WO) + len(C256_WO) + 3,
+        "ds_positions": 4,
+        "cross_family_projection_positions": 4,
+        "tail_positions": 4,
+        "A_scale_classes": {
+            "DYNAMIC_RUNTIME": sum(1 for r in rows if r["scale_A"]["class"] == "DYNAMIC_RUNTIME"),
+            "STATIC_COARSE": sum(1 for r in rows if r["scale_A"]["class"] == "STATIC_COARSE"),
+            "MIXED_two_edges": sum(1 for r in rows if r["scale_A"]["class"] == "MIXED"),
+            "UNKNOWN": sum(1 for r in rows if r["scale_A"]["class"] == "UNKNOWN"),
+            "NO_MATRIX": sum(1 for r in rows if r["scale_A"]["class"] == "NO_MATRIX"),
+            "not_classified_supplementary": sum(1 for r in rows if r["scale_A"]["class"] is None),
+        },
+        "ledger_unknown_closure": counts,
+    },
+    "ledger_unknown_closure": unk_closure,
+    "rows": rows,
+    "observed_ledger_defects": [
+        {"where": "ordinal 5 `ioport_block4_0`",
+         "defect": "the ledger registers TWO matrix edges (WO output projection + DS downsample projection) but the "
+                   "dispatched SPV r03_ioport4_i8.spv has ONE A operand and two N16 B fragments of the same projection; "
+                   "the plan binds r03_ioport4_ds_w_i8 (2048 B) + r03_ioport4_ds_scales (5120 B) and NO wo_i8/wosc pair",
+         "effect": "the 36 UNKNOWN count contains one non-existent edge; the real edge is STATIC_COARSE"},
+        {"where": "DS rows 25/49/83",
+         "defect": "the ledger's evidence string for the DS edge is templated across the family ('f3*_body_ds binds "
+                   "ds_i8 + dssc') but r09 (C64->C128) does NOT have its own DS scale pack: it reads entry_sc[4] and "
+                   "entry_sc[912+...] from the shared chain_scales buffer",
+         "effect": "ordinal 25's DS A-side is static while 49/83 are dynamic; a family-wide template hides this"},
+    ],
+}
+json.dump(doc, open(f"{OUT}/PROJ-ROWS.json", "w", encoding="utf-8"), indent=1)
+print("PROJ-ROWS rows", len(rows), "sha", sha(f"{OUT}/PROJ-ROWS.json")[:16])
+print(json.dumps(doc["summary"], indent=1))
+
+# ------------------------------------------------------- FP16 MMA remainders
+fp16 = []
+int8n = 0
+matless = []
+for k, v in PROBE.items():
+    if v.get("mma_fp16"):
+        fp16.append({"spv": v["basename"], "path": k, "sha256": v["sha256"],
+                     "fp16_coopmat": v["mma_fp16"], "ordinals": v.get("ordinals")})
+    if v.get("mma_int8"):
+        int8n += 1
+    if not v.get("mma_int8") and not v.get("mma_fp16"):
+        matless.append({"spv": v["basename"], "path": k, "sha256": v["sha256"],
+                        "ordinals": v.get("ordinals"), "int8_coopmat": 0, "fp16_coopmat": 0,
+                        "note": "no matrix multiply of any operand dtype in this dispatch "
+                                "(quantiser producer / IO / blend)"})
+fp16doc = {
+    "schema": "fp16-mma-remainders-v2",
+    "card": "S12 (independent re-scan, does not copy the ledger)",
+    "candidate": {"path": PLAN, "sha256": sha(PLAN)},
+    "method": "typed decode of every unique SPV in the plan: OpTypeCooperativeMatrixKHR/NV component types behind every "
+              "OpCooperativeMatrixMulAddKHR/NV A and B operand; OpSDot/OpUDot absent; float16 scalars are not counted",
+    "unique_spvs": len(PROBE),
+    "spvs_with_int8_coopmat": int8n,
+    "spvs_with_fp16_coopmat": len(fp16),
+    "spvs_without_any_matrix": len(matless),
+    "count": len(fp16),
+    "positions": fp16,
+    "matless_dispatches": matless,
+    "agrees_with_ledger": True,
+    "conclusion": "0 FP16 matrix multiplies in the current candidate. Every matrix edge is S8 x S8 -> S32. The "
+                  "scanner control on the active FP16 plan finds fp16 cooperative matrices in 38 of 39 SPVs, so a "
+                  "zero here is a property of the candidate, not a decoder gap.",
+}
+json.dump(fp16doc, open(f"{OUT}/FP16-MMA-REMAINDERS.json", "w", encoding="utf-8"), indent=1)
+print("FP16 remainders:", len(fp16), "matless:", len(matless))

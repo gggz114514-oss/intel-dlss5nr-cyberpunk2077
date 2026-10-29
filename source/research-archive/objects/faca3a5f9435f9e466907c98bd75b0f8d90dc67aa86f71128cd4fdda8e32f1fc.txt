@@ -1,0 +1,122 @@
+n02d-f02-bias-wide — RESUME
+================================================================
+状态: AWAITING-GPU（机制已落地、全部 CPU 门通过；lane map 未测 ⇒ 本卡不判 E、不判 A）
+族:   F02 body（7 PASS: ordinal 1,2,3,4,227,228,229）
+GPU:  零。未取锁、未跑 clock_runner / gtpin / zprof、未部署、未改任何指针或基线 plan。
+分诊: 暂不适用。可判死的分支只有一种（探针 CROSS-LANE ⇒ C：机制不可行）；
+      其余按合同 §6 在 GPU 回来后落 A/B/C/D/E。机制归类 = L12（被并发隐藏的消息），
+      不是 L2（重复消息删除）：n02c 已实测 bias 的重复读为 0。
+
+链头: accepted/restore-n10-f10-next-20261027/plan.txt = 719f100b…
+      本组 7 行仍全部指向父 SPV 4c034a53…（逐字节，BUILD.json.chain_head_rows）
+      父源码 75e3474d… → 本卡按 RECIPES.json[4c034a53] 配方（pin 头 1c4c7489 +
+      从 c32-feed-owner-20261025/kv-tile 传 NoContraction）**逐字节复现**父 SPV
+
+----------------------------------------------------------------
+1. 本卡做了什么（按 CARD.txt 的 A/B/C 三步）
+----------------------------------------------------------------
+[A] lane-map 探针（探针本身需要 GPU，故写成"上 GPU 的第一步"）
+    问题: 8×64 f32 累加器带的 component k of lane L 到底持有瓦片的哪个 (row,col)？
+          密封头文件只测到 8×16（row=2c+(L>>4), col=L&15）与 16×16。
+    工件: probe.comp / probe.spv d50ed5ca… / probe-plan.txt 862f0ccb…（replaced==7，
+          cpu-check 通过；**不进计时/门/部署**），判读器 probe_read.py（含 --synthetic 自检）。
+    为什么必须 GPU: lane map 是驱动/编译器 SPIR-V→ISA 降级的性质；SPIR-V 里 component
+          访问只是一个不透明类型的下标，CPU 侧无法读出。CPU 侧能证的只是"这个假设足够、
+          且其他分支可判别"（PROOF.json.P3 + probe_read.py 的三态判读）。
+    判读（probe_read.py，角色一致性测试，抗重复值）:
+          H1   → k=4b+c 成立，候选**按构造数值精确**，直接进数值门
+          PERM → 另一个同 lane 双射：改 NRH_C64_AT() 一行重建，零指令代价
+          CROSS-LANE → 机制死（提取需跨 lane，≥64 shuffle vs 省 56 消息）⇒ 按 C 收尾
+          NO-BASE → 探针臂没跑（--dump-intermediates / debug / 偏移），不是布局结论
+    自检（CPU，未花 GPU 槽）: H1 合成 → H1 + 密封律 128/128；NAIVE 合成 → CROSS-LANE；
+          人为置换 → PERM 且还原出该双射。见 probe-selftest-*.json。
+
+[B] 寄存器预算（BUDGET.md）
+    一条 8×64 带 = 2048 B = 16 GRF/线程；今天 bias 峰值 8 GRF（8 站点串行复用）。
+    实测基准: 整核 r127；屏障之后 bias 段水位 r108（regwindow.py）。
+    W1（本卡实现，两条带同时在场）= 32 GRF = +24；W2（h-外提，一次一条带）= 16 GRF = +8，
+       代价是 shK 块读复制（load.slm 16→24，528 交织 mov 可能 →592，除非 igc 做 CSE）；
+    W3（半宽 8×32）= **不是退路**：h-内仍是 32 GRF，h-外提则每行只有 128 B 连续
+       ⇒ 32 条 128 B 消息/SG，既过不了 ≤16 门也省不下寄存器。卡里的"半宽"前提不成立。
+    门（写死）: scratch 0 且 max_r ≤127 ⇒ 预算成立；否则 B 类，改 W2 并连 SLM/mov 一起报。
+
+[C] 实现（candidate.comp / candidate.spv 242d6033…）
+    8 个 `coopMatLoad(bias,fb,…,64u,LROW)` 站点 → 2 条 8×64 带读
+    （基址 pc.p2.w+(t0+0)*64、+(t0+8)*64，行跨度 64 ⇒ 各 2048 B 连续）。
+    保持: 每列块 2 条 shK 块读 + 4 条 DPAS（**128 不变**）+ 32 条 precise f32 加（左操作数逐项相同）
+          + 8 处 nrh_narrow 半精度舍入点（OpFConvert 26→26）+ exp/den 树 + 唯一 barrier（1→1）
+          + 64 个 `(16,16,B)` 块读（528 交织 mov 的来源，计数不变）。
+    净: 每 SG bias 消息 64→8（−56，或 256 B 形态 64→16，−48）；执行路径 UGM 读 182→126（−30.8%）；
+        逻辑字节守恒 4096 B；代码体积 −2244 B。
+
+----------------------------------------------------------------
+2. 已证 / 未证
+----------------------------------------------------------------
+已证（CPU，可重跑 build.py / make_proof.py）:
+  - 父 SPV 逐字节复现（parent-rebuild.spv = 4c034a53…）
+  - 候选 SPV 过 spv_validate_cpu（rc=0）；探针 SPV 同
+  - plan = 链头**只**改 7 行（differing lines = PASS 1,2,3,4,148,149,150 = ordinal 1,2,3,4,227,228,229），
+    cpu-check rc=0，且输出与链头**逐字相同**（行数/缓冲数/池字节不变）
+  - 瓦片覆盖: 父 8×4×32 = 1024 与候选 2×16×32 = 1024 覆盖同一 1024 元素、重数 1、元素集合相同
+  - 32 条 bias 加的左操作数逐项未变，右操作数 = 4b+c（BUILD.json.bias_add_operand_pairs）
+  - 模块不变量: muladd 128 / barrier 1 / fadd 86 / fconvert 26 / NC 185 全部不变
+  - float NoContraction 逐站点对齐: float_NC_checked = 184，所有函数序列 identical
+未证（无 GPU，已在 COST-LEDGER.unknown 与 NATIVE-PREDICTION 列名）:
+  - 8×64 累加器的 lane map（本卡候选的数值身份是**条件身份**：对齐 H1，不是"已证实的实现"）
+  - IGC 是否支持 N=64 的 subgroup accumulator 降级（glslang 接受；驱动支持未证）
+  - 宽读的实际消息宽度（512 B d64x64t 还是 256 B d32x64t）
+  - 真实寄存器峰值 / scratch（W1 的 +24 GRF 是本卡唯一真新增项）
+  - ordinary 的整体收益
+
+----------------------------------------------------------------
+3. 下一处具体改动 / 可区分实验（给主代理，不属本卡权限内执行）
+----------------------------------------------------------------
+GPU 第 1 步（必须先做，30 秒级）:
+    clock_runner.exe --plan cards/n02d-f02-bias-wide/probe-plan.txt --out <fresh> \
+                     --pool --warm 0 --reps 1 --dump-intermediates
+    python cards/n02d-f02-bias-wide/probe_read.py \
+        --dump <fresh>/dump_swin_1_debug.bin \
+        --fb   .../swin/network/block1/pack/c32_aux.bin \
+        --out  cards/n02d-f02-bias-wide/LANE-MAP.json
+GPU 第 2/3 步: native（N1..N12）→ resources（scratch/max_r）→ gates fixed+fb2 → ordinary 两臂 6 组。
+
+按判读结果的分支:
+  H1 / PERM  → 直接跑 native+gates+ordinary；PERM 先改 NRH_C64_AT 一行重建。
+  CROSS-LANE → 本卡候选作废（不再跑计时）。下一处改动换到 n02c RESUME 的"备选"：
+               宿主/资产侧把这张 dispatch 不变的 64×64 f32 bias 表预排成"片段连续"顺序
+               （一次性 16 KiB，内核零成本、无屏障、无 SLM）——**属资产级改动，需用户裁定**，
+               与 n01b 给 wb 的预排列同一条。
+  native 显示 d32x16t 没降（A 类）→ 查两点：驱动是否把 8×64 标量化（看是否出现 d32x1t），
+               以及两个带站点的地址增量是否 +512 B 连续（N3）。
+  scratch>0 / max_r>127（B 类）→ 按 BUDGET.md 改 W2（h-外提，16 GRF），
+               同时报 load.slm 16→24 与 528→592（若未 CSE）。
+
+----------------------------------------------------------------
+4. 交付物清单（合同 §5）
+----------------------------------------------------------------
+有: CARD.txt、ANALYSIS.md（六问）、PROBE-DESIGN.md、BUDGET.md、PROOF.json、
+    COST-LEDGER.json、NATIVE-PREDICTION.md、BUILD.json、GPU-REQUEST.json、RESUME.txt（本文件）、
+    SOURCE-DIFF.patch（**已应用**，不是提案）、candidate.comp、candidate.spv、
+    plan.txt、probe.comp、probe.spv、probe-plan.txt、
+    构建产物: parent-rebuild.spv（= 父字节）、parent-raw.spv、candidate-raw.spv、probe-raw.spv、
+    工具（全 CPU）: gen_candidate.py、build.py、make_proof.py、probe_read.py、regwindow.py、
+    nc_transfer.py、spv_scan.py、
+    证据: probe-selftest-H1.json、probe-selftest-CROSSLANE.json、probe-selftest-PERM.json
+缺: 无（本卡不是 BLOCKED 卡）。但 candidate 的数值身份依赖探针，见 §2 与 PROBE-DESIGN.md §5。
+
+----------------------------------------------------------------
+5. 恢复点 / 未决项（合同 §7：本卡自行推断，未停下来等）
+----------------------------------------------------------------
+重跑（全部 CPU-only，不碰 GPU 锁，不写卡目录之外）:
+    python cards/n02d-f02-bias-wide/build.py        # 父复现 + 候选 + NC 对齐 + 校验 + plan + cpu-check
+    python cards/n02d-f02-bias-wide/make_proof.py   # 枚举覆盖证明 + 不变量
+    python cards/n02d-f02-bias-wide/probe_read.py --fb <c32_aux.bin> --mode synthetic --synthetic H1
+未决项:
+  1) NRH_C64_AT(b,c) 目前 = 4b+c（假设 H1）。探针一跑就定；PERM 情况下改一行即可。
+  2) 若主代理不愿为 F02 花一次探针槽，则本卡候选**不能**进数值门或计时门——
+     那将是"用假设当证据"，违反合同 §3/§8.5。建议宁可花这 30 秒。
+  3) 528 交织 mov 的判据在本卡是"结构性保证"（不复制任何 NRH_B 块读），
+     但如果主代理选 W2（16 GRF）版本，这条保证会被 shK 复制打破，届时需重新定价。
+  4) `float_NC_checked = 184`（不是 185）：nc_transfer 的对齐计数是"逐函数逐 opcode 类
+     取 min(父, 子)"之和，有一个 NoContraction 站点落在不含浮点算术的函数里，
+     不进这个计数；候选的 NC 总数与父同为 185（BUILD.json.candidate.nc_count）。

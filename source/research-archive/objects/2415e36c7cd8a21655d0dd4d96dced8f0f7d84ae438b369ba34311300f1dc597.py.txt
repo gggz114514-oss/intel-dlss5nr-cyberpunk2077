@@ -1,0 +1,115 @@
+"""R10/R11 build: compile the two INT8 modules, replay both parents, validate,
+audit operands, account declared shared memory, and write build-receipt.json.
+
+CPU only.  No Vulkan device, pipeline, runner or GPU.lock is touched.
+
+usage: python tools/build.py
+"""
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+CARD = HERE.parent
+R = Path("@NR_WORKSPACE@")
+BUILD = R / "work/dsh-int8-fullnet-impl-20261024/build/r10-r11-ds"
+GLSLANG = R / "src/project/tools/glslang-16.5.0/bin/glslang.exe"
+VALIDATE = R / ("candidates/amd-map-20261015/s4-final-output-fusion-fix/"
+                "production-repair/spv_validate_cpu.exe")
+AUDIT = R / "work/dsh-xmx-handoff-validation-20261024/tools/mma_operand_audit.py"
+PY_NUMPY = Path("@NR_USER_HOME@/.cache/codex-runtimes/codex-primary-runtime/"
+                "dependencies/python/python.exe")
+PY312 = R / "run/python312/python.exe"
+
+MODS = [
+    dict(tag="r10", pass_name="f3c128_body_ds", pass_order=14,
+         parent_src=CARD / "source/parent/r10/fused_c128_body_ds.comp",
+         parent_inc=CARD / "source/parent/r10",
+         deployed=R / ("candidates/amd-netorg-acceleration-workbuddy-20261016/"
+                       "f3-c128-fused-half-patch-v1/fused_c128_body_ds.spv"),
+         cand_src=CARD / "source/candidate/r10_f3c128_body_ds_wo_ds_i8.comp",
+         cand_inc=CARD / "source/candidate",
+         cand_out=CARD / "spv/r10_f3c128_body_ds_wo_ds_i8.spv"),
+    dict(tag="r11", pass_name="f3c256_body_ds", pass_order=22,
+         parent_src=CARD / "source/parent/r11/fused_c256_body_ds.comp",
+         parent_inc=CARD / "source/parent/r11",
+         deployed=R / ("candidates/amd-netorg-full-scope-workbuddy-20261017/c2-layout/"
+                       "layout0-unify-l2-v4/spv/c2_S19_fused_c256_body_ds.spv"),
+         cand_src=CARD / "source/candidate/r11_f3c256_body_ds_wo_ds_i8.comp",
+         cand_inc=CARD / "source/candidate",
+         cand_out=CARD / "spv/r11_f3c256_body_ds_wo_ds_i8.spv"),
+]
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def run(argv, cwd=None):
+    p = subprocess.run([str(a) for a in argv], capture_output=True, text=True, cwd=cwd)
+    return {"argv": [str(a) for a in argv], "rc": p.returncode,
+            "stdout": p.stdout.strip(), "stderr_last": p.stderr.strip().splitlines()[-1:]}
+
+
+def main():
+    BUILD.mkdir(parents=True, exist_ok=True)
+    (CARD / "spv").mkdir(parents=True, exist_ok=True)
+    rec = {"card": CARD.name, "gpu_used": False,
+           "toolchain": {"glslang": {"path": GLSLANG.as_posix(), "sha256": sha(GLSLANG)},
+                         "validator": {"path": VALIDATE.as_posix(),
+                                       "sha256": sha(VALIDATE)}},
+           "modules": []}
+    for m in MODS:
+        parent_spv = BUILD / ("%s.parent.replay.spv" % m["tag"])
+        r1 = run([GLSLANG, "-V", "--target-env", "vulkan1.3", "-I%s" % m["parent_inc"],
+                  "-o", parent_spv, m["parent_src"]], cwd=R)
+        r2 = run([GLSLANG, "-V", "--target-env", "vulkan1.3", "-I%s" % m["cand_inc"],
+                  "-o", m["cand_out"], m["cand_src"]], cwd=R)
+        v1 = run([VALIDATE, parent_spv], cwd=R)
+        v2 = run([VALIDATE, m["cand_out"]], cwd=R)
+        a1 = run([PY_NUMPY, AUDIT, "--json", BUILD / ("%s.audit.json" % m["tag"]),
+                  parent_spv, m["cand_out"]], cwd=R)
+        rec["modules"].append({
+            "tag": m["tag"], "pass_name": m["pass_name"], "pass_order": m["pass_order"],
+            "parent": {"src": m["parent_src"].as_posix(), "src_sha256": sha(m["parent_src"]),
+                       "replay_spv": parent_spv.as_posix(), "bytes": parent_spv.stat().st_size,
+                       "sha256": sha(parent_spv),
+                       "deployed_spv": m["deployed"].as_posix(),
+                       "deployed_bytes": m["deployed"].stat().st_size,
+                       "deployed_sha256": sha(m["deployed"]),
+                       "replay_byte_identical": sha(parent_spv) == sha(m["deployed"]),
+                       "compile": r1, "validate": v1},
+            "candidate": {"src": m["cand_src"].as_posix(), "src_sha256": sha(m["cand_src"]),
+                          "spv": m["cand_out"].as_posix(),
+                          "bytes": m["cand_out"].stat().st_size,
+                          "sha256": sha(m["cand_out"]), "compile": r2, "validate": v2},
+            "operand_audit": a1,
+        })
+        print("%s parent %s (%d B) identical=%s | candidate %s (%d B) %s | %s"
+              % (m["tag"], sha(parent_spv)[:16], parent_spv.stat().st_size,
+                 sha(parent_spv) == sha(m["deployed"]), sha(m["cand_out"])[:16],
+                 m["cand_out"].stat().st_size,
+                 [l for l in v2["stdout"].splitlines() if "result=" in l][:1],
+                 a1["stdout"].strip().splitlines()[-1] if a1["stdout"] else a1["rc"]))
+
+    # declared shared memory, all four modules
+    srec = run([PY_NUMPY, CARD / "tools/shared_bytes.py", "--json",
+                BUILD / "shared-bytes.json",
+                BUILD / "r10.parent.replay.spv", BUILD / "r11.parent.replay.spv",
+                MODS[0]["cand_out"], MODS[1]["cand_out"]], cwd=R)
+    rec["shared_bytes"] = srec
+    (BUILD / "build-receipt.json").write_text(
+        json.dumps(rec, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    print("\n" + (srec["stdout"] or ""))
+    ok = all(m["parent"]["replay_byte_identical"]
+             and m["candidate"]["compile"]["rc"] == 0
+             and m["candidate"]["validate"]["rc"] == 0 for m in rec["modules"])
+    print("BUILD_OK" if ok else "BUILD_CHECK")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

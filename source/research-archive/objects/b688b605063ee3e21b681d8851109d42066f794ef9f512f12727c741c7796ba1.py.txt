@@ -1,0 +1,218 @@
+"""make_candidate.py - build the B1 candidate source from the verbatim parent copy.
+
+The construction is a byte-level edit list, not a hand-typed file, so the change
+set is exactly enumerable and every replacement is asserted to match once.
+
+Edits (parent line numbers, 1-based):
+  c32_body1_i8.comp
+    39        delete   shared int8_t sX8[2048];
+    225..228  replace  nr_i8_put_x(xN, CB, sg * 512u)  ->  sg * 2048u   (4 sites)
+    267       replace  coopMatLoad(xb8, sX8, sg * 512u, ...) ->
+                       coopMatLoad(xb8, sE8, sg * 2048u, ...)
+    268..270  insert   2 comment lines + subgroupBarrier()
+    top       insert   change-log header (fixed line count, numbers filled in
+                       from the actual built file)
+  c32_i8_common.glsl
+    45..46    insert   2 comment lines
+    49        replace  sX8[  ->  sE8[   inside nr_i8_put_x
+  register_handoff.glsl: copied verbatim (0 changes)
+
+usage: python make_candidate.py
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+SRC_P = CARD / "source" / "parent"
+SRC_C = CARD / "source" / "candidate"
+LOG = CARD / "logs"
+
+PARENT_COMP_SHA = "9cd26cf47e6bab0cb8038f676a34cf9f7d9c1154fe0a5937cd6288a850854c5a"
+
+HEADER = [
+    "// ===========================================================================",
+    "// B1 candidate b1-c32-xe-reuse -- INT8 C32 body1: X reuses the sE8 SG slot.",
+    "//   parent : candidates/int8-coverage-v2-20261020/C/c32-i8-debug-eact-v1/",
+    "//            source/c32_body1_i8.comp (verbatim copy in source/parent/)",
+    "//            sha256 9cd26cf47e6bab0cb8038f676a34cf9f7d9c1154fe0a5937cd6288a850854c5a",
+    "//   change : sX8[2048] deleted.  Each subgroup's 2048 B sE8 slot now holds its",
+    "//            own X copy in the first 512 B (byte-identical to the E slab that",
+    "//            carries features 0..31), reused in time instead of in space.",
+    "//   changed lines in THIS file (1-based, this file, after the header insert):",
+    "//     L{DECL}  deleted  shared int8_t sX8[2048];",
+    "//     L{PX0}-L{PX1}  X publish base  sg * 512u -> sg * 2048u  (4 call sites)",
+    "//     L{LOAD}  the one X coopMatLoad: sX8,sg*512 -> sE8,sg*2048",
+    "//     L{B0}-L{B2}  NEW comment + subgroupBarrier(): all X reads done before",
+    "//                  any lane writes E over those 512 bytes",
+    "//   c32_i8_common.glsl: nr_i8_put_x writes sE8 (was sX8), index math untouched.",
+    "//   Untouched: expand/contract math, K order, scale indices, invX/invE,",
+    "//   RNE/clamp/narrow, dequant, seeds, P/den, history.",
+    "// ===========================================================================",
+]
+
+BARRIER_INS = [
+    "            // B1 rendezvous: the single X read above is complete for every lane of",
+    "            // this subgroup; only now may E overwrite those same 512 shared bytes.",
+    "            subgroupBarrier();",
+]
+
+COMMON_INS = [
+    "// B1: X lands in the first 512 B of this subgroup's sE8 slot (sgoff = sg*2048).",
+    "// Those bytes are the same slab E uses for features 0..31 (slot offset 0..511).",
+]
+
+
+def sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def split_keep(data):
+    """split on \n but keep the terminator, so joining is byte-exact"""
+    out = []
+    i = 0
+    while i < len(data):
+        j = data.find(b"\n", i)
+        if j < 0:
+            out.append(data[i:])
+            break
+        out.append(data[i:j + 1])
+        i = j + 1
+    return out
+
+
+def main():
+    raw = (SRC_P / "c32_body1_i8.comp").read_bytes()
+    assert sha(raw) == PARENT_COMP_SHA, "parent source is not the sealed parent"
+    lines = split_keep(raw)
+    assert len(lines) == 1427, len(lines)
+    nl = b"\r\n"
+
+    def at(n):
+        return lines[n - 1]
+
+    # ---- 1. the deleted declaration (parent line 39) --------------------------
+    old = b"shared int8_t sX8[2048];" + nl
+    assert at(39) == old, repr(at(39))
+    new_decl = (b"// B1: shared int8_t sX8[2048]; deleted -- X aliases the first 512 B of"
+                b" this subgroup's sE8 slot." + nl)
+    lines[38] = new_decl
+
+    # ---- 2. the four X publish call sites (parent 225..228) ------------------
+    for n, comp in ((225, b"x0"), (226, b"x1"), (227, b"x2"), (228, b"x3")):
+        old = b"        nr_i8_put_x(" + comp + b", "
+        assert at(n).startswith(old), (n, repr(at(n)))
+        assert at(n).endswith(b"sg * 512u);" + nl), (n, repr(at(n)))
+        lines[n - 1] = at(n)[:-len(b"sg * 512u);" + nl)] + b"sg * 2048u);" + nl
+
+    # ---- 3. the single X cooperative-matrix load (parent 267) ---------------
+    assert at(267) == b"            coopMatLoad(xb8, sX8, sg * 512u, 32u, LCOL);" + nl, \
+        repr(at(267))
+    lines[266] = b"            coopMatLoad(xb8, sE8, sg * 2048u, 32u, LCOL);" + nl
+
+    # ---- 4. new subgroup barrier right after the X read ---------------------
+    ins = [x.encode() + nl for x in BARRIER_INS]
+    body = lines[:267] + ins + lines[267:]
+
+    # ---- 5. fill the header line numbers from the built text ----------------
+    h = len(HEADER)
+    decl_line = h + 39
+    px0, px1 = h + 225, h + 228
+    load_line = h + 267
+    b0, b2 = h + 268, h + 270
+    head = []
+    for ln in HEADER:
+        head.append(ln.format(DECL=decl_line, PX0=px0, PX1=px1, LOAD=load_line,
+                              B0=b0, B2=b2))
+    assert len(head) == h
+    cand = b"".join(x.encode() + nl for x in head) + b"".join(body)
+
+    # ---- 6. verify the asserted line numbers really hold --------------------
+    cl = split_keep(cand)
+    assert cl[decl_line - 1].startswith(b"// B1: shared int8_t sX8[2048]; deleted")
+    assert cl[px0 - 1].startswith(b"        nr_i8_put_x(x0, 0u, sg * 2048u);")
+    assert cl[px1 - 1].startswith(b"        nr_i8_put_x(x3, 24u, sg * 2048u);")
+    assert cl[load_line - 1].strip() == b"coopMatLoad(xb8, sE8, sg * 2048u, 32u, LCOL);"
+    assert cl[b0 - 1].strip().startswith(b"// B1 rendezvous:")
+    assert cl[b2 - 1].strip() == b"subgroupBarrier();"
+    assert cl[b2].strip() == b"I8A wa;", cl[b2]
+    (SRC_C / "c32_body1_i8.comp").write_bytes(cand)
+
+    # ---- 7. common file -----------------------------------------------------
+    craw = (SRC_P / "c32_i8_common.glsl").read_bytes()
+    clines = split_keep(craw)
+    assert len(clines) == 61, len(clines)
+    assert clines[44] == b"// X fragment rows are 8 channels, columns are 16 tokens" \
+                         b" (original tiled input layout).\n", repr(clines[44])
+    assert clines[48] == b"        sX8[sgoff + rc.y * 32u + cbase + rc.x] = " \
+                         b"int8_t(nr_i8_code(x[i], fsc[1]));\n", repr(clines[48])
+    clines[48] = clines[48].replace(b"sX8[", b"sE8[", 1)
+    c_ins = [x.encode() + b"\n" for x in COMMON_INS]
+    clines = clines[:45] + c_ins + clines[45:]
+    ccommon = b"".join(clines)
+    cl2 = split_keep(ccommon)
+    assert cl2[45].startswith(b"// B1: X lands in the first 512 B")
+    assert cl2[47] == b"void nr_i8_put_x(NRH_CH x, uint cbase, uint sgoff) {\n"
+    assert cl2[50].strip().startswith(b"sE8[sgoff + rc.y * 32u")
+    (SRC_C / "c32_i8_common.glsl").write_bytes(ccommon)
+
+    # ---- 8. register_handoff.glsl stays verbatim ---------------------------
+    (SRC_C / "register_handoff.glsl").write_bytes(
+        (SRC_P / "register_handoff.glsl").read_bytes())
+
+    rec = {
+        "card": "b1-c32-xe-reuse",
+        "parent_source_sha256": sha(raw),
+        "candidate_comp_sha256": sha(cand),
+        "candidate_comp_bytes": len(cand),
+        "parent_comp_lines": 1427,
+        "candidate_comp_lines": len(cl),
+        "header_lines": h,
+        "edits": [
+            {"file": "c32_body1_i8.comp", "parent_line": 39,
+             "candidate_line": decl_line, "op": "replace",
+             "was": "shared int8_t sX8[2048];",
+             "now": "// B1: ... deleted -- X aliases the first 512 B of this "
+                    "subgroup's sE8 slot."},
+            {"file": "c32_body1_i8.comp", "parent_line": [225, 226, 227, 228],
+             "candidate_line": [px0, px1], "op": "replace",
+             "was": ["nr_i8_put_x(x0, 0u, sg * 512u)", "nr_i8_put_x(x1, 8u, sg * 512u)",
+                     "nr_i8_put_x(x2, 16u, sg * 512u)", "nr_i8_put_x(x3, 24u, sg * 512u)"],
+             "now": "sg * 512u -> sg * 2048u (4 sites)"},
+            {"file": "c32_body1_i8.comp", "parent_line": 267,
+             "candidate_line": load_line, "op": "replace",
+             "was": "coopMatLoad(xb8, sX8, sg * 512u, 32u, LCOL);",
+             "now": "coopMatLoad(xb8, sE8, sg * 2048u, 32u, LCOL);"},
+            {"file": "c32_body1_i8.comp", "parent_line": None,
+             "candidate_line": [b0, b1 := b0 + 1, b2], "op": "insert",
+             "now": "2 comment lines + subgroupBarrier(); after the X read, "
+                    "before the first E write"},
+            {"file": "c32_i8_common.glsl", "parent_line": [45, 46],
+             "candidate_line": [45, 46], "op": "insert", "now": "2 comment lines"},
+            {"file": "c32_i8_common.glsl", "parent_line": 49, "candidate_line": 51,
+             "op": "replace", "was": "sX8[sgoff + rc.y * 32u + cbase + rc.x]",
+             "now": "sE8[sgoff + rc.y * 32u + cbase + rc.x]"},
+        ],
+        "source_sha256": {
+            "parent/c32_body1_i8.comp": sha(raw),
+            "parent/c32_i8_common.glsl": sha(craw),
+            "parent/register_handoff.glsl": sha(
+                (SRC_P / "register_handoff.glsl").read_bytes()),
+            "candidate/c32_body1_i8.comp": sha(cand),
+            "candidate/c32_i8_common.glsl": sha(ccommon),
+            "candidate/register_handoff.glsl": sha(
+                (SRC_P / "register_handoff.glsl").read_bytes()),
+        },
+    }
+    (LOG / "CHANGE-SET.json").write_text(json.dumps(rec, indent=1) + "\n",
+                                         encoding="utf-8")
+    print("wrote candidate source; changes:", len(rec["edits"]))
+    print("candidate comp sha256:", rec["candidate_comp_sha256"])
+    print("header lines:", h, "decl:", decl_line, "put_x:", px0, px1,
+          "load:", load_line, "barrier:", b0, b2)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

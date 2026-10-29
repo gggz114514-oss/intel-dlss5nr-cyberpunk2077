@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Emit GPU-JOBS-TEMPLATE.json: the minimal GPU job set for S13, not executed here.
+
+Groups
+  A  autonomous-feedback chains for the three formal sequences (7 chained runs each;
+     the sequence head reuses the existing candidate run, which already used the
+     captured FP16 history for that frame)
+  B  independent scene / holdout: BLOCKED, no capture exists (needs the user to play and
+     capture new scenes under CAPTURE-CONTRACT.txt)
+  C  same-batch paired timing: FP16 baseline vs current static candidate vs original
+     corrected INT8, one frame, identical protocol
+
+Nothing in the output template has been run.  GPU work needs the single GPU.lock, a
+closed game, one queue, and the main executor.  This script only writes JSON.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+SELF_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SELF_DIR))
+
+import feedback_plan as fp  # noqa: E402
+
+TAGS = {
+    "day-street-static-formal-01": "s01",
+    "day-street-motion-formal-01": "m01",
+    "day-street-motion-formal-02": "m02",
+}
+PY = (fp.Q / "tool-env/Scripts/python.exe").as_posix()
+RUNNER = fp.RUNNER.as_posix()
+TOOL = (SELF_DIR / "feedback_plan.py").as_posix()
+QUALITY = (SELF_DIR / "quality_report.py").as_posix()
+CANDIDATE = fp.CANDIDATE_DIR.as_posix()
+DATASET = fp.DATASET.as_posix()
+FP16_REPLAY = (fp.Q / "capture-buffered/formal-replay-24").as_posix()
+ORIGINAL_INT8 = (fp.D / "int8-{frame}.txt").as_posix()
+
+
+def sha(path: Path) -> str:
+    h = hashlib.sha256()
+    h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def feedback_jobs(geometry, out_root: str, stage_root: str) -> list:
+    jobs = []
+    for sequence in fp.FORMAL_SEQUENCES:
+        frames = fp.list_frames(sequence)
+        tag = TAGS[sequence]
+        head = frames[0]
+        head_run = f"{CANDIDATE}/run-{head}"
+        for pos, frame in enumerate(frames):
+            plan_out = f"{out_root}/{sequence}/plan-{frame}.txt"
+            receipt = f"{out_root}/{sequence}/receipt-{frame}.json"
+            run_dir = f"{out_root}/{sequence}/run-{frame}"
+            capture = f"{DATASET}/{sequence}/0-{frame}/capture.json"
+            if pos == 0:
+                job = {
+                    "id": f"FB-{tag}-{frame}",
+                    "kind": "feedback_chain_head_reuse",
+                    "sequence": sequence,
+                    "frame": frame,
+                    "chain_index": 0,
+                    "status": "TEMPLATE_REUSE_EXISTING_RUN",
+                    "gpu_required": False,
+                    "why_no_run": ("the head plan differs from the frozen candidate plan only in the OUTPUT "
+                                   "file name, so the existing candidate run is already the captured-history result"),
+                    "existing_run": head_run,
+                    "existing_output": f"{head_run}/replayed-network.bin",
+                    "identity_check": [
+                        f"plan sha256 must equal the frozen combo-{frame}.txt sha256",
+                        "planlib diff versus the head plan must list only the OUTPUT line",
+                        "output sha256 recorded in the ledger",
+                    ],
+                    "candidate_plan": f"{CANDIDATE}/combo-{frame}.txt",
+                    "candidate_plan_sha256": sha(Path(f"{CANDIDATE}/combo-{frame}.txt")),
+                    "capture": capture,
+                    "history_source": {
+                        "type": "CAPTURED_FP16_HISTORY",
+                        "detail": "the history this captured frame actually consumed, injected once at the sequence head",
+                        "plane_offset_in_output": geometry.source_offset,
+                        "plane_bytes": geometry.plane_bytes,
+                        "input_plane_offset": sorted(set(geometry.destinations.values()))[0],
+                        "consumed_by_all_frames_after_this_one": True,
+                    },
+                }
+                jobs.append(job)
+                continue
+            prev = frames[pos - 1]
+            prev_run = head_run if pos == 1 else f"{out_root}/{sequence}/run-{prev}"
+            prev_output_name = "replayed-network.bin" if pos == 1 else fp.OUTPUT_NAME
+            stage_argv = [
+                PY, "-X", "utf8", TOOL, "build",
+                "--sequence", sequence, "--frame", str(frame),
+                "--prev-run", prev_run, "--prev-frame", str(prev),
+                "--prev-output-name", prev_output_name,
+                "--stage-dir", f"{stage_root}/{sequence}",
+                "--plan-out", plan_out, "--receipt", receipt, "--out-run", run_dir,
+            ]
+            jobs.append({
+                "id": f"FB-{tag}-{frame}",
+                "kind": "feedback_chain_step",
+                "sequence": sequence,
+                "frame": frame,
+                "chain_index": pos,
+                "status": "TEMPLATE_NOT_RUN",
+                "gpu_required": True,
+                "depends_on": f"FB-{tag}-{prev}",
+                "candidate_plan": f"{CANDIDATE}/combo-{frame}.txt",
+                "candidate_plan_sha256": sha(Path(f"{CANDIDATE}/combo-{frame}.txt")),
+                "capture": capture,
+                "history_source": {
+                    "type": "PREDECESSOR_CANDIDATE_OUTPUT",
+                    "predecessor_frame": prev,
+                    "predecessor_run": prev_run,
+                    "predecessor_output": f"{prev_run}/{prev_output_name}",
+                    "plane_offset_in_predecessor_output": geometry.source_offset,
+                    "plane_bytes": geometry.plane_bytes,
+                    "injected_into_input_buffers": {str(k): v for k, v in sorted(geometry.destinations.items())},
+                },
+                "stage": {
+                    "argv": stage_argv,
+                    "produces": [plan_out, receipt],
+                    "composites_bytes_per_frame": 52936784 + 40550480,
+                    "prune_after_receipt": ("derived composites may be deleted once the receipt sha256 is in the "
+                                            "ledger; raw captures must never be deleted"),
+                },
+                "run": {
+                    "argv": [RUNNER, "--plan", plan_out, "--out", run_dir,
+                             "--pool", "--warm", "0", "--reps", "1"],
+                    "out_dir": run_dir,
+                    "output_file": fp.OUTPUT_NAME,
+                    "must_not_pass": ["--feedback"],
+                    "why": ("--feedback copies the plan's own output into its own input and would repeat one image; "
+                            "the chain already injects the real predecessor history"),
+                },
+                "expected": {"plan_sha256": None, "output_sha256": None,
+                             "note": "the stage step writes the plan sha into its receipt; record both in the ledger"},
+                "success_criteria": [
+                    "stage exit 0 and receipt schema 1 with integrity.fp16_history_reinjected == false",
+                    "plan validation problems empty; policy table and PASS/PUSH/BIND identity unchanged",
+                    "runner exit 0; output 29491200 bytes; all finite; NaN/Inf counters zero",
+                    "stage receipt plan sha256 equals the sha256 of the plan actually executed",
+                ],
+            })
+    return jobs
+
+
+def perf_jobs(out_root: str) -> list:
+    frame = 34189
+    arms = [
+        ("fp16-baseline", f"{FP16_REPLAY}/day-street-static-formal-01-{frame}.txt",
+         "production FP16 identity on the same captured input"),
+        ("static-c64", f"{CANDIDATE}/combo-{frame}.txt",
+         "current pure-static C64-family candidate"),
+        ("original-int8", ORIGINAL_INT8.format(frame=frame),
+         "original corrected INT8 baseline for cost context"),
+    ]
+    jobs = []
+    for name, plan, note in arms:
+        out = f"{out_root}/perf/{name}-{frame}"
+        jobs.append({
+            "id": f"PERF-{name}-{frame}",
+            "kind": "paired_timing",
+            "frame": frame,
+            "status": "TEMPLATE_NOT_RUN",
+            "gpu_required": True,
+            "plan": plan,
+            "plan_sha256": sha(Path(plan)),
+            "note": note,
+            "run": {
+                "argv": [RUNNER, "--plan", plan, "--out", out,
+                         "--pool", "--warm", "5", "--reps", "30"],
+                "out_dir": out,
+                "must_not_pass": ["--dump-intermediates", "--per-pass-timing", "--save-frames"],
+                "why": "no instrumentation, no dumps: timing must include quantization overhead, not diagnostics",
+            },
+            "success_criteria": [
+                "runner receipt status GPU_EXECUTED_NUMERIC_PENDING with nan == 0 and inf == 0",
+                "gpu_mean_ms / gpu_median_ms / gpu_p95_ms recorded",
+                "batch repeated twice in opposite order; report both batches, not one",
+            ],
+        })
+    return jobs
+
+
+def build_template() -> dict:
+    geometry, evidence = fp.derive_geometry(fp.Plan(fp.CANDIDATE_DIR / "combo-34189.txt"))
+    out_root = "{GPU_OUT_ROOT}"
+    stage_root = "{GPU_STAGE_ROOT}"
+    feedback = feedback_jobs(geometry, out_root, stage_root)
+    perf = perf_jobs(out_root)
+    feedback_runs = [j["id"] for j in feedback if j["gpu_required"]]
+    minimal = [j for j in feedback_runs if j.startswith("FB-m01-")] + [j["id"] for j in perf]
+    template = {
+        "schema": 1,
+        "kind": "GPU-JOBS-TEMPLATE",
+        "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "executed": False,
+        "warning": ("Template only. Nothing here has been run by the S13 card. GPU work requires the single "
+                    "GPU.lock, a normal game exit, one queue, and the main executor; this file grants no permission."),
+        "placeholders": {
+            "{GPU_OUT_ROOT}": "new directory for the GPU batch, e.g. work/dsh-fullnet-static-20261029/S13-quality/gpu-runs-<date>",
+            "{GPU_STAGE_ROOT}": "new directory for derived feedback composites (about 94 MB per chained frame, prunable after receipts)",
+        },
+        "identity": {
+            "candidate_plan_glob": f"{CANDIDATE}/combo-<frame>.txt",
+            "candidate_example": {"frame": 34189, "sha256": sha(Path(f"{CANDIDATE}/combo-34189.txt"))},
+            "fp16_live_plan_sha256": fp.FP16_LIVE_PLAN_SHA,
+            "corrected_int8_plan_sha256": fp.PLAN_WITH_HISTORY_SHA,
+            "runner": RUNNER,
+            "python": PY,
+            "dataset_root": DATASET,
+        },
+        "history_geometry": geometry.to_json(),
+        "history_geometry_evidence": evidence,
+        "executor_contract": [
+            "acquire @NR_GPU_WORKSPACE@/artifacts/parallel-port-20261013/GPU.lock exclusively; never start the game concurrently",
+            "one GPU queue; the S13 card must not be edited by the executor",
+            "every --out directory must be fresh; never overwrite an existing run",
+            "run the stage step before every chained frame and check the plan sha256 against the stage receipt",
+            "never pass --feedback to the runner",
+            "record plan sha256, output sha256, receipt sha256 and timestamps in the ledger",
+            "do not delete raw captures, prior runs or negative results; derived composites may be pruned after hashing",
+            "report GPU_VERIFICATION only for jobs actually executed; everything else stays NOT_RUN",
+        ],
+        "runner_defaults": {
+            "replay_args": ["--pool", "--warm", "0", "--reps", "1"],
+            "note": "quality replay only; timing jobs use group C's own protocol",
+        },
+        "groups": {
+            "A_autonomous_feedback_chains": {
+                "purpose": ("close the feedback loop with the candidate's own history: sequence head keeps the "
+                            "captured FP16 history, every following frame consumes the previous candidate output"),
+                "jobs": feedback,
+                "gpu_runs_required": len(feedback_runs),
+                "analysis": [
+                    f"{PY} -X utf8 {QUALITY} --output-name feedback-network.bin "
+                    f"--arm chain_a={out_root}/day-street-motion-formal-01/run-{{frame}} "
+                    f"--arm chain_b={out_root}/day-street-motion-formal-02/run-{{frame}} "
+                    f"--arm chain_c={out_root}/day-street-static-formal-01/run-{{frame}} "
+                    f"--baseline chain_a --focus 43655 --out {out_root}/FEEDBACK-QUALITY.json",
+                    "compare each chain against the same frame's captured-FP16-history result (the 24-frame runs) "
+                    "and against the FP16 chain: report per-frame direction, history drift, temporal residual",
+                ],
+                "acceptance": ("NOT a pass/fail line. The question is whether the chain drifts, flickers or "
+                               "accumulates colour bias; the user target is near-invisible difference."),
+            },
+            "B_independent_scene_holdout": {
+                "status": "BLOCKED_INPUT",
+                "jobs": [],
+                "why": "no captured scene outside the three formal daytime sequences exists in this workspace",
+                "required_user_action": [
+                    "play and capture at least two new sequences (8+ consecutive frames each) with the capture build "
+                    "under CAPTURE-CONTRACT.txt: night neon, dark interior, bright/dark transition, fast pan",
+                    "keep per-scene capture/holdout split by contiguous clip, never by random adjacent frames",
+                    "record model/plan/weight identity and NR style/strength/resolution per sequence",
+                ],
+                "planned_job_shape": {
+                    "id": "HOLD-<scene>-<frame>",
+                    "kind": "holdout_replay_or_chain",
+                    "status": "BLOCKED_NO_INPUT",
+                    "note": "same stage/run shape as group A once captures exist; parameters stay frozen from the "
+                            "calibration scenes",
+                },
+                "gap": "cross-scene generalisation is UNPROVEN; do not describe the 24 frames as independent holdout",
+            },
+            "C_same_batch_timing": {
+                "purpose": ("paired end-to-end timing in one batch so clock/thermal state is shared: FP16 baseline "
+                            "vs static C64 candidate vs original INT8"),
+                "jobs": perf,
+                "protocol": [
+                    "game closed, GPU idle, lock held, single queue",
+                    "warm 5, reps 30, pooled allocation, identical command shape for all arms",
+                    "no dumps, no per-pass timing, no frame saving inside the timing batch",
+                    "repeat the batch a second time in opposite order and report both",
+                    "report median and p95, plus whether any pass regressed >5 %",
+                ],
+                "not_measured_here": [
+                    "per-pass attribution (separate diagnostic run, not comparable)",
+                    "native scratch/spill accounting (needs the native inspection tool, not shipped here)",
+                    "the staging cost of the feedback composites (host-side, outside the network timer)",
+                ],
+            },
+        },
+        "minimal_set": {
+            "description": ("smallest set that can decide whether autonomous feedback is viable and whether the "
+                            "candidate costs more than FP16: one motion chain plus the paired timing batch"),
+            "job_ids": minimal,
+            "gpu_runs": len(minimal),
+            "then_conditional": [j for j in feedback_runs if not j.startswith("FB-m01-")],
+            "conditional_reason": "extend to the remaining two chains only after the first chain shows no drift blow-up",
+        },
+        "not_included": [
+            "any GPU execution by this card (this file is a template)",
+            "production deployment of capture-bound combo plans",
+            "user visual acceptance / screenshot comparison",
+            "full-net pure-static closure: attention Q/K/V/P dynamic amax positions remain open (S10/S11)",
+        ],
+    }
+    return template
+
+
+def main() -> int:
+    template = build_template()
+    out = SELF_DIR / "GPU-JOBS-TEMPLATE.json"
+    out.write_text(json.dumps(template, indent=2, ensure_ascii=False), encoding="utf-8")
+    jobs_a = len(template["groups"]["A_autonomous_feedback_chains"]["jobs"])
+    runs_a = template["groups"]["A_autonomous_feedback_chains"]["gpu_runs_required"]
+    runs_c = len(template["groups"]["C_same_batch_timing"]["jobs"])
+    print(json.dumps({
+        "out": str(out),
+        "feedback_jobs": jobs_a,
+        "feedback_gpu_runs": runs_a,
+        "timing_jobs": runs_c,
+        "minimal_gpu_runs": template["minimal_set"]["gpu_runs"],
+    }, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

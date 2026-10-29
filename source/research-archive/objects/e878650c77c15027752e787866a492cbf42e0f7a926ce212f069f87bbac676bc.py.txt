@@ -1,0 +1,965 @@
+"""Fold the S03 / S12 UNKNOWN closures into a V2 ledger (does NOT touch the v1 files).
+
+Inputs (read-only):
+  ledger/FULLNET-ROWS.json                    v1 rows (288 dispatches / 426 entries)
+  ledger/evidence/reclassification-probe.json independent SPIR-V re-scan (verify_cards.py)
+  S12-proj/PROJ-ROWS.json                     36-edge closure + 2 named ledger defects
+  S03-tail/TAIL-RISKS.json, TAIL-CONTRACT.json R7 (F2 / F20 / b39 are known-dynamic) + R8 (b70 12 vs 14)
+  shader sources cited per edge (never recompiled, identity is basename+line, same evidence class as v1)
+
+Outputs (write zone = ledger/ only):
+  FULLNET-ROWS-V2.json
+  DYNAMIC-SCALE-REMAINDERS-V2.json
+  SCALE-CLASS-SUMMARY-V2.json
+  RECLASSIFICATION.md
+  evidence/reclassification-probe.json is read, not rewritten here.
+
+Run:
+  python -X utf8 work/dsh-fullnet-static-20261029/ledger/_work/build_v2.py
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import sys
+from collections import Counter, OrderedDict
+from pathlib import Path
+
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/ledger/_work")
+
+L = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/ledger"
+S03 = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S03-tail"
+S12 = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S12-proj"
+
+V1_ROWS = L + r"/FULLNET-ROWS.json"
+V1_REMAINDERS = L + r"/DYNAMIC-SCALE-REMAINDERS.json"
+V1_SUMMARY = L + r"/SCALE-CLASS-SUMMARY.json"
+PROBE = L + r"/evidence/reclassification-probe.json"
+S03_RISKS = S03 + r"/TAIL-RISKS.json"
+S12_ROWS = S12 + r"/PROJ-ROWS.json"
+
+OUT_ROWS = L + r"/FULLNET-ROWS-V2.json"
+OUT_REMAINDERS = L + r"/DYNAMIC-SCALE-REMAINDERS-V2.json"
+OUT_SUMMARY = L + r"/SCALE-CLASS-SUMMARY-V2.json"
+OUT_MD = L + r"/RECLASSIFICATION.md"
+
+V1_ROWS_SHA = "3e9281ea3d90fe4a6ab763057f2374b9b40417e0a03b5ca9cb989c173713e6af"
+V1_REMAINDERS_SHA = "31c95bfb09ed924317d77ab74357e06a3941abc6e0b54ca6cdd032c6e254995c"
+V1_SUMMARY_SHA = "f7908f7ab7958a6722396bfd1a66648fa95adff81f9a43bfa18edd197c910ac0"
+
+EXPECTED_V1_CLASSES = {"STATIC_REFINED": 32, "STATIC_COARSE": 168, "DYNAMIC_RUNTIME": 190, "UNKNOWN": 36}
+EXPECTED_V2_CLASSES = {"STATIC_REFINED": 32, "STATIC_COARSE": 170, "DYNAMIC_RUNTIME": 223, "UNKNOWN": 0}
+
+
+def sha_file(p: str) -> str:
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+# --------------------------------------------------------------------------- evidence strings
+C64_WO_EV = (
+    "SRC r07-output-proj/source/candidate/c64_complete_d4_int8.comp L93-121: one amax over the workgroup's own "
+    "4096 gT half values, then inv=127/m and sC=m/127, code point = RNE(x*invC) clamped +/-127. SPV "
+    "r07_c64_output_wo_i8.spv: FAbs 1, 2x OpFDiv by 127.0, 127.0 present, no 1/127; the only bound scale "
+    "buffer is the static per-output-channel weight pack r07_c64_b*_wosc (256 B). The A side is measured "
+    "in the kernel, not read from a pack (S12 PROJ-ROWS: C64 WO A-side -> DYNAMIC_RUNTIME)."
+)
+C256_WO_EV = (
+    "SRC r07-c256-wo-merged/source/c256_output_qx_int8_wo_i8.comp L109-131: one amax over the workgroup's own "
+    "16384 gT half values, shScale[0]=127/m, shScale[1]=m/127, code point = RNE(x*invC) clamped +/-127. SPV "
+    "r07m_c256_wo_qx_i8.spv({qxlast}): FAbs 1, 2x OpFDiv by 127.0, 127.0 present, no 1/127; the only bound "
+    "scale buffer is the static weight pack r07m_c256_b*_wosc (1024 B). A side measured in the kernel "
+    "(S12 PROJ-ROWS: C256 WO A-side -> DYNAMIC_RUNTIME)."
+)
+DS5_EV = (
+    "SRC r03-ioport4/source/candidate/r03_ioport4_i8.comp L51-52 (scale table: 0 sV, 1 invV=127/sV), L67 "
+    "'precise float invV=sc[1]', L80 one static code point; L88-94 ONE coopMatLoad(aa) is multiplied by TWO N16 "
+    "B fragments (bb at n0, bb1 at n0+16) -> one matrix edge, not two. SPV r03_ioport4_i8.spv: 2 INT8 MMA "
+    "sharing one A operand, 0 FAbs, 0 OpFDiv; binding 4 = r03_ioport4_ds_scales (5120 B, file-backed) and no "
+    "wo_i8/wosc pair is bound -> STATIC_COARSE (S12 defect 1: this dispatch has no 'WO' edge)."
+)
+DS25_WO_EV = (
+    "SRC r09_f3c64_body_ds_wo_i8.comp L132-159: per-workgroup amax over the window's own gT halves, inv=127/m, "
+    "sC=m/127, then the RNE code point. SPV r09_f3c64_body_ds_wo_i8.spv: FAbs 1, 2x OpFDiv by 127.0 -> the WO "
+    "A side is measured in the kernel (S12: DS WO edge A-side -> DYNAMIC_RUNTIME)."
+)
+DS25_DS_EV = (
+    "SRC r09_f3c64_body_ds_wo_i8.comp L50 ('nrf_mean[...] = ENTRY_Q(clamp(roundEven(float(v)*entry_sc[4])))') "
+    "and L315 ('precise float scaled=float(v)*entry_sc[4]'): the DS A side reads a FILE-backed scale slot and "
+    "measures no amax. The kernel has exactly ONE FAbs in total (the WO one) and 2x OpFDiv-by-127.0, so no "
+    "second reduction exists; binding 11 = chain_scales (4160 B, chain-scales-*.f32.bin) -> STATIC_COARSE "
+    "(S12 defect 2: r09 has no own DS scale pack, it reads entry_sc[4])."
+)
+DS49_WO_EV = (
+    "SPV r10_f3c128_body_ds_wo_ds_i8.spv: FAbs 2 and 4x OpFDiv by 127.0 -> two independent in-kernel amax "
+    "sites, one per matrix edge; the WO weight scale is the static r10_c128_wosc pack (512 B) but the WO "
+    "ACTIVATION is measured in the kernel (S12: DS WO edge A-side -> DYNAMIC_RUNTIME). SRC "
+    "r10_f3c128_body_ds_wo_ds_i8.comp follows the r09 template quoted for the same reduction."
+)
+DS49_DS_EV = (
+    "SPV r10_f3c128_body_ds_wo_ds_i8.spv: the second FAbs / 2 further OpFDiv-by-127.0 sites belong to the DS "
+    "path, so the DS activation is measured in the kernel (the dssc pack, 1024 B, only carries the static "
+    "per-output-channel DS weight scales) (S12: DS projection A-side -> DYNAMIC_RUNTIME)."
+)
+DS83_WO_EV = (
+    "SPV r11_f3c256_body_ds_wo_ds_i8.spv: FAbs 2 and 4x OpFDiv by 127.0 -> two independent in-kernel amax "
+    "sites, one per matrix edge; the WO weight scale is the static r11_c256_wosc pack (1024 B) but the WO "
+    "ACTIVATION is measured in the kernel (S12: DS WO edge A-side -> DYNAMIC_RUNTIME)."
+)
+DS83_DS_EV = (
+    "SPV r11_f3c256_body_ds_wo_ds_i8.spv: the second FAbs / 2 further OpFDiv-by-127.0 sites belong to the DS "
+    "path, so the DS activation is measured in the kernel (the dssc pack, 2048 B, only carries the static "
+    "per-output-channel DS weight scales) (S12: DS projection A-side -> DYNAMIC_RUNTIME)."
+)
+PROJ_EV = {
+    167: ("SRC r16-r18-r19-proj/source/candidate/r16_b39_project_blend_i8mma.comp L122-135: amax over this "
+          "row's own x values, inv3=127/m3, codes = RNE(x*inv3), then the epilogue publishes amax/127 = 1/inv3 "
+          "(R17-FIX-A). SPV r16_b39_project_blend_i8mma.spv: FAbs 1, 1x OpFDiv by 127.0 (2 OpFDiv in total), "
+          "127.0 present -> one in-kernel amax per row (S03 R7 b39 = 1 amax site; S12: cross-family projection "
+          "A-side -> DYNAMIC_RUNTIME)."),
+    201: ("SRC r17-fix-a-dequant/source/c3x_pre_c256_i8mma.comp L112-131: amax over the row's own half values, "
+          "inv3=127/m3, codes = RNE(x*inv3), nr3_srow[r3]=1/inv3 (amax/127) at L131 (R17-FIX-A). SPV "
+          "r17_pre_c256_i8_fixa.spv: FAbs 1, 1x OpFDiv by 127.0, 127.0 present -> one in-kernel amax per row "
+          "(S12: cross-family projection A-side -> DYNAMIC_RUNTIME; S12 cites r17 L112-131)."),
+    234: ("SRC r16-r18-r19-proj/source/candidate/r18_pre_c128_i8mma.comp L119-132: amax over the row's own "
+          "values, inv3=127/m3, codes = RNE(x*inv3), dequant published as amax/127 (R17-FIX-A). SPV "
+          "r18_pre_c128_i8mma.spv: FAbs 1, 1x OpFDiv by 127.0, 127.0 present -> one in-kernel amax per row "
+          "(S12: cross-family projection A-side -> DYNAMIC_RUNTIME)."),
+    260: ("SRC r16-r18-r19-proj/source/candidate/r19_pre_c64_i8mma.comp L131-146: amax over the row's own "
+          "values, inv3=127/m3, codes = RNE(x*inv3), rowF=1/inv3 (amax/127, R17-FIX-A). SPV "
+          "r19_pre_c64_i8mma.spv: FAbs 1, 1x OpFDiv by 127.0, 127.0 present -> one in-kernel amax per row "
+          "(S12: cross-family projection A-side -> DYNAMIC_RUNTIME)."),
+}
+F2_EV = (
+    "SRC corrected-20261029/source/c32_i8_common.glsl L18-27: two scale kinds, 'dynamic: an activation scale "
+    "computed inside the kernel from the very values that get quantised ... never folded into a static tap'; "
+    "L42-43 'This card has no static activation scale at all'. SPV f2.spv: 14x OpFDiv by 127.0 (15 OpFDiv "
+    "total), FAbs 3, FMax3 5, 127.0 present, no 1/127, 53 INT8 MMA; only the static weight/body scale packs "
+    "are bound (c32_b66_i8_scales 656 B, c32_f2_i8_body_scales 640 B) -> no static activation scale at any of "
+    "the 14 quantiser sites (S03 R7, S12)."
+)
+F20_EV = (
+    "SRC c32-f1-f2-b70/source/c32_lifetime_b70_i8.comp L24-36 enumerates the activation scales as "
+    "'self-scaling, not a calibrated constant': X, E, Y, Q, K, P, V, Ctx (8 named); L164-185 NR_SG_SCALE "
+    "computes the subgroup amax then _s/127.0; L188-199 nr_wg_scale computes s/127.0. SPV b70_i8_full.spv: "
+    "9 FAbs, 7x OpFDiv by 127.0 (16 OpFDiv total), 12 INT8 MMA. On the count discrepancy: S03 R8 shows the "
+    "source header's '14' is the FP16 parent's logical step count while the binary has 12 INT8 MMA -> the SPV "
+    "count is authoritative. Dynamic (S03 R7, S12)."
+)
+
+# --------------------------------------------------------------------------- patch table
+# ordinal -> dict(edges={index: (class, confidence, evidence)}, retract=[indices], card, ref,
+#                 reason, custom_status_reason, note)
+P = OrderedDict()
+
+for o in (10, 15, 20, 265, 270, 275, 280):
+    P[o] = dict(edges={0: ("DYNAMIC_RUNTIME", "HIGH", C64_WO_EV)}, card="S12",
+                ref="PROJ-ROWS.json ledger_unknown_closure ordinal %d (C64 WO A-side)" % o)
+for o in (54, 58, 62, 66, 70, 74, 78, 205, 209, 213, 217, 221, 225, 229, 233):
+    qx = "qxlast variant" if o in (78, 233) else "merged variant"
+    P[o] = dict(edges={0: ("DYNAMIC_RUNTIME", "HIGH", C256_WO_EV.format(qxlast=qx))}, card="S12",
+                ref="PROJ-ROWS.json ledger_unknown_closure ordinal %d (C256 WO A-side)" % o)
+
+P[5] = dict(edges={1: ("STATIC_COARSE", "HIGH", DS5_EV)}, retract=[0], card="S12",
+            ref="PROJ-ROWS.json ledger_unknown_closure ordinals 5 (DS 'WO' edge = RETRACTED, DS projection "
+                "A-side = STATIC_COARSE) + observed_ledger_defects[0]",
+            status_reason="single real matrix edge (DS projection) carries a static scale read from the bound "
+                          "r03_ioport4_ds_scales pack (sc[1]=127/sV); the second 'WO' edge of the v1 template "
+                          "does not exist and was retracted")
+P[25] = dict(edges={0: ("DYNAMIC_RUNTIME", "HIGH", DS25_WO_EV), 1: ("STATIC_COARSE", "HIGH", DS25_DS_EV)},
+             card="S12",
+             ref="PROJ-ROWS.json ledger_unknown_closure ordinals 25 (WO -> DYNAMIC_RUNTIME, DS -> "
+                 "STATIC_COARSE) + observed_ledger_defects[1]",
+             status_reason="WO A-side measured in kernel (r09 L132-159); DS A-side static via entry_sc[4] of "
+                           "chain_scales (r09 L50/L315) - the v1 family template hid this difference")
+P[49] = dict(edges={0: ("DYNAMIC_RUNTIME", "HIGH", DS49_WO_EV), 1: ("DYNAMIC_RUNTIME", "HIGH", DS49_DS_EV)},
+             card="S12", ref="PROJ-ROWS.json ledger_unknown_closure ordinals 49 (DS WO + DS projection both "
+                              "DYNAMIC_RUNTIME)")
+P[83] = dict(edges={0: ("DYNAMIC_RUNTIME", "HIGH", DS83_WO_EV), 1: ("DYNAMIC_RUNTIME", "HIGH", DS83_DS_EV)},
+             card="S12", ref="PROJ-ROWS.json ledger_unknown_closure ordinals 83 (DS WO + DS projection both "
+                              "DYNAMIC_RUNTIME)")
+for o in (167, 201, 234, 260):
+    P[o] = dict(edges={0: ("DYNAMIC_RUNTIME", "HIGH", PROJ_EV[o])}, card="S12",
+                ref="PROJ-ROWS.json ledger_unknown_closure ordinal %d (cross-family projection A-side)" % o)
+P[281] = dict(edges={0: ("DYNAMIC_RUNTIME", "HIGH", F2_EV)}, card="S03",
+              ref="TAIL-RISKS.json R7 (F2 source: no static activation scale) + S12 PROJ-ROWS ordinal 281")
+P[286] = dict(edges={0: ("DYNAMIC_RUNTIME", "HIGH", F20_EV)}, card="S03",
+              ref="TAIL-RISKS.json R7 (F20 8 in-kernel amax) + R8 (12 vs 14 MMA) + S12 PROJ-ROWS ordinal 286")
+
+# Positions the two cards do NOT close; kept as conflicts, never silently reclassified.
+CONFLICTS = [
+    {
+        "id": "C1",
+        "where": "ordinal 120 vit_block31_ffn_expand and ordinal 169 split16_b40_l0",
+        "rows_say": "STATIC_COARSE, status CLOSED (v1 evidence: 'vit_nb04_expand_int8.comp (14 lines, no scale "
+                    "math)' / 'split16_l0_s23_qx.spv 8 int8 MMA')",
+        "s12_says": "PROJ-ROWS.json keeps both UNKNOWN ('FAbs present but no 127.0 division, so the scale "
+                    "derivation is ambiguous from the SPV alone'); they are qx/expand positions, not WO, and "
+                    "belong to S07/S08",
+        "measured": "both SPVs: FAbs 1, FMax3 2, Fma 2, RoundEven 1, 127.0 present, ZERO OpFDiv, no 1/127. A "
+                    "reduction exists, so the v1 evidence text 'no scale math' is wrong, but with no /127 the "
+                    "derivation cannot be called either static or dynamic from the SPV alone",
+        "action": "kept at STATIC_COARSE / CLOSED in V2 (not part of the 36, no positive evidence for either "
+                  "class); flagged for S07/S08. This is the only respect in which 'UNKNOWN = 0' is a "
+                  "ledger-scope statement.",
+    },
+    {
+        "id": "C2",
+        "where": "v1 evidence prose of the 7 C64 WO rows (ordinals 10,15,20,265,270,275,280)",
+        "rows_say": "v1 evidence string: 'SPV has no 1/127 and no FAbs reduction'",
+        "contradiction": "the same v1 row's machine record already carries spv.ext_inst.FAbs = 1",
+        "measured": "r07_c64_output_wo_i8.spv: FAbs 1, 2x OpFDiv by 127.0",
+        "action": "prose was stale, machine record and S12 agree; V2 replaces the prose and keeps the measured "
+                  "numbers (no class conflict: v1 called it UNKNOWN, V2 DYNAMIC_RUNTIME on the new source "
+                  "evidence)",
+    },
+]
+
+DEFERRED = [
+    {"id": "D1", "from": "S03 R3",
+     "request": "add a separate 'scalar float MAC' class for the tail exit projection (io-f27-surfaces.spv, "
+                "sha b7720bd7169b3510a71f4ae56f0d26725b5df341f87b7b7c3d1016125783ed3d, 25536 B: 4 outputs x "
+                "32 channels per pixel = 128 fp16 MAC/pixel, 117.9M MAC/frame, 0 cooperative matrices)",
+     "why_deferred": "it is a new class over an entry that currently has no INT8 matrix edge (ordinal 287 "
+                     "ioport_block70_2 is family 'tail' / NO_MATRIX; its SPV sha256 b7720bd7… is byte-identical "
+                     "to the io-f27-surfaces.spv S03 cites). Adding it would change the 425-entry denominator "
+                     "and the v2 schema; it is not part of the 36 closures",
+     "status": "OPEN, owned by the ledger owner / S00"},
+    {"id": "D2", "from": "S03 R7",
+     "request": "'190 -> 190 + 10 named' (F2 1 + F20 8 + b39 1)",
+     "why_deferred": "that is a per-named-tensor/site count, not an edge count. V2 follows S12's edge-level "
+                     "closure (33 DYNAMIC_RUNTIME) and records the site counts separately in the remainder "
+                     "caveat. Both numbers are kept, they must not be added together",
+     "status": "documented, no ledger change"},
+]
+
+
+def edge_probe_numbers(probe: dict, ordinal: int) -> dict:
+    for t in probe["targets"]:
+        if t["ordinal"] == ordinal:
+            return {"opfdiv_by_127": t["opfdiv_by_127"], "opfdiv_total": t["opfdiv_total"],
+                    "fabs_ext_inst": t["fabs_ext_inst"], "has_127": t["has_127"],
+                    "has_1_over_127": t["has_1_over_127"], "mma_int8": t["mma_int8"],
+                    "any_scale_buffer_written": t["any_scale_buffer_written"]}
+    return {}
+
+
+def worst_class(row) -> str:
+    cls = {e["scale_A_source"] for e in row["quant_edges"]}
+    if not cls:
+        return "NO_MATRIX"
+    for k in ("DYNAMIC_RUNTIME", "UNKNOWN", "FP16", "STATIC_REFINED", "STATIC_COARSE"):
+        if k in cls:
+            return k
+    return "UNKNOWN"
+
+
+def status_for(row) -> tuple[str, str]:
+    cls = {e["scale_A_source"] for e in row["quant_edges"]}
+    if not row["quant_edges"]:
+        return "CLOSED", "no INT8 matrix edge in this dispatch (blend/IO/quantiser-free kernel)"
+    if "DYNAMIC_RUNTIME" in cls:
+        return "OPEN", ("activation-side scale still measured in kernel (see "
+                        "DYNAMIC-SCALE-REMAINDERS-V2.json)")
+    if "UNKNOWN" in cls:
+        return "OPEN", "activation-side scale provenance not proven (UNKNOWN)"
+    return "CLOSED", "all matrix edges carry a static scale from a bound pack"
+
+
+# --------------------------------------------------------------------------- position metadata
+POSMETA = {
+    "C64": {"WO output projection": ("C64 WO A operand (gT context tile, per-workgroup 64x64 amax)",
+                                     "per workgroup (whole window tile of this dispatch)")},
+    "C256": {"WO output projection": ("C256 WO A operand (gT tile, per-workgroup 256x256 amax)",
+                                      "per workgroup (whole window tile of this dispatch)")},
+    "DS": {"WO output projection": ("DS-family WO A operand (gT window tile, per-workgroup amax)",
+                                    "per workgroup"),
+           "DS downsample projection": ("DS A operand (the projected mean tile, per-workgroup amax)",
+                                        "per workgroup")},
+    "projection": {"cross-family projection (+blend)": (
+        "projection A operand (per row/token amax of this dispatch)",
+        "per row (token); one amax per 8/16/32-row group, not per head")},
+    "F2": {"fused F2 C32 block (FFN+attn+WO)": (
+        "fused F2 block: 14 in-kernel /127 quantiser sites (Y/K/Q per token, P per query, V per dim, ctx, E, O)",
+        "per token / per query / per dimension inside one fused dispatch (14 sites, not split per edge)")},
+    "F20": {"F20 tail body b70 (fused)": (
+        "fused b70 body: 8 named in-kernel activation scales (X, E, Y, Q, K, P, V, Ctx)",
+        "X/E/Y/Q/P/Ctx per 8-token group; K and V one scalar per workgroup tile")},
+}
+STATIC_REPL = {
+    "WO": ("a fixed per-output-channel (or per-tensor) amax bound provable offline for every window the "
+           "dispatch can see (max over the calibration distribution >= max over deployment), folded into the "
+           "weight tap. S12's vertical slice measured a naive pure-static A scale at 0.8763% against 0.6617% "
+           "for the deployed packs, so a real static WO needs a different A-side scheme (per-output-channel A "
+           "or a K-group split) = a new SPV identity, not a pack-only change"),
+    "DS": ("a fixed per-tensor amax bound for the DS activation, provable offline for every window; no "
+           "measurement exists for this position yet"),
+    "projection": ("a fixed per-row amax bound, or a change of granularity (per-column static) - the row amax "
+                   "is data dependent by construction, so a static replacement is a new quantiser, not a "
+                   "recalibration"),
+    "F2": ("no static activation scale exists anywhere in this card's source; staticising it requires a new "
+           "scale pack plus a re-derived kernel and an end-to-end re-measure"),
+    "F20": ("replace the self-scaling amax with a per-tensor bound and recalibrate; the 8 named scales are "
+            "inside one fused kernel, so it needs a new SPV as well"),
+    "attention": ("a fixed per-head (and per-key-slot-independent) amax bound must be provable offline for every "
+                  "window the dispatch can see, i.e. max over the calibration distribution >= max over "
+                  "deployment; then sX=amax/127 is a constant folded into the following weight tap, and "
+                  "sK*sQ / sV*pP must be separable along K (constant in K) so that one scalar per dot replaces "
+                  "the runtime value"),
+}
+
+
+def main() -> None:
+    # ---- integrity of the inputs
+    assert sha_file(V1_ROWS) == V1_ROWS_SHA, "FULLNET-ROWS.json changed since v1 was documented"
+    assert sha_file(V1_REMAINDERS) == V1_REMAINDERS_SHA, "v1 remainders changed"
+    assert sha_file(V1_SUMMARY) == V1_SUMMARY_SHA, "v1 summary changed"
+    v1 = json.load(open(V1_ROWS, encoding="utf-8"))
+    v1_rem = json.load(open(V1_REMAINDERS, encoding="utf-8"))
+    v1_sum = json.load(open(V1_SUMMARY, encoding="utf-8"))
+    probe = json.load(open(PROBE, encoding="utf-8"))
+    s12 = json.load(open(S12_ROWS, encoding="utf-8"))
+    s03 = json.load(open(S03_RISKS, encoding="utf-8"))
+
+    rows = v1["rows"]
+    by_ord = {r["ordinal"]: r for r in rows}
+    assert len(rows) == 288
+
+    before = Counter(e["scale_A_source"] for r in rows for e in r["quant_edges"])
+    assert dict(before) == EXPECTED_V1_CLASSES, before
+    v1_unknown = {(r["ordinal"], i) for r in rows for i, e in enumerate(r["quant_edges"])
+                  if e["scale_A_source"] == "UNKNOWN"}
+    assert len(v1_unknown) == 36, len(v1_unknown)
+
+    # the closure must be exactly the 36 UNKNOWN positions, by ordinal
+    closure = {}
+    for c in s12["ledger_unknown_closure"]:
+        closure.setdefault(c["ordinal"], []).append(c)
+    s12_ords = sorted({c["ordinal"] for c in s12["ledger_unknown_closure"]})
+    assert set(s12_ords) == {o for o, _ in v1_unknown}, (
+        sorted(set(s12_ords) - {o for o, _ in v1_unknown}),
+        sorted({o for o, _ in v1_unknown} - set(s12_ords)))
+    # every patched ordinal carries at least one probe record
+    for o in P:
+        assert edge_probe_numbers(probe, o), f"missing probe for ordinal {o}"
+        assert probe_sha_ok(probe, o, by_ord[o]["spv"]["sha256"]), f"probe sha mismatch at {o}"
+
+    # ---- apply
+    applied = []
+    for o, spec in P.items():
+        r = by_ord[o]
+        before_classes = [e["scale_A_source"] for e in r["quant_edges"]]
+        for idx, (cls, conf, ev) in spec["edges"].items():
+            e = r["quant_edges"][idx]
+            assert e["scale_A_source"] == "UNKNOWN", (o, idx, e["scale_A_source"])
+            old_ev = e["evidence"]
+            e["scale_A_source"] = cls
+            e["confidence"] = conf
+            e["evidence"] = ev
+            e["evidence_v1"] = old_ev
+            e["reclassified"] = {
+                "card": spec["card"], "ref": spec["ref"], "from": "UNKNOWN", "to": cls,
+                "spv_probe": edge_probe_numbers(probe, o),
+                "probe_artifact": "evidence/reclassification-probe.json ordinal %d" % o,
+            }
+            applied.append({"ordinal": o, "dispatch": r["name"], "family": r["family"], "edge_index": idx,
+                            "edge": e["edge"], "from": "UNKNOWN", "to": cls, "card": spec["card"]})
+        # row-level record (written after the retraction so the "after" list is final)
+        r["_reclass_spec"] = spec
+        r["_before_classes"] = before_classes
+
+    # retraction last, so the patch indices above stay valid
+    retracted = []
+    for o, spec in P.items():
+        if not spec.get("retract"):
+            continue
+        r = by_ord[o]
+        for idx in spec["retract"]:
+            e = r["quant_edges"][idx]
+            assert e["edge"] == "WO output projection" and e["scale_A_source"] == "UNKNOWN", (o, e)
+            retracted.append({"ordinal": o, "dispatch": r["name"], "family": r["family"], "edge": e["edge"],
+                              "scale_A_source_before": "UNKNOWN",
+                              "scale_B_source": e["scale_B_source"],
+                              "card": spec["card"], "ref": spec["ref"],
+                              "reason": "the dispatched SPV has ONE A operand and two N16 B fragments of the "
+                                        "same projection (one coopMatLoad(aa) feeding coopMatMulAdd with bb "
+                                        "and bb1); the plan binds r03_ioport4_ds_w_i8 + "
+                                        "r03_ioport4_ds_scales and no wo_i8/wosc pair, so a second 'WO' "
+                                        "edge does not exist",
+                              "evidence_v1": e["evidence"]})
+            r.setdefault("retracted_edges", []).append(retracted[-1])
+        r["quant_edges"] = [e for i, e in enumerate(r["quant_edges"]) if i not in spec["retract"]]
+
+    # ---- row status / reclassification block
+    for o, spec in P.items():
+        r = by_ord[o]
+        spec = r.pop("_reclass_spec")
+        before_classes = r.pop("_before_classes")
+        if spec.get("status_reason"):
+            r["status"] = status_for(r)[0]
+            r["status_reason"] = spec["status_reason"]
+        else:
+            r["status"], r["status_reason"] = status_for(r)
+        if r["status"] == "CLOSED":
+            assert not any(e["scale_A_source"] in ("DYNAMIC_RUNTIME", "UNKNOWN") for e in r["quant_edges"]), o
+        r["reclassification"] = OrderedDict([
+            ("card", spec["card"]), ("ref", spec["ref"]),
+            ("row_worst_class_before", "UNKNOWN"), ("row_worst_class_after", worst_class(r)),
+            ("edges_before", before_classes),
+            ("edges_after", [e["scale_A_source"] for e in r["quant_edges"]]),
+            ("status_before", "OPEN"), ("status_after", r["status"]),
+        ])
+        # make the A-side provenance explicit at row level, per edge (the DS rows differ edge by edge)
+        basis = r["activation_scale_basis"]
+        basis["a_side_scale"] = [
+            OrderedDict([
+                ("edge", e["edge"]),
+                ("class", e["scale_A_source"]),
+                ("source", ("in-kernel amax of the dispatched tensor (no static activation pack bound)"
+                            if e["scale_A_source"] == "DYNAMIC_RUNTIME" else
+                            "file-backed scale slot read by the kernel")),
+            ])
+            for e in r["quant_edges"]
+        ]
+        basis["a_side_scale_note"] = ("the bound scale buffers are weight/DS-weight packs only; the activation "
+                                      "scale is either measured in the kernel or read from a dedicated real "
+                                      "slot (chain_scales entry_sc[4] for ordinal 25)")
+        basis["probe_artifact"] = "evidence/reclassification-probe.json ordinal %d" % o
+
+    # ---- recompute totals from the patched rows
+    after = Counter(e["scale_A_source"] for r in rows for e in r["quant_edges"])
+    for k in EXPECTED_V2_CLASSES:
+        assert after.get(k, 0) == EXPECTED_V2_CLASSES[k], (k, after.get(k, 0), EXPECTED_V2_CLASSES[k])
+    entries = sum(after.values())
+    assert entries == 425, entries
+    assert sum(1 for r in rows for e in r["quant_edges"]) == 425
+
+    # ---- V2 rows file
+    v2_rows = OrderedDict()
+    v2_rows["schema"] = "fullnet-rows-v2"
+    v2_rows["candidate"] = v1["candidate"]
+    v2_rows["parents"] = v1["parents"]
+    v2_rows["frame_invariance"] = v1["frame_invariance"]
+    v2_rows["lineage"] = OrderedDict([
+        ("supersedes", "FULLNET-ROWS.json"),
+        ("supersedes_sha256", V1_ROWS_SHA),
+        ("transform", "ledger/_work/build_v2.py (deterministic patch of the 36 UNKNOWN edges; v1 untouched)"),
+        ("measured_probe", "ledger/_work/verify_cards.py -> evidence/reclassification-probe.json"),
+        ("closure_cards", [
+            {"card": "S03-tail", "files": ["S03-tail/TAIL-RISKS.json (R7, R8)", "S03-tail/TAIL-CONTRACT.json"],
+             "sha256": {"TAIL-RISKS.json": sha_file(S03_RISKS),
+                        "TAIL-CONTRACT.json": sha_file(S03 + r"/TAIL-CONTRACT.json")}},
+            {"card": "S12-proj", "files": ["S12-proj/PROJ-ROWS.json (ledger_unknown_closure, "
+                                           "observed_ledger_defects)"],
+             "sha256": {"PROJ-ROWS.json": sha_file(S12_ROWS)}},
+        ]),
+        ("closure_tally", {"promoted_to_DYNAMIC_RUNTIME": len(applied) - 2, "promoted_to_STATIC_COARSE": 2,
+                           "retracted": len(retracted), "unknown_left_in_ledger_scope": 0}),
+        ("conflicts_open", [c["id"] for c in CONFLICTS]),
+        ("rules", [
+            "no UNKNOWN -> DYNAMIC_RUNTIME promotion without a source line AND an independent SPV measurement",
+            "the v1 evidence string of every changed edge is preserved under evidence_v1",
+            "the retracted edge keeps its v1 evidence under retracted_edges[].evidence_v1",
+            "row status is recomputed from the edge classes, except where the card supplies a sharper reason",
+        ]),
+    ])
+    v2_rows["rows"] = rows
+
+    # ---- remainders V2: the 190 v1 records are reused verbatim, only the 33 new ones are built here
+    v1_pos = {(p["ordinal"], p["edge"]): p for p in v1_rem["positions"]}
+    reused = 0
+    positions = []
+    for r in rows:
+        for i, e in enumerate(r["quant_edges"]):
+            if e["scale_A_source"] != "DYNAMIC_RUNTIME":
+                continue
+            key = (r["ordinal"], e["edge"])
+            if key in v1_pos:
+                positions.append(json.loads(json.dumps(v1_pos[key])))
+                reused += 1
+                continue
+            what = gran = None
+            for k in POSMETA.get(r["family"], {}):
+                if e["edge"].startswith(k):
+                    what, gran = POSMETA[r["family"]][k]
+                    break
+            if what is None:
+                what, gran = (e["edge"],
+                              "per workgroup (documented for the Swin family; kernel-specific granularity for "
+                              "this variant is inferred from the same generator, not re-derived)")
+            rec = OrderedDict([
+                ("ordinal", r["ordinal"]), ("dispatch", r["name"]), ("family", r["family"]),
+                ("kernel", r["spv"]["basename"]), ("kernel_sha256", r["spv"]["sha256"]),
+                ("edge", e["edge"]), ("position", what), ("granularity", gran),
+                ("spv_evidence", {"has_1_over_127": r["spv"]["has_1_over_127"], "has_127": r["spv"]["has_127"],
+                                  "ext_inst": r["spv"]["ext_inst"], "int8_mma": r["spv"]["int8_mma"]}),
+                ("documentary_evidence", e["evidence"]),
+                ("consumer", "this dispatch quantises and consumes its own A operand codes"),
+                ("static_replacement_condition", STATIC_REPL[
+                    "WO" if e["edge"].startswith("WO") else
+                    "DS" if e["edge"].startswith("DS") else
+                    "projection" if e["edge"].startswith("cross-family") else
+                    "F2" if r["family"] == "F2" else
+                    "F20" if r["family"] == "F20" else "attention"]),
+                ("status", "OPEN"),
+                ("new_in_v2", OrderedDict([
+                    ("from", "UNKNOWN"), ("card", e["reclassified"]["card"]),
+                    ("ref", e["reclassified"]["ref"]),
+                    ("spv_probe", e["reclassified"]["spv_probe"]),
+                    ("evidence_v1", e["evidence_v1"]),
+                ])),
+            ])
+            positions.append(rec)
+
+    assert reused == 190, reused
+    assert len(positions) == 223, len(positions)
+    assert len({p["ordinal"] for p in positions}) == 109, len({p["ordinal"] for p in positions})
+
+    by_class = Counter()
+
+    def role_of(e, fam):
+        if "fused C32" in e:
+            return "fused_C32"
+        if "QKV" in e:
+            return "QKV"
+        if "QK" in e:
+            return "QK"
+        if "PV" in e:
+            return "PV"
+        if e.startswith("WO"):
+            return "WO"
+        if e.startswith("DS"):
+            return "DS_projection"
+        if "cross-family" in e:
+            return "cross-family projection"
+        return fam
+
+    for p in positions:
+        by_class[role_of(p["edge"], p["family"])] += 1
+    assert sum(by_class.values()) == 223, by_class
+    assert by_class["fused_C32"] == 7 and by_class["QKV"] == 52 and by_class["WO"] == 36, by_class
+    # S09 crosswalk: 1 instance per Swin QKV A edge, 2 per QK edge (q,k), 2 per PV edge (v,p)
+    qkv_swin = sum(1 for p in positions if p["edge"].startswith("QKV projection"))
+    qk = sum(1 for p in positions if p["edge"].endswith("QK score"))
+    pv = sum(1 for p in positions if p["edge"].endswith("PV context"))
+    s09_instances = qkv_swin + 2 * qk + 2 * pv
+    assert s09_instances == 276, (qkv_swin, qk, pv, s09_instances)
+    assert qk == 60 and pv == 60 and qkv_swin == 36
+
+    v2_rem = OrderedDict()
+    v2_rem["schema"] = "dynamic-scale-remainders-v2"
+    v2_rem["candidate_sha256"] = v1["candidate"]["sha256"]
+    v2_rem["supersedes"] = OrderedDict([("file", "DYNAMIC-SCALE-REMAINDERS.json"),
+                                        ("sha256", V1_REMAINDERS_SHA),
+                                        ("positions", v1_rem["summary"]["positions"])])
+    v2_rem["summary"] = OrderedDict([
+        ("positions", len(positions)),
+        ("dispatches", len({p["ordinal"] for p in positions})),
+        ("by_family", dict(Counter(p["family"] for p in positions))),
+        ("by_position_class", dict(Counter(p["edge"].split("(")[0].strip() for p in positions))),
+        ("by_role", dict(by_class)),
+        ("delta_vs_v1", {"added_from_UNKNOWN": len(applied) - 2, "removed_to_static": 0,
+                         "retracted": len(retracted)}),
+    ])
+    v2_rem["positions"] = positions
+    v2_rem["not_dynamic"] = v1_rem["not_dynamic"]
+    v2_rem["unknown_positions"] = []
+    v2_rem["unknown_positions_note"] = (
+        "empty: the v1 scopes F2 / F20 / projection / DS were closed by S03 R7 and S12 PROJ-ROWS. "
+        "The two positions S12 still calls UNKNOWN in its own 71-row inventory (ordinals 120, 169) are NOT "
+        "ledger dynamics edges: they are qx/expand positions the ledger has always carried as STATIC_COARSE. "
+        "They are listed in RECLASSIFICATION.md as conflict C1 and were not reclassified either way.")
+    v2_rem["retracted_positions"] = retracted
+    v2_rem["crosswalk_s09_instances"] = OrderedDict([
+        ("source", "S09-qkv-attn/ATTENTION-SITES.json counts.dynamic_scale_instances_total"),
+        ("published_total", 276),
+        ("recomputed_from_this_file", s09_instances),
+        ("formula", "1 x Swin QKV-A edges (36) + 2 x QK edges (60, the q and k slabs) + 2 x PV edges (60, the "
+                    "v and p slabs) = 276"),
+        ("not_counted_by_s09", {"WO A-side (incl. the 3 fused DS-family WO edges)":
+                                sum(1 for p in positions if p["edge"].startswith("WO")),
+                                "DS projection": sum(1 for p in positions if p["edge"].startswith("DS")),
+                                "cross-family projection": sum(1 for p in positions
+                                                               if p["edge"].startswith("cross-family")),
+                                "fused C32": sum(1 for p in positions if p["edge"].startswith("fused C32")),
+                                "F2": sum(1 for p in positions if p["family"] == "F2"),
+                                "F20": sum(1 for p in positions if p["family"] == "F20")}),
+        ("statement", "the S09 276 is unchanged by this reclassification: none of the 33 promotions is an "
+                      "attention QK/PV/QKV position, so the edge count moves 190 -> 223 while the per-head "
+                      "instance count stays 276. Edges and instances are different units and must not be added."),
+    ])
+    v2_rem["granularity_caveat"] = OrderedDict([
+        ("statement", "one ledger position = one dynamic edge, NOT one in-kernel quantiser site. Fused kernels "
+                      "under-count sites on purpose: the v1 rule 'fused-kernel stage split unproven -> one "
+                      "fused edge' is kept, so 223 must not be quoted as '223 amax sites in the network'."),
+        ("measured_sites", [
+            {"scope": "C64 WO (7 rows, one shared SPV)", "amax_sites": 1, "opfdiv_by_127": 2, "fabs": 1,
+             "ledger_edges": 7},
+            {"scope": "C256 WO (15 rows, 2 SPVs)", "amax_sites": 1, "opfdiv_by_127": 2, "fabs": 1,
+             "ledger_edges": 15},
+            {"scope": "r09 (ordinal 25)", "amax_sites": 1, "opfdiv_by_127": 2, "fabs": 1,
+             "ledger_dynamic_edges": 1, "ledger_static_edges": 1},
+            {"scope": "r10/r11 (ordinals 49, 83)", "amax_sites": 2, "opfdiv_by_127": 4, "fabs": 2,
+             "ledger_dynamic_edges": 2},
+            {"scope": "cross-family projections (4)", "amax_sites": 1, "opfdiv_by_127": 1, "fabs": 1,
+             "ledger_edges": 4},
+            {"scope": "F2 (ordinal 281)", "named_quantisers": 14, "opfdiv_by_127": 14, "fabs": 3,
+             "ledger_edges": 1},
+            {"scope": "F20/b70 (ordinal 286)", "named_amax_tensors": 8, "opfdiv_by_127": 7, "fabs": 9,
+             "ledger_edges": 1},
+        ]),
+        ("source", "evidence/reclassification-probe.json (independent second-pass SPIR-V decode)"),
+    ])
+    v2_rem["conflicts"] = CONFLICTS
+    v2_rem["deferred"] = DEFERRED
+
+    # ---- summary V2 (same shape as v1 + delta/recompute)
+    CLS_ORDER = ("DYNAMIC_RUNTIME", "UNKNOWN", "FP16", "STATIC_REFINED", "STATIC_COARSE", "NO_MATRIX")
+
+    def fam_block(fr):
+        cls = Counter()
+        dcl = Counter(worst_class(r) for r in fr)
+        for r in fr:
+            for e in r["quant_edges"]:
+                cls[e["scale_A_source"]] += 1
+        return OrderedDict([
+            ("dispatches", len(fr)),
+            ("dispatches_with_int8_mma", sum(1 for r in fr if (r["spv"]["int8_mma"] or 0) > 0)),
+            ("dispatches_open", sum(1 for r in fr if r["status"] == "OPEN")),
+            ("dispatches_closed", sum(1 for r in fr if r["status"] == "CLOSED")),
+            ("dispatches_by_worst_class", {k: dcl[k] for k in CLS_ORDER if dcl[k]}),
+            ("edge_scale_classes", {k: cls[k] for k in ("STATIC_REFINED", "STATIC_COARSE", "DYNAMIC_RUNTIME",
+                                                        "FP16", "UNKNOWN") if cls[k]}),
+            ("edges_total", sum(cls.values())),
+        ])
+
+    v2_sum = OrderedDict()
+    v2_sum["schema"] = "fullnet-scale-class-summary-v2"
+    v2_sum["candidate"] = v1_sum["candidate"]
+    v2_sum["supersedes"] = OrderedDict([("file", "SCALE-CLASS-SUMMARY.json"),
+                                        ("sha256", V1_SUMMARY_SHA),
+                                        ("edges_by_activation_scale_class",
+                                         v1_sum["totals"]["edges_by_activation_scale_class"])])
+    v2_sum["note"] = v1_sum["note"]
+    fams = sorted({r["family"] for r in rows})
+    v2_sum["per_family"] = OrderedDict()
+    for f in fams:
+        v2_sum["per_family"][f] = fam_block([r for r in rows if r["family"] == f])
+
+    total = Counter(e["scale_A_source"] for r in rows for e in r["quant_edges"])
+    v2_sum["totals"] = OrderedDict([
+        ("dispatches", len(rows)),
+        ("dispatches_with_int8_mma", sum(1 for r in rows if (r["spv"]["int8_mma"] or 0) > 0)),
+        ("dispatches_without_matrix", sum(1 for r in rows if not r["quant_edges"])),
+        ("dispatches_open", sum(1 for r in rows if r["status"] == "OPEN")),
+        ("dispatches_closed", sum(1 for r in rows if r["status"] == "CLOSED")),
+        ("dispatches_blocked", sum(1 for r in rows if r["status"] == "BLOCKED")),
+        ("dispatches_by_worst_class", {k: v for k, v in
+                                       Counter(worst_class(r) for r in rows).items()}),
+        ("edges_total", sum(total.values())),
+        ("matrix_edges", sum(1 for r in rows for e in r["quant_edges"] if not e["edge"].startswith("QX"))),
+        ("quantiser_epilogue_positions", sum(1 for r in rows for e in r["quant_edges"]
+                                             if e["edge"].startswith("QX"))),
+        ("edges_by_activation_scale_class", {k: total[k] for k in ("STATIC_REFINED", "STATIC_COARSE",
+                                                                   "DYNAMIC_RUNTIME", "FP16", "UNKNOWN")
+                                             if total[k]}),
+        ("fp16_mma_positions", sum(1 for r in rows if (r["spv"]["fp16_mma"] or 0) > 0)),
+        ("dynamic_positions", len(positions)),
+    ])
+    assert v2_sum["totals"]["matrix_edges"] == 403, v2_sum["totals"]["matrix_edges"]
+    assert v2_sum["totals"]["quantiser_epilogue_positions"] == 22
+
+    v2_sum["delta_vs_v1"] = OrderedDict([
+        ("source_file", "FULLNET-ROWS.json"), ("source_sha256", V1_ROWS_SHA),
+        ("edge_counts_before", v1_sum["totals"]["edges_by_activation_scale_class"]),
+        ("edge_counts_after", v2_sum["totals"]["edges_by_activation_scale_class"]),
+        ("entries_total_before", v1_sum["totals"]["edges_total"]),
+        ("entries_total_after", v2_sum["totals"]["edges_total"]),
+        ("matrix_edges_before", v1_sum["totals"]["matrix_edges"]),
+        ("matrix_edges_after", v2_sum["totals"]["matrix_edges"]),
+        ("dispatch_worst_class_before", v1_sum["totals"]["dispatches_by_worst_class"]),
+        ("dispatch_worst_class_after", v2_sum["totals"]["dispatches_by_worst_class"]),
+        ("status_before", {"CLOSED": v1_sum["totals"]["dispatches_closed"],
+                           "OPEN": v1_sum["totals"]["dispatches_open"]}),
+        ("status_after", {"CLOSED": v2_sum["totals"]["dispatches_closed"],
+                          "OPEN": v2_sum["totals"]["dispatches_open"]}),
+        ("promotions", applied),
+        ("retractions", [{"ordinal": x["ordinal"], "dispatch": x["dispatch"], "edge": x["edge"],
+                          "card": x["card"]} for x in retracted]),
+        ("removed_from_dynamic", []),
+    ])
+    v2_sum["recompute_check"] = OrderedDict([
+        ("command", "python -X utf8 work/dsh-fullnet-static-20261029/ledger/_work/build_v2.py (writes "
+                    "FULLNET-ROWS-V2.json, re-reads it from disk and recounts)"),
+        ("method", "sum of quant_edges[].scale_A_source over all rows of the file on disk; sum of rows with "
+                   "int8_mma>0; matrix_edges = edges whose name does not start with 'QX'"),
+    ])
+
+    # ---- write rows first so the independent re-read is meaningful
+    def dump(path, obj):
+        Path(path).write_text(json.dumps(obj, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+        return sha_file(path)
+
+    sha_rows = dump(OUT_ROWS, v2_rows)
+
+    disk = json.loads(Path(OUT_ROWS).read_text(encoding="utf-8"))
+    rc = Counter(e["scale_A_source"] for r in disk["rows"] for e in r["quant_edges"])
+    rc_entries = sum(rc.values())
+    rc_matrix = sum(1 for r in disk["rows"] for e in r["quant_edges"] if not e["edge"].startswith("QX"))
+    v2_sum["recompute_check"]["recount"] = {k: rc[k] for k in sorted(rc)}
+    v2_sum["recompute_check"]["recount_entries"] = rc_entries
+    v2_sum["recompute_check"]["recount_matrix_edges"] = rc_matrix
+    v2_sum["recompute_check"]["matches"] = (
+        all(v2_sum["totals"]["edges_by_activation_scale_class"].get(k, 0) == rc[k] for k in rc)
+        and rc_entries == v2_sum["totals"]["edges_total"]
+        and rc_matrix == v2_sum["totals"]["matrix_edges"])
+    assert v2_sum["recompute_check"]["matches"], v2_sum["recompute_check"]
+
+    v2_sum["conflicts"] = [{"id": c["id"], "where": c["where"], "action": c["action"]} for c in CONFLICTS]
+    v2_sum["deferred"] = [{"id": d["id"], "from": d["from"], "status": d["status"]} for d in DEFERRED]
+
+    sha_rem = dump(OUT_REMAINDERS, v2_rem)
+    sha_sum = dump(OUT_SUMMARY, v2_sum)
+
+    # ---- RECLASSIFICATION.md
+    md = render_md(sha_rows, sha_rem, sha_sum, probe, applied, retracted, v2_sum, v2_rem, v1_sum)
+    Path(OUT_MD).write_text(md, encoding="utf-8")
+
+    print(json.dumps({
+        "files": {"FULLNET-ROWS-V2.json": sha_rows,
+                  "DYNAMIC-SCALE-REMAINDERS-V2.json": sha_rem,
+                  "SCALE-CLASS-SUMMARY-V2.json": sha_sum,
+                  "RECLASSIFICATION.md": sha_file(OUT_MD)},
+        "classes": dict(rc), "entries": rc_entries, "matrix_edges": rc_matrix,
+        "positions": len(positions), "dynamic_dispatches": len({p["ordinal"] for p in positions}),
+        "promoted_edges_total": len(applied), "retractions": len(retracted),
+        "status": {"closed": v2_sum["totals"]["dispatches_closed"],
+                   "open": v2_sum["totals"]["dispatches_open"]},
+        "recompute_ok": v2_sum["recompute_check"]["matches"],
+        "s09_instances_recomputed": s09_instances,
+    }, indent=1, ensure_ascii=False))
+
+
+def probe_sha_ok(probe: dict, ordinal: int, sha: str) -> bool:
+    for t in probe["targets"]:
+        if t["ordinal"] == ordinal:
+            return t["sha256"] == sha
+    return False
+
+
+def render_md(sha_rows, sha_rem, sha_sum, probe, applied, retracted, v2_sum, v2_rem, v1_sum) -> str:
+    t = v2_sum["totals"]
+    d = v2_sum["delta_vs_v1"]
+    tgt = {x["ordinal"]: x for x in probe["targets"]}
+    L_ = []
+    A = L_.append
+    A("# 全网台账 V2：S03/S12 的 36 条 UNKNOWN 落地（逐边 reclassification）")
+    A("")
+    A("生成：2026-10-29（Asia/Tokyo）｜ledger 续作子代理｜写区 `work/dsh-fullnet-static-20261029/ledger/`")
+    A("对象：`combo-34189`（sha256 `2b5481d5…f1c690`，288 dispatches / 906 buffers）— 与 V1 同一候选，**未换计划**。")
+    A("")
+    A("> V1 文件（`FULLNET-ROWS.json` / `DYNAMIC-SCALE-REMAINDERS.json` / `SCALE-CLASS-SUMMARY.json`）**未被覆盖**，")
+    A("> 三个 V2 文件是确定性补丁后的新产物；`build_v2.py` 开头对 V1 三个 SHA 断言，输入一改就拒绝运行。")
+    A(">")
+    A("> 字段兼容：V1 的顶层键与 row 键**一个都没删**，只做加法——rows 增加 `lineage`，每行增加")
+    A("> `reclassification` / `retracted_edges` / `activation_scale_basis.a_side_scale`，被改边增加 `evidence_v1` /")
+    A("> `reclassified`；remainders 增加 `supersedes` / `retracted_positions` / `crosswalk_s09_instances` /")
+    A("> `granularity_caveat` / `conflicts` / `deferred`；summary 增加 `delta_vs_v1` / `conflicts` / `deferred`。")
+    A("> 只把 schema 字符串升到 `-v2`，避免有人把 V2 数字当 V1 引用。")
+    A("")
+    A("## 1. 新计数（口径：每条台账边 = 1 个 position）")
+    A("")
+    A("| 项 | V1 | V2 | 变化 |")
+    A("|---|---:|---:|---:|")
+    A(f"| STATIC_REFINED | {d['edge_counts_before']['STATIC_REFINED']} | {d['edge_counts_after']['STATIC_REFINED']} | 0 |")
+    A(f"| STATIC_COARSE | {d['edge_counts_before']['STATIC_COARSE']} | {d['edge_counts_after']['STATIC_COARSE']} | +2 |")
+    A(f"| DYNAMIC_RUNTIME | {d['edge_counts_before']['DYNAMIC_RUNTIME']} | {d['edge_counts_after']['DYNAMIC_RUNTIME']} | +33 |")
+    A(f"| UNKNOWN | {d['edge_counts_before']['UNKNOWN']} | {d['edge_counts_after'].get('UNKNOWN', 0)} | -36 |")
+    A(f"| **条目合计** | **{d['entries_total_before']}** | **{d['entries_total_after']}** | **-1（撤回 1 条不存在边）** |")
+    A(f"| 矩阵边 | {d['matrix_edges_before']} | {d['matrix_edges_after']} | -1 |")
+    A(f"| 量化 epilogue 位置 | 22 | {t['quantiser_epilogue_positions']} | 0 |")
+    A(f"| 动态 position（`DYNAMIC-SCALE-REMAINDERS-V2.json`）| {v2_rem['supersedes']['positions']} | **{v2_rem['summary']['positions']}** | +33 |")
+    A(f"| 含动态边的 dispatch | 78 | {v2_rem['summary']['dispatches']} | +31 |")
+    A(f"| dispatch 最坏类：DYNAMIC / COARSE / REFINED / UNKNOWN / NO_MATRIX | "
+      f"{d['dispatch_worst_class_before'].get('DYNAMIC_RUNTIME',0)} / {d['dispatch_worst_class_before'].get('STATIC_COARSE',0)} / "
+      f"{d['dispatch_worst_class_before'].get('STATIC_REFINED',0)} / {d['dispatch_worst_class_before'].get('UNKNOWN',0)} / "
+      f"{d['dispatch_worst_class_before'].get('NO_MATRIX',0)} | "
+      f"{d['dispatch_worst_class_after'].get('DYNAMIC_RUNTIME',0)} / {d['dispatch_worst_class_after'].get('STATIC_COARSE',0)} / "
+      f"{d['dispatch_worst_class_after'].get('STATIC_REFINED',0)} / {d['dispatch_worst_class_after'].get('UNKNOWN',0)} / "
+      f"{d['dispatch_worst_class_after'].get('NO_MATRIX',0)} | 32 条由 UNKNOWN 转为具名类，其中 1 条（ord5）整行转 CLOSED |")
+    A(f"| status：CLOSED / OPEN | {d['status_before']['CLOSED']} / {d['status_before']['OPEN']} | "
+      f"{d['status_after']['CLOSED']} / {d['status_after']['OPEN']} | +1 CLOSED |")
+    A(f"| FP16 矩阵乘位置 | 0 | {t['fp16_mma_positions']} | 0 |")
+    A("")
+    A("**32 refined / 170 coarse / 223 dynamic / 0 unknown，合计 425 条目**——与 S12 给的净计数一致。")
+    A("")
+    A("算术说明（为什么不许“直接 33 加 190”，以及为什么这里结果仍是 223）：")
+    A("")
+    A("* 旧 190 条 position 记录**逐字保留**（脚本断言 `reused == 190`），新增的 33 条带 `new_in_v2` 块"
+      "（from/card/ref/SPV 探针/`evidence_v1`），因此 223 条可以当 190+33 的严格超集来 diff。")
+    A("* `DYNAMIC-SCALE-REMAINDERS` 的 position 在本台账里是**按动态边一条一条生成**的（`build_ledger.py` "
+      "对每个 `scale_A_source == DYNAMIC_RUNTIME` 的边 append 一条），所以 190 恰好等于 190 条动态边。")
+    A("* 36 条 UNKNOWN 是**边**；其中 33 条翻成 DYNAMIC、2 条翻成 STATIC_COARSE、1 条撤回。因此"
+      "`190 + 33 - 0 = 223`，`426 - 1 = 425`。")
+    A("* S12 的警告成立在**另一个单位**上：物理核内 amax/127 位点数远多于 223（F20 一个 dispatch 就有 8 个具名尺度；"
+      "F2 有 14 个 `/127` 位点）。所以 223 只能读作“台账边数”，不能读作“全网 amax 位点数”，见 §5。")
+    A("")
+    A("## 2. 证据链（每条改动都可落到下面这几类）")
+    A("")
+    A("| 证据类 | 内容 |")
+    A("|---|---|")
+    A("| `SOURCE_LINE` | 与 SPV 同目录/同族的 `.comp`/`.glsl` 源码行（**未重编译**，身份等级同 V1 的 "
+      "SOURCE_BASENAME_MATCH） |")
+    A("| `SPV_PROBE` | 本次独立第二遍 SPIR-V 解码：`OpFDiv` 的操作数常量、`FAbs/FMax/FMax3` 计数、"
+      "`OpCooperativeMatrixMulAddKHR` 计数、scale binding 是否被本核写 |")
+    A("| `CARD_S12` | `S12-proj/PROJ-ROWS.json` 的 `ledger_unknown_closure`（36 条逐 ordinal）与 "
+      "`observed_ledger_defects`（2 条具名缺陷） |")
+    A("| `CARD_S03` | `S03-tail/TAIL-RISKS.json` R7（F2/F20/b39 是已知动态）与 R8（b70 12 vs 14 MMA） |")
+    A("")
+    A("硬规则（脚本里以 assert 固化）：**没有“源码行 + 独立 SPV 测量”双证据的边，不允许从 UNKNOWN 翻成 "
+      "DYNAMIC_RUNTIME**。每条被改边的 V1 证据原文保留在 `evidence_v1` 字段，撤回的边保留在 "
+      "`retracted_edges[].evidence_v1`。")
+    A("")
+    A("复核证据汇总（`evidence/reclassification-probe.json`，13 个唯一 SPV）：")
+    A("")
+    A("| 组 | ordinal | `OpFDiv /127.0` | `FAbs` | 127.0 | 1/127 | INT8 MMA | 结论 |")
+    A("|---|---|---:|---:|---|---|---:|---|")
+    A("| C64 WO | 10/15/20/265/270/275/280 | 2 | 1 | 有 | 无 | 4 | 核内 amax→DYNAMIC |")
+    A("| C256 WO | 54/58/62/66/70/74/78/205/209/213/217/221/225/229/233 | 2 | 1 | 有 | 无 | 2 | 核内 amax→DYNAMIC |")
+    A("| r09 WO | 25 | 2 | 1 | 有 | 无 | 6 | 核内 amax→DYNAMIC |")
+    A("| r09 DS | 25 | — | 同一个 FAbs | 有 | 无 | — | 只读 `entry_sc[4]`→STATIC |")
+    A("| r10 / r11 | 49 / 83 | 4 | 2 | 有 | 无 | 6 | 两个 amax→两条都 DYNAMIC |")
+    A("| 投影 r16/r17/r18/r19 | 167/201/234/260 | 1 | 1 | 有 | 无 | 2 | per-row amax→DYNAMIC |")
+    A("| F2 | 281 | **14** | 3 | 有 | 无 | 53 | 14 个 `/127` 位点→DYNAMIC |")
+    A("| F20/b70 | 286 | 7（另有 9 个 `/1.0`）| 9 | 有 | 无 | 12 | 8 个具名 amax→DYNAMIC |")
+    A("")
+    A("## 3. 逐条落地（33 DYNAMIC + 2 STATIC + 1 撤回）")
+    A("")
+    A("| # | ordinal | dispatch | 边 | V1 → V2 | 卡片 |")
+    A("|---:|---:|---|---|---|---|")
+    for i, a in enumerate(applied, 1):
+        A(f"| {i} | {a['ordinal']} | `{a['dispatch']}` | {a['edge']} | UNKNOWN → **{a['to']}** | {a['card']} |")
+    for i, r in enumerate(retracted, len(applied) + 1):
+        A(f"| {i} | {r['ordinal']} | `{r['dispatch']}` | {r['edge']} | UNKNOWN → **撤回（边不存在）** | {r['card']} |")
+    A("")
+    A("计数自检：33 DYNAMIC + 2 STATIC_COARSE + 1 撤回 = 36，与 S12 `ledger_unknown_closure` 的 36 条逐 ordinal 对齐")
+    A("（脚本断言 `set(S12 ordinals) == set(V1 UNKNOWN ordinals)`）。")
+    A("")
+    A("## 4. 与旧 190 的差异表")
+    A("")
+    A("| 类别 | 条数 | 明细 |")
+    A("|---|---:|---|")
+    A(f"| 新增（UNKNOWN → DYNAMIC，本次首次进入动态清单）| {len(applied)-2} | C64 WO 7（ord 10/15/20/265/270/275/280）· "
+      "C256 WO 15（ord 54…233）· DS 5（ord25-WO、49-WO、49-DS、83-WO、83-DS）· 跨族投影 4（ord167/201/234/260）· "
+      "F2 1（ord281）· F20 1（ord286） |")
+    A("| 新增（UNKNOWN → STATIC_COARSE）| 2 | ord5 的真实 DS 边、ord25 的 DS 边（`entry_sc[4]`）|")
+    A("| 撤回（边不存在，不是“改类”）| 1 | ord5 `ioport_block4_0` 的 `WO output projection` |")
+    A("| 从动态清单移除（DYNAMIC → STATIC）| **0** | 190 条旧动态边**一条都没变**，190 ⊂ 223 |")
+    A("| 净增 | +33 | 223 = 190 + 33 |")
+    A("")
+    A("所以“新增 / 撤回 / 从 UNKNOWN 变 DYNAMIC”三个数字分别是 **33 / 1 / 33**，且撤回的那条来自 UNKNOWN 池、"
+      "不是来自动态池——这就是 426 → 425 的唯一来源。")
+    A("")
+    A("## 5. 三个不能互相替换的计数单位")
+    A("")
+    A("| 单位 | 数字 | 出处 | 回答什么问题 |")
+    A("|---|---:|---|---|")
+    A("| 台账边（V2 动态 position）| **223** | `DYNAMIC-SCALE-REMAINDERS-V2.json` | 还有多少条矩阵边不是静态 |")
+    A("| S09 逐 head/per-query 实例 | **276（未变）** | `S09-qkv-attn/ATTENTION-SITES.json` | 要改多少个 attention 尺度点 |")
+    A("| 物理核内 amax/127 位点 | ≥ 223（F20 8、F2 14、r10/r11 2 …）| `evidence/reclassification-probe.json` | 换实现时实际要动多少段代码 |")
+    A("")
+    A("**与 S09 的 276 的口径区别（可复算）**：")
+    A("")
+    A("* S09 只数 attention，且把一条边展开成多个实例：`1 × Swin QKV-A 边(36) + 2 × QK 边(60) + 2 × PV 边(60) = 276`")
+    A("  （QK 边展开 q/k 两个 slab，PV 边展开 v/p 两个 slab）。脚本从 V2 的 223 条动态边**重算回 276 并断言相等**。")
+    A("* 276 **不含** WO、DS、跨族投影、C32 融合块、F2、F20。V2 里这些非 attention 动态边共 "
+      f"{sum(v2_rem['crosswalk_s09_instances']['not_counted_by_s09'].values())} 条"
+      "（旧 18 = C128 WO 11 + C32 融合 7；新 33 = C64 WO 7 + C256 WO 15 + DS 5 + 投影 4 + F2 1 + F20 1）。")
+    A("* 本次 33 条晋升**没有一条**是 attention 的 QK/PV/QKV 位点，所以 **S09 的 276 不变**；变的是边数 190 → 223。")
+    A("  两个数字都对，不能相加，也不能用一个去覆盖另一个。")
+    A("")
+    A("## 6. 两个 DS 台账缺陷的修正（S12 `observed_ledger_defects`）")
+    A("")
+    A("**缺陷 1（ord5 `ioport_block4_0` 模板过切）**：V1 按“DS 家族模板”给每个 dispatch 固定两条边"
+      "（WO + DS）。但 `r03_ioport4_i8.spv` 只有 2 个 INT8 MMA，共用**同一个 A 操作数**，乘的是同一投影的两片 "
+      "N16 B 碎片（源码 `r03_ioport4_i8.comp` L88-94：一次 `coopMatLoad(aa)`，`bb` 与 `bb1` 两次 MulAdd）；"
+      "绑定位 0/4 是 `r03_ioport4_ds_w_i8` / `r03_ioport4_ds_scales`，**没有** `wo_i8`/`wosc`。"
+      "→ 撤回 `WO output projection`，保留的 DS 边 A 侧读 `sc[1]=127/sV`（文件型 5120 B）→ **STATIC_COARSE**，整行转 CLOSED。")
+    A("")
+    A("**缺陷 2（ord25/49/83 的 DS 静态/动态差异）**：V1 对三个 DS dispatch 用同一句证据 "
+      "“`f3*_body_ds` binds `ds_i8` + `dssc`”。实测：`r09`（C64→C128）**只有一个 FAbs**、2 个 `/127`，即只有 WO 一个 "
+      "amax，DS 侧读共享 `chain_scales` 的 `entry_sc[4]`（`r09…comp` L50/L315，绑定 11，4160 B）→ **STATIC_COARSE**；"
+      "`r10`/`r11` 有 **2 个 FAbs、4 个 `/127`**，WO 与 DS 各自 amax → 两条都 **DYNAMIC_RUNTIME**。"
+      "家族模板确实掩盖了真实差异。")
+    A("")
+    A("## 7. 冲突（**列出，不强行改**）")
+    A("")
+    for c in CONFLICTS:
+        A(f"### {c['id']} — {c['where']}")
+        A("")
+        A(f"* 台账说的：{c.get('rows_say')}")
+        if c.get("s12_says"):
+            A(f"* S12 说的：{c['s12_says']}")
+        if c.get("contradiction"):
+            A(f"* 自相矛盾：{c['contradiction']}")
+        A(f"* 实测：{c['measured']}")
+        A(f"* 处置：{c['action']}")
+        A("")
+    A("## 7b. 其它被记录但不改台账的偏差")
+    A("")
+    A("* **S03 R7 的“8 个 b70 amax” vs 实测 7 个 `/127` 位点**：源码 L24-36 确实**具名** 8 个张量（X/E/Y/Q/K/P/V/Ctx），"
+      "而 SPV 里 `OpFDiv by 127.0` 只有 7 处、`FAbs` 9 处。两者计数基不同（具名张量 vs 指令位点），"
+      "S12 说“7 sites”对应的是 SPV 位点。**不影响类判定**（F20 一条融合边，无论 7 还是 8 都是动态）。")
+    A("* **S03 R8（b70 14 vs 12 MMA）**：源码头注释的 14 是 FP16 父本逻辑步数，二进制 12 个 INT8 MMA；"
+      "台账 V2 的 F20 证据里已写明“SPV 12 为准”，避免后续对账时误判缺阶段。")
+    A("* **D1（S03 R3 要求新增“标量浮点 MAC”类）**：未在本卡落地。出口核 `io-f27-surfaces.spv`"
+      "（`b7720bd7…`，25536 B）每像素做 4×32 fp16 乘 fp32 累加（117.9M MAC/帧）但 0 个 coopmat，"
+      "它在台账里是 ordinal 287 `ioport_block70_2`、family `tail`、`NO_MATRIX`，且该行的 SPV SHA "
+      "`b7720bd7…3ed3d` 与 S03 引用的出口核**逐字节一致**（已核）。新增一个类会改变 425 这个分母与 V2 schema，"
+      "超出“落 36 条 UNKNOWN”的范围，登记为待办而不是偷改。")
+    A("* **S12 的 36 个 WO-bearing position ≠ 36 条 UNKNOWN**：C128 的 11 条 WO 在 V1 里本来就是 DYNAMIC，"
+      "所以 WO 侧真正翻类的只有 C64 7 + C256 15 = 22 条；另 8 条 UNKNOWN 是 DS 边、4 条是投影、2 条是 F2/F20。")
+    A("* **V1 的 C64 WO 证据串是错的**：“no FAbs reduction”，但同一行 machine record 早就是 `FAbs: 1`；"
+      "本次以源码 + 独立 SPV 复扫为准（见冲突 C2）。")
+    A("")
+    A("## 8. 复现")
+    A("")
+    A("```")
+    A("PY = work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/tool-env/Scripts/python.exe")
+    A("& $PY -X utf8 work/dsh-fullnet-static-20261029/ledger/_work/verify_cards.py   # 独立 SPV 复扫 -> evidence/")
+    A("& $PY -X utf8 work/dsh-fullnet-static-20261029/ledger/_work/build_v2.py       # 三个 V2 JSON + 本文件")
+    A("& $PY -X utf8 work/dsh-fullnet-static-20261029/ledger/_work/validate_v2.py    # 跨文件一致性（应输出 PASS）")
+    A("```")
+    A("")
+    A("`build_v2.py` 的输出自带对账：写盘后**从文件内容重读**再独立累加，与 V2 summary 的 `totals` 比对，")
+    A(f"`recompute_check.matches = {str(v2_sum['recompute_check']['matches']).lower()}`，"
+      f"`recount = {json.dumps(v2_sum['recompute_check']['recount'], ensure_ascii=False)}`，"
+      f"`entries = {v2_sum['recompute_check']['recount_entries']}`。")
+    A("")
+    A("## 9. 边界")
+    A("")
+    A("* 只读输入：V1 台账、S03/S12 卡片、plan/SPV/pack/源码；只写 `ledger/`（V2 文件、`evidence/`、`_work/`）。")
+    A("* 未运行 `clock_runner.exe`、未取 `GPU.lock`、未开游戏、未编译任何候选、未开子代理。")
+    A("* 本卡只做**分类与证据**：`quality_accepted=false` 未变，29.61 dB 不是通过线；V2 不构成“纯静态完成”。")
+    A("* 223 条动态边仍在，其中 C32 七块的融合边、C256/split16/ViT 的粒度证明等 V1 §7 未决项**一条都没消**；"
+      "本卡减少的是 UNKNOWN（36 → 0），不是动态总量（190 → 223，方向是变多）。")
+    A("")
+    A("**仍然写着 V1 计数的地方（不在本卡写区，未改，需主执行刷新）**：`ledger/README.md` §5（190 / 168 / 36）、"
+      "`ledger/STATUS.txt`、`reports/FULLNET-STATUS.json`（`dynamic_scale_remainders.ledger_edges = 190`、"
+      "`open_items` 第 3 条 “36 UNKNOWN edges”）、`reports/DSH-FINAL-REPORT.md` 第 12/32 行（190 边 / 276 实例）。"
+      "V2 之后台账口径应以 **223 边 / 0 UNKNOWN / 425 条目** 为准；276 实例数不变。")
+    A("")
+    A("## 10. 产物")
+    A("")
+    A("| 文件 | 说明 | SHA256 |")
+    A("|---|---|---|")
+    A(f"| `FULLNET-ROWS-V2.json` | 288 行 / 425 条目，含 `lineage`、每行 `reclassification` | `{sha_rows}` |")
+    A(f"| `DYNAMIC-SCALE-REMAINDERS-V2.json` | {v2_rem['summary']['positions']} 条动态 position + 撤回记录 + 粒度警示 + S09 对账 | `{sha_rem}` |")
+    A(f"| `SCALE-CLASS-SUMMARY-V2.json` | 按族统计 + `delta_vs_v1` + `recompute_check` | `{sha_sum}` |")
+    A("| `RECLASSIFICATION.md` | 本文件 | — |")
+    A("| `evidence/reclassification-probe.json` | 13 个唯一 SPV 的独立复扫（含 2 条冲突探针） | — |")
+    A("")
+    return "\n".join(L_)
+
+
+if __name__ == "__main__":
+    main()

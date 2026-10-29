@@ -1,0 +1,190 @@
+"""Read-only audit. Never imports project code, compiles, or invokes a GPU tool."""
+from pathlib import Path
+import hashlib, json, re, statistics as st, struct, collections
+R=Path('@NR_WORKSPACE@')
+O=R/'work/codex-astra-fp16-int8-audit-20261024'
+W=R/'work/dsh-int8-same-family-20261023'
+C=R/'candidates/dsh-int8-same-family-20261023'
+RUN=R/'run/dsh-int8-same-family-20261023'
+manifest={}
+def ident(p):
+ p=Path(p)
+ if not p.is_absolute(): p=R/p
+ key=p.as_posix()
+ if key not in manifest:
+  if not p.exists(): manifest[key]={'exists':False}
+  else:
+   h=hashlib.sha256()
+   with p.open('rb') as f:
+    for b in iter(lambda:f.read(1024*1024),b''):h.update(b)
+   manifest[key]={'bytes':p.stat().st_size,'sha256':h.hexdigest()}
+ return {'path':key,**manifest[key]}
+def jread(p):
+ ident(p);return json.loads(Path(p).read_text(encoding='utf-8-sig'))
+def lines(p,pattern):
+ ident(p);return [{'line':i,'text':s} for i,s in enumerate(Path(p).read_text(encoding='utf-8-sig').splitlines(),1) if re.search(pattern,s)]
+def plan(p):
+ p=Path(p); ident(p); ls=p.read_text(encoding='utf-8-sig').splitlines(); ts=lambda s:[x.strip('"') for x in re.findall(r'"[^"]*"|\S+',s)]
+ passes=[];bufs=[]
+ for i,l in enumerate(ls):
+  t=ts(l)
+  if t and t[0]=='BUFFER':bufs.append({'line':i+1,'name':t[1],'bytes':int(t[2]),'file':t[3]})
+  if t and t[0]=='PASS':
+   n=int(t[6]);passes.append({'line':i+1,'name':t[2],'spv':t[3],'subgroup':int(t[4]),'shared':int(t[5]),'grid':list(map(int,t[8:11])),'bindings':ls[i+1:i+1+n],'push_line':i+2+n,'push':list(map(int,ts(ls[i+1+n])[1:]))})
+ return {'identity':ident(p),'header':ls[0],'buffers':bufs,'passes':passes,'lines':ls}
+def spv(p):
+ ident(p); b=Path(p).read_bytes(); words=struct.unpack('<%dI'%(len(b)//4),b);ins=[];i=5
+ while i<len(words):
+  count,op=words[i]>>16,words[i]&65535;ins.append((op,words[i+1:i+count]));i+=count
+ types={};const={};names={};vars=[];execs=[]
+ for op,a in ins:
+  if op==5:names[a[0]]=struct.pack('<%dI'%(len(a)-1),*a[1:]).split(b'\0')[0].decode()
+  if op in (21,22,23,28,29,30,32):types[a[0]]=(op,a[1:])
+  if op==43:const[a[1]]=a[2]
+  if op==59:vars.append(a)
+  if op in (16,331):execs.append({'opcode':op,'args':list(a)})
+ def size(t):
+  op,a=types[t]
+  if op in (21,22):return a[0]//8
+  if op==23:return size(a[0])*a[1]
+  if op==28:return size(a[0])*const[a[1]]
+  if op==32:return size(a[1])
+  return None
+ shared=[{'name':names.get(a[1]),'id':a[1],'bytes':size(a[0]),'access_chains':sum(op in (65,66) and z[2]==a[1] for op,z in ins)} for a in vars if a[2]==4]
+ return {'identity':ident(p),'shared_variables':shared,'shared_bytes':sum(x['bytes'] for x in shared),'execution_modes':execs,'static_mma_sites':sum(op==4459 for op,a in ins),'opcode_counts':dict(collections.Counter(op for op,a in ins))}
+def stats(x):return {'n':len(x),'mean':st.mean(x),'standard_median':st.median(x),'sample_sd':st.stdev(x),'min':min(x),'max':max(x),'first':x[0],'last':x[-1]}
+labels=['b37-fp16-pre-001','b37-int8-001','b37-fp16-post-001','b38-fp16p-pre-001','b38-int8p-001','b38-fp16p-post-001','b39-pp-fp16-001','b39-pp-int8-001','b40-body1-raw-001','b40-body1-pad-001','b41-body1-pad2048-001','b41-body1-pad4096-001','b41-body1-pad8192-001']
+receipts={}; arms={}; plans={}
+for lab in labels:
+ p=RUN/lab/'port_network_receipt.json';j=jread(p);receipts[lab]=j;lock=jread(RUN/'exports'/f'{lab}.lock-receipt.json');argv=lock['argv'];pp=Path(argv[argv.index('--plan')+1]);plans.setdefault(pp.as_posix(),plan(pp));ident(argv[0]);out=ident(RUN/lab/'frame_out.bin')
+ arms[lab]={'receipt':ident(p),'lock_receipt':ident(RUN/'exports'/f'{lab}.lock-receipt.json'),'argv':argv,'runner':ident(argv[0]),'plan':ident(pp),'started_utc':lock['started_utc'],'finished_utc':lock['finished_utc'],'stats':stats(j['gpu_samples_ms']),'reported_median':j['gpu_median_ms'],'samples':j['gpu_samples_ms'],'output':out,'receipt_fields':{k:j[k] for k in ['status','normal_close','original_plan_rows','gpu_passes','device','driver_version_raw','warm','reps','allocation_mode','feedback','dump_alias_disabled','pool_allocated_bytes','timestamp_scope','per_pass_timing','timestamp_count_per_frame','per_pass_interval_scope']}}
+batches={}
+for tag,ids in [('flat',labels[:3]),('pooled',labels[3:6])]:
+ a,c,b=[arms[x]['stats'] for x in ids];base=(a['mean']+b['mean'])/2;h=[2.045*x['sample_sd']/len(receipts[l]['gpu_samples_ms'])**.5 for x,l in zip([a,c,b],ids)]
+ batches[tag]={'runs':ids,'fp16_pre_mean':a['mean'],'candidate_mean':c['mean'],'fp16_post_mean':b['mean'],'fp16_bracket_mean':base,'delta_ms':c['mean']-base,'delta_pct':100*(c['mean']/base-1),'post_minus_pre':b['mean']-a['mean'],'post_minus_pre_pct':100*(b['mean']/a['mean']-1),'reported_rule_B_recomputed':abs(a['mean']-b['mean'])/2+max(h[0],h[2])+h[1],'uncertainty':'One pre/candidate/post process sequence per allocation mode. Frame repeats are not 30 independent process pairs; B is a descriptive within-run rule, not a process-level confidence interval.'}
+# Current referenced material identities, including same input and all packs/SPVs.
+basefp=plans[arms[labels[0]]['plan']['path']];basei8=plans[arms[labels[1]]['plan']['path']]
+for p in [basefp,basei8]:
+ for b in p['buffers']:
+  if b['file']!='-':ident(b['file'])
+ for x in p['passes']:ident(x['spv'])
+fpbuf={x['name']:x for x in basefp['buffers']};ibuf={x['name']:x for x in basei8['buffers']}
+input_names=[n for n in fpbuf if 'image' in n or 'history' in n or 'frame' in n]
+inputs={n:{'fp16':fpbuf[n],'int8':ibuf.get(n),'same_source':Path(ibuf[n]['file'])==Path(fpbuf[n]['file'])} for n in input_names}
+for v in inputs.values():
+ for side in ['fp16','int8']:
+  if v[side] and v[side]['file']!='-':v[side]['identity']=ident(v[side]['file'])
+fp=receipts['b39-pp-fp16-001']['per_pass_gpu'];ii=receipts['b39-pp-int8-001']['per_pass_gpu'];fm={x['name']:x for x in fp};im={x['name']:x for x in ii};common=sorted(fm.keys()&im.keys());onlyi=sorted(im.keys()-fm.keys());onlyf=sorted(fm.keys()-im.keys());s=lambda seq:sum(st.mean(x['samples_ms']) for x in seq)
+attrib={'fp16_count':len(fp),'fp16_unique_names':len(fm),'int8_count':len(ii),'int8_unique_names':len(im),'shared_count':len(common),'sum_fp16':s(fp),'sum_int8':s(ii),'shared_delta':sum(st.mean(im[n]['samples_ms'])-st.mean(fm[n]['samples_ms']) for n in common),'int8_only':[{'name':n,'mean':st.mean(im[n]['samples_ms'])} for n in onlyi],'fp16_only':[{'name':n,'mean':st.mean(fm[n]['samples_ms'])} for n in onlyf],'all_delta_rows':[{'name':n,'delta':st.mean(im[n]['samples_ms'])-st.mean(fm[n]['samples_ms'])} for n in common]}
+attrib['int8_only_sum']=s([im[n] for n in onlyi]);attrib['fp16_only_sum']=s([fm[n] for n in onlyf]);attrib['net_unique']=attrib['int8_only_sum']-attrib['fp16_only_sum'];attrib['actual_named_quant_producer_count']=sum('producer' in n for n in onlyi);attrib['actual_named_quant_producer_sum']=s([im[n] for n in onlyi if 'producer' in n]);attrib['block70_int8_only_sum']=s([im[n] for n in onlyi if 'block70' in n]);attrib['fastest_int8_pass']=min([{'name':n,'mean':st.mean(im[n]['samples_ms'])} for n in im],key=lambda x:x['mean'])
+targets=[f'block{b}_swin_body_1' for b in [1,2,3,4,67,68,69]]
+curve={}
+for lab in labels[6:]:
+ rec=receipts[lab];ps={x['name']:x for x in rec['per_pass_gpu']};vals={n:stats(ps[n]['samples_ms']) for n in targets};curve[lab]={'frame':stats(rec['gpu_samples_ms']),'body1':vals,'body1_sum':sum(x['mean'] for x in vals.values()),'body1_mean':st.mean(x['mean'] for x in vals.values()),'other_pass_sum':s([x for x in rec['per_pass_gpu'] if x['name'] not in targets])}
+raw=plans[arms['b40-body1-raw-001']['plan']['path']];pad=plans[arms['b40-body1-pad-001']['plan']['path']]
+shared={'curve':curve,'raw_pad_plan_diff':[{'line':i+1,'raw':a,'pad':b} for i,(a,b) in enumerate(zip(raw['lines'],pad['lines'])) if a!=b],'targets':[]}
+for x in pad['passes']:
+ if x['name'] in targets:shared['targets'].append({'name':x['name'],'line':x['line'],'grid':x['grid'],'push_line':x['push_line'],'word15':x['push'][15],'guard_true':x['push'][15]!=0,'shared_plan_bytes':x['shared']})
+spvs={}
+for p in [*C.glob('body1-exp/spv/c32*.spv'),*C.glob('body1-half/spv/*.spv')]:spvs[p.as_posix()]=spv(p)
+shared['source_evidence']=lines(C/'body1-exp/source/c32_register_pad.comp',r'local_size_x|body1_pad|ivec4 p0')
+shared['delta_pad_minus_raw_body1_sum']=curve['b40-body1-pad-001']['body1_sum']-curve['b40-body1-raw-001']['body1_sum'];shared['delta_pad_minus_raw_frame']=curve['b40-body1-pad-001']['frame']['mean']-curve['b40-body1-raw-001']['frame']['mean'];shared['delta_pad_minus_raw_other_passes']=curve['b40-body1-pad-001']['other_pass_sum']-curve['b40-body1-raw-001']['other_pass_sum'];shared['delta_int8_minus_pad_body1_sum']=curve['b39-pp-int8-001']['body1_sum']-curve['b40-body1-pad-001']['body1_sum'];shared['delta_int8_minus_pad_frame']=curve['b39-pp-int8-001']['frame']['mean']-curve['b40-body1-pad-001']['frame']['mean']
+shared['native_resource_evidence']='No native ISA/SLM/GRF/scratch/occupancy artifacts located for these exact raw/pad/size variants in work/candidates/build/run dsh-int8-same-family-20261023. SPIR-V retained array declarations are not native resource evidence.'
+raw_source=R/'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1/source/c32_register.comp'
+pad_source=C/'body1-exp/source/c32_register_pad.comp'
+ident(raw_source)
+shared['source_equal_after_removing_pad_lines_and_blank_lines']=[s for s in raw_source.read_text(encoding='utf-8').splitlines() if s.strip()]==[s for s in pad_source.read_text(encoding='utf-8').splitlines() if s.strip() and 'body1_pad' not in s]
+shared['raw_spv_is_deployed_spv']=ident(C/'body1-exp/spv/c32_register_raw.spv')['sha256']==ident(next(x['spv'] for x in basefp['passes'] if x['name']==targets[0]))['sha256']
+import numpy as np
+a=np.fromfile(RUN/'b40-body1-raw-001/frame_out.bin',dtype='<f4');b=np.fromfile(RUN/'b39-pp-fp16-001/frame_out.bin',dtype='<f4')
+shared['raw_vs_deployed_output']={'elements':a.size,'bitwise_unequal_elements':int(np.count_nonzero(a.view('<u4')!=b.view('<u4'))),'max_abs':float(np.max(np.abs(a.astype('f8')-b.astype('f8')))),'raw_finite':bool(np.all(np.isfinite(a))),'deployed_finite':bool(np.all(np.isfinite(b)))}
+census_path=R/'work/astra-int8-full-network-design-20261023/G3-GAP-CENSUS.json';cj=jread(census_path);pos=cj['positions'];spill=sum(x['spill_bytes_fp16_out'] for x in pos);debug_spill=sum(b['bytes'] for x in pos for b in x['outputs'] if b['elem']=='float16' and 'debug' in b['buffer']);touch=[x for x in pos if x['fp16_activation_inputs'] or x['fp16_outputs']]
+census={'identity':ident(census_path),'summary':cj['summary'],'position_count':len(pos),'dtype_counts':dict(collections.Counter(x['dtype_status'] for x in pos)),'touch_fp16_using_original_fields':len(touch),'touch_excluding_debug_outputs':sum(bool(x['fp16_activation_inputs'] or [n for n in x['fp16_outputs'] if 'debug' not in n]) for x in pos),'spill_bound_bytes_fp16_outputs':spill,'spill_bound_MB_decimal':spill/1e6,'spill_bound_MiB':spill/2**20,'debug_fp16_output_bound_bytes':debug_spill,'first_position':pos[0],'binding_total_input_bytes':sum(b['bytes'] for x in pos for b in x['inputs']),'binding_total_output_bytes':sum(b['bytes'] for x in pos for b in x['outputs'])}
+bc=collections.defaultdict(lambda:collections.Counter())
+for x in pos:
+ for direction in ['inputs','outputs']:
+  for b in x[direction]:
+   n=b['buffer']; cat='debug' if 'debug' in n else ('weights_aux' if any(y in n for y in ['weight','pack','aux','scale']) else 'activation')
+   bc[cat][direction]+=b['bytes']
+census['name_classification_binding_capacity_not_traffic']=dict(bc)
+census['debug_only_positions']=[x['name'] for x in pos if not x['fp16_activation_inputs'] and x['fp16_outputs'] and all('debug' in n for n in x['fp16_outputs'])]
+census['fp16_output_bound_excluding_debug_bytes']=spill-debug_spill
+census['memory_report_category_reproduction']='4,532,252,524 total declared input+output bytes is reproducible. The original 1.77GB activation /2.70GB weights+aux partition has no supplied exact category predicate and is not independently confirmed; arbitrary name/file heuristics produce different partitions. No binding sum measures access multiplicity or cache/DRAM traffic.'
+kernel_source=R/'candidates/int8-coverage-v2-20261020/C/c32-i8-debug-eact-v1/source/c32_i8_common.glsl'
+source_facts={'body1_static_quantization':lines(kernel_source,r'static symmetric|fsc layout|precise float c|roundEven|fsc\[1\]|fsc\[3\]'),'runner':lines(R/'build/codex-sol-int8-pilot-20261018/pilot_network_runner.cpp',r'pass.shared >|timestampPeriod|sorted\[reps/2\]|vkCmdPushConstants\(command|auto push=pass.push'),'census_builder':lines(R/'work/int8-coverage-v2-20261020/make_g3_tables.py',r'fp16_in =|fp16_out =|spill_bytes_fp16_out|file-backed weight')}
+for n in ['f1c32_image_pre','ioport_block70_1']:
+ x=next(x for x in basei8['passes'] if x['name']==n);source_facts[n]={'plan_pass':x,'spv':spv(x['spv'])}
+half_e=jread(W/'body1-half/evidence/EVIDENCE.json');half_plan=plan(C/'body1-half/plans/plan-body1-half.txt');half_diff=[{'line':i+1,'parent':a,'half':b} for i,(a,b) in enumerate(zip(basei8['lines'],half_plan['lines'])) if a!=b]
+half={'evidence':half_e,'ordinary_plan':ident(C/'body1-half/plans/plan-body1-half.txt'),'plan_line_count_same':len(basei8['lines'])==len(half_plan['lines']),'line_diff':half_diff,'parent_spv_equal':ident(C/'body1-half/spv/c32_body1_i8_parent_repro.spv')['sha256']==ident(half_e['parent_reproduction']['deployed'])['sha256'],'gpu_run_directories_matching_half':[p.as_posix() for p in RUN.iterdir() if p.is_dir() and ('half' in p.name or 'se8' in p.name.lower())]}
+for p in [W/'INT8-VS-FP16-SPEED.json',W/'INT8-SPEED-LEDGER.json',W/'PER-PASS-ATTRIBUTION.json',W/'BODY1-SHARED-EXPERIMENT.json',W/'BODY1-SHARED-CURVE-RESULT.json',W/'INT8-DATAPATH-STATUS.md',W/'FULL-INT8-CEILING-AND-AMD-FP8.json',W/'PER-FRAME-MEMORY-ACCOUNT.json',W/'WHERE-THE-TIME-GOES.json',W/'tools/body1_shared_experiment.py',W/'tools/body1_shared_curve.py',C/'body1-half/REPORT.md',W/'body1-half/logs/validate-half.log',W/'body1-half/logs/validate-pool-final.log',W/'body1-half/evidence/ADDRESS-PROOF.json']:ident(p)
+hot=s([im[n] for n in ['f1c32_image_pre','ioport_block70_0','ioport_block70_1','ioport_block70_2']]);arith={'claimed_1_82_plus_2_92':1.82+2.92,'claimed_hotspots_share_of_26_25_pct':(1.82+2.92)/26.25*100,'actual_hotspots_ms':hot,'actual_hotspots_share_of_b39_pct':hot/st.mean(receipts['b39-pp-int8-001']['gpu_samples_ms'])*100,'top12_share_complement_61':'61 is the complement of reported top-12 39%, not the share of 1.82+2.92ms. No matrix/nonmatrix isolated timing is supplied.','optimistic_arithmetic':26.25-3.259-.63-1.754,'conservative_arithmetic':26.25-.967-.63-1.754,'claimed_2_96_reconciliation':'1.45 negative +2.96+1.75 =3.26, not separately measured quantization-only time; pass differences do not isolate arithmetic, conversion, occupancy, or traffic.'}
+out={'scope':'INT8 B3-B7 read-only CPU audit; current files rehashed, no new compile/device/pipeline/GPU/lock/deployment','arms':arms,'ordinary_batches':batches,'base_plan_headers':{'fp16':basefp['header'],'int8':basei8['header']},'input_comparison':inputs,'per_pass':attrib,'shared':shared,'spv_static':spvs,'census':census,'half_variant':half,'arithmetic':arith,'source_facts':source_facts,'manifest':manifest}
+out['findings']=[
+ {'id':'IP01','status':'KEEP_WITH_SCOPE','claim':'Ordinary INT8 slower than FP16','verified':'pooled +3.273993848 ms (+14.249572%); flat +2.894443508 ms (+11.876973%); 265-pass FP16 vs 287-pass G3 INT8','minimum_correction':'Name these exact parents. Do not compare against latest 232-pass FP16, infer whole-network adoption, or treat 30 replays as 30 independent runs.'},
+ {'id':'IP02','status':'CORRECT','claim':'Shared pass count 251','verified':'264 common names; 23 INT8-only; 1 FP16-only. Total 287/265.','minimum_correction':'Change count to 264; preserve arithmetic +2.430645772+3.259041589-2.292072858=3.397614503 ms.'},
+ {'id':'IP03','status':'RETRACT','claim':'23 pure producer passes cost 3.259 ms','verified':'21 named qx producers cost 0.607989568 ms; two block70 kernels cost 2.651052021 ms. 0.966968731 ms is net unmatched topology cost.','minimum_correction':'Keep separate producer timing and block70 compute; do not subtract gross block70 work as free quantization removal.'},
+ {'id':'IP04','status':'RETRACT_CAUSAL_EXCLUSIVITY','claim':'Unused shared alone reproduces entire regression; native occupancy proven','verified':'4 of 7 pad guards are true; local size 128; raw rebuilt SPV/output differs from deployed FP16; seven kernels +1.754166623 ms, other kernels +0.813249975 ms; frame +2.56769786 ms. Native SLM/GRF/scratch/residency unverified.','minimum_correction':'Keep empirical pad variant timing/step response. Correct guard and source identity statements. If claiming unique causality, deliver exact native resource ledger and controlled repeated comparison; no new GPU required for this audit.'},
+ {'id':'IP05','status':'RETRACT','claim':'body1 dynamic absmax costs 0.63 ms; static scale removes it','verified':'Current source already uses static fsc[1]/fsc[3], multiply/RNE/clamp; 0.628458319 ms is entire seven-kernel INT8-minus-pad difference, not isolated conversion time.','minimum_correction':'Describe actual static quantization, dequantization, narrow/layout/storage costs and preserve them in a future complete chain contract.'},
+ {'id':'IP06','status':'CORRECT_SCOPE','claim':'226/287 FP16 activation positions and 894 MB spill traffic','verified':'226 by existing fields, but eight debug-only ViT expand positions; excluding debug outputs yields 218 under that same predicate. 894167104 declared output bytes include 44542016 debug bytes.','minimum_correction':'State count predicates and exclude debug when claiming data activations. Call sizes declared binding capacity sums, not measured global/L2/DRAM traffic or register spill.'},
+ {'id':'IP07','status':'RETRACT','claim':'2.96ms measured quantization-only layer; 61% image-pre/block70','verified':'No isolated 2.96ms measurement; 1.82+2.92=4.74ms=18.06% of 26.25ms. Exact b39 hotspots 4.73655197ms=17.7474%. F1 SPV has 129 MMA sites, block70_1 14 sites.','minimum_correction':'Do not label F1 pure preprocessing, these stages nonmatrix-only, or whole net matrix-minority without an appropriate measurement.'},
+ {'id':'IP08','status':'RETRACT_AS_BOUND','claim':'Full INT8 ceiling 20.6-22.9ms','verified':'Arithmetic 20.607/22.899 is correct for assumptions; gross producer term includes essential block70 compute, remaining terms are uncontrolled same-family aggregate differences from different timing modes.','minimum_correction':'At most an unvalidated scenario, not ceiling/prediction/committed gain. A future graph must retain needed residual/history/nonlinear/scaling/narrowing/layout costs and independently validate combined identity.'},
+ {'id':'IP09','status':'KEEP_CPU_PREPARATION_ONLY','claim':'sE8 half variant ready, benefit unmeasured','verified':'Parent SPV equal; half SPV shared declaration 14336 vs18432; ordinary plan differs only seven PASS lines; existing validator result=0; no half GPU receipts found.','minimum_correction':'Keep new candidate CPU-prepared; do not bank 1.75/2.6ms. Eventual exact nonzero numerical gate, ordinary pre/candidate/post and native ledger remain pending.'}
+]
+(O/'int8-performance.json').write_text(json.dumps(out,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+md=['# INT8 原始性能与数据通路审计','',
+'结论：265 发 FP16 父对 287 发 G3 INT8 的 ordinary 变慢成立。shared 变体的响应成立，但“完全未使用 padding、只改 shared、全部开销由 occupancy 唯一造成”不成立；当前 body1 已经是静态尺度。20.6–22.9 ms 只能作为有错误前提的历史算术，不能作为预计帧时或天花板。',
+'', '本报告所有业务文件均位于 `@NR_WORKSPACE@`；下列路径在该根下展开，JSON manifest 给出实际绝对路径、完整 SHA256、字节数。审计仅做原始 JSON、计划、SPIR-V 字节、源码和输出读取/统计；未编译、未创建 Vulkan device/pipeline、未运行 GPU、未接触 GPU 锁。',
+'','## 1. Ordinary：保留数值，限定身份和统计资格','',
+'|分配|FP16 pre|INT8|FP16 post|FP16中点|INT8增量|pre→post|',
+'|---|---:|---:|---:|---:|---:|---:|']
+for k,v in batches.items():md.append(f"|{k}|{v['fp16_pre_mean']:.9f}|{v['candidate_mean']:.9f}|{v['fp16_post_mean']:.9f}|{v['fp16_bracket_mean']:.9f}|+{v['delta_ms']:.9f} ms / +{v['delta_pct']:.6f}%|{v['post_minus_pre']:+.9f} ms|")
+md+=['',f"FP16 计划：`{basefp['identity']['path']}`，SHA256 `{basefp['identity']['sha256']}`；头部 `{basefp['header']}`。INT8 计划：`{basei8['identity']['path']}`，SHA256 `{basei8['identity']['sha256']}`；头部 `{basei8['header']}`。该 FP16 是 265 发父，**不是最新 232 发组合**。",
+f"同一 runner：`{arms[labels[0]]['runner']['path']}`，当前 SHA256 `{arms[labels[0]]['runner']['sha256']}`。锁回执 argv 指向同一路径；原始 receipt 不内嵌执行时 exe/SPV/输入哈希，本审计区分回执路径绑定与当前实物重哈希。",
+'两种分配各自只有一组 pre/candidate/post，都是 warm=0、reps=30、feedback=false、per_pass_timing=false。时间戳覆盖整网 dispatch/barrier，排除上传/回读；B580、driver_version_raw=1663934 相同。pool 两臂分别 735623104/771969088 字节，不能声称池容量相同。',
+'输入资源 `ioport_0_ioport_images` 与 `ioport_70_ioport_images` 在两计划第454/480行指向同一实物（路径分隔符文本不同）；SHA256 分别 `3837c438b83736c7b478ac45a4e31631423586beed891bb90a97118395e21728` 和 `bd4732d3e6fdc1cd383468097ee0fadbe8513a3e877f4cd1f784257b15d9f47e`。是同一固定 fixture 的非反馈重播，不能称多场景/连续帧结论。',
+'回执记录 UTC 起止，B37 为 2026-10-23 15:11:26–15:11:40，B38 为15:12:18–15:12:30；未见 GPU 核心/显存频率、功率或温度采样。runner 第506行使用 Vulkan timestampPeriod 换算，这不证明硬件频率锁定。',
+'原报告 B 规则复算 flat=0.531112074、pool=0.119158301 ms；它只是由一批内 SD 和 pre/post 漂移形成的描述性规则，不能当独立进程配对置信区间，更不能把90个帧样本当90次独立实验。INT8 高于 pre 与 post 两者的事实不依赖这项夸大。',
+'','标准 median 用 sorted[14]、sorted[15] 的平均值；runner 第572行实际取 sorted[reps/2]（上中位数），需更正名称或输出：','',
+'|运行|mean ms|标准median ms|原receipt median ms|receipt SHA256|','|---|---:|---:|---:|---|']
+for n in labels[:6]:
+ a=arms[n];md.append(f"|{n}|{a['stats']['mean']:.9f}|{a['stats']['standard_median']:.9f}|{a['reported_median']:.9f}|`{a['receipt']['sha256']}`|")
+md+=['','这些原件路径是 `run/dsh-int8-same-family-20261023/<运行>/port_network_receipt.json`，第10–25行固定模式，`gpu_samples_ms` 为逐样本真值。完整样本与参数见 JSON `arms`。',
+'','## 2. 逐 pass 账：净差成立，producer 分类错误','',
+f"b39 两臂各5 reps、pool、per-pass instrumentation。重算完整 pass 均值和 FP16={attrib['sum_fp16']:.9f}、INT8={attrib['sum_int8']:.9f} ms；共同名字 **264**（账本写251），INT8独有23，FP16独有1。共同核净差 +{attrib['shared_delta']:.9f}，INT8独有 +{attrib['int8_only_sum']:.9f}，FP16独有 −{attrib['fp16_only_sum']:.9f}，合计 +{attrib['sum_int8']-attrib['sum_fp16']:.9f} ms。",
+f"23个 INT8 独有项实际为 **21个 qx producer，共{attrib['actual_named_quant_producer_sum']:.9f} ms**，加 `ioport_block70_0` 0.385374991、`ioport_block70_1` 2.265677030，共{attrib['block70_int8_only_sum']:.9f} ms。后者有必须执行的网络计算；SPV `c32-full.spv` 独立扫描含14个静态 MMA site。因此3.259不是可免费全删的量化成本；0.966968731仅为两种计划不匹配部分的净拓扑成本。",
+'证据：`work/dsh-int8-same-family-20261023/PER-PASS-ATTRIBUTION.json` 第26–38行已经列出 block70；`INT8-SPEED-LEDGER.json` 第12–15行存在 count=251 错误。原始 b39 两个 receipt、每个 pass 的 samples 和完整重算列见 JSON `per_pass`/manifest。',
+'最快 dispatch interval=0.004145833 ms 只证明最短被测区间；其 scope 明写包括 clear/dispatch/barriers/instrumentation，不能乘287当纯launch开销上界，也不能由整核赢家推导原生MMA单指令2倍。',
+'','## 3. Shared 对照：保留响应，撤回唯一因果','',
+'|运行/变体|SPV声明shared B|7核平均 ms|7核合计 ms|帧 mean ms|','|---|---:|---:|---:|---:|']
+sizes=[8192,18432,8192,18432,10240,12288,16384]
+for lab,size in zip(labels[6:],sizes):
+ v=curve[lab];md.append(f"|{lab}|{size}|{v['body1_mean']:.9f}|{v['body1_sum']:.9f}|{v['frame']['mean']:.9f}|")
+md+=['',
+'保留：raw/pad 计划只有七条 PASS 的SPV路径和shared声明值不同，geometry/PUSH/bindings/其它计划行相同；删掉插入的 pad 与 guard 行后，source 非空行与 raw source 相同。SPIR-V 独立解析确认 pad 数组仍存在：10240/12288/16384/18432 B 是 **SPIR-V 声明总量**。并没有核实 native SLM 分配、GRF/scratch 或 occupancy。计划shared字段在 runner 第93–95行读取并上限校验，不能代替驱动资源实测。',
+'撤回“从不执行”：`candidates/dsh-int8-same-family-20261023/body1-exp/source/c32_register_pad.comp` 第166行是 `if(pc.p3.w != 0) body1_pad[gl_LocalInvocationID.x] = 0u`，第31行PC由ivec4组成。pad计划第527/541/3303/3317行，对block2/4/67/69的PUSH word15=4294967295（int -1），guard为真；因此4/7核并非无工作padding。即便死写可能被native消掉，也需要native证据；不能同时假定写入无成本、数组又必然全部保留。第24行local_size_x=128，原报告256线程也应更正。',
+'撤回“部署父逐位复现”：部署FP16 SPV是133768B/SHA `34700631b1ed707bb6cb402aee28848f4438f44aed1049ac7eec73f91714aeb4`；raw重编是133984B/SHA `5000ee6f7913b1e247675073462feb73f8de620061522481cd0cef49c235e767`，不是同一文件。raw最终输出与部署FP16的7372800个float32中5526366个位模式不同，max abs=0.0013283491134643555（均finite）。raw/pad/三个size变体彼此最终输出SHA相同 `60ea7590d6c76bc42ee8d4eeaca500026573a0665331af9e866a0748e1fb6d2f`，证明本输入上padding不改最终输出，不能反推其运行成本为零。',
+'区分三个数：单目标核均差0.250595232 ms ×7 = **1.754166623 ms**；整帧差 **2.567697860 ms**；未改的其它258核合计也多了 **0.813249975 ms**。因此不能将2.567全记到7核占用率。INT8和pad帧差只有0.012385420，但7目标核仍相差0.628458319，说明其它核差值发生抵消；两帧总时接近并不证明两条数学/资源路径等效。',
+'10/12/16KiB变体与18KiB之间存在被测时间响应，适合保留为资源相关优化线索。未用重复交错process试验控制频率/缓存与时间漂移、又缺native资源账，不能声称确定occupancy阈值、2KB必然回收2.6ms、或排除其它算术/指令/调度成本。最小补正是更正报告、补exact SPV的native SLM/GRF/scratch和实际guard说明；未来只对最终半变体做必要数值与ordinary比较，不在本次审计重跑所有旧实验。',
+'','## 4. body1 已使用静态尺度，0.63不是absmax读数','',
+'`candidates/int8-coverage-v2-20261020/C/c32-i8-debug-eact-v1/source/c32_i8_common.glsl` 第1/15/18–21/49/58行明确：static symmetric、fsc[1]=invX、fsc[3]=invE、乘inverse/RNE/clamp，写sX8/sE8。第24–41行把int32转浮点、乘静态乘积尺度、保留seed再窄化。当前body1不存在所宣称的输入动态absmax扫描。',
+'0.628458319 ms是 b39 INT8 相对 b40 pad 的七核合计差值，包含矩阵类型、计算/转换/布局/存储/屏障等整体变化及跨run差异，并未隔离出“量化/屏障成本”。静态标定不使乘尺度、窄化、饱和、非线性/残差域转换或片元布局自动免费，跨层直接消费也必须遵守权重/激活尺度合同。',
+'','## 5. Census 与访存账：保留静态口径，撤回流量/带宽因果','',
+f"`work/astra-int8-full-network-design-20261023/G3-GAP-CENSUS.json` SHA `{census['identity']['sha256']}`：287 dispatch 中 INT8_ALL_SITES=135、MIXED=25、FP16_ALL_SITES=104、NON_MATRIX=23；这是静态矩阵site分类，不是运行时指令次数或纯数据类型链。226可按 `fp16_activation_inputs or fp16_outputs` 复现；但八个ViT31–38 ffn_expand仅FP16 **debug输出**导致入选。沿原谓词排除debug输出后为218，此数仍是同一静态/保守分类，不能升级成逐元素真实流量。",
+'894167104字节（894.167104 MB、852.744202 MiB）来自每位置FP16输出 **BIND声明范围求和**，含44542016字节debug；排debug=849625088字节。`work/int8-coverage-v2-20261020/make_g3_tables.py` 第68–81行明确实现此口径，未计算实际写域、访问次数、cache hit/miss 或 DRAM bytes。也不能把它称寄存器spill。',
+'输入BIND总和3204916940字节 + 输出1327335584字节 =4532252524字节，可复现4.53GB总声明账；原1.77GB激活/2.70GB权重分区未提供可执行分类谓词，未独立确认。更重要的是声明容量不是traffic上界：实际写域可小，重读可多，cache可吸收；故1.77/456的4–10ms带宽模型不能声称实际占帧1/3–1/2，也不能由八个25MB绑定推定201MB全部权重每帧DRAM必读。AMD“只有1/3”同样缺实际访问/计数证明。',
+'2.96ms没有相应隔离实验或纯量化区间：它不能用上述BIND账证明，也不能从整核差唯一归因。把矩阵省1.45、非矩阵2.96、occupancy1.75相加仅是未经独立校准的解释性账本。',
+'','## 6. 61%、F1、20.6–22.9ms','',
+'1.82+2.92=4.74ms，占26.25ms的18.057%，占22.976ms的20.630%，不是61%。原始b39热点和为4.736551970ms，占26.688697260ms的17.7474%。61恰等于top12占39%的补数，但这不能把剩余61%归为不可INT8加速。',
+'F1不是纯前处理：INT8计划第741行绑定 `candidates/dhs-netorg-long-20261018/T3/c32a-f1-transport-v1/c32a_f1_transport.spv`，SHA `cd8037859c126af417e5388ea6c63fe2012ec76869715e44b464ab0aa4019e26`；独立SPIR-V扫描129个MMA站点。block70_1也含14个静态MMA站点。不能把整核时间都算矩阵外开销或都作为融合可回收收益。',
+'26.25−3.259−0.63−1.754=20.607，26.25−0.967−0.63−1.754=22.899，算术本身正确，但假设不成立：3.259含必需block70计算；0.63未隔离；1.754不是已测native占用率纯成本；基线26.25来自ordinary，分项来自instrumented且不同run；删producer/改内部阶段也会同时改变资源和布局，不能假定独立可加。23.52“修到极致打平”同样不是数学上限。最小补正：撤回速度承诺/天花板，至多标作未验证情景，不据此裁定全INT8只能覆盖研究。',
+'','## 7. 最新sE8 half：仅CPU准备，未见新GPU','',
+f"半变体计划 `{half['ordinary_plan']['path']}`，SHA `{half['ordinary_plan']['sha256']}`，与G3普通计划仅7行PASS不同；父SPV字节复现确认。新SPV SHA `cf820f6162c86e779c26d66ddc16066462b686bc4b615ea78b02d95451c6973f`，静态Workgroup声明14336B，父18432B；existing `validate-half.log` 有result=0，`validate-pool-final.log` violations/file_errors/bind_errors均空。",
+'`work/dsh-int8-same-family-20261023/body1-half/evidence/EVIDENCE.json` 第4–5行gpu_run=false；ADDRESS-PROOF记录整数地址检查all_ok。当前run目录/exports未见half或sE8 GPU回执；不能因CPU证明就授予GPU字节资格或银行化1.75/2.6ms。其report把pad8192说成未跑是旧时点，b41-pad8192已在；这只补全pad曲线，并没有补half。新schedule延长若干累加器/expand活区，native寄存器变化仍未证。',
+'最小后续：保留half为候选研究身份，依次补非零完整有效域父/half数值门、同一普通计划pre/candidate/post、exact SPV native资源账；不要先承诺占用率收益。其它已有充分ordinary证据无需重做。',
+'','## 8. 核心实物哈希','',
+'|实物绝对路径|SHA256|','|---|---|']
+core=[W/'BODY1-SHARED-EXPERIMENT.json',W/'BODY1-SHARED-CURVE-RESULT.json',pad_source,raw_source,kernel_source,W/'INT8-DATAPATH-STATUS.md',W/'FULL-INT8-CEILING-AND-AMD-FP8.json',W/'PER-FRAME-MEMORY-ACCOUNT.json',R/'build/codex-sol-int8-pilot-20261018/pilot_network_runner.cpp',R/'work/int8-coverage-v2-20261020/make_g3_tables.py']
+for p in core:md.append(f"|`{p.as_posix()}`|`{ident(p)['sha256']}`|")
+md+=['','机器结果：`int8-performance.json` 的 `arms/ordinary_batches/per_pass/shared/spv_static/census/half_variant/source_facts/findings/manifest` 保存全部重算与身份。审计程序 `audit-int8-performance.py` 只读业务，输出仅本审计目录。']
+(O/'int8-performance.md').write_text('\n'.join(md)+'\n',encoding='utf-8')
+print(json.dumps({'ordinary':batches,'inputs':inputs,'per_pass':{k:v for k,v in attrib.items() if k!='all_delta_rows'},'shared_summary':{k:v for k,v in shared.items() if k!='curve'},'census':{k:v for k,v in census.items() if k not in ['first_position','summary']},'half_plan_diff_count':len(half_diff),'arithmetic':arith},ensure_ascii=False,indent=2))

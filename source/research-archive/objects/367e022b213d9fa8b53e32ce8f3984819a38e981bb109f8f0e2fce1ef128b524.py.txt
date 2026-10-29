@@ -1,0 +1,82 @@
+from pathlib import Path
+import json,hashlib,subprocess,shlex,sys,collections,shutil
+D=Path(__file__).resolve().parent;A=D.parent;B=A.parent.parent;P=A/'f20-coarse-owner-20261026';S=D/'ups-fused-no-mirror';S.mkdir(exist_ok=True)
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+def ident(p):return dict(path=str(p),sha256=sha(p))
+def save(p,x):p.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding='utf-8')
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+lines=(P/'plan.txt').read_text().splitlines();rows=[];starts=[]
+for i,l in enumerate(lines):
+ t=shlex.split(l)
+ if not t:continue
+ if t[0]=='PASS':rows.append(dict(tokens=t,bind=[],lines=[l]));starts.append(i)
+ elif t[0]=='BIND':rows[-1]['bind'].append(list(map(int,t[1:])));rows[-1]['lines'].append(l)
+ elif t[0]=='PUSH':rows[-1]['push']=list(map(int,t[1:]));rows[-1]['lines'].append(l)
+
+def access(spv,slot):
+ m=ST.Module(spv);ids={o[0] for op,o,*_ in m.instructions if op==71 and len(o)==3 and o[1:]==[33,slot]}
+ return [(op,o) for op,o,*_ in m.instructions if op not in (5,15,71,59) and any(v in ids for v in o)]
+proof=[];sources=[];changed={};drop={168,214}
+for C,ord,z in [(64,213,1),(256,167,4)]:
+ b,c=rows[ord],rows[ord+1];assert b['bind'][:8]==c['bind'];assert b['push'][:17]==c['push'][:17];assert c['push'][7]==0
+ root=B/'work/dsh-xmx-handoff-validation-20261024/candidates/a1-d034-gm-drop';src=root/f'source/c{C}/fused_d034_c{C}.comp';parent=root/f'spv/a1_c{C}.spv'
+ out=S/f'c{C}.spv';run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(src.parent),src,'-o',out]);pm,cm=ST.Module(parent),ST.Module(out);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,set());ST.set_no_contraction(cm,keep,out);assert sha(out)==sha(parent)
+ assert not access(out,5)
+ rid=b['bind'][5][1];bound=[]
+ for idx,r in enumerate(rows):
+  for slot,res,off,size in r['bind']:
+   if res==rid:
+    ac=access(Path(r['tokens'][3]),slot);bound.append(dict(ordinal=idx,slot=slot,reference_count=len(ac)))
+    assert idx in (ord,ord+1) or not ac,(C,idx,'remaining M reader')
+ # Full tile owner coverage, both middle and output. No two owners overlap.
+ count=collections.Counter();slab=64//z;ng=C//32
+ for zg in range(z):
+  for sg in range(8):
+   g=sg%ng;pair=sg//ng
+   for t in range(zg*slab+16*pair,zg*slab+16*pair+16):
+    for ch in range(32*g,32*g+32):count[t,ch]+=1
+ assert set(count)=={(t,ch) for t in range(64) for ch in range(C)} and set(count.values())=={1}
+ assert [hb*2+i for hb in range(4) for i in range(2)]==list(range(8))
+ # Expand weights: two row fragments per pair in both old/new, no duplicated weight request.
+ oldz=int(b['tokens'][-1]);r=1 if C==256 else 2
+ old_w=oldz*8*r*(C//16)*2;new_w=z*8*4*(C//16)*2;assert old_w==new_w
+ # Current consumers only use canonical Y, M has no surviving access.
+ t=b['tokens'][:];t[3]=out.as_posix();t[5]='8192';t[-1]=str(z)
+ newlines=[' '.join(('"'+v+'"') if j in (2,3) else v for j,v in enumerate(t))]+b['lines'][1:-1]+['PUSH '+' '.join(map(str,c['push']))]
+ changed[ord]=newlines
+ gx,gy=map(int,t[-3:-1]);mbytes=gx*gy*64*C*2
+ proof.append(dict(width=C,parent_body=ord,parent_contract=ord+1,new_grid=[gx,gy,z],old_grid_z=oldz,owner_coverage='All64tokens x C channels exactly once',M_bound=bound,removed_global_M_store_bytes=mbytes,removed_global_M_min_read_bytes=mbytes,expand_weight_load_requests_per_window={'old':old_w,'new':new_w},shared_old=int(b['tokens'][5]),shared_new=8192,rounding='Each expand uses K ascending then FP32->half then original half act; middle K=hb*32+0,+16 ascending then FP32->half; contract half seed product widened then ascending K; no algebraic reassociation.',lifetime='Four middle FP32 accumulators live across expand loop; four expand FP32 accumulators plus four half activations at peak (logical accumulator payload128B/lane plus64B/lane half representations before compiler reuse; operands extra). Expand and middle retire before contract accumulators. Eight SG active; group count decreases. Actual scratch checked from identical native already present and candidate capture.',push='Full contract32words; body-used words0..16 equal; rs word17 now contract scale. Only p0..p4 read by fused.'))
+ sources.append(dict(width=C,source=ident(src),module=ident(parent),rebuild=ident(out)))
+# Preserve ordinal-dependent pool lifetimes, map deleted contract to fused producer.
+def remap(v):return v-sum(d<v for d in drop)-(1 if v in drop else 0)
+out=[];i=0;ord=0
+while i<len(lines):
+ l=lines[i]
+ if l.startswith('PASS '):
+  n=len(rows[ord]['lines'])
+  if ord not in drop:out.extend(changed.get(ord,rows[ord]['lines']))
+  i+=n;ord+=1;continue
+ if l.startswith('POLICY '):
+  t=l.split();t[3]=str(remap(int(t[3])));t[4]=str(remap(int(t[4])));l=' '.join(t)
+ out.append(l);i+=1
+h=out[0].split();h[3]='230';out[0]=' '.join(h);plan=S/'plan.txt';plan.write_text('\n'.join(out)+'\n')
+cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check'])
+# Resource evidence on identical binaries already in current network. No new compiled identity.
+res=json.loads((D/'ups-coarse-owner/run/resources-f20-pixel-owner/pipeline-statistics.json').read_text());native=[]
+for x in sources:
+ ix=next(i for i,r in enumerate(rows) if sha(Path(r['tokens'][3]))==x['module']['sha256']);pi=res['pass_pipeline_indices'][ix];stat={v['name']:v['value'] for v in res['pipelines'][pi]['executables'][0]['statistics']};assert stat['Scratch Memory Size']==0;native.append(dict(width=x['width'],known_ordinal=ix,pipeline=pi,statistics=stat))
+save(S/'PROOF.json',dict(rows=proof,known_native=native,scope='Normal path fixed/fb2; debug intermediate dumps differ and are not claimed compatible',prior='A2 used fused kernels retaining gM mirror. This arm reuses A1 no-mirror identities on current canonical UPS interfaces. No inferred performance from older A2.'))
+save(S/'BUILD.json',dict(parent=ident(P/'plan.txt'),plan=ident(plan),sources=sources,CPU=cpu,deleted_ordinals=sorted(drop)))
+(S/'run').mkdir(exist_ok=True)
+for kind in ['GATES','RESOURCES','ORDINARY']:
+ t=json.loads((P/f'LUNA-{kind}.json').read_text());ex=S/(kind.lower()+'-execution');ex.mkdir(exist_ok=True);t['output_root']=str(ex);t['identities']=[v for v in t['identities'] if not v['path'].endswith('.spv')]+[v['rebuild'] for v in sources]
+ for j in t['jobs']:
+  jp=P/'plan.txt' if kind=='ORDINARY' and j['candidate']=='parent' else plan
+  j['plan']=ident(jp);j['runner_output']=str(S/'run'/j['id']);ar=j['argv'];ar[ar.index('--plan')+1]=str(jp);ar[ar.index('--out')+1]=j['runner_output']
+ save(S/f'LUNA-{kind}.json',t)
+exe=(D/'combined/execute.ps1').read_text();exe=exe.replace('LUNA-FULLNET-MECHANISM-COMBO-20261026','LUNA-UPS-FUSED-NOMIRROR-20261026');(S/'execute.ps1').write_text(exe)
+shutil.copyfile(D/'combined/review_timing.py',S/'review_timing.py')
+print(cpu);print(json.dumps(native,indent=2));print('M store bytes removed',sum(x['removed_global_M_store_bytes'] for x in proof))
+

@@ -1,0 +1,84 @@
+import json, os, hashlib
+import numpy as np
+
+W = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029"
+Q = r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = os.path.join(Q, "real-int8-24")
+
+def load(p):
+    return np.fromfile(p, dtype="<f2").astype(np.float32)
+
+def sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+CASES = [
+    ("block15_out (C256 b15 out)", 256, "family-isolation/run-block15/replayed-network.bin", "dump-fp16/dump_block15_out.bin", "corrected-INT8 chain dump arm"),
+    ("block31_out (ViT b31 out)", 256, "family-isolation/run-block31/replayed-network.bin", "dump-fp16/dump_block31_out.bin", "corrected-INT8 chain dump arm"),
+    ("block38_out (ViT b38 out)", 256, "family-isolation/run-block38/replayed-network.bin", "dump-fp16/dump_block38_out.bin", "corrected-INT8 chain dump arm"),
+]
+BUCKETS = [(0.0, 50.0), (50.0, 90.0), (90.0, 99.0), (99.0, 99.9), (99.9, 100.01)]
+
+out = []
+for label, C, rel_i8, rel_fp, chain in CASES:
+    pi, pf = os.path.join(D, rel_i8), os.path.join(D, rel_fp)
+    a = load(pi); b = load(pf)
+    assert a.size == b.size
+    assert a.size % (C * 16) == 0, (label, a.size, C)
+    d = a - b
+    A = a.reshape(-1, C // 16, 16, 16); B = b.reshape(-1, C // 16, 16, 16); Dd = d.reshape(-1, C // 16, 16, 16)
+    bias = Dd.mean(axis=(0, 2)).reshape(-1)
+    fp_abs = np.abs(B).mean(axis=(0, 2)).reshape(-1)
+    rel = np.abs(Dd).mean(axis=(0, 2)).reshape(-1) / np.maximum(fp_abs, 1e-12)
+    rec = {"boundary": label, "chain": chain, "C": int(C), "n": int(a.size),
+           "int8_file": rel_i8, "int8_sha256": sha(pi), "int8_bytes": os.path.getsize(pi),
+           "fp16_file": rel_fp, "fp16_sha256": sha(pf), "fp16_bytes": os.path.getsize(pf),
+           "global": {"mean_signed_diff": float(d.mean()), "mean_abs_diff": float(np.abs(d).mean()),
+                      "rmse": float(np.sqrt((d.astype(np.float64) ** 2).mean())),
+                      "rel_l2": float(np.linalg.norm(d) / np.linalg.norm(b)),
+                      "fp16_absmax": float(np.abs(b).max()), "int8_absmax": float(np.abs(a).max()),
+                      "fp16_absmax_ratio_int8_over_fp16": float(np.abs(a).max() / np.abs(b).max()),
+                      "fp16_std": float(b.std()), "int8_std": float(a.std()),
+                      "exact_equal_fraction": float((a == b).mean())},
+           "channel": {"layout": "reshape(-1,C/16,16,16); channel=(g,k)=g*16+k; reduce axes (0,2) [layout assumed, not verified for this family]",
+                       "bias_max": float(bias.max()), "bias_min": float(bias.min()),
+                       "bias_argmax": int(np.argmax(bias)), "bias_argmin": int(np.argmin(bias)),
+                       "bias_mean": float(bias.mean()), "bias_l1": float(np.abs(bias).mean()),
+                       "n_channels_bias_pos": int((bias > 0).sum()), "n_channels_bias_neg": int((bias < 0).sum()),
+                       "rel_err_max": float(rel.max()), "rel_err_argmax": int(np.argmax(rel)),
+                       "bias_signed": [round(float(x), 6) for x in bias]},
+           "magnitude_buckets": []}
+    ab = np.abs(b).reshape(-1); q = np.percentile(ab, [50, 90, 99, 99.9])
+    for lo, hi in BUCKETS:
+        if lo == 0.0: m = ab <= q[0]
+        elif hi >= 100: m = ab > q[3]
+        elif lo == 50.0: m = (ab > q[0]) & (ab <= q[1])
+        elif lo == 90.0: m = (ab > q[1]) & (ab <= q[2])
+        else: m = (ab > q[2]) & (ab <= q[3])
+        if m.sum() == 0: continue
+        rec["magnitude_buckets"].append({"fp16_abs_percentile_band": [lo, hi if hi < 100 else None],
+                                         "pixel_fraction": float(m.mean()),
+                                         "mean_signed_diff": float(d.reshape(-1)[m].mean()),
+                                         "mean_abs_diff": float(np.abs(d.reshape(-1)[m]).mean()),
+                                         "fp16_mean_signed": float(b.reshape(-1)[m].mean()),
+                                         "int8_over_fp16_signed_ratio": (float(a.reshape(-1)[m].mean() / b.reshape(-1)[m].mean())
+                                                                         if abs(b.reshape(-1)[m].mean()) > 1e-9 else None)})
+    out.append(rec)
+    g = rec["global"]; c = rec["channel"]
+    print("\n%s [%s]" % (label, chain))
+    print("  n=%d C=%d relL2=%.4f meanD=%+.5f mean|D|=%.5f rmse=%.5f fp_absmax=%.3f i8_absmax=%.3f ratio=%.4f std fp=%.3f i8=%.3f" % (
+        a.size, C, g["rel_l2"], g["mean_signed_diff"], g["mean_abs_diff"], g["rmse"], g["fp16_absmax"], g["int8_absmax"],
+        g["fp16_absmax_ratio_int8_over_fp16"], g["fp16_std"], g["int8_std"]))
+    print("  bias [%+.4f..%+.4f] mean %+.4f L1 %.4f pos/neg %d/%d relmax %.4f@c%d" % (
+        c["bias_min"], c["bias_max"], c["bias_mean"], c["bias_l1"], c["n_channels_bias_pos"], c["n_channels_bias_neg"],
+        c["rel_err_max"], c["rel_err_argmax"]))
+    for bk in rec["magnitude_buckets"]:
+        print("     band=%-12s frac=%.5f meanD=%+.5f mean|D|=%.5f fp_mean=%+.4f ratio=%s" % (
+            bk["fp16_abs_percentile_band"], bk["pixel_fraction"], bk["mean_signed_diff"], bk["mean_abs_diff"],
+            bk["fp16_mean_signed"], ("%.4f" % bk["int8_over_fp16_signed_ratio"]) if bk["int8_over_fp16_signed_ratio"] else "n/a"))
+
+json.dump(out, open(os.path.join(W, "C00-first-divergence/_work/boundary-channel-stats-tail3.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+print("\nwrote boundary-channel-stats-tail3.json")

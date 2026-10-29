@@ -1,0 +1,89 @@
+"""Summarise the hardware-counter profiling run (XMX slots, pipe utilisation, stalls).
+
+The counters are measured per PASS by the driver (VK_KHR_performance_query). This script
+reports them raw, plus one derived ratio: XMX execution slots divided by the number of
+cycles the frame actually took, expressed per candidate XMX-unit count (the SKU's unit
+count is the only assumption in the whole chain).
+"""
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+
+root = K.C / 'queue' / sys.argv[1]
+p = list(root.rglob('hardware-counters.json'))[0]
+d = K.read_json(p)
+names = [m['name'] for m in d['metrics']]
+idx = {n: i for i, n in enumerate(names)}
+passes = d['frames'][0]['passes']
+print('metrics:', len(names))
+print('passes:', len(passes))
+
+def col(name):
+    i = idx[name]
+    return [pp['values'][i] for pp in passes]
+
+gpu_ns = col('GpuTime')
+clk = col('AvgGpuCoreFrequencyMHz')
+xmx = col('XVE_INST_EXECUTED_XMX_FP16')
+active = col('XVE_ACTIVE')
+occ = col('XVE_THREADS_OCCUPANCY_ALL')
+send_stall = col('XVE_STALL_SENDWR')
+bar_stall = col('XVE_STALL_BARRIER')
+aluwr = col('XVE_STALL_ALUWR')
+pipe = col('XVE_STALL_PIPESTALL')
+alu0 = col('XVE_INST_EXECUTED_ALU0_ALL_UTILIZATION')
+alu1 = col('XVE_INST_EXECUTED_ALU1_ALL_UTILIZATION')
+alu2 = col('XVE_INST_EXECUTED_ALU2_ALL_UTILIZATION')
+readb = col('LOAD_STORE_CACHE_BYTE_READ')
+writeb = col('LOAD_STORE_CACHE_BYTE_WRITE')
+
+total_ms = sum(gpu_ns) / 1e6
+freq = sum(clk) / len(clk)
+cycles = total_ms * 1e-3 * freq * 1e6
+tslots = sum(xmx)
+print('\nframe: %.3f ms of GPU time (sum of per-PASS GpuTime), mean clock %.0f MHz -> %.3e cycles'
+      % (total_ms, freq, cycles))
+print('XMX FP16 execution slots per frame: %.4e' % tslots)
+print('  slots per cycle: %.3f' % (tslots / cycles))
+print('  if the SKU has N XMX units, utilisation = slots/(cycles*N):')
+for n in (40, 80, 160):
+    print('    N=%3d -> %6.2f%%' % (n, 100 * tslots / (cycles * n)))
+
+def wavg(v):
+    return sum(a * b for a, b in zip(v, gpu_ns)) / sum(gpu_ns)
+print('\ntime-weighted averages over the frame:')
+for lbl, v in (('XVE_ACTIVE %', active), ('thread occupancy %', occ), ('ALU0 util %', alu0),
+               ('ALU1 util %', alu1), ('ALU2 util %', alu2),
+               ('stall SENDWR %', send_stall), ('stall BARRIER %', bar_stall),
+               ('stall ALUWR %', aluwr), ('stall PIPESTALL %', pipe)):
+    print('  %-20s %6.2f' % (lbl, wavg(v)))
+print('\ntraffic: read %.2f GiB, write %.2f GiB' % (sum(readb) / 2**30, sum(writeb) / 2**30))
+
+order = sorted(range(len(passes)), key=lambda i: -gpu_ns[i])
+print('\ntop 8 passes by GpuTime:')
+print('  %-30s %8s %8s %8s %8s %8s' % ('name', 'ms', 'XMXslots', 'active%', 'sendSt%', 'barSt%'))
+for i in order[:8]:
+    print('  %-30s %8.3f %8.3e %8.1f %8.1f %8.1f' % (passes[i]['name'], gpu_ns[i] / 1e6,
+                                                     xmx[i], active[i], send_stall[i], bar_stall[i]))
+
+by_xmx = sorted(range(len(passes)), key=lambda i: -xmx[i])
+print('\ntop 8 passes by XMX slots:')
+for i in by_xmx[:8]:
+    print('  %-30s slots %9.3e  %.3f ms  active %5.1f%%' % (passes[i]['name'], xmx[i],
+                                                            gpu_ns[i] / 1e6, active[i]))
+
+out = dict(total_gpu_ms=total_ms, mean_clock_mhz=freq, cycles=cycles, xmx_slots=tslots,
+           slots_per_cycle=tslots / cycles,
+           utilisation_per_unit_count={str(n): tslots / (cycles * n) for n in (40, 80, 160)},
+           weighted=dict(xve_active=wavg(active), occupancy=wavg(occ), alu0=wavg(alu0),
+                         alu1=wavg(alu1), alu2=wavg(alu2), stall_sendwr=wavg(send_stall),
+                         stall_barrier=wavg(bar_stall), stall_aluwr=wavg(aluwr),
+                         stall_pipestall=wavg(pipe)),
+           read_gib=sum(readb) / 2**30, write_gib=sum(writeb) / 2**30,
+           per_pass=[dict(index=pp['index'], name=pp['name'], gpu_ns=pp['values'][idx['GpuTime']],
+                          xmx_slots=pp['values'][idx['XVE_INST_EXECUTED_XMX_FP16']],
+                          xve_active=pp['values'][idx['XVE_ACTIVE']])
+                     for pp in passes])
+K.write_json(K.C / 'evidence' / 'XMX-COUNTERS.json', out)
+print('\nwrote evidence/XMX-COUNTERS.json')

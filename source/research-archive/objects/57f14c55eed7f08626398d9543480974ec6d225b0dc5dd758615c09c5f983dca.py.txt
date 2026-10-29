@@ -1,0 +1,293 @@
+"""F19 (ord 226) cost breakdown from the existing GTPin ISA dump. CPU only, read-only.
+
+Reads the accepted-baseline native capture of ord 226 (pipeline 37 of
+native-root-f2), reconstructs a coarse CFG from the label/branch structure and
+reports:
+
+  * opcode histogram
+  * send-message composition (type x wr/rd units)
+  * dpas / barrier / slm traffic
+  * which basic blocks are reachable only through a *uniform* predicate
+    (the `if(debug)` regions -> never executed when pc.p0.z == 0)
+  * address-chain and interleaved-mov shares inside/outside those blocks
+
+No writes outside cards/n19-f19-root/.
+"""
+import json
+import re
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+CAMP = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+CARD = CAMP / 'cards/n19-f19-root'
+sys.path.insert(0, str(CAMP))
+import ISA  # noqa: E402
+
+ISA_DIR = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+               'c32-rest-20261026/root-f2/captures/native-root-f2/ISA')
+ASM = ISA_DIR / 'CS_asmf3942341c6275bc3_simd32_0000000000000026_37_orig.asm'
+
+LABEL = re.compile(r'^(L\d+):')
+BRANCH = re.compile(r'\b(jmpi|goto|join|brc)\b')
+TARGET = re.compile(r'\bL(\d+)\b')
+
+
+def load():
+    """[(addr, raw, label_before, instruction_dict)] in file order."""
+    rows = []
+    label = None
+    for raw in ASM.read_text(encoding='utf-8-sig', errors='replace').splitlines():
+        m = LABEL.match(raw)
+        if m:
+            label = m.group(1)
+            continue
+        mm = ISA.LINE.match(raw)
+        if not mm:
+            continue
+        rows.append(dict(raw=raw.rstrip(), label=label, addr=int(mm.group('addr'), 16)))
+        label = None
+    parsed = ISA.parse(ASM)
+    assert len(parsed) == len(rows), (len(parsed), len(rows))
+    for r, p in zip(rows, parsed):
+        r['i'] = p
+    return rows
+
+
+def is_uniform_flag(flags):
+    """(W&fN) / (W&~fN) / (W) with an f-flag predicate -> uniform branch."""
+    f = flags or ''
+    return bool(re.search(r'\(W&(~?)f\d+\.\d+\)', f))
+
+
+def build_cfg(rows):
+    """Index-based blocks with predicated edges.
+
+    IGC lays out `if (uniform_flag) { ... }` as `(W&fN) jmpi L_join` followed by
+    the guarded body and then the L_join label, so BOTH the taken edge and the
+    fall-through edge of a predicated jmpi are conditional.  A block entered
+    only through such an edge never runs when the predicate is false.
+    """
+    blocks = []
+    cur = dict(label=rows[0]['label'] or 'L0', start=0, end=0, instrs=[], exits=[])
+    for k, r in enumerate(rows):
+        if r['label'] is not None and cur['instrs']:
+            cur['end'] = k - 1
+            blocks.append(cur)
+            cur = dict(label=r['label'], start=k, end=k, instrs=[], exits=[])
+        elif r['label'] is not None:
+            cur['label'] = r['label']
+        cur['instrs'].append(k)
+        cur['end'] = k
+        if BRANCH.search(r['i']['op']):
+            tgts = TARGET.findall(r['raw'])
+            flagstr = r['i']['flags'] or ''
+            has_pred = bool(re.search(r'f\d+\.\d+', flagstr))
+            for t in tgts:
+                cur['exits'].append(('L' + t, has_pred))
+            if tgts:
+                cur['end_is_predicated_jump'] = has_pred
+                cur['end_is_unconditional_jump'] = not has_pred
+    if cur['instrs']:
+        blocks.append(cur)
+    return blocks
+
+
+def _succ(blocks):
+    by = {b['label']: n for n, b in enumerate(blocks)}
+    succ = []
+    for n, b in enumerate(blocks):
+        s = []
+        uncond = b.get('end_is_unconditional_jump')
+        for t, uni in b['exits']:
+            if t in by:
+                s.append((by[t], bool(uni or b.get('end_is_predicated_jump'))))
+        if n + 1 < len(blocks) and not uncond:
+            s.append((n + 1, bool(b.get('end_is_predicated_jump'))))
+        succ.append(s)
+    return succ
+
+
+def reachable_sets(blocks):
+    """(always_reachable_block_idx, only_via_conditional_edge_idx), from block 0."""
+    succ = _succ(blocks)
+    always = set()
+    stack = [0]
+    while stack:
+        n = stack.pop()
+        if n in always:
+            continue
+        always.add(n)
+        for m, guarded in succ[n]:
+            if not guarded and m not in always:
+                stack.append(m)
+    total = set()
+    stack = [0]
+    while stack:
+        n = stack.pop()
+        if n in total:
+            continue
+        total.add(n)
+        for m, _ in succ[n]:
+            if m not in total:
+                stack.append(m)
+    return always, total - always
+
+
+def classify(rows):
+    sends = Counter()
+    units = defaultdict(lambda: [0, 0, 0])
+    for r in rows:
+        i = r['i']
+        if i['op'].startswith('send') and i['comment']:
+            m = re.search(r'wr:(\d+)\+(\d+), rd:(\d+);\s*(.*)$', i['comment'])
+            if m:
+                key = m.group(4).strip()
+                sends[key] += 1
+                units[key][0] += int(m.group(1))
+                units[key][1] += int(m.group(2))
+                units[key][2] += int(m.group(3))
+            else:
+                sends[i['comment']] += 1
+    return sends, units
+
+
+def guarded_spans(rows):
+    """Instruction indices that only execute when a *uniform* predicate holds.
+
+    IGC lays `if (uniform_flag) { body }` out as
+        cmp (eq)fN ...          ; or any uniform flag producer
+        (W&fN) jmpi Ljoin       ; skip the body
+        <body>                  ; guarded
+    Ljoin:
+    so every instruction strictly between a predicated forward skip and its
+    target is skipped at runtime whenever the predicate is false.  Spans nest
+    (the debug `if`s here are nested two deep), so the result is a union.
+    """
+    starts = {}
+    for k, r in enumerate(rows):
+        if r['label'] is not None:
+            starts[r['label']] = k
+    spans = []
+    for k, r in enumerate(rows):
+        if r['i']['op'] != 'jmpi':
+            continue
+        flagstr = r['i']['flags'] or ''
+        if not re.search(r'f\d+\.\d+', flagstr):
+            continue                       # unconditional jump
+        tgts = TARGET.findall(r['raw'])
+        if len(tgts) != 1:
+            continue
+        t = 'L' + tgts[0]
+        if t not in starts:
+            continue
+        tgt = starts[t]
+        if tgt > k + 1:                    # forward skip -> guarded body
+            spans.append((k + 1, tgt - 1))
+    guarded = set()
+    for a, b in spans:
+        guarded.update(range(a, b + 1))
+    return guarded, spans
+
+
+def main():
+    rows = load()
+    blocks = build_cfg(rows)
+    gset, spans = guarded_spans(rows)
+
+    def split(pred):
+        return [r for k, r in enumerate(rows) if pred(k)]
+
+    out = {}
+    out['asm'] = str(ASM)
+    out['instructions'] = len(rows)
+    out['blocks'] = len(blocks)
+    out['uniform_guarded_blocks'] = len(spans)
+    out['uniform_guarded_spans'] = [[hex(rows[a]['addr']), hex(rows[b]['addr']), b - a + 1] for a, b in spans]
+    out['instructions_guarded_only'] = len(gset)
+    out['instructions_always'] = len(rows) - len(gset)
+
+    def hist(sel):
+        return Counter(r['i']['op'] for r in sel)
+
+    out['opcode_all'] = dict(hist(rows).most_common())
+    out['opcode_always'] = dict(hist(split(lambda k: k not in gset)).most_common())
+    out['opcode_guarded'] = dict(hist(split(lambda k: k in gset)).most_common())
+
+    sends_all, units_all = classify(rows)
+    out['messages_all'] = {k: dict(count=v, wr_units=units_all[k][0], hdr_units=units_all[k][1],
+                                   rd_units=units_all[k][2]) for k, v in sorted(sends_all.items())}
+    g_rows = split(lambda k: k in gset)
+    a_rows = split(lambda k: k not in gset)
+    for tag, sel in (('guarded', g_rows), ('always', a_rows)):
+        s, u = classify(sel)
+        out['messages_' + tag] = {k: dict(count=v, wr_units=u[k][0], hdr_units=u[k][1],
+                                          rd_units=u[k][2]) for k, v in sorted(s.items())}
+    # per-lane bytes where the message type is a plain block type
+    def bytes_of(msg):
+        m = re.search(r'\.d(\d+)x(\d+)(t?)\.', msg)
+        if not m:
+            return None
+        return int(m.group(1)) // 8 * int(m.group(2))
+    out['message_bytes'] = {k: dict(count=v, per_lane_bytes=bytes_of(k)) for k, v in sorted(sends_all.items())}
+
+    # address / index arithmetic share
+    ADDR = {'add', 'add3', 'shl', 'shr', 'and', 'or', 'mul', 'mad', 'macl', 'bfn.0xFE', 'bfn.0xEA',
+            'cmp', 'fbl', 'sel'}
+    for tag, sel in (('all', rows), ('always', a_rows), ('guarded', g_rows)):
+        h = hist(sel)
+        out['arith_' + tag] = {
+            'addr_index_ops': sum(h.get(o, 0) for o in ADDR),
+            'mov': h.get('mov', 0),
+            'sel': h.get('sel', 0),
+            'mul': h.get('mul', 0),
+            'mad': h.get('mad', 0),
+            'add': h.get('add', 0),
+            'add3': h.get('add3', 0),
+            'shl': h.get('shl', 0),
+            'shuffle_like_indirect_read': sum(1 for r in sel
+                                             if r['i']['op'] == 'mov' and 'r[a0.' in r['raw']),
+        }
+    # descriptor rebroadcast (a0.0 reloads) - bindless descriptor mov cost
+    a0 = [(k, r) for k, r in enumerate(rows) if re.search(r'a0\.\d+<1>:(ud|uw|w)\s', r['raw'])]
+    out['a0_writes'] = dict(all=len(a0),
+                            guarded=sum(1 for k, _ in a0 if k in gset),
+                            always=sum(1 for k, _ in a0 if k not in gset))
+    out['a0_sources'] = dict(Counter(
+        ('r2.9' if 'r2.9' in r['raw'] else 'r2.4' if 'r2.4' in r['raw'] else
+         'r2.10' if 'r2.10' in r['raw'] else 'r[a0' if 'r[a0' in r['raw'] else 'other')
+        for _, r in a0))
+    # dpas / barriers / sync
+    h = hist(rows)
+    out['dpas'] = h.get('dpas.8x8', 0)
+    out['dpas_lane_width'] = 8
+    out['barrier_sync'] = dict(sync_bar=h.get('sync.bar', 0), sync_allrd=h.get('sync.allrd', 0),
+                               sync_allwr=h.get('sync.allwr', 0), sync_nop=h.get('sync.nop', 0),
+                               fence_slm=sum(1 for r in rows if 'fence.slm' in r['raw']),
+                               signal_barrier=sum(1 for r in rows if 'signal barrier' in r['raw']))
+    # register pressure / scratch
+    regs = set()
+    for r in rows:
+        for m in re.finditer(r'\br(\d+)\.', r['raw']):
+            regs.add(int(m.group(1)))
+    out['max_grf'] = max(regs) if regs else None
+    out['distinct_grf'] = len(regs)
+    out['scratch_ops'] = sum(1 for r in rows if 'scratch' in r['raw'])
+    out['rf_use_r127_header'] = sum(1 for r in rows if re.search(r'\br127\.', r['raw']))
+    # guarded-block composition detail
+    gb = [b for n, b in enumerate(blocks) if any(k in gset for k in b['instrs'])]
+    out['guarded_block_detail'] = [
+        dict(label=b['label'], n=len(b['instrs']), addr=hex(rows[b['start']]['addr']),
+             stores=sum(1 for k in b['instrs'] if 'store.ugm.d32x8t' in rows[k]['raw']))
+        for b in gb]
+    (CARD / 'isa-breakdown-raw.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print(json.dumps({k: v for k, v in out.items() if k not in ('opcode_all', 'guarded_block_detail')},
+                     indent=2)[:9000])
+    print('guarded blocks:', len(gb), 'instrs', len(gset), '/', len(rows))
+
+
+if __name__ == '__main__':
+    main()
+
+
+

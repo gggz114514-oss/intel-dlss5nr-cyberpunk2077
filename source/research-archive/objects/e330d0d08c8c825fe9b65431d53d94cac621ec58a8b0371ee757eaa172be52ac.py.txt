@@ -1,0 +1,160 @@
+"""S06 diagnostics: qA reference layout, seed branch, probe2 transpose bug.
+
+Nothing here is a deliverable; it resolves three open questions before the
+calibration is written.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+import c256b15 as L
+from importlib import import_module
+ch = import_module("03_chain".replace("03_", "n03_")) if False else None
+
+# re-use the chain helpers by copying the minimum needed
+idx, oob = L.window_to_canonical()
+valid = idx >= 0
+NW, NV = L.N_TOK, L.N_VALID
+V48REF = L.V48 / "evidence/v4-reference-block48"
+
+ev = {}
+
+
+def load_pack(path):
+    raw = np.fromfile(path, dtype=np.uint8)
+    codes = dict(
+        wc=L.from_pack_bytes(raw[L.WC_OFF:L.WE_OFF].view(np.int8), 256, 256),
+        we=L.from_pack_bytes(raw[L.WE_OFF:L.WM_OFF].view(np.int8), 1024, 256),
+        wm=L.from_pack_bytes(raw[L.WM_OFF:L.SC_OFF].view(np.int8), 256, 128),
+    )
+    sc = np.frombuffer(raw[L.SCAL_OFF:L.SCAL_OFF + 128].tobytes(), dtype="<f4")
+    d = dict(invX=float(sc[0]), invA=float(sc[1]), invM=float(sc[2]))
+    d["ew"] = np.frombuffer(raw[L.EW_OFF:L.EW_OFF + 4096].tobytes(), dtype="<f4")
+    d["mw"] = np.frombuffer(raw[L.MW_OFF:L.MW_OFF + 1024].tobytes(), dtype="<f4")
+    d["alpha"] = np.frombuffer(raw[L.ALPHA_OFF:L.ALPHA_OFF + 1024].tobytes(), dtype="<f4")
+    rs = np.frombuffer(raw[L.RS_OFF:L.RS_OFF + 1024].tobytes(), dtype="<f4").astype(np.float16)
+    return raw, codes, d, rs
+
+
+def expand(qx, cod, sc):
+    acc = qx.astype(np.float64) @ cod["we"].astype(np.float64).T
+    f = acc.astype(np.float32)
+    v = np.float32(f * sc["ew"][None, :])
+    vh = L.narrow_half(v)
+    ha = L.act_half32(vh)
+    return L.code(ha, sc["invA"]), f, vh, ha
+
+
+def mid(qa, cod, sc):
+    qm = np.zeros((NW, 256), dtype=np.int32)
+    a2 = qa.astype(np.float64)
+    for g in range(8):
+        sl = slice(32 * g, 32 * g + 32)
+        r = (a2[:, 128 * g:128 * g + 128] @ cod["wm"][sl].astype(np.float64).T).astype(np.float32)
+        t = np.float32(r * sc["mw"][sl][None, :])
+        c = np.float32(t * np.float32(sc["invM"]))
+        qm[:, sl] = np.clip(np.rint(c.astype(np.float64)), -127.0, 127.0).astype(np.int32)
+    return qm
+
+
+def contract(qm, seed_half, cod, sc, rs):
+    acc = qm.astype(np.float64) @ cod["wc"].astype(np.float64).T
+    f = acc.astype(np.float32)
+    real = np.float32(f * sc["alpha"][None, :])
+    s = L.narrow_half(seed_half * rs[None, :]).astype(np.float32)
+    return np.float32(real + s)
+
+
+# ---------------- (1) which byte layout does the GPU qA dump use? ----------
+raw48, cod48, sc48, rs48 = load_pack(L.V48 / "pack/c256_b48_int8.bin")
+qx_ref = np.fromfile(V48REF / "qX.bin", dtype=np.int8).reshape(NV, 256)
+qa_ref = np.fromfile(V48REF / "qA.bin", dtype=np.int8)
+qx_win = np.zeros((NW, 256), dtype=np.int8)
+qx_win[valid] = qx_ref[idx[valid]]
+qa, fA, vhA, haA = expand(qx_win, cod48, sc48)
+
+c = np.arange(1024)[None, :]
+tile = (idx[valid] // 16)[:, None]
+s = (idx[valid] % 16)[:, None]
+mine = qa[valid]
+layouts = {
+    "g32_tile_s_c": tile * 16384 + (c // 32) * 512 + s * 32 + (c % 32),
+    "g32_tile_c_s": tile * 16384 + (c // 32) * 512 + (c % 32) * 16 + s,
+    "tile_s_c": tile * 16384 + s * 1024 + c,
+    "g16_tile_s_c": tile * 16384 + (c // 16) * 256 + s * 16 + (c % 16),
+    "tile_c_s": tile * 16384 + c * 16 + s,
+}
+lay = {}
+for name, pos in layouts.items():
+    flat = np.zeros(4128768, dtype=np.int8)
+    flat[pos.ravel()] = mine.ravel()
+    eq = int((flat == qa_ref).sum())
+    lay[name] = dict(equal=eq, n=int(flat.size), pct=eq / flat.size * 100,
+                     max_abs_diff=int(np.abs(flat.astype(np.int16) - qa_ref.astype(np.int16)).max()))
+ev["qA_layout_search"] = lay
+
+# value-multiset comparison: are the numbers the same set at all?
+a = np.sort(qa_ref.astype(np.int16)); b = np.sort(mine.ravel().astype(np.int16))
+ev["qA_multiset_equal"] = bool(np.array_equal(a, b))
+ev["qA_value_hist_diff"] = dict(ref_zero=int((qa_ref == 0).sum()), mine_zero=int((mine == 0).sum()),
+                                ref_min=int(qa_ref.min()), ref_max=int(qa_ref.max()),
+                                mine_min=int(mine.min()), mine_max=int(mine.max()))
+
+# also: does qX_ref equal my producer output from the block48 teacher input?
+X48 = L.load_x_canonical(L.D / "dump-fp16/dump_ioport_block48_blend.bin")
+Xw48 = np.zeros((NW, 256), dtype=np.float32)
+Xw48[valid] = X48[idx[valid]]
+qx48 = L.code(np.where(valid[:, None], Xw48, np.float32(0)), sc48["invX"])
+ev["qX_from_teacher_vs_ref"] = dict(
+    equal=int((qx48[valid] == qx_ref[idx[valid]]).sum()), n=int(qx48[valid].size),
+    pct=float((qx48[valid] == qx_ref[idx[valid]]).mean() * 100))
+
+# ---------------- (2) block15: seed branch (rs vs 1) ----------------------
+raw15, cod15, sc15, rs15 = load_pack(L.PACK_OLD)
+Xb15 = L.load_x_canonical(L.D / "dump-fp16/dump_block14_out.bin")
+Xw15 = np.zeros((NW, 256), dtype=np.float32)
+Xw15[valid] = Xb15[idx[valid]]
+Yteach = np.fromfile(L.D / "dump-fp16/dump_swin_15_Y.bin", dtype="<f2").reshape(NW, 256).astype(np.float32)
+qx15 = L.code(np.where(valid[:, None], Xw15, np.float32(0)), sc15["invX"])
+qa15, fA15, vh15, ha15 = expand(qx15, cod15, sc15)
+qm15 = mid(qa15, cod15, sc15)
+sd = np.where(valid[:, None], Xw15, np.float32(0)).astype(np.float16)
+ev["block15_seed_branch"] = {}
+for name, rsv in (("rs", rs15), ("ones", np.ones(256, dtype=np.float16))):
+    Y = contract(qm15, sd, cod15, sc15, rsv)
+    ev["block15_seed_branch"][name] = L.stats(Y, Yteach, valid, f"b15 int8 old arm, seed=X*{name}")
+# no-quantisation control with the transpose FIXED
+We, Wm, Wc, rsfp = L.decode_weights()
+Aref = (Xw15.astype(np.float64) @ We.astype(np.float64).T).astype(np.float32)
+Ah = L.narrow_half(Aref)
+Aa = L.act_half32(Ah)
+Mref = np.zeros((NW, 256), dtype=np.float32)
+for g in range(8):
+    sl = slice(32 * g, 32 * g + 32)
+    Mref[:, sl] = (Aa[:, 128 * g:128 * g + 128].astype(np.float64) @ Wm[sl].astype(np.float64).T).astype(np.float32)
+Mh = L.narrow_half(Mref)
+base = (Mh.astype(np.float64) @ Wc.astype(np.float64).T).astype(np.float32)
+for name, rsv in (("rs", rsfp.astype(np.float16)), ("ones", np.ones(256, dtype=np.float16))):
+    Y = np.float32(base + L.narrow_half(sd * rsv[None, :]))
+    ev["block15_seed_branch"]["fp16_ref_" + name] = L.stats(Y, Yteach, valid, f"b15 fp16 ref (no quant), seed=X*{name}")
+ev["block15_stage"] = dict(
+    A_f32_max=float(np.abs(fA15).max()), A_half_max=float(np.abs(vh15).max()),
+    A_act_max=float(np.abs(ha15).max()),
+    M_absmax=float(np.abs(qm15).max()),
+    Mref_absmax=float(np.abs(Mh).max()),
+    contract_absmax=float(np.abs(base).max()),
+    contract_vs_teacher_rel=f"see stats above",
+)
+# implied dequant checks
+ev["block15_scale_consistency"] = dict(
+    invX_times_sX=float(sc15["invX"] * float(np.float32(1) / sc15["invX"])),
+    sA_times_invA=float(np.frombuffer(raw15[L.SCAL_OFF:L.SCAL_OFF+128].tobytes(), dtype="<f4")[4]
+                        * np.frombuffer(raw15[L.SCAL_OFF:L.SCAL_OFF+128].tobytes(), dtype="<f4")[1]),
+    rs_first8=[float(x) for x in rs15[:8]],
+)
+
+Path(L.W / "evidence/04-diag.json").write_text(json.dumps(ev, indent=1), encoding="utf-8")
+print(json.dumps(ev, indent=1)[:7000])

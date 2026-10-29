@@ -1,0 +1,135 @@
+# -*- coding: utf-8 -*-
+"""C00 part E: full-resolution A/B and fixed-gain difference images.
+
+Fixed, documented 8-bit mapping (no per-image auto-stretch anywhere):
+  display   : v8 = round(clip(v,0,1) * 255)                    (same as DISPLAY-CONTRACT)
+  signed d  : v8 = round(clip(0.5 + GAIN*d, 0, 1) * 255), GAIN = 4  (|d|=0.25 saturates,
+              i.e. 1 LSB of 255 == 0.00098 in error units; 0 -> mid grey 128)
+  clip mask : red   = FP16 clipped, INT8 not (highlight lost)
+              green = both clipped
+              blue  = INT8 clipped, FP16 not (new clipping)
+              black = neither clipped
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pngio  # noqa: E402
+
+OUT = Path(__file__).resolve().parent.parent
+PNG = OUT / "PNG"
+B = Path(r"@NR_WORKSPACE@")
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+W = B / "work/dsh-fullnet-static-20261029"
+GAIN = 4.0
+LUMA = np.array([0.2126, 0.7152, 0.0722])
+ROIS = {
+    "sky-bright":      (646, 155, 700, 205),
+    "building-bright": (706, 150, 762, 232),
+    "ncpd-sign":       (455, 255, 620, 305),
+    "blue-ground":     (100, 600, 300, 672),
+    "blue-wall":       (640, 368, 720, 430),
+    "neutral-wall":    (1090, 192, 1130, 230),
+}
+ROI_COLORS = [(255, 60, 60), (255, 170, 0), (60, 200, 255),
+              (60, 255, 120), (220, 60, 255), (255, 255, 255)]
+FRAMES = [(34189, "day-street-static-formal-01"),
+          (41444, "day-street-motion-formal-01"),
+          (43654, "day-street-motion-formal-02")]
+
+
+def load(p):
+    return np.fromfile(p, dtype="<f4").reshape(2, 720, 1280, 4).astype(np.float64)
+
+
+def to8(v):
+    return np.rint(np.clip(v, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def signed8(d):
+    return to8(0.5 + GAIN * d)
+
+
+def draw_boxes(img, box, thickness=3):
+    x0, y0, x1, y1 = box
+    img[y0:y0 + thickness, x0:x1] = 255
+    img[y0:y1, x0:x0 + thickness] = 255
+    img[y1 - thickness:y1, x0:x1] = 255
+    img[y0:y1, x1 - thickness:x1] = 255
+
+
+manifest = []
+for frame, seq in FRAMES:
+    ref = load(Q / f"dataset/{seq}/0-{frame}/network-output.bin")
+    ref_rgb = ref[0, :, :, :3]
+    ref_y = ref_rgb @ LUMA
+
+    # ROI archive overlay on the FP16 reference
+    ov = to8(ref_rgb).copy()
+    for (name, box), col in zip(ROIS.items(), ROI_COLORS):
+        x0, y0, x1, y1 = box
+        ov[y0:y0 + 3, x0:x1] = col
+        ov[y0:y1, x0:x0 + 3] = col
+        ov[y1 - 3:y1, x0:x1] = col
+        ov[y0:y1, x1 - 3:x1] = col
+    p = pngio.write_rgb(PNG / "ROI" / f"ROI-overlay-{frame}.png", ov)
+    manifest.append({"kind": "roi-overlay", "frame": frame, "path": str(p).replace("\\", "/"),
+                     "mapping": "round(clip(fp16_plane0,0,1)*255), 3px white boxes at ROI borders"})
+
+    for arm, path in (("xe", W / f"S02-f01/runs24/run-{frame}/replayed-network.bin"),
+                      ("c64", Q / f"real-int8-24/c64-family-static/run-{frame}/replayed-network.bin")):
+        cand = load(path)
+        cand_rgb = cand[0, :, :, :3]
+        d = cand_rgb - ref_rgb
+        cand_y = cand_rgb @ LUMA
+        dy = cand_y - ref_y
+
+        ab = np.empty((720, 2560, 3), np.uint8)
+        ab[:, :1280] = to8(ref_rgb)
+        ab[:, 1280:] = to8(cand_rgb)
+        p = pngio.write_rgb(PNG / "AB" / f"AB-{frame}-fp16-vs-{arm}.png", ab)
+        manifest.append({"kind": "ab", "frame": frame, "arm": arm, "path": str(p).replace("\\", "/"),
+                         "layout": "left 1280px = FP16 reference, right 1280px = INT8 arm",
+                         "mapping": "round(clip(v,0,1)*255)"})
+
+        p = pngio.write_rgb(PNG / "DIFF" / f"DIFF-rgb-signed-g4-{frame}-{arm}.png", signed8(d))
+        manifest.append({"kind": "diff-signed-rgb", "frame": frame, "arm": arm,
+                         "path": str(p).replace("\\", "/"),
+                         "mapping": f"round(clip(0.5+{GAIN:g}*d,0,1)*255), d=INT8-FP16 per channel",
+                         "gain": GAIN})
+
+        p = pngio.write_rgb(PNG / "DIFF" / f"DIFF-luma-g4-{frame}-{arm}.png",
+                            np.repeat(signed8(dy)[:, :, None], 3, axis=2))
+        manifest.append({"kind": "diff-luma", "frame": frame, "arm": arm,
+                         "path": str(p).replace("\\", "/"),
+                         "mapping": f"round(clip(0.5+{GAIN:g}*dY,0,1)*255), "
+                                    f"dY = 0.2126dR+0.7152dG+0.0722dB (display proxy)",
+                         "gain": GAIN})
+
+        chroma = d - dy[:, :, None]
+        p = pngio.write_rgb(PNG / "DIFF" / f"DIFF-chroma-g4-{frame}-{arm}.png", signed8(chroma))
+        manifest.append({"kind": "diff-chroma", "frame": frame, "arm": arm,
+                         "path": str(p).replace("\\", "/"),
+                         "mapping": f"round(clip(0.5+{GAIN:g}*(dR-dY,dG-dY,dB-dY),0,1)*255)",
+                         "gain": GAIN})
+
+        rc = (ref_rgb >= 1.0).any(axis=2)
+        cc = (cand_rgb >= 1.0).any(axis=2)
+        mask = np.zeros((720, 1280, 3), np.uint8)
+        mask[rc & ~cc] = (255, 0, 0)
+        mask[rc & cc] = (0, 255, 0)
+        mask[~rc & cc] = (0, 64, 255)
+        p = pngio.write_rgb(PNG / "DIFF" / f"DIFF-clipmask-{frame}-{arm}.png", mask)
+        manifest.append({"kind": "clip-mask", "frame": frame, "arm": arm,
+                         "path": str(p).replace("\\", "/"),
+                         "mapping": "red=FP16-clipped only, green=both, blue=INT8-clipped only, "
+                                    "black=neither (any channel >= 1.0)"})
+        print(f"{frame} {arm}: ref_clip_px={int(rc.sum())} cand_clip_px={int(cc.sum())} "
+              f"lost={int((rc & ~cc).sum())} new={int((~rc & cc).sum())}")
+
+(PNG / "image-manifest.json").write_text(json.dumps({"gain": GAIN, "images": manifest}, indent=1),
+                                         encoding="utf-8")
+print("images:", len(manifest))

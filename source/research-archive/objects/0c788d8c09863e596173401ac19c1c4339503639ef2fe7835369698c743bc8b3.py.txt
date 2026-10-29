@@ -1,0 +1,206 @@
+# C02 candidate: F20 merged producer-subgroup Q/K norm+scale.
+# Baseline: ../c32-stream-balanced-20261025/f20-score-owner (plan SHA256 d655b6b1...).
+# Only stage 5 + stage 5b are replaced; every other byte of candidate.comp is kept.
+# Tree proof (exact, per row r of 128 rows over 8 SG, 2 lanes per row):
+#   original scalar norm per row:  sq[c]=v*v (c=0..31);
+#   a[c]=sq[c]+sq[c+16]; b[c]=sq[c+8]+sq[c+24]; s[c]=a[c]+b[c]  (c=0..7)
+#   t4[c]=s[c]+s[c+4]; t2[c]=t4[c]+t4[c+2]; sum=t2[0]+t2[1]      (c=0..3 / 0..1)
+#   mx=max(float(sum),6.2e-05f); n=float16_t(inversesqrt(mx))
+#   scale: v*n (precise), Q rows additionally *scalar0 (precise), in place.
+# Candidate mapping: row r is owned by the PRODUCER subgroup sg=r/8 (stage 4
+# writes rows 8*sg..8*sg+7 of Q and K from SG sg). Lane pair (2k,2k+1) of the
+# owning half handles row r: lo lane (channels 0..15) and hi lane (16..31).
+# After one subgroupShuffleXor(...,1u) exchange of the 8 packed square pairs,
+# each lane holds its own sq[0..15] and the partner's p[0..15], where for the
+# lo lane p[c]=sq_orig[c+16] and p[c+8]=sq_orig[c+24], and for the hi lane
+# (its sq[c]=sq_orig[16+c]) p[c]=sq_orig[c], p[c+8]=sq_orig[8+c]. Both lanes
+# then form a[c],b[c],s[c],t4,t2,sum in the ORIGINAL operand order:
+#   lo lane: a[c]=sq[c]+p[c];        b[c]=sq[c+8]+p[c+8]
+#   hi lane: a[c]=p[c]+sq[c];        b[c]=p[c+8]+sq[c+8]
+# i.e. the exact original (sq[c]+sq[c+16]) and (sq[c+8]+sq[c+24]) pairings with
+# identical operand order — no commutativity assumption needed. Downstream adds
+# are lane-local on identical values, so every lane of the pair computes the
+# same n bits and scales its own 16 channels in place.
+# Removed: shNorm[256] (512 B), stage-5b separate pass (4096 extra SLM loads,
+# 2048 shNorm loads), one WG barrier. Added: 8 pack + 8 shuffleXor + 8 unpack
+# per lane. All 8 subgroups now participate (baseline norm phase used only
+# threads 0..127 = SG 0..3, SG 4..7 idle).
+from pathlib import Path
+import hashlib, json, subprocess, sys
+
+R = Path(__file__).resolve().parent
+A = R.parent
+B = A.parents[1]
+P = A / 'c32-stream-balanced-20261025/f20-score-owner'
+N = R / 'c02-f20-merged-norm'
+N.mkdir(exist_ok=True)
+
+def ident(p):
+    return dict(path=str(p), sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+
+def run(args):
+    r = subprocess.run(list(map(str, args)), capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return r.stdout
+
+s = (P / 'candidate.comp').read_text(encoding='utf-8-sig')
+
+# Helper that keeps every merged-tree add out of driver fma contraction: the
+# baseline norm ISA emits plain half adds (verified in the c11529fb capture),
+# so the candidate must too. The builder decorates every FAdd inside this
+# function with NoContraction after the aligned transfer.
+helper = """// C02: contraction barrier for the merged norm tree (baseline ISA is plain
+// half adds; the driver must not fuse these squares into fma).
+float16_t nr_c02_tree_add(float16_t x, float16_t y) { return x + y; }
+
+void main() {"""
+assert s.count("void main() {") == 1
+s = s.replace("void main() {", helper, 1)
+
+old_decl = "shared float16_t shNorm[256];     // nq[64] nk[64] inv[64]        512 B\n"
+assert s.count(old_decl) == 1
+s = s.replace(old_decl, "")
+
+old5_start = s.index("    // ============ stage 5: Q/K half norm")
+old5_end = s.index("    if (debug) {", old5_start)
+old_block = s[old5_start:old5_end]
+for probe in ["if (t_local < 128u)", "shNorm[t + (isQ ? 0u : 64u)] = n;",
+              "float16_t scalar0 = float16_t(fb[uint(pc.p2.z)]);",
+              "for (uint e = 2u*t_local; e < 4096u; e += 512u) {"]:
+    assert probe in old_block, probe
+
+new_block = """    // ============ stage 5: merged producer-subgroup Q/K norm+scale ==========
+    // C02: each subgroup normalises and scales the 8 Q rows and 8 K rows its
+    // own stage-4 round produced (row r -> SG r/8), two lanes per row, no
+    // shNorm, no separate scale pass, no extra barrier. The original scalar
+    // tree sq[c]=v*v; a[c]=sq[c]+sq[c+16]; b[c]=sq[c+8]+sq[c+24]; s[c]=a[c]+b[c];
+    // t4[c]=s[c]+s[c+4]; t2[c]=t4[c]+t4[c+2]; sum=t2[0]+t2[1]; n=half(invsqrt(
+    // max(float(sum),6.2e-05f))) is preserved with the original operand order
+    // on both lanes of the pair (see build_c02_merged_norm.py header).
+    {
+        float16_t scalar0 = float16_t(fb[uint(pc.p2.z)]);
+        bool isQ = lane < 16u;
+        bool hi = (t_local & 1u) != 0u;
+        uint row = sg * 8u + ((lane >> 1u) & 7u);
+        uint base = (isQ ? 0u : 2048u) + row * 32u + (hi ? 16u : 0u);
+        float16_t sq[16], rv[16];
+        for (uint c = 0u; c < 16u; ++c) {
+            float16_t v = shArena[base + c];
+            rv[c] = v;
+            sq[c] = v * v;
+        }
+        uint xp[8];
+        for (uint c = 0u; c < 8u; ++c)
+            xp[c] = packFloat2x16(f16vec2(sq[2u*c], sq[2u*c + 1u]));
+        uint pp[8];
+        for (uint c = 0u; c < 8u; ++c)
+            pp[c] = subgroupShuffleXor(xp[c], 1u);
+        float16_t p[16];
+        for (uint c = 0u; c < 8u; ++c) {
+            f16vec2 u = unpackFloat2x16(pp[c]);
+            p[2u*c] = u.x;
+            p[2u*c + 1u] = u.y;
+        }
+        float16_t s[8];
+        if (hi) {
+            for (uint c = 0u; c < 8u; ++c) {
+                float16_t a = nr_c02_tree_add(p[c], sq[c]);
+                float16_t b = nr_c02_tree_add(p[c + 8u], sq[c + 8u]);
+                s[c] = nr_c02_tree_add(a, b);
+            }
+        } else {
+            for (uint c = 0u; c < 8u; ++c) {
+                float16_t a = nr_c02_tree_add(sq[c], p[c]);
+                float16_t b = nr_c02_tree_add(sq[c + 8u], p[c + 8u]);
+                s[c] = nr_c02_tree_add(a, b);
+            }
+        }
+        float16_t t4[4], t2[2];
+        for (uint c = 0u; c < 4u; ++c) t4[c] = nr_c02_tree_add(s[c], s[c + 4]);
+        for (uint c = 0u; c < 2u; ++c) t2[c] = nr_c02_tree_add(t4[c], t4[c + 2]);
+        float16_t sum = nr_c02_tree_add(t2[0], t2[1]);
+        float mx = max(float(sum), float(float16_t(0.000062)));
+        float16_t n = float16_t(inversesqrt(mx));
+        for (uint c = 0u; c < 16u; ++c) {
+            precise float16_t r = rv[c] * n;
+            if (isQ) r = r * scalar0;
+            shArena[base + c] = r;
+        }
+    }
+    barrier();
+    // ============ end merged norm+scale ============
+
+"""
+s = s[:old5_start] + new_block + s[old5_end:]
+
+# The original post-scale barrier (between the debug Q/K dump block and stage 6)
+# is redundant now: the merged phase's own WG barrier already publishes the
+# scaled Q/K, and the debug dump path keeps its internal barriers.
+post_scale = "    }\n    barrier();\n\n    // ============ stage 6: score + bias/exp"
+assert s.count(post_scale) == 1
+s = s.replace(post_scale, "    }\n\n    // ============ stage 6: score + bias/exp")
+
+# Shared slab comment: shNorm removal shrinks declared shared by 512 B.
+s = s.replace("// ---- shared: 25088 B; no shared score P publication ----",
+              "// ---- shared: 24576 B; no shNorm: norm+scale merged in producer subgroups ----")
+
+candidate = s
+src = N / 'candidate.comp'; spv = N / 'candidate.spv'
+src.write_text(candidate, encoding='utf-8')
+run([B / 'src/project/tools/glslang-16.5.0/bin/glslang.exe', '-V', '--target-env', 'vulkan1.3', src, '-o', spv])
+sys.path.insert(0, str(B / 'build/zcode-fp16-compute-backend-20261021/scripts'))
+import spv_tools_local as ST
+pm = ST.Module(P / 'candidate.spv'); cm = ST.Module(spv)
+keep, info = ST.transfer_decoration_pattern_aligned(pm, cm, [])
+assert len(keep) == len(ST.no_contraction_ids(pm)) == 7
+
+def name_map_and_fadds_by_function(module):
+    names, fadds, cur = {}, {}, None
+    for op, ops, _, _ in module.instructions:
+        if op == 54:
+            cur = ops[1]
+        elif op == 56:
+            cur = None
+        elif op == 5:
+            words = ops[1:]
+            b = b''.join(int(w).to_bytes(4, 'little') for w in words)
+            names[ops[0]] = b.split(b'\x00')[0].decode('utf-8', 'replace')
+        elif op == 129 and cur is not None:
+            fadds.setdefault(cur, []).append(ops[1])
+    return names, fadds
+
+names, fadds = name_map_and_fadds_by_function(cm)
+helper_fns = [fid for fid, nm in names.items() if 'nr_c02_tree_add' in nm]
+assert len(helper_fns) == 1, helper_fns
+tree_add_ids = fadds.get(helper_fns[0], [])
+assert len(tree_add_ids) == 1, len(tree_add_ids)
+calls = sum(1 for op, ops, _, _ in cm.instructions
+            if op == 57 and len(ops) > 2 and ops[2] == helper_fns[0])
+assert calls == 9, calls  # 3+3 in the hi/else c-loops, 1 t4, 1 t2, 1 sum (loop bodies)
+ST.set_no_contraction(cm, set(keep) | set(tree_add_ids), spv)
+run([B / 'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe', spv])
+text = (P / 'plan.txt').read_text(encoding='utf-8-sig')
+assert text.count((P / 'candidate.spv').as_posix()) == 1
+plan = N / 'plan.txt'
+plan.write_text(text.replace((P / 'candidate.spv').as_posix(), spv.as_posix()), encoding='utf-8')
+T = R.parent / 'c32-stream-balanced-20261025/f20-peer8-fouracc'
+runner = Path(json.loads((T / 'LUNA-GATES.json').read_text())['identities'][0]['path'])
+cpu = run([runner, '--plan', plan, '--cpu-check'])
+(N / 'CANDIDATE.json').write_text(json.dumps(dict(
+    source=ident(src), spv=ident(spv), plan=ident(plan), parent=ident(P / 'plan.txt'),
+    cpu_check=cpu.strip().splitlines()[-5:], no_contraction_count=7, decoration_alignment=info,
+    change='stage5+stage5b merged into producer-subgroup 2-lane norm+scale; shNorm removed; 1 barrier removed'),
+    indent=2), encoding='utf-8')
+for kind in ['GATES', 'NATIVE']:
+    task = json.loads((T / f'LUNA-{kind}.json').read_text().replace('f20-peer8-fouracc', 'c02-f20-merged-norm'))
+    task['identities'] = [v for v in task['identities'] if not v['path'].endswith('.spv')] + [ident(spv)]
+    for j in task['jobs']:
+        j['plan'] = ident(plan); j['argv'][j['argv'].index('--plan') + 1] = str(plan)
+        if 'candidate' in j: j['candidate'] = 'c02-f20-merged-norm'
+        j['id'] = j['id'].replace('f20-peer8-fouracc', 'c02-f20-merged-norm')
+        j['runner_output'] = str(N / 'run' / j['id'])
+        j['argv'][j['argv'].index('--out') + 1] = str(N / 'run' / j['id'])
+        if kind == 'NATIVE' and not j.get('expected_frame_out'):
+            j['expected_frame_out'] = '1755e9c2fadba97f08cb5b02b7a4294cde3675379bdec75352287505f7e129d6'
+    (N / f'LUNA-{kind}.json').write_text(json.dumps(task, indent=2), encoding='utf-8')
+print(json.dumps(ident(spv)))

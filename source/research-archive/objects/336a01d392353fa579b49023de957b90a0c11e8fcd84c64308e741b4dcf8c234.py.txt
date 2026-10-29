@@ -1,0 +1,282 @@
+"""S03-tail step C: spatial/channel error statistics of the CURRENT tail output.
+
+Inputs (read-only):
+  D/c64-family-static/run-<frame>/replayed-network.bin   INT8 end-to-end output
+  Q/dataset/<seq>/<split>-<frame>/network-output.bin      captured FP16 reference
+Both are 2 x 720 x 1280 x 4 little-endian fp32 (the exit kernel's two surfaces).
+
+Plane 0 = final display RGBA (measured by QUALITY-24), plane 1 = the history surface
+(RGB mixed-for-feedback + blend weight) which QUALITY-24 does NOT score.
+
+This script only *describes* the existing outputs.  It makes no causal claim about
+which layer produced the error and does not touch any plan/weight/game file.
+"""
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+
+import numpy as np
+
+B = Path("@NR_WORKSPACE@")
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+OUT = D / "c64-family-static"
+FRAMES = {
+    "day-street-static-formal-01": list(range(34189, 34197)),
+    "day-street-motion-formal-01": list(range(41444, 41452)),
+    "day-street-motion-formal-02": list(range(43654, 43662)),
+}
+
+SHAPE = (2, 720, 1280, 4)
+
+
+def ref_path(seq: str, frame: int) -> Path:
+    # dataset dirs are named "<split>-<frame>" where split is the 0-based index in the sequence
+    for sub in (Q / "dataset" / seq).iterdir():
+        if sub.is_dir() and sub.name.endswith(f"-{frame}"):
+            return sub / "network-output.bin"
+    raise FileNotFoundError(f"no dataset dir for {seq} {frame}")
+
+
+def block_mean(a: np.ndarray, by: int, bx: int) -> np.ndarray:
+    h, w = a.shape
+    hh, ww = (h // by) * by, (w // bx) * bx
+    t = a[:hh, :ww].reshape(hh // by, by, ww // bx, bx)
+    return t.mean(axis=(1, 3))
+
+
+def period_peak(profile: np.ndarray, lo: int = 8, hi: int = 320) -> dict:
+    """Strongest spatial period of a 1-D profile (detrended), by DFT magnitude."""
+    x = profile.astype(np.float64)
+    x = x - x.mean()
+    n = len(x)
+    if not np.any(x):
+        return {"period": None, "strength": 0.0}
+    spec = np.abs(np.fft.rfft(x))
+    freqs = np.fft.rfftfreq(n, d=1.0)
+    best = {"period": None, "strength": 0.0}
+    for k in range(1, len(spec)):
+        p = 1.0 / freqs[k] if freqs[k] > 0 else 1e9
+        if lo <= p <= hi and spec[k] > best["strength"]:
+            best = {"period": float(p), "strength": float(spec[k])}
+    denom = float(np.sum(spec[1:]) + 1e-30)
+    best["strength_frac"] = best["strength"] / denom if best["period"] else 0.0
+    return best
+
+
+def main() -> None:
+    rows = []
+    pooled = {"sse_rgb": 0.0, "n_rgb": 0.0, "sse_hist": 0.0, "n_hist": 0.0,
+              "abs_rgb": 0.0, "abs_hist": 0.0}
+    ch_bias = np.zeros(4)
+    ch_abs = np.zeros(4)
+    ch_max = np.zeros(4)
+    hch_bias = np.zeros(4)
+    hch_abs = np.zeros(4)
+    hch_max = np.zeros(4)
+    block_edges_pool = []
+    edge_bucket_pool = []
+    col_peak = {"period": None, "strength_frac": 0.0}
+    row_peak = {"period": None, "strength_frac": 0.0}
+    alpha_report = {"min": None, "max": None, "n_not_one_in_ref": 0, "n_not_one_in_cur": 0,
+                    "max_abs_alpha_diff": 0.0}
+    blend_ranges = {"ref_min": None, "ref_max": None, "cur_min": None, "cur_max": None}
+
+    for seq, frames in FRAMES.items():
+        for f in frames:
+            rp = ref_path(seq, f)
+            cp = OUT / f"run-{f}" / "replayed-network.bin"
+            ref = np.fromfile(rp, dtype="<f4").reshape(SHAPE)
+            cur = np.fromfile(cp, dtype="<f4").reshape(SHAPE)
+            assert np.isfinite(cur).all() and np.isfinite(ref).all()
+
+            # ---- plane 0: final display RGB (the QUALITY-24 metric) ----------
+            e = cur[0, :, :, :3].astype(np.float32) - ref[0, :, :, :3].astype(np.float32)
+            a = np.abs(e)
+            mse = float(np.mean(e * e))
+            psnr = -10.0 * math.log10(mse) if mse > 0 else float("inf")
+            row = {
+                "frame": f, "sequence": seq,
+                "rgbs_mse": mse, "psnr": psnr, "mae": float(a.mean()),
+                "max_abs": float(a.max()),
+                "ch_bias": [float(e[:, :, c].mean()) for c in range(3)],
+                "ch_mae": [float(a[:, :, c].mean()) for c in range(3)],
+                "ch_max": [float(a[:, :, c].max()) for c in range(3)],
+                "ch_rmse": [float(np.sqrt(np.mean(e[:, :, c] ** 2))) for c in range(3)],
+            }
+            pooled["sse_rgb"] += float(np.sum(e * e))
+            pooled["n_rgb"] += e.size
+            pooled["abs_rgb"] += float(a.sum())
+            for c in range(3):
+                ch_bias[c] += float(e[:, :, c].sum())
+                ch_abs[c] += float(a[:, :, c].sum())
+                ch_max[c] = max(ch_max[c], float(a[:, :, c].max()))
+
+            # ---- alpha channel of plane 0 -------------------------------------
+            da = np.abs(cur[0, :, :, 3] - ref[0, :, :, 3])
+            alpha_report["max_abs_alpha_diff"] = max(alpha_report["max_abs_alpha_diff"], float(da.max()))
+            alpha_report["n_not_one_in_ref"] += int(np.count_nonzero(ref[0, :, :, 3] != 1.0))
+            alpha_report["n_not_one_in_cur"] += int(np.count_nonzero(cur[0, :, :, 3] != 1.0))
+            ra = ref[0, :, :, 3]
+            ca = cur[0, :, :, 3]
+            alpha_report["min"] = float(ra.min()) if alpha_report["min"] is None else min(alpha_report["min"], float(ra.min()))
+            alpha_report["max"] = float(ra.max()) if alpha_report["max"] is None else max(alpha_report["max"], float(ra.max()))
+            row["alpha_max_abs_diff"] = float(da.max())
+
+            # ---- plane 1: history surface (not scored by QUALITY-24) ----------
+            eh = cur[1].astype(np.float32) - ref[1].astype(np.float32)
+            ah = np.abs(eh)
+            row["hist_rgb_mse"] = float(np.mean(eh[:, :, :3] ** 2))
+            row["hist_rgb_mae"] = float(ah[:, :, :3].mean())
+            row["hist_rgb_max"] = float(ah[:, :, :3].max())
+            row["hist_blend_mae"] = float(ah[:, :, 3].mean())
+            row["hist_blend_max"] = float(ah[:, :, 3].max())
+            row["hist_ch_bias"] = [float(eh[:, :, c].mean()) for c in range(3)]
+            pooled["sse_hist"] += float(np.sum(eh[:, :, :3] ** 2))
+            pooled["n_hist"] += eh[:, :, :3].size
+            pooled["abs_hist"] += float(ah[:, :, :3].sum())
+            for c in range(4):
+                hch_bias[c] += float(eh[:, :, c].sum())
+                hch_abs[c] += float(ah[:, :, c].sum())
+                hch_max[c] = max(hch_max[c], float(ah[:, :, c].max()))
+
+            rb = ref[1, :, :, 3]
+            cb = cur[1, :, :, 3]
+            blend_ranges["ref_min"] = float(rb.min()) if blend_ranges["ref_min"] is None else min(blend_ranges["ref_min"], float(rb.min()))
+            blend_ranges["ref_max"] = float(rb.max()) if blend_ranges["ref_max"] is None else max(blend_ranges["ref_max"], float(rb.max()))
+            blend_ranges["cur_min"] = float(cb.min()) if blend_ranges["cur_min"] is None else min(blend_ranges["cur_min"], float(cb.min()))
+            blend_ranges["cur_max"] = float(cb.max()) if blend_ranges["cur_max"] is None else max(blend_ranges["cur_max"], float(cb.max()))
+            row["blend_mean_ref"] = float(rb.mean())
+            row["blend_frac_gt_0p5"] = float((rb > 0.5).mean())
+            row["blend_frac_gt_0p1"] = float((rb > 0.1).mean())
+
+            # ---- spatial structure of the final-RGB error ---------------------
+            am = a.mean(axis=2)  # (720,1280)
+            sse_map = (e * e).sum(axis=2)
+            flat = sse_map.ravel()
+            order = np.argsort(flat)[::-1]
+            top1 = float(flat[order[: max(1, flat.size // 100)]].sum() / (flat.sum() + 1e-30))
+            top10 = float(flat[order[: max(1, flat.size // 10)]].sum() / (flat.sum() + 1e-30))
+            blk = block_mean(am, 32, 32).ravel()
+            row["block32_meanabs_p50"] = float(np.percentile(blk, 50))
+            row["block32_meanabs_p95"] = float(np.percentile(blk, 95))
+            row["block32_meanabs_p99"] = float(np.percentile(blk, 99))
+            row["block32_meanabs_ratio_p95_p50"] = float(np.percentile(blk, 95) / (np.percentile(blk, 50) + 1e-30))
+            row["sse_share_top1pct"] = top1
+            row["sse_share_top10pct"] = top10
+            block_edges_pool.append(blk)
+
+            # ---- edge vs flat (descriptive bucketing on the reference) --------
+            luma = (0.2126 * ref[0, :, :, 0] + 0.7152 * ref[0, :, :, 1] + 0.0722 * ref[0, :, :, 2]).astype(np.float32)
+            gx = np.zeros_like(luma)
+            gy = np.zeros_like(luma)
+            gx[:, 1:-1] = luma[:, 2:] - luma[:, :-2]
+            gy[1:-1, :] = luma[2:, :] - luma[:-2, :]
+            grad = np.sqrt(gx * gx + gy * gy)
+            qs = np.quantile(grad, [0.25, 0.5, 0.75])
+            buckets = []
+            for name, mask in (
+                ("flat_q1", grad <= qs[0]),
+                ("q2", (grad > qs[0]) & (grad <= qs[1])),
+                ("q3", (grad > qs[1]) & (grad <= qs[2])),
+                ("edge_q4", grad > qs[2]),
+            ):
+                buckets.append({"bucket": name,
+                                "pixel_frac": float(mask.mean()),
+                                "mean_abs_err": float(am[mask].mean()) if mask.any() else None,
+                                "sse_share": float(sse_map[mask].sum() / (sse_map.sum() + 1e-30)),
+                                "ref_grad_mean": float(grad[mask].mean())})
+            row["edge_buckets"] = buckets
+            edge_bucket_pool.append(buckets)
+
+            # ---- periodicity of the error profile ----------------------------
+            cp_prof = am.mean(axis=0)
+            rp_prof = am.mean(axis=1)
+            row["col_period"] = period_peak(cp_prof[:1280], 8, 320)
+            row["row_period"] = period_peak(rp_prof[:720], 8, 320)
+            rows.append(row)
+            print(f"{f}: psnr={psnr:.4f} mae={row['mae']:.5f} max={row['max_abs']:.4f} "
+                  f"hist_mae={row['hist_rgb_mae']:.5f} blend>0.5={row['blend_frac_gt_0p5']:.3f}")
+
+    n = len(rows)
+    pooled_rmse = math.sqrt(pooled["sse_rgb"] / pooled["n_rgb"])
+    hist_rmse = math.sqrt(pooled["sse_hist"] / pooled["n_hist"])
+    summary = {
+        "frames": n,
+        "mean_psnr": float(np.mean([r["psnr"] for r in rows])),
+        "min_psnr": float(np.min([r["psnr"] for r in rows])),
+        "max_psnr": float(np.max([r["psnr"] for r in rows])),
+        "pooled_rmse": pooled_rmse,
+        "pooled_psnr": -10.0 * math.log10(pooled_rmse ** 2),
+        "mean_mae": float(np.mean([r["mae"] for r in rows])),
+        "worst_max_abs": float(np.max([r["max_abs"] for r in rows])),
+        "ch_bias": (ch_bias[:3] / pooled["n_rgb"] * 3).tolist(),
+        "ch_mae": (ch_abs[:3] / pooled["n_rgb"] * 3).tolist(),
+        "ch_worst_abs": ch_max[:3].tolist(),
+        "hist_rgb_rmse": hist_rmse,
+        "hist_rgb_mae": float(pooled["abs_hist"] / pooled["n_hist"]),
+        "hist_ch_bias": (hch_bias / pooled["n_hist"] * 4).tolist(),
+        "hist_ch_mae": (hch_abs / pooled["n_hist"] * 4).tolist(),
+        "hist_ch_worst_abs": hch_max.tolist(),
+        "alpha": alpha_report,
+        "blend": blend_ranges,
+        "sse_share_top1pct_mean": float(np.mean([r["sse_share_top1pct"] for r in rows])),
+        "sse_share_top10pct_mean": float(np.mean([r["sse_share_top10pct"] for r in rows])),
+        "block32_ratio_p95_p50_mean": float(np.mean([r["block32_meanabs_ratio_p95_p50"] for r in rows])),
+    }
+    allblocks = np.concatenate(block_edges_pool)
+    summary["block32_pooled"] = {
+        "p50": float(np.percentile(allblocks, 50)),
+        "p90": float(np.percentile(allblocks, 90)),
+        "p95": float(np.percentile(allblocks, 95)),
+        "p99": float(np.percentile(allblocks, 99)),
+        "max": float(allblocks.max()),
+        "min": float(allblocks.min()),
+    }
+    agg = {}
+    for row_buckets in edge_bucket_pool:
+        for b in row_buckets:
+            acc = agg.setdefault(b["bucket"], {"pixel_frac": 0.0, "sse": 0.0, "wabs": 0.0, "grad": 0.0})
+            acc["pixel_frac"] += b["pixel_frac"]
+            acc["sse"] += b["sse_share"]
+            acc["wabs"] += b["mean_abs_err"] * b["pixel_frac"]
+            acc["grad"] += b["ref_grad_mean"]
+    summary["edge_buckets_pooled"] = {
+        k: {"pixel_frac": v["pixel_frac"] / n,
+            "sse_share": v["sse"] / n,
+            "mean_abs_err": v["wabs"] / max(v["pixel_frac"], 1e-30),
+            "ref_grad_mean": v["grad"] / n}
+        for k, v in agg.items()
+    }
+    colp = [r["col_period"] for r in rows if r["col_period"]["period"]]
+    rowp = [r["row_period"] for r in rows if r["row_period"]["period"]]
+    summary["column_period_median"] = float(np.median([p["period"] for p in colp])) if colp else None
+    summary["column_period_strength_frac_median"] = float(np.median([p["strength_frac"] for p in colp])) if colp else None
+    summary["row_period_median"] = float(np.median([p["period"] for p in rowp])) if rowp else None
+    summary["row_period_strength_frac_median"] = float(np.median([p["strength_frac"] for p in rowp])) if rowp else None
+
+    doc = {
+        "scope": ("S03-tail step C. Describes the two exit surfaces of the existing 24-frame "
+                  "INT8 replay vs the captured FP16 reference. Plane 0 = final display RGBA "
+                  "(the scored metric); plane 1 = history surface + blend weight (NOT scored by "
+                  "QUALITY-24 but is the value used for feedback). Descriptive only: no causal "
+                  "attribution to the tail layers, no GPU run, no plan/weight change."),
+        "inputs": {
+            "int8": "real-int8-24/c64-family-static/run-<frame>/replayed-network.bin",
+            "fp16_reference": "dataset/<seq>/<split>-<frame>/network-output.bin",
+            "layout": "2 x 720 x 1280 x 4 fp32 little-endian",
+        },
+        "summary": summary,
+        "rows": rows,
+    }
+    dest = B / "work/dsh-fullnet-static-20261029/S03-tail/evidence/tail-output-stats-24.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(doc, indent=1), encoding="utf-8")
+    print(json.dumps({k: v for k, v in summary.items() if k != "rows"}, indent=1))
+    print(f"wrote {dest}")
+
+
+if __name__ == "__main__":
+    main()

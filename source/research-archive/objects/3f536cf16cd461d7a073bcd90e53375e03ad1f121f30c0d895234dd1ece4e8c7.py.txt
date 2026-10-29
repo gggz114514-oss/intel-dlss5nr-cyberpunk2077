@@ -1,0 +1,52 @@
+"""Sweep the E magnitude (tap_e scale) and the E quantiser inverse independently.
+
+The kernel computes E = acc * fsc[4+m]; if my acc or tap is off by a factor the E
+codes and the activation both move.  Objective = free-fit residual of
+(Y_gpu - seed) against the resulting eq basis.
+"""
+import sys, itertools
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+info = L.block_bindings(L.D / "c32-minmax/local-b4.txt", ordinal=4)
+x_flat = np.fromfile(info["input"], dtype="<f2")
+gpu = np.fromfile(L.D / "c32-minmax/local-b4/replayed-network.bin", dtype="<f2")
+wb = np.fromfile(info["wb"], dtype="<f2")
+we, wc = L.load_w8(info["w8"])
+fsc = L.load_fsc(info["fsc"])
+rs = wb[info["rs_base"] + 8:info["rs_base"] + 40].astype(np.float16)
+
+rng = np.random.default_rng(5)
+tiles = np.sort(rng.choice(168 * 96, size=600, replace=False))
+TT, CC = np.meshgrid(tiles, np.arange(16), indexing="ij")
+TT = TT.ravel(); CC = CC.ravel()
+base = TT * 512 + CC * 16
+ref = np.empty((32, TT.size), np.float16)
+for c in range(32):
+    off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+    ref[c] = gpu[base + off]
+ref = ref.astype(np.float64)
+x = L.gather(x_flat, TT, CC)
+seed = L.widen(L.to_half(x * rs[:, None]))
+tgt = ref - seed
+xq = L.code8_ch(x, np.full(32, np.float32(fsc[1])))
+acc = np.rint(we.astype(np.float64) @ xq.astype(np.float64)).astype(np.int32)
+
+best = None
+print("  k      invE_mult   resid")
+for k, ge in itertools.product([0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0],
+                               [0.25, 0.5, 1.0, 2.0, 4.0]):
+    e_pre = acc.astype(np.float32) * (fsc[4:132] * k)[:, None]
+    a_h = L.act_h(L.to_half(e_pre))
+    eq = L.code8_ch(a_h, np.float32(fsc[3]) * ge)
+    if not eq.any():
+        continue
+    A, *_ = np.linalg.lstsq(eq.astype(np.float64).T, tgt.T, rcond=None)
+    r = float(np.linalg.norm(tgt.T - eq.astype(np.float64).T @ A) / np.linalg.norm(tgt))
+    if best is None or r < best[0]:
+        best = (r, k, ge)
+    print(f"{k:6.2f} {ge:8.2f}   {r:.5f}")
+print("best", best)

@@ -1,0 +1,272 @@
+"""S09 ViT QK staticisation: pack builder + 3-frame dynamic-vs-static CPU study.
+
+CPU ONLY. No GPU, no Vulkan, no game. Reads the FP16 teacher dumps and the read-only
+vit_scales files; writes only inside this card's directory.
+
+Contract modelled (r12r15_vit_attention_qk8_pv8, see CONTRACT.md):
+  QKV layout         qkv[t*3072 + 0..1023] Q, +1024 K, +2048 V ; head h owns [h*32,h*32+32)
+  live tokens 288 (p0.x), padded keys 320 (p0.y), 5 workgroups of 64 queries,
+  5 key chunks of 64; padded keys keep exp(0) inside den, pad subtracted once per query,
+  one reciprocal per query after the last chunk, P unnormalised into PV.
+
+Dynamic (deployed) scales
+  sQ   per workgroup  max|Q| over that WG's 64x32 f16 values * (1/127)
+  sK   per key chunk  max|K| over that chunk's 64x32 f16 values * (1/127)
+  sV   per key chunk  max|V| over that chunk's 64x32 f16 values * (1/127)
+  sP   per (query, chunk) max|P| over that query's 64 unnormalised halfs * (1/127)
+
+Static QK (this card)
+  sQ[h] = max|Q_h| over ALL 288 tokens of the CALIBRATION frame * (1/127)   (= max of the
+          5 dynamic per-WG values, so it can never clip on the calibration frame)
+  sK[h] = max|K_h| over ALL tokens of the calibration frame * (1/127)       (idem per chunk)
+  sV, sP stay exactly as deployed.
+"""
+import hashlib
+import json
+import os
+import sys
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from vit_attn_model import EPS_INV, HD, HEADS, PADK, TOK, den_tree, rel_l2, vit_exp  # noqa: E402
+
+BASE = r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+FRAMES = {
+    "F1-34189": os.path.join(BASE, "dump-fp16"),
+    "F2-41444": os.path.join(BASE, "teacher-diagnostics", "teacher-41444"),
+    "F3-43654": os.path.join(BASE, "teacher-diagnostics", "teacher-43654"),
+}
+OUT = os.path.dirname(HERE)
+SCALES_SRC = r"@NR_WORKSPACE@/src/project/artifacts/parallel-port-20261013/vit"
+PACK = os.path.join(OUT, "PACK")
+BLOCKS = list(range(31, 39))
+NWG = (TOK + 63) // 64
+NCH = (PADK + 63) // 64
+WGS = [(i * 64, min((i + 1) * 64, TOK)) for i in range(NWG)]
+EXP0 = vit_exp(np.float16(0.0))
+PAD = np.float16(np.float32(PADK - TOK) * np.float32(EXP0))
+INV127 = np.float32(1.0) / np.float32(127.0)   # == GLSL 1.0/127.0 (0x3C010204)
+
+
+def load_qkv(dirname, block):
+    a = np.fromfile(os.path.join(dirname, "dump_vit_block%d_QKV.bin" % block), dtype=np.float16)
+    assert a.size == TOK * 3072, (block, a.size)
+    a = a.reshape(TOK, 3072)
+    return (a[:, :1024].reshape(TOK, HEADS, HD),
+            a[:, 1024:2048].reshape(TOK, HEADS, HD),
+            a[:, 2048:3072].reshape(TOK, HEADS, HD))
+
+
+def amax16(x):
+    """max |f32(x_f16)| - exactly what the kernel's abs/atomicMax sees."""
+    v = np.asarray(x, np.float16).astype(np.float32)
+    return float(np.abs(v).max())
+
+
+def step(a):
+    """absmax -> dequant step, in fp32 exactly like uintBitsToFloat(max)*(1.0/127.0)."""
+    return np.float32(a) * INV127
+
+
+def codes(x, s, clip_counter):
+    c = np.round(np.asarray(x, np.float32) / np.float32(s))
+    if clip_counter is not None:
+        clip_counter[0] += int((np.abs(c) > 127.0).sum())
+        clip_counter[1] += c.size
+    return np.clip(c, -127.0, 127.0)
+
+
+def run_head(q, k, v, qs=None, ks=None, vs=None, want_clip=False):
+    """qs (NWG,) | float | None ; ks (NWG,NCH) | float | None ; vs idem. sP always dynamic."""
+    Qf = np.asarray(q, np.float32)
+    Kf = np.asarray(k, np.float32)
+    Vf = np.asarray(v, np.float32)
+    score = np.zeros((TOK, PADK), np.float32)
+    P = np.zeros((TOK, PADK), np.float32)
+    den = np.zeros(TOK, np.float16)
+    ctx = np.zeros((TOK, HD), np.float32)
+    cq = [0, 0]
+    ck = [0, 0]
+    cp = [0, 0]
+    Vp = np.zeros((PADK, HD), np.float32)
+    Vp[:TOK] = Vf
+    for wg, (a, b) in enumerate(WGS):
+        n = b - a
+        if qs is None:
+            qd = Qf[a:b]
+        else:
+            s = np.float32(qs[wg] if np.ndim(qs) else qs)
+            qd = codes(Qf[a:b], s, cq if want_clip else None) * s
+        for ci in range(NCH):
+            j0, j1 = ci * 64, min(ci * 64 + 64, TOK)
+            keys = np.zeros((64, HD), np.float32)
+            keys[:max(j1 - j0, 0)] = Kf[j0:j1]
+            vcodes = Vp[j0:j0 + 64]
+            sv = np.float32(1.0)
+            if vs is not None:
+                sv = np.float32(vs[wg][ci] if np.ndim(vs) else vs)
+                vcodes = codes(vcodes, sv, None)
+            if ks is None:
+                kd = keys
+            else:
+                sk = np.float32(ks[wg][ci] if np.ndim(ks) else ks)
+                kd = codes(keys, sk, ck if want_clip else None) * sk
+            s = (qd @ kd.T).astype(np.float16)
+            score[a:b, j0:j0 + 64] = s.astype(np.float32)
+            pv = vit_exp(s).astype(np.float32)
+            P[a:b, j0:j0 + 64] = pv
+            pmx = pv.max(axis=1)
+            sp = np.where(pmx > 0.0, pmx * INV127, np.float32(1.0)).astype(np.float32)
+            c = codes(pv, sp[:, None], cp if want_clip else None)
+            Prow = np.full((n, 64), EXP0, np.float16)
+            po = pv.astype(np.float16)
+            if j1 - j0 < 64:
+                po[:, j1 - j0:] = EXP0
+            Prow[:, :] = po
+            den[a:b] = (den[a:b].astype(np.float32) +
+                        den_tree(Prow).astype(np.float32)).astype(np.float16)
+            ctx[a:b] += (c @ vcodes) * (sp * sv)[:, None]
+    den = (den.astype(np.float32) - np.float32(PAD)).astype(np.float16)
+    inv = (np.float32(1.0) / np.maximum(den.astype(np.float32),
+                                        np.float32(EPS_INV))).astype(np.float16)
+    num_h = ctx.astype(np.float16).astype(np.float32)
+    out = (num_h * inv.astype(np.float32)[:, None]).astype(np.float16)
+    d = {"score": score, "P": P, "den": den, "inv": inv, "ctx": ctx, "out": out}
+    if want_clip:
+        d["clip_q"] = cq[0] / max(cq[1], 1)
+        d["clip_k"] = ck[0] / max(ck[1], 1)
+        d["clip_p"] = cp[0] / max(cp[1], 1)
+    return d
+
+
+def summarise(vals):
+    a = np.asarray(vals, np.float64)
+    return {"mean": float(a.mean()), "median": float(np.median(a)), "p90": float(np.percentile(a, 90)),
+            "max": float(a.max())}
+
+
+def build_pack(block, sQ, sK):
+    src = os.path.join(SCALES_SRC, "block%d" % block, "vit_scales.fp32.bin")
+    base = np.fromfile(src, dtype=np.float32)
+    assert base.size == 32, (src, base.size)
+    out = np.concatenate([base, sQ.astype(np.float32), sK.astype(np.float32)])
+    assert out.size == 96
+    path = os.path.join(PACK, "vit_block%d_scales_qks.fp32.bin" % block)
+    out.astype("<f4").tofile(path)
+    return {"path": path, "bytes": int(os.path.getsize(path)),
+            "sha256": hashlib.sha256(open(path, "rb").read()).hexdigest(),
+            "src": src, "src_sha256": hashlib.sha256(open(src, "rb").read()).hexdigest(),
+            "producer_scales_first8": [float(x) for x in base[:8]],
+            "sQ": [float(x) for x in sQ], "sK": [float(x) for x in sK]}
+
+
+def main():
+    os.makedirs(PACK, exist_ok=True)
+    rep = {"schema": "s09-vit-qk-static-v1", "cpu_only": True, "gpu_verified": False,
+           "not_a_full_network_statement": True,
+           "calibration_frame": "F1-34189", "frames": list(FRAMES), "blocks": BLOCKS,
+           "inv127_float32": float(INV127), "pack": {}, "per_frame": {}}
+    cal = {}
+    for b in BLOCKS:
+        Q, K, _ = load_qkv(FRAMES["F1-34189"], b)
+        sQ = np.array([step(amax16(Q[:, h, :])) for h in range(HEADS)], np.float32)
+        sK = np.array([step(amax16(K[:, h, :])) for h in range(HEADS)], np.float32)
+        cal[b] = (sQ, sK)
+        rep["pack"]["block%d" % b] = build_pack(b, sQ, sK)
+        print("pack b%d sha=%s sQ[0]=%.6g sK[0]=%.6g" % (
+            b, rep["pack"]["block%d" % b]["sha256"][:16], sQ[0], sK[0]))
+        sys.stdout.flush()
+
+    for fname, fdir in FRAMES.items():
+        rep["per_frame"][fname] = {}
+        for b in BLOCKS:
+            Q, K, V = load_qkv(fdir, b)
+            sQ, sK = cal[b]
+            acc = {}
+            for h in range(HEADS):
+                q, k, v = Q[:, h, :], K[:, h, :], V[:, h, :]
+                qsd = np.array([step(amax16(q[a:c])) for a, c in WGS], np.float32)
+                ksd = np.zeros((NWG, NCH), np.float32)
+                vsd = np.zeros((NWG, NCH), np.float32)
+                for ci in range(NCH):
+                    j0, j1 = ci * 64, min(ci * 64 + 64, TOK)
+                    ksd[:, ci] = step(amax16(k[j0:j1]))
+                    vsd[:, ci] = step(amax16(v[j0:j1]))
+                ref = run_head(q, k, v)
+                dyn = run_head(q, k, v, qsd, ksd, vsd, want_clip=True)
+                sta = run_head(q, k, v, np.full(NWG, sQ[h], np.float32),
+                               np.full((NWG, NCH), sK[h], np.float32), vsd, want_clip=True)
+                for tag, r in (("dyn", dyn), ("static_qk", sta)):
+                    e = acc.setdefault(tag, {k2: [] for k2 in
+                                             ("score", "P", "ctx", "T", "clip_q", "clip_k", "clip_p", "den")})
+                    e["score"].append(rel_l2(r["score"], ref["score"]))
+                    e["P"].append(rel_l2(r["P"], ref["P"]))
+                    e["ctx"].append(rel_l2(r["ctx"], ref["ctx"]))
+                    e["T"].append(rel_l2(r["out"].astype(np.float32), ref["out"].astype(np.float32)))
+                    e["den"].append(rel_l2(r["den"].astype(np.float32), ref["den"].astype(np.float32)))
+                    e["clip_q"].append(r["clip_q"])
+                    e["clip_k"].append(r["clip_k"])
+                    e["clip_p"].append(r["clip_p"])
+                rr = acc.setdefault("resolution", {"Q": [], "K": [], "V": []})
+                rr["Q"].append(float(np.median(qsd) * 127.0 / max(float(sQ[h]) * 127.0, 1e-30)))
+                rr["K"].append(float(np.median(ksd) * 127.0 / max(float(sK[h]) * 127.0, 1e-30)))
+                rr["V"].append(float(np.median(vsd) * 127.0 / max(float(np.median(vsd)) * 127.0, 1e-30)))
+                # attribution: static vs dynamic context
+                e = acc.setdefault("static_vs_dyn", {"ctx": [], "T": []})
+                e["ctx"].append(rel_l2(sta["ctx"], dyn["ctx"]))
+                e["T"].append(rel_l2(sta["out"].astype(np.float32), dyn["out"].astype(np.float32)))
+            out = {}
+            for tag in ("dyn", "static_qk"):
+                e = acc[tag]
+                out[tag] = {k2: summarise(e[k2]) for k2 in
+                            ("score", "P", "ctx", "T", "den")}
+                out[tag]["clip_q_max"] = float(np.max(e["clip_q"]))
+                out[tag]["clip_k_max"] = float(np.max(e["clip_k"]))
+                out[tag]["clip_p_max"] = float(np.max(e["clip_p"]))
+                out[tag]["heads_with_q_clip"] = int(np.sum(np.asarray(e["clip_q"]) > 0))
+                out[tag]["heads_with_k_clip"] = int(np.sum(np.asarray(e["clip_k"]) > 0))
+            out["resolution"] = {k2: {"mean": float(np.mean(v2)), "min": float(np.min(v2)),
+                                      "max": float(np.max(v2))} for k2, v2 in acc["resolution"].items()}
+            out["static_vs_dyn"] = {k2: summarise(v2) for k2, v2 in acc["static_vs_dyn"].items()}
+            rep["per_frame"][fname]["block%d" % b] = out
+            print("%s b%02d  dyn ctx=%.5f T=%.5f | static ctx=%.5f T=%.5f | q_clip=%.4f%% k_clip=%.4f%%"
+                  " | score %.5f -> %.5f | resQ=%.3f" % (
+                      fname, b, out["dyn"]["ctx"]["mean"], out["dyn"]["T"]["mean"],
+                      out["static_qk"]["ctx"]["mean"], out["static_qk"]["T"]["mean"],
+                      100 * out["static_qk"]["clip_q_max"], 100 * out["static_qk"]["clip_k_max"],
+                      out["dyn"]["score"]["mean"], out["static_qk"]["score"]["mean"],
+                      out["resolution"]["Q"]["mean"]))
+            sys.stdout.flush()
+
+    # run-level summary over the 8 blocks
+    summ = {}
+    for fname in FRAMES:
+        s = {}
+        for tag in ("dyn", "static_qk"):
+            for metric in ("score", "P", "ctx", "T"):
+                vals = [rep["per_frame"][fname]["block%d" % b][tag][metric]["mean"] for b in BLOCKS]
+                s["%s_%s_median_of_blocks" % (tag, metric)] = float(np.median(vals))
+                s["%s_%s_max_of_blocks" % (tag, metric)] = float(np.max(vals))
+        s["static_clip_q_max"] = max(rep["per_frame"][fname]["block%d" % b]["static_qk"]["clip_q_max"] for b in BLOCKS)
+        s["static_clip_k_max"] = max(rep["per_frame"][fname]["block%d" % b]["static_qk"]["clip_k_max"] for b in BLOCKS)
+        s["static_heads_with_q_clip"] = int(sum(rep["per_frame"][fname]["block%d" % b]["static_qk"]["heads_with_q_clip"] for b in BLOCKS))
+        s["static_heads_with_k_clip"] = int(sum(rep["per_frame"][fname]["block%d" % b]["static_qk"]["heads_with_k_clip"] for b in BLOCKS))
+        s["dyn_heads_with_q_clip"] = int(sum(rep["per_frame"][fname]["block%d" % b]["dyn"]["heads_with_q_clip"] for b in BLOCKS))
+        s["resQ_median"] = float(np.median([rep["per_frame"][fname]["block%d" % b]["resolution"]["Q"]["mean"] for b in BLOCKS]))
+        s["resK_median"] = float(np.median([rep["per_frame"][fname]["block%d" % b]["resolution"]["K"]["mean"] for b in BLOCKS]))
+        summ[fname] = s
+    rep["run_summary"] = summ
+    path = os.path.join(HERE, "s09-qk-static-study.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(rep, f, indent=1)
+    print("wrote", path)
+    for fname, s in summ.items():
+        print(fname, "dyn ctx %.5f | static ctx %.5f | static T %.5f | qclip %.5f%%"
+              % (s["dyn_ctx_median_of_blocks"], s["static_qk_ctx_median_of_blocks"],
+                 s["static_qk_T_median_of_blocks"], 100 * s["static_clip_q_max"]))
+
+
+if __name__ == "__main__":
+    main()

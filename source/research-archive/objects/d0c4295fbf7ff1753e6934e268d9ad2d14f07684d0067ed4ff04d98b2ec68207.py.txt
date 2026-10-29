@@ -1,0 +1,194 @@
+"""n33 task A: F02 latency exposure audit (executed path).
+
+Output: A-AUDIT.json with
+  1. identity (one SPV / 7 ordinals / one kernel hash across 118 capture files)
+  2. the 24 expensive ops: file-order distance (campaign convention,
+     evidence/LATENCY-EXPOSURE.json) and executed-path distance + histogram
+  3. block decomposition of the two expensive regions:
+        norm section  8 x (tree -- 2 rsqt -- apply)   [16 rsqt]
+        softmax       4 x (tree -- 2 inv  -- apply)   [ 8 inv ]
+     where tree = backward def-use slice from the expensive op, apply = the
+     instructions that consume its result.
+  4. per-lane independent chains (n32 method) of the parent.
+"""
+import sys, json, re
+from pathlib import Path
+from collections import Counter, defaultdict
+
+HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE))
+import _isa  # noqa: E402
+from _t02_live import reachable  # noqa: E402
+from _t01_identity import classify, reg_base, reaching  # noqa: E402
+
+
+def build():
+    ins, labels = _isa.parse()
+    seen = reachable(ins, labels)
+    for i, it in enumerate(ins):
+        it["live"] = seen[i]
+        it["w"], it["r"] = classify(it)
+    by_dw = defaultdict(list)
+    for it in ins:
+        for f, no, dw, n in it["w"]:
+            for d in range(dw, dw + n):
+                by_dw[(f, no, d)].append(it["idx"])
+    for v in by_dw.values():
+        v.sort()
+    return ins, by_dw
+
+
+def par(ins, by_dw, live_idx, k):
+    out = set()
+    for f, no, dw, cnt in ins[k]["r"]:
+        for d in range(dw, dw + cnt):
+            p = reaching(by_dw, (f, no, d), k)
+            if p is not None and p in live_idx:
+                out.add(p)
+    return out
+
+
+def users_of(ins, by_dw, live_idx, k):
+    """live instructions that read something k defines"""
+    keys = set()
+    for f, no, dw, n in ins[k]["w"]:
+        for d in range(dw, dw + n):
+            keys.add((f, no, d))
+    hits = []
+    for j in sorted(live_idx):
+        if j <= k:
+            continue
+        for f, no, dw, n in ins[j]["r"]:
+            if any((f, no, d) in keys for d in range(dw, dw + n)):
+                hits.append(j)
+                break
+    return hits
+
+
+def main():
+    ins, by_dw = build()
+    n = len(ins)
+    live_idx = {i for i in range(n) if ins[i]["live"]}
+    print("total %d live %d" % (n, len(live_idx)))
+
+    exp = [k for k in sorted(live_idx) if ins[k]["op"] in ("math.rsqt", "math.inv")]
+    rows = []
+    for k in exp:
+        us = users_of(ins, by_dw, live_idx, k)
+        first = us[0] if us else None
+        gap = sum(1 for j in range(k + 1, first) if j in live_idx) if first else None
+        # campaign convention: scan the file for the first text-level reader
+        dst = None
+        for o in ins[k]["ops"]:
+            m = re.match(r"^r(\d+)(?:\.(\d+))?", o)
+            if m:
+                dst = (int(m.group(1)), int(m.group(2) or 0))
+                break
+        file_d = None
+        for j in range(k + 1, min(k + 400, n)):
+            for o in ins[j]["ops"]:
+                m = re.match(r"^r(\d+)(?:\.(\d+))?", o)
+                if m and (int(m.group(1)), int(m.group(2) or 0)) == dst:
+                    file_d = j - k
+                    break
+            if file_d:
+                break
+        rows.append(dict(idx=k, addr=hex(ins[k]["addr"]), op=ins[k]["op"], dst=dst,
+                         first_use=first, file_distance=file_d,
+                         live_gap=gap, n_users=len(us),
+                         last_use=us[-1] if us else None,
+                         consumer_ops=sorted({ins[u]["op"] for u in us})))
+    print("\n%-6s %-9s %8s %8s %6s %6s" % ("idx", "op", "file_d", "live_gap", "nuse", "1st"))
+    for r in rows:
+        print("%-6d %-9s %8s %8s %6d %6d" % (r["idx"], r["op"], r["file_distance"],
+                                             r["live_gap"], r["n_users"], r["first_use"]))
+    hist = Counter("<=2" if (r["file_distance"] or 999) <= 2 else
+                   ("3-10" if r["file_distance"] <= 10 else ">10") for r in rows)
+    print("\nhistogram (campaign convention, distance<=2 = exposed):", dict(hist))
+
+    # ---------------- block decomposition
+    def back_slice(k):
+        seen_, st = set(), [k]
+        while st:
+            j = st.pop()
+            if j in seen_:
+                continue
+            seen_.add(j)
+            st.extend(par(ins, by_dw, live_idx, j))
+        return seen_
+
+    norm_rsqt = [k for k in exp if ins[k]["op"] == "math.rsqt"]
+    sections = []
+    for k in norm_rsqt:
+        sl = back_slice(k)
+        sections.append((min(sl), max(sl), k, len(sl)))
+    print("\n== norm rsqt backward slices (tree extents) ==")
+    for lo, hi, k, cnt in sections:
+        print("   rsqt@%d  slice [%d..%d]  %d instructions" % (k, lo, hi, cnt))
+
+    invs = [k for k in exp if ins[k]["op"] == "math.inv"]
+    print("\n== inv backward slices ==")
+    for k in invs:
+        sl = back_slice(k)
+        print("   inv@%d  slice [%d..%d]  %d instructions" % (k, min(sl), max(sl), len(sl)))
+
+    # ---------------- per-lane independent chains (n32 method)
+    def chains_metric(order_key="addr"):
+        sinks = [i for i in sorted(live_idx)
+                 if ins[i]["op"].startswith("send") and
+                 ("store." in (ins[i]["comment"] or "") or "fence" in (ins[i]["comment"] or ""))]
+        chain, st = set(), list(sinks)
+        while st:
+            k = st.pop()
+            if k in chain:
+                continue
+            chain.add(k)
+            st.extend(par(ins, by_dw, live_idx, k))
+        order = sorted(chain, key=lambda k: ins[k][order_key])
+        owner, chains = {}, []
+        for k in order:
+            cand = None
+            for p in sorted(par(ins, by_dw, live_idx, k), reverse=True):
+                if p in owner:
+                    cand = owner[p]
+                    break
+            if cand is None:
+                cand = len(chains)
+                chains.append(dict(id=cand, lo=ins[k][order_key], hi=ins[k][order_key]))
+            owner[k] = cand
+            c = chains[cand]
+            c["lo"] = min(c["lo"], ins[k][order_key])
+            c["hi"] = max(c["hi"], ins[k][order_key])
+        ev = []
+        for c in chains:
+            ev.append((c["lo"], 1))
+            ev.append((c["hi"] + 1, -1))
+        ev.sort()
+        cur = best = 0
+        best_at = 0
+        for a, d in ev:
+            cur += d
+            if cur > best:
+                best, best_at = cur, a
+        return dict(chains=len(chains), max_concurrent=best, at=hex(best_at),
+                    chain_instr=len(chain), live=len(live_idx))
+
+    cm = chains_metric()
+    print("\n== per-lane independent chains (parent) ==")
+    print("  chains %d  max concurrent per lane %d at %s  chain instr %d / live %d"
+          % (cm["chains"], cm["max_concurrent"], cm["at"], cm["chain_instr"], cm["live"]))
+
+    out = dict(identity=dict(kernel="7a38a17947f21ae6", ordinals=_isa.ORDINALS,
+                             spv=str(_isa.SPV), isa_files=_isa.FILES,
+                             isa_dir=str(_isa.CAP)),
+               total=n, live=len(live_idx), debug_unreachable=n - len(live_idx),
+               op_live=dict(Counter(ins[i]["op"] for i in sorted(live_idx)).most_common()),
+               expensive=rows, histogram=dict(hist),
+               norm_slices=[dict(rsqt=k, lo=lo, hi=hi, n=cnt) for lo, hi, k, cnt in sections],
+               chains=cm)
+    (HERE / "A-AUDIT.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
+    print("\nwrote A-AUDIT.json")
+
+
+if __name__ == "__main__":
+    main()

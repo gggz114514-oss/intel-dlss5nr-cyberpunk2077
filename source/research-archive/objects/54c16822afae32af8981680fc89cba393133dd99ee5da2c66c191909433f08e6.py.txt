@@ -1,0 +1,119 @@
+"""n35-f18-latency: exactness proof of the shared-reciprocal integer division.
+
+The candidate replaces the sixteen per-site hardware integer divisions of the
+parent with one shared reciprocal plus a per-element fix-up.  This script proves
+that the fix-up returns the exact unsigned quotient and remainder, by emulating
+the emitted code in IEEE binary32 (struct-based rounding; no numpy needed).
+
+Emulated sequence (exactly the GLSL in candidate.comp):
+    ci3 = int(dz3 ? 1u : C);   ri3 = 1.0f / float(ci3);
+    n3  = int(e);
+    q0  = int(float(n3) * ri3);
+    m0  = n3 - q0 * ci3;
+    qa  = q0 - (m0 < 0 ? 1 : 0);
+    q3  = qa + (m0 >= ci3 ? 1 : 0);
+    s3  = dz3 ? 0xFFFFFFFFu : uint(q3);
+    k3  = dz3 ? 0xFFFFFFFFu : uint(n3 - q3 * ci3);
+
+Domains
+  A1  the reachable domain of this pass: C = 512, every n < 4096            (exhaustive)
+  A2  every C in [1,4096] x every n in [0,4096)                            (exhaustive, 16.7M)
+  B   uniform random n, C < 2**20                                          (sampled)
+  C   C == 0: both words must be 0xFFFFFFFF (the parent's -1 presets)      (exhaustive in n)
+"""
+import json, random, struct
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+OUT = HERE / 'EXACT-DIVMOD.json'
+PACK = struct.Struct('<f')
+
+
+def f32(x):
+    """round a double to IEEE binary32 (single rounding => identical to an fp32 op)"""
+    return PACK.unpack(PACK.pack(x))[0]
+
+
+def inv32(c):
+    """ri3 = 1.0f / float(c), computed in binary32"""
+    return f32(1.0 / f32(float(c)))
+
+
+def step(n, c, rinv):
+    """one element; returns (s3, k3, fixups)"""
+    dz3 = (c == 0)
+    ci3 = 1 if dz3 else c
+    n3 = n
+    q0 = int(f32(n3 * rinv))          # fp32 multiply, trunc toward zero
+    m0 = n3 - q0 * ci3
+    qa = q0 - (1 if m0 < 0 else 0)
+    q3 = qa + (1 if m0 >= ci3 else 0)
+    if dz3:
+        return 0xFFFFFFFF, 0xFFFFFFFF, (1 if q0 != q3 else 0)
+    return q3 & 0xFFFFFFFF, (n3 - q3 * ci3) & 0xFFFFFFFF, (1 if q0 != q3 else 0)
+
+
+def main():
+    res = {}
+    # ---- A1: the actual configuration (C = 512, n < 4096)
+    rinv = inv32(512)
+    bad = fixes = 0
+    for n in range(4096):
+        s3, k3, fx = step(n, 512, rinv)
+        fixes += fx
+        if s3 != n // 512 or k3 != n % 512:
+            bad += 1
+    res['A1_reachable_config'] = dict(C=512, pairs=4096, mismatches=bad, fixups_triggered=fixes,
+                                      verdict='EXACT' if bad == 0 else 'MISMATCH')
+
+    # ---- A2: every C in [1,4096] x every n in [0,4096)
+    bad_c, pairs, fixes = [], 0, 0
+    worst = None
+    for c in range(1, 4097):
+        r = inv32(c)
+        badc = 0
+        for n in range(4096):
+            s3, k3, fx = step(n, c, r)
+            fixes += fx
+            if s3 != n // c or k3 != n % c:
+                badc += 1
+        pairs += 4096
+        if badc:
+            bad_c.append(dict(C=c, mismatches=badc))
+        # margin statistic: largest |q0 - q_exact| for this C
+        if c in (3, 7, 512, 513, 4095, 4096):
+            e = max(abs(int(f32(n * r)) - n // c) for n in range(0, 4096, 7))
+            worst = dict(C=c, max_estimate_error=e) if worst is None else worst
+    res['A2_all_C_1_4096'] = dict(pairs=pairs, mismatching_C=bad_c, fixups_triggered=fixes,
+                                  verdict='EXACT' if not bad_c else 'MISMATCH')
+    res['A2_margin'] = worst
+
+    # ---- C: C == 0
+    bad0 = 0
+    r0 = inv32(1)                       # dz3 -> ci3 = 1
+    for n in range(4096):
+        s3, k3, _ = step(n, 0, r0)
+        if s3 != 0xFFFFFFFF or k3 != 0xFFFFFFFF:
+            bad0 += 1
+    res['C_divisor_zero'] = dict(pairs=4096, mismatches=bad0,
+                                 verdict='EXACT' if bad0 == 0 else 'MISMATCH')
+
+    # ---- B: wide sweep
+    rng = random.Random(20261028)
+    badb = 0
+    for _ in range(200000):
+        n = rng.randrange(0, 1 << 20)
+        c = rng.randrange(1, 1 << 20)
+        s3, k3, _ = step(n, c, inv32(c))
+        if s3 != n // c or k3 != n % c:
+            badb += 1
+    res['B_wide_sweep'] = dict(pairs=200000, domain='n < 2**20, 1 <= C < 2**20, uniform random',
+                               mismatches=badb, verdict='EXACT' if badb == 0 else 'MISMATCH')
+
+    OUT.write_text(json.dumps(res, indent=1), encoding='utf-8')
+    print(json.dumps(res, indent=1))
+    print('wrote', OUT)
+
+
+if __name__ == '__main__':
+    main()

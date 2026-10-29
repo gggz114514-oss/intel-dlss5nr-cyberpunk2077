@@ -1,0 +1,405 @@
+"""n38-f20-arena-shrink build: F20 (ord 230 `s37_fold_body_r1a_v1`) SLM 24576 -> 20480 B.
+
+Mechanism (one class: retire a shared plane whose values never overlap the previous
+occupant's live window):
+
+    shX (= shXP[2048], 4096 B) carries three DIFFERENT values in one workgroup lifetime,
+    in a strict order, with only intra-owner handoffs:
+        vX  stage 0 fold writes rows 8sg..8sg+7  ->  stage 1 reads them, stage 3 reads the
+            same rows back as the contract seed
+        vY  stage 3 writes rows 8sg..8sg+7       ->  stage 9 reads the same rows as the
+            projection seed
+        vO  stage 9 writes rows 8sg..8sg+7       ->  the 2-SG pixel tail reads all 64 rows
+    The parent stores vY in its own array `shY[2048]` (4096 B), even though its writer and
+    its reader are the same subgroup on the same rows and both handoffs are payload-ordered
+    (the store value is derived from the value just loaded).  Aliasing vY into shX therefore
+    retires the whole shY declaration: Workgroup storage 24576 -> 20480 B, residency
+    2 -> 3 at the n36 pool bracket P in [65536, 73728) (65536/21845 = 3).
+
+    Nothing else changes: no barrier added or removed, no message, no live value, no
+    arithmetic, no rounding point, no K order.  Every offset expression of the five moved
+    accesses is character-identical to the parent's (only the array identifier changes).
+
+Steps (CPU only; no GPU, no deployment; writes only inside this card directory):
+  1. parent byte reproduction from the baseline source + the recorded recipe
+     (glslang 16.5.0 + the NoContraction pattern transfer from the f20-pixel-owner
+     decoration parent) -> must be byte identical to 215aca67...
+  2. candidate source (7 hunks: 1 header note, 1 removed declaration, 5 accesses shY->shX)
+  3. candidate compile + the same NoContraction transfer -> candidate.spv, spv_validate_cpu
+  4. plan.txt on the CURRENT chain head, replacing only the ord-230 PASS line, and syncing
+     its workgroup-memory ledger field 29184 -> 20480; plus plan-ledger-29184.txt as the
+     control that proves the field is a ledger only (identical cpu-check output)
+  5. cpu-check of both plans + the parent plan
+  6. read-only structural accounting: _spv_check.py, _addr_audit.py, _lifetime.py, _proof.py
+
+Run:  @NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe build.py
+"""
+import hashlib
+import json
+import pathlib
+import subprocess
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+CAMP = pathlib.Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+W = pathlib.Path(r'@NR_WORKSPACE@')
+GLSLANG = W / 'src/project/tools/glslang-16.5.0/bin/glslang.exe'
+VALIDATE = W / 'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'
+RUNNER = W / 'work/codex-astra-fp16-int8-audit-20261024/phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe'
+SPVTOOLS = W / 'build/zcode-fp16-compute-backend-20261021/scripts'
+
+PARENT_SRC = W / 'work/codex-astra-fp16-int8-audit-20261024/f20-coarse-owner-20261026/candidate.comp'
+PARENT_SRC_SHA = '3e0879b37a7f7a8a49b70fd7d6bc771eebd184b3233506e892442678db5672d4'
+PARENT_SPV = W / 'work/codex-astra-fp16-int8-audit-20261024/f20-coarse-owner-20261026/candidate.spv'
+PARENT_SPV_SHA = '215aca679aaa2d5c36329ae45514efadae221ef4e8631121388b25052a7f7e32'
+DECOR_PARENT = W / 'work/codex-astra-fp16-int8-audit-20261024/c32-boundary-followup-20261026/f20-pixel-owner/candidate.spv'
+PINNED_INC = CAMP / 'cards/idt-identity-recipe/evidence/headers/215aca679aaa'
+RECIPE_INC = W / 'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1/source'
+
+PARENT_WG_BYTES = 24576
+CANDIDATE_WG_BYTES = 20480
+LEDGER_FIELD_PARENT = '29184'
+
+sys.path.insert(0, str(SPVTOOLS))
+sys.path.insert(0, str(CAMP))
+import spv_tools_local as ST          # noqa: E402
+import COMMON as K                    # noqa: E402
+
+# ------------------------------------------------------------------ the hunks
+HEADER_NOTE = (
+    b'// N38-F20 (2026-10-28): retire the second 64x32 plane; shared 24576 -> 20480 B.\r\n'
+    b'// shX already carries three values in disjoint windows (vX stage0->3, vY stage3->9,\r\n'
+    b'// vO stage9->tail).  vY is written and read by the SAME subgroup on the SAME rows\r\n'
+    b'// (8*sg..8*sg+7), both handoffs are payload-ordered (the store value is derived from\r\n'
+    b'// the value just loaded), and the only cross-owner edge (stage 1 reads of vX -> the\r\n'
+    b'// stage 3 write of vY) is closed by the existing unconditional barrier at line 282.\r\n'
+    b'// So vY is aliased into shX and the second 2048-half declaration is deleted: 4096 B\r\n'
+    b'// less workgroup memory, residency 2 -> 3 at P in [65536,73728).  Offsets, barriers,\r\n'
+    b'// messages, live values, arithmetic, rounding and K order are unchanged.\r\n')
+
+HUNKS = [
+    ('header-note',
+     b'// K order, barrier or allocation change.\r\n',
+     b'// K order, barrier or allocation change.\r\n' + HEADER_NOTE),
+
+    ('remove-shY-declaration',
+     b'shared float16_t shY[2048];       // 64x32            4096 B\r\n',
+     b'// N38-F20: the second 64x32 plane is retired; the stage-3 result (vY) lives in shX.\r\n'),
+
+    ('shared-size-comment',
+     b'// ---- shared: 25088 B; no shared score P publication ----\r\n',
+     b'// ---- shared: 20480 B (4096 + 16384); no shared score P publication ----\r\n'),
+
+    ('stage3-Y-store-0',
+     b'        coopMatStore(half0, shY, m0 * 32u, 32u, LROW);\r\n',
+     b'        // N38-F20: same element map, same offset, other array (shX): the rows this\r\n'
+     b'        // subgroup just read as the seed, so the WAR is intra-owner + payload-ordered.\r\n'
+     b'        coopMatStore(half0, shX, m0 * 32u, 32u, LROW);\r\n'),
+
+    ('stage3-Y-store-1',
+     b'        coopMatStore(half1, shY, m0 * 32u + 16u, 32u, LROW);\r\n',
+     b'        coopMatStore(half1, shX, m0 * 32u + 16u, 32u, LROW);\r\n'),
+
+    ('debug-Y-echo',
+     b'        for (uint e = t_local; e < 2048u; e += 256u) dbg[8192u + e] = shY[e];\r\n',
+     b'        for (uint e = t_local; e < 2048u; e += 256u) dbg[8192u + e] = shX[e];\r\n'),
+
+    ('stage9-seed-load-0',
+     b'            coopMatLoad(seed, shY, m0 * 32u + 0u, 32u, LROW);\r\n',
+     b'            coopMatLoad(seed, shX, m0 * 32u + 0u, 32u, LROW);\r\n'),
+
+    ('stage9-seed-load-1',
+     b'            coopMatLoad(seed, shY, m0 * 32u + 16u, 32u, LROW);\r\n',
+     b'            coopMatLoad(seed, shX, m0 * 32u + 16u, 32u, LROW);\r\n'),
+]
+
+
+def sha(p):
+    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+
+
+def run(argv):
+    r = subprocess.run([str(x) for x in argv], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    return r.returncode, (r.stdout or '').strip(), (r.stderr or '').strip()
+
+
+def compile_glsl(src, out, incs):
+    argv = [GLSLANG, '-V', '--target-env', 'vulkan1.3']
+    for d in incs:
+        argv.append('-I' + str(d))
+    argv += [str(src), '-o', str(out)]
+    return argv, run(argv)
+
+
+def build_spv(src, raw, final, incs):
+    """compile + NoContraction pattern transfer from the recorded decoration parent."""
+    argv, (rc, so, se) = compile_glsl(src, raw, incs)
+    assert rc == 0, 'glslang failed\n%s\n%s' % (so, se)
+    pm = ST.Module(DECOR_PARENT)
+    cm = ST.Module(raw)
+    keep, info = ST.transfer_decoration_pattern_aligned(pm, cm, set())
+    ST.set_no_contraction(cm, keep, final)
+    return dict(argv=[str(x) for x in argv], glslang_rc=rc, glslang_stderr=se[-400:],
+                raw_sha256=sha(raw), raw_bytes=pathlib.Path(raw).stat().st_size,
+                nc_count=len(keep), nc_parent=len(ST.no_contraction_ids(pm)),
+                nc_info={k: info[k] for k in ('alignment', 'functions_mapped',
+                                              'child_functions_without_parent_counterpart',
+                                              'parent_decorations_total')},
+                spv_sha256=sha(final), spv_bytes=pathlib.Path(final).stat().st_size)
+
+
+def unified_diff(old_bytes, new_bytes, a_name, b_name):
+    import difflib
+    a = old_bytes.decode('utf-8-sig').replace('\r\n', '\n').split('\n')
+    b = new_bytes.decode('utf-8-sig').replace('\r\n', '\n').split('\n')
+    lines = [l.rstrip('\n') for l in difflib.unified_diff(a, b, fromfile=a_name,
+                                                          tofile=b_name, n=4)]
+    return '\n'.join(lines) + '\n'
+
+
+def retarget_plan(base_plan, out_plan, ledger_field):
+    """Replace the ord-230 SPV path on the chain head and sync its ledger field."""
+    base_text = pathlib.Path(base_plan).read_text(encoding='utf-8-sig')
+    n = K.make_plan(CARD / 'candidate.spv', out_plan, parent_plan=base_plan,
+                    spv_shas={PARENT_SPV_SHA})
+    assert n == 1, 'replaced %d passes, expected 1' % n
+    lines = pathlib.Path(out_plan).read_text(encoding='utf-8-sig').splitlines()
+    base_lines = base_text.splitlines()
+    assert len(lines) == len(base_lines), 'plan line count changed'
+    diff = [i for i, (a, b) in enumerate(zip(base_lines, lines)) if a != b]
+    assert len(diff) == 1, 'plan differs on %d lines: %s' % (len(diff), diff)
+    i = diff[0]
+    assert base_lines[i] == K.pass_lines_of(base_plan)[230]['line'], 'changed line is not ord 230'
+    toks = lines[i].split()
+    assert toks[:2] == ['PASS', '151'] and toks[3] == '"%s"' % (CARD / 'candidate.spv').as_posix(), toks
+    old_field = toks[5]
+    assert old_field == LEDGER_FIELD_PARENT, old_field
+    toks[5] = ledger_field
+    lines[i] = ' '.join(toks)
+    pathlib.Path(out_plan).write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return dict(old_line=base_lines[i], new_line=lines[i], changed_index=i,
+                old_ledger=old_field, new_ledger=ledger_field, replaced=n,
+                line_count=len(lines))
+
+
+def main():
+    out = {'card': 'n38-f20-arena-shrink', 'family': 'F20', 'ordinal': 230,
+           'gpu_used': False, 'deployed': False}
+    (CARD / 'build').mkdir(exist_ok=True)
+
+    # ---------------- 0. identity of the inputs ----------------
+    src_bytes = PARENT_SRC.read_bytes()
+    assert sha(PARENT_SRC) == PARENT_SRC_SHA, 'parent source sha changed'
+    assert sha(PARENT_SPV) == PARENT_SPV_SHA, 'baseline parent SPV sha changed'
+    out['parent'] = {
+        'source': K.ident(PARENT_SRC), 'source_sha_expected': PARENT_SRC_SHA,
+        'spv': K.ident(PARENT_SPV), 'spv_sha_expected': PARENT_SPV_SHA,
+        'decoration_parent': K.ident(DECOR_PARENT),
+        'recipe': {'include_dirs': [str(PINNED_INC), str(RECIPE_INC)],
+                   'pinned_include_dir': str(PINNED_INC),
+                   'nc': 'transfer_decoration_pattern_aligned(decoration_parent -> child), keep_ids=empty',
+                   'source': 'evidence/RECIPES.json entry 215aca67... (nc_recipe mode=parent)'},
+        'spv_workgroup_bytes': PARENT_WG_BYTES,
+        'plan_row_header_fields': '32 29184 6 32 169 97 1  (SPIR-V and the captured ISA both '
+                                  'say 24576 B: see SLM-LIFETIME.md section 0)',
+    }
+
+    # ---------------- 1. parent byte reproduction ----------------
+    incs = [d for d in (PINNED_INC, RECIPE_INC) if pathlib.Path(d).exists()]
+    out['parent_rebuild'] = build_spv(PARENT_SRC, CARD / 'build/parent-raw.spv',
+                                      CARD / 'parent-rebuild.spv', incs)
+    out['parent_rebuild']['byte_match'] = (out['parent_rebuild']['spv_sha256'] == PARENT_SPV_SHA)
+    assert out['parent_rebuild']['byte_match'], 'parent did not reproduce byte for byte'
+
+    # ---------------- 2. candidate source (minimal patch) ----------------
+    cand = src_bytes
+    applied = []
+    for name, old, new in HUNKS:
+        n = cand.count(old)
+        assert n == 1, 'anchor %r occurs %d times' % (name, n)
+        cand = cand.replace(old, new)
+        applied.append(name)
+    assert b'shY' not in cand, 'shY still referenced'
+    assert cand.count(b'barrier();') == src_bytes.count(b'barrier();'), 'barrier count changed'
+    (CARD / 'parent.comp').write_bytes(src_bytes)
+    (CARD / 'candidate.comp').write_bytes(cand)
+    patch = unified_diff(src_bytes, cand,
+                         'a/f20-coarse-owner-20261026/candidate.comp',
+                         'b/cards/n38-f20-arena-shrink/candidate.comp')
+    (CARD / 'SOURCE-DIFF.patch').write_text(patch, encoding='utf-8')
+    out['candidate_source'] = {
+        'path': str(CARD / 'candidate.comp'), 'sha256': sha(CARD / 'candidate.comp'),
+        'bytes': len(cand), 'hunks': len(applied), 'hunk_names': applied,
+        'diff_lines': {'removed': sum(1 for l in patch.splitlines()
+                                      if l.startswith('-') and not l.startswith('---')),
+                       'added': sum(1 for l in patch.splitlines()
+                                    if l.startswith('+') and not l.startswith('+++'))},
+        'barrier_calls': {'parent': src_bytes.count(b'barrier();'),
+                          'candidate': cand.count(b'barrier();')},
+        'shY_occurrences': {'parent': src_bytes.count(b'shY'),
+                            'candidate': cand.count(b'shY')},
+        'only_site': ('the shY[2048] declaration and its five accesses (stage 3 Y store x2, '
+                      'debug Y echo, stage 9 seed load x2); every offset expression is '
+                      'character-identical to the parent'),
+    }
+    assert out['candidate_source']['shY_occurrences']['candidate'] == 0
+
+    # ---------------- 3. candidate compile + validate ----------------
+    out['candidate'] = build_spv(CARD / 'candidate.comp', CARD / 'build/candidate-raw.spv',
+                                 CARD / 'candidate.spv', incs)
+    out['candidate']['spv'] = str(CARD / 'candidate.spv')
+    out['candidate']['nc_equal_to_parent'] = (out['candidate']['nc_count']
+                                              == out['parent_rebuild']['nc_count'])
+    rc, so, se = run([VALIDATE, CARD / 'candidate.spv'])
+    out['spv_validate_cpu'] = {'candidate': {'rc': rc, 'stdout': so, 'stderr': se}}
+    rc2, so2, se2 = run([VALIDATE, CARD / 'parent-rebuild.spv'])
+    out['spv_validate_cpu']['parent_rebuild'] = {'rc': rc2, 'stdout': so2, 'stderr': se2}
+    assert rc == 0, 'candidate failed spv_validate_cpu: %s %s' % (so, se)
+
+    # ---------------- 3b. the one number that matters: Workgroup bytes --------
+    cm = ST.Module(CARD / 'candidate.spv')
+    by_id = cm.id_to_instruction()
+    wg = []
+    for op, ops, _, _ in cm.instructions:
+        if op == 59 and ops[2] == 4:
+            wg.append(dict(name=cm.name_of(ops[1]), bytes=cm.type_size_bytes(by_id[ops[0]][1][2])))
+    out['workgroup_bytes'] = {
+        'parent': PARENT_WG_BYTES, 'candidate': sum(v['bytes'] for v in wg),
+        'candidate_variables': wg,
+        'candidate_storage_bytes': cm.storage_bytes()['Workgroup'],
+        'target': 65536 // 3, 'saving': PARENT_WG_BYTES - sum(v['bytes'] for v in wg),
+        'residency_parent': 65536 // PARENT_WG_BYTES,
+        'residency_candidate': 65536 // sum(v['bytes'] for v in wg),
+    }
+    assert out['workgroup_bytes']['candidate'] == CANDIDATE_WG_BYTES, out['workgroup_bytes']
+    assert out['workgroup_bytes']['candidate'] <= out['workgroup_bytes']['target']
+
+    # ---------------- 4. plan on the current chain head ----------------
+    base_plan, base_sha, chain = K.current_best()
+    out['plan'] = dict(
+        parent_plan={'path': str(base_plan), 'sha256': base_sha},
+        handoff_baseline_plan={'path': str(K.BASELINE), 'sha256': K.BASELINE_SHA},
+        chain_head_label=chain[-1]['label'] if chain else None,
+    )
+    out['plan']['main'] = retarget_plan(base_plan, CARD / 'plan.txt',
+                                        str(CANDIDATE_WG_BYTES))
+    out['plan']['main']['path'] = str(CARD / 'plan.txt')
+    out['plan']['main']['sha256'] = sha(CARD / 'plan.txt')
+    out['plan']['control'] = retarget_plan(base_plan, CARD / 'plan-ledger-29184.txt',
+                                          LEDGER_FIELD_PARENT)
+    out['plan']['control']['path'] = str(CARD / 'plan-ledger-29184.txt')
+    out['plan']['control']['sha256'] = sha(CARD / 'plan-ledger-29184.txt')
+
+    # ---------------- 5. CPU plan checks ----------------
+    checks = {}
+    for key, plan in (('candidate', CARD / 'plan.txt'),
+                      ('control_ledger_29184', CARD / 'plan-ledger-29184.txt'),
+                      ('chain_head', base_plan)):
+        rc, so, se = run([RUNNER, '--plan', plan, '--cpu-check'])
+        checks[key] = dict(plan=str(plan), plan_sha256=sha(plan), rc=rc,
+                           stdout=so[-4000:], stderr=se[-2000:])
+    out['cpu_check'] = checks
+    assert checks['candidate']['rc'] == 0, checks['candidate']
+    assert checks['chain_head']['rc'] == 0, checks['chain_head']
+    out['cpu_check']['candidate_equals_chain_head'] = (
+        checks['candidate']['stdout'] == checks['chain_head']['stdout'])
+    out['cpu_check']['control_equals_chain_head'] = (
+        checks['control_ledger_29184']['stdout'] == checks['chain_head']['stdout'])
+
+    out['float_NC_checked'] = out['parent_rebuild']['nc_count']
+    out['float_NC_note'] = ('the same 45 NoContraction decorations are transferred from the recorded '
+                            'decoration parent onto the same FP instructions in both modules; the '
+                            'float/GLSL.std.450 expression multiset is identical (build/spv-check.json)')
+
+    # ---------------- 6. ord 230 plan row: BIND / PUSH audit ----------------
+    recs = K.pass_lines_of(CARD / 'plan.txt')
+    lines = (CARD / 'plan.txt').read_text(encoding='utf-8-sig').splitlines()
+    i0 = lines.index(recs[230]['line'])
+    binds, push = [], None
+    for l in lines[i0 + 1:]:
+        if l.startswith('PASS '):
+            break
+        if l.startswith('BIND '):
+            binds.append([int(x) for x in l.split()[1:]])
+        elif l.startswith('PUSH '):
+            push = [int(x) for x in l.split()[1:]]
+    out['ord230_bind'] = [{'set': b[0], 'buffer_id': b[1], 'offset': b[2], 'size_bytes': b[3]}
+                          for b in binds]
+    out['ord230_push_dwords'] = push
+    out['ord230_push_pc'] = {('p%d' % (k // 4)): push[k:k + 4] for k in range(0, len(push), 4)}
+    out['ord230_push_dwords_as_i32'] = [x - (1 << 32) if x >= (1 << 31) else x for x in push]
+    out['ord230_pass_header'] = recs[230]['line']
+
+    # ---------------- 7. CPU-only structural checks, regenerated in place -------
+    # _proof.py reads BUILD.json, so the identity block is written once before the checks
+    # and once again after them (the second write adds the digest of the artifacts).
+    K.write_json(CARD / 'BUILD.json', out)
+    out['checks'] = run_checks()
+
+    K.write_json(CARD / 'BUILD.json', out)
+    print(json.dumps({k: out[k] for k in ('parent_rebuild', 'candidate', 'spv_validate_cpu',
+                                          'workgroup_bytes', 'plan', 'cpu_check',
+                                          'float_NC_checked', 'checks')},
+                     indent=1)[:7000])
+
+
+def run_checks():
+    """Re-run the read-only analysers and digest their JSON output."""
+    py = sys.executable
+    res = {}
+    for name, script, artifact in (
+            ('spv_check', '_spv_check.py', 'build/spv-check.json'),
+            ('addr_audit', '_addr_audit.py', 'build/addr-audit.json'),
+            ('lifetime', '_lifetime.py', 'build/lifetime.json'),
+            ('proof', '_proof.py', 'PROOF.json')):
+        r = subprocess.run([py, str(CARD / script)], capture_output=True, text=True,
+                           encoding='utf-8', errors='replace', cwd=str(CARD))
+        art = CARD / artifact
+        res[name] = dict(script=script, rc=r.returncode, artifact=artifact,
+                         artifact_sha256=sha(art) if art.exists() else None,
+                         stderr_tail=(r.stderr or '').strip()[-600:])
+        assert r.returncode == 0, (name, r.returncode, r.stdout[-2000:], r.stderr[-2000:])
+        d = json.loads(art.read_text(encoding='utf-8')) if art.exists() else {}
+        if name == 'spv_check' and d:
+            res[name]['summary'] = dict(
+                words=d['words'], instructions=d['instructions'], opcode_delta=d['opcode_delta'],
+                workgroup_barriers={k: d['workgroup_barriers'][k]
+                                    for k in ('parent', 'candidate', 'delta', 'scope_relaxed',
+                                              'no_subgroup_barrier_introduced')},
+                workgroup_storage_bytes={k: d['storage_bytes'][k]['Workgroup']
+                                         for k in ('parent', 'candidate')},
+                storage_identical=d['storage_bytes']['identical'],
+                coopmat_movement=d['coopmat_movement'],
+                fp_multiset_identical=d['fp_multiset']['identical'],
+                fp_sites=[d['fp_multiset']['parent_sites'], d['fp_multiset']['candidate_sites']],
+                nc_sites=[d['nc_sites']['parent'], d['nc_sites']['candidate']],
+                nc_identical_multiset=d['nc_sites']['identical_multiset'],
+                structural_diff=d['structural_diff']['hunks'],
+                cfg_shape_identical=d['cfg_shape']['parent'] == d['cfg_shape']['candidate'])
+        elif name == 'addr_audit' and d:
+            res[name]['summary'] = dict(
+                verdict=d['verdict'], violations=len(d['violations']),
+                arms={a: dict(declarations=v['declarations'], bytes=v['declared_bytes'],
+                              access_sites=len(v['sites']), violations=len(v['violations']))
+                      for a, v in d['arms'].items()},
+                offset_identity_identical=d['I2_offset_identity']['identical'],
+                declaration_delta=d['I1_declaration_delta'],
+                selftest=d['selftest'])
+        elif name == 'lifetime' and d:
+            res[name]['summary'] = dict(
+                parent_bytes=d['byte_budget']['parent']['total_bytes'],
+                candidate_bytes=d['byte_budget']['candidate']['total_bytes'],
+                delta=d['byte_budget']['delta_bytes'],
+                residency=d['byte_budget']['residency'],
+                aliased_lines_identical=all(a['equal_after_rename']
+                                            for a in d['aliased_plane_lines']),
+                anchor_failures={a: d['arms'][a]['anchor_failures'] for a in d['arms']})
+        elif name == 'proof' and d:
+            res[name]['summary'] = dict(verdicts={k: v.get('verdict')
+                                                  for k, v in d['proofs'].items()})
+    return res
+
+
+if __name__ == '__main__':
+    main()

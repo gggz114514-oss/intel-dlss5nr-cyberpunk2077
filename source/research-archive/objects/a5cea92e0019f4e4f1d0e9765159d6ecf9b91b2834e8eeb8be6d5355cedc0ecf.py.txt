@@ -1,0 +1,120 @@
+"""Package several measured cards into one candidate plan on the chain head and measure it.
+
+Usage:
+  python package.py --name pkg-vit-hoist --cards n11-vit-ffn,n11b-vit-projection-hoist --stage gates|native|resources|ordinary
+  python package.py --name pkg-vit-hoist --cards ... --plan-only
+
+The package plan = chain head with each card's shader group replaced by that card's
+candidate.spv. Scope is verified line by line: the changed PASS lines must be exactly
+the union of the members' pass ordinals, and nothing else may move.
+"""
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+import STAGE
+import submit_card
+
+
+def build_plan(name, cards):
+    base, base_sha, chain = K.current_best()
+    text = base.read_text(encoding='utf-8-sig')
+    members = []
+    ords = set()
+    for c in cards:
+        d = K.C / 'cards' / c
+        req = K.read_json(d / 'GPU-REQUEST.json')
+        shas = set((req.get('shader_group') or {}).get('spv_sha256_baseline') or [])
+        grp_ords = (req.get('shader_group') or {}).get('pass_ordinals') or []
+        assert shas and grp_ords, c
+        cand = (d / 'candidate.spv').as_posix()
+        paths = []
+        for r in K.rows():
+            if r['spv_sha256'] in shas:
+                p = Path(r['spv']).as_posix()
+                if p not in paths:
+                    paths.append(p)
+        n = 0
+        for p in paths:
+            cnt = text.count(p)
+            assert cnt >= 1, (c, p)
+            text = text.replace(p, cand)
+            n += cnt
+        assert n == len(grp_ords), (c, n, len(grp_ords))
+        members.append(dict(card=c, candidate=(d / 'candidate.spv').as_posix(),
+                            candidate_sha256=K.sha(d / 'candidate.spv'),
+                            replaced=n, ordinals=sorted(grp_ords)))
+        ords |= set(grp_ords)
+    out = K.C / 'queue' / name
+    out.mkdir(parents=True, exist_ok=True)
+    plan = out / 'plan.txt'
+    plan.write_text(text, encoding='utf-8')
+    # scope check against the chain head: compare the PASS records, not raw line numbers
+    from audit_card import pass_lines
+    pa = pass_lines(base)
+    pb = pass_lines(plan)
+    assert len(pa) == len(pb) == 232
+    changed = [x for x, y in zip(pa, pb) if x['line'] != y['line']]
+    expect_names = sorted(K.row_by_ordinal(o)['name'] for o in ords)
+    assert len(changed) == len(expect_names), (len(changed), len(expect_names))
+    assert sorted(x['name'] for x in changed) == expect_names, \
+        (sorted(x['name'] for x in changed)[:5], expect_names[:5])
+    diff = changed
+    info = dict(package=name, members=members, chain_head=dict(path=str(base), sha256=base_sha),
+                plan=dict(path=str(plan), sha256=K.sha(plan)),
+                changed_pass_lines=len(diff), pass_ordinals=sorted(ords))
+    K.write_json(out / 'PACKAGE.json', info)
+    return info, plan
+
+
+def spec_for(name, stage, plan, plan_sha):
+    base, base_sha, _ = K.current_best()
+    out = K.C / 'queue' / name
+    run = out / 'run'
+    jobs = []
+    arms = [('base', base, base_sha), ('pkg', plan, plan_sha)]
+    if stage == 'gates':
+        for aid, p, s in arms:
+            for mode in ('fixed', 'fb2'):
+                jobs.append(K.gate_job('%s-%s-%s' % (stage, aid, mode), p, s,
+                                       run / ('%s-%s-%s' % (stage, aid, mode)), mode, aid))
+    elif stage == 'native':
+        for aid, p, s in arms:
+            jobs.append(K.native_job('%s-%s' % (stage, aid), p, s, run / ('%s-%s' % (stage, aid)),
+                                     out / 'captures', out / ('native-%s.log' % aid), aid))
+    elif stage == 'resources':
+        for aid, p, s in arms:
+            jobs.append(K.resources_job('%s-%s' % (stage, aid), p, s, run / ('%s-%s' % (stage, aid)), aid))
+    elif stage == 'ordinary':
+        for pi in range(6):
+            order = [arms[0], arms[1]] if pi % 2 == 0 else [arms[1], arms[0]]
+            for aid, p, s in order:
+                jobs.append(K.ordinary_job('ord-%d-%s' % (pi, aid), p, s,
+                                           run / ('ord-%d-%s' % (pi, aid)), aid, pi))
+    spec = dict(stage=stage, owner='LUNA-CONTINUOUS-PKG-' + name.upper(),
+                authorization='Main (this session) authorized package %s stage %s only: the jobs in this manifest, gold required.' % (name, stage),
+                output_root=str(out / stage), identities=[str(base), str(plan), str(K.RUNNER)],
+                jobs=jobs, rules='package measurement; all samples retained, no rerun after nongold')
+    sp = out / ('spec-%s.json' % stage)
+    K.write_json(sp, spec)
+    return sp, spec
+
+
+if __name__ == '__main__':
+    name = sys.argv[sys.argv.index('--name') + 1]
+    cards = sys.argv[sys.argv.index('--cards') + 1].split(',')
+    stage = sys.argv[sys.argv.index('--stage') + 1] if '--stage' in sys.argv else None
+    info, plan = build_plan(name, cards)
+    print(json.dumps({k: v for k, v in info.items() if k != 'members'}, indent=2))
+    for m in info['members']:
+        print('  member %-28s replaced %2d' % (m['card'], m['replaced']))
+    if '--plan-only' in sys.argv or not stage:
+        sys.exit(0)
+    sp, spec = spec_for(name, stage, plan, info['plan']['sha256'])
+    manifest, ps1 = STAGE.prepare(spec)
+    r = STAGE.run(manifest, ps1)
+    s = STAGE.summarize(spec['output_root'])
+    K.write_json(Path(spec['output_root']) / 'STAGE-SUMMARY.json', s)
+    print(s['status'], [ (j['id'], j['status'], j['frame']) for j in s['jobs'] ])
+    if s['status'] != 'COMPLETED':
+        print(r.stdout[-2000:], r.stderr[-2000:])

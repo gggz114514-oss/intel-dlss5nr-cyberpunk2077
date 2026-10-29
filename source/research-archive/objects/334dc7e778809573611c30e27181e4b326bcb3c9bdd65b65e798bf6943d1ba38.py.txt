@@ -1,0 +1,80 @@
+"""S06 diagnostics-2: pin the qX reference token order via qM (window-major).
+
+qM.bin is 1,081,344 B = 4224 x 256 window-major, so it is unambiguous.  Feeding
+the v4 qX reference through expand+act+mid under two candidate token orders and
+comparing qM isolates the only ambiguity left.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+import c256b15 as L
+
+idx, oob = L.window_to_canonical()
+valid = idx >= 0
+NW, NV = L.N_TOK, L.N_VALID
+V48REF = L.V48 / "evidence/v4-reference-block48"
+ev = {}
+
+
+def load_pack(path):
+    raw = np.fromfile(path, dtype=np.uint8)
+    codes = dict(
+        wc=L.from_pack_bytes(raw[L.WC_OFF:L.WE_OFF].view(np.int8), 256, 256),
+        we=L.from_pack_bytes(raw[L.WE_OFF:L.WM_OFF].view(np.int8), 1024, 256),
+        wm=L.from_pack_bytes(raw[L.WM_OFF:L.SC_OFF].view(np.int8), 256, 128))
+    sc = np.frombuffer(raw[L.SCAL_OFF:L.SCAL_OFF + 128].tobytes(), dtype="<f4")
+    d = dict(invX=float(sc[0]), invA=float(sc[1]), invM=float(sc[2]))
+    d["ew"] = np.frombuffer(raw[L.EW_OFF:L.EW_OFF + 4096].tobytes(), dtype="<f4")
+    d["mw"] = np.frombuffer(raw[L.MW_OFF:L.MW_OFF + 1024].tobytes(), dtype="<f4")
+    d["alpha"] = np.frombuffer(raw[L.ALPHA_OFF:L.ALPHA_OFF + 1024].tobytes(), dtype="<f4")
+    rs = np.frombuffer(raw[L.RS_OFF:L.RS_OFF + 1024].tobytes(), dtype="<f4").astype(np.float16)
+    return raw, codes, d, rs
+
+
+def expand_mid(qx, cod, sc):
+    acc = qx.astype(np.float64) @ cod["we"].astype(np.float64).T
+    f = acc.astype(np.float32)
+    v = np.float32(f * sc["ew"][None, :])
+    qa = L.code(L.act_half32(L.narrow_half(v)), sc["invA"])
+    qm = np.zeros((NW, 256), dtype=np.int32)
+    a2 = qa.astype(np.float64)
+    for g in range(8):
+        sl = slice(32 * g, 32 * g + 32)
+        r = (a2[:, 128 * g:128 * g + 128] @ cod["wm"][sl].astype(np.float64).T).astype(np.float32)
+        t = np.float32(r * sc["mw"][sl][None, :])
+        c = np.float32(t * np.float32(sc["invM"]))
+        qm[:, sl] = np.clip(np.rint(c.astype(np.float64)), -127.0, 127.0).astype(np.int32)
+    return qa, qm
+
+
+raw48, cod48, sc48, rs48 = load_pack(L.V48 / "pack/c256_b48_int8.bin")
+qx_ref = np.fromfile(V48REF / "qX.bin", dtype=np.int8).reshape(NV, 256)
+qm_ref = np.fromfile(V48REF / "qM.bin", dtype=np.int8).reshape(NW, 256)
+qa_ref = np.fromfile(V48REF / "qA.bin", dtype=np.int8)
+
+# interpretation A: qX reference rows are canonical tokens
+qxA = np.zeros((NW, 256), dtype=np.int8)
+qxA[valid] = qx_ref[idx[valid]]
+# interpretation B: qX reference rows follow the window-major *valid* slots
+wvalid = np.nonzero(valid)[0]
+qxB = np.zeros((NW, 256), dtype=np.int8)
+qxB[wvalid] = qx_ref
+
+res = {}
+for tag, qx in (("A_canonical_rows", qxA), ("B_window_valid_rows", qxB)):
+    qa, qm = expand_mid(qx, cod48, sc48)
+    eq = int((qm.astype(np.int8) == qm_ref).sum())
+    res[tag] = dict(qM_equal=eq, qM_n=int(qm.size), qM_pct=eq / qm.size * 100,
+                    qM_max_abs_diff=int(np.abs(qm.astype(np.int16) - qm_ref.astype(np.int16)).max()),
+                    qA_equal=int((qa.ravel() == qa_ref).sum()) if qa.size == qa_ref.size else None)
+ev["qX_token_order"] = res
+
+# Where does the qA reference live?  brute-force the (tile,s,c) -> slot map by
+# matching the *multiset* of the 1024-vectors per tile: use qM instead -- qM is
+# already unambiguous, so just report the qA conclusion from qM.
+Path(L.W / "evidence/05-diag2.json").write_text(json.dumps(ev, indent=1), encoding="utf-8")
+print(json.dumps(ev, indent=1))

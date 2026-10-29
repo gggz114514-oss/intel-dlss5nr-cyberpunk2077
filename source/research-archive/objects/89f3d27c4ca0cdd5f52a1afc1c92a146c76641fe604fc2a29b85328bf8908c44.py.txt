@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""R07 C64 SPV identity: parent FP16 output projection vs the INT8 candidate.
+
+CPU only, word level.  The proof is structured in five parts:
+
+  P1 interface        bindings, shared arrays, push-constant size, entry point,
+                      execution mode, cooperative-matrix type table
+  P2 operand streams  the cooperative-matrix load/store streams are compared one
+                      by one on (buffer, address expression, stride, layout,
+                      component, rows, cols, use): the residual seed reads and the
+                      whole store stream must be *kept*, the four FP16 matrix
+                      operand loads must be *removed*, and every added load must
+                      belong to the new INT8 operand stream
+  P3 matrix sites     four FP16 MulAdd sites gone, four INT8 MulAdd sites present,
+                      with A/B/C provenance enumerated
+  P4 opcode deltas    every per-opcode count delta with its source-level reason
+                      and, where it is mechanically determined, its derivation
+  P5 invariants       no new function boundary, no cross-lane op, no atomics, no
+                      new barrier scope, push-constant and entry point unchanged
+
+usage: python spv_identity.py
+"""
+import json
+import struct
+import sys
+from collections import Counter
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CARD = HERE.parent
+sys.path.insert(0, str(HERE))
+import spvlib  # noqa: E402
+
+# three opcodes this reader did not need before; names verified against the two
+# modules' own operand shapes (see tools/opcheck.py output in the report)
+for _op, _name in ((3, "OpSource"), (4, "OpSourceExtension"),
+                   (186, "OpFOrdGreaterThan")):
+    spvlib.OP.setdefault(_op, _name)
+
+import sites as SITES  # noqa: E402
+
+SITES.SLOT["sT8"] = "sT8(shared)"
+PARENT = CARD / "spv/parent_repro-c64_output.spv"
+CAND = CARD / "spv/r07_c64_output_wo_i8.spv"
+SLOT = SITES.SLOT
+STORAGE = {0: "UniformConstant", 1: "Input", 2: "Uniform", 3: "Output", 4: "Workgroup",
+           5: "CrossWorkgroup", 6: "Private", 7: "Function", 9: "PushConstant",
+           12: "StorageBuffer"}
+
+LOAD_KEEP = lambda r: (r["slot"].startswith("gY") or
+                       (r["slot"] == "pack(b0)" and r["stride"] == 0))
+STORE_KEEP = lambda r: r["slot"] in ("dbg(b4)", "imgout(b3)")
+
+
+def stream(m):
+    loads, stores = [], []
+    for it in m.insts:
+        if it.name == "OpCooperativeMatrixLoadKHR":
+            buf = m.block_name(m.base_var(it.a[2]) or it.a[2]) or "?"
+            loads.append({"slot": SLOT.get(buf, buf), "buffer": buf,
+                          "address": m.resolve(it.a[2])[0],
+                          "stride": m.fval(it.a[4]),
+                          "layout": "ColumnMajor" if m.fval(it.a[3]) == 1 else "RowMajor",
+                          "cmat": m.cm_type(it.a[0])})
+        elif it.name == "OpCooperativeMatrixStoreKHR":
+            obj = it.a[1]
+            buf = m.block_name(m.base_var(it.a[0]) or it.a[0]) or "?"
+            stores.append({"slot": SLOT.get(buf, buf), "buffer": buf,
+                           "address": m.resolve(it.a[0])[0],
+                           "stride": m.fval(it.a[3]),
+                           "layout": "ColumnMajor" if m.fval(it.a[2]) == 1 else "RowMajor",
+                           "cmat": m.cm_type(m.byid[obj].a[0]) if obj in m.byid else None})
+    return loads, stores
+
+
+def tup(r):
+    c = r["cmat"] or {}
+    return (r["slot"], r["address"], r["stride"], r["layout"],
+            c.get("component"), c.get("rows"), c.get("cols"), c.get("use"))
+
+
+def mma(m):
+    tr = SITES.Trace(m)
+    out = []
+    for it in m.insts:
+        if it.name != "OpCooperativeMatrixMulAddKHR":
+            continue
+        rc = m.cm_type(it.a[0])
+        out.append({"word_offset": it.woff, "result_id": it.a[1],
+                    "function": m.funcs.get(it.func, "?"),
+                    "accumulator": rc and rc.get("component"),
+                    "A_cmat": m.cm_type(m.byid[it.a[2]].a[0]),
+                    "B_cmat": m.cm_type(m.byid[it.a[3]].a[0]),
+                    "A_origin": {k: v for k, v in (tr.origin(it.a[2], it.idx) or {}).items()
+                                 if k != "op"},
+                    "B_origin": {k: v for k, v in (tr.origin(it.a[3], it.idx) or {}).items()
+                                 if k != "op"},
+                    "C_chain": tr.chain(it.a[4], it.idx)})
+    return out
+
+
+def pc_bytes(m):
+    for vid, sc, tid in m.vars:
+        if STORAGE.get(sc) != "PushConstant":
+            continue
+        t = m.types.get(tid)
+        if t and t[0] == "ptr":
+            return m.size(t[2])
+    return None
+
+
+def iface(m):
+    bindings = {}
+    shared = []
+    for vid, sc, tid in m.vars:
+        d = m.decor.get(vid, {})
+        b = d.get(33, [[None]])[0][0]
+        if b is not None:
+            bindings[str(b)] = {"name": m.names.get(vid), "block": m.block_name(vid),
+                                "storage": STORAGE.get(sc)}
+        if STORAGE.get(sc) == "Workgroup":
+            shared.append({"name": m.names.get(vid), "bytes": m.size(tid)})
+    ep = [it for it in m.insts if it.name == "OpEntryPoint"]
+    ex = [[m.fval(x) if x in m.consts else x for x in it.a]
+          for it in m.insts if it.name == "OpExecutionMode"]
+    return {
+        "bindings": bindings,
+        "shared": shared,
+        "lds_bytes": sum(s["bytes"] for s in shared),
+        "entry_point": {"model": ep[0].a[0], "id": ep[0].a[1],
+                        "name": bytes(b"".join(struct.pack("<I", x)
+                                               for x in ep[0].a[2:])).split(b"\0")[0].decode()}
+        if ep else None,
+        "execution_modes": ex,
+        "cm_types": sorted({(v[0] and m.ctype(v[0]), v[1], m.fval(v[2]), m.fval(v[3]),
+                             v[4] and m.fval(v[4])) for v in m.cm_types.values()},
+                           key=str),
+        "push_constant_bytes": pc_bytes(m),
+        "functions": [m.funcs[k] for k in m.funcs],
+    }
+
+
+# Every opcode delta of this card with the source-level reason.  `derived` states
+# how the magnitude follows from the edit, when it follows mechanically.
+ATTRIB = {
+    "OpSourceExtension": "the two new #extension lines (int8 arithmetic types, 8-bit storage)",
+    "OpCapability": "the two capabilities those extensions require",
+    "OpCooperativeMatrixMulAddKHR": "4 FP16 A/B->f32 K16 steps become 4 INT8 A/B->i32 K32 steps "
+                                    "(static count unchanged, accumulator dtype flips)",
+    "OpCooperativeMatrixLoadKHR": "derived: -2 FP16 WO tile loads -2 FP16 context A loads "
+                                  "+2 INT8 WO tile loads +2 INT8 shared context tile loads "
+                                  "+4 f32 per-output-channel scale loads = +4 "
+                                  "(the 6 residual loads are kept, see P2)",
+    "OpFConvert": "derived: +2 = the two `float(gT[...])` widenings of the staging passes; "
+                  "the per-output f16->f32 seed widen and the single f32->f16 narrow are "
+                  "unchanged, so their count is unchanged",
+    "OpConvertSToF": "derived: +4 = one int32-accumulator -> f32 conversion per epilogue block",
+    "OpFMul": "derived: +9 = 1 quantiser multiply + 4 x (sC * sWo[n]) + 4 x (acc * fsc)",
+    "OpFAdd": "derived: +4 = the FP32 residual add moves out of the accumulator seed into "
+              "the epilogue, one per output block",
+    "OpFDiv": "derived: +2 = the two per-workgroup scalars 127/amax and amax/127",
+    "OpExtInst": "derived: +5 = roundEven + clamp of the code point, abs + max of the amax "
+                 "pass, max of the serial reduction",
+    "OpConvertFToS": "derived: +1 = the single float->int8 code point instruction "
+                     "(one static instruction for all 4096 staged elements)",
+    "OpCompositeConstruct": "derived: +4 = the broadcast MAT_C(sC) of each epilogue block",
+    "OpFOrdGreaterThan": "derived: +2 = the two `m > 0.0` degeneracy guards",
+    "OpControlBarrier": "derived: +3 = two workgroup barriers of the staging/protection "
+                        "sequence; the parent's debug-echo barrier is kept",
+    "OpStore": "the staged int8 context tile, the two publication slots, and the "
+               "materialised f32 epilogue locals",
+    "OpLoad": "reads of the staged tile and the publication slots, the second gT read of "
+              "the staging pass, and the materialised epilogue locals",
+    "OpUDiv": "index arithmetic of the staging tile (mA/32, n0/16, (n0+16)/16) and loop "
+              "bounds",
+    "OpUMod": "index arithmetic of the staging tile (mA%32, t%32)",
+    "OpULessThan": "derived: +3 = the three added loop headers",
+    "OpIEqual": "the `t_local == 0` serial-reduction guard",
+    "OpIAdd": "staging-tile and scale-address arithmetic",
+    "OpIMul": "staging-tile address arithmetic",
+    "OpBitwiseAnd": "staging-tile index masks (t & 31, t & 63)",
+    "OpShiftRightLogical": "staging-tile index shifts (t >> 5, t >> 6)",
+    "OpBitcast": "NAMED RESIDUAL: one fewer signed<->unsigned int bitcast in the inlined "
+                 "image-address computation (12 -> 11); the image store stream is "
+                 "byte-identical in address expression, stride and layout (see P2), so no "
+                 "address value changes; why glslang folds one int<->uint round trip "
+                 "differently is not identified",
+    "OpConstant": "new literal constants (64, 32, 2048, 4096, 127, ...)",
+    "OpConstantComposite": "the constant vector of the epilogue locals",
+    "OpAccessChain": "addressing of the staged tile, the publication slots and the two "
+                     "new buffers",
+    "OpVariable": "2 storage buffers + 3 shared arrays + the materialised function-scope "
+                  "locals of the new epilogue",
+    "OpName": "names of the new declarations and locals",
+    "OpMemberName": "member names of the two new storage blocks",
+    "OpDecorate": "binding decorations of the new buffers and the shared-array decorations",
+    "OpMemberDecorate": "member decorations of the two new storage blocks",
+    "OpTypeInt": "derived: +1 = OpTypeInt 8 for the INT8 operands",
+    "OpTypeArray": "derived: +3 = shared shMax[256], shScale[2], and the f32 scale view",
+    "OpTypeRuntimeArray": "derived: +2 = gWo8[] and gWosc[]",
+    "OpTypeStruct": "derived: +2 = the two new storage blocks",
+    "OpTypePointer": "pointers to the new blocks, arrays and shared tile",
+    "OpTypeCooperativeMatrixKHR": "derived: +1 = +3 new types (i8 8x32 A, i8 32x16 B, "
+                                  "i32 8x16 accumulator) -2 types no longer used "
+                                  "(f16 8x16 A, f16 16x16 B); the f16 accumulator and the "
+                                  "f32 accumulator types are kept",
+    "OpLabel": "labels of the new control flow (the staging passes and the reduction)",
+    "OpBranch": "branches of the new control flow",
+    "OpBranchConditional": "conditional branches of the new control flow",
+    "OpLoopMerge": "derived: +3 = the three added loops",
+    "OpSelectionMerge": "selection merges of the new guards",
+    "OpPhi": "loop-carried values of the new control flow",
+}
+MUST_ZERO = ["OpExecutionMode", "OpMemoryModel", "OpEntryPoint", "OpFunction",
+             "OpFunctionCall", "OpGroupNonUniformShuffle", "OpGroupNonUniformBroadcast",
+             "OpGroupNonUniformIAdd", "OpGroupNonUniformFAdd", "OpAtomicIAdd",
+             "OpAtomicExchange", "OpAtomicCompareExchange"]
+
+
+def main():
+    p, c = spvlib.Mod(PARENT), spvlib.Mod(CAND)
+    rec = {"parent": {"path": str(PARENT), "bytes": PARENT.stat().st_size, "words": len(p.w)},
+           "candidate": {"path": str(CAND), "bytes": CAND.stat().st_size, "words": len(c.w)}}
+
+    ip, ic = iface(p), iface(c)
+    tadd = [t for t in ic["cm_types"] if t not in ip["cm_types"]]
+    trem = [t for t in ip["cm_types"] if t not in ic["cm_types"]]
+    rec["P1_interface"] = {
+        "bindings_added": {k: ic["bindings"][k] for k in ic["bindings"]
+                           if k not in ip["bindings"]},
+        "bindings_removed": sorted(set(ip["bindings"]) - set(ic["bindings"])),
+        "bindings_kept": {k: ip["bindings"][k] for k in ip["bindings"] if k in ic["bindings"]},
+        "bindings_kept_identical": all(ip["bindings"][k]["block"] == ic["bindings"][k]["block"]
+                                       for k in ip["bindings"] if k in ic["bindings"]),
+        "shared_before": ip["shared"], "shared_after": ic["shared"],
+        "lds_before": ip["lds_bytes"], "lds_after": ic["lds_bytes"],
+        "push_constant_bytes": [ip["push_constant_bytes"], ic["push_constant_bytes"]],
+        "entry_point": [ip["entry_point"], ic["entry_point"]],
+        "execution_modes": [ip["execution_modes"], ic["execution_modes"]],
+        "functions": [ip["functions"], ic["functions"]],
+        "cm_types_added": tadd, "cm_types_removed": trem,
+        "cm_types_f16_accumulator_kept": [t for t in ip["cm_types"]
+                                              if t[0] == "f16" and t[4] == 2] ==
+                                             [t for t in ic["cm_types"]
+                                              if t[0] == "f16" and t[4] == 2],
+    }
+
+    lp, sp = stream(p)
+    lc, sc = stream(c)
+    keep_p = Counter(tup(x) for x in lp if LOAD_KEEP(x))
+    keep_c = Counter(tup(x) for x in lc if LOAD_KEEP(x))
+    st_p = Counter(tup(x) for x in sp if STORE_KEEP(x))
+    st_c = Counter(tup(x) for x in sc if STORE_KEEP(x))
+    rec["P2_operand_streams"] = {
+        "residual_loads_before": [list(k) for k in keep_p],
+        "residual_loads_after": [list(k) for k in keep_c],
+        "residual_loads_identical": keep_p == keep_c,
+        "store_stream_identical": st_p == st_c,
+        "store_stream": [list(k) for k in st_p],
+        "loads_removed": {str(k): v for k, v in (Counter(tup(x) for x in lp) - Counter(tup(x) for x in lc)).items()},
+        "loads_added": {str(k): v for k, v in (Counter(tup(x) for x in lc) - Counter(tup(x) for x in lp)).items()},
+        "stores_removed": {str(k): v for k, v in (Counter(tup(x) for x in sp) - Counter(tup(x) for x in sc)).items()},
+        "stores_added": {str(k): v for k, v in (Counter(tup(x) for x in sc) - Counter(tup(x) for x in sp)).items()},
+        "parent_load_count": len(lp), "candidate_load_count": len(lc),
+        "parent_store_count": len(sp), "candidate_store_count": len(sc),
+    }
+
+    mp, mc = mma(p), mma(c)
+    rec["P3_matrix_sites"] = {
+        "parent_count": len(mp),
+        "parent_fp16": sum(1 for s in mp if s["accumulator"] == "f32"),
+        "parent_int8": sum(1 for s in mp if s["accumulator"] == "i32"),
+        "candidate_count": len(mc),
+        "candidate_fp16": sum(1 for s in mc if s["accumulator"] == "f32"),
+        "candidate_int8": sum(1 for s in mc if s["accumulator"] == "i32"),
+        "candidate_sites": mc,
+        "parent_sites": [{"word_offset": s["word_offset"], "result_id": s["result_id"],
+                          "accumulator": s["accumulator"],
+                          "B": s["B_origin"].get("slot"), "C": s["C_chain"].get("kind")}
+                         for s in mp],
+        "no_fp16_matrix_multiply_left": sum(1 for s in mc if s["accumulator"] == "f32") == 0,
+    }
+
+    hp, hc = Counter(), Counter()
+    for it in p.insts:
+        hp[it.name] += 1
+    for it in c.insts:
+        hc[it.name] += 1
+    deltas, unexplained = {}, []
+    for k in sorted(set(hp) | set(hc)):
+        d = hc[k] - hp[k]
+        if not d:
+            continue
+        d_ = {"before": hp[k], "after": hc[k], "delta": d,
+              "attribution": ATTRIB.get(k)}
+        deltas[k] = d_
+        if d_["attribution"] is None:
+            unexplained.append(k)
+    mz = {k: hc[k] - hp[k] for k in MUST_ZERO}
+    rec["P4_opcodes"] = {"deltas": deltas, "unexplained": unexplained,
+                         "must_be_zero": mz,
+                         "must_be_zero_ok": all(v == 0 for v in mz.values()),
+                         "parent_histogram": dict(sorted(hp.items())),
+                         "candidate_histogram": dict(sorted(hc.items()))}
+
+    def dec(m):
+        out = Counter()
+        for vid, d in m.decor.items():
+            for k, ops in d.items():
+                out[str(k)] += len(ops)
+        return out
+    dp, dc = dec(p), dec(c)
+    # decoration numbers verified against the decorated opcodes in this module
+    # (see evidence/SPV-IDENTITY-C64.json and the report section on P5)
+    DNAME = {"2": "Block", "6": "ArrayStride", "11": "BuiltIn", "24": "NonWritable",
+             "33": "Binding", "34": "DescriptorSet", "42": "NoContraction"}
+    dc_ops = {}
+    for vid, dd in c.decor.items():
+        if 42 in dd:
+            tgt = c.byid.get(vid)
+            dc_ops[tgt.name if tgt is not None else "?"] = dc_ops.get(
+                tgt.name if tgt is not None else "?", 0) + len(dd[42])
+    rec["P5_decorations"] = {
+        "deltas": {DNAME.get(k, "decoration_" + k): {"before": dp.get(k, 0),
+                                                     "after": dc.get(k, 0)}
+                   for k in sorted(set(dp) | set(dc)) if dc.get(k, 0) != dp.get(k, 0)},
+        "nocontraction_before": dp.get("42", 0), "nocontraction_after": dc.get("42", 0),
+        "nocontraction_decorated_opcodes": dc_ops,
+        "note": "NoContraction is present only on the new precise-qualified quantiser and "
+                "epilogue arithmetic; none is removed from a parent instruction. The "
+                "decoration count (18) exceeds the net new OpFMul count (9) because "
+                "glslang also marks shared subexpressions of the same precise statement "
+                "-- reported as a named micro-residual, inert for values with no OpFAdd "
+                "consumer (the store stream is unchanged, see P2).",
+    }
+
+    ok = (not unexplained
+          and rec["P4_opcodes"]["must_be_zero_ok"]
+          and rec["P1_interface"]["bindings_removed"] == []
+          and rec["P1_interface"]["bindings_kept_identical"]
+          and rec["P1_interface"]["cm_types_f16_accumulator_kept"]
+          and rec["P1_interface"]["push_constant_bytes"][0] == rec["P1_interface"]["push_constant_bytes"][1]
+          and rec["P2_operand_streams"]["residual_loads_identical"]
+          and rec["P2_operand_streams"]["store_stream_identical"]
+          and rec["P3_matrix_sites"]["no_fp16_matrix_multiply_left"]
+          and not rec["P2_operand_streams"]["stores_removed"])
+    rec["verdict"] = "ATTRIBUTED" if ok else "FAIL"
+    (CARD / "evidence/SPV-IDENTITY-C64.json").write_text(json.dumps(rec, indent=1) + "\n",
+                                                         encoding="utf-8")
+    print(json.dumps({
+        "verdict": rec["verdict"], "unexplained": unexplained,
+        "deltas": {k: v["delta"] for k, v in deltas.items()},
+        "bindings_added": list(rec["P1_interface"]["bindings_added"]),
+        "cm_types_added": rec["P1_interface"]["cm_types_added"],
+        "cm_types_removed": rec["P1_interface"]["cm_types_removed"],
+        "lds": [rec["P1_interface"]["lds_before"], rec["P1_interface"]["lds_after"]],
+        "push": rec["P1_interface"]["push_constant_bytes"],
+        "residual_loads_identical": rec["P2_operand_streams"]["residual_loads_identical"],
+        "store_stream_identical": rec["P2_operand_streams"]["store_stream_identical"],
+        "stores_removed": rec["P2_operand_streams"]["stores_removed"],
+        "mma": [rec["P3_matrix_sites"]["parent_fp16"], rec["P3_matrix_sites"]["candidate_fp16"],
+                rec["P3_matrix_sites"]["candidate_int8"]],
+        "must_be_zero": mz,
+    }, indent=1))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

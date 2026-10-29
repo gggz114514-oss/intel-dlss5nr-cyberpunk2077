@@ -1,0 +1,314 @@
+"""n36-f05-arena-shrink: exhaustive SLM layout / lifetime / hazard model (CPU only).
+
+The model is source-faithful (it re-derives every cooperative-matrix footprint from the
+deployment formula, not from a sample), and it is cross-checked against the compiled
+modules: the per-module cooperative-matrix counts and strides must equal the model's.
+
+Produces build/lifetime.json:
+  regions        per-head plane table of the parent and the candidate
+  phases         ordered site list per group
+  coverage       exhaustive (Sg, token, dim) -> half address, parent vs candidate
+  hazards        per-half-address reader/writer SG sets, WAR/RAW/WAW classification
+  residency      SLM pool interval implied by the two reverse probes, residents per pool
+"""
+import collections
+import json
+import pathlib
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+
+# ------------------------------------------------------------------ geometry
+# one workgroup = 256 threads = 8 subgroups; heads per workgroup = 2 (h = 2*WG.z + sg/4)
+# per head: 64 tokens x 32 dims for Q, K, V (half); 4 subgroups (t = sg%4) own 16 tokens
+TOKENS, DIMS, SGS_PER_HEAD, HEADS = 64, 32, 4, 2
+PLANE = TOKENS * DIMS                     # 2048 half = 4096 B per plane per head
+PARENT_BASE = 6144                        # half, per-head section stride (parent)
+CAND_BASE = 4096                          # half, per-head section stride (candidate)
+Q_OFF, K_OFF, V_OFF_PARENT, V_OFF_CAND = 0, 2048, 4096, 0
+
+GROUPS = {
+    # k_in = input channels of the projection; kloop = the k-step list of the V pass
+    'c64': dict(k_in=64, ksteps=[0, 16, 32, 48], vec=2,
+                qkv_note='row_phase loop, one A fragment feeds Q/K/V'),
+    'c128': dict(k_in=128, ksteps=[0, 16, 32, 48, 64, 80, 96, 112], vec=2,
+                 qkv_note='row_phase loop, one A fragment feeds Q/K/V'),
+    'c256': dict(k_in=256, ksteps=list(range(0, 256, 16)), vec=2,
+                 qkv_note='M-doubled QK pass and a separate V pass (n05a), A not shared'),
+}
+
+
+def v_half_matrix(base, token0, dimhalf):
+    """Footprints of one MAT_H store: LROW stride 32, 8 rows x 16 cols.
+
+    element (row, col) -> base + token0*32 + row*32 + dimhalf + col
+    """
+    return {base + (token0 + r) * DIMS + dimhalf + c
+            for r in range(8) for c in range(16)}
+
+
+def q_half_matrix(base, qg, dimhalf):
+    """Footprints of one MAT_B load: LCOL stride 32, 16x16 (16 dims x 16 queries).
+
+    element (row=dim i, col=query n) -> base + qg*32 + n*32 + dimhalf + i
+    """
+    return {base + (qg + n) * DIMS + dimhalf + i
+            for n in range(16) for i in range(16)}
+
+
+def k_block(base, slot):
+    """Footprints of one MAT_A load from K: LCOL stride 8, 8 keys x 16 dims.
+
+    element (row=key r, col=dim c) -> base + slot*128 + c*8 + r
+    """
+    return {base + slot * 128 + c * 8 + r for r in range(8) for c in range(16)}
+
+
+def v_a_block(base, key0, dimhalf):
+    """Footprints of one MAT_A load from V for PV: LCOL stride 32, 16 keys x 8 dims.
+
+    element (row=dim i, col=key k) -> base + (key0 + k)*32 + dimhalf + i
+    """
+    return {base + (key0 + k) * DIMS + dimhalf + i for k in range(16) for i in range(8)}
+
+
+def layout_parent():
+    """Parent: three planes of 2048 half per head, section stride 6144 half."""
+    per_head = {'Q': set(), 'K': set(), 'V': set()}
+    for t in range(SGS_PER_HEAD):
+        for rp in range(2):
+            m0 = t * 8 + rp * 32
+            for dh in (0, 16):
+                per_head['Q'] |= v_half_matrix(Q_OFF, m0, dh)
+                per_head['V'] |= v_half_matrix(V_OFF_PARENT, m0, dh)
+            for slot in (2 * (m0 // 8), 2 * (m0 // 8) + 1):
+                per_head['K'] |= k_block(K_OFF, slot)
+    return per_head
+
+
+def layout_candidate():
+    """Candidate: two planes of 2048 half per head; V reuses the Q plane.
+
+    V token ownership is {16t .. 16t+15} so the V store footprint of subgroup t is
+    exactly the 512 half of Q it read itself.
+    """
+    per_head = {'Q': set(), 'K': set(), 'V': set()}
+    for t in range(SGS_PER_HEAD):
+        for rp in range(2):
+            m0 = t * 8 + rp * 32
+            for dh in (0, 16):
+                per_head['Q'] |= v_half_matrix(Q_OFF, m0, dh)
+            for slot in (2 * (m0 // 8), 2 * (m0 // 8) + 1):
+                per_head['K'] |= k_block(K_OFF, slot)
+        vt = t * 16
+        for blk in (0, 8):
+            for dh in (0, 16):
+                per_head['V'] |= v_half_matrix(V_OFF_CAND, vt + blk, dh)
+    return per_head
+
+
+def sg_footprints(cand):
+    """{operation: {t: set(addr)}} in per-head half coordinates."""
+    rep = {'read_Q': {t: set() for t in range(4)},
+           'read_K': {t: set() for t in range(4)},
+           'read_V': {t: set() for t in range(4)},
+           'write_Q': {t: set() for t in range(4)},
+           'write_K': {t: set() for t in range(4)},
+           'write_V': {t: set() for t in range(4)}}
+    for t in range(SGS_PER_HEAD):
+        for rp in range(2):
+            m0 = t * 8 + rp * 32
+            for dh in (0, 16):
+                rep['write_Q'][t] |= v_half_matrix(Q_OFF, m0, dh)
+            for slot in (2 * (m0 // 8), 2 * (m0 // 8) + 1):
+                rep['write_K'][t] |= k_block(K_OFF, slot)
+            if not cand:
+                for dh in (0, 16):
+                    rep['write_V'][t] |= v_half_matrix(V_OFF_PARENT, m0, dh)
+        # every subgroup reads all of K and all of V in the score / PV phases
+        qg = t * 16
+        for dh in (0, 16):
+            rep['read_Q'][t] |= q_half_matrix(Q_OFF, qg, dh)
+        for slot in range(16):
+            rep['read_K'][t] |= k_block(K_OFF, slot)
+        for key0 in (0, 16, 32, 48):
+            for dh in range(0, 32, 8):
+                rep['read_V'][t] |= v_a_block(V_OFF_CAND if cand else V_OFF_PARENT,
+                                              key0, dh)
+        if cand:
+            vt = t * 16
+            for blk in (0, 8):
+                for dh in (0, 16):
+                    rep['write_V'][t] |= v_half_matrix(V_OFF_CAND, vt + blk, dh)
+    return rep
+
+
+def qkv_stores(group, rp):
+    """Static Q/K/V publication stores per subgroup (Q 2, K 2, V 2 per M block/pass)."""
+    return 2 * rp + 2
+
+
+def token_ownership():
+    """Parent vs candidate V token ownership per subgroup, and the union coverage."""
+    rows = []
+    for t in range(SGS_PER_HEAD):
+        parent = sorted({t * 8 + rp * 32 + r for rp in range(2) for r in range(8)})
+        cand = list(range(t * 16, t * 16 + 16))
+        rows.append(dict(t=t, parent=parent, candidate=cand))
+    union_p = sorted({x for r in rows for x in r['parent']})
+    union_c = sorted({x for r in rows for x in r['candidate']})
+    return dict(rows=rows, parent_union=union_p, candidate_union=union_c,
+                parent_is_partition=union_p == list(range(64)) and
+                sum(len(r['parent']) for r in rows) == 64,
+                candidate_is_partition=union_c == list(range(64)) and
+                sum(len(r['candidate']) for r in rows) == 64,
+                each_token_once_parent=all(len(r['parent']) == len(set(r['parent']))
+                                           for r in rows))
+
+
+def residency():
+    """SLM pool interval P implied by the two measured reverse probes.
+
+    F05 probe: pad 24576 -> 49152 B and residency falls 2 -> 1.
+    F06 probe: pad 32768 -> 49152 B and residency falls 2 -> 1.
+    """
+    lo = max(2 * 24576, 2 * 32768)          # floor(P/W) == 2  =>  P >= 2W
+    hi = min(3 * 24576, 3 * 32768) - 1      # floor(P/W) == 2  =>  P <  3W
+    rows = []
+    for w in (24576, 20480, 16384, 12288, 8192):
+        a, b = lo // w, hi // w
+        rows.append(dict(workgroup_bytes=w, residents_min=a, residents_max=b,
+                         exact=a == b, pair=(a, b)))
+    return dict(pool_bytes_interval=[lo, hi], basis=[
+        'F05 reverse probe: 24576 B -> 2 residents, 49152 B -> 1 resident',
+        'F06 reverse probe: 32768 B -> 2 residents, 49152 B -> 1 resident',
+    ], table=rows)
+
+
+def main():
+    out = {}
+    par = layout_parent()
+    cand = layout_candidate()
+    for name, lay, base in (('parent', par, PARENT_BASE), ('candidate', cand, CAND_BASE)):
+        out.setdefault('regions', {})[name] = {
+            k: dict(count=len(v), first=min(v), last=max(v),
+                    bytes=2 * (max(v) - min(v) + 1),
+                    contiguous=(v == set(range(min(v), max(v) + 1))))
+            for k, v in lay.items()}
+        out['regions'][name]['section_halves'] = base
+        out['regions'][name]['section_bytes'] = 2 * base
+        out['regions'][name]['workgroup_bytes'] = 2 * base * HEADS
+        out['regions'][name]['arena_is_partition'] = (
+            lay['Q'].isdisjoint(lay['K']) and
+            len(lay['Q']) == PLANE and len(lay['K']) == PLANE and
+            (lay['V'] <= (lay['Q'] | lay['K'])))
+    out['v_token_ownership'] = token_ownership()
+    out['residency'] = residency()
+
+    haz = {}
+    for name, ok in (('parent', False), ('candidate', True)):
+        rep = sg_footprints(ok)
+        base = CAND_BASE if ok else PARENT_BASE
+        # absolute addresses of the whole workgroup: both head sections, stride `base`
+        absrep = {op: {t: {a + hsel * base for a in s for hsel in range(HEADS)}
+                       for t, s in per.items()}
+                  for op, per in rep.items()}
+
+        def owner_map(op):
+            m = collections.defaultdict(set)
+            for t in range(4):
+                for a in absrep[op][t]:
+                    m[a].add(t)
+            return m
+
+        owners = {op: owner_map(op) for op in absrep}
+        # WAR: a prior read of an address by one subgroup, a later write by another
+        war = {}
+        for rd, wr in (('read_Q', 'write_V'), ('read_K', 'write_V'),
+                       ('read_Q', 'write_K'), ('read_K', 'write_Q')):
+            intra = cross = 0
+            for t in range(4):
+                for a in absrep[wr][t]:
+                    who = owners[rd].get(a, set())
+                    if not who:
+                        continue
+                    if who == {t}:
+                        intra += 1
+                    else:
+                        cross += 1
+            war['%s->%s' % (rd, wr)] = dict(intra_sg=intra, cross_sg=cross)
+        # RAW: producer subgroup set vs consumer subgroup set, per address
+        raw = {}
+        for wr, rd in (('write_Q', 'read_Q'), ('write_K', 'read_K'),
+                       ('write_V', 'read_V')):
+            intra = cross = 0
+            for t in range(4):
+                for a in absrep[rd][t]:
+                    who = owners[wr].get(a, set())
+                    if not who:
+                        continue
+                    if who == {t}:
+                        intra += 1
+                    else:
+                        cross += 1
+            raw['%s->%s' % (wr, rd)] = dict(intra_sg=intra, cross_sg=cross)
+        haz[name] = dict(war=war, raw=raw)
+    out['hazards'] = haz
+
+    # per-phase liveness in source order (site index), used for the peak live set
+    phases = ['QKV Q store', 'QKV K store', 'QKV V store', 'barrier B1',
+              'debug V echo', 'score Q read', 'score K read', 'den (registers)',
+              'V pass (candidate only)', 'barrier B2/B3', 'PV V read']
+    out['phases'] = phases
+    per_group = {}
+    for g, spec in GROUPS.items():
+        # Dynamic per-subgroup operand-load accounting, derived from the geometry.
+        # Native message price (n05a census, same kernels): one gY A tile (8 rows x 16
+        # half, row stride = K) decomposes into 8 load.ugm.d32x8t messages, one weight
+        # B tile is 1 load.ugm.d32x8 message.
+        ksteps = len(spec['ksteps'])
+        rp = 2                               # row_phase (c64/c128) or M-pair (c256)
+        if g == 'c256':
+            # the n05a parent already runs a separate M-doubled V pass, with its own A
+            # loads, so relocating that pass changes no message at all
+            par_a, par_b = 2 * ksteps + 2 * ksteps, 4 * ksteps + 2 * ksteps
+            can_a, can_b = 2 * ksteps + 2 * ksteps, 4 * ksteps + 2 * ksteps
+        else:
+            par_a, par_b = rp * ksteps, rp * ksteps * 6             # A shared by Q/K/V
+            can_a, can_b = rp * ksteps + 2 * ksteps, rp * ksteps * 4 + 2 * ksteps
+        score_a = 8 * 2                    # 8 key blocks x 2 k-halves of K (SLM)
+        score_b = 2                        # Q^T B operands (IGC CSEs the repeats)
+        pv_a = 4 * 4                       # PV V operands (SLM)
+        per_group[g] = dict(
+            ksteps=ksteps, row_phase_or_mpair=rp,
+            A_TILE_MESSAGES=8, B_TILE_MESSAGES=1,
+            parent=dict(A_tiles=par_a, B_tiles=par_b,
+                        ugm_messages=8 * par_a + par_b,
+                        dpas=rp * ksteps * 6 + score_a + pv_a,
+                        slm_loads=score_a + score_b + pv_a, slm_stores=qkv_stores(g, rp)),
+            candidate=dict(A_tiles=can_a, B_tiles=can_b,
+                           ugm_messages=8 * can_a + can_b,
+                           dpas=rp * ksteps * 4 + ksteps * 4 + score_a + pv_a,
+                           slm_loads=score_a + score_b + pv_a,
+                           slm_stores=qkv_stores(g, rp)))
+        p, c = per_group[g]['parent'], per_group[g]['candidate']
+        per_group[g]['delta'] = dict(
+            A_tiles=c['A_tiles'] - p['A_tiles'], B_tiles=c['B_tiles'] - p['B_tiles'],
+            ugm_messages=c['ugm_messages'] - p['ugm_messages'],
+            ugm_message_pct=round(100.0 * (c['ugm_messages'] - p['ugm_messages'])
+                                  / p['ugm_messages'], 2),
+            dpas=c['dpas'] - p['dpas'],
+            slm_loads=c['slm_loads'] - p['slm_loads'],
+            slm_stores=c['slm_stores'] - p['slm_stores'])
+    out['dynamic_messages'] = per_group
+    (CARD / 'build/lifetime.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print(json.dumps(out['regions'], indent=1))
+    print(json.dumps(out['hazards'], indent=1))
+    print(json.dumps(out['residency']['table'], indent=1))
+    print(json.dumps({g: v['delta'] for g, v in per_group.items()}, indent=1))
+    print('v-ownership partitions:', out['v_token_ownership']['parent_is_partition'],
+          out['v_token_ownership']['candidate_is_partition'])
+
+
+if __name__ == '__main__':
+    sys.exit(main())

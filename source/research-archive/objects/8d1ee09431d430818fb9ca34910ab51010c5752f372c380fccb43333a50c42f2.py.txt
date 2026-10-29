@@ -1,0 +1,99 @@
+"""Generate cards/n19-f19-root/candidate.comp from the baseline F19 source.
+
+Two literal replacements, nothing else (the resulting diff is written to
+SOURCE-DIFF.patch by the same run).  CPU only.
+"""
+import difflib
+import sys
+from pathlib import Path
+
+CAMP = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+CARD = CAMP / 'cards/n19-f19-root'
+BASE = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+            'c32-rest-20261026/root-f2/candidate.comp')
+
+OLD_FN = '''f16vec2 nr_blend_pair(uint sg2,uint slot,uint ch){
+ uint sx=slot%4u,sy=slot/4u;
+ uint px=(2u*gl_WorkGroupID.x+(sg2&1u))*4u+sx;
+ uint py=(2u*gl_WorkGroupID.y+(sg2>>1u))*4u+sy;
+ uint ct=(2u*(sg2>>1u)+(sy>>1u))*4u+2u*(sg2&1u)+(sx>>1u);
+ precise f16vec2 main_scaled=f16vec2(shK[ct*32u+ch],shK[ct*32u+ch+1u]);
+ if(pc.p5.w==1u) main_scaled=main_scaled*f16vec2(pw[pc.p5.z+pc.p5.y+ch],pw[pc.p5.z+pc.p5.y+ch+1u]);
+ const f16vec2 skip_gain=f16vec2(pw[pc.p5.z+ch],pw[pc.p5.z+ch+1u]);
+ uint sa=pc.p4.z+nrf2_io_at0(px,py,ch,pc.p6.x,32u);
+ const f16vec2 skip_input=f16vec2(sk[sa],sk[sa+1u]);
+ precise f16vec2 skip_v=skip_input*skip_gain;
+ precise f16vec2 value=main_scaled+skip_v;
+ return value;
+}'''
+
+NEW_FN = '''// n19-f19-root: the blend gather has 8 literal call sites and every one of them
+// passes slot = 2*j + (lane>>4) with j in 0..7, so slot is always in [0,16).
+// That makes the div/mod chain in nrf2_io_at0 exact identities:
+//   sy = slot/4 in [0,4), sx = slot%4 in [0,4)
+//   px = 4*ax + sx, py = 4*ay + sy  =>  px/4 == ax, px%4 == sx, py/4 == ay, py%4 == sy
+//   t  = 16*(ay*(W/4)+ax) + (4*sy+sx)  =>  t/16 == ay*(W/4)+ax, t%16 == slot
+// so with C = 32 the whole index collapses to
+//   sa = pc.p4.z + (ay*(W/4)+ax)*512 + (ch/16)*256 + slot*16 + (ch%16)
+//   shK index = 256*(sg>>1) + 64*(sg&1) + ch + 128*(j>=4) + 32*(j&1)
+// The two gain pairs depend only on ch and the push constants, so they are
+// gathered once per lane instead of once per call site (7 spare loads each).
+// No FP expression, rounding point, accumulation order or barrier changes:
+// skip_v = skip_input*skip_gain and value = main_scaled+skip_v keep their
+// operand order and their single half roundings.
+f16vec2 nr_blend_pair(uint sa,uint shk,f16vec2 skip_gain,f16vec2 proj_gain){
+ precise f16vec2 main_scaled=f16vec2(shK[shk],shK[shk+1u]);
+ if(pc.p5.w==1u) main_scaled=main_scaled*proj_gain;
+ const f16vec2 skip_input=f16vec2(sk[sa],sk[sa+1u]);
+ precise f16vec2 skip_v=skip_input*skip_gain;
+ precise f16vec2 value=main_scaled+skip_v;
+ return value;
+}'''
+
+OLD_HDR = '''NRH_CH nx00,nx01,nx10,nx11;
+{'''
+NEW_HDR = '''// n19: lane-invariant blend operands, hoisted out of the 8 call sites.
+// blend_hi is the only lane bit that moves with the call-site index.
+const uint blend_hi = lane >> 4u;
+const uint blend_ch = 2u * (lane & 15u);
+const uint blend_sa_base = pc.p4.z
+    + (2u * gl_WorkGroupID.y + (sg >> 1u)) * (pc.p6.x / 4u) * 512u
+    + (2u * gl_WorkGroupID.x + (sg & 1u)) * 512u
+    + (blend_ch >> 4u) * 256u + (blend_ch & 15u) + 16u * blend_hi;
+const uint blend_shk_base = 256u * (sg >> 1u) + 64u * (sg & 1u) + blend_ch;
+const f16vec2 blend_skip_gain = f16vec2(pw[pc.p5.z + blend_ch], pw[pc.p5.z + blend_ch + 1u]);
+f16vec2 blend_proj_gain = f16vec2(float16_t(0));
+if (pc.p5.w == 1u) blend_proj_gain = f16vec2(pw[pc.p5.z + pc.p5.y + blend_ch],
+                                             pw[pc.p5.z + pc.p5.y + blend_ch + 1u]);
+NRH_CH nx00,nx01,nx10,nx11;
+{'''
+# per call site: (j, sa offset, shK offset)
+SITES = [(0, 0, 0), (1, 32, 32), (2, 64, 0), (3, 96, 32),
+         (4, 128, 128), (5, 160, 160), (6, 192, 128), (7, 224, 160)]
+OLD_CALL = 'uint packed=packFloat2x16(nr_blend_pair(sg,%du+(lane>>4u),2u*(lane&15u)));'
+NEW_CALL = ('uint packed=packFloat2x16(nr_blend_pair(blend_sa_base+%du,blend_shk_base+%du,'
+            'blend_skip_gain,blend_proj_gain));')
+
+
+def main():
+    text = BASE.read_text(encoding='utf-8-sig')
+    assert text.count(OLD_FN) == 1, text.count(OLD_FN)
+    assert text.count(OLD_HDR) == 1
+    out = text.replace(OLD_FN, NEW_FN).replace(OLD_HDR, NEW_HDR)
+    for j, sa, shk in SITES:
+        old = OLD_CALL % (2 * j)
+        assert out.count(old) == 1, (j, out.count(old))
+        out = out.replace(old, NEW_CALL % (sa, shk))
+    (CARD / 'candidate.comp').write_text(out, encoding='utf-8')
+    diff = difflib.unified_diff(text.splitlines(True), out.splitlines(True),
+                                '@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                                'c32-rest-20261026/root-f2/candidate.comp',
+                                'candidate.comp', n=3)
+    patch = ''.join(diff)
+    (CARD / 'SOURCE-DIFF.patch').write_text(patch, encoding='utf-8')
+    print(patch)
+    print('base lines', len(text.splitlines()), 'cand lines', len(out.splitlines()))
+
+
+if __name__ == '__main__':
+    main()

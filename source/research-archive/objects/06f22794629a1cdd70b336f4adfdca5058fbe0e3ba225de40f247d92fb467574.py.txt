@@ -1,0 +1,259 @@
+"""Node-by-node and exhaustive binary16 check of the F14 norm reduction rewrite.
+
+Parent (vit_qkv_norm_owner_v2 / vq_tree_xor), scalar form of the predicated tree:
+    s[d] = z[d]^2 + z[d+16]^2            d = 0..15
+    for step in (8,4,2,1):
+        for d in 0..step-1:  s[d] = s[d] + s[d+step]
+    total = s[0]
+
+Parent lane mapping: column d holds s[d]; the lane-parallel predicated form is
+    if ((lane&15) < step) s = s + shuffleXor(s, step)
+so only column 0 completes the tree.
+
+Candidate: the same four steps without the column predicate, i.e. every column
+runs the full butterfly.  Claim: for every column l the final value is
+bit-identical to the parent's s[0].
+
+Additions are IEEE-754 binary16 add (round-to-nearest-even of the exact sum).
+The proof is: lane l's tree is the parent's tree with, at some internal nodes,
+the two children swapped, and b16 addition is commutative.  This script checks
+that claim numerically: 1) the operand tree shapes are compared symbolically for
+every lane, 2) randomised + adversarial value checks compare bits.
+
+Output: evidence/TREE-PROOF.json
+"""
+import itertools
+import json
+import random
+import struct
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CARD = HERE.parent
+EVID = CARD / 'evidence'
+EVID.mkdir(exist_ok=True)
+
+
+# --------------------------------------------------------------- binary16 ops
+def h(x):
+    """Round a python float to binary16 (RNE) and return its bit pattern.
+
+    struct.pack('<e') raises on magnitudes above the finite range instead of
+    returning infinity, so the two overflow cases are materialised by hand with
+    the IEEE rule (|x| >= 65520 rounds to infinity; 65504 < |x| < 65520 keeps the
+    largest finite value because the tie goes to the even significand, and the
+    largest finite 0x7bff is odd)."""
+    x = float(x)
+    try:
+        return struct.unpack('<H', struct.pack('<e', x))[0]
+    except OverflowError:
+        sign = 0x8000 if x < 0 else 0
+        return sign | (0x7bff if abs(x) < 65520.0 else 0x7c00)
+
+
+def hf(bits):
+    return struct.unpack('<e', struct.pack('<H', bits))[0]
+
+
+def add(a, b):
+    """a, b are binary16 bit patterns; return the binary16 add bit pattern.
+
+    The exact sum of two binary16 values is representable in binary32, so
+    rounding binary32 -> binary16 with RNE gives the binary16 result."""
+    s = struct.unpack('<f', struct.pack('<f', hf(a) + hf(b)))[0]
+    return h(s)
+
+
+def mul(a, b):
+    s = struct.unpack('<f', struct.pack('<f', hf(a) * hf(b)))[0]
+    return h(s)
+
+
+SQUARE_OF = {}
+
+
+# ------------------------------------------------------------------- models
+def parent_tree(s):
+    """s: list of 16 binary16 bit patterns.  Parent scalar tree; returns s[0]."""
+    s = list(s)
+    for step in (8, 4, 2, 1):
+        for d in range(step):
+            s[d] = add(s[d], s[d + step])
+    return s[0]
+
+
+def butterfly(s):
+    """s: list of 16 binary16 bit patterns.  Returns all 16 lane results."""
+    v = list(s)
+    for step in (8, 4, 2, 1):
+        nv = list(v)
+        for l in range(16):
+            nv[l] = add(v[l], v[l ^ step])
+        v = nv
+    return v
+
+
+def parent_nodes(s):
+    """The multiset of (left, right) operand pairs the parent's tree adds, per
+    level, as a set of frozensets so a swapped pair counts as the same node."""
+    s = list(s)
+    levels = []
+    for step in (8, 4, 2, 1):
+        ops = []
+        for d in range(step):
+            ops.append(frozenset((s[d], s[d + step])))
+            s[d] = add(s[d], s[d + step])
+        levels.append(ops)
+    return levels
+
+
+def butterfly_nodes(s):
+    """Same view for every lane of the butterfly."""
+    out = []
+    v = list(s)
+    for step in (8, 4, 2, 1):
+        nv = list(v)
+        level = []
+        for l in range(16):
+            level.append(frozenset((v[l], v[l ^ step])))
+            nv[l] = add(v[l], v[l ^ step])
+        v = nv
+        out.append(level)
+    return out
+
+
+# --------------------------------------------------------------- value pools
+def random_half(rng):
+    """Random binary16 bit pattern that is not NaN."""
+    while True:
+        b = rng.getrandbits(16)
+        e = (b >> 10) & 0x1f
+        if e != 0x1f:
+            return b
+
+
+def square_sum_pool(rng, n):
+    """Realistic norm inputs: s[d] = z[d]^2 + z[d+16]^2 for z = round(half)."""
+    out = []
+    for _ in range(n):
+        row = []
+        for _d in range(16):
+            z0 = h(rng.uniform(-9.0, 9.0))
+            z1 = h(rng.uniform(-9.0, 9.0))
+            row.append(add(mul(z0, z0), mul(z1, z1)))
+        out.append(row)
+    return out
+
+
+def adversarial_pool():
+    special = [h(0.0), h(-0.0), 0x0001, 0x03ff, 0x0400, 0x7bff, h(1.0), h(-1.0),
+               h(0.5), h(2.0), h(65504.0), h(6.103515625e-05), h(0.0001),
+               h(255.9), h(256.1), h(2048.0), h(4096.0), h(4097.0)]
+    pools = []
+    pools.append([special[0]] * 16)                       # all +0
+    pools.append([special[1]] * 16)                       # all -0
+    pools.append([special[5]] * 16)                       # all max finite
+    pools.append(special[:16])                            # 16 distinct specials
+    pools.append(special[16:] + special[:14])
+    # rounding-tie heavy: neighbours of 2048 (half spacing 2) and 1024 (spacing 1)
+    rng = random.Random(7)
+    for _ in range(2000):
+        row = []
+        for _d in range(16):
+            base = rng.choice([0x6400, 0x6800, 0x6000, 0x6c00])
+            row.append((base + rng.randrange(-4, 5)) & 0xffff)
+        pools.append(row)
+    # catastrophic cancellation / mixed exponent
+    for _ in range(2000):
+        row = []
+        for _d in range(16):
+            e = rng.randrange(0, 30)
+            row.append((rng.randrange(0, 2) << 15) | (e << 10) | rng.randrange(0, 1024))
+        pools.append(row)
+    # values that overflow when summed
+    pools.append([h(65504.0)] * 8 + [h(65504.0)] * 8)
+    pools.append([h(65504.0), h(65504.0), h(-65504.0), h(-65504.0)] * 4)
+    return pools
+
+
+def main():
+    rng = random.Random(20261027)
+    trials = 0
+    mismatch = 0
+    first_mismatch = None
+    node_mismatch = 0
+    node_checks = 0
+
+    pools = square_sum_pool(rng, 100000) + adversarial_pool()
+    for trial in pools:
+        trials += 1
+        ref = parent_tree(trial)
+        lanes = butterfly(trial)
+        if any(v != ref for v in lanes):
+            mismatch += 1
+            if first_mismatch is None:
+                first_mismatch = dict(inputs=trial, parent=ref, lanes=lanes)
+
+    # per-level operand-node comparison: every butterfly node at every level
+    # must be the parent's node for the same block (as an unordered pair)
+    for trial in pools[:20000]:
+        pn = parent_nodes(trial)
+        bn = butterfly_nodes(trial)
+        for step_i in range(4):
+            # the parent's level has 2**step_i nodes (step = 8,4,2,1 -> 8,4,2,1 nodes)
+            parent_pairs = set(pn[step_i])
+            for pair in bn[step_i]:
+                node_checks += 1
+                if pair not in parent_pairs:
+                    node_mismatch += 1
+                    if node_mismatch < 4:
+                        print('node mismatch', step_i, sorted(pair), sorted(parent_pairs)[:8])
+
+    # lane 0 / lane 16 keep the parent's operand order exactly (not just value):
+    # the parent's node is s[0] + s[step]; lane 0 of the butterfly evaluates
+    # add(v[0], v[0^step]) = add(v[0], v[step]), i.e. the same left/right order.
+    ordered_checks = 0
+    ordered_mismatch = 0
+    for trial in pools[:20000]:
+        s = list(trial)
+        ref = list(s)
+        v = list(s)
+        for step in (8, 4, 2, 1):
+            for d in range(step):
+                ordered_checks += 1
+                if (v[d] != ref[d]) or (v[d ^ step] != ref[d + step]):
+                    ordered_mismatch += 1
+            ref = [add(ref[d], ref[d + step]) if d < step else ref[d] for d in range(16)]
+            v = [add(v[l], v[l ^ step]) for l in range(16)]
+    order_ok = ordered_mismatch == 0
+
+    out = dict(
+        schema='n12-vit-qkv/tree-proof/v1',
+        operation='IEEE-754 binary16 add, round-to-nearest-even (exact sum rounded once)',
+        parent_model='s[d]=s[d]+s[d+step] for d<step, step=8,4,2,1; total=s[0]',
+        candidate_model='for every column l: v[l]=v[l]+v[l^step], step=8,4,2,1',
+        trials=trials,
+        random_realistic_trials=100000,
+        adversarial_trials=len(pools) - 100000,
+        value_mismatches=mismatch,
+        first_mismatch=first_mismatch,
+        node_checks=node_checks,
+        node_mismatches=node_mismatch,
+        owner_operand_order_checks=ordered_checks,
+        owner_operand_order_mismatches=ordered_mismatch,
+        lane0_lane16_operand_order_unchanged=order_ok,
+        conclusion=('every one of the 16 columns reproduces the parent total bit-for-bit; '
+                    'each butterfly node is the parent node for the same block, only the '
+                    'operand order may be swapped, and binary16 addition is commutative'),
+        caveat=('max(s,0x1.04p-14) and inversesqrt() are unchanged instructions and receive a '
+                'bit-identical operand, so their results are identical by construction, not by '
+                'recomputation'),
+    )
+    (EVID / 'TREE-PROOF.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print(json.dumps({k: v for k, v in out.items() if k != 'first_mismatch'}, indent=2))
+    return 0 if mismatch == 0 and node_mismatch == 0 else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,155 @@
+"""Minimal SPIR-V renderer: enough to diff parent vs candidate at IR level.
+
+No disassembler ships in this workspace, so this renders each instruction with
+ids resolved to friendly names/constants. It is a *diff aid*, not a validator:
+correctness gates stay spv_validate_cpu + the address proof.
+"""
+from pathlib import Path
+import struct, sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+import COMMON as K
+sys.path.insert(0, str(K.SPV_TOOLS))
+import spv_tools_local as ST
+
+OPNAME = {
+    3: 'OpSource', 4: 'OpSourceExtension', 5: 'OpName', 6: 'OpMemberName', 7: 'OpString',
+    10: 'OpExtension', 11: 'OpExtInstImport', 12: 'OpExtInst', 14: 'OpMemoryModel',
+    15: 'OpEntryPoint', 16: 'OpExecutionMode', 17: 'OpCapability', 19: 'OpTypeVoid',
+    20: 'OpTypeBool', 21: 'OpTypeInt', 22: 'OpTypeFloat', 23: 'OpTypeVector',
+    28: 'OpTypeArray', 29: 'OpTypeRuntimeArray', 30: 'OpTypeStruct', 32: 'OpTypePointer',
+    33: 'OpTypeFunction', 41: 'OpConstantTrue', 42: 'OpConstantFalse', 43: 'OpConstant',
+    44: 'OpConstantComposite', 46: 'OpConstantNull',
+    54: 'OpFunction', 55: 'OpFunctionParameter', 56: 'OpFunctionEnd', 57: 'OpFunctionCall',
+    59: 'OpVariable', 61: 'OpLoad', 62: 'OpStore', 65: 'OpAccessChain',
+    66: 'OpInBoundsAccessChain', 67: 'OpPtrAccessChain',
+    71: 'OpDecorate', 72: 'OpMemberDecorate', 73: 'OpDecorationGroup',
+    77: 'OpVectorShuffle', 79: 'OpCompositeConstruct', 80: 'OpCompositeExtract',
+    81: 'OpCompositeInsert', 96: 'OpSelect',
+    126: 'OpKill', 127: 'OpReturn', 128: 'OpIAdd', 129: 'OpFAdd', 130: 'OpISub',
+    131: 'OpFSub', 132: 'OpIMul', 133: 'OpFMul', 134: 'OpUDiv', 135: 'OpSDiv',
+    136: 'OpFDiv', 137: 'OpUMod', 138: 'OpSRem', 139: 'OpSMod', 140: 'OpFRem',
+    141: 'OpFMod', 148: 'OpDot', 169: 'OpSelect', 170: 'OpIEqual', 171: 'OpINotEqual',
+    172: 'OpUGreaterThan', 173: 'OpSGreaterThan', 176: 'OpULessThan', 177: 'OpSLessThan',
+    178: 'OpULessThanEqual', 179: 'OpSLessThanEqual',
+    194: 'OpShiftRightLogical', 195: 'OpShiftRightArithmetic', 196: 'OpShiftLeftLogical',
+    197: 'OpBitwiseOr', 198: 'OpBitwiseXor', 199: 'OpBitwiseAnd', 200: 'OpNot',
+    210: 'OpBitcast', 224: 'OpControlBarrier', 225: 'OpMemoryBarrier',
+    245: 'OpPhi', 246: 'OpLoopMerge', 247: 'OpSelectionMerge', 248: 'OpLabel',
+    249: 'OpBranch', 250: 'OpBranchConditional', 251: 'OpSwitch', 253: 'OpReturn',
+    254: 'OpReturnValue',
+    4456: 'OpCooperativeMatrixLengthKHR', 4457: 'OpCooperativeMatrixLoadKHR',
+    4458: 'OpCooperativeMatrixStoreKHR', 4459: 'OpCooperativeMatrixMulAddKHR',
+}
+STORAGE = {0: 'UniformConstant', 1: 'Input', 2: 'Uniform', 3: 'Output', 4: 'Workgroup',
+           5: 'CrossWorkgroup', 6: 'Private', 7: 'Function', 8: 'Generic',
+           9: 'PushConstant', 12: 'StorageBuffer'}
+DECOR = {1: 'RelaxedPrecision', 5: 'Location', 6: 'Component', 11: 'BuiltIn',
+         20: 'Coherent', 22: 'MatrixStride', 23: 'ColMajor', 24: 'RowMajor',
+         33: 'Binding', 34: 'DescriptorSet', 35: 'Offset', 42: 'NoContraction',
+         44: 'NoPerspective'}
+
+
+def _str(words):
+    return b''.join(struct.pack('<I', w) for w in words).split(b'\0')[0].decode('utf-8', 'replace')
+
+
+def render(path):
+    m = ST.Module(Path(path))
+    ins = m.instructions
+    consts, types, names, out_names = {}, {}, {}, {}
+    # pass 1: names + types + constants
+    for op, ops, _, _ in ins:
+        if op == 5 and len(ops) >= 2:
+            out_names[ops[0]] = _str(ops[1:])
+    for op, ops, _, _ in ins:
+        if op == 22 and len(ops) >= 2:
+            types[ops[0]] = 'f%d' % ops[1]
+        elif op == 21 and len(ops) >= 3:
+            types[ops[0]] = '%s%d' % ('s' if ops[2] else 'u', ops[1])
+        elif op == 19:
+            types[ops[0]] = 'void'
+        elif op == 23 and len(ops) >= 3:
+            types[ops[0]] = 'vec%d<%s>' % (ops[2], types.get(ops[1], '?'))
+        elif op == 28 and len(ops) >= 3:
+            types[ops[0]] = 'arr<%s x %s>' % (types.get(ops[1], '?'), ops[2])
+        elif op == 30:
+            types[ops[0]] = 'struct{%s}' % ','.join('t%d' % x for x in ops[2:])
+        elif op == 32 and len(ops) >= 3:
+            types[ops[0]] = 'ptr<%s,%s>' % (STORAGE.get(ops[1], str(ops[1])), types.get(ops[2], 't%d' % ops[2]))
+        elif op == 33:
+            types[ops[0]] = 'fn'
+        elif op == 43 and len(ops) >= 3:
+            t = types.get(ops[0], '?')
+            if t.startswith('f'):
+                bits = ops[2]
+                if ops[0] in [i for i, v in types.items() if v == 'f16']:
+                    consts[ops[1]] = 'h:%04x' % (bits & 0xffff)
+                else:
+                    consts[ops[1]] = 'f:%08x' % bits
+            else:
+                consts[ops[1]] = 'u:%d' % ops[2]
+        elif op == 44 and len(ops) >= 3:
+            consts[ops[1]] = 'comp<%s>' % ','.join(consts.get(x, str(x)) for x in ops[2:])
+    # pass 2: render
+    lines = []
+    for idx, (op, ops, _, count) in enumerate(ins):
+        nm = OPNAME.get(op, 'Op%d' % op)
+        parts = []
+        if op == 5:
+            parts = ['"%s"' % out_names.get(ops[0], '?')]
+        elif op == 6:
+            parts = ['%' + out_names.get(ops[0], str(ops[0])), str(ops[1]),
+                     '"%s"' % _str(ops[2:])]
+        elif op in (3, 4, 10, 11):
+            parts = ['"%s"' % _str(ops)]
+        elif op == 16:
+            parts = ['%' + out_names.get(ops[0], str(ops[0])),
+                     {17: 'LocalSize', 18: 'LocalSizeHint', 26: 'SubgroupsPerWorkgroup',
+                      27: 'SubgroupsPerWorkgroupId'}.get(ops[1], 'Mode%d' % ops[1])] + [str(x) for x in ops[2:]]
+        elif op == 15:
+            parts = [str(ops[0]), '%' + out_names.get(ops[1], str(ops[1])),
+                     '"%s"' % _str(ops[2:3])] + ['%' + out_names.get(x, str(x)) for x in ops[3:]]
+        elif op == 7:
+            parts = ['"%s"' % _str(ops)]
+        elif op == 71 and len(ops) >= 2:
+            parts = ['%' + out_names.get(ops[0], str(ops[0])),
+                     DECOR.get(ops[1], 'Dec%d' % ops[1])] + [str(x) for x in ops[2:]]
+        elif op == 72:
+            parts = ['%' + out_names.get(ops[0], str(ops[0])), str(ops[1]),
+                     DECOR.get(ops[2], 'Dec%d' % ops[2])] + [str(x) for x in ops[3:]]
+        elif op == 59 and len(ops) >= 3:
+            parts = ['%' + out_names.get(ops[1], str(ops[1])),
+                     ':' + types.get(ops[0], str(ops[0])),
+                     STORAGE.get(ops[2], str(ops[2]))]
+        elif op == 32 and len(ops) >= 3:
+            parts = [':%s' % types[ops[0]], STORAGE.get(ops[1], str(ops[1])),
+                     ':' + types.get(ops[2], str(ops[2]))]
+        elif op == 248:
+            parts = ['L' + str(ops[0])]
+        elif op == 250:
+            parts = ['L' + str(ops[0]), 'L' + str(ops[1]), 'L' + str(ops[2])]
+        elif op == 249:
+            parts = ['L' + str(ops[0])]
+        else:
+            for j, w in enumerate(ops):
+                if w in consts:
+                    parts.append('#' + consts[w])
+                elif w in out_names:
+                    parts.append('%' + out_names[w])
+                else:
+                    parts.append(str(w))
+        lines.append('%4d %-32s %s' % (idx, nm, ' '.join(parts)))
+    return lines
+
+
+def main():
+    a = Path(sys.argv[1])
+    b = Path(sys.argv[2])
+    la, lb = render(a), render(b)
+    Path(sys.argv[3]).write_text('\n'.join(la) + '\n', encoding='utf-8')
+    Path(sys.argv[4]).write_text('\n'.join(lb) + '\n', encoding='utf-8')
+
+
+if __name__ == '__main__':
+    main()

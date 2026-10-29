@@ -1,0 +1,187 @@
+"""N02B F20 address / coverage / bounds enumeration (CPU only).
+
+Replays the executed tail mapping of ord 230 exactly as the shader computes it,
+for every (workgroup, subgroup, lane) of the plan's grid, and proves:
+
+  * the pixel that each thread writes is the same pixel the parent writes
+    (same px,py formula, same guard)
+  * the byte range of the 4 scalar stores in the parent is byte-for-byte the
+    byte range of the one 16 B record store in the candidate
+  * every record is 16 B aligned inside the buffer (BIND offset 0, record*16)
+  * the written record index is inside the plan buffer range (no overflow)
+  * the (px,py) map is a bijection on the 1280x720 window: every pixel exactly
+    once, no double write, no tail block
+
+Writes build/addr-proof.json.
+"""
+import json
+import pathlib
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(CARD.parent.parent))
+import COMMON as K          # noqa: E402
+
+W_, H_ = 1280, 720                  # the shader's own hardcoded window guard
+BUFFER_BYTES = 14745600            # BIND 3 of PASS ord 230 in the chain-head plan
+BUFFER_OFFSET = 0
+RECORD_BYTES = 16
+
+
+def main():
+    out = {'card': 'n02b-f20-store', 'ordinal': 230, 'cpu_only': True}
+    plan = CARD / 'plan.txt'
+    recs = K.pass_lines_of(plan)
+    lines = plan.read_text(encoding='utf-8-sig').splitlines()
+    i0 = lines.index(recs[230]['line'])
+    header = recs[230]['line'].split()
+    grid = [int(header[-3]), int(header[-2]), int(header[-1])]
+    binds, push = [], None
+    for l in lines[i0 + 1:]:
+        if l.startswith('PASS '):
+            break
+        if l.startswith('BIND '):
+            binds.append([int(x) for x in l.split()[1:]])
+        elif l.startswith('PUSH '):
+            push = [int(x) for x in l.split()[1:]]
+    bind3 = next(b for b in binds if b[0] == 3)
+    assert bind3[2] == BUFFER_OFFSET and bind3[3] == BUFFER_BYTES, bind3
+
+    def i32(x):
+        return x - (1 << 32) if x >= (1 << 31) else x
+
+    p0, p3 = push[0:4], push[12:16]
+    tiles_x, shift, debug, wx_single = i32(p0[0]), i32(p0[1]), i32(p0[2]), i32(p0[3])
+    wy_single, single_flag, tiles_y, shift_y = (i32(p3[0]), i32(p3[1]),
+                                                i32(p3[2]), i32(p3[3]))
+    out['plan'] = {'path': str(plan), 'sha256': K.sha(plan), 'pass_line': recs[230]['line']}
+    out['plan_binding'] = {'binding': bind3[0], 'buffer_id': bind3[1],
+                           'offset': bind3[2], 'size_bytes': bind3[3],
+                           'offset_mod16': bind3[2] % 16,
+                           'size_mod16': bind3[3] % 16,
+                           'records': bind3[3] // RECORD_BYTES}
+    out['push'] = {'tiles_x': tiles_x, 'shift': shift, 'debug': debug,
+                   'wx_single': wx_single, 'wy_single': wy_single,
+                   'single_flag': single_flag, 'tiles_y': tiles_y,
+                   'shift_y': shift_y, 'grid': grid,
+                   'local_size': 256, 'executing_subgroups': [0, 1]}
+
+    total_threads = 0
+    valid = 0
+    skipped = 0
+    seen = {}
+    dups = 0
+    max_record = -1
+    max_byte = -1
+    byte_checks = 0
+    misaligned = 0
+    negative = 0
+    for wy in range(grid[1]):
+        for wx in range(grid[0]):
+            ux = wx_single if single_flag else wx
+            uy = wy_single if single_flag else wy
+            for sg in (0, 1):                       # if(sg<2u)
+                for lane in range(32):
+                    total_threads += 1
+                    t = sg * 32 + lane
+                    q, r = t // 16, t % 16
+                    px = (2 * ux + shift + (q & 1)) * 4 + (r % 4)
+                    py = (2 * uy + shift_y + (q >> 1)) * 4 + (r // 4)
+                    if not (0 <= px < W_ and 0 <= py < H_):
+                        skipped += 1
+                        continue
+                    valid += 1
+                    record = py * W_ + px                      # candidate vec4 index
+                    address = record * 4                       # parent float index
+                    if record in seen:
+                        dups += 1
+                    else:
+                        seen[record] = (wx, wy, sg, lane)
+                    # parent stores element address+k at byte (address+k)*4
+                    for k in range(4):
+                        pb = (address + k) * 4
+                        cb = record * RECORD_BYTES + 4 * k
+                        byte_checks += 1
+                        assert pb == cb, (pb, cb, record, k)
+                    if record * RECORD_BYTES % RECORD_BYTES:
+                        misaligned += 1
+                    if record < 0:
+                        negative += 1
+                    max_record = max(max_record, record)
+                    max_byte = max(max_byte, record * RECORD_BYTES + RECORD_BYTES - 1)
+    out['enumeration'] = {
+        'threads': total_threads, 'executed_stores': valid, 'guarded_off': skipped,
+        'distinct_pixels': len(seen), 'duplicate_writes': dups,
+        'byte_pairs_compared': byte_checks, 'byte_mismatches': 0,
+        'misaligned_records': misaligned,
+        'negative_records': negative,
+        'max_record_index': max_record, 'max_record_byte': max_byte,
+        'buffer_bytes': BUFFER_BYTES,
+        'fits': max_byte < BUFFER_BYTES,
+        'coverage_complete': len(seen) == W_ * H_ and dups == 0,
+        'window_pixels': W_ * H_,
+        'tail_block': 'none: %d threads, %d inside the window' % (total_threads, valid),
+    }
+    # the map is a bijection on the window: 921600 pixels written exactly once
+    assert out['enumeration']['coverage_complete'], out['enumeration']
+    assert out['enumeration']['fits'], out['enumeration']
+    assert out['enumeration']['byte_mismatches'] == 0
+    assert out['enumeration']['max_record_byte'] == BUFFER_BYTES - 1, 'record block ends flush'
+
+    # per-warp active-lane accounting (SIMD mask of the store instruction)
+    warps = {}
+    for wy in range(grid[1]):
+        for wx in range(grid[0]):
+            ux = wx_single if single_flag else wx
+            uy = wy_single if single_flag else wy
+            for sg in (0, 1):
+                act = 0
+                for lane in range(32):
+                    t = sg * 32 + lane
+                    q, r = t // 16, t % 16
+                    px = (2 * ux + shift + (q & 1)) * 4 + (r % 4)
+                    py = (2 * uy + shift_y + (q >> 1)) * 4 + (r // 4)
+                    if 0 <= px < W_ and 0 <= py < H_:
+                        act += 1
+                warps[(wx, wy, sg)] = act
+    hist = {}
+    for v in warps.values():
+        hist[v] = hist.get(v, 0) + 1
+    out['warp_activity'] = {
+        'warps': len(warps),
+        'warps_with_zero_active_lanes': sum(1 for v in warps.values() if v == 0),
+        'mean_active_lanes': sum(warps.values()) / float(len(warps)),
+        'histogram_active_lanes': {str(k): hist[k] for k in sorted(hist)},
+        'note': ('the four scalar stores and the single record store are issued under the same '
+                 'lane mask, so the message count scales with the number of warps that have any '
+                 'active lane, not with the number of active lanes'),
+    }
+
+    # lane/component -> (pixel, channel) map, enumerated for one workgroup
+    lane_map = []
+    for sg in (0, 1):
+        for lane in range(32):
+            t = sg * 32 + lane
+            q, r = t // 16, t % 16
+            lane_map.append({'sg': sg, 'lane': lane, 't': t, 'q': q, 'r': r,
+                             'dx': (q & 1), 'dy': (q >> 1),
+                             'px_off': (q & 1) * 4 + (r % 4),
+                             'py_off': (q >> 1) * 4 + (r // 4)})
+    offs = {(m['px_off'], m['py_off']) for m in lane_map}
+    out['lane_map'] = {
+        'entries': len(lane_map),
+        'distinct_offsets': len(offs),
+        'block': '8x8 pixels per workgroup at (8*wx + 4*shift, 8*wy + 4*shift_y)',
+        'injective': len(offs) == 64,
+        'sample': lane_map[:4],
+    }
+    assert out['lane_map']['injective']
+
+    (CARD / 'build').mkdir(exist_ok=True)
+    (CARD / 'build/addr-proof.json').write_text(json.dumps(out, indent=1), encoding='utf-8')
+    print(json.dumps({k: out[k] for k in ('plan_binding', 'enumeration', 'lane_map')},
+                     indent=1)[:4000])
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,115 @@
+"""n01b-f02-load-side: produce candidate.comp from the parent source.
+
+ONE mechanism (load side): the four `coopMatLoad(scale, wb, base, 0u, LROW)`
+fragment loads that are issued **twice each** are issued once each and the
+fragment is reused.  Nothing else changes: same loads, same operands, same
+order of every FP expression, same rounding points.
+
+Why the bytes are identical for every (lane, component):
+  stride = 0  =>  the fragment's element (row, col) is at wb[base + col]
+                  (nrh_coord_C(row,col).y == col, and the row term is
+                   multiplied by the stride).  The row index therefore does not
+                   enter the address, so a stride-0 fragment is fully determined
+                   by the 16 halves at wb[base .. base+15].
+  Two loads with the same `base` read the same 16 halves => every one of the
+  32 lanes x 4 components is bit-identical.
+
+CPU only.  Writes only inside this card directory.
+"""
+import sys, hashlib, json
+from pathlib import Path
+
+CARD = Path(__file__).parent
+PARENT_SRC = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                  'c32-rest-20261026/body-pv-den-overlap/candidate.comp')
+OUT = CARD / 'candidate.comp'
+
+# (anchor, replacement) applied in order; every anchor must occur exactly once.
+EDITS = [
+    # ---- input side: one `scale` fragment per distinct column window ---------
+    (
+        "NRH_A xa00; NRH_C ny00;\n{\n",
+        "// n01b load-side: the stride-0 `scale` fragments are row-invariant, so the\n"
+        "// two column windows (+8, +24) are loaded ONCE each and reused by the two\n"
+        "// token halves (ny00/ny10 and ny01/ny11).  8 fragment loads -> 4.\n"
+        "NRH_CH nrh_scale_x0; coopMatLoad(nrh_scale_x0,wb,uint(pc.p2.x)+8u,0u,LROW);\n"
+        "NRH_CH nrh_scale_x1; coopMatLoad(nrh_scale_x1,wb,uint(pc.p2.x)+24u,0u,LROW);\n"
+        "NRH_A xa00; NRH_C ny00;\n{\n",
+    ),
+    (
+        "xa00=nrh_to_A(x);\nNRH_CH scale; coopMatLoad(scale,wb,uint(pc.p2.x)+8u,0u,LROW);\n"
+        "ny00=nrh_widen_exact(x*scale);",
+        "xa00=nrh_to_A(x);\nny00=nrh_widen_exact(x*nrh_scale_x0);",
+    ),
+    (
+        "xa01=nrh_to_A(x);\nNRH_CH scale; coopMatLoad(scale,wb,uint(pc.p2.x)+24u,0u,LROW);\n"
+        "ny01=nrh_widen_exact(x*scale);",
+        "xa01=nrh_to_A(x);\nny01=nrh_widen_exact(x*nrh_scale_x1);",
+    ),
+    (
+        "xa10=nrh_to_A(x);\nNRH_CH scale; coopMatLoad(scale,wb,uint(pc.p2.x)+8u,0u,LROW);\n"
+        "ny10=nrh_widen_exact(x*scale);",
+        "xa10=nrh_to_A(x);\nny10=nrh_widen_exact(x*nrh_scale_x0);",
+    ),
+    (
+        "xa11=nrh_to_A(x);\nNRH_CH scale; coopMatLoad(scale,wb,uint(pc.p2.x)+24u,0u,LROW);\n"
+        "ny11=nrh_widen_exact(x*scale);",
+        "xa11=nrh_to_A(x);\nny11=nrh_widen_exact(x*nrh_scale_x1);",
+    ),
+    # ---- output side: same for the two residual-seed column windows ----------
+    (
+        "NRH_CH ctx00=nrh_narrow(tc00);",
+        "// n01b load-side: same stride-0 de-duplication on the residual-seed side\n"
+        "// (pc.p2.y+0 and pc.p2.y+16 were each loaded twice).  8 -> 4 total.\n"
+        "NRH_CH nrh_scale_o0; coopMatLoad(nrh_scale_o0,wb,uint(pc.p2.y)+0u,0u,LROW);\n"
+        "NRH_CH nrh_scale_o1; coopMatLoad(nrh_scale_o1,wb,uint(pc.p2.y)+16u,0u,LROW);\n"
+        "NRH_CH ctx00=nrh_narrow(tc00);",
+    ),
+    (
+        "NRH_CH scale;coopMatLoad(scale,wb,uint(pc.p2.y)+0u,0u,LROW);oc00=nrh_widen_exact(y00*scale);",
+        "oc00=nrh_widen_exact(y00*nrh_scale_o0);",
+    ),
+    (
+        "NRH_CH scale;coopMatLoad(scale,wb,uint(pc.p2.y)+16u,0u,LROW);oc01=nrh_widen_exact(y01*scale);",
+        "oc01=nrh_widen_exact(y01*nrh_scale_o1);",
+    ),
+    (
+        "NRH_CH scale;coopMatLoad(scale,wb,uint(pc.p2.y)+0u,0u,LROW);oc10=nrh_widen_exact(y10*scale);",
+        "oc10=nrh_widen_exact(y10*nrh_scale_o0);",
+    ),
+    (
+        "NRH_CH scale;coopMatLoad(scale,wb,uint(pc.p2.y)+16u,0u,LROW);oc11=nrh_widen_exact(y11*scale);",
+        "oc11=nrh_widen_exact(y11*nrh_scale_o1);",
+    ),
+]
+
+
+def main():
+    text = PARENT_SRC.read_text(encoding='utf-8-sig')
+    before = text
+    applied = []
+    for anchor, repl in EDITS:
+        n = text.count(anchor)
+        assert n == 1, 'anchor occurs %d times: %r' % (n, anchor[:60])
+        text = text.replace(anchor, repl)
+        applied.append(dict(anchor=anchor.splitlines()[0][:70], count=1))
+    OUT.write_text(text, encoding='utf-8')
+    sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+    print('parent ', PARENT_SRC, sha(PARENT_SRC))
+    print('cand   ', OUT, sha(OUT))
+    print('edits applied', len(applied))
+    # sanity: residual scale-load sites
+    import re
+    left = re.findall(r'coopMatLoad\(scale,wb,[^)]*\)', text)
+    print('remaining `coopMatLoad(scale,...)` sites:', len(left))
+    assert len(left) == 0
+    CARD.joinpath('make_candidate.json').write_text(json.dumps(dict(
+        parent=dict(path=str(PARENT_SRC), sha256=sha(PARENT_SRC)),
+        candidate=dict(path=str(OUT), sha256=sha(OUT)),
+        edits=applied,
+        removed_sites=8, added_sites=4,
+    ), indent=2), encoding='utf-8')
+
+
+if __name__ == '__main__':
+    main()

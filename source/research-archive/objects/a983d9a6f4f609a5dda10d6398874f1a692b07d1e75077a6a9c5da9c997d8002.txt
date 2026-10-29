@@ -1,0 +1,65 @@
+n04a-f05-c64-feed — RESUME（2026-10-27，CPU 侧已完成）
+
+状态: BUILT / AWAITING-GPU（本轮允许的 CPU 工作全部做完）
+分诊预登记: **A（实现未落地）为首要判定分支**。理由：本候选能不能算"落地"，唯一判据是
+  「权重 send 的地址 payload 不再坐在权重返回区里」（NATIVE-PREDICTION.md P1）与「每 send 一次的
+  `mul *32` 从 49 降到 ≤12」（P2）。这两条不成立就是 A，不需要任何计时；成立而 mov/sync 明显上升
+  则转 B；成立且整体无差异转 C/D。数值分支 E 在结构上已被排除（见下），但仍保留为首差排查项。
+
+## 1. 身份（全部本轮复测）
+- 基线 plan sha256 `a024c3c5aa1d1432ab3f0591bf03a897880d86be2c99d6de1e1492a2a7b2befe`（与合同一致）。
+- 父 SPV `0d83192b5368cc6074e00bbefed67ec71f8f540a9088d4d96752887390459641`
+  用基线源 + glslang 16.5.0 **裸重编译字节复现**（`parent-rebuild.spv`，无 NC 转移）。
+- 候选 SPV `7b6da747ed3fbf413a0a7b403178e74998e219ba5535894b42bd843276f922ad`
+  （`spv_validate_cpu` result=0，words=12638；80/80 NoContraction 站点逐条对齐，0 mismatch）。
+- 候选 plan `7451fa2acbad4d17abd72141ac26cb7b0513ad389cc1dca34c101bb13b88b722`
+  = 基线 plan 只把本组 8 个 PASS 的路径换成 `candidate.spv`（替换数 8，`proof-check.json` 里
+  `plan_equals_baseline_with_only_this_path_swapped: true`）。
+- `clock_runner --cpu-check`：父与候选项**逐字相同**
+  `CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded`。
+
+## 2. 已证 / 未证
+已证（CPU 可复现，脚本在本目录）：
+1. 地址整数恒等：`((96h+n)/16*4 + k0/16)*256 ≡ 6144h + 1024*(n/16) + 256*(k0/16)`，
+   7,864,320 组 (wq,h,n,k0) 组合 0 mismatch；除法全部整除（`proof_check.py` → `build/proof-check.json`）。
+2. 候选与父的差异只在整数地址算术：SPIR-V opcode 差值 `OpIMul −33 / OpIAdd −22 / OpUDiv −22 /
+   OpLoad −20 / OpConstant +1 / OpName +2 / OpVariable +2 / OpStore +2`，**无任何浮点算子变化**。
+3. 映射、K 累加序、norm/den 归约树、half 舍入点、exp/倒数/FMA 收缩全部未动（PROOF.json）。
+4. 父 native 的具名冲突（本轮新证据，逐条定位到 offset）：
+   row_phase0 的 8 个权重地址寄存器里 **4 个（r7,r8,r18,r22）同时是权重返回区**；
+   row_phase1 是 2 个（r7,r15）；24 条 send 只用 12 个返回区（r22 被 5 个片段复用、r19 4 个、r27 3 个）；
+   每条 send 恰好 1 条 DPAS 消费。
+
+未证（必须 GPU）：
+- IGC 是否把 `wk` 保持为跨六条 send 的一个值，而不是重算（P1/P2）。
+- 物理 GRF 占用、scratch 是否仍为 0、`mov`/`sync.nop` 的增减（P3–P5）。
+- 整体帧时（两臂 6 组 × 30 reps）。
+
+## 3. 下一处具体代码改动（若 P1/P2 判为 A）
+不要换写法重跑同一件事。按以下顺序取一处：
+1. **把 `wk` 变成"跨步不重算"的显式载体**：在 k0 循环外用 4 个 `const uint` 分别命名
+   `wk0/wk1/wk2/wk3`（各 = `wq_row + 256*s`），循环内按 `s` 选择。这会把"每步重算"改掉，
+   但同时**新增 3 个标量活值**（必须记：+3 dword 跨整个相位）——如果这一版让 mov/add 上升超过
+   QKV 段的 5%，停止，不要继续堆。
+2. 若第 1 步仍不落地：改攻**返回区本身**而不是地址——在 GLSL 里把 V 组的两个 `MAT_B` 用
+   `const` 作用域隔开并让第三组的 b0/b1 在第二个 DPAS 之后才 `coopMatLoad`（即把"六块先读"
+   改成"两组、两组、两组"的有界分簇）。**这不是加预取**：总 send 数不变，只是让第 3 组的返回区
+   在第一组消费完之前不被写入。判据：返回区数从 12/9 变化且 send 数仍为 48。
+3. 若两条都不动：停止该机制，改记 C（当前身份无净收益），把 QKV 段 782/4229 的地址占比当成
+   "结构性小项"，转去 `n04b-f05-c128-feed`（同族 C128）或 N05。
+
+## 4. 未决项（不阻塞，已记录）
+- `COMMON.py` 的 `FB2_LAST_GOLD = 2b63d4ba…` 与 START-HERE 第 33 行的 fb2 末帧 `9c3e511e…` **不一致**。
+  本卡只读，未改；GPU manifest 生成前必须由主代理确定真实期望值（已写进 GPU-REQUEST.json）。
+- 权重 send 的 `rd:8` 与逻辑 512 B 片段的"分配单位 vs 数据字节"仍未闭合（F10 教训里的同一问题）。
+  本卡按 per-lane 地址步长 32 B × 16 lane = 512 B 记录，未把 rd:8 当数据字节。
+- 同一批 24 个权重 tile 每 WG 被读 2 次（两个 row_phase 各一遍）是当前形状的既有成本，本卡不修。
+
+## 5. 恢复点
+- 目录：`cards/n04a-f05-c64-feed/`；产物：`candidate.comp`、`candidate.spv`、`parent-rebuild.comp`、
+  `parent-rebuild.spv`、`plan.txt`、`SOURCE-DIFF.patch`、`BUILD.json`、`PROOF.json`、`COST-LEDGER.json`、
+  `ANALYSIS.md`、`NATIVE-PREDICTION.md`、`ISA-QKV-FEED.json`、`GPU-REQUEST.json`。
+- 复跑脚本（只读上游、只写本目录）：`build_card.py` → `verify_card.py` → `finalize_build.py` →
+  `proof_check.py` → `evidence_isa.py`。全部 CPU，无 GPU、无锁。
+- GPU 只需三步：native（判 P1–P8）→ 若落地则 fixed/fb2 双门 → 若门过则两臂 ordinary。
+  若 native 判 A，**不要**开 ordinary 批次。

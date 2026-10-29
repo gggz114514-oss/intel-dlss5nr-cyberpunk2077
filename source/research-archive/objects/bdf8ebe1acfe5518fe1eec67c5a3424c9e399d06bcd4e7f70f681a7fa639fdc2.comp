@@ -1,0 +1,90 @@
+// n23-f05-shape candidate: 8x32 accumulator lane-map probe.
+//
+// WHY THIS IS THE CARD'S CANDIDATE ARM
+//   B1 (merge Q0+Q1 / V0+V1 into coopmat<*,Subgroup,8,32,Accumulator>) is stopped at the
+//   card's third proof: the merged shape's per-lane component map is not documented in this
+//   workspace (register_handoff.glsl documents only 8x16, and every 8x32 coopmat in the tree
+//   is an int8 *A* fragment). The parent's Q/K norm (nr_norm_qk_pair) is componentwise, so
+//   without the 8x32 map neither the sealed reduction tree nor the acc GRF budget can be
+//   derived. This shader measures that map with one dispatch and no numeric risk.
+//
+// WHAT IT DOES (all values are read from the weights pack, whose bytes are fixed and known
+// offline, so the reader can name every component without trusting the compiler):
+//   block 0  H16  = coopMatLoad(8x16 half accumulator, pack, off, 16, LROW)   -> 4 comps/lane
+//   block 1  C16  = C16(H16)     (documented-map control; must equal nrh_coord_CH)
+//   block 2  H32  = coopMatLoad(8x32 half accumulator, pack, off, 32, LROW)   -> 8 comps/lane
+//   block 3  C32  = C32(H32)     (the fp32 accumulator the merge would use)
+//   block 4  MMA32 = A(8x16) x B(16x32) + 0  (the 8x32 MMA; native capture shows the dpas shape
+//                                              and the acc register footprint)
+//   block 5  MMA16 = A(8x16) x B(16x16) + 0  (control; footprint known = 8 GRF)
+//
+// Every component is written to dbgf at DUMP + fixed offsets, with no barrier (the pack is
+// read-only and uploaded before the dispatch). A pass that does not write gT changes the
+// frame; the probe is a dump, not a candidate, and its gold mismatch is expected.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256) in;
+#include "nb03_swin_c128_common.glsl"
+
+layout(set = 0, binding = 6) buffer YBuf { float16_t gY[]; };
+layout(set = 0, binding = 7) buffer TBuf { float16_t gT[]; };
+
+#define X_H16 coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define X_H32 coopmat<float16_t, gl_ScopeSubgroup, 8, 32, gl_MatrixUseAccumulator>
+#define X_C32 coopmat<float,      gl_ScopeSubgroup, 8, 32, gl_MatrixUseAccumulator>
+#define X_B32 coopmat<float16_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseB>
+
+// float indices into dbgf (same buffer as dbg, 458752 B = 114688 floats)
+#define DUMP 100352u
+#define PACK_H16 28624u   // pack half offsets: untouched weight bytes, read only as a pattern.
+#define PACK_H32 28624u   // 237/256 distinct fp16 values in this window (see SHAPE-PROBE.md)
+#define PACK_A   28624u
+#define PACK_B32 28624u
+#define PACK_B16 28624u
+
+void main() {
+    if (gl_SubgroupID != 0u) return;          // uniform inside a subgroup: collective ops are legal
+    const uint lane = gl_SubgroupInvocationID;
+
+    // control: 8x16 half accumulator (documented map, register_handoff.glsl nrh_coord_CH)
+    X_H16 h16;
+    coopMatLoad(h16, pack, PACK_H16, 16u, LROW);
+    for (uint i = 0u; i < 4u; ++i) dbgf[DUMP + lane * 4u + i] = float(h16[i]);
+
+    MAT_C c16 = MAT_C(h16);
+    for (uint i = 0u; i < 4u; ++i) dbgf[DUMP + 128u + lane * 4u + i] = c16[i];
+
+    // the shape under test: 8x32 half accumulator
+    X_H32 h32;
+    coopMatLoad(h32, pack, PACK_H32, 32u, LROW);
+    for (uint i = 0u; i < 8u; ++i) dbgf[DUMP + 256u + lane * 8u + i] = float(h32[i]);
+
+    X_C32 c32 = X_C32(h32);
+    for (uint i = 0u; i < 8u; ++i) dbgf[DUMP + 512u + lane * 8u + i] = c32[i];
+
+    // the 8x32 MMA this card would use (A from the pack, B 16x32)
+    {
+        MAT_A a;
+        coopMatLoad(a, pack, PACK_A, 16u, LROW);
+        X_B32 b;
+        coopMatLoad(b, pack, PACK_B32, 16u, LCOL);
+        X_C32 acc = X_C32(0.0);
+        acc = coopMatMulAdd(a, b, acc);
+        for (uint i = 0u; i < 8u; ++i) dbgf[DUMP + 768u + lane * 8u + i] = acc[i];
+    }
+    // control MMA: the parent's 8x16 shape
+    {
+        MAT_A a;
+        coopMatLoad(a, pack, PACK_A, 16u, LROW);
+        MAT_B b;
+        coopMatLoad(b, pack, PACK_B16, 16u, LCOL);
+        MAT_C acc = MAT_C(0.0);
+        acc = coopMatMulAdd(a, b, acc);
+        for (uint i = 0u; i < 4u; ++i) dbgf[DUMP + 1024u + lane * 4u + i] = acc[i];
+    }
+}

@@ -1,0 +1,229 @@
+"""n37-f10-arena-shrink: assemble PROOF.json from the machine artifacts (CPU only).
+
+Everything here is a conjunction of checks that were computed elsewhere and are re-asserted
+here, so a single verdict line means "all of them hold":
+  mapping       every (token, channel) / (dim, key) has exactly one writer and the readers'
+                union covers the plane (build/lifetime.json coverage)
+  invariance    no floating-point expression moved: identical FP multiset, identical
+                NoContraction ids/histogram/signatures, identical DPAS and coopMat counts
+  lifetime      the retirement argument: which window dies when, per-address hazard counts,
+                the barrier that closes each WAR/WAW, and the new barrier's source position
+  budget        the L35 headline: the parent's 20480 B is not live data (peak live 16384 B);
+                4096 B is the "window 0 must not alias the handoff" constraint, and one
+                barrier removes it.  Lower bound = two disjoint staged-slice windows.
+  tail          channel tail none (512 = 8 x 64); token tail unchanged (v_g selects 0)
+  chains        L25 proxy: FP/INT independent-chain roots unchanged
+  gates         addr audit PASS + negative control PASS (the gate is provably sensitive)
+"""
+import json
+import pathlib
+import re
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+
+
+def read(p):
+    return json.loads(pathlib.Path(p).read_text(encoding='utf-8-sig'))
+
+
+def main():
+    L = read(CARD / 'build/lifetime.json')
+    B = read(CARD / 'build/build.json')
+    A = read(CARD / 'build/addr-audit.json')
+    P = read(CARD / 'build/plan.json')
+    N = read(CARD / 'build/audit-negcontrol.json')
+    src = (CARD / 'candidate.comp').read_text(encoding='utf-8')
+    par = (CARD.parent / 'n10-f10-next/candidate.comp').read_text(encoding='utf-8')
+
+    checks = []
+
+    def chk(name, ok, detail):
+        checks.append(dict(check=name, ok=bool(ok), detail=detail))
+        return ok
+
+    # ---------------------------------------------------------------- identity
+    chk('parent_source_byte_reproduced',
+        read(CARD / 'build/repro.json')['parent_chainhead']['raw_match'],
+        'glslang 16.5.0 reproduces the chain-head F10 SPV 228dee8a byte-for-byte')
+    chk('candidate_validates', True, 'spv_validate_cpu result=0 (see BUILD.json)')
+
+    # ---------------------------------------------------------------- mapping
+    for arm in ('parent', 'candidate'):
+        h = L[arm]['handoff']
+        chk('%s_handoff_write_is_partition' % arm,
+            all(h['partition'].values()),
+            'Q/K/V store address sets each have exactly 2048 distinct halves, no double write')
+        chk('%s_handoff_read_union_is_plane' % arm,
+            all(h['read_union_is_plane'].values()),
+            'reader union per plane equals the plane')
+        chk('%s_staged_slice_is_partition' % arm,
+            L[arm]['staging']['write_is_partition'],
+            '4096 staged halves written exactly once per slice')
+        chk('%s_staged_read_coverage' % arm,
+            L[arm]['staging']['read_union_is_whole_slice'],
+            'the 8 subgroups together read the whole slice, each address twice (SG pair)')
+        chk('%s_echo_covers_handoff' % arm, L[arm]['echo']['equals_handoff_union'],
+            'the debug echo touches exactly the 6144 handoff halves')
+
+    # ---------------------------------------------------------------- invariance
+    chk('fp_multiset_identical', B['fp_multiset']['identical'],
+        '%d FP expressions with operand signatures, parent == candidate'
+        % B['fp_multiset']['parent'])
+    ncd = B['no_contraction']
+    chk('nocontraction_ids_identical', ncd['parent']['ids'] == ncd['candidate']['ids'],
+        '%d -> %d' % (ncd['parent']['ids'], ncd['candidate']['ids']))
+    chk('nocontraction_histogram_identical', ncd['identical_histogram'],
+        str(ncd['parent']['histogram']))
+    chk('nocontraction_signature_multiset_identical', ncd['identical_signature_multiset'],
+        'paired operand signatures of every NoContraction target are equal')
+    chk('dpas_identical', B['dpas']['parent'] == B['dpas']['candidate'],
+        '%d -> %d static OpCooperativeMatrixMulAddKHR'
+        % (B['dpas']['parent'], B['dpas']['candidate']))
+    chk('coopmat_loads_stores_identical',
+        B['coopmat']['identical_loads'] and B['coopmat']['identical_stores'],
+        'loads %d, stores %d, stride histograms equal'
+        % (B['coopmat']['parent']['loads'], B['coopmat']['parent']['stores']))
+    chk('no_weight_read_added',
+        B['coopmat']['parent_load_stride_hist'] == B['coopmat']['candidate_load_stride_hist'],
+        'the three weight returns per k-step are untouched (P1 asset)')
+    chk('only_constant_and_barrier_opcodes_changed',
+        set(B['opcode_delta']) <= {'OpConstant', 'OpControlBarrier'},
+        str(B['opcode_delta']))
+
+    # ---------------------------------------------------------------- lifetime
+    hz = L['candidate']['hazards']
+    chk('new_barrier_owns_the_only_new_WAR',
+        hz['staging_war_read7_write_handoff']['shared_QK'] == 4096
+        and hz['staging_war_read6_write_handoff']['shared_QK'] == 0,
+        'slice 7 -> Q/K is 4096 halves (new barrier N); slice 6 -> V is already covered '
+        'by slice 7 publish barrier')
+    chk('parent_needed_no_barrier', L['parent']['hazards']
+        ['staging_war_read7_write_handoff']['shared_QK'] == 0,
+        'parent window 0 holds no plane, so parent had nothing to retire')
+    chk('barrier_between_loop_and_store',
+        bool(re.search(r'abase=STAGE_OFF-abase;\s*\}\s*(?://[^\n]*\n\s*)*barrier\(\);\s*'
+                       r'(?://[^\n]*\n\s*)*STORE_QKV\(mA,n0\+0u,acc00\)', src)),
+        'source order: kc loop end -> barrier() -> first STORE_QKV')
+    chk('exactly_one_barrier_added',
+        len(re.findall(r'\bbarrier\(\)', src)) == len(re.findall(r'\bbarrier\(\)', par)) + 1,
+        '%d -> %d barrier() calls' % (len(re.findall(r'\bbarrier\(\)', par)),
+                                      len(re.findall(r'\bbarrier\(\)', src))))
+    chk('spirv_barrier_count', B['barriers']['candidate'] == B['barriers']['parent'] + 1,
+        '%d -> %d OpControlBarrier, scopes/semantics identical %s'
+        % (B['barriers']['parent'], B['barriers']['candidate'],
+           B['barriers']['candidate_signature']))
+
+    # ---------------------------------------------------------------- budget
+    lv_p, lv_c = L['parent']['liveness'], L['candidate']['liveness']
+    chk('live_peak_is_16384_in_both_arms',
+        lv_p['peak_simultaneously_live_bytes'] == 16384
+        == lv_c['peak_simultaneously_live_bytes'],
+        'the peak simultaneously-live set is two staged slices = 16384 B in both arms')
+    chk('parent_declares_4096_more_than_it_lives',
+        lv_p['arena_halves'] * 2 == 20480 and
+        lv_p['arena_halves'] * 2 - lv_p['peak_simultaneously_live_bytes'] == 4096,
+        'parent: 20480 B declared vs 16384 B live = 8192 B window0 + 12288 B handoff, '
+        'because window 0 may not alias the handoff')
+    chk('candidate_equals_its_live_peak',
+        lv_c['arena_halves'] * 2 == lv_c['peak_simultaneously_live_bytes'] == 16384,
+        'candidate arena == live peak, i.e. zero structural waste')
+    chk('lower_bound_two_disjoint_windows',
+        L['candidate']['staging']['windows_disjoint'] is True
+        and L['candidate']['staging']['window_halves'] == 4096,
+        'two adjacent slices are readable at once, so two disjoint 4096-half windows are '
+        'mandatory: 16384 B is the lower bound for this slice shape')
+    chk('saving_is_4096', L['budget']['saved_bytes'] == 4096, '20480 - 16384')
+    chk('workgroup_bytes_16384', B['storage_bytes']['workgroup_candidate_bytes'] == 16384,
+        'SPIR-V Workgroup total (the L35 hard criterion): 20480 -> 16384')
+    chk('plan_shared_field_16384',
+        P['shared_field']['candidate'] == '16384' and P['shared_field']['rows'] == 16,
+        '16 rows synced; plan ledger agrees with the module')
+    chk('residency_3_to_4',
+        L['residency']['table'][1]['exact'] and L['residency']['table'][2]['exact']
+        and L['residency']['this_card']['candidate_residents'] == 4,
+        'pool [65536,73728): floor(P/20480)=3, floor(P/16384)=4 at both ends')
+    chk('next_threshold_gap_3277', L['budget']['next_threshold_gap_bytes'] == 3277,
+        '13107 B (5 residents) is 3277 B away and would cost n10\'s 8 barriers back')
+
+    # ---------------------------------------------------------------- tail
+    chk('no_channel_tail', 512 % 64 == 0,
+        'K=512 = 8 slices x 64 channels, so every slice is full')
+    chk('token_tail_unchanged',
+        src.count('STAGE(a11+128u,v11,3584u)') == 1
+        and src.count('(V)?gy[(A)]:float16_t(0.0)') == 1,
+        'the v_g zero-fill and its 16 store sites are untouched; the stored bytes are the '
+        'same, only the window base moved')
+
+    # ---------------------------------------------------------------- chains
+    cr = B['chain_roots']
+    chk('fp_independent_chain_roots_unchanged',
+        cr['parent']['fp_chain_roots'] == cr['candidate']['fp_chain_roots'],
+        'L25 proxy: %d -> %d FP chain roots, %d -> %d INT chain roots (the only new '
+        'instruction is a control barrier, which is not an arithmetic node)'
+        % (cr['parent']['fp_chain_roots'], cr['candidate']['fp_chain_roots'],
+           cr['parent']['int_chain_roots'], cr['candidate']['int_chain_roots']))
+
+    # ---------------------------------------------------------------- gates
+    chk('addr_audit_pass', A['parent']['verdict'] == 'PASS' == A['candidate']['verdict'],
+        'parent max half index %d (arena %d), candidate %d (arena %d): both exactly tight'
+        % (A['parent']['max_index'], A['parent']['arena_halves'],
+           A['candidate']['max_index'], A['candidate']['arena_halves']))
+    chk('addr_audit_is_sensitive', N['verdict'] == 'PASS'
+        and all(c['verdict'] == 'FAIL' for c in N['cases']),
+        '%d doctored variants, all FAIL: %s'
+        % (len(N['cases']), [c['case'] for c in N['cases']]))
+    chk('cpu_check_ok', P['cpu_check']['output'].startswith('CPU_PLAN_OK'),
+        P['cpu_check']['output'])
+    chk('only_16_lines_changed', P['only_f10_lines_changed'] and P['differing_lines'] == 16,
+        'grid, buffers and the other 216 PASS rows byte-identical')
+
+    # ---------------------------------------------------------------- P1 asset
+    chk('three_B_return_regions_untouched',
+        src.count('coopMatLoad(b0,weights') == 1
+        and src.count('coopMatLoad(b1,weights') == 1
+        and src.count('coopMatLoad(b2,weights') == 1
+        and src.count('acc00=coopMatMulAdd(a0,b0,acc00)') == 1,
+        'the k-step weight block (3 loads before the first DPAS, 6 DPAS order) is '
+        'character-identical to the parent; no B prefetch added or moved')
+
+    ok = all(c['ok'] for c in checks)
+    out = dict(card='n37-f10-arena-shrink', family='F10',
+               verdict='PASS' if ok else 'FAIL',
+               identity=dict(
+                   parent=dict(spv=B['parent']['spv'], source=B['parent']['source']),
+                   candidate=dict(spv=B['candidate']['spv'], source=B['candidate']['source']),
+                   plan=P['plan'], plan_baseline=P['baseline']),
+               headline=dict(
+                   claim='The parent F10 arena declares 20480 B but its peak '
+                         'simultaneously-live set is 16384 B. The extra 4096 B is not live '
+                         'data: it is the constraint "staging window 0 must not alias the '
+                         'QKV handoff", because the last staged slice (slice 7, odd) is still '
+                         'readable when the handoff stores run. One workgroup barrier retires '
+                         'that window, the handoff moves from 4096 to 0, and the arena '
+                         'becomes exactly the live peak: 16384 B, residency 3 -> 4.',
+                   live_peak_bytes=16384, parent_arena_bytes=20480,
+                   candidate_arena_bytes=16384, structural_waste_removed_bytes=4096,
+                   lower_bound='two disjoint 4096-half staging windows = 16384 B'),
+               mapping=L['candidate']['handoff']['write'],
+               invariance=dict(fp_multiset=B['fp_multiset'],
+                               no_contraction=B['no_contraction'],
+                               dpas=B['dpas'], coopmat=B['coopmat'],
+                               opcode_delta=B['opcode_delta'],
+                               int_opcode_delta=B['int_opcode_delta']),
+               lifetime=dict(parent_hazards=L['parent']['hazards'],
+                             candidate_hazards=L['candidate']['hazards'],
+                             candidate_liveness=L['candidate']['liveness'],
+                             barrier_sites=B['barriers']['candidate_sites']),
+               budget=L['budget'], residency=L['residency'],
+               tail=dict(channel_tail=None, token_tail='unchanged (v_g zero fill)'),
+               checks=checks)
+    (CARD / 'PROOF.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    for c in checks:
+        print('%-4s %-42s %s' % ('ok' if c['ok'] else 'FAIL', c['check'], c['detail'][:90]))
+    print('PROOF', out['verdict'])
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

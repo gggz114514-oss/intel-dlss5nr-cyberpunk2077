@@ -1,0 +1,32 @@
+"""Pure static C64 family calibration, FP16 Y reconstruction objective."""
+from pathlib import Path
+import json,numpy as np
+Q=Path(__file__).resolve().parent;D=Q/'real-int8-24';O=D/'c64-family-static';O.mkdir(exist_ok=True)
+data=json.loads((Q/'ACTIVE-ROWS.json').read_text());buf=data['buffers'];teachers=[D/'dump-fp16',D/'teacher-diagnostics/teacher-41444',D/'teacher-diagnostics/teacher-43654'];reports=[]
+def half(x):return x.astype(np.float16).astype(np.float32)
+def code(x):return np.clip(np.rint(x),-127,127)
+for block in [5,6,7,8,62,63,64,65]:
+ r=next(r for r in data['rows'] if r['name']==f'block{block}_swin_body_3');b={int(k):v for k,v in r['bindings'].items()};p=list(map(int,r['push']));r1=next(r for r in data['rows'] if r['name']==f'block{block}_swin_body_2');bb={int(k):v for k,v in r1['bindings'].items()}
+ scold=np.fromfile(buf[bb[1][0]]['file'],dtype='<f4');wold=np.fromfile(buf[bb[0][0]]['file'],dtype='i1').astype(np.float32);wp=np.fromfile(buf[b[0][0]]['file'],dtype='<f2').astype(np.float32);rs=wp[p[17]:p[17]+64]
+ we=np.array([[wp[p[12]+(n//16)*1024+(k//16)*256+(n%16)*16+k%16] for k in range(64)] for n in range(256)],np.float32)
+ assert np.linalg.norm(we-wold[:16384].reshape(256,64)*(scold[16:272]/scold[0])[:,None])/np.linalg.norm(we)<.03
+ sxshift=p[2] if p[2]<2**31 else p[2]-2**32;syshift=p[3] if p[3]<2**31 else p[3]-2**32;ids=np.random.default_rng(20261029).choice(p[4]*p[5]*64,4096,replace=False);win=ids//64;t=ids%64;tx=2*(win%p[4])+sxshift+((t//16)&1);ty=2*(win//p[4])+syshift+((t//16)>>1);valid=(tx>=0)&(tx<84)&(ty>=0)&(ty<48)
+ xs=[];ys=[];amax=np.zeros(64,np.float32)
+ for td in teachers:
+  raw=np.fromfile(td/f'dump_{buf[b[2][0]]["name"]}.bin',dtype='<f2').reshape(-1,4,16,16).transpose(0,2,1,3).reshape(-1,16,64).astype(np.float32);amax=np.maximum(amax,abs(raw).max(axis=(0,1)));x=np.zeros((len(ids),64),np.float32);x[valid]=raw[ty[valid]*84+tx[valid],t[valid]%16];xs.append(x);ys.append(np.fromfile(td/f'dump_swin_{block}_Y.bin',dtype='<f2').reshape(-1,64)[ids].astype(np.float32))
+ X=np.concatenate(xs);Y=np.concatenate(ys);diag=np.exp2(np.rint(np.log2(np.maximum(amax,1e-12)))).astype(np.float32);wt=we*diag;sw=np.maximum(abs(wt).max(axis=1)/127,1e-12);sx=np.float32(np.max(amax/diag)/127);w=wold.copy();w[:16384]=code(wt/sw[:,None]).ravel();sc0=np.concatenate([scold,np.float32(1/sx)/diag,rs]);sc0[400:464]*=sx*diag/sc0[0];sc0[:2]=[sx,1/sx];sc0[16:272]=sx*sw
+ def forward(sc,ww,original=False):
+  inv=np.full(64,sc[1],np.float32) if original else sc[464:528];qx=code(X*inv);e=half((qx@ww[:16384].reshape(256,64).T)*sc[16:272]);t=np.clip(e,-4,4);a=half(e*half(t*half(-.055908203125*abs(t)+.447265625)+.89453125));qa=code(a*sc[2]);mw=ww[16384:24576].reshape(64,128);m=np.concatenate([qa[:,g*128:(g+1)*128]@mw[g*32:(g+1)*32].T for g in range(2)],axis=1)*sc[272:336];qm=code(m*sc[3]);c=(qm@ww[24576:28672].reshape(64,64).T)*sc[336:400];return half(c+(qx*sc[400:464] if original else half(X*rs)))
+ def scales(f):
+  s=sc0.copy();s[0]*=f[0];s[1]/=f[0];s[16:272]*=f[0];s[400:464]*=f[0];s[464:528]/=f[0];s[2]/=f[1];s[272:336]*=f[1];s[3]/=f[2];s[336:400]*=f[2];return s
+ olderr=float(np.mean((forward(scold,wold,True)-Y)**2));f=np.ones(3);history=[]
+ for dim in range(3):
+  opts=[]
+  for value in [.5,.65,.8,1.,1.2]:
+   trial=f.copy();trial[dim]=value;loss=float(np.mean((forward(scales(trial),w)-Y)**2));opts.append((loss,trial));history.append(dict(factors=trial.tolist(),mse=loss))
+  loss,f=min(opts,key=lambda z:z[0])
+ sf=O/f'b{block}-scales.bin';wf=O/f'b{block}-weights.bin';scales(f).astype('<f4').tofile(sf);w.astype('i1').tofile(wf)
+ reports.append(dict(block=block,scale_resource=bb[1][0],weight_resource=bb[0][0],old_scale=buf[bb[1][0]]['file'],old_weight=buf[bb[0][0]]['file'],new_scale=str(sf),new_weight=str(wf),factors=f.tolist(),old_relative_l2=float(np.sqrt(olderr/np.mean(Y*Y))),new_relative_l2=float(np.sqrt(loss/np.mean(Y*Y))),history=history,diagonal=diag.tolist()))
+ print(block,reports[-1]['old_relative_l2'],reports[-1]['new_relative_l2'],f.tolist(),flush=True)
+(O/'CALIBRATION.json').write_text(json.dumps(dict(method='offline X channel equalization, static X/A/M coordinate search against teacher Y, original half residual; no runtime reductions',scope='three daytime calibration frames, 4096 tokens/frame/block, not holdout; GPU validation pending',rows=reports),indent=2))
+

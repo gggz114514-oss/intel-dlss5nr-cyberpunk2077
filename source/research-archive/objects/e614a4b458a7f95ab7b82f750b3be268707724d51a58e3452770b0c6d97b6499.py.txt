@@ -1,0 +1,352 @@
+"""N02B F20 SPIR-V structural check: baseline parent vs candidate.
+
+Compares the two artifacts that go into the plan
+  parent   : cards/n02b-f20-store/parent-rebuild.spv  (byte identical to 215aca67...)
+  candidate: cards/n02b-f20-store/candidate.spv       (8b213eb4...)
+
+and proves, on the module itself:
+  1. opcode histogram delta (only the record-store chain may differ)
+  2. the floating-point / GLSL.std.450 expression multiset is identical
+  3. exactly four 4 B scalar stores at binding 3 become one 16 B vec4 store
+  4. the address algebra: parent index = (expr)*4, candidate index = expr, same expr
+  5. the stored values are channel-for-channel the same (x,y,z,w in order)
+  6. resource shape: ArrayStride 4 -> 16, element size 4 -> 16 B, same binding,
+     same number of descriptors / push constants / shared variables
+
+CPU only.  Writes build/spv-check.json.
+"""
+import collections
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST          # noqa: E402
+
+CARD = pathlib.Path(__file__).resolve().parent
+
+OPNAME = {
+    12: 'OpExtInst', 42: 'OpConstantNull', 43: 'OpConstant', 59: 'OpVariable',
+    61: 'OpLoad', 62: 'OpStore', 65: 'OpAccessChain', 79: 'OpVectorShuffle',
+    80: 'OpCompositeConstruct', 81: 'OpCompositeExtract', 82: 'OpCompositeInsert',
+    83: 'OpCopyObject', 124: 'OpBitcast', 126: 'OpSNegate', 127: 'OpFNegate',
+    128: 'OpIAdd', 129: 'OpFAdd', 130: 'OpISub', 131: 'OpFSub', 132: 'OpIMul',
+    133: 'OpFMul', 134: 'OpUDiv', 135: 'OpFDiv', 136: 'OpUMod', 137: 'OpRem',
+    138: 'OpSRem', 139: 'OpSMod', 140: 'OpFRem', 141: 'OpFMod',
+    142: 'OpVectorTimesScalar', 143: 'OpMatrixTimesScalar', 144: 'OpVectorTimesMatrix',
+    145: 'OpMatrixTimesVector', 146: 'OpMatrixTimesMatrix', 147: 'OpOuterProduct',
+    148: 'OpDot', 177: 'OpSelect', 194: 'OpShiftRightLogical',
+    195: 'OpShiftRightArithmetic', 196: 'OpShiftLeftLogical', 197: 'OpBitwiseOr',
+    198: 'OpBitwiseXor', 199: 'OpBitwiseAnd', 200: 'OpNot', 109: 'OpConvertFToU',
+    110: 'OpConvertFToS', 111: 'OpConvertSToF', 112: 'OpConvertUToF', 113: 'OpUConvert',
+    114: 'OpSConvert', 115: 'OpFConvert', 117: 'OpSatConvertSToU', 118: 'OpSatConvertUToS',
+}
+FP_OPS = {127, 129, 131, 133, 135, 140, 141, 142, 143, 144, 145, 146, 147, 148}
+# GLSL.std.450 instructions in use here (Fma=50, Exp=27, Log=28, Pow=26, Sqrt=31,
+# InverseSqrt=32, FAbs=4, FClamp=43, FMin=37, FMax=40, Floor=8, Fract=10, Round=49).
+FP_EXT = {4, 8, 10, 26, 27, 28, 31, 32, 37, 40, 43, 46, 49, 50}
+BINDING = 3          # ImageOut / residual_out in the F20 tail
+
+
+def result_ids_of(module):
+    out = []
+    for op, ops, _, _ in module.instructions:
+        rid = ST.result_id_of(op, ops)
+        if rid is not None:
+            out.append((op, rid))
+    return out
+
+
+class Canon:
+    """ID-free canonical expression tree.
+
+    Function-scope variables are tagged with their ordinal among the module's
+    OpVariable instructions so two different locals never collapse into one
+    node; every other id is dropped.
+    """
+
+    def __init__(self, module):
+        self.m = module
+        self.by = module.id_to_instruction()
+        self.cache = {}
+        self.bind = {}
+        self.var_ord = {}
+        n = 0
+        for op, ops, _, _ in module.instructions:
+            if op == 71 and len(ops) > 2 and ops[1] == 33:
+                self.bind[ops[0]] = ops[2]
+            if op == 59:
+                self.var_ord[ops[1]] = n
+                n += 1
+
+    def c(self, cid, depth=0):
+        if cid in self.cache:
+            return self.cache[cid]
+        assert depth < 400, 'canon recursion'
+        op, ops = self.by.get(cid, (None, None))
+        if op is None:
+            val = ('undef', cid)
+        elif op == 43:
+            t_ops = self.by[ops[0]][1]
+            val = ('const', tuple(t_ops[1:]), ops[2])
+        elif op == 59:
+            val = ('var', ops[2], self.bind.get(cid), self.var_ord.get(cid))
+        elif op == 65:
+            val = ('ac', self.c(ops[2], depth + 1),
+                   tuple(self.c(x, depth + 1) for x in ops[3:]))
+        elif op == 61:
+            val = ('load', self.c(ops[2], depth + 1))
+        elif op == 81:
+            val = ('extract', self.c(ops[2], depth + 1), tuple(ops[3:]))
+        elif op == 80:
+            val = ('construct', tuple(self.c(x, depth + 1) for x in ops[2:]))
+        elif op == 79:
+            val = ('shuffle', self.c(ops[2], depth + 1), self.c(ops[3], depth + 1),
+                   tuple(ops[4:]))
+        elif op == 82:
+            val = ('insert', self.c(ops[2], depth + 1), self.c(ops[3], depth + 1),
+                   tuple(ops[4:]))
+        elif op in (124, 109, 110, 111, 112, 113, 114, 115, 117, 118):
+            val = ('conv', op, self.c(ops[2], depth + 1))
+        elif op == 12:
+            val = ('ext', ops[2], ops[3],
+                   tuple(self.c(x, depth + 1) for x in ops[4:]))
+        elif op in (126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137,
+                    138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148,
+                    194, 195, 196, 197, 198, 199, 200) or 170 <= op <= 191:
+            val = ('op', op, tuple(self.c(x, depth + 1) for x in ops[2:]))
+        else:
+            val = ('id', op)
+        self.cache[cid] = val
+        return val
+
+
+def fp_multiset(m):
+    can = Canon(m)
+    bag = collections.Counter()
+    for op, rid in result_ids_of(m):
+        if op in FP_OPS:
+            bag[can.c(rid)] += 1
+        elif op == 12:
+            _, ops = m.defining_instruction(rid)
+            if ops[3] in FP_EXT:
+                bag[can.c(rid)] += 1
+    return bag
+
+
+def value_multiset(m):
+    can = Canon(m)
+    bag = collections.Counter()
+    for op, rid in result_ids_of(m):
+        bag[can.c(rid)] += 1
+    return bag
+
+
+def buffer_stores(m, binding):
+    """[(index, pointer_canon, value_canon, index_operands)] for stores to `binding`."""
+    can = Canon(m)
+    out = []
+    for op, ops, _, _ in m.instructions:
+        if op != 62:
+            continue
+        ptr = can.c(ops[0])
+        if ptr[0] == 'ac' and ptr[1][0] == 'var' and ptr[1][2] == binding:
+            out.append(dict(ptr=ptr, value=can.c(ops[1]),
+                            index_ids=list(ops[0] and ops[0:0]) or None))
+    return out
+
+
+def stored_into_var(m, var_canon):
+    """Canonical value stored into a function variable ('var', 7, None, k)."""
+    can = Canon(m)
+    hits = []
+    for op, ops, _, _ in m.instructions:
+        if op != 62:
+            continue
+        if can.c(ops[0]) == var_canon:
+            hits.append(can.c(ops[1]))
+    return hits
+
+
+def main():
+    par = ST.Module(CARD / 'parent-rebuild.spv')
+    cand = ST.Module(CARD / 'candidate.spv')
+    res = {}
+    res['words'] = {'parent': len(par.words), 'candidate': len(cand.words)}
+    res['instructions'] = {'parent': len(par.instructions),
+                           'candidate': len(cand.instructions)}
+    res['bound'] = {'parent': par.bound, 'candidate': cand.bound}
+
+    hp = collections.Counter(op for op, _, _, _ in par.instructions)
+    hc = collections.Counter(op for op, _, _, _ in cand.instructions)
+    res['opcode_delta'] = {OPNAME.get(k, 'op%d' % k): [hp.get(k, 0), hc.get(k, 0)]
+                           for k in sorted(set(hp) | set(hc))
+                           if hp.get(k, 0) != hc.get(k, 0)}
+
+    # ---- 2. FP multiset must be identical ----
+    fp_p, fp_c = fp_multiset(par), fp_multiset(cand)
+    res['fp_multiset'] = {
+        'parent_sites': sum(fp_p.values()), 'candidate_sites': sum(fp_c.values()),
+        'identical': fp_p == fp_c,
+        'parent_only': [str(k) for k in (fp_p - fp_c)],
+        'candidate_only': [str(k) for k in (fp_c - fp_p)],
+    }
+
+    # ---- 3/4/5. the record store ----
+    sp = buffer_stores(par, BINDING)
+    sc = buffer_stores(cand, BINDING)
+    # stores to another binding are out of scope; report the totals too
+    all_stores_p = sum(1 for op, *_ in par.instructions if op == 62)
+    all_stores_c = sum(1 for op, *_ in cand.instructions if op == 62)
+    res['stores'] = {'parent_total': all_stores_p, 'candidate_total': all_stores_c,
+                     'parent_binding3': len(sp), 'candidate_binding3': len(sc)}
+
+    # index of each binding-3 store: the last access-chain operand
+    def idx(node):
+        return node[2][-1]
+
+    p_idx = [idx(s['ptr']) for s in sp]
+    c_idx = [idx(s['ptr']) for s in sc]
+    res['binding3_indices'] = {'parent': [str(x) for x in p_idx],
+                               'candidate': [str(x) for x in c_idx]}
+
+    # the index of store 0 is a load of the `address`/`record` local; walk to the
+    # value that local was assigned and strip the *4 scale from the parent side
+    def assigned(node):
+        assert node[0] == 'load', node
+        var = node[1]
+        vals = stored_into_var(par, var) if par else []
+        return var, vals
+
+    p_var, p_vals = None, None
+    if p_idx and p_idx[0][0] == 'load':
+        p_var = p_idx[0][1]
+        p_vals = stored_into_var(par, p_var)
+    c_var, c_vals = None, None
+    if c_idx and c_idx[0][0] == 'load':
+        c_var = c_idx[0][1]
+        c_vals = stored_into_var(cand, c_var)
+
+    def strip_scale(vals):
+        """('op',132,[expr,('const',...,4)]) -> (expr, 4) ; else (None,None)."""
+        assert len(vals) == 1, vals
+        v = vals[0]
+        if v[0] == 'op' and v[1] == 132 and len(v[2]) == 2 \
+                and v[2][1][0] == 'const' and v[2][1][2] == 4:
+            return v[2][0], 4
+        return None, None
+
+    p_expr, p_scale = strip_scale(p_vals) if p_vals else (None, None)
+    c_expr, c_scale = strip_scale(c_vals) if c_vals else (None, None)
+    if c_expr is None and c_vals and len(c_vals) == 1:
+        c_expr = c_vals[0]            # candidate assigns the unscaled record index
+    res['address_algebra'] = {
+        'parent_index_local': str(p_var),
+        'candidate_index_local': str(c_var),
+        'parent_assigned': str(p_vals),
+        'candidate_assigned': str(c_vals),
+        'parent_scale': p_scale,
+        'candidate_scale': c_scale,
+        'unscaled_expr_equal': p_expr is not None and p_expr == c_expr,
+        'parent_expr': str(p_expr),
+        'candidate_expr': str(c_expr),
+        'identity': 'parent index = (IAdd(IMul(u32(py),1280), u32(px))) * 4 ; '
+                    'candidate index = the same IAdd without the *4; '
+                    'element size 4 B -> 16 B, so byte offset is unchanged',
+    }
+
+    # channel order: parent stores hold value channel k (extract/ac literal k),
+    # candidate holds the whole vec4 (a load of the same local)
+    p_channels = []
+    for s in sp:
+        v = s['value']
+        if v[0] == 'load' and v[1][0] == 'ac':
+            p_channels.append(v[1][2][-1][-1])       # literal component index
+        elif v[0] == 'extract':
+            p_channels.append(v[2][-1])
+        else:
+            p_channels.append(str(v))
+    c_value = sc[0]['value'] if sc else None
+    p_vec_local = (str(sp[0]['value'][1][1]) if sp and sp[0]['value'][0] == 'load'
+                   and sp[0]['value'][1][0] == 'ac' else None)
+    c_vec_local = (str(c_value[1]) if c_value and c_value[0] == 'load' else None)
+    res['channel_order'] = {
+        'parent_component_literals': p_channels,
+        'parent_all_from_same_vector': len({str(s['value'][1][1]) for s in sp}) == 1,
+        'parent_vector_local': p_vec_local,
+        'candidate_value': str(c_value),
+        'candidate_vector_local': c_vec_local,
+        'candidate_is_whole_vector_load': bool(c_value and c_value[0] == 'load'),
+        'same_vector_local': p_vec_local == c_vec_local,
+        'order_preserved': p_channels == [0, 1, 2, 3],
+    }
+
+    # ---- control-flow skeleton: the guard and the block nesting must not move ----
+    CFG = {248: 'OpLabel', 249: 'OpBranch', 250: 'OpBranchConditional',
+           247: 'OpSelectionMerge', 246: 'OpLoopMerge', 251: 'OpSwitch',
+           54: 'OpFunctionEnd', 56: 'OpFunction'}
+    res['cfg_shape'] = {
+        'parent': {v: hp.get(k, 0) for k, v in CFG.items()},
+        'candidate': {v: hc.get(k, 0) for k, v in CFG.items()},
+    }
+    res['cfg_shape']['identical'] = res['cfg_shape']['parent'] == res['cfg_shape']['candidate']
+
+    # ---- 6. resource shape ----
+    def stride_of(m, binding):
+        var = m.binding_ids().get(binding)          # binding value -> variable id
+        assert var is not None, (binding, m.binding_ids())
+        # OpVariable -> result type (OpTypePointer) -> pointee (struct) -> member
+        # (OpTypeRuntimeArray) -> element type; ArrayStride decorates the array.
+        by = m.id_to_instruction()
+        vop, vops = by[var]
+        assert vop == 59, vop
+        pop, pops = by[vops[0]]
+        assert pop == 32, pop
+        node, chain = pops[2], []
+        while True:
+            op, ops = by[node]
+            chain.append(op)
+            if op == 30:                                   # OpTypeStruct
+                node = ops[1]
+            elif op in (28, 29):                           # OpTypeArray/RuntimeArray
+                array_id = node
+                node = ops[1]
+                break
+            else:
+                raise AssertionError('unexpected container op %d' % op)
+        stride = None
+        for op, ops, _, _ in m.instructions:
+            if op == 71 and ops[0] == array_id and ops[1] == 6:   # OpDecorate ArrayStride
+                stride = ops[2]
+        eop, eops = by[node]
+        return {'variable_id': var, 'array_type_id': array_id, 'array_stride': stride,
+                'container_ops': chain, 'element_type_op': eop,
+                'element_ops': list(eops), 'element_size_bytes': m.type_size_bytes(node)}
+
+    res['buffer3_shape'] = {'parent': stride_of(par, BINDING),
+                            'candidate': stride_of(cand, BINDING)}
+    res['buffers'] = {'parent': {b: v for b, v in par.binding_ids().items()},
+                      'candidate': {b: v for b, v in cand.binding_ids().items()}}
+    res['storage_bytes'] = {'parent': par.storage_bytes(),
+                            'candidate': cand.storage_bytes()}
+
+    # ---- full value multiset difference (everything except the record chain) ----
+    vp, vc = value_multiset(par), value_multiset(cand)
+    only_p, only_c = vp - vc, vc - vp
+    res['value_multiset'] = {
+        'parent_values': sum(vp.values()), 'candidate_values': sum(vc.values()),
+        'parent_only_count': sum(only_p.values()),
+        'candidate_only_count': sum(only_c.values()),
+        'parent_only': [str(k) for k in only_p],
+        'candidate_only': [str(k) for k in only_c],
+    }
+
+    (CARD / 'build').mkdir(exist_ok=True)
+    (CARD / 'build/spv-check.json').write_text(json.dumps(res, indent=1), encoding='utf-8')
+    print(json.dumps({k: res[k] for k in ('fp_multiset', 'stores', 'address_algebra',
+                                          'channel_order', 'buffer3_shape',
+                                          'opcode_delta')}, indent=1)[:8000])
+
+
+if __name__ == '__main__':
+    main()

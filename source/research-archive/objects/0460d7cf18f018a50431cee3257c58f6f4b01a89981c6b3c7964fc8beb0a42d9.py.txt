@@ -1,0 +1,130 @@
+"""Read-only ISA accounting for the parent identity of n09b-f09-sx-stage.
+
+No GPU, no capture, no lock: it only parses ISA text that the n09 card's
+`native-base` arm already dumped (plan sha = baseline a024c3c5..., kernel hash
+34be92e335be82ff).  The numbers are the *reference* for this card's native
+prediction; the card's own `base` arm must reproduce them (contract §8.7).
+
+Writes: NATIVE-BASELINE-ISA.json in this card directory.
+
+Run:
+  @NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe isa_baseline.py
+"""
+from pathlib import Path
+import re, json, hashlib, collections
+
+CARD = Path(__file__).resolve().parent
+CAMPAIGN = CARD.parent.parent
+CAP_DIR = CAMPAIGN / 'queue/n09-f09-f11-store/native/captures/native-native-base/ISA'
+KERNEL = '34be92e335be82ff'
+BASELINE_PLAN_SHA = 'a024c3c5aa1d1432ab3f0591bf03a897880d86be2c99d6de1e1492a2a7b2befe'
+F09_ORDINALS = [61, 65, 69, 73, 77, 81, 85, 89, 135, 139, 143, 147, 151, 155, 159, 163]
+
+LINE = re.compile(r'^/\* \[([0-9A-F]+)\]\s+\*/\s+(.*)$')
+MNEM = re.compile(r'^(?:\([^)]*\)\s+)?(?:\(W\)\s+)?([A-Za-z][A-Za-z0-9_.]*)')
+
+
+def main():
+    asm = sorted(CAP_DIR.glob('CS_asm%s_*.asm' % KERNEL))
+    assert len(asm) == 1, asm
+    asm = asm[0]
+    lines = asm.read_text(encoding='utf-8', errors='replace').splitlines()
+
+    instrs = []
+    for L in lines:
+        m = LINE.match(L)
+        if not m:
+            continue
+        body = m.group(2).rstrip()
+        mm = MNEM.match(body.strip())
+        instrs.append(dict(off=m.group(1), op=(mm.group(1) if mm else body.split()[0]),
+                           text=body))
+
+    mnem = collections.Counter(i['op'] for i in instrs)
+    sends = collections.Counter()
+    for i in instrs:
+        if i['op'].startswith('send.'):
+            comment = i['text'].split('//', 1)[1].strip() if '//' in i['text'] else ''
+            sends['%s | %s' % (i['op'], comment)] += 1
+
+    # gtp-in header lines (comments only) if any
+    header = [L for L in lines if L.strip().startswith('//')]
+
+    dpas_idx = [n for n, i in enumerate(instrs) if i['op'].startswith('dpas')]
+    barrier_idx = [n for n, i in enumerate(instrs) if i['op'] == 'sync.bar']
+    staging_store = [n for n, i in enumerate(instrs) if 'store.slm' in i['text']]
+    fences = [n for n, i in enumerate(instrs) if 'fence.slm' in i['text']]
+    signal = [n for n, i in enumerate(instrs) if 'signal barrier' in i['text']]
+
+    def region(lo, hi):
+        c = collections.Counter(i['op'] for i in instrs[lo:hi])
+        return dict(instructions=hi - lo, mnemonic_histogram=dict(sorted(c.items())))
+
+    bi = barrier_idx[0] if barrier_idx else len(instrs)
+    out = dict(
+        card='n09b-f09-sx-stage',
+        source_capture=dict(
+            isa=str(asm), isa_sha256=hashlib.sha256(asm.read_bytes()).hexdigest(),
+            kernel_hash=KERNEL,
+            capture_dir=str(CAP_DIR.parent.parent),
+            plan_sha256=BASELINE_PLAN_SHA,
+            plan_user='queue/n09-f09-f11-store/native/LUNA-NATIVE.json job native-base',
+            identity_note='same plan sha and same parent SPV bytes as this card\'s parent; '
+                          'captured by the n09 card, i.e. a different batch than this card\'s '
+                          'own arms. Contract §8.7: this card\'s own base arm is authoritative '
+                          'if the two disagree.',
+            shared_bytes_declared=16384,
+            f09_ordinals=F09_ORDINALS),
+        static=dict(instructions=len(instrs),
+                    first_offset=instrs[0]['off'], last_offset=instrs[-1]['off'],
+                    mnemonic_histogram=dict(sorted(mnem.items())),
+                    dpas=len(dpas_idx),
+                    sync_bar=len(barrier_idx),
+                    signal_barrier=len(signal),
+                    fence_slm=len(fences),
+                    store_slm_static=len(staging_store),
+                    send_slm_total=sum(1 for i in instrs if i['op'] == 'send.slm'),
+                    send_ugm_total=sum(1 for i in instrs if i['op'] == 'send.ugm'),
+                    send_gtwy_total=sum(1 for i in instrs if i['op'] == 'send.gtwy')),
+        message_histogram=dict(sorted(sends.items())),
+        regions=dict(
+            upto_and_including_barrier=region(0, bi + 1),
+            after_barrier=region(bi + 1, len(instrs)),
+            note='the pre-barrier region is prologue + the sx staging loop; the post-barrier '
+                 'region is the seed blocks + the fully unrolled K loop + the two end stores'),
+        structure=dict(
+            k_loop='fully unrolled: 64 dpas / 2 per k step = 32 k steps',
+            a_fetch_loads_per_k_step=256 // 32,
+            weight_loads_per_k_step=64 // 32,
+            staging_loop=dict(trip_count=32,
+                              derivation='for (e = lid; e < 8192; e += 256) with 256 threads '
+                                         '-> 32 iterations per thread',
+                              static_store_slm_in_body=len(staging_store),
+                              static_load_ugm_in_body=sum(1 for i in instrs[:bi]
+                                                          if 'load.ugm.d16u32' in i['text']),
+                              body_width=len(staging_store),
+                              iterations=32 // max(len(staging_store), 1),
+                              dynamic_note='4-wide unrolled body executed 8 times -> 32 global '
+                                           'reads + 32 SLM stores per thread'),
+            dpas_indices=dpas_idx[:8],
+            barrier_index=barrier_idx,
+            note='indices are instruction ordinals in the dump, not byte offsets'),
+        scratch=dict(gtwy_sends=sum(1 for i in instrs if i['op'] == 'send.gtwy'),
+                     spill_like=[i['text'] for i in instrs if 'spill' in i['text'].lower()
+                                 or 'fill' in i['text'].lower()][:8],
+                     note='send.gtwy carries the named-barrier signal and the end-of-thread '
+                          'message; no scratch/spill traffic appears in the parent ISA'),
+    )
+    (CARD / 'NATIVE-BASELINE-ISA.json').write_text(
+        json.dumps(out, indent=2), encoding='utf-8')
+    print(json.dumps(dict(isa=str(asm), instructions=out['static']['instructions'],
+                          dpas=out['static']['dpas'], sync_bar=out['static']['sync_bar'],
+                          store_slm=out['static']['store_slm_static'],
+                          send_slm=out['static']['send_slm_total'],
+                          send_ugm=out['static']['send_ugm_total'],
+                          messages=list(out['message_histogram'])), indent=2))
+    print('header comment lines:', header[:2])
+
+
+if __name__ == '__main__':
+    main()

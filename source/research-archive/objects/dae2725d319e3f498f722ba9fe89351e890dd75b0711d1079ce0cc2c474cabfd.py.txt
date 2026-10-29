@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""Generate `c32_f2_i8_body.comp` from the byte-identical deployed parent.
+
+The parent `C/c32-i8-debug-eact-v1/source/c32_f2_i8.comp` reproduces the deployed
+`c32_f2_i8.spv` (f52e5264...) byte for byte; every splice below is anchored on a
+unique line and asserted, and the script writes a machine-checkable account.
+
+Six splices:
+  R1  binding + shared declarations   (int8 K/V/Q/P staging, new b9/b10)
+  R2  body INT8 helpers               (inserted before nrf2_project_and_blend)
+  R3  projection MMA                  (1 FP16 K64 loop -> 2 int8 K32 steps)
+  R4  Y -> int8 publishing            (replaces the two NRH_B joins)
+  R5  QKV                             (24 FP16 MMA -> 12 int8 MMA)
+  R6  post-norm .. stores             (16 score + 16 PV + 8 output -> 8 + 8 + 4)
+"""
+import json
+import sys
+from pathlib import Path
+
+ROOT = Path("@NR_WORKSPACE@")
+SRC = ROOT / "candidates/int8-coverage-v2-20261020/C/c32-i8-debug-eact-v1/source/c32_f2_i8.comp"
+OUT = ROOT / "work/dsh-int8-fullnet-impl-20261024/candidates/c32-f1-f2/source/c32_f2_i8_body.comp"
+ACC = ROOT / "work/dsh-int8-fullnet-impl-20261024/candidates/c32-f1-f2/evidence/SPLICE.json"
+
+
+def die(msg):
+    print("SPLICE-FAIL:", msg)
+    sys.exit(2)
+
+
+# ---------------------------------------------------------------- R1 -------
+R1_OLD = """// ---- C32-I8 v1 declarations (generated) ----------------------------------
+layout(set=0,binding=7) readonly buffer C32I8Weights { int8_t w8[]; };
+layout(set=0,binding=8) readonly buffer C32I8Scales { float fsc[]; };
+shared int8_t sX8[2048];
+shared int8_t sE8[8192];
+#include "c32_i8_common.glsl"
+// --------------------------------------------------------------------------
+
+shared float16_t shK[2048];
+shared float16_t shV[2048];"""
+
+R1_NEW = """// ---- C32-I8 v1 declarations (generated) ----------------------------------
+layout(set=0,binding=7) readonly buffer C32I8Weights { int8_t w8[]; };
+layout(set=0,binding=8) readonly buffer C32I8Scales { float fsc[]; };
+// c32-f1-f2: body-stage INT8 weight tiles (b9) and per-output-channel static
+// weight scales (b10).  Both are new descriptors; b0..b8 are untouched.
+layout(set=0,binding=9) readonly buffer C32I8BodyWeights { int8_t wb8[]; };
+layout(set=0,binding=10) readonly buffer C32I8BodyScales { float fsc2[]; };
+shared int8_t sX8[2048];
+shared int8_t sE8[8192];
+#include "c32_i8_common.glsl"
+// --------------------------------------------------------------------------
+// The published K/V tiles are int8 in this card: the FP16 copies had exactly
+// one reader each (score / PV) and no other stage, and the debug dumps still
+// write the FP16 registers, so the FP16 shared tiles are dropped outright.
+shared int8_t shK8[2048];
+shared int8_t shV8[2048];
+shared float shKV[8];"""
+
+# ---------------------------------------------------------------- R2 -------
+R2 = """// ---- C32-I8 body helpers (c32-f1-f2) --------------------------------------
+// Weight tile bases inside C32I8BodyWeights (bytes).  An 8x32 I8A tile occupies
+// 1024 bytes of address space with 256 live codes (stride 32, LCOL), exactly the
+// convention the deployed FFN pack already uses.
+#define C32I8B_WQ 32768u
+#define C32I8B_WK 36864u
+#define C32I8B_WV 40960u
+#define C32I8B_WO 45056u
+#define C32I8B_WP 49152u
+// Static per-output-channel weight scales inside C32I8BodyScales.
+#define C32I8B_SQ 0u
+#define C32I8B_SK 32u
+#define C32I8B_SV 64u
+#define C32I8B_SO 96u
+#define C32I8B_SP 128u
+// Shared int8 staging carved out of sE8, which is dead once the contract has
+// consumed E: Q8[sg] is [tok][dim] stride 32 (512 B), P8[sg] is two [tok][key]
+// tiles of 512 B.  Total 2048 + 4096 = 6144 of sE8's 8192 bytes.
+#define C32I8B_Q8 0u
+#define C32I8B_P8 2048u
+
+// Largest |component| a lane holds in one 8x16 half fragment.
+float nr_i8_amax(NRH_CH a) {
+    float m = 0.0;
+    for (int i = 0; i < 4; ++i) m = max(m, abs(float(a[i])));
+    return m;
+}
+// Subgroup max by shuffle-xor (the module only enables the shuffle extension,
+// so subgroupMax/subgroupAdd are deliberately not used).
+float nr_i8_sgmax(float v) {
+    for (uint m = 16u; m > 0u; m >>= 1u) v = max(v, subgroupShuffleXor(v, uint(m)));
+    return v;
+}
+// sX8 staging with a caller-supplied inverse scale: element (row, col) of the
+// fragment lands at base + col*32 + rowoff + row, i.e. the [token][channel]
+// stride-32 I8B tile that coopMatLoad(...,32,LCOL) reads.
+void nr_i8_put_ys(NRH_CH a, uint rowoff, uint base, float inv) {
+    for (int i = 0; i < 4; ++i) {
+        uvec2 rc = nrh_coord_CH(uint(i));
+        sX8[base + rc.y * 32u + rowoff + rc.x] = int8_t(nr_i8_code(a[i], inv));
+    }
+}
+// sE8 Q8 tile: [sg][token][dim] stride 32.
+void nr_i8_put_q(NRH_CH a, uint rowoff, uint base, float inv) {
+    for (int i = 0; i < 4; ++i) {
+        uvec2 rc = nrh_coord_CH(uint(i));
+        sE8[C32I8B_Q8 + base + rc.y * 32u + rowoff + rc.x] = int8_t(nr_i8_code(a[i], inv));
+    }
+}
+// Published K/V tiles: [key 0..63][lane 0..31] stride 32, key = keybase + token.
+void nr_i8_put_k(NRH_CH a, uint rowoff, uint keybase, float inv) {
+    for (int i = 0; i < 4; ++i) {
+        uvec2 rc = nrh_coord_CH(uint(i));
+        shK8[(keybase + rc.y) * 32u + rowoff + rc.x] = int8_t(nr_i8_code(a[i], inv));
+    }
+}
+void nr_i8_put_v(NRH_CH a, uint rowoff, uint keybase, float inv) {
+    for (int i = 0; i < 4; ++i) {
+        uvec2 rc = nrh_coord_CH(uint(i));
+        shV8[(keybase + rc.y) * 32u + rowoff + rc.x] = int8_t(nr_i8_code(a[i], inv));
+    }
+}
+// sE8 P tile: [sg][key tile 32][token][key%32] stride 32.
+void nr_i8_put_p(NRH_CH a, uint keyrow, uint tileoff, uint base, float inv) {
+    for (int i = 0; i < 4; ++i) {
+        uvec2 rc = nrh_coord_CH(uint(i));
+        sE8[C32I8B_P8 + base + tileoff + rc.y * 32u + keyrow + rc.x] =
+            int8_t(nr_i8_code(a[i], inv));
+    }
+}
+// Dequantisation, folded exactly once: static per-output-channel weight scale
+// times the activation scale that was used to build the int8 operand.
+NRH_C nr_i8_deq2(I8C a, uint sbase, float sAct) {
+    I8F f = I8F(a);
+    NRH_C o = NRH_C(0.0);
+    for (int i = 0; i < 4; ++i) {
+        uvec2 rc = nrh_coord_C(uint(i));
+        o[i] = f[i] * (fsc2[sbase + rc.x] * sAct);
+    }
+    return o;
+}
+NRH_C nr_i8_deq2_add(I8C a, uint sbase, float sAct, NRH_C seed) {
+    I8F f = I8F(a);
+    NRH_C o = NRH_C(0.0);
+    for (int i = 0; i < 4; ++i) {
+        uvec2 rc = nrh_coord_C(uint(i));
+        o[i] = f[i] * (fsc2[sbase + rc.x] * sAct) + seed[i];
+    }
+    return o;
+}
+// Pure dynamic-operand dequantisation (no static weight column): score and PV
+// both sit between two self-calibrated activations.
+NRH_C nr_i8_deq_s(I8C a, float s) {
+    I8F f = I8F(a);
+    NRH_C o = NRH_C(0.0);
+    for (int i = 0; i < 4; ++i) o[i] = f[i] * s;
+    return o;
+}
+// --------------------------------------------------------------------------
+"""
+
+# ---------------------------------------------------------------- R3 -------
+R3_OLD = """    // ---- projection: SG role (row half = sg2>>1, channel group = sg2&1) ----
+    // The bound projection kernel (PROJECT_WG=32, PROJECT_GATHER=0, K=64)
+    // computes c00/c01/c10/c11 with A = 8 coarse tokens x 16 K RowMajor from
+    // block65_out and B = 16x16 ColumnMajor weight tiles; K chunks ascend.
+    // One fragment per subgroup keeps that per-element K order bit-identical.
+    {
+        const uint rh = sg2 >> 1u;            // coarse tokens 0-7 / 8-15
+        const uint cg = sg2 & 1u;             // channels 0-15 / 16-31
+        const uint tile65 = wy2 * pc.p4.w + wx2;
+        const uint abase = pc.p4.x + tile65 * (pc.p5.x / 16u) * 256u
+                         + rh * 128u;
+        const uint wbase = pc.p4.y + cg * (pc.p5.x / 16u) * 256u;
+        NR2_MC acc = NR2_MC(0.0);
+        for (uint kc = 0u; kc < pc.p5.x; kc += 16u) {
+            NR2_MA a; NR2_MB b;
+            coopMatLoad(a, x65, abase + (kc / 16u) * 256u, 16u, LROW);
+            coopMatLoad(b, pw, wbase + (kc / 16u) * 256u, 16u, LCOL);
+            acc = coopMatMulAdd(a, b, acc);
+        }
+        // one fp16 narrowing, exactly the bound kernel's MH store rounding
+        NR2_MH h = NR2_MH(acc);
+        coopMatStore(h, nrf2_proj, rh * 8u * 32u + cg * 16u, 32u, LROW);
+    }"""
+
+R3_NEW = """    // ---- projection: SG role (row half = sg2>>1, channel group = sg2&1) ----
+    // INT8 in this card.  A = 8 coarse tokens x pc.p5.x channels of block65_out,
+    // B = per-output-channel statically quantised weight tiles.  The activation
+    // scale is ONE scalar per subgroup over the whole 8 x K block, because the
+    // accumulator runs over the complete K before the single dequantisation.
+    {
+        const uint rh = sg2 >> 1u;            // coarse tokens 0-7 / 8-15
+        const uint cg = sg2 & 1u;             // channels 0-15 / 16-31
+        const uint tile65 = wy2 * pc.p4.w + wx2;
+        const uint abase = pc.p4.x + tile65 * (pc.p5.x / 16u) * 256u
+                         + rh * 128u;
+        // 1) stage the live 8 x K window as int8 (sE8 is free until the body's
+        //    expand writes it, and a full barrier separates the two).
+        float amax = 0.0;
+        for (uint tt = 0u; tt < 8u; ++tt)
+            for (uint kk = lane2; kk < pc.p5.x; kk += 32u)
+                amax = max(amax, abs(float(x65[abase + tt * 16u + kk])));
+        const float asum = nr_i8_sgmax(amax);
+        const float sA = max(asum, 1e-12) / 127.0;
+        const float invA = 127.0 / max(asum, 1e-12);
+        for (uint tt = 0u; tt < 8u; ++tt)
+            for (uint kk = lane2; kk < pc.p5.x; kk += 32u)
+                sE8[sg2 * 2048u + kk * 32u + tt] =
+                    int8_t(nr_i8_code(x65[abase + tt * 16u + kk], invA));
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        // 2) K completed as int8 K32 steps against the static weight tiles
+        I8C acc = I8C(0);
+        for (uint kc = 0u; kc < pc.p5.x; kc += 32u) {
+            I8A a; I8B b;
+            coopMatLoad(a, sE8, sg2 * 2048u + (kc / 32u) * 1024u, 32u, LCOL);
+            coopMatLoad(b, wb8, C32I8B_WP + cg * 1024u + (kc / 32u) * 512u, 32u, LCOL);
+            acc = coopMatMulAdd(a, b, acc);
+        }
+        // one fp16 narrowing, exactly the bound kernel's MH store rounding
+        I8F accf = I8F(acc);
+        NR2_MH h = NR2_MH(float16_t(0.0));
+        for (int i = 0; i < 4; ++i) {
+            uvec2 rc = nrh_coord_C(uint(i));
+            h[i] = float16_t(accf[i] * (fsc2[C32I8B_SP + cg * 16u + rc.x] * sA));
+        }
+        coopMatStore(h, nrf2_proj, rh * 8u * 32u + cg * 16u, 32u, LROW);
+    }"""
+
+# ---------------------------------------------------------------- R4 -------
+R4_OLD = """        NRH_B yb0 = nrh_join_rows_to_B(y0, y1);
+        NRH_B yb1 = nrh_join_rows_to_B(y2, y3);"""
+
+R4_NEW = """        // ---- C32-I8: quantise the contract output once, publish it as the
+        // QKV B operand.  X's int8 copy in sX8 is dead once expand consumed it.
+        float ya = max(max(nr_i8_amax(y0), nr_i8_amax(y1)),
+                       max(nr_i8_amax(y2), nr_i8_amax(y3)));
+        float ysum = nr_i8_sgmax(ya);
+        float sY = max(ysum, 1e-12) / 127.0;
+        float invY = 127.0 / max(ysum, 1e-12);
+        nr_i8_put_ys(y0, 0u, sg * 512u, invY);
+        nr_i8_put_ys(y1, 8u, sg * 512u, invY);
+        nr_i8_put_ys(y2, 16u, sg * 512u, invY);
+        nr_i8_put_ys(y3, 24u, sg * 512u, invY);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        I8B yq8;
+        coopMatLoad(yq8, sX8, sg * 512u, 32u, LCOL);"""
+
+# ---------------------------------------------------------------- R5 -------
+QW = "C32I8B_WQ"
+KW = "C32I8B_WK"
+VW = "C32I8B_WV"
+QSB = "C32I8B_SQ"
+KSB = "C32I8B_SK"
+VSB = "C32I8B_SV"
+
+
+def qkv_block():
+    o = []
+    o.append("        // ---- C32-I8 QKV: one int8 K32 step per output fragment")
+    o.append("        //      (was 24 FP16 MMA, 8 per group; K16 x2 -> K32).")
+    o.append("        NRH_CH k0, k1, k2, k3, v0, v1, v2, v3;")
+    o.append("        NRH_C zq0, zq1, zq2, zq3, zk0, zk1, zk2, zk3, zv0, zv1, zv2, zv3;")
+    o.append("        {")
+    o.append("            I8A wa; I8C a0;")
+    for grp, (wbase, sbase, dst) in enumerate([
+            (QW, "C32I8B_SQ", "zq"), (KW, "C32I8B_SK", "zk"), (VW, "C32I8B_SV", "zv")]):
+        o.append("            // %s" % ("QKV"[grp]))
+        for f in range(4):
+            o.append("            a0 = I8C(0);")
+            o.append("            coopMatLoad(wa, wb8, %s + %du, 32u, LCOL);" % (wbase, 1024 * f))
+            o.append("            a0 = coopMatMulAdd(wa, yq8, a0);")
+            o.append("            %s%d = nr_i8_deq2(a0, %s + %du, sY);" % (dst, f, sbase, 8 * f))
+    o.append("        }")
+    for f in range(4):
+        o.append("        q%d = nrh_narrow(zq%d);" % (f, f))
+    for f in range(4):
+        o.append("        k%d = nrh_narrow(zk%d);" % (f, f))
+    for f in range(4):
+        o.append("        v%d = nrh_narrow(zv%d);" % (f, f))
+    return "\n".join(o)
+
+
+def norm_and_publish():
+    o = []
+    o.append("        // Norm and reciprocal are per token; no subgroupAdd or alternate tree.")
+    o.append("        f16vec2 norm_pair=nr_norm32_pair(q0,q1,q2,q3,k0,k1,k2,k3);")
+    o.append("        float16_t scalar0 = float16_t(fb[uint(pc.p2.z)]);")
+    for f in range(4):
+        for j in range(4):
+            o.append("        {")
+            o.append("            float16_t qn=norm_pair.x, kn=norm_pair.y;")
+            o.append("            float16_t qr = q%d[%d] * qn;" % (f, j))
+            o.append("            qr = qr * scalar0;")
+            o.append("            q%d[%d] = qr;" % (f, j))
+            o.append("            k%d[%d] = k%d[%d] * kn;" % (f, j, f, j))
+            o.append("        }")
+        o.append("        if (debug) coopMatStore(q%d, dbg, 10240u+t0*32u+%du, 32u, LCOL);" % (f, 8 * f))
+        o.append("        if (debug) coopMatStore(k%d, dbg, 12288u+t0*32u+%du, 32u, LCOL);" % (f, 8 * f))
+    o.append("        // ---- C32-I8 activation scales for the attention stage ----")
+    o.append("        // Q is consumed only by its own subgroup, so one scalar per")
+    o.append("        // subgroup (16 queries x 32 dims) is sound.  K and V are")
+    o.append("        // published tiles and the PV accumulator runs over all 64")
+    o.append("        // keys, so both need ONE workgroup scalar: a per-chunk scale")
+    o.append("        // could not be folded out of a single dequantisation.")
+    o.append("        float sK, sV, sQ;")
+    o.append("        {")
+    o.append("            float qa = max(max(nr_i8_amax(q0), nr_i8_amax(q1)), max(nr_i8_amax(q2), nr_i8_amax(q3)));")
+    o.append("            float ka = max(max(nr_i8_amax(k0), nr_i8_amax(k1)), max(nr_i8_amax(k2), nr_i8_amax(k3)));")
+    o.append("            float va = max(max(nr_i8_amax(v0), nr_i8_amax(v1)), max(nr_i8_amax(v2), nr_i8_amax(v3)));")
+    o.append("            float qs = nr_i8_sgmax(qa);")
+    o.append("            float ks = nr_i8_sgmax(ka);")
+    o.append("            float vs = nr_i8_sgmax(va);")
+    o.append("            if (lane == 0u) { shKV[sg] = ks; shKV[4u + sg] = vs; }")
+    o.append("            barrier();")
+    o.append("            float gk = max(max(shKV[0u], shKV[1u]), max(shKV[2u], shKV[3u]));")
+    o.append("            float gv = max(max(shKV[4u], shKV[5u]), max(shKV[6u], shKV[7u]));")
+    o.append("            sK = max(gk, 1e-12) / 127.0;")
+    o.append("            sV = max(gv, 1e-12) / 127.0;")
+    o.append("            sQ = max(qs, 1e-12) / 127.0;")
+    o.append("            float invK = 127.0 / max(gk, 1e-12);")
+    o.append("            float invV = 127.0 / max(gv, 1e-12);")
+    o.append("            float invQ = 127.0 / max(qs, 1e-12);")
+    for f in range(4):
+        o.append("            nr_i8_put_k(k%d, %du, sg * 16u, invK);" % (f, 8 * f))
+    for f in range(4):
+        o.append("            nr_i8_put_v(v%d, %du, sg * 16u, invV);" % (f, 8 * f))
+    for f in range(4):
+        o.append("            nr_i8_put_q(q%d, %du, sg * 512u, invQ);" % (f, 8 * f))
+    o.append("            memoryBarrierShared();")
+    o.append("            barrier();")
+    o.append("        }")
+    return "\n".join(o)
+
+
+def score_block():
+    o = []
+    o.append("        // S^T[key,query] = K[key,dim] * Q[dim,query], one int8 K32 step.")
+    o.append("        I8B qb8;")
+    o.append("        coopMatLoad(qb8, sE8, C32I8B_Q8 + sg * 512u, 32u, LCOL);")
+    for f in range(8):
+        o.append("        NRH_CH p%d;" % f)
+        o.append("        {")
+        o.append("            I8C sc8 = I8C(0);")
+        o.append("            {")
+        o.append("                I8A a;")
+        o.append("                coopMatLoad(a, shK8, %du, 32u, LCOL);" % (256 * f))
+        o.append("                sc8 = coopMatMulAdd(a, qb8, sc8);")
+        o.append("            }")
+        o.append("            NRH_C sc = nr_i8_deq_s(sc8, sK * sQ);")
+        o.append("            NRH_C bias;")
+        o.append("            coopMatLoad(bias, fb, uint(pc.p2.w)+t0*64u+%du, 64u, LCOL);" % (8 * f))
+        for j in range(4):
+            o.append("            precise float nr_score_biased_%d_%d = sc[%d] + bias[%d];" % (f, j, j, j))
+            o.append("            sc[%d] = nr_score_biased_%d_%d;" % (j, f, j))
+        o.append("            p%d = nrh_narrow(sc);" % f)
+        o.append("            {f16vec2 e01=nr_exp_h2(f16vec2(p%d[0],p%d[1]));p%d[0]=e01.x;p%d[1]=e01.y;" % (f, f, f, f))
+        o.append("             f16vec2 e23=nr_exp_h2(f16vec2(p%d[2],p%d[3]));p%d[2]=e23.x;p%d[3]=e23.y;}" % (f, f, f, f))
+        o.append("        }")
+    return "\n".join(o)
+
+
+def denom_and_p():
+    o = []
+    o.append("        // Original64-key half denominator. Every operation/node is literal.")
+    for j in range(4):
+        o.append("        float16_t den%d=float16_t(0.0);" % j)
+        for k in range(4):
+            o.append("        float16_t den_pair_%d_%d=p%d[%d]+p%d[%d];" % (j, k, 2 * k, j, 2 * k + 1, j))
+            o.append("        den%d=den%d+den_pair_%d_%d;" % (j, j, j, k))
+    o.append("        float16_t denpartial=(den0+den1)+(den2+den3);")
+    o.append("        uint den_bits=nrh_pack2(denpartial,denpartial);")
+    o.append("        float16_t denpeer=nrh_unpack2(subgroupShuffleXor(den_bits,16u)).x;")
+    o.append("        bool iseven=(lane&16u)==0u;")
+    o.append("        float16_t even=iseven?denpartial:denpeer, odd=iseven?denpeer:denpartial;")
+    o.append("        float16_t sum = even+odd;")
+    o.append("        float16_t inv = float16_t(1.0/max(float(sum),6.103515625e-05));")
+    for f in range(8):
+        for j in range(4):
+            o.append("        {")
+            o.append("            float16_t r=inv;")
+            o.append("            p%d[%d] = p%d[%d] * r;" % (f, j, f, j))
+            o.append("        }")
+        o.append("        if (debug) coopMatStore(p%d, dbg, 14336u+t0*64u+%du, 64u, LCOL);" % (f, 8 * f))
+    o.append("        // ---- C32-I8 P tile: one scalar per subgroup over 64 keys x 16")
+    o.append("        // tokens; the PV accumulator spans all 64 keys, so it must be one.")
+    o.append("        float sP;")
+    o.append("        {")
+    o.append("            float pa = max(max(nr_i8_amax(p0), nr_i8_amax(p1)), max(nr_i8_amax(p2), nr_i8_amax(p3)));")
+    o.append("            pa = max(pa, max(max(nr_i8_amax(p4), nr_i8_amax(p5)), max(nr_i8_amax(p6), nr_i8_amax(p7))));")
+    o.append("            float ps = nr_i8_sgmax(pa);")
+    o.append("            sP = max(ps, 1e-12) / 127.0;")
+    o.append("            float invP = 127.0 / max(ps, 1e-12);")
+    for f in range(8):
+        tile = 512 * (f // 4)
+        row = 8 * (f % 4)
+        o.append("            nr_i8_put_p(p%d, %du, %du, sg * 1024u, invP);" % (f, row, tile))
+    o.append("            subgroupMemoryBarrierShared();")
+    o.append("            subgroupBarrier();")
+    o.append("        }")
+    return "\n".join(o)
+
+
+def pv_and_out():
+    o = []
+    o.append("        // Ctx^T = V^T * P^T; reciprocal and per-entry H already applied.")
+    o.append("        // INT8: 4 channel fragments x 2 key chunks of 32 (was 16 FP16 MMA).")
+    o.append("        I8C tc0 = I8C(0);")
+    o.append("        I8C tc1 = I8C(0);")
+    o.append("        I8C tc2 = I8C(0);")
+    o.append("        I8C tc3 = I8C(0);")
+    o.append("        {")
+    o.append("            I8A a; I8B pb;")
+    for kc in range(2):
+        o.append("            coopMatLoad(pb, sE8, C32I8B_P8 + sg * 1024u + %du, 32u, LCOL);" % (512 * kc))
+        for f in range(4):
+            o.append("            coopMatLoad(a, shV8, %du, 32u, LCOL);" % (1024 * kc + 8 * f))
+            o.append("            tc%d = coopMatMulAdd(a, pb, tc%d);" % (f, f))
+    o.append("        }")
+    for f in range(4):
+        o.append("        NRH_C tcd%d = nr_i8_deq_s(tc%d, sV * sP);" % (f, f))
+    for f in range(4):
+        o.append("        NRH_CH ctx%d = nrh_narrow(tcd%d);" % (f, f))
+        o.append("        if (debug) coopMatStore(ctx%d, dbg, 18432u+t0*32u+%du, 32u, LCOL);" % (f, 8 * f))
+    o.append("        // ---- C32-I8 Ctx tile for the output projection ----------")
+    o.append("        float sC;")
+    o.append("        {")
+    o.append("            float ca = max(max(nr_i8_amax(ctx0), nr_i8_amax(ctx1)), max(nr_i8_amax(ctx2), nr_i8_amax(ctx3)));")
+    o.append("            float cs = nr_i8_sgmax(ca);")
+    o.append("            sC = max(cs, 1e-12) / 127.0;")
+    o.append("            float invC = 127.0 / max(cs, 1e-12);")
+    for f in range(4):
+        o.append("            nr_i8_put_ys(ctx%d, %du, sg * 512u, invC);" % (f, 8 * f))
+    o.append("            subgroupMemoryBarrierShared();")
+    o.append("            subgroupBarrier();")
+    o.append("        }")
+    o.append("        I8B cb8;")
+    o.append("        coopMatLoad(cb8, sX8, sg * 512u, 32u, LCOL);")
+    o.append("        // Projection residual is H(Y*ars) BEFORE original K0,16.")
+    for f in range(4):
+        o.append("        NRH_C oc%d;" % f)
+        o.append("        {")
+        o.append("            NRH_CH scale;")
+        o.append("            coopMatLoad(scale,wb,uint(pc.p2.y)+%du,0u,LCOL);" % (8 * f))
+        o.append("            NRH_CH seed = y%d * scale;" % f)
+        o.append("            oc%d = nrh_widen_exact(seed);" % f)
+        o.append("        }")
+    o.append("        {")
+    o.append("            I8A wa; I8C a0;")
+    for f in range(4):
+        o.append("            a0 = I8C(0);")
+        o.append("            coopMatLoad(wa, wb8, C32I8B_WO + %du, 32u, LCOL);" % (1024 * f))
+        o.append("            a0 = coopMatMulAdd(wa, cb8, a0);")
+        o.append("            oc%d = nr_i8_deq2_add(a0, C32I8B_SO + %du, sC, oc%d);" % (f, 8 * f, f))
+    o.append("        }")
+    for f in range(4):
+        o.append("        NRH_CH o%d = nrh_narrow(oc%d);" % (f, f))
+        o.append("        if (debug) coopMatStore(o%d,dbg,20480u+t0*32u+%du,32u,LCOL);" % (f, 8 * f))
+        o.append("        bool o_oob%d;" % f)
+        o.append("        uint o_base%d=nr_tok_addr(t0,%du,wx,wy,shift,tiles_x,o_oob%d);" % (f, 8 * f, f))
+        o.append("        if (!o_oob%d) coopMatStore(o%d,imgout,o_base%d,16u,LCOL);" % (f, f, f))
+    return "\n".join(o)
+
+
+def main():
+    src = SRC.read_text(encoding="utf-8")
+    lines = src.split("\n")
+    acc = {"parent": str(SRC), "splices": []}
+
+    def expect(old, new, tag):
+        nonlocal src
+        n = src.count(old)
+        if n != 1:
+            die("%s: anchor count %d (expected 1)" % (tag, n))
+        src = src.replace(old, new, 1)
+        acc["splices"].append({"id": tag, "old_bytes": len(old.encode()),
+                               "new_bytes": len(new.encode())})
+
+    expect(R1_OLD, R1_NEW, "R1-declarations")
+    expect("void nrf2_project_and_blend() {", R2 + "\nvoid nrf2_project_and_blend() {",
+           "R2-helpers")
+    expect(R3_OLD, R3_NEW, "R3-projection")
+    expect(R4_OLD, R4_NEW, "R4-y-quantise")
+
+    # R5: the whole Q/K/V section, from its banner comment up to (excluding) the
+    # norm comment.  Anchor on both ends.
+    i0 = src.index("        // Q/K/V share the two resident Y operands; original K0,16.")
+    i1 = src.index("        // Norm and reciprocal are per token; no subgroupAdd or alternate tree.")
+    if i1 <= i0:
+        die("R5 span")
+    old = src[i0:i1]
+    src = src[:i0] + qkv_block() + "\n" + src[i1:]
+    acc["splices"].append({"id": "R5-qkv", "old_bytes": len(old.encode()),
+                           "new_bytes": len(qkv_block().encode()),
+                           "old_fp16_mma": old.count("coopMatMulAdd"),
+                           "new_int8_mma": qkv_block().count("coopMatMulAdd")})
+
+    # R6: from the norm block through the last imgout store.
+    j0 = src.index("        // Norm and reciprocal are per token; no subgroupAdd or alternate tree.")
+    j1 = src.index("        if (!o_oob3) coopMatStore(o3,imgout,o_base3,16u,LCOL);")
+    j1 += len("        if (!o_oob3) coopMatStore(o3,imgout,o_base3,16u,LCOL);")
+    old6 = src[j0:j1]
+    new6 = "\n".join([norm_and_publish(), score_block(), denom_and_p(),
+                      pv_and_out()])
+    src = src[:j0] + new6 + src[j1:]
+    acc["splices"].append({"id": "R6-attention", "old_bytes": len(old6.encode()),
+                           "new_bytes": len(new6.encode()),
+                           "old_fp16_mma": old6.count("coopMatMulAdd"),
+                           "new_int8_mma": new6.count("coopMatMulAdd"),
+                           "old_coopmat_load": old6.count("coopMatLoad"),
+                           "new_coopmat_load": new6.count("coopMatLoad")})
+
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(src, encoding="utf-8")
+    acc["out"] = str(OUT)
+    acc["out_bytes"] = len(src.encode())
+    acc["out_lines"] = src.count("\n") + 1
+    acc["total_fp16_mma_removed"] = 24 + (old6.count("coopMatMulAdd"))
+    ACC.parent.mkdir(parents=True, exist_ok=True)
+    ACC.write_text(json.dumps(acc, indent=1), encoding="utf-8")
+    print(json.dumps(acc, indent=1))
+
+
+if __name__ == "__main__":
+    main()

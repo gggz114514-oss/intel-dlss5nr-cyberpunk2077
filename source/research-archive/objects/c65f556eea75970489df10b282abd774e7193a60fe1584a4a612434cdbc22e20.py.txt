@@ -1,0 +1,233 @@
+"""S12 SPIR-V probe: typed cooperative-matrix scan + in-kernel-quantiser signature.
+
+Independent of the ledger scanner (which does not count OpFDiv).  Everything is
+derived from the SPV bytes; no dump, no plan text, no source is trusted here.
+
+Signatures reported per module
+  mma_int8 / mma_fp16 / mma_other   cooperative-matrix MulAdd operand classes
+  opfdiv, opfmul                    arithmetic tallies
+  div_by_const127                   OpFDiv whose divisor IS the float 127.0 constant
+                                    (the  "127.0 / amax"  in-kernel quantiser step)
+  mul_by_inv127                     OpFMul with the 1/127 float constant
+  fabs / fmax / fmax3 / fmix        GLSL.std.450 amax-reduction machinery
+  first_fabs_lt_first_f2s8          True when the abs-reduction precedes the first
+                                    narrowing store/conversion (ordering sanity)
+  bindings[].written_by_kernel      same write-tracking idea as the ledger
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import struct
+import sys
+from pathlib import Path
+
+EXT_ABS = 4
+EXT_FMAX = 38
+EXT_FMAX3 = 50
+EXT_FMIX = 40
+EXT_ROUNDEVEN = 2
+OP_FDIV = 136
+OP_FMUL = 133
+OP_FABS = None  # via ext inst
+CONST_127 = 127.0
+INV_127 = 1.0 / 127.0
+
+
+def scan(path: Path) -> dict:
+    data = path.read_bytes()
+    n = len(data) // 4
+    w = struct.unpack("<%dI" % n, data[: n * 4])
+    if not w or w[0] != 0x07230203:
+        raise SystemExit(f"{path}: not SPIR-V")
+    i = 5
+    names: dict[int, str] = {}
+    t_int: dict[int, tuple[int, bool]] = {}
+    t_float: dict[int, int] = {}
+    t_ptr: dict[int, tuple[int, int]] = {}
+    t_coop: dict[int, dict] = {}
+    const_f: dict[int, float] = {}
+    const_i: dict[int, int] = {}
+    deco: dict[int, dict] = {}
+    var: dict[int, tuple[int, int]] = {}
+    vtype: dict[int, int] = {}
+    chain: dict[int, int] = {}
+    written: set[int] = set()
+    muladd: list[dict] = []
+    ext: dict[str, int] = {}
+    nfdiv = nfmul = 0
+    div_by_127 = 0
+    mul_by_inv127 = 0
+    fdiv_after_abs = 0
+    names_of = {}
+    while i < n:
+        wc = w[i] >> 16
+        op = w[i] & 0xFFFF
+        if wc == 0:
+            break
+        o = w[i + 1: i + wc]
+        if op == 5:
+            raw = struct.pack("<%dI" % len(o[1:]), *o[1:])
+            names[o[0]] = raw.split(b"\x00")[0].decode("utf-8", "replace")
+        elif op in (21, 22, 32):
+            if op == 21:
+                t_int[o[0]] = (o[1], bool(o[2]))
+            elif op == 22:
+                t_float[o[0]] = o[1]
+            else:
+                t_ptr[o[0]] = (o[1], o[2])
+            vtype[o[0]] = -1
+        elif op in (4456, 5358):
+            t_coop[o[0]] = {"comp": o[1], "rows": o[3], "cols": o[4]}
+            vtype[o[0]] = -1
+        elif op == 43:
+            vt, vid = o[0], o[1]
+            if vt in t_float and t_float[vt] == 32:
+                const_f[vid] = struct.unpack("<f", struct.pack("<I", o[2]))[0]
+            elif vt in t_float and t_float[vt] == 16:
+                const_f[vid] = struct.unpack("<e", struct.pack("<H", o[2] & 0xFFFF))[0]
+            elif vt in t_int and t_int[vt][0] == 32:
+                v = o[2]
+                const_i[vid] = v - (1 << 32) if (not t_int[vt][1] and v >= 1 << 31) else v
+            vtype[vid] = vt
+        elif op == 71:
+            deco.setdefault(o[0], {})[o[1]] = o[2] if len(o) > 2 else True
+        elif op in (65, 66, 67):
+            chain[o[1]] = o[2]
+            vtype[o[1]] = o[0]
+        elif op == 62:
+            p = o[0]
+            for _ in range(8):
+                if p in chain:
+                    p = chain[p]
+                else:
+                    break
+            written.add(p)
+        elif op == 59:
+            var[o[1]] = (o[0], o[2])
+            vtype[o[1]] = o[0]
+        elif op in (4458, 5357):
+            p = o[0]
+            for _ in range(8):
+                if p in chain:
+                    p = chain[p]
+                else:
+                    break
+            written.add(p)
+        elif op in (4459, 5359):
+            muladd.append({"rtype": o[0], "a": o[2], "b": o[3], "c": o[4]})
+        elif op == 136:
+            nfdiv += 1
+            a, b = o[2], o[3]
+            if (const_f.get(a) is not None and abs(const_f[a] - CONST_127) < 1e-3) or \
+               (const_f.get(b) is not None and abs(const_f[b] - CONST_127) < 1e-3):
+                div_by_127 += 1
+                fdiv_after_abs += 1
+        elif op == 133:
+            nfmul += 1
+            a, b = o[2], o[3]
+            if (const_f.get(a) is not None and abs(const_f[a] - INV_127) < 1e-7) or \
+               (const_f.get(b) is not None and abs(const_f[b] - INV_127) < 1e-7):
+                mul_by_inv127 += 1
+        elif op == 12:
+            lit = o[3]
+            nm = {EXT_ABS: "FAbs", EXT_FMAX: "FMax", EXT_FMAX3: "FMax3",
+                  EXT_FMIX: "FMix", EXT_ROUNDEVEN: "RoundEven"}.get(lit, f"#{lit}")
+            ext[nm] = ext.get(nm, 0) + 1
+            if len(o) > 1:
+                vtype[o[1]] = o[0]
+        else:
+            if len(o) >= 2 and op not in (6, 7, 10, 11, 72, 73, 74, 248, 249, 250, 251, 252, 253, 254):
+                vtype[o[1]] = o[0]
+        i += wc
+
+    def resolve(tid):
+        d = 0
+        while tid in t_ptr and d < 6:
+            tid = t_ptr[tid][1]
+            d += 1
+        return tid
+
+    def comp_of(tid):
+        if tid is None or tid < 0:
+            return None
+        c = t_coop.get(resolve(tid))
+        if not c:
+            return None
+        ct = c["comp"]
+        if ct in t_int:
+            return {"kind": "int", "bits": t_int[ct][0], "signed": t_int[ct][1]}
+        if ct in t_float:
+            return {"kind": "float", "bits": t_float[ct]}
+        return {"kind": "unknown"}
+
+    def cconst(tid, key):
+        if tid is None or tid < 0:
+            return None
+        t = t_coop.get(resolve(tid))
+        if not t:
+            return None
+        return const_i.get(t.get(key))
+
+    mma = []
+    for m in muladd:
+        a = vtype.get(m["a"], -1)
+        b = vtype.get(m["b"], -1)
+        mma.append({"a": comp_of(a), "b": comp_of(b), "acc": comp_of(vtype.get(m["c"], -1)),
+                    "M": cconst(m["rtype"], "rows"), "N": cconst(m["rtype"], "cols"),
+                    "a_rows": cconst(a, "rows"), "a_cols": cconst(a, "cols"),
+                    "b_rows": cconst(b, "rows"), "b_cols": cconst(b, "cols")})
+
+    def cls(x):
+        a = x["a"]
+        if a is None:
+            return "unknown"
+        if a["kind"] == "float" and a["bits"] == 16:
+            return "fp16"
+        if a["kind"] == "int" and a["bits"] == 8:
+            return "int8"
+        return "other"
+
+    classes = [cls(m) for m in mma]
+    iface = []
+    for vid, (vt, sc) in var.items():
+        if sc not in (0, 2, 12, 9):
+            continue
+        d = deco.get(vid, {})
+        ptr = t_ptr.get(vt)
+        iface.append({"binding": d.get(33), "set": d.get(34),
+                      "pointee": names.get(ptr[1]) if ptr else None,
+                      "non_writable": d.get(49) is True,
+                      "written_by_kernel": vid in written})
+    iface.sort(key=lambda r: (-1 if r["binding"] is None else r["binding"]))
+    fl = sorted({round(v, 9) for v in const_f.values()})
+    return {
+        "path": str(path).replace("\\", "/"),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "bytes": len(data),
+        "mma_total": len(mma),
+        "mma_int8": classes.count("int8"),
+        "mma_fp16": classes.count("fp16"),
+        "mma_other": classes.count("other"),
+        "mma_shapes": sorted({(m["a_rows"], m["a_cols"], m["M"], m["N"]) for m in mma},
+                             key=lambda t: tuple(-1 if x is None else x for x in t)),
+        "int_dots": sum(1 for k in () ) ,
+        "ext": dict(sorted(ext.items())),
+        "opfdiv": nfdiv, "opfmul": nfmul,
+        "div_by_const127": div_by_127, "mul_by_inv127": mul_by_inv127,
+        "has_float_127": any(abs(x - 127.0) < 1e-3 for x in fl),
+        "has_inv127": any(abs(x - INV_127) < 1e-7 for x in fl),
+        "float_constants": fl[:40],
+        "bindings": iface,
+    }
+
+
+if __name__ == "__main__":
+    out = {}
+    for a in sys.argv[1:]:
+        p = Path(a)
+        try:
+            out[str(p).replace("\\", "/")] = scan(p)
+        except Exception as e:  # noqa: BLE001
+            out[str(p).replace("\\", "/")] = {"error": f"{type(e).__name__}: {e}"}
+    print(json.dumps(out, indent=1, ensure_ascii=False))

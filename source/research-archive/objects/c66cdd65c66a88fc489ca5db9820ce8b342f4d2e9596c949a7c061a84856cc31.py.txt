@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Assemble evidence/SEED-FLOW.json for B3 from the raw analyzer dumps.
+
+Everything in the output is copied out of tools/b3_analyze.py's output (machine
+extraction), plus a few derived booleans. No hand-typed instruction offsets.
+"""
+import json
+from pathlib import Path
+
+CARD = Path(r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024/candidates/b3-c32-seed")
+E = CARD / "evidence"
+
+
+def load(p):
+    return json.loads((E / p).read_text(encoding="utf-8"))
+
+
+def seed_pack(raw, idx):
+    """Compact per-seed record: every read/write point of this seed."""
+    s = raw["seed_flow"]["seeds"][idx]
+    w = s["reach_widen"][0] if s["reach_widen"] else None
+    d = s["reach_deq_add"][0] if s["reach_deq_add"] else None
+    out = {
+        "half_mul": {"op": s["mul"]["op"], "inst": s["mul"]["inst"], "word": s["mul"]["word"],
+                     "block": s["mul"]["block"],
+                     "result_type_is_NRH_CH": True},
+        "half_var": s["half_var"],
+        "half_var_writes": s.get("half_var_writes", []),
+        "half_var_reads": s["half_var_reads"],
+        "widen": None,
+        "copy": None,
+        "deq_add": None,
+        "narrow": None,
+        "spans": {"half_seed_live_words": s["half_seed_live_words"],
+                  "half_seed_live_instructions": s["half_seed_live_instructions"],
+                  "wide_seed_live_words": s["wide_seed_live_words"]},
+    }
+    if w:
+        out["widen"] = {"load": w["load"], "arg_store": w["arg_store"], "call": w["call"],
+                        "result_store": w.get("result_store"),
+                        "wide_var": w.get("wide_var"),
+                        "wide_var_reads": w.get("wide_var_reads", [])}
+    if d:
+        chain = d["seed_arg_chain"]
+        out["deq_add"] = {"call": d["call"], "seed_arg_var": d["seed_arg_var"],
+                          "seed_arg_chain": chain}
+        # the copy (parent only): a store whose value is a load of the wide (ycN) var
+        origin = chain["stores"][0]["origin"]
+        if origin.get("kind") == "load":
+            for w in origin.get("var_writes", []):
+                o0 = w.get("origin", {})
+                if o0.get("kind") == "load" and o0.get("from_var", {}).get("name", "").startswith("yc"):
+                    out["copy"] = {
+                        "load": o0["at"], "store": w["at"],
+                        "src_var": o0["from_var"], "dst_var": origin["from_var"],
+                        "note": "NRH_C seedN = ycN lowered as OpLoad(OpStore) through "
+                                "Private variables; not SSA-eliminated by glslang"}
+                    break
+        if d.get("narrow"):
+            out["narrow"] = d["narrow"][0]
+    return out
+
+
+def main():
+    rp, rc = load("seedflow-raw-parent.json"), load("seedflow-raw-child.json")
+    delta = load("SPV-DELTA.json")
+    src = load("SOURCE-CHANGE.json")
+
+    def mod(raw):
+        m = raw["module"]
+        return {"path": m["path"], "sha256": m["sha256"], "bytes": m["bytes"],
+                "words": m["words"], "instructions": m["census"]["instructions"],
+                "NRH_CH_type": m["NRH_CH_type"], "NRH_C_type": m["NRH_C_type"]}
+
+    # the seed muls that feed a deq_add call = the contract seeds
+    pseeds = [seed_pack(rp, i) for i, s in enumerate(rp["seed_flow"]["seeds"])
+              if s["class"] == "contract_seed"]
+    cseeds = [seed_pack(rc, i) for i, s in enumerate(rc["seed_flow"]["seeds"])
+              if s["class"] == "contract_seed"]
+    assert len(pseeds) == len(cseeds) == 4, (len(pseeds), len(cseeds))
+
+    # first cooperative-matrix mul-add after the first widen, in program order
+    def after(order, kind, word):
+        return next((o for o in order if o["kind"] == kind and o["word"] > word), None)
+
+    pfirst_widen = pseeds[0]["widen"]["call"]["word"]
+    cfirst_widen = cseeds[0]["widen"]["call"]["word"]
+    p_first_muladd = after(rp["order"], "muladd", pfirst_widen)
+    c_first_muladd = after(rc["order"], "muladd", cfirst_widen)
+    p_loop = [o for o in rp["order"] if o["kind"] == "loop_header"]
+    c_loop = [o for o in rc["order"] if o["kind"] == "loop_header"]
+
+    checks = {
+        "parent_widen_in_same_block_as_half_mul":
+            all(s["widen"]["call"]["block"] == s["half_mul"]["block"] for s in pseeds),
+        "parent_half_seed_live_words": [s["spans"]["half_seed_live_words"] for s in pseeds],
+        "parent_wide_seed_live_words": [s["spans"]["wide_seed_live_words"] for s in pseeds],
+        "parent_widen_precedes_first_k_muladd": {
+            "widen_word": pfirst_widen,
+            "first_muladd_after_widen": p_first_muladd,
+            "verdict": p_first_muladd is not None and pfirst_widen < p_first_muladd["word"]},
+        "parent_widen_precedes_k_loop_header": {
+            "widen_word": pfirst_widen,
+            "loop_headers_in_main": p_loop,
+            "verdict": all(pfirst_widen < o["word"] for o in p_loop) if p_loop else None},
+        "parent_copy_present_as_load_store_pair": [
+            {"seed": i, "load_word": s["copy"]["load"]["word"],
+             "store_word": s["copy"]["store"]["word"]} for i, s in enumerate(pseeds)],
+        "parent_wide_seed_read_count": [
+            len(s["widen"]["wide_var_reads"]) for s in pseeds],
+        "child_half_seed_crosses_k_loop": {
+            "half_mul_words": [s["half_mul"]["word"] for s in cseeds],
+            "widen_words": [s["widen"]["call"]["word"] for s in cseeds],
+            "loop_headers_in_main": c_loop,
+            "verdict": all(w["word"] < s["widen"]["call"]["word"]
+                           for w in c_loop for s in cseeds) if c_loop else None},
+        "child_widen_immediately_before_deq_add": [
+            {"seed": i, "widen_word": s["widen"]["call"]["word"],
+             "deq_add_word": s["deq_add"]["call"]["word"],
+             "gap_words": s["deq_add"]["call"]["word"] - s["widen"]["call"]["word"]}
+            for i, s in enumerate(cseeds)],
+        "child_half_seed_live_words": [s["spans"]["half_seed_live_words"] for s in cseeds],
+        "child_wide_seed_live_words": [s["spans"]["wide_seed_live_words"] for s in cseeds],
+        "conversion_instructions": {
+            "parent_OpFConvert": rp["module"]["census"]["histogram"].get("115:4"),
+            "child_OpFConvert": rc["module"]["census"]["histogram"].get("115:4"),
+            "note": "nrh_widen_exact still executes 4 x 4 scalar f16->f32 converts; the "
+                    "candidate relocates the same four calls, it does not remove them"},
+        "widen_calls_in_main": {
+            "parent": sum(1 for s in rp["seed_flow"]["seeds"] if s["reach_widen"]),
+            "child": sum(1 for s in rc["seed_flow"]["seeds"] if s["reach_widen"])},
+        "deq_add_calls_in_main": {"parent": rp["seed_flow"]["deq_add_call_count"],
+                                  "child": rc["seed_flow"]["deq_add_call_count"]},
+        "op_copy_object_present": {"parent": "83:3" in rp["module"]["census"]["histogram"],
+                                   "child": "83:3" in rc["module"]["census"]["histogram"],
+                                   "note": "glslang lowers every local cooperative-matrix "
+                                           "copy to a Private OpVariable round trip; there is "
+                                           "no OpCopyObject in either module"},
+    }
+
+    doc = {
+        "card": "b3-c32-seed",
+        "generated_by": ["tools/b3_analyze.py", "tools/make_evidence.py"],
+        "inputs": {"parent_spv": mod(rp), "child_spv": mod(rc)},
+        "question": "Did the front end already keep the contract seed in half until the "
+                    "dequant epilogue (i.e. is the target change already there)?",
+        "answer": "NO. In the parent module each nrh_widen_exact call is emitted %d words "
+                  "after its half multiply, in the same basic block, %d words before the "
+                  "first cooperative-matrix mul-add and %d words (inclusive span) before the "
+                  "nr_i8_deq_add call that consumes the seed. The parent's `NRH_C seedN = ycN` "
+                  "copy is an explicit OpLoad/OpStore pair through Private variables (no "
+                  "OpCopyObject, no SSA elimination by glslang)." % (
+                      pseeds[0]["spans"]["half_seed_live_words"],
+                      p_first_muladd["word"] - pfirst_widen,
+                      pseeds[0]["deq_add"]["call"]["word"] - pfirst_widen + 1),
+        "candidate": {
+            "change": "seed stays NRH_CH (half) from the multiply to the epilogue; "
+                      "nrh_widen_exact is called inside the nr_i8_deq_add argument list",
+            "half_seed_live_words": [s["spans"]["half_seed_live_words"] for s in cseeds],
+            "wide_seed_live_words": [s["spans"]["wide_seed_live_words"] for s in cseeds],
+            "widen_to_deq_add_gap_words": [
+                s["deq_add"]["call"]["word"] - s["widen"]["call"]["word"] for s in cseeds],
+        },
+        "seeds": [{"seed": i, "parent": pseeds[i], "child": cseeds[i]} for i in range(4)],
+        "checks": checks,
+        "spv_delta_ref": {"file": "SPV-DELTA.json", "verdict": delta["verdict"],
+                          "instruction_delta": delta["instruction_delta_parent_minus_child"],
+                          "word_delta": delta["word_delta_parent_minus_child"]},
+        "source_change_ref": {"file": "SOURCE-CHANGE.json",
+                              "parent_sha256": src["parent_source"]["sha256"],
+                              "candidate_sha256": src["candidate_source"]["sha256"]},
+    }
+    (E / "SEED-FLOW.json").write_text(json.dumps(doc, indent=1) + "\n",
+                                      encoding="utf-8", newline="\n")
+    print(json.dumps(checks, indent=1))
+
+
+if __name__ == "__main__":
+    main()

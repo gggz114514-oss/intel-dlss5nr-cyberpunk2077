@@ -1,0 +1,400 @@
+"""Loopback NR control panel: Small/VK102, style, strength and mask.
+
+Writes the shared nr_panel.ini selected by panel-config.json.  Style/intensity/mask are ordinary
+per-frame controls; changing them never rebuilds a backend.  Only the backend
+selection asks the ASI to reload at the next frame boundary.
+"""
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import configparser
+import hashlib
+import json
+import os
+import secrets
+import webbrowser
+
+HERE = Path(__file__).resolve().parent
+CONFIG = Path(os.environ.get("NR_PANEL_CONFIG", str(HERE / "panel-config.json")))
+settings = json.loads(CONFIG.read_text(encoding="utf-8"))
+STATE = Path(settings["state"])
+OPTI = Path(settings["optiscaler_ini"])
+INI = Path(settings["ini"])
+SMALL = settings["manifest"]
+VK102 = settings.get("vk102_manifest", "")
+COMPONENT = Path(settings.get("component_status", str(STATE.with_name("component_status.json"))))
+BACKEND_LABELS = {"small": "Small", "102": "Full"}
+
+
+def backend_identities():
+    """Identify the loaded model by the configured artifacts, never its route key."""
+    result = {}
+    for key, directory in (("small", SMALL), ("102", VK102)):
+        if not directory:
+            continue
+        try:
+            root = Path(directory)
+            result[key] = {
+                "manifest_sha256": hashlib.sha256((root / "port_network_manifest.json").read_bytes()).hexdigest(),
+                "runtime_sha256": hashlib.sha256((root / "port_network_runtime.txt").read_bytes()).hexdigest(),
+            }
+        except OSError:
+            continue
+    return result
+
+
+IDENTITIES = backend_identities()
+
+
+def describe_backend(state, component, requested, fresh):
+    requested_label = BACKEND_LABELS.get(requested, "未知后端")
+    result = {"actual_key": None, "requested_label": requested_label,
+              "label": "未连接（状态已过期）", "detail": "请求 " + requested_label,
+              "show_metrics": False}
+    if not fresh or not state:
+        return result
+    if not state.get("mounted") or not state.get("processor"):
+        result["label"] = "未挂载"
+        return result
+    if component.get("init_state") != 2:
+        result["label"] = "后端初始化中"
+        return result
+    matches = [key for key, identity in IDENTITIES.items()
+               if all(str(component.get(field, "")).lower() == value for field, value in identity.items())]
+    if len(matches) != 1:
+        result["label"] = "已连接（模型身份未确认）"
+        return result
+    actual = matches[0]
+    result.update(actual_key=actual, label=BACKEND_LABELS[actual] + "（已挂载）", show_metrics=True)
+    result["detail"] = ("已应用" if actual == requested else "请求 " + requested_label + "，尚未生效")
+    if component.get("last_status") or component.get("gpu_timeout") or component.get("fallback"):
+        result["detail"] += " · 组件报告异常"
+    return result
+OPTI_KEYS = ("SpoofedVendorId", "SpoofedDeviceId", "SpoofedGPUName",
+             "Dxgi", "StreamlineSpoofing", "SpoofHAGS", "DxgiVRAM")
+OPTI_PRESETS = {
+    "nvidia4090": {"SpoofedVendorId": "0x10de", "SpoofedDeviceId": "0x2684",
+                   "SpoofedGPUName": "NVIDIA GeForce RTX 4090", "Dxgi": "true",
+                   "StreamlineSpoofing": "true", "SpoofHAGS": "true", "DxgiVRAM": "auto"},
+    "intelb580": {"SpoofedVendorId": "0x8086", "SpoofedDeviceId": "0xe20b",
+                  "SpoofedGPUName": "Intel(R) Arc(TM) B580 Graphics", "Dxgi": "false",
+                  "StreamlineSpoofing": "auto", "SpoofHAGS": "auto", "DxgiVRAM": "auto"},
+}
+
+DEFAULTS = {
+    "backend": "small", "enabled": 1, "style": 0,
+    "intensity": 1.0, "local_structure": 1.0, "local_tone": 0.0,
+    "skin_structure": 0.0, "auto_mask": 1, "display_strength": 1.0,
+}
+
+
+def load():
+    cfg = configparser.ConfigParser()
+    cfg.read(INI, encoding="utf-8")
+    out = dict(DEFAULTS)
+    if cfg.has_section("NR"):
+        for key in out:
+            if cfg.has_option("NR", key):
+                raw = cfg.get("NR", key)
+                if key == "backend":
+                    out[key] = raw
+                elif key in ("enabled", "style", "auto_mask"):
+                    out[key] = int(raw)
+                else:
+                    out[key] = float(raw)
+    return out
+
+
+def save(values):
+    INI.parent.mkdir(parents=True, exist_ok=True)
+    cfg = configparser.ConfigParser()
+    cfg["NR"] = {
+        "backend": values["backend"], "enabled": str(int(values["enabled"])),
+        "style": str(int(values["style"])), "intensity": f"{values['intensity']:.4f}",
+        "local_structure": f"{values['local_structure']:.4f}",
+        "local_tone": f"{values['local_tone']:.4f}",
+        "skin_structure": f"{values['skin_structure']:.4f}",
+        "auto_mask": str(int(values["auto_mask"])),
+        "display_strength": f"{values['display_strength']:.4f}",
+    }
+    cfg["Backends"] = {k: v for k, v in (("small", SMALL), ("102", VK102)) if v}
+    tmp = INI.with_suffix(".tmp")
+    try:
+        tmp.write_text("", encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as f:
+            cfg.write(f)
+        tmp.replace(INI)
+    except OSError:
+        raise
+
+
+def live_status():
+    """Bridge-published state plus the ini the panel owns."""
+    out = {"state": None, "ini": load()}
+    component = {}
+    fresh = False
+    try:
+        out["state"] = json.loads(STATE.read_text(encoding="utf-8"))
+        component = json.loads(COMPONENT.read_text(encoding="utf-8"))
+        now = time.time()
+        fresh = all(0 <= now - path.stat().st_mtime <= 5 for path in (STATE, COMPONENT))
+    except Exception as exc:  # missing file or a half-written frame
+        out["error"] = str(exc)
+    out["backend_status"] = describe_backend(out["state"], component, out["ini"]["backend"], fresh)
+    return out
+
+
+def opti_load():
+    """Current values of the keys this block owns, comments ignored."""
+    out = {key: "auto" for key in OPTI_KEYS}
+    try:
+        for line in OPTI.read_text(encoding="utf-8-sig").splitlines():
+            text = line.strip()
+            if not text or text[0] in ";#" or "=" not in text:
+                continue
+            name, _, value = text.partition("=")
+            name = name.strip()
+            if name in out:
+                out[name] = value.strip()
+    except OSError as exc:
+        return {"error": str(exc), "values": out}
+    return {"values": out, "path": str(OPTI), "presets": OPTI_PRESETS}
+
+
+def opti_save(values):
+    """Rewrite only the owned keys; every other line stays byte-identical."""
+    text = OPTI.read_text(encoding="utf-8-sig")
+    lines = text.splitlines(True)
+    pending = {k: v for k, v in values.items() if k in OPTI_KEYS}
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped[0] in ";#" or "=" not in stripped:
+            continue
+        name = stripped.partition("=")[0].strip()
+        if name in pending:
+            ending = "\r\n" if line.endswith("\r\n") else "\n"
+            lines[index] = "%s = %s%s" % (name, pending.pop(name), ending)
+    if pending:
+        raise ValueError("unknown keys: " + ", ".join(sorted(pending)))
+    if game_running():
+        raise ValueError("Close Cyberpunk before changing OptiScaler settings")
+    backup = OPTI.with_suffix(".ini.nr-backup")
+    if not backup.exists():
+        backup.write_bytes(OPTI.read_bytes())
+    with OPTI.open("w", encoding="utf-8", newline="") as handle:
+        handle.write("".join(lines))
+    return opti_load()
+
+
+def save_async(values):
+    import threading
+    import time
+    def worker():
+        for _ in range(80):
+            try:
+                save(values)
+                return
+            except OSError:
+                time.sleep(0.2)
+    threading.Thread(target=worker, daemon=True).start()
+
+
+PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>NR 后端控制</title><style>
+body{font:16px system-ui;background:#101827;color:#eaf2ff;max-width:680px;margin:28px auto;padding:0 16px}
+label{display:block;margin:14px 0}select,input{margin-left:10px;background:#26344b;color:#fff;padding:6px}
+button{padding:10px 18px;background:#26344b;color:#fff;border:1px solid #537096;border-radius:6px;cursor:pointer}
+#live{background:#16233a;border:1px solid #2c3f5c;border-radius:6px;padding:10px 12px;margin:14px 0;font:14px ui-monospace,SFMono-Regular,Consolas,monospace;line-height:1.7}#live span{color:#9fb3cc}#opti{background:#1b2a1f;border:1px solid #35543f;border-radius:6px;padding:10px 12px;margin:14px 0;font:13px ui-monospace,Consolas,monospace;line-height:1.8}#opti .row{margin:6px 0}#opti input{background:#26344b;color:#fff;border:1px solid #3c5270;border-radius:4px;padding:2px 6px;margin-right:8px}#opti small{color:#9fb3cc}.style button{padding:7px 12px;margin-right:6px}.active{background:#2475c7}small{color:#aebed2}
+</style><h1>NR 后端控制</h1>
+<div id=live>
+<div>后端 <b id=lvBackend>—</b> <span id=lvSwitch></span></div>
+<div>桥内区间 <b id=lvTotal>—</b> ms <span id=lvStage></span></div>
+<div>参数 <span id=lvParams></span></div>
+</div><small>桥内区间含跨帧重叠等待，不是游戏帧时。风格/强度/遮罩为逐帧控制；后端切换在帧边界生效。</small>
+<label>选择后端 <select id=backend><option value=small>Small（原版）</option>__VK102_OPTION__</select></label>
+<label>启用 <input id=enabled type=checkbox></label>
+<div class=style>风格：<span id=style><button data-v=0>经典</button><button data-v=1>自然</button><button data-v=2>电影</button></span></div>
+<label>强度 <input id=intensity type=range min=0 max=2 step=.05><output></output></label>
+<label>局部结构 <input id=local_structure type=range min=0 max=2 step=.05><output></output></label>
+<label>局部色调 <input id=local_tone type=range min=0 max=2 step=.05><output></output></label>
+<label>皮肤/遮罩强度 <input id=skin_structure type=range min=-1 max=2 step=.05><output></output></label>
+<label>自动遮罩 <input id=auto_mask type=checkbox></label>
+<label>风格强度 <input id=display_strength type=range min=0 max=2 step=.05><output></output></label>
+<div id=opti>
+<div><b>OptiScaler 伪装</b> <small>（写 OptiScaler.ini，重启游戏生效）</small></div>
+<div class=row><select id=optiPreset>
+<option value=nvidia4090>NVIDIA RTX 4090</option>
+<option value=intelb580>Intel B580（原生）</option>
+</select><button id=optiApply>应用预设</button></div>
+<div class=row>VendorId <input id=SpoofedVendorId size=8> DeviceId <input id=SpoofedDeviceId size=8></div>
+<div class=row>GPU 名 <input id=SpoofedGPUName size=34></div>
+<div class=row>DXGI <input id=Dxgi size=6> Streamline <input id=StreamlineSpoofing size=6> HAGS <input id=SpoofHAGS size=6> VRAM <input id=DxgiVRAM size=6></div>
+<div class=row><button id=optiSave>保存伪装</button><span id=optiStatus></span></div>
+</div>
+<button id=save>保存</button><p id=status></p>
+<script>
+const fields=['enabled','style','intensity','local_structure','local_tone','skin_structure','auto_mask','display_strength'];
+let state=null;const token='__TOKEN__';
+function set(v){state=v;document.getElementById('backend').value=v.backend;document.getElementById('enabled').checked=!!v.enabled;
+ document.getElementById('auto_mask').checked=!!v.auto_mask;
+ for(const b of document.querySelectorAll('#style button'))b.classList.toggle('active',+b.dataset.v===v.style);
+ for(const k of fields)if(k!=='enabled'&&k!=='style'&&k!=='auto_mask'){const e=document.getElementById(k);e.value=v[k];e.nextElementSibling.value=v[k]}}
+async function load(){set(await (await fetch('/api')).json())}
+const STYLE_TONE={0:1.0,1:1.0,2:1.0};for(const b of document.querySelectorAll('#style button'))b.onclick=()=>{state.style=+b.dataset.v;state.local_tone=STYLE_TONE[state.style];set(state);document.getElementById('save').click()};
+for(const k of ['intensity','local_structure','local_tone','skin_structure','display_strength'])document.getElementById(k).oninput=e=>{state[k]=+e.target.value;e.target.nextElementSibling.value=e.target.value};
+document.getElementById('save').onclick=async()=>{state.backend=document.getElementById('backend').value;state.enabled=+document.getElementById('enabled').checked;state.auto_mask=+document.getElementById('auto_mask').checked;
+ const r=await fetch('/api',{method:'POST',headers:{'Content-Type':'application/json','X-NR-Token':token},body:JSON.stringify(state)});document.getElementById('status').textContent=r.ok?(poll(),'已保存'):('保存失败: '+((await r.json().catch(()=>({}))).error||'未知'))};
+load();
+const STYLE_NAME=['经典','自然','电影'];
+async function poll(){try{
+ const r=await fetch('/status');const d=await r.json();const s=d.state;
+ const el=id=>document.getElementById(id);
+ if(!s){el('lvBackend').textContent='未连接（bridge 未写状态）';el('lvSwitch').textContent='';
+  el('lvTotal').textContent='—';el('lvStage').textContent='';el('lvParams').textContent='';return}
+ const bs=d.backend_status;
+ el('lvBackend').textContent=bs.label;
+ el('lvSwitch').textContent='· '+bs.detail;
+ if(!bs.show_metrics){el('lvTotal').textContent='—';el('lvStage').textContent='';el('lvParams').textContent='';return}
+ const st=s.stage||{};el('lvTotal').textContent=(st.total||0).toFixed(2);
+ el('lvStage').textContent='prep '+(st.prep||0).toFixed(2)+' / host '+(st.host||0).toFixed(2)+
+  ' / 合成 '+(st.composite||0).toFixed(2)+' / tail '+(st.tail||0).toFixed(2)+
+  ' · 帧 '+(st.frames||0)+' · 计数 '+(s.processed||0);
+ const a=s.applied||{};
+ el('lvParams').textContent='风格 '+(STYLE_NAME[a.style]||a.style)+' · 强度 '+a.intensity+
+  ' · 结构 '+a.structure+' · 色调 '+a.tone+' · 皮肤 '+a.skin+' · 显示 '+a.display+
+  ' · 遮罩 '+(a.mask?'开':'关')+' · 启用 '+(a.enabled?'是':'否');
+}catch(e){}}
+setInterval(poll,250);poll();
+async function optiLoad(){const r=await fetch('/opti');const d=await r.json();
+ if(d.error){document.getElementById('optiStatus').textContent='读取失败: '+d.error;return}
+ const v=d.values||{};for(const k of ['SpoofedVendorId','SpoofedDeviceId','SpoofedGPUName','Dxgi','StreamlineSpoofing','SpoofHAGS','DxgiVRAM']){
+  const e=document.getElementById(k);if(e)e.value=v[k]||''}}
+async function optiPost(body){const r=await fetch('/opti',{method:'POST',headers:{'Content-Type':'application/json','X-NR-Token':token},body:JSON.stringify(body)});
+ const d=await r.json();document.getElementById('optiStatus').textContent=r.ok?'已写入，重启游戏生效':('失败: '+(d.error||''));if(r.ok)optiLoad()}
+document.getElementById('optiSave').onclick=()=>{const body={};
+ for(const k of ['SpoofedVendorId','SpoofedDeviceId','SpoofedGPUName','Dxgi','StreamlineSpoofing','SpoofHAGS','DxgiVRAM'])
+  body[k]=document.getElementById(k).value.trim();optiPost(body)};
+document.getElementById('optiApply').onclick=async()=>{const name=document.getElementById('optiPreset').value;
+ const r=await fetch('/opti/preset/'+name,{method:'POST',headers:{'X-NR-Token':token}});const d=await r.json();
+ document.getElementById('optiStatus').textContent=r.ok?'已套用预设，重启游戏生效':('失败: '+(d.error||''));if(r.ok)optiLoad()};
+optiLoad();
+</script>"""
+
+
+import sys
+import threading
+import time
+
+WATCH = "--watch" in sys.argv
+SERVER = None
+
+
+def game_running():
+    import subprocess
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Cyberpunk2077.exe"],
+                             capture_output=True, text=True, timeout=5).stdout
+        return "Cyberpunk2077.exe" in out
+    except Exception:
+        return False
+
+
+def watch_game():
+    # Started by the launcher before the game: wait for it, then exit with it.
+    deadline = time.time() + 180
+    while time.time() < deadline and not game_running():
+        time.sleep(2)
+    while game_running():
+        time.sleep(5)
+    if SERVER is not None:
+        SERVER.shutdown()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code, data, ctype="application/json"):
+        body = data.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/":
+            page = PAGE.replace("__VK102_OPTION__", '<option value=102>Full（优化版）</option>' if VK102 else '')
+            self._send(200, page.replace("__TOKEN__", TOKEN), "text/html; charset=utf-8")
+        elif self.path == "/api":
+            self._send(200, json.dumps(load()))
+        elif self.path == "/status":
+            self._send(200, json.dumps(live_status()))
+        elif self.path == "/opti":
+            self._send(200, json.dumps(opti_load()))
+        elif self.path.startswith("/opti/preset/"):
+            self._send(404, "{}")
+        else:
+            self._send(404, "{}")
+
+    def do_POST(self):
+        if self.headers.get("X-NR-Token") != TOKEN:
+            return self._send(403, "{}")
+        if self.path.startswith("/opti/preset/"):
+            name = self.path.rsplit("/", 1)[-1]
+            try:
+                preset = OPTI_PRESETS.get(name)
+                if not preset:
+                    raise ValueError("unknown preset " + name)
+                self._send(200, json.dumps(opti_save(preset)))
+            except Exception as exc:
+                self._send(400, json.dumps({"error": str(exc)}))
+            return
+        if self.path == "/opti":
+            try:
+                values = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+                self._send(200, json.dumps(opti_save(values)))
+            except Exception as exc:
+                self._send(400, json.dumps({"error": str(exc)}))
+            return
+        if self.path != "/api":
+            return self._send(403, "{}")
+        try:
+            values = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+            merged = load()
+            for key in DEFAULTS:
+                if key not in values:
+                    continue
+                value = values[key]
+                if value is None:      # a stale page may post null
+                    continue
+                try:
+                    if key == "backend":
+                        merged[key] = str(value)
+                    elif key in ("enabled", "style", "auto_mask"):
+                        merged[key] = int(value)
+                    else:
+                        merged[key] = float(value)
+                except (TypeError, ValueError):
+                    raise ValueError("%s: invalid value %r" % (key, value))
+            save(merged)   # synchronous: a failed write must be visible
+            self._send(200, json.dumps(merged))
+        except Exception as exc:
+            self._send(400, json.dumps({"error": str(exc)}))
+
+
+TOKEN = secrets.token_hex(24)
+if __name__ == "__main__":
+    if not INI.exists():
+        save(dict(DEFAULTS))
+    port = int(os.environ.get("NR_PANEL_PORT", "8788"))
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    SERVER = server
+    url = f"http://127.0.0.1:{port}/"
+    try:
+        print(f"{url}  (config: {INI})")
+    except Exception:
+        pass
+    webbrowser.open(url)
+    if WATCH:
+        threading.Thread(target=watch_game, daemon=True).start()
+    server.serve_forever()

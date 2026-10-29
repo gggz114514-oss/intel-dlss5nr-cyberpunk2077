@@ -1,0 +1,126 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x=128) in;
+#include "split16_common.glsl"
+#define MH coopmat<float16_t,gl_ScopeSubgroup,8,16,gl_MatrixUseAccumulator>
+#if KIND!=1 && KIND!=4
+#error Active swapped projection supports KIND1/KIND4 only
+#endif
+#if KIND==4
+shared float16_t half_tail[512];
+#endif
+// Actual transposed GEMM: C^T[N,T] = W[N,K] * GT^T[K,T].
+// No lane/component mapping is assumed. Every load/store is standard ROW/COL.
+//
+// n09-f09-f11-store (F11, KIND==1): address fold only.
+// t0 is always a multiple of 16 (t0 = 32*WG.x) and n0 is always a multiple of
+// 16 (n0 = 64*WG.y + 16*sg), therefore
+//   tiled(t0+16,n0  ,512) == tiled(t0,n0,512) + 32*256 == ob + 8192
+//   tiled(t0   ,n0+8,512) == tiled(t0,n0,512) +  8     == ob +    8
+//   tiled(t0+16,n0+8,512) == ob + 8200
+// so the one supertile base ob (the address the consumer of go re-derives as
+// tiled(token,0,512)) serves the four residual-seed loads and the four output
+// stores, and the K stride becomes an induction increment instead of a
+// re-derived (k/16)*256 term. No weight/A/B read count, no DPAS count, no
+// store width/lane mask and no per-output accumulation order changes.
+void main() {
+    uint sg=gl_LocalInvocationID.x/32u,lane=gl_LocalInvocationID.x%32u;
+    const uint t0=gl_WorkGroupID.x*32u,n0=gl_WorkGroupID.y*64u+sg*16u;
+    const uint wb=uint(pc.p3.z),rs=uint(pc.p3.w);
+    const uint wbase=wb+(n0/16u)*8192u;
+    // One supertile base for this subgroup (16 tokens x 16 channels).
+    const uint ob=tiled(t0,n0,512u);
+    const uint o00=ob,o01=ob+8192u,o10=ob+8u,o11=ob+8200u;
+    const uint xbase0=tiled(t0,0u,512u),xbase1=xbase0+8192u;
+    MC c00,c01,c10,c11;
+    MH scale0,scale1;
+    // COL stride0 repeats the same eight channel gains across sixteen tokens.
+    coopMatLoad(scale0,weights,rs+n0,0u,COL);
+    coopMatLoad(scale1,weights,rs+n0+8u,0u,COL);
+    {MH h;coopMatLoad(h,gy,o00,16u,COL);h=h*scale0;c00=MC(h);}
+    {MH h;coopMatLoad(h,gy,o01,16u,COL);h=h*scale0;c01=MC(h);}
+    {MH h;coopMatLoad(h,gy,o10,16u,COL);h=h*scale1;c10=MC(h);}
+    {MH h;coopMatLoad(h,gy,o11,16u,COL);h=h*scale1;c11=MC(h);}
+    uint wo=wbase,xo0=xbase0,xo1=xbase1;
+    for(uint k=0u;k<512u;k+=16u) {
+        // Shipping SWAP_AB=1's token-outer/channel-inner MMA order is retained.
+        // Each token B supplies two channel A fragments, and the two loaded
+        // weight A fragments are reused for both token fragments.
+        MA a0,a1;MB b;
+        coopMatLoad(a0,weights,wo,16u,ROW);
+        coopMatLoad(a1,weights,wo+128u,16u,ROW);
+        coopMatLoad(b,gt,xo0,16u,COL);
+        c00=coopMatMulAdd(a0,b,c00);c10=coopMatMulAdd(a1,b,c10);
+        coopMatLoad(b,gt,xo1,16u,COL);
+        c01=coopMatMulAdd(a0,b,c01);c11=coopMatMulAdd(a1,b,c11);
+        wo+=256u;xo0+=256u;xo1+=256u;
+    }
+    {
+        MH h=MH(c00);
+#if KIND==1
+        // Rows are channels, columns tokens: standard COL restores go[T,N].
+        coopMatStore(h,go,o00,16u,COL);
+#else
+        // Real half scratch has [16 tokens][8 channels]. COL stride8 is16B.
+        coopMatStore(h,half_tail,sg*128u,8u,COL);
+        subgroupMemoryBarrierShared();subgroupBarrier();
+        for(uint e=lane;e<128u;e+=32u) {
+            uint t=t0+0u+e/8u,n=n0+0u+e%8u;
+            go[view(t,n)]=half_tail[sg*128u+e];
+        }
+        subgroupMemoryBarrierShared();subgroupBarrier();
+#endif
+    }
+    {
+        MH h=MH(c01);
+#if KIND==1
+        // Rows are channels, columns tokens: standard COL restores go[T,N].
+        coopMatStore(h,go,o01,16u,COL);
+#else
+        // Real half scratch has [16 tokens][8 channels]. COL stride8 is16B.
+        coopMatStore(h,half_tail,sg*128u,8u,COL);
+        subgroupMemoryBarrierShared();subgroupBarrier();
+        for(uint e=lane;e<128u;e+=32u) {
+            uint t=t0+16u+e/8u,n=n0+0u+e%8u;
+            go[view(t,n)]=half_tail[sg*128u+e];
+        }
+        subgroupMemoryBarrierShared();subgroupBarrier();
+#endif
+    }
+    {
+        MH h=MH(c10);
+#if KIND==1
+        // Rows are channels, columns tokens: standard COL restores go[T,N].
+        coopMatStore(h,go,o10,16u,COL);
+#else
+        // Real half scratch has [16 tokens][8 channels]. COL stride8 is16B.
+        coopMatStore(h,half_tail,sg*128u,8u,COL);
+        subgroupMemoryBarrierShared();subgroupBarrier();
+        for(uint e=lane;e<128u;e+=32u) {
+            uint t=t0+0u+e/8u,n=n0+8u+e%8u;
+            go[view(t,n)]=half_tail[sg*128u+e];
+        }
+        subgroupMemoryBarrierShared();subgroupBarrier();
+#endif
+    }
+    {
+        MH h=MH(c11);
+#if KIND==1
+        // Rows are channels, columns tokens: standard COL restores go[T,N].
+        coopMatStore(h,go,o11,16u,COL);
+#else
+        // Real half scratch has [16 tokens][8 channels]. COL stride8 is16B.
+        coopMatStore(h,half_tail,sg*128u,8u,COL);
+        subgroupMemoryBarrierShared();subgroupBarrier();
+        for(uint e=lane;e<128u;e+=32u) {
+            uint t=t0+16u+e/8u,n=n0+8u+e%8u;
+            go[view(t,n)]=half_tail[sg*128u+e];
+        }
+        subgroupMemoryBarrierShared();subgroupBarrier();
+#endif
+    }
+}

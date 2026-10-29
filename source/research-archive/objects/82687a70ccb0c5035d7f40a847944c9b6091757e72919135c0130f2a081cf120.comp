@@ -1,0 +1,70 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x=256) in;
+#define STAGE_D1 1
+#include "pilot_common.glsl"
+shared QT sa[8192];
+
+void main() {
+    uint tid=gl_LocalInvocationID.x,sg=tid/32u;
+    uint wx=gl_WorkGroupID.x,wy=gl_WorkGroupID.y,g=gl_WorkGroupID.z;
+    uint w=wy*uint(pc.p1.x)+wx;
+    // Producer29 emitted each valid image value once in [tile][M8][channel128][row8].
+    // All four z shards share it; no quantization, repack, or sx staging here.
+    const uint n=(sg%4u)*32u;
+    const float invA=sc[2],invM=sc[3];
+    const float eScale0=nr_scale_column(16u+g*128u+n);
+    const float eScale1=nr_scale_column(16u+g*128u+n+16u);
+    for(uint r=0u;r<2u;++r) {
+        uint m0=(sg/4u+4u*r)*8u,m1=m0+16u,n0=(sg%4u)*32u;
+        bool oob0,oob1;
+        uint base0=input_addr(m0,0u,wx,wy,oob0),base1=input_addr(m1,0u,wx,wy,oob1);
+        ACC a0=ACC(ZERO),a1=ACC(ZERO),b0=ACC(ZERO),b1=ACC(ZERO);
+        for(uint k=0u;k<128u;k+=KS) {
+            MA x;MB v0,v1;
+            coopMatLoad(v0,qw,(g*128u+n0)*128u+k,128u,COL);
+            coopMatLoad(v1,qw,(g*128u+n0+16u)*128u+k,128u,COL);
+            if(!oob0)coopMatLoad(x,gx,base0+k*8u,8u,COL);else x=MA(QT(0));
+            a0=coopMatMulAdd(x,v0,a0);a1=coopMatMulAdd(x,v1,a1);
+            if(!oob1)coopMatLoad(x,gx,base1+k*8u,8u,COL);else x=MA(QT(0));
+            b0=coopMatMulAdd(x,v0,b0);b1=coopMatMulAdd(x,v1,b1);
+        }
+        dumpdot(a0,0u,m0,g*128u+n0,512u);
+        dumpdot(a1,0u,m0,g*128u+n0+16u,512u);
+        dumpdot(b0,0u,m1,g*128u+n0,512u);
+        dumpdot(b1,0u,m1,g*128u+n0+16u,512u);
+        const uint sa0=((m0>>3u)*128u+n0)*8u+(m0&7u),sa1=((m1>>3u)*128u+n0)*8u+(m1&7u);
+        MQ q=requant_act(a0,eScale0,invA);
+        coopMatStore(q,sa,sa0,8u,COL);
+        q=requant_act(a1,eScale1,invA);
+        coopMatStore(q,sa,sa0+128u,8u,COL);
+        q=requant_act(b0,eScale0,invA);
+        coopMatStore(q,sa,sa1,8u,COL);
+        q=requant_act(b1,eScale1,invA);
+        coopMatStore(q,sa,sa1+128u,8u,COL);
+    }
+    barrier();
+    uint m=sg*8u;
+    const uint saBase=(m>>3u)*1024u;
+    const float mScale0=nr_scale_column(528u+g*32u);
+    const float mScale1=nr_scale_column(528u+g*32u+16u);
+    ACC a0=ACC(ZERO),a1=ACC(ZERO);
+    for(uint k=0u;k<128u;k+=KS) {
+        MA x;MB b0,b1;
+        coopMatLoad(x,sa,saBase+k*8u,8u,COL);
+        coopMatLoad(b0,qw,65536u+(32u*g)*128u+k,128u,COL);
+        coopMatLoad(b1,qw,65536u+(32u*g+16u)*128u+k,128u,COL);
+        a0=coopMatMulAdd(x,b0,a0);a1=coopMatMulAdd(x,b1,a1);
+    }
+    dumpdot(a0,32768u,m,g*32u,128u);
+    dumpdot(a1,32768u,m,g*32u+16u,128u);
+    const uint dst=((w*8u+(m>>3u))*128u+g*32u)*8u+(m&7u);
+    MQ q=requant_linear(a0,mScale0,invM);
+    coopMatStore(q,gm,dst,8u,COL);
+    q=requant_linear(a1,mScale1,invM);
+    coopMatStore(q,gm,dst+128u,8u,COL);
+}

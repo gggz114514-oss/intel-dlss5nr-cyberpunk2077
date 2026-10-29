@@ -1,0 +1,105 @@
+"""S06: fold the GPU results and the post-GPU diagnosis into QUALITY.json / JOBS.json."""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+import c256b15 as L
+
+W = L.W
+EV = W / "evidence"
+q = json.loads((W / "QUALITY.json").read_text())
+fd = json.loads((EV / "12-frame-diff.json").read_text())["frames"]
+ln = json.loads((EV / "13-ln-metric.json").read_text())
+taps = json.loads((EV / "14-taps.json").read_text())
+q8 = json.loads((EV / "08-quality.json").read_text())
+
+frames = {}
+for f, v in fd.items():
+    if "missing" in v:
+        frames[f] = v
+        continue
+    mse_b, mse_c = v["mse_baseline"], v["mse_candidate"]
+    ed2 = v["diff"]["rms"] ** 2
+    frames[f] = dict(
+        baseline_sha256=v["baseline_sha"], candidate_sha256=v["candidate_sha"],
+        psnr_baseline=v["psnr_baseline"], psnr_candidate=v["psnr_candidate"], delta_db=v["delta_db"],
+        mse_baseline=mse_b, mse_candidate=mse_c,
+        frame_change_rms=v["diff"]["rms"],
+        frame_change_over_error=float(np.sqrt(ed2 / mse_b)),
+        projection_on_error=float(v["diff_vs_error"]["energy_toward"]),
+        orthogonal_fraction=float(1 - abs(v["diff_vs_error"]["energy_toward"]) / np.sqrt(ed2 / mse_b)),
+        implied_block_share_of_error_energy=float(ed2 / (2 * mse_b)),
+        implied_best_case_gain_db=float(-10 * np.log10(1 - 0.8 * ed2 / (2 * mse_b))),
+        spatial_p95=v["spatial"]["p95"], mean_diff=v["diff"]["mean"],
+    )
+
+q["gpu"] = {
+    "GPU_VERIFICATION": "MEASURED_3_FRAMES",
+    "executed_by": "main execution, exclusive lock, per S06 JOBS.json",
+    "jobs": "see evidence/12-frame-diff.json and gpu/a-<frame>/",
+    "environment_determinism": {
+        "control": "gpu/runs/regress-c64-34189/replayed-network.bin sha256 56318ff6d8e7c57dafaa82f4fd10f1ffd817be5075b15d3e4b38c7e8fb2c37c0",
+        "equals_recorded_baseline_hash": True,
+        "conclusion": "the pipeline is bit-reproducible, so the frame deltas below are real, not run noise",
+    },
+    "frames": frames,
+    "mean_delta_db": float(np.mean([frames[f]["delta_db"] for f in frames])),
+    "verdict": "arm NOT adopted: 2/3 frames regress, mean -0.0018 dB",
+    "diagnosis": {
+        "local_gain_is_real": dict(raw=ln["mean"]["old"]["raw"], raw_new=ln["mean"]["A_mse"]["raw"],
+                                   tok=ln["mean"]["old"]["tok"], tok_new=ln["mean"]["A_mse"]["tok"],
+                                   g32=ln["mean"]["old"]["g32"], g32_new=ln["mean"]["A_mse"]["g32"],
+                                   improvement=ln["improvement"]),
+        "but_not_transmitted": ("the frame change caused by the new block15 FFN is 96-97 % orthogonal to the "
+                                "existing frame error (projection 0.25-0.42 % of |e|); only ~3 % of the change "
+                                "acts as correction"),
+        "effect_size": ("block15's FFN error accounts for ~0.3 % of the frame error energy "
+                        "(implied_block_share_of_error_energy); removing 80 % of it is worth at most "
+                        "+0.01 dB, the same size as the measured scatter"),
+        "why": ("one C64 block bought +0.006 dB (8 blocks = +0.0514 dB); the C256 FFN of a single block is "
+                "below the resolution of this test, and the down-stream attention re-quantises Y with a "
+                "DYNAMIC per-workgroup amax, so a different (locally better) Y also means a different "
+                "quantisation grid there"),
+    },
+    "quality_accepted": False,
+}
+q["quality_accepted"] = False
+q["status"] = "REJECTED_AS_SINGLE_BLOCK_ARM / template retained; family bundle required for a measurable signal"
+q["cpu"]["tap_audit"] = taps["tap_audit"]
+q["cpu"]["desync_control"] = taps["desync_control"]
+(W / "QUALITY.json").write_text(json.dumps(q, indent=1, ensure_ascii=False), encoding="utf-8")
+
+jobs = json.loads((W / "JOBS.json").read_text())
+jobs["jobs"][0].update(status="EXECUTED", measured=frames, note="result: -0.004653 dB vs baseline")
+jobs["jobs"][2].update(status="EXECUTED", measured={k: frames[k] for k in ("41444", "43654") if k in frames})
+jobs["jobs"].insert(1, {
+    "id": "s06-b15-gate",
+    "arm": "A_mse + internal dumps",
+    "purpose": "the qX / M / Y gate the CPU audit still needs: dump the block15 pack (qx at +376,832), "
+               "swin_15_M and swin_15_Y on frame 34189 and compare against the CPU model",
+    "sequence": "day-street-static-formal-01", "frame": 34189,
+    "plan": taps["gate_plan"]["path"], "plan_sha256": taps["gate_plan"]["sha256"],
+    "out_dir": str(W / "gpu/gate-34189"),
+    "cmd": f"--plan {taps['gate_plan']['path']} --out {W / 'gpu/gate-34189'} --pool --warm 0 --reps 1",
+    "expected_artifacts": {
+        "block15_pack.bin": dict(bytes=5537792,
+                                 check="sha256 of [376832:1409024] == CPU qX "
+                                       + taps["cpu_qx_34189"]["sha256"] + " (canonical order, see evidence/14)"),
+        "block15_M.bin": dict(bytes=2162688, check="CPU qM window-major (evidence/13 arms)"),
+        "block15_Y.bin": dict(bytes=2162688,
+                              check="CPU Y relL2 vs this file should be < 1e-6 if the GPU reproduces the "
+                                    "arithmetic; CPU arm predicts 0.015453 vs the teacher"),
+    },
+    "dump": True,
+    "status": "PROPOSED",
+})
+(W / "JOBS.json").write_text(json.dumps(jobs, indent=1, ensure_ascii=False), encoding="utf-8")
+print(json.dumps({f: {k: round(v[k], 6) if isinstance(v[k], float) else v[k]
+                      for k in ("delta_db", "frame_change_over_error", "projection_on_error",
+                                "orthogonal_fraction", "implied_block_share_of_error_energy",
+                                "implied_best_case_gain_db")}
+                  for f, v in frames.items() if "delta_db" in v}, indent=1))
+print("QUALITY.json / JOBS.json updated")

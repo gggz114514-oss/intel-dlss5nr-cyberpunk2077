@@ -1,0 +1,126 @@
+n02c-f02-fb-bias — RESUME
+================================================================
+状态: BLOCKED（定价后净收益 <= 0；足迹前提不成立）
+族:   F02 body（7 PASS: ordinal 1,2,3,4,227,228,229）
+GPU:  零。未取锁、未跑 clock_runner / gtpin / zprof、未部署。
+分诊: 不适用（本卡无 GPU 测量；不拿它替代任何 A/B/C/D/E 实测判定）。
+      机制归类：L12「被并发隐藏的消息」，不是 L2「重复消息删除」（重复读实测为 0）。
+链头: accepted/n10-f10-next-20261027/plan.txt = 719f100b…；本组 7 行 SPV 仍为 4c034a53…
+       （BUILD.json.chain_head_rows 逐字节实测，all_equal_parent = true）
+
+----------------------------------------------------------------
+1. 本卡做完了什么（可复核）
+----------------------------------------------------------------
+[1] 父身份三件套的前两件：
+    - 父源码 75e3474d… + RECIPES.json[4c034a53] 配方（pin 头 register_handoff.glsl
+      1c4c7489… + 从 c32-feed-owner-20261025/kv-tile 传 NoContraction，185 站点）
+      → parent-rebuild.spv 逐字节 = 4c034a53…（byte_match = true）
+    - 链头 plan 里本组 7 行仍指向该 SPV（逐字节）
+    第三件（plan.txt + cpu-check）不适用：没有候选。
+
+[2] fb bias 的消息构成与字节（本卡核心任务的第一半，实测）：
+    64 条 load.ugm.d32x16t.a32.bss，全部 uniform (1|M0)、rd:1、每条 64 B。
+    8 个 coopMatLoad 站点 × 8 行，行地址增量实测 256 B（立即数 0/256/…/1792）。
+    每 SG 4096 B = 16 行 × 64 列 f32；4 个站点拼成整行、两个行半拼成 16 行。
+    相对**执行路径**（182 条 UGM 读）占 35.2% 条数、12.9% 字节。
+    → 修正 n01b 的 "11%"（那是把 388 条 if(debug) 存储一起当分母的静态口径）。
+    另修正 n01b 的 "64 条消息 + 64 条搬移"：那 64 条是 nrh_narrow 的 half 舍入 mov，
+    不是额外开销；bias 路径上**唯一可删的就是消息条数，且没有重复读**（PROOF.json P3）。
+    64 条消息全在唯一 sync.bar（0xb520）之后，且与 12 条 dpas.8x8 交织。
+
+[3] 定价（COST-LEDGER.json，机器可核）：
+    方案 N（线性 SLM 缓存）: 64 → 80..88 条（+16..+24），**0 条省下**：
+        回读仍是 8 条/站点的逐行 gather（地址空间换了而已）。
+    方案 T（真转置）: 64 → 48（最好） / 72（编译器不合并填充读的现实情况）；
+        +16 KiB shared（8192→24576）、+1 道屏障落在 score→softmax 关键路径、
+        +32 散写 + 32..96 地址 ALU、消息管道字节 4 KiB→12 KiB。
+    卡里的 "8×64 half / 1 KiB" 前提: **数值非法** —— bias 是 f32 且必须在
+        f32 加之后再窄化（§3 合同），half 缓存会在加之前多一次舍入；
+        真实足迹是 4 KiB/SG × 4 SG = 16 KiB（shared 是每 WG）。
+    并发/L12: 该表 dispatch 内不变（基址只含推送常量与 t0），每 WG 读同一张 16 KiB，
+        全部命中 L1/L2 ⇒ 这 64 条**不付 DRAM 钱**，只付发射槽；
+        同身份同 7 PASS 上 n01b 已实测省 32 条 → +0.0127 ms INDISTINCT。
+    ⇒ 即使最好情况（−16）也落在协议分辨率内，且要拿一道关键路径屏障去换。
+
+----------------------------------------------------------------
+2. 已证 / 未证
+----------------------------------------------------------------
+已证（CPU，可重跑）:
+  - 父字节复现（build.py）
+  - (lane,component)→(row,col) 闭式 row=2c+(lane>>4), col=lane&15（128 项逐项）
+  - 8 站点 × 4 comp × 32 lane 与 16×64 表元素**恰好一一覆盖**（1024/1024，重数 1）
+  - 64 条消息 × 16 元素 = 1024，无冗余读、无漏读
+  - 基址 dispatch 不变（不含 WGID / token 基址）
+  - 消息条数 = 窗口极大连续行段数（同核 5 类窗口实测）
+未证（本卡无权/无 GPU，已在 §7 与 COST-LEDGER.unknown 列名）:
+  - 同 SG SLM 可见原语的 ISA 代价（会不会退化成 sync.bar）
+  - shared 24576 B 的常驻 WG 数影响（需资源门）
+  - 8×64 累加器片段的 lane map（密封头文件只到 8×16 与 16×16）
+  - 编译器是否把每 lane 的 4 个相邻标量读合并成一条 512 B 消息
+
+----------------------------------------------------------------
+3. 下一处具体改动（给链头，不属本卡权限内实施）
+----------------------------------------------------------------
+首选：**8×64 累加器形状的 bias 宽读**（唯一有量级、且不需要 SLM/屏障的形态）
+  现状: 每 SG 16 行 × 64 列本来就在 fb 里**连续 4096 B**（行跨度 64 = 整行长度），
+        但按 8×16 片段读就只能 8 行 × 64 B 逐行 gather。
+  改法: 每行半读成一个 coopmat<float, …, 8, 64, Accumulator>（2048 B 连续 →
+        4 条 512 B 消息），再用 component 索引取出 4 个 8×16 站点的值
+        （`bias64[4*s + c]`），f32 加与 nrh_narrow 位置不变。
+  预期: load.ugm.d32x16t 64 → 0、新增 512 B 读 +8；sync.bar 仍 1、shared 仍 8192、
+        无散写；**每 SG −56 条消息**（执行路径 182 → 126，−30%）。
+  两个前置（缺一不可）:
+    (a) 先做**探针**（不是候选）：if(debug) 把 8×64 片段 16 个 component 逐 lane
+        落盘，与 fb[] 的已知值比对，测出 8×64 lane map。判据写在
+        NATIVE-PREDICTION.md §4；测不到就停。
+    (b) BUDGET（L9）：宽片段常驻 16 GRF，而该核实测最高寄存器已到 r127；
+        必须先出预算表，不得直接改。
+备选（不在本线权限内，需用户裁定）：宿主/资产侧把这张 **dispatch 不变的 64×64 f32
+  bias 表**预排成"片段连续"顺序。一次性 16 KiB，内核零成本、无屏障、无 SLM——
+  与 n01b 判 `wb` 预排列"需用户裁定"属同一类。
+
+不建议再试的方向（本卡已定价否掉）:
+  - 任何"线性 SLM 缓存 + 原样回读"的写法（+16..+24 条消息，0 收益）
+  - 任何"half 缓存"（数值非法）
+  - 逐行 gather 的重复读取消重（重复读 = 0，无可消）
+
+----------------------------------------------------------------
+4. 交付物清单（合同 §5）
+----------------------------------------------------------------
+有: ANALYSIS.md（六问）、PROOF.json（机器生成）、COST-LEDGER.json、
+    NATIVE-PREDICTION.md、BUILD.json、RESUME.txt（本文件）、
+    GPU-REQUEST.json（空请求，不上槽）、
+    机器证据: isa-message-census.json、bias-clusters.json、
+    parent-rebuild.spv（= 父字节）、parent-raw.spv、
+    工具: isaparse.py / isa_census.py / find_kernel.py / window.py /
+          make_census.py / make_proof.py / nc_transfer.py / build.py
+无（BLOCKED，合同 §5 允许，此处说明）:
+    candidate.comp / candidate.spv / plan.txt —— 没有候选，所以没有这 7 行的重指；
+    plan 的 replaced==7 与 cpu-check 在本卡不适用。
+    SOURCE-DIFF.patch 存在，但内容是**方案 T 的定价用 diff**，
+    文件头明确标注 NOT APPLIED / NOT A CANDIDATE / NOT BUILT，**不得构建或部署**。
+
+----------------------------------------------------------------
+5. 恢复点
+----------------------------------------------------------------
+- 关于 AUDIT-main.json：`audit_card.py` 的 REQUIRED 列表含 candidate.comp / candidate.spv /
+  plan.txt，本卡按合同 §5 允许不交这三个，所以它的 problems 里会一直有这三条；
+  另外它用"路径以 candidate.spv 结尾"去认候选 UUID，而本卡的**父 SPV 文件名本身就叫
+  candidate.spv**，于是在没有 in-card 候选时会误把父 ident 当候选 ident ⇒
+  `candidate_identity_ok=false` 属于预期，不是身份错误。
+  该报告里真正有意义的两行是 `parent_is_baseline_row_spv=true`、
+  `parent_rebuilt_equals_parent=true`（父字节复现通过）。
+  `float_NC_checked=0` 是因为没有候选 SPV 可对齐（父本身有 185 个 NC 站点）。
+  BUILD.json 里已写入 `candidate: null` 与 `audit_note` 说明同一件事。
+- 若主代理决定接受本卡判定：本卡无需任何 GPU 动作；F02 的下一条卡按 §3 首选执行
+  （先探针，再预算，后候选）。
+- 若要复核本卡数字：重跑
+    python cards/n02c-f02-fb-bias/build.py        （父字节复现 + 链头 7 行核对）
+    python cards/n02c-f02-fb-bias/make_census.py  （ISA 消息普查）
+    python cards/n02c-f02-fb-bias/make_proof.py   （枚举证明）
+  三条全部 CPU-only，不碰 GPU 锁、不写卡目录之外。
+- 未决项（合同 §7：本卡自行推断，未停下来等）:
+    1) 方案 T 的填充读是否被编译器合并（−16 还是 +8）——只能靠 ISA 采集定，
+       本卡不建候选因此留空；
+    2) 8×64 累加器 lane map 的自然延伸（component 4*s+c）是**假设**，
+       必须以探针为准；若主代理不愿为 F02 花一次探针槽，则本族到此为止。

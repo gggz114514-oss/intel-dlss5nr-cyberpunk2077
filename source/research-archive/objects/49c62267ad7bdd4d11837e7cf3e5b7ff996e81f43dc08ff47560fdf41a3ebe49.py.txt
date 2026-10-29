@@ -1,0 +1,32 @@
+"""Offline channel equalization; preserve signed narrow-range Vulkan contract."""
+from pathlib import Path
+import json, numpy as np
+Q=Path(__file__).resolve().parent;B=Q.parents[2];D=Q/'real-int8-24';O=D/'lift-equalized';O.mkdir(exist_ok=False)
+w=np.fromfile(B/'candidates/amd-map-20261015/s1-integrated/candidate/packs/ioport_0_ioport_pack.fp16.bin',dtype='<f2')
+W=np.array([[w[8192+(c//8)*128+(c%8)*16+k] for c in range(32)] for k in range(16)],dtype=np.float32)
+amax=np.zeros(16,dtype=np.float32);samples=[]
+for frame in [34189,41444,43654]:
+ x=np.fromfile(D/f'feature-diagnostics/run-{frame}/features.bin',dtype='<f2').reshape(768,1344,16).astype(np.float32)
+ amax=np.maximum(amax,abs(x).max(axis=(0,1)))
+ groups=x.reshape(96,2,4,168,2,4,16).transpose(0,3,1,4,2,5,6).reshape(-1,16,16)
+ samples.append(groups[::64].copy())
+x=np.concatenate(samples);ref=(x@W).astype(np.float16).astype(np.float32)
+def trial(d,static):
+ z=x/d;wt=W*d[:,None];sw=np.maximum(abs(wt).max(axis=0)/127,1e-12);qw=np.clip(np.rint(wt/sw),-127,127).astype(np.int32)
+ sa=np.float32(np.max(amax/d)/127) if static else np.maximum(abs(z).max(axis=(1,2),keepdims=True)/127,1e-12)
+ qa=np.clip(np.rint(z/sa),-127,127).astype(np.int32);y=((qa@qw).astype(np.float32)*sw*sa).astype(np.float16).astype(np.float32)
+ e=y-ref
+ return dict(rel_l2=float(np.linalg.norm(e)/np.linalg.norm(ref)),rmse=float(np.sqrt(np.mean(e*e))),max_abs=float(abs(e).max()),scale=float(sa) if static else 'per SG dynamic',d=d.tolist()),sw,qw,sa
+rows=[]
+baseline,*_=trial(np.ones(16,np.float32),False);rows.append(dict(name='existing dynamic',**baseline))
+weight_amax=abs(W).max(axis=1)
+options=[]
+for alpha in [.5,1.]:
+ raw=np.maximum(amax,1e-12)**alpha/np.maximum(weight_amax,1e-12)**(1-alpha)
+ d=np.exp2(np.rint(np.log2(raw))).astype(np.float32);d[amax==0]=1
+ for static in [True,False]:
+  r,sw,qw,sa=trial(d,static);rows.append(dict(name=f'pow2 alpha={alpha} static={static}',**r))
+  if static:options.append((r['rel_l2'],d,sw,qw,sa,alpha))
+_,d,sw,qw,sa,alpha=min(options,key=lambda v:v[0])
+np.savez(O/'CALIBRATION.npz',d=d,weight=W,weight_scale=sw,weight_codes=qw,activation_scale=sa,features=x.reshape(-1,16),feature_absmax=amax)
+(O/'CALIBRATION.json').write_text(json.dumps({'scope':'three daytime calibration frames; sampled groups evaluate local mathematical lift only; no holdout claim','selected_alpha':alpha,'range':[-127,127],'zero_point':0,'rounding':'RNE','feature_absmax':amax.tolist(),'rows':rows},indent=2));print(json.dumps(rows,indent=2))

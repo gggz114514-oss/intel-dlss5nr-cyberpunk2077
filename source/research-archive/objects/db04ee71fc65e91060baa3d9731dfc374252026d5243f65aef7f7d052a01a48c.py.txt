@@ -1,0 +1,103 @@
+"""Reconcile this card's 32-byte A row trace against f05-a-return-separation A-PROVENANCE.json.
+
+Read-only on the historical card; writes only into this card directory.
+Checks (per phase): 128 row sends, 32 valid bytes inside a 64 B allocation,
+6 DPAS consumers per row, 8 complete rows per DPAS, 4 same-width 32 B packing
+copies per 8-row fragment, fragment -> 4-register operand layout.
+"""
+import json
+import collections
+from pathlib import Path
+
+D = Path(r'@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\fullnet-mechanism-transfer-20261026')
+SEP = D / 'f05-a-return-separation-20261027'
+CARD = Path(r'@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\fullnet-continuous-20261027\cards\n04b-f05-c128-feed')
+
+A = json.loads((SEP / 'A-PROVENANCE.json').read_text(encoding='utf-8-sig'))
+B = json.loads((SEP / 'B-PROVENANCE.json').read_text(encoding='utf-8-sig'))
+TW = json.loads((SEP / 'A-TILE-WINDOWS.json').read_text(encoding='utf-8-sig'))
+
+res = {'source_files': {'A': str(SEP / 'A-PROVENANCE.json'), 'B': str(SEP / 'B-PROVENANCE.json'),
+                        'W': str(SEP / 'A-TILE-WINDOWS.json')}}
+for which in ('rolling', 'candidate'):
+    blk = A[which]
+    rows, dpas = blk['rows'], blk['DPAS']
+    # fragment = consecutive group of 8 rows sharing the same consumer PC set,
+    # defined by DPAS provenance (not by send order) - same rule as A-TILE-WINDOWS.
+    frag_of_dpas = collections.OrderedDict()
+    for d in dpas:
+        key = tuple(sorted(d['A_rows']))
+        frag_of_dpas.setdefault(key, []).append(d)
+    # copies per fragment via its rows
+    row_by_id = {r['id']: r for r in rows}
+    frags = []
+    for key, ds in frag_of_dpas.items():
+        cop = collections.OrderedDict()
+        for rid in key:
+            for c in (row_by_id[rid].get('copies') or []):
+                cop.setdefault(c, []).append(rid)
+        frags.append(dict(rows=list(key), n_dpas=len(ds),
+                          copy_pcs=list(cop.keys()),
+                          copy_map={k: v for k, v in cop.items()},
+                          a_banks=sorted({d['A_bank'] for d in ds})))
+    # operand layout: bank -> which rows land in .0 vs .8
+    bank_layout = collections.defaultdict(dict)
+    for r in rows:
+        label = r.get('consumer_halves') or r.get('layout') or None
+        bank_layout[r['bank']][r['id']] = label
+    per_row_consumers = sorted({len(r['consumers']) for r in rows})
+    dpas_sizes = sorted({len(d['A_rows']) for d in dpas})
+    overwritten = [r['id'] for r in rows if r.get('overwritten_A_labels')]
+    # a DPAS closes 8 complete rows iff its row set is a full 8-row tile
+    full_tiles = [f for f in frags if f['n_dpas'] == 6]
+    res[which] = dict(
+        native=blk['native'],
+        rows=len(rows), dpas=len(dpas),
+        valid_A_bytes=sorted({r['valid_A_bytes'] for r in rows}),
+        alloc_bytes=sorted({r['return_allocation_bytes'] for r in rows}),
+        consumers_per_row=per_row_consumers,
+        rows_per_dpas=dpas_sizes,
+        n_fragments=len(frags),
+        fragments_with_6_dpas=len(full_tiles),
+        copies_per_fragment=sorted({len(f['copy_pcs']) for f in frags}),
+        copy_widths=sorted({len(v) for f in frags for v in f['copy_map'].values()}),
+        a_banks=sorted({d['A_bank'] for d in dpas}),
+        rows_overwritten_before_last_use=overwritten,
+        closure=blk.get('closure'),
+        fragment_sample=frags[:4],
+        last_dpas_pc=dpas[-1]['pc'],
+        last_row_send_pc=max(rows, key=lambda r: int(r['producer_pc'], 16))['producer_pc'],
+    )
+
+# B side: 96 weight returns (48 per phase), 512 B each, one exact DPAS B consumer
+bout = {}
+for which in ('rolling', 'candidate'):
+    arms = B['arms'][which]
+    edges = [e for arm in arms for e in arm['edges']]
+    rd = sorted({int(x) for e in edges for x in
+                 __import__('re').findall(r'rd:(\d+)', e['send'])})
+    bout[which] = dict(n=len(edges), per_phase=[len(a['edges']) for a in arms],
+                       rd=rd, payload_bytes=[8 * 64 * r for r in rd],
+                       peak_issue_intervals=[a['peak_issue_intervals'] for a in arms],
+                       sample=edges[0]['send'])
+res['b'] = bout
+res['b_scope'] = B['scope']
+res['tile_windows_keys'] = list(TW.keys())
+
+(CARD / 'build').mkdir(parents=True, exist_ok=True)
+(CARD / 'build' / 'a-provenance-summary.json').write_text(
+    json.dumps(res, indent=1, ensure_ascii=False), encoding='utf-8')
+
+r = res['rolling']
+print('rolling: rows=%d dpas=%d valid=%s alloc=%s consumers/row=%s rows/dpas=%s frags=%d full6=%d copies/frag=%s copy_widths=%s banks=%s overwritten=%s'
+      % (r['rows'], r['dpas'], r['valid_A_bytes'], r['alloc_bytes'], r['consumers_per_row'],
+         r['rows_per_dpas'], r['n_fragments'], r['fragments_with_6_dpas'], r['copies_per_fragment'],
+         r['copy_widths'], r['a_banks'], r['rows_overwritten_before_last_use']))
+print('closure:', r['closure'])
+print('frag0:', json.dumps(r['fragment_sample'][0], ensure_ascii=False))
+print('frag1:', json.dumps(r['fragment_sample'][1], ensure_ascii=False))
+c = res['candidate']
+print('cand   : rows=%d dpas=%d frags=%d full6=%d copies/frag=%s banks=%s'
+      % (c['rows'], c['dpas'], c['n_fragments'], c['fragments_with_6_dpas'], c['copies_per_fragment'], c['a_banks']))
+print('B rolling n=%s closure=%s' % (bout['rolling']['n'], bout['rolling']['closure']))
+print('B sample:', json.dumps(bout['rolling']['sample'], ensure_ascii=False)[:500])

@@ -1,0 +1,105 @@
+# -*- coding: utf-8 -*-
+"""Minimal deterministic PNG read/write (numpy + zlib only).
+
+PIL/Pillow is not installed in any interpreter on this host (checked:
+Python312, Python310, Q/tool-env).  This module implements the subset needed
+for C00: 8-bit RGB / RGBA, non-interlaced, filter types 0-4, and exposes the
+exact 8-bit mapping used for every image so the mapping can be audited.
+
+Writing is deterministic: filter 0 on every scanline, zlib level 6, no
+metadata chunks other than IHDR/IDAT/IEND.
+"""
+from __future__ import annotations
+
+import struct
+import zlib
+from pathlib import Path
+
+import numpy as np
+
+
+def _chunk(tag: bytes, data: bytes) -> bytes:
+    return (struct.pack(">I", len(data)) + tag + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+
+def write_rgb(path: str | Path, rgb: np.ndarray) -> Path:
+    """rgb: HxWx3 uint8."""
+    a = np.ascontiguousarray(rgb, dtype=np.uint8)
+    if a.ndim != 3 or a.shape[2] != 3:
+        raise ValueError(f"expected HxWx3, got {a.shape}")
+    h, w, _ = a.shape
+    raw = np.empty((h, 1 + w * 3), dtype=np.uint8)
+    raw[:, 1:] = a.reshape(h, w * 3)
+    raw[:, 0] = 0
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    blob = (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", zlib.compress(raw.tobytes(), 6)) + _chunk(b"IEND", b""))
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(blob)
+    return p
+
+
+def _unfilter(data: bytes, h: int, w: int, bpp: int) -> np.ndarray:
+    stride = w * bpp
+    out = np.zeros((h, stride), dtype=np.uint8)
+    pos = 0
+    prev = np.zeros(stride, dtype=np.uint8)
+    for y in range(h):
+        ft = data[pos]
+        pos += 1
+        line = np.frombuffer(data, dtype=np.uint8, count=stride, offset=pos).copy()
+        pos += stride
+        if ft == 0:
+            cur = line
+        elif ft == 1:
+            cur = line
+            for i in range(bpp, stride):
+                cur[i] = (int(cur[i]) + int(cur[i - bpp])) & 0xFF
+        elif ft == 2:
+            cur = (line.astype(np.uint16) + prev.astype(np.uint16)).astype(np.uint8)
+        elif ft == 3:
+            cur = line
+            for i in range(stride):
+                left = int(cur[i - bpp]) if i >= bpp else 0
+                cur[i] = (int(cur[i]) + ((left + int(prev[i])) >> 1)) & 0xFF
+        elif ft == 4:
+            cur = line
+            for i in range(stride):
+                a = int(cur[i - bpp]) if i >= bpp else 0
+                b = int(prev[i])
+                c = int(prev[i - bpp]) if i >= bpp else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                cur[i] = (int(cur[i]) + pr) & 0xFF
+        else:
+            raise ValueError(f"unsupported filter {ft}")
+        out[y] = cur
+        prev = cur
+    return out.reshape(h, w, bpp)
+
+
+def read_rgb(path: str | Path) -> np.ndarray:
+    """Return HxWx3 (or HxWx4) uint8 for 8-bit non-interlaced PNG."""
+    blob = Path(path).read_bytes()
+    if blob[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG")
+    pos, idat, w = 8, [], None
+    while pos < len(blob):
+        ln = struct.unpack(">I", blob[pos:pos + 4])[0]
+        tag = blob[pos + 4:pos + 8]
+        data = blob[pos + 8:pos + 8 + ln]
+        pos += 12 + ln
+        if tag == b"IHDR":
+            w, h, depth, ctype, comp, filt, inter = struct.unpack(">IIBBBBB", data)
+            if depth != 8 or comp != 0 or filt != 0 or inter != 0:
+                raise ValueError(f"unsupported PNG: {depth=} {comp=} {filt=} {inter=}")
+            bpp = {0: 1, 2: 3, 4: 2, 6: 4}[ctype]
+        elif tag == b"IDAT":
+            idat.append(data)
+        elif tag == b"IEND":
+            break
+    raw = zlib.decompress(b"".join(idat))
+    return _unfilter(raw, h, w, bpp)

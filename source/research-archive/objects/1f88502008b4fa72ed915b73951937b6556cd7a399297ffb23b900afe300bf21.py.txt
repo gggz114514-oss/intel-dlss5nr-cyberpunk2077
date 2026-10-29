@@ -1,0 +1,56 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,shlex,shutil,collections
+D=Path(__file__).resolve().parent;A=D.parent;B=A.parent.parent;R=D/'backend-uniform-owner';R.mkdir(exist_ok=True)
+P=D/'f05-owner-concurrency/subgroup-owner-family'
+read=lambda p:json.loads(p.read_text(encoding='utf-8-sig'));sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+def ident(p):return dict(path=str(p),sha256=sha(p))
+def save(p,x):p.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding='utf-8')
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def restore(pm,cm,out):
+ allnc=set(ST.no_contraction_ids(pm));integer_ops={128,130,132,134,135,137,138,139};nc={ST.result_id_of(op,a) for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in allnc and op not in integer_ops};ops={op for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in nc}
+ pr=ST.function_regions(pm);cr=ST.function_regions(cm);assert len(pr)==len(cr);keep=[];checked=0
+ for p,c in zip(pr,cr):
+  ps=[pm.instructions[i] for i in p if pm.instructions[i][0] in ops];cs=[cm.instructions[i] for i in c if cm.instructions[i][0] in ops];assert len(ps)==len(cs)
+  for x,y in zip(ps,cs):
+   assert (x[0],x[3])==(y[0],y[3]);a=ST.result_id_of(x[0],x[1]);b=ST.result_id_of(y[0],y[1]);assert pm.operand_signature(a,3)==cm.operand_signature(b,3),(a,b);checked+=1
+   if a in nc:keep.append(b)
+ assert len(keep)==len(nc);rawnc=set(ST.no_contraction_ids(cm));ints=[ST.result_id_of(op,a) for op,a,_,_ in cm.instructions if op in integer_ops and ST.result_id_of(op,a) in rawnc];ST.set_no_contraction(cm,keep+ints,out)
+ return dict(arithmetic_checked=checked,floating_NC=len(keep),integer_NC=len(ints))
+scan=read(D/'CURRENT-CENSUS.json')['rows'];pt=(P/'plan.txt').read_text(encoding='utf-8');planrows=[shlex.split(l) for l in pt.splitlines() if l.startswith('PASS ')]
+for variant,ordinals in [('d034-family',[6,18,36]),('ups-c256-contract',[168])]:
+ S=R/variant;S.mkdir(exist_ok=True);sources=[];text=pt;proof=[]
+ for ordinal in ordinals:
+  old=scan[ordinal];parent=Path(planrows[ordinal][3]);src=Path(old['source']);assert sha(parent)==old['sha256'];C={6:64,18:128,36:256,168:256}[ordinal];folder=S/f'c{C}';folder.mkdir(exist_ok=True)
+  def compile(name,s):
+   f=folder/(name+'.comp');o=folder/(name+'.spv');f.write_text(s,encoding='utf-8');run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(src.parent),f,'-o',o]);return o
+  original=src.read_text(encoding='utf-8-sig');pm=ST.Module(parent);rebuilt=compile('parent-rebuild',original);rm=ST.Module(rebuilt);keep,info=ST.transfer_decoration_pattern_aligned(pm,rm,set());ST.set_no_contraction(rm,keep,rebuilt);assert sha(rebuilt)==sha(parent)
+  assert original.count('const uint sg = t_local / 32u;')==1 and original.count('const uint lane = t_local % 32u;')==1
+  changed=original.replace('const uint sg = t_local / 32u;','const uint sg = gl_SubgroupID;').replace('const uint lane = t_local % 32u;','const uint lane = gl_SubgroupInvocationID;');o=compile('candidate',changed);mapping=restore(pm,ST.Module(o),o);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',o])
+  selected=[i for i,t in enumerate(planrows) if Path(t[3])==parent];text=text.replace(parent.as_posix(),o.as_posix());sources.append(dict(width=C,ordinal=ordinal,ordinals=selected,parent=ident(parent),parent_rebuilt=ident(rebuilt),source=ident(o.with_suffix('.comp')),candidate=ident(o),arithmetic_alignment=mapping))
+  cells=collections.Counter()
+  if variant=='d034-family':
+   groups=C//32;rows=4096//C
+   for sg in range(8):
+    for t in range(16*(sg//groups),16*(sg//groups)+16):
+     for c in range(32*(sg%groups),32*(sg%groups)+32):cells[t,c]+=1
+   assert cells==collections.Counter((t,c) for t in range(rows) for c in range(C))
+   proof.append(dict(width=C,coverage='Every slab token/channel exactly once',slab_rows=rows,SLM_bytes=8192,owner='g=sg%(C/32), pair=sg/(C/32); rows16*pair+[0,16), channels32*g+[0,32)',lifetime='Original middle4acc carried across hidden blocks; expand4acc scope unchanged; mLocal publish then same barrier then contract4acc. No new matrix/address state in source.',weights='Two row tiles continue sharing each expand/middle/contract B load. Identical loop counts and logical requests.'))
+  else:
+   for sg in range(8):
+    for r in range(4):
+     for t in range(16*r,16*r+16):
+      for c in range(32*sg,32*sg+32):cells[t,c]+=1
+   assert cells==collections.Counter((t,c) for t in range(64) for c in range(256))
+   proof.append(dict(width=C,coverage='Every64x256 output cell exactly once',SLM_bytes=32768,owner='r0..3 gives16rows; subgroup0..7 gives32channels. localID cooperative shM publication unchanged; WG barrier before any reader unchanged.',lifetime='Four seeded FP32acc keep original K16 order; two rows share two B operands. Original seed narrowing/multiply/widen untouched; no new matrix values. Address representation is only tested variable.'))
+ plan=S/'plan.txt';plan.write_text(text,encoding='utf-8');cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check']);save(S/'BUILD.json',dict(parent=ident(P/'plan.txt'),plan=ident(plan),sources=sources,CPU=cpu))
+ save(S/'PROOF.json',dict(mapping=proof,contract='Only subgroup/lane identity changes. Actual captured SIMD32 same. Workgroup/grid/SLM/bind/PUSH/rounding/tree/K order/debug branch remain unchanged; original parent rebuild byte-identical.',hypothesis='Explicit subgroup-uniform owner may reduce long-lived coordinate/address vectors. Native baseline D034C128 scratch448 with stores01C0/0250; UPScontract scratch768 with address spill1D70. Not all scratch values or performance cost attributed.',acceptance='fixed/fb2gold; scratch nonincrease on every changed module; one six-pair batch against accepted F05owner baseline. No speculative retries.'))
+ (S/'run').mkdir(exist_ok=True)
+ for kind in ['GATES','RESOURCES','NATIVE','ORDINARY']:
+  t=read(P/f'LUNA-{kind}.json');ex=S/(kind.lower()+'-execution');ex.mkdir(exist_ok=True);t['output_root']=str(ex);t['identities']=[v for v in t['identities'] if not v['path'].endswith('.spv')]+[x['candidate'] for x in sources]+[x['parent'] for x in sources]
+  for j in t['jobs']:
+   jp=P/'plan.txt' if kind=='ORDINARY' and j['candidate']=='parent' else plan;j['plan']=ident(jp);j['runner_output']=str(S/'run'/j['id']);ar=j['argv'];ar[ar.index('--plan')+1]=str(jp);ar[ar.index('--out')+1]=j['runner_output']
+   if kind=='NATIVE':ar[ar.index('--output_dir')+1]=str(S/'captures');ar[ar.index('--msg_file')+1]=str(S/'native.log');j['capture_output']=str(S/'captures'/ar[ar.index('--profile_dir')+1])
+  save(S/f'LUNA-{kind}.json',t)
+ (S/'execute.ps1').write_text((P/'execute.ps1').read_text(encoding='utf-8').replace('LUNA-F05-SUBGROUP-OWNER-FAMILY','LUNA-BACKEND-OWNER-'+variant),encoding='utf-8');shutil.copyfile(P/'review_timing.py',S/'review_timing.py');print(variant,cpu.strip())

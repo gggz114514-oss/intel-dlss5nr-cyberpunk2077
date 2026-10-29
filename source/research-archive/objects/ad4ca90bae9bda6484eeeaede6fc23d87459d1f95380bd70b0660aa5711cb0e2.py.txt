@@ -1,0 +1,55 @@
+import json,hashlib,subprocess,shlex,sys
+from pathlib import Path
+D=Path(__file__).resolve().parent;R=D/'direct-f01';R.mkdir(exist_ok=True);B=Path('@NR_WORKSPACE@')
+family=B/'candidates/dsh-fp16-same-family-20261023/d01-k03-v1';source=family/'source/kernel.comp';parent=family/'spv/K03.spv'
+compiler=B/'src/project/tools/glslang-16.5.0/bin/glslang.exe';validator=B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'
+original=source.read_text(encoding='utf-8-sig')
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'))
+import spv_tools_local as ST
+def identity(p):return {'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+def compile(src,dest):
+ r=subprocess.run([str(compiler),'-V','--target-env','vulkan1.3','-I'+str(source.parent),str(src),'-o',str(dest)],capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+ child=ST.Module(dest);keep,info=ST.transfer_decoration_pattern_aligned(ST.Module(parent),child,[])
+ assert len(keep)==len(ST.no_contraction_ids(ST.Module(parent)))
+ ST.set_no_contraction(child,keep,dest)
+ (dest.with_suffix('.nc.json')).write_text(json.dumps(info,indent=2),encoding='utf-8')
+ r=subprocess.run([str(validator),str(dest)],capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+compile(source,R/'parent-rebuilt.spv');assert identity(R/'parent-rebuilt.spv')['sha256']==identity(parent)['sha256'],'parent mismatch'
+wrapper='''
+layout(set=0,binding=15,std430) buffer ClockProbe { uint clockWords[]; };
+void main() {
+ENTRY_CLOCK
+    nr_original_main();
+EXIT_CLOCK
+    if ((gl_WorkGroupID.x & 15u)==8u && (gl_WorkGroupID.y & 15u)==8u && gl_SubgroupInvocationID==0u) {
+        uint record = ((gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*4u+gl_SubgroupID)*4u;
+        clockWords[record]=nrClockStart.x; clockWords[record+1u]=nrClockStart.y;
+        clockWords[record+2u]=nrClockEnd.x; clockWords[record+3u]=nrClockEnd.y;
+    }
+}
+'''
+specs={'whole':('entry','exit'),'null':('entry','entry'),'first':('entry','bar'),'second':('bar','exit')}
+for name,(a,b) in specs.items():
+ s=original.replace('#version 450','#version 450\n#extension GL_ARB_shader_clock : require').replace('#include "register_handoff.glsl"','#include "register_handoff.glsl"\nuvec2 nrClockStart,nrClockEnd;').replace('void main() {','void nr_original_main() {')
+ assert s.count('barrier();')==1
+ s=s.replace('barrier();','barrier();'+('nrClockStart=clock2x32ARB();' if a=='bar' else '')+('nrClockEnd=clock2x32ARB();' if b=='bar' else ''))
+ entry=('nrClockStart=clock2x32ARB();' if a=='entry' else '')+('nrClockEnd=clock2x32ARB();' if b=='entry' else '')
+ s+=wrapper.replace('ENTRY_CLOCK',entry).replace('EXIT_CLOCK','nrClockEnd=clock2x32ARB();' if b=='exit' else '')
+ src=R/(name+'.comp');src.write_text(s,encoding='utf-8');compile(src,R/(name+'.spv'))
+plan=B/'work/zcode-fp16-fullnet-handoff-20261024/candidates/combo1-gates-passed/plan-combo1-232.txt';lines=plan.read_text(encoding='utf-8-sig').splitlines();h=lines[0].split();nb=int(h[2]);no=int(h[4]);idx=[i for i,l in enumerate(lines) if l.startswith('PASS ')][0];tokens=shlex.split(lines[idx]);gx,gy,gz=map(int,tokens[-3:]);assert gz==1;size=gx*gy*4*16
+out={'grid':[gx,gy,gz],'sg_count':4,'order':0,'clock_buffer_bytes':size,'plans':{},'parent_rebuild':identity(R/'parent-rebuilt.spv')}
+for name in ['control',*specs]:
+ o=lines.copy();hh=h.copy();hh[2]=str(nb+1);hh[4]=str(no+1);o[0]=' '.join(hh);t=tokens.copy();t[6]=str(int(t[6])+1)
+ if name!='control':t[3]=(R/(name+'.spv')).as_posix()
+ o[idx]=' '.join(t[:2]+[json.dumps(t[2]),json.dumps(t[3])]+t[4:]);o.insert(idx+1,f'BIND 15 {nb} 0 {size}')
+ o.insert(next(i for i,l in enumerate(o) if l.startswith('POLICY ')),f'OUTPUT {nb} raw "clock.bin"');o.append(f'POLICY {nb} 1 0 232 1');o.insert(nb+1,f'BUFFER "phase_clock" {size} "-"')
+ p=R/('plan-'+name+'.txt');p.write_text('\n'.join(o)+'\n',encoding='utf-8');out['plans'][name]=identity(p)
+(R/'PREPARATION.json').write_text(json.dumps(out,indent=2),encoding='utf-8')
+base=json.loads((D/'LUNA-DIRECT-CLOCK-JOBS.json').read_text(encoding='utf-8-sig'));base['jobs']=[];base['identities']=[identity(D/'direct-clock-build/Release/clock_runner.exe')]+[identity(R/(n+'.spv')) for n in specs]
+for rep in range(3):
+ order=['control','whole','first','second','null'] if rep%2==0 else ['null','second','first','whole','control']
+ for name in order:
+  plan=out['plans'][name];label=f'f01-closure-r{rep}-{name}';dest=D/'run'/label
+  base['jobs'].append({'id':label,'plan':plan,'argv':[str(D/'direct-clock-build/Release/clock_runner.exe'),'--plan',plan['path'],'--out',str(dest),'--pool','--warm','1','--reps','10','--per-pass-timing'],'runner_output':str(dest),'expected_fixed_frame_out':'1755e9c2fadba97f08cb5b02b7a4294cde3675379bdec75352287505f7e129d6'})
+base['status']='F01_DIRECT_CLOCK_REPEATS_AND_ADDITIVITY_CALIBRATION';base['rules']=['Original plan only ordinal0 changes. 4SG/WG; sampled x%16=8,y%16=8. All CPU validation passed.','Unique GPU lock; serial exact jobs. Any nongold/device lost/missing receipt/nonzero exit stops remaining. Preserve clocks, frames, timings.','No timing interpretation or additional experiments by executor.']
+(D/'LUNA-F01-CLOSURE-JOBS.json').write_text(json.dumps(base,indent=2),encoding='utf-8');print('F01 parent exact; four clock SPVs CPU valid; 15 jobs prepared')

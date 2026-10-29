@@ -1,0 +1,139 @@
+"""n33 step A2: executed-path (reachability) mask for the F02 kernel.
+
+The campaign-wide audit (latency_audit.py) scans the ISA listing linearly, so a
+"consumer" it finds may itself be inside a debug echo island.  This script builds
+a static CFG over the listing - the debug path is entered by a *conditional*
+jmpi at the prologue and every echo block ends with an unconditional jmpi over
+the island - and reports:
+
+  * reachable / unreachable instruction counts and where the islands are
+  * the 24 expensive ops: file-order distance (campaign convention) AND
+    executed-path distance (live instructions strictly between op and first
+    live reader)
+"""
+import sys, json
+from pathlib import Path
+from collections import Counter, defaultdict
+
+HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE))
+import _isa  # noqa: E402
+
+BRANCH = {"jmpi", "goto", "join", "ret", "brd", "brc"}
+
+
+def label_target(ins):
+    for tok in ins["ops"]:
+        if tok.startswith("L") and tok[1:].isdigit():
+            return int(tok[1:])
+    return None
+
+
+def reachable(ins, labels):
+    """CFG from entry; a predicated jmpi falls through too, an unconditional
+    jmpi/goto/join does not (the ISA listing uses jmpi for both)."""
+    n = len(ins)
+    seen = [False] * n
+    stack = [0]
+    while stack:
+        i = stack.pop()
+        if i is None or i < 0 or i >= n or seen[i]:
+            continue
+        seen[i] = True
+        it = ins[i]
+        op = it["op"]
+        nxt = []
+        if op in ("jmpi", "goto", "join"):
+            t = label_target(it)
+            if t is not None and t in labels:
+                nxt.append(labels[t])
+            # jmpi with a predicate and two label operands = conditional jump
+            if it["flags"] and not it["flags"].startswith("(W&") and "(" in it["flags"]:
+                nxt.append(i + 1)
+            elif op == "jmpi" and len([o for o in it["ops"] if o.startswith("L")]) >= 2:
+                # `(f2.0) goto Lx Ly` style: both targets are candidates
+                for tok in it["ops"]:
+                    if tok.startswith("L") and tok[1:].isdigit() and int(tok[1:]) in labels:
+                        nxt.append(labels[int(tok[1:])])
+        elif op in ("ret",):
+            pass
+        else:
+            nxt.append(i + 1)
+        stack.extend(nxt)
+    return seen
+
+
+def main():
+    ins, labels = _isa.parse()
+    seen = reachable(ins, labels)
+    n = len(ins)
+    live = [i for i in range(n) if seen[i]]
+    dead = [i for i in range(n) if not seen[i]]
+    print("instructions %d  reachable %d  unreachable %d" % (n, len(live), len(dead)))
+    # islands of unreachable code
+    runs, start = [], None
+    for i in range(n):
+        if not seen[i] and start is None:
+            start = i
+        if seen[i] and start is not None:
+            runs.append((start, i - 1))
+            start = None
+    if start is not None:
+        runs.append((start, n - 1))
+    runs = [r for r in runs if r[1] - r[0] >= 2]
+    print("unreachable runs (len>=3): %d, total %d instructions"
+          % (len(runs), sum(b - a + 1 for a, b in runs)))
+    for a, b in runs[:12]:
+        print("   [%d..%d] len %d  %s ... %s"
+              % (a, b, b - a + 1, ins[a]["op"], ins[b]["op"]))
+
+    # expensive ops
+    exp = [i for i in range(n) if ins[i]["op"] in ("math.rsqt", "math.inv")]
+    rows = []
+    for k in exp:
+        dst = None
+        for o in ins[k]["ops"]:
+            import re
+            m = re.match(r"^r(\d+)(?:\.(\d+))?", o)
+            if m:
+                dst = (int(m.group(1)), int(m.group(2) or 0))
+                break
+        file_d = live_d = None
+        for j in range(k + 1, min(k + 400, n)):
+            if any(_reads(ins[j], dst) for _ in [0]):
+                if file_d is None:
+                    file_d = j - k
+                if seen[j] and live_d is None:
+                    live_d = j - k
+                    break
+        gap_live = sum(1 for j in range(k + 1, k + (live_d or 1)) if seen[j])
+        rows.append(dict(idx=k, op=ins[k]["op"], dst=dst, reachable=seen[k],
+                         file_distance=file_d, live_distance=live_d, live_gap=gap_live))
+    print("\n%-6s %-9s %8s %8s %7s" % ("idx", "op", "file_d", "live_d", "gap"))
+    for r in rows:
+        print("%-6d %-9s %8s %8s %7s %s"
+              % (r["idx"], r["op"], r["file_distance"], r["live_distance"],
+                 r["live_gap"], "" if r["reachable"] else "  <-- UNREACHABLE"))
+    json.dump(dict(n=n, reachable=len(live), unreachable=len(dead), runs=runs,
+                   expensive=rows), open(HERE / "A-LIVE.json", "w"), indent=1)
+    print("\nwrote A-LIVE.json")
+
+
+def _reads(it, dst):
+    import re
+    if dst is None:
+        return False
+    for o in it["ops"][1:] if len(it["ops"]) > 1 else []:
+        m = re.match(r"^r(\d+)(?:\.(\d+))?", o)
+        if m and (int(m.group(1)), int(m.group(2) or 0)) == dst:
+            return True
+    # a store/send may read through operand 0 as well
+    for o in it["ops"]:
+        m = re.match(r"^r(\d+)(?:\.(\d+))?", o)
+        if m and (int(m.group(1)), int(m.group(2) or 0)) == dst and it["ops"].index(o) > 0:
+            return True
+    return False
+
+
+if __name__ == "__main__":
+    main()

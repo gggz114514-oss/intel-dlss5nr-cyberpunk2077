@@ -1,0 +1,132 @@
+"""C32 tail (blocks 67/68/69) static X equalization, same closed method as body1-3.
+
+Reuses the already-verified c32-equalized kernel SPV (per-input-channel inverse
+at fsc[292..323]) and only regenerates the unified weight/scale packs for the
+tail blocks.  No GPU is run here; this produces a candidate + JOBS for the
+central GPU executor.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+import planlib  # noqa: E402
+
+Q = Path(r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029")
+D = Q / "real-int8-24"
+W = Path(r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029")
+OUT = W / "S01-c32-tail"
+OUT.mkdir(exist_ok=True)
+TEACHERS = [D / "dump-fp16", D / "teacher-diagnostics/teacher-41444", D / "teacher-diagnostics/teacher-43654"]
+BASE = D / "c64-family-static/combo-34189.txt"
+SPV = D / "c32-equalized/candidate.spv"
+BLOCKS = [67, 68, 69]
+
+
+def half(x):
+    return x.astype(np.float16).astype(np.float32)
+
+
+def main() -> None:
+    plan = planlib.Plan(BASE)
+    cal = {"method": "X/D power-of-two channel equalization folded into expand weights; same verified c32-equalized kernel",
+           "scope": "blocks 67/68/69, three captured FP16 teacher frames, no GPU run",
+           "rows": []}
+    patch = {"base_sha256": plan.sha256(), "replace_buffers": {}, "replace_spv": [], "notes": "C32 tail equalisation candidate, blocks 67-69"}
+    for block in BLOCKS:
+        d1 = next(d for d in plan.passes if d.name == f"block{block}_swin_body_1")
+        binds = {b.binding: b for b in d1.binds}
+        pc = [int(x) for x in d1.push]
+        wbuf = plan.buffers[binds[0].buffer]
+        ubuf = plan.buffers[binds[5].buffer]
+        sbuf = plan.buffers[binds[6].buffer]
+        wp = np.fromfile(wbuf.file, dtype="<f2").astype(np.float32)
+        # Parent's fp16 expand layout, verified in calibrate_c32_real.py.
+        Wm = np.array([[wp[pc[4] + (f // 16) * 512 + ((f % 16) // 8) * 128 + (k // 16) * 256 + (f % 8) * 16 + k % 16]
+                        for k in range(32)] for f in range(128)], np.float32)
+        am = np.zeros(32, np.float32)
+        xs = []
+        for td in TEACHERS:
+            p = td / f"dump_block{block-1}_out.bin"
+            x = np.fromfile(p, dtype="<f2").reshape(-1, 2, 16, 16).transpose(0, 2, 1, 3).reshape(-1, 32).astype(np.float32)
+            xs.append(x)
+            am = np.maximum(am, np.abs(x).max(axis=0))
+        d = np.exp2(np.rint(np.log2(np.sqrt(np.maximum(am, 1e-12) / np.maximum(np.abs(Wm).max(axis=0), 1e-12))))).astype(np.float32)
+        d[am == 0] = 1.0
+        wt = Wm * d[None, :]
+        sw = np.maximum(np.abs(wt).max(axis=1) / 127.0, 1e-12).astype(np.float32)
+        qw = np.clip(np.rint(wt / sw[:, None]), -127, 127).astype(np.int8)
+        sx = np.float32(np.max(am / d) / 127.0)
+        old_w8 = np.fromfile(ubuf.file, dtype=np.int8).copy()
+        new_w8 = old_w8.copy()
+        for f in range(128):
+            for k in range(32):
+                new_w8[(f // 8) * 1024 + k * 32 + (f % 8)] = qw[f, k]
+        old_sc = np.fromfile(D / f"c32-minmax/b{block}-scales.bin", dtype="<f4")
+        assert old_sc.size == 292, (block, old_sc.size)
+        new_sc = np.concatenate([old_sc, (np.float32(1.0) / sx / d).astype(np.float32)]).astype("<f4")
+        new_sc[:2] = [sx, 1.0 / sx]
+        new_sc[4:132] = (sx * sw).astype(np.float32)
+        wpath = OUT / f"b{block}-weights.bin"
+        spath = OUT / f"b{block}-scales.bin"
+        new_w8.tofile(wpath)
+        new_sc.tofile(spath)
+        # CPU quantization-error estimate on the same teacher inputs.
+        old_inv = float(old_sc[1])
+        new_inv = (np.float32(1.0) / sx / d).astype(np.float32)
+        old_err = new_err = 0.0
+        denom = 0.0
+        for x in xs:
+            q_old = np.clip(np.rint(x * old_inv), -127, 127)
+            q_new = np.clip(np.rint(x * new_inv[None, :]), -127, 127)
+            old_err += float(np.sum((x - q_old * (1.0 / old_inv)) ** 2))
+            new_err += float(np.sum((x - q_new / new_inv[None, :]) ** 2))
+            denom += float(np.sum(x.astype(np.float64) ** 2))
+        patch["replace_buffers"][ubuf.name] = {"file": wpath.as_posix(), "bytes": int(new_w8.size)}
+        patch["replace_buffers"][sbuf.name] = {"file": spath.as_posix(), "bytes": int(new_sc.size * 4)}
+        patch["replace_spv"].append({"ordinal": d1.ordinal, "name": d1.name, "spv": SPV.as_posix(),
+                                     "expected_sha256": planlib.sha256_file(SPV)})
+        cal["rows"].append({
+            "block": block,
+            "ordinal": d1.ordinal,
+            "input_channel_absmax": am.tolist(),
+            "diagonal": d.tolist(),
+            "sX": float(sx),
+            "old_inv": old_inv,
+            "scale_bytes_before": sbuf.bytes,
+            "scale_bytes_after": int(new_sc.size * 4),
+            "x_static_rel_l2_before": float(np.sqrt(old_err / denom)),
+            "x_channel_rel_l2_after": float(np.sqrt(new_err / denom)),
+            "weight_bytes_before": ubuf.bytes,
+            "weight_bytes_after": int(new_w8.size),
+            "weight_sha256": planlib.sha256_file(wpath),
+            "scale_sha256": planlib.sha256_file(spath),
+        })
+        print(block, cal["rows"][-1]["x_static_rel_l2_before"], cal["rows"][-1]["x_channel_rel_l2_after"], float(sx), d.min(), d.max())
+    out = OUT / "candidate-34189.txt"
+    planlib.apply_patch(BASE, patch, out)
+    (OUT / "CALIBRATION.json").write_text(json.dumps(cal, indent=2), encoding="utf-8")
+    (OUT / "PATCH.json").write_text(json.dumps(patch, indent=2), encoding="utf-8")
+    jobs = []
+    for frame in (34189, 41444, 43654):
+        base_f = D / f"c64-family-static/combo-{frame}.txt"
+        out_f = OUT / f"candidate-{frame}.txt"
+        if frame != 34189:
+            p2 = dict(patch)
+            p2["base_sha256"] = planlib.sha256_file(base_f)
+            planlib.apply_patch(base_f, p2, out_f)
+        else:
+            out_f = out
+        jobs.append({"sequence": "c32-tail", "frame": frame, "plan": out_f.as_posix(),
+                     "out": (OUT / f"run-{frame}").as_posix(), "expected_output_sha256": None,
+                     "dump": False, "note": "GPU_NOT_RUN; central executor only"})
+    (OUT / "JOBS.json").write_text(json.dumps(jobs, indent=2), encoding="utf-8")
+    print("candidates", [planlib.sha256_file(j["plan"]) for j in jobs])
+
+
+if __name__ == "__main__":
+    main()

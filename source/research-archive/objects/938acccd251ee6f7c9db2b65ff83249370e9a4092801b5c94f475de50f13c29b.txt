@@ -1,0 +1,45 @@
+n08-f08-wg-map（F08 分组 FFN：同权重组相邻 token 的 WG 映射）
+状态: BUILT / AWAITING-GPU。本卡全程未跑 GPU、未取锁、未部署、未改基线 plan / 指针 JSON / COMMON.py / 其他卡目录。
+分诊（预登记，未测）: D（INDISTINCT）为主；B 为备选（每 WG 输入足迹 2x + 同 slab 4 条流相位漂移）；A 已用证据排除；E 不适用。
+
+一、做了什么（唯一变量）
+父 = fullnet-mechanism-transfer-20261026/f08-register-chain-20261027/candidate.spv（sha 32291c7e…，16 PASS，已接受 0.0884 ms）。
+候选只改 (token8 tile, group) 装进哪个 WG：
+  父   token = WGID.x*16 + (sg%2)*8 ; g = WGID.y*4 + sg/2 ; grid (66,2,1)  -> 每 WG = 2 tile x 4 group
+  候选 token = WGID.x*32 + (sg%4)*8 ; g = WGID.y*2 + sg/4 ; grid (33,4,1)  -> 每 WG = 4 tile x 2 group
+SG tile（M8 x N64 x K512）、每 acc K 序、算术、SLM 2048、scratch 0、绑定、PUSH 全不动；WG 数 132->132 不变；未扩大每 SG 的 M 复用跨度（第二候选未做）。
+
+二、已证（本机 CPU 侧，可复核）
+1. 父字节复现：用父源码原样 glslang 16.5.0 重编译 = 父 SPV 字节相同（两组不同 -I 目录各自相同）。BUILD.json:parent_rebuild。
+2. candidate.spv sha256 = d699bc54b62573af52c3c70412730c30c9b09d943ac554cec9490724e985d267，过 spv_validate_cpu。
+3. SPIR-V 结构：1375 条指令 / 5656 word，与父逐序号 opcode 全同；归一化（result-id 归一 + 常量代入）后仅 6 处不同：OpIMul 16->32、OpUMod 2->4、OpIMul 4->2、OpUDiv 2->4 + 两个 OpConstant 槽位交换值 1/4。float_NC_checked = 3（1 个 OpFMul + 2 个 GLSL.std.450 Fma；签名逐条相同；父子 NoContraction 集合都为空）。
+4. 映射一一覆盖：1056 个 (tile, group) 对，两套映射都是双射（重复 0、缺失 0、多余 0）；写集 540672 half = 1056x512，两 mapping 集合**相等**、重复 0、等于全集；无尾块（1056%32=0、8%2=0，不需要 guard），最后一个 WG (32,3) 覆盖 tokens 1024..1055 完整。
+5. plan：只替换本组 16 个 PASS 的 SPV 路径 + 这 16 行 grid `66 2 1`->`33 4 1`；与基线逐行 diff 仅 16 行；cpu_check = "CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded"。plan sha256 = 6dcb1e5cc897ea3bd7e979d8558f1f87395eb848e8c584edfc6c25f52bc1c402。
+
+三、量化（逻辑字节，不是 DRAM）
+每 PASS 权重请求量 132 MiB 不变、去重权重 1 MiB 不变、每 group slab 的 SG 请求 132 不变；
+每 WG 去重权重 512 KiB -> 256 KiB（WG 内复用比 2.0 -> 4.0）；每 group slab 的 WG 回放 66 -> 33（WG,slab 关联 528 -> 264）；
+代价：每 WG 去重输入 16 KiB -> 32 KiB，同 slab 并发流 2 -> 4，dispatch y 2 -> 4。
+
+四、未证 / 不能证
+- cache 命中率与每 WG 权重是否真的驻留：本工具集无 cache 计数器（gtpin mode0 = ISA/基本块；zprof 只有 GpuTime），不写"已证明"，只由整体计时判断。
+- B580 每 Xe core cache 容量、并发 WG 数、"8 SG 同 core"（仅由每 WG 2048 B workgroup memory 分配语义推出）；
+- lane->(row,col) fragment 内部约定未在本工作区找到可引证据（候选/父在该层一致，不影响结论）。
+- 整体毫秒：未测，不预测。
+
+五、下一处具体代码改动（若 native 显示整数指令变多，A 类兜底）
+把索引改写成显式 tile 形式以消掉 token 的除法/取余（与现写法逐元素等价）：
+  uint t16 = gl_WorkGroupID.x*2u + (sg>>1);  uint tr = (sg&1u)*8u;  uint token = t16*16u + tr;
+  tiled(token,0,512) -> t16*8192 ; tiled(token,c,512) -> (t16*32 + c/16)*256 + tr*16 + c%16
+当前不采用：SPIR-V 已证指令数 1375/1375 相同，无需为 0 收益再加源码改动。
+若整体计时显著变慢（B），第一条要改的是 locality 强度而不是网格：把每 WG 改成 8 tile x 1 group（grid (17,8)，WG 132->136，+4 WG、32 个 token 槽空闲、需要尾块 guard）——这是本卡刻意**没有**混进来的第二机制，必须单独首次修改、单独归因。
+
+六、可区分实验 / 归因
+- 两臂 base(现役基线 a024c3c5…) vs cand(本卡 plan 6dcb1e5c…)，6 组交替、30 样本/臂/组、warm1、feedback；门 fixed + fb2；见 GPU-REQUEST.json。
+- 归因边界：F08 l0 是 232 PASS 中的 16 个，且候选/父指令流零差异，所以差值只能归到 cache 局部性、WG->core 分配/波次、进程噪声三者之一，不得归到某条 load/send；不得跨批次相减毫秒，不得用 per-pass 或合成屏障计时当证据。
+- 判读规则（预先登记）：CI 跨 0 -> D（同族成包，不挑显著样本）；显著为负且 native 结构不变 -> B（先修最大副作用）；native 常量未变 -> A（检查 plan 16 行）。
+
+七、恢复点
+- 复跑构建：cd cards/n08-f08-wg-map && python build.py && python verify.py（只写本目录）。
+- 证据：BUILD.json（父复现/候选/plan/cpu-check/float 站点逐条）、PROOF.json（双射 + 写集 + 132+132 WG 枚举 + SPIR-V 差异 + 权重/输入账）、COST-LEDGER.json、NATIVE-PREDICTION.md、GPU-REQUEST.json、SOURCE-DIFF.patch、ANALYSIS.md。
+- 产物：candidate.comp / candidate.spv / parent-rebuild.spv（+ parent-rebuild-altinclude.spv，另一组 -I 的同一字节结果）/ plan.txt。

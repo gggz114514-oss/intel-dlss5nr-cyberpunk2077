@@ -1,0 +1,95 @@
+卡 n18-f01-entry / F01 / ordinal 0 `f1c32_image_pre`
+状态: BUILT — AWAITING-GPU（candidate.spv 已产出、已过 spv_validate、plan 只换 1 行、cpu-check 通过；未上 GPU，未部署）
+分诊: 待测。判定顺序与最可能类别见 §5（预测 B，其次 C；A 只在 IGC 拒绝内联该 helper 时成立，且可观察）。
+
+--------------------------------------------------------------------
+1. 做了什么（一句话）
+--------------------------------------------------------------------
+nrf_hist_linear 的 4 个双线性角点读在进 nrf_rgba 之前已经被 clamp 到 [0,W-1]x[0,H-1]，
+而 nrf_mirror(i,size)==i 在该区间上恒成立；因此新增 nrf_rgba_clamped（同 base/W/同 +0/+4/+8），
+把 5 个 tap × 4 个角点 = 20 次调用从“先镜像再读”改成“直接读已夹取的像素”。
+加/减汇编：gather 依旧 73 条消息、地址值不变；删掉的是入口区里 17–20 处 runtime 取模
+（mul(16|M0)+mul(16|M16)+macl×2 + 符号修正 + 反射选择），预计 -170 ~ -300 条静态指令。
+
+不改：任何消息数/地址/顺序、任何 f16 舍入点（入口 24 条 mov hf<-f）、任何 mix/fract/floor/除法、
+任何 SLM 往返与屏障、调试块、scratch(0)/SLM(9216)/grid(168x96x1)。
+
+--------------------------------------------------------------------
+2. 已证（有可复核证据）
+--------------------------------------------------------------------
+[x] 父字节复现：RECIPES 的 nc_recipe（decoration 迁移 + NC 189），decorated_match=true，
+    parent-rebuild.spv = 31c2fd9afffd4af8f2170ba322a79e6b8da8903d206bc2d471b38f3111d1ea32（= 基线 SPV 原字节）。
+    raw 编译不匹配（raw=2dcfedb7…），符合 RECIPES 记录（raw_match=false）。
+[x] 候选 SPV：ecc9dd3921d8054a01ce2626739df006852b5690d1bd0f75a370c85fff280787，spv_validate 通过。
+[x] NC 一一对应：189/189，3 个函数映射的匹配块 158/195/6095 与父完全一致，pattern 外自加装饰 0。
+[x] plan：244e919260fa416e8b915b029435b05c5db481f511e2f261777d4bbee82fae8e，
+    相对链头 n09c 只替换 PASS 0 的 SPV 路径（1 删 1 增），其余 3510 行逐字节相同。
+[x] cpu-check：CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded。
+[x] 地址恒等：tools/proof_mirror.py 扫 1,016,561 例（含 clamp 后全区间、地址公式、随机双线性角点），
+    0 处不一致（tools/mirror-identity.json, PASS=true）。
+[x] 成本分解：COST-BREAKDOWN.md（7165 指令 / 306 热消息 / 73 条 4B 标量 gather / 1501 条调试块 /
+    入口区 1491 条中 31 处取模站点）。
+
+--------------------------------------------------------------------
+3. 未证（缺什么）
+--------------------------------------------------------------------
+[ ] 候选的 ISA（无 GPU，无法取 IGC 产物）：第 1 条谓词（mul(16|M0) acc 31 → ≤14）未验证。
+[ ] 动态收益：没有任何 cycle/事件计数，COST-BREAKDOWN §5 的 0.73 填充率是量级论证，不是预测。
+[ ] 门与整帧：fixed/fb2/ordinary 全部未跑。
+[ ] §4.2 的“跨 SG 半重复”（gather 地址去重因子 2.0，301 MB 请求字节）只是结构证明，未做内存事务核。
+
+--------------------------------------------------------------------
+4. 可区分实验（若主代理要更强归因）
+--------------------------------------------------------------------
+ablate：把 candidate.comp 的 4 个 nrf_rgba_clamped 换回 nrf_rgba（源码 4 行），其余不动，
+用它作为第三臂。它应当与 base 有**相同**的 mul(16|M0) acc 计数；若第三臂的计时与 cand 相同而
+base 不同，说明效应来自别的因素（例如 IGC 调度差异），本机制归 0。
+
+--------------------------------------------------------------------
+5. 分诊判定顺序（给主代理，按合同 §8.5）
+--------------------------------------------------------------------
+1) 先看 native：mul(16|M0) acc 站点 31 → ≤14？ 否 → **A 实现未落地**（大概率是 IGC 没有内联
+   nrf_rgba_clamped；ISA 里会出现 call/栈操作，可当场确认）。是 → 继续。
+2) 再看数值/资源：fixed/fb2 门不变、scratch 0、SLM 9216、Basic Block ≤179？ 否 → **E**（先定位首差）。
+3) 最后看计时：ordinary 6 对交替 30 rep 的 CI95。
+   * 显著更快 → 采纳（B 类副作用已通过第 2 步排除）。
+   * 不显著但 CI 紧 → **C/D**（单 PASS 6.4% 帧占比，若仍平，优先按同机制打包而不是改写）。
+   * 显著更慢 → **B**（看 sel/cmp 是否反升、max_r 是否上升）。
+
+--------------------------------------------------------------------
+6. 下一处具体改动（按价值排序，均已定位到行）
+--------------------------------------------------------------------
+(a) 入口 feature pack 的 6 次恒等往返（最小、最稳，属 FConvert 类）：
+    candidate.comp packFloat2x16 的 packed[2..4] 里 `float16_t(float(cn.x))` 等写法，
+    cn/hn 本来就是 float16_t，`float()` 再 `float16_t()` 是 half→f32→half 的精确往返，
+    可写成 `float16_t(cn.x)`。预计 -12 条（入口 24 条 hf<-f 中的 6 条 + 6 条 f<-hf）。
+    风险：NaN 的 payload 可能被规范化（值仍是 NaN）；需要一次门确认。
+(b) 跨 SG 半重复（最大，但要改几何）：见 COST-BREAKDOWN §4.2。lane 16..31 读的像素属于另一个 SG /
+    下一个 WG（q=0 的下半 = q=2 的上半；q=2/3 的下半 = 下一个 WG 的行 8-11）。把 lane→像素映射改成
+    “32 lane 全部有效”（每 SG 8 列 × 4 行 = 32 像素的 1/4 tile），需要同步改 shK 的 token 归属
+    （token = 16q + lane 变成 16q + lane/2 ...）与 nr_pool_natural 的 (py,px) 计算。收益：gather
+    请求字节减半（602.9 MB → 301.5 MB），但会改变 8×8 tile 的 (xl,yl)→token 映射，必须先证
+    token 覆盖仍是一一映射。
+(c) 宽读消融：nrf_rgba 三通道 3 条 4B → 1 条 16B（vec4 视图）。仅作为对照实验，不作为候选：
+    字节 +33%，且依赖 16B 对齐假设（本卡无 GPU 无法验证）。
+
+--------------------------------------------------------------------
+7. 恢复点（复跑命令，全部不碰 GPU）
+--------------------------------------------------------------------
+PY=@NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe
+CD=@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/cards/n18-f01-entry
+
+& $PY "$CD/tools/build.py" parent        # -> parent-rebuild.spv（应 = 31c2fd9a…）
+& $PY "$CD/tools/build.py" candidate     # -> candidate.spv（应 = ecc9dd39…）
+& $PY "$CD/tools/spv_delta.py"           # -> tools/spv-delta.json
+& $PY "$CD/tools/proof_mirror.py"        # -> tools/mirror-identity.json（PASS=true）
+& $PY "$CD/tools/cost_table.py"          # -> tools/cost-table.json
+plan/cpu-check/validate 走 COMMON.make_plan(…, spv_shas={31c2fd9a…}) / cpu_check / validate_spv。
+
+--------------------------------------------------------------------
+8. 未决项（按合同自行判断，不停等）
+--------------------------------------------------------------------
+* W/H = 0 时 clamp(lo>hi) 与父代 `i%0` 都是未定义；两版同等未定义，候选未引入新失效模式。
+  以“history 维度 ≥1”为运行时不变量（父代本来就要求它）。
+* 认为 IGC 会内联 nrf_rgba_clamped：该函数与 nrf_rgba 同形态（4 次 OpAccessChain + 4 次 OpLoad），
+  父代已内联 20+ 次同类 helper。若不内联，ISA 会出现 call 且第 1 条谓词不降 → 判 A。

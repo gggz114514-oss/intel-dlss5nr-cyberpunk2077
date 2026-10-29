@@ -1,0 +1,187 @@
+"""Reproduce any baseline SPV of the 232-pass plan from its recorded source bytes.
+
+    python reproduce_any.py <ordinal>            # 0..231
+    python reproduce_any.py <spv-sha256-prefix>  # >= 8 hex chars
+    python reproduce_any.py <shader-name>        # e.g. split16_b23_l3
+    python reproduce_any.py --all                # every unique shader, then every pass
+    python reproduce_any.py --list               # recipe table only
+options:  --out DIR   keep the produced .spv (default: a temporary directory)
+          --json      machine-readable single-line result
+          --workspace-headers   use the workspace include dirs instead of the pinned copies
+
+Exit code 0 means the produced SPIR-V is byte identical to the plan's baseline SPV.
+CPU only: glslang 16.5.0 + NoContraction decoration surgery, no GPU, no plan edits.
+"""
+import argparse
+import hashlib
+import json
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent
+sys.path.insert(0, str(CARD))
+import identity_kit as K  # noqa: E402
+
+RECIPES = CARD / 'RECIPES.json'
+ROWS = Path('@NR_USER_HOME@/Documents/Codex/2026-10-24/nr-fp16-int8-astra-audit-20261024/'
+            'handoff/dsh-fullnet-20261027/CURRENT-232-ROWS.json')
+
+
+def load():
+    recipes = K.read_json(RECIPES)
+    rows = K.read_json(ROWS) if ROWS.exists() else []
+    return recipes, rows
+
+
+def shas_of(recipes):
+    return recipes
+
+
+def find(recipes, rows, key):
+    """(spv_sha, recipe) for an ordinal / sha prefix / shader name."""
+    if key.isdigit() and rows:
+        n = int(key)
+        for r in rows:
+            if r['ordinal'] == n:
+                if r['spv_sha256'] not in recipes:
+                    raise SystemExit('ordinal %d: shader %r has no recipe' % (n, r['name']))
+                return r['spv_sha256'], recipes[r['spv_sha256']]
+        raise SystemExit('ordinal %s out of range' % key)
+    hits = [s for s in recipes if s.startswith(key)]
+    if not hits:
+        hits = [s for s, v in recipes.items() if v.get('name') == key]
+    if len(hits) != 1:
+        raise SystemExit('%r matches %d recipes (%s)' % (key, len(hits), hits[:4]))
+    return hits[0], recipes[hits[0]]
+
+
+def describe(sph, rec):
+    comp = rec['compile']
+    print('shader      : %s %s' % (rec['families'][0], rec['name']))
+    print('spv sha256  : %s' % sph)
+    print('passes      : %d  %s' % (len(rec['ordinals']), rec['ordinals']))
+    print('source      : %s' % rec['source'])
+    print('source sha  : %s' % rec['source_sha256'])
+    print('defines     : %s' % (comp.get('defines') or '(none)'))
+    for d in comp.get('include_dirs') or []:
+        print('include dir : %s' % d)
+    if comp.get('pinned_include_dir'):
+        print('pinned dir  : %s  (exists=%s)'
+              % (comp['pinned_include_dir'], Path(comp['pinned_include_dir']).exists()))
+    for n, h in (comp.get('header_pins') or {}).items():
+        print('header pin  : %-34s %s' % (n, h))
+    nc = rec.get('nc_recipe') or {}
+    print('no-contract : %s%s' % (nc.get('mode'), '' if nc.get('mode') == 'raw'
+                                  else '  parent=%s' % (rec.get('decoration_parent') or nc.get('parent'))))
+    if nc.get('drop_region'):
+        print('              drop parent region %r, keep child FP nodes there'
+              % nc['drop_region'])
+    if nc.get('own_region'):
+        print('              keep child own FP nodes in region %r' % nc['own_region'])
+    if rec.get('note'):
+        print('note        : %s' % rec['note'])
+
+
+def build(sph, rec, outdir, workspace_headers=False):
+    comp = rec['compile']
+    incs = list(comp.get('include_dirs') or [])
+    pinned = comp.get('pinned_include_dir')
+    used_pin = False
+    if pinned and Path(pinned).exists() and not workspace_headers:
+        incs = [pinned]
+        used_pin = True
+    spec = dict(source=rec['source'], include_dirs=incs,
+                defines=comp.get('defines') or [], nc=rec.get('nc_recipe') or {'mode': 'raw'},
+                target=rec.get('target'))
+    res = K.rebuild(spec, outdir, target=rec.get('target'))
+    res['pinned_used'] = used_pin
+    res['expected_sha256'] = rec.get('verified_sha256') or rec.get('target_sha256')
+    res['recipe_verified'] = bool(rec.get('verified'))
+    res['ok'] = res['rebuilt_sha256'] == res['expected_sha256'] == res['target_sha256']
+    # header pin audit
+    missing = []
+    for n, h in (comp.get('header_pins') or {}).items():
+        p = Path(pinned) / n if used_pin else None
+        if p is not None and (not p.exists() or K.sha(p) != h):
+            missing.append(n)
+    res['pin_mismatch'] = missing
+    return res
+
+
+def default_out(sph, keep):
+    """Artifact directory: --out, else the card's evidence/rebuilds when writing
+    inside the workspace is allowed, else a temp directory."""
+    if keep:
+        return Path(keep)
+    return CARD / 'evidence/rebuilds'
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument('key', nargs='?')
+    ap.add_argument('--all', action='store_true')
+    ap.add_argument('--list', action='store_true')
+    ap.add_argument('--json', action='store_true')
+    ap.add_argument('--out')
+    ap.add_argument('--workspace-headers', action='store_true')
+    a = ap.parse_args()
+
+    recipes, rows = load()
+    if a.list:
+        for sph, rec in sorted(recipes.items(), key=lambda kv: min(kv[1]['ordinals'])):
+            print('%-12s %-4s %-32s n=%-3d def=%-18s nc=%-7s verified=%s'
+                  % (sph[:12], rec['families'][0], rec['name'], len(rec['ordinals']),
+                     ','.join(rec['compile'].get('defines') or []) or '-',
+                     (rec.get('nc_recipe') or {}).get('mode'), rec.get('verified')))
+        return 0
+
+    if a.all:
+        base = default_out(None, a.out)
+        bad, seen = [], {}
+        for sph, rec in sorted(recipes.items(), key=lambda kv: min(kv[1]['ordinals'])):
+            r = build(sph, rec, base / sph[:12], a.workspace_headers)
+            seen[sph] = r
+            print('%-5s %-4s %-32s ord=%-4s rebuilt=%s pin=%s'
+                  % ('OK' if r['ok'] else 'FAIL', rec['families'][0], rec['name'],
+                     min(rec['ordinals']), r['rebuilt_sha256'][:12], r['pinned_used']))
+            if not r['ok']:
+                bad.append(sph)
+        npass = 0
+        for r in rows:
+            if r['spv_sha256'] in seen:
+                npass += 1
+            elif r['spv_sha256'] not in recipes:
+                bad.append(r['spv_sha256'])
+        print('\n%d/%d unique SPVs byte identical; %d/%d passes covered by those SPVs'
+              % (len(recipes) - len([b for b in bad if b in recipes]), len(recipes),
+                 npass, len(rows)))
+        return 0 if not bad else 1
+
+    if not a.key:
+        ap.print_help()
+        return 2
+    sph, rec = find(recipes, rows, a.key)
+    base = default_out(sph, a.out)
+    r = build(sph, rec, base / sph[:12], a.workspace_headers)
+    if a.json:
+        print(json.dumps({k: r[k] for k in ('ok', 'rebuilt_sha256', 'expected_sha256',
+                                            'target_sha256', 'raw_match', 'pinned_used',
+                                            'pin_mismatch', 'defines', 'include_dirs')},
+                         default=str))
+    else:
+        describe(sph, rec)
+        print('rebuilt sha : %s' % r['rebuilt_sha256'])
+        print('expected    : %s' % r['expected_sha256'])
+        print('raw match   : %s' % r['raw_match'])
+        print('headers     : %s' % ('pinned copies' if r['pinned_used'] else 'workspace dirs'))
+        print('RESULT      : %s' % ('BYTE IDENTICAL' if r['ok'] else 'MISMATCH'))
+        if not r['ok']:
+            print('artifacts   : %s' % base)
+    return 0 if r['ok'] else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+

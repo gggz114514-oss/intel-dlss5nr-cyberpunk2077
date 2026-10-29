@@ -1,0 +1,141 @@
+"""site_source_map.py - tie every static FP16 MMA of the parent module to its
+source line, and prove the correspondence is an identity rather than a guess.
+
+Method: the parent writes every matrix step as a three-line block
+
+        NRH_A w;                                  (or `a`)
+        coopMatLoad(w, wb, uint(pc.p1.z) + 128u, 16u, LROW);
+        z0 = coopMatMulAdd(w, yb0, z0);
+
+so the *weight/shared address of the A operand* is a literal in the source and
+also appears in the SPIR-V operand chain.  The tool extracts (segment, address,
+B variable, accumulator) from the source lines, extracts the same fields from
+the module through tools/spvlib.py, and requires a one-to-one match in program
+order.  Any mismatch is reported and exits non-zero.
+"""
+import json
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import spvlib as S        # noqa: E402
+import spv_sites as SS    # noqa: E402
+
+CARD = Path(__file__).resolve().parents[1]
+SRC = CARD / "source/parent/c32_body1_i8.comp"
+SPV = CARD / "spv/parent_repro.spv"
+OUT = CARD / "evidence/SITE-SOURCE-MAP.json"
+
+LOAD = re.compile(r"coopMatLoad\(\s*(\w+)\s*,\s*(\w+)\s*,\s*([^,]+),\s*(\w+)\s*,\s*(\w+)\s*\)")
+MMA = re.compile(r"(\w+)\s*=\s*coopMatMulAdd\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*\)")
+
+
+def parse_source():
+    lines = SRC.read_text(encoding="utf-8").splitlines()
+    out = []
+    for i, ln in enumerate(lines):
+        m = MMA.search(ln)
+        if not m:
+            continue
+        if "coopMatMulAdd" not in ln:
+            continue
+        acc, a, b, cin = m.group(1), m.group(2), m.group(3), m.group(4)
+        # the A load is the last coopMatLoad naming the same variable above it
+        off = base = stride = layout = None
+        for j in range(i - 1, max(i - 6, 0) - 1, -1):
+            lm = LOAD.search(lines[j])
+            if lm and lm.group(1) == a:
+                base, off = lm.group(2), lm.group(3).strip()
+                stride, layout = lm.group(4), lm.group(5)
+                a_line = j + 1
+                break
+        if base is None:
+            continue
+        # keep only the FP16 matrix steps: the module also contains the 16 int8
+        # expand and 4 int8 contract steps, which are outside this card's scope
+        if (base, layout) not in (("wb", "LROW"), ("shK", "LROW"), ("shV", "LCOL")):
+            continue
+        out.append({"source_line": i + 1, "accumulator": acc, "A_var": a,
+                    "A_base": base, "A_offset_expr": off, "stride": stride,
+                    "layout": layout, "B_var": b, "C_in": cin,
+                    "A_load_line": a_line})
+    return out
+
+
+def seg_of(base, b):
+    if base == "shK":
+        return "QK"
+    if base == "shV":
+        return "PV"
+    if b in ("yb0", "yb1"):
+        return "QKV"
+    if b in ("tb0", "tb1"):
+        return "OUTPUT"
+    return "UNASSIGNED"
+
+
+def main():
+    src = parse_source()
+    mod = S.Mod(SPV)
+    sites = []
+    for s in mod.mma_sites():
+        if s["result_type"]["component"] != "f32":
+            continue
+        s["A_src"] = SS.classify(SS.producers(mod, s["A_id"], s["idx"]))
+        s["B_src"] = SS.classify(SS.producers(mod, s["B_id"], s["idx"]))
+        s["segment"] = SS.segment_of(s["A_src"], s["B_src"])
+        sites.append(s)
+    problems = []
+    if len(src) != 64:
+        problems.append("source matrix steps %d != 64" % len(src))
+    if len(sites) != 64:
+        problems.append("module fp16 sites %d != 64" % len(sites))
+    rows = []
+    for k, (a, b) in enumerate(zip(src, sites)):
+        seg = seg_of(a["A_base"], a["B_var"])
+        # the SPIR-V A operand must be the same buffer and the same literal
+        spv_base = b["A_src"].get("base")
+        spv_off_raw = (b["A_src"].get("offset") or [None])[-1]
+        spv_off = None
+        if spv_off_raw is not None:
+            m = re.search(r"(\d+)\)?$", str(spv_off_raw))
+            spv_off = m.group(1) if m else None
+        nums = re.findall(r"\d+", a["A_offset_expr"])
+        want_off = nums[-1] if nums else None
+        ok_seg = seg == b["segment"]
+        ok_base = (spv_base == a["A_base"]) or (a["A_base"] == "wb" and
+                                                spv_base in ("HalfBuf", "wb"))
+        ok_off = (want_off is None and spv_off is None) or (
+            want_off is not None and spv_off is not None and int(want_off) == int(spv_off))
+        ok_b = a["B_var"] in (b["B_src"].get("named_vars") or [])
+        row = {"ordinal": k, "source_line": a["source_line"],
+               "A_load_line": a["A_load_line"],
+               "segment": seg, "A_base": a["A_base"],
+               "A_offset_expr": a["A_offset_expr"], "stride": a["stride"],
+               "layout": a["layout"], "B_var": a["B_var"],
+               "accumulator": a["accumulator"],
+               "word_offset": b["word_offset"], "result_id": b["result_id"],
+               "spv_A_base": spv_base, "spv_A_offset": spv_off,
+               "match": {"segment": ok_seg, "A_base": ok_base,
+                         "A_offset": ok_off, "B_var": ok_b}}
+        if not all(row["match"].values()):
+            problems.append("site %d (word %d): %s" % (k, b["word_offset"], row))
+        rows.append(row)
+    segs = {}
+    for r in rows:
+        segs.setdefault(r["segment"], []).append(r["ordinal"])
+    out = {"source": str(SRC), "spv": str(SPV),
+           "sha256_spv": mod and __import__("hashlib").sha256(mod.raw).hexdigest(),
+           "counts": {k: len(v) for k, v in segs.items()},
+           "ordinals": segs, "rows": rows, "problems": problems,
+           "verdict": "ONE-TO-ONE" if not problems else "MISMATCH"}
+    OUT.write_text(json.dumps(out, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps({"counts": out["counts"], "problems": problems[:3],
+                      "verdict": out["verdict"]}, indent=1))
+    if problems:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

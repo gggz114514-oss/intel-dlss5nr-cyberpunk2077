@@ -1,0 +1,222 @@
+"""n21 step-1: build candidate.comp (debug-gated store path deleted) and candidate.spv.
+
+Reads  : baseline ord-194 source/spv (read only)
+Writes : this card dir only (candidate.comp, candidate.spv, parent-rebuild.spv, build facts)
+"""
+import sys, json, difflib, collections
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent
+C = CARD.parent.parent
+sys.path.insert(0, str(C))
+sys.path.insert(0, str(C))
+import COMMON as K
+
+ST = K.ST
+BUILD = CARD / 'build'
+BUILD.mkdir(exist_ok=True)
+
+ROW = K.row_by_ordinal(194)
+PARENT_COMP = Path(ROW['source'])
+PARENT_SPV = Path(ROW['spv'])
+PINNED = C / 'cards/idt-identity-recipe/evidence/headers/ffde3c3d2379'
+PARENT_SHA = ROW['spv_sha256']
+
+# ------------------------------------------------------------------ 1. source surgery
+src_lines = PARENT_COMP.read_text(encoding='utf-8').splitlines(keepends=True)
+
+DROP = [24, 94, 95, 100, 101, 106, 107, 112, 113]          # 1-based
+EXPECT = {
+    24: '    const bool debug = pc.p1.w != 0;\n',
+    94: '            if (debug)\n',
+    95: '                coopMatStore(narrowed, dbg, 81920u + mA * 128u + n0, 128u, LROW);\n',
+    100: '            if (debug)\n',
+    101: '                coopMatStore(narrowed, dbg, 81920u + mA * 128u + (n0 + 16u), 128u, LROW);\n',
+    106: '            if (debug)\n',
+    107: '                coopMatStore(narrowed, dbg, 81920u + mB * 128u + n0, 128u, LROW);\n',
+    112: '            if (debug)\n',
+    113: '                coopMatStore(narrowed, dbg, 81920u + mB * 128u + (n0 + 16u), 128u, LROW);\n',
+}
+for ln, txt in EXPECT.items():
+    assert src_lines[ln - 1] == txt, (ln, repr(src_lines[ln - 1]), repr(txt))
+
+cand_text = ''.join(l for i, l in enumerate(src_lines, 1) if i not in DROP)
+assert cand_text.count('dbg') == 0, 'dbg still referenced'
+(CARD / 'candidate.comp').write_text(cand_text, encoding='utf-8')
+(CARD / 'parent.comp').write_text(''.join(src_lines), encoding='utf-8')
+
+# the remaining source must be byte-identical to the parent outside the dropped lines
+kept_parent = ''.join(l for i, l in enumerate(src_lines, 1) if i not in DROP)
+assert kept_parent == cand_text
+
+# ------------------------------------------------------------------ 2. diff
+parent_name = 'fullnet-mechanism-transfer-20261026/contract-scale-fragments/family/c128/candidate.comp'
+cand_name = 'cards/n21-debug-regrelief/candidate.comp'
+diff = list(difflib.unified_diff(src_lines, cand_text.splitlines(keepends=True),
+                                 fromfile='a/' + parent_name, tofile='b/' + cand_name, n=4))
+(CARD / 'SOURCE-DIFF.patch').write_text(''.join(diff), encoding='utf-8')
+
+# ------------------------------------------------------------------ 3. compile parent + candidate
+raw = BUILD / 'parent-rebuild-raw.spv'
+K.compile_glsl(PARENT_COMP, raw, [PINNED])
+assert K.sha(raw) == PARENT_SHA, 'parent byte reproduction failed'
+import shutil
+shutil.copyfile(raw, CARD / 'parent-rebuild.spv')
+
+cand_spv = CARD / 'candidate.spv'
+K.compile_glsl(CARD / 'candidate.comp', cand_spv, [PINNED])
+cand_sha = K.sha(cand_spv)
+K.validate_spv(cand_spv)                       # raises on failure
+
+# ------------------------------------------------------------------ 4. SPIR-V facts
+OPNAME = {54: 'OpFunction', 56: 'OpFunctionEnd', 57: 'OpFunctionCall', 61: 'OpLoad',
+          62: 'OpStore', 65: 'OpAccessChain', 43: 'OpConstant', 12: 'OpExtInst',
+          249: 'OpControlBarrier', 250: 'OpMemoryBarrier', 248: 'OpFunctionParameter',
+          59: 'OpVariable', 71: 'OpDecorate', 44: 'OpConstantComposite',
+          81: 'OpCompositeExtract', 80: 'OpCompositeConstruct',
+          4456: 'OpTypeCooperativeMatrixNV<A>', 4457: 'OpTypeCooperativeMatrixNV<B>',
+          4458: 'OpTypeCooperativeMatrixNV<C>', 5358: 'OpTypeCooperativeMatrixKHR'}
+# cooperative matrix ops (NV/KHR)
+CM_LOAD = {4459, 4457, 4458}
+SPV_OPS = {
+    4459: 'OpCooperativeMatrixLoadNV', 4460: 'OpCooperativeMatrixStoreNV',
+    4461: 'OpCooperativeMatrixMulAddNV', 4462: 'OpCooperativeMatrixLengthNV',
+    4457: 'type', 4458: 'type',
+    5348: 'OpCooperativeMatrixLoadKHR', 5349: 'OpCooperativeMatrixStoreKHR',
+    5350: 'OpCooperativeMatrixMulAddKHR', 5351: 'OpCooperativeMatrixLengthKHR',
+}
+CM_LOAD_OPS = {4459, 5348}
+CM_STORE_OPS = {4460, 5349}
+CM_MUL_OPS = {4461, 5350}
+
+
+def hist(mod):
+    return collections.Counter((op, cnt) for op, ops, _, cnt in mod.instructions)
+
+
+pm = ST.Module(PARENT_SPV)
+cm = ST.Module(cand_spv)
+
+# module-level sections
+def storage_vars(mod):
+    out = []
+    for op, ops, _, _ in mod.instructions:
+        if op == 59:                                   # OpVariable
+            out.append((ops[0], ops[1], ops[2]))       # type, result, storage class
+    return out
+
+def bindings(mod, names):
+    """binding number -> (storage class) for the uniform/buffer variables."""
+    dec = {}
+    for op, ops, _, _ in mod.instructions:
+        if op == 71 and len(ops) >= 3 and ops[1] == 33:      # OpDecorate Binding
+            dec[ops[0]] = ops[2]
+    out = {}
+    for t, rid, sc in storage_vars(mod):
+        if sc == 0:                                          # UniformConstant
+            pass
+        out[dec.get(rid, 'n/a')] = dict(storage_class=sc, name=names.get(rid, ''))
+    return out
+
+pnames = pm.names_by_id if hasattr(pm, 'names_by_id') else {}
+
+
+def name_map(mod):
+    out = {}
+    for op, ops, _, _ in mod.instructions:
+        if op == 5 and len(ops) >= 2 and ops[0] < 100000:
+            out.setdefault(ops[0], bytes(''.join(chr(c) for c in ops[1:]).encode()).decode('utf-8', 'replace'))
+    return out
+
+# string decode: OpName words are little-endian packed chars
+def name_map2(mod):
+    out = {}
+    for op, ops, _, _ in mod.instructions:
+        if op == 5 and len(ops) >= 2:
+            b = b''.join(int(w).to_bytes(4, 'little') for w in ops[1:])
+            out.setdefault(ops[0], b.split(b'\0')[0].decode('utf-8', 'replace'))
+    return out
+
+pnames, cnames = name_map2(pm), name_map2(cm)
+
+def var_table(mod, names):
+    dec = collections.defaultdict(dict)
+    for op, ops, _, _ in mod.instructions:
+        if op == 71 and len(ops) >= 3:
+            if ops[1] == 33:
+                dec[ops[0]]['binding'] = ops[2]
+            elif ops[1] == 34:
+                dec[ops[0]]['set'] = ops[2]
+    out = []
+    for t, rid, sc in storage_vars(mod):
+        out.append(dict(name=names.get(rid, ''), storage_class=sc,
+                        set=dec[rid].get('set'), binding=dec[rid].get('binding')))
+    return out
+
+pvar, cvar = var_table(pm, pnames), var_table(cm, cnames)
+
+def storclass(mod):
+    return collections.Counter(sc for _, _, sc in storage_vars(mod))
+
+def cm_sites(mod):
+    """cooperative-matrix load/store/muladd with their constant offsets."""
+    sites = collections.Counter()
+    for op, ops, _, _ in mod.instructions:
+        if op in CM_STORE_OPS or op in CM_MUL_OPS or op in CM_LOAD_OPS:
+            sites[SPV_OPS.get(op, str(op))] += 1
+    return sites
+
+def barriers(mod):
+    c = collections.Counter()
+    for op, ops, _, _ in mod.instructions:
+        if op == 249:
+            c['OpControlBarrier'] += 1
+        if op == 250:
+            c['OpMemoryBarrier'] += 1
+    return c
+
+def nc_count(mod):
+    return len(ST.no_contraction_ids(mod))
+
+def code_len(mod):
+    return len(ST.code_instructions(mod))
+
+# skeleton subsequence: is the child's function body an in-order subset of the parent's?
+pf = max(ST.functions(pm), key=len)
+cf = max(ST.functions(cm), key=len)
+matched, total, first_miss = ST.subsequence(pf, cf)
+extras = ST.subsequence_diff(pf, cf)
+
+ph, ch = hist(pm), hist(cm)
+removed = ph - ch
+added = ch - ph
+
+facts = dict(
+    parent=dict(path=str(PARENT_SPV), sha256=PARENT_SHA, bytes=PARENT_SPV.stat().st_size),
+    parent_rebuild=dict(path=str(CARD / 'parent-rebuild.spv'), sha256=K.sha(CARD / 'parent-rebuild.spv'),
+                        bytes=(CARD / 'parent-rebuild.spv').stat().st_size,
+                        equals_parent=K.sha(CARD / 'parent-rebuild.spv') == PARENT_SHA),
+    parent_source=dict(path=str(PARENT_COMP), sha256=K.sha(PARENT_COMP)),
+    candidate_source=dict(path=str(CARD / 'candidate.comp'), sha256=K.sha(CARD / 'candidate.comp')),
+    candidate=dict(path=str(cand_spv), sha256=cand_sha, bytes=cand_spv.stat().st_size),
+    dropped_source_lines=DROP,
+    code_instructions=dict(parent=code_len(pm), candidate=code_len(cm)),
+    whole_instructions=dict(parent=len(pm.instructions), candidate=len(cm.instructions)),
+    function_body=dict(parent=len(pf), candidate=len(cf),
+                       subsequence_matched=matched, subsequence_total=total,
+                       first_miss=first_miss,
+                       child_is_ordered_subset=(matched == len(cf)),
+                       parent_instructions_skipped=len(extras)),
+    histogram=dict(
+        removed=[[list(k), v] for k, v in sorted(removed.items())],
+        added=[[list(k), v] for k, v in sorted(added.items())],
+    ),
+    cm_sites=dict(parent=dict(cm_sites(pm)), candidate=dict(cm_sites(cm))),
+    storage_class_vars=dict(parent=dict(storclass(pm)), candidate=dict(storclass(cm))),
+    variables=dict(parent=pvar, candidate=cvar),
+    barriers=dict(parent=dict(barriers(pm)), candidate=dict(barriers(cm))),
+    no_contraction=dict(parent=nc_count(pm), candidate=nc_count(cm)),
+    storage_bytes=dict(parent=pm.storage_bytes(), candidate=cm.storage_bytes()),
+)
+K.write_json(BUILD / 'facts.json', facts)
+print(json.dumps(facts, indent=1)[:4000])

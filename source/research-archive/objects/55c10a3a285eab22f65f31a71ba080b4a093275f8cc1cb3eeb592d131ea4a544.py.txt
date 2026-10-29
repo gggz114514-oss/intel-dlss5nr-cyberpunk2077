@@ -1,0 +1,107 @@
+import json
+from pathlib import Path
+import numpy as np
+
+DIR = Path(r"@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\prep-gpu-handoff-20261028\latelatch-eval-20261028")
+
+
+def stats(arr):
+    if len(arr) == 0:
+        return {"count": 0, "mean": 0.0, "p50": 0.0, "p05": 0.0, "p95": 0.0}
+    a = np.array(arr, dtype=np.float64)
+    return {
+        "count": len(arr),
+        "mean": float(np.mean(a)),
+        "p50": float(np.median(a)),
+        "p05": float(np.percentile(a, 5)),
+        "p95": float(np.percentile(a, 95)),
+    }
+
+
+def main():
+    meta = json.loads((DIR / "window-metadata.json").read_text(encoding="utf-8"))
+    cpu_records = [json.loads(line) for line in (DIR / "CPU-FRAMES.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    gpu_records = [json.loads(line) for line in (DIR / "GPU-STAGES.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    cpu_by_win = {w["window_id"]: [] for w in meta}
+    gpu_by_win = {w["window_id"]: [] for w in meta}
+
+    for w in meta:
+        wid = w["window_id"]
+        s_end = w["settling_end_frame"]
+        w_end = w["win_end_frame"]
+        for r in cpu_records:
+            if r.get("window_id") == wid and s_end and s_end < r["frame_id"] <= w_end:
+                cpu_by_win[wid].append(r)
+        for r in gpu_records:
+            if r.get("window_id") == wid and s_end and s_end < r["frame_id"] <= w_end:
+                gpu_by_win[wid].append(r)
+
+    results = {}
+    for w in meta:
+        wid = w["window_id"]
+        wname = w["window_name"]
+        cpus = cpu_by_win[wid]
+        gpus = gpu_by_win[wid]
+
+        # Calculate inter-frame periods and gaps from consecutive valid GPU records
+        periods = []
+        gaps = []
+        for i in range(1, len(gpus)):
+            prev = gpus[i-1]
+            curr = gpus[i]
+            dfreq = curr.get("d3d_freq_hz") or 19200000
+            if prev.get("d9_tick") and curr.get("d9_tick") and curr["d9_tick"] > prev["d9_tick"]:
+                p_ms = (curr["d9_tick"] - prev["d9_tick"]) * 1000.0 / dfreq
+                periods.append(p_ms)
+            if prev.get("d9_tick") and curr.get("d0_tick") and curr["d0_tick"] > prev["d9_tick"]:
+                g_ms = (curr["d0_tick"] - prev["d9_tick"]) * 1000.0 / dfreq
+                gaps.append(g_ms)
+
+        fps_list = [1000.0 / p for p in periods if p > 0]
+        span_list = [r["d3d_total_span_gpu_ms"] for r in gpus if r.get("d3d_total_span_gpu_ms")]
+        nr_net_list = [r["vk_network_266_gpu_ms"] for r in gpus if r.get("vk_network_266_gpu_ms")]
+        sr_list = [r["d3d_deferred_sr_gpu_ms"] for r in gpus if r.get("d3d_deferred_sr_gpu_ms")]
+
+        tail_wait_list = [r["tail_wait_cpu_ms"] for r in cpus if "tail_wait_cpu_ms" in r]
+        total_ms_list = [r["total_ms"] for r in cpus if "total_ms" in r]
+        retire_prev_list = [r["retire_prev_cpu_ms"] for r in cpus if "retire_prev_cpu_ms" in r]
+
+        results[wname] = {
+            "window_id": wid,
+            "late_latch": w["late_latch"],
+            "records": len(cpus),
+            "gpu_records": len(gpus),
+            "frame_period_ms": stats(periods),
+            "fps": stats(fps_list),
+            "interframe_gap_gpu_ms": stats(gaps),
+            "d3d_total_span_gpu_ms": stats(span_list),
+            "vk_network_266_gpu_ms": stats(nr_net_list),
+            "d3d_deferred_sr_gpu_ms": stats(sr_list),
+            "tail_wait_cpu_ms": stats(tail_wait_list),
+            "retire_prev_cpu_ms": stats(retire_prev_list),
+            "total_ms": stats(total_ms_list),
+        }
+
+    (DIR / "EVAL-RESULTS.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+
+    # Print summary
+    print("\n" + "="*80)
+    print(" LATE-LATCH RETIREMENT EVALUATION RESULTS")
+    print("="*80)
+    header = f"{'Window':<18} | {'LateLatch':<9} | {'Period (ms)':<12} | {'FPS':<7} | {'GPU Gap (ms)':<13} | {'TailWait (ms)':<13} | {'Total_ms':<9}"
+    print(header)
+    print("-" * len(header))
+    for name, r in results.items():
+        ll = "YES (1)" if r["late_latch"] == 1 else "NO (0)"
+        p = f"{r['frame_period_ms']['mean']:.2f} (p50:{r['frame_period_ms']['p50']:.2f})"
+        fps = f"{r['fps']['mean']:.2f}"
+        gap = f"{r['interframe_gap_gpu_ms']['mean']:.2f} (p50:{r['interframe_gap_gpu_ms']['p50']:.2f})"
+        tw = f"{r['tail_wait_cpu_ms']['mean']:.2f} (p50:{r['tail_wait_cpu_ms']['p50']:.2f})"
+        tot = f"{r['total_ms']['mean']:.2f}"
+        print(f"{name:<18} | {ll:<9} | {p:<12} | {fps:<7} | {gap:<13} | {tw:<13} | {tot:<9}")
+    print("="*80 + "\n")
+
+
+if __name__ == "__main__":
+    main()

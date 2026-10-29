@@ -1,0 +1,97 @@
+from pathlib import Path
+import json,re
+D=Path(__file__).resolve().parent;A=D.parent;OLD=A/'c32-boundary-candidates-20261026';P=A/'c32-boundary-followup-20261026/f20-pixel-owner'
+ns={'__file__':str(OLD/'build.py')};exec((OLD/'build.py').read_text(encoding='utf-8-sig').split('# Before writing candidates:')[0],ns)
+for k in ['B','ST','sha','ident','save','run','build']:globals()[k]=ns[k]
+ns['P']=P;ns['T']=P;tickets=ns['tickets']
+assert sha(P/'plan.txt')=='ce550e7ccbed7e452068cec4ebcc913f177d0af90a0bf094ffc419a3c4bbabb0'
+src=(P/'candidate.comp').read_text(encoding='utf-8-sig')
+# Source read/write lifetime proof is backed by stage ranges, then owner enumeration.
+assert 'NR_CTX' in src and 'if (debug) coopMatStore(ctx_half0, shArena, 6144u' in src
+for sg in range(8):
+ assert {(sg*8+l,k) for l in range(8) for k in range(4)}=={(sg*8+l//4,l%4) for l in range(32)}
+ for l in range(32):
+  assert ((l&~3)//4)==l//4
+assert set(range(6144,6272)).isdisjoint(range(0,6144))
+assert [c+h for c in range(0,32,2) for h in (0,1)]==list(range(32))
+# Verify crop keeps each8-pixel SG uniformly valid/invalid, including all grid edges.
+hist={}
+for wy in range(97):
+ for wx in range(169):
+  for sg in range(8):
+   n=0
+   for p in range(8):
+    t=sg*8+p;q,r=divmod(t,16);x=(2*wx-1+(q&1))*4+r%4;y=(2*wy-1+(q>>1))*4+r//4
+    n+=int(0<=x<1280 and 0<=y<720)
+   assert n in (0,8);hist[n]=hist.get(n,0)+1
+save(D/'PROOF-BEFORE-CODE.json',dict(baseline=ident(P/'plan.txt'),scope='Two controlled local-consumer variants; no changes to existing F01, tail, arithmetic order, or weights',mapping='SGsg produces8rows at sg*8. Pixel variant lane0..7 computes4 outputs. Broadcast variant all32lanes: row=sg*8+lane//4,out=lane%4, source=lane&~3. Each input half pair loaded by one source lane and shuffled once to its four consumers.',lifetime='Arena0..8191 used by FFN, retired at existing stage3 WG barrier. QKV occupies0..6143. After QKV, normal path caches128weights in6144..6271 before EXISTING stage4 WG barrier. Score reads Q/K, PV readsV, normal ctx remains registers. Stage9 own shX8rows published with subgroup barrier, no crossSG readers. Debug skips cache and reads original global weights because debug ctx overwrites6144..8191.',rounding='Original output half narrowing; copied four FP32 channel0..31 chains or scalar channel-specific equivalent; no FMA contraction. Packed shuffle transports two existing half values without arithmetic.',costs={'baseline':{'active_projection_SG':2,'active_lanes_per_SG':32,'new_epilogue_WG_barriers':1,'SLM_input_read_B_fullWG':4096},'common':{'projection_SG':8,'cache_global_weight_B_fullWG':256,'cache_SLM_write_B_fullWG':256,'added_shared_allocation':0,'epilogue_subgroup_barriers':1,'epilogue_WG_barriers':0,'SLM_input_read_B_fullWG':4096},'pixel':{'active_lanes_per_SG':8,'float_accumulators_per_active_lane':4,'new_shuffle_per_SG':0,'unique_cached_weight_set_B_read_per_SG':256},'broadcast':{'active_lanes_per_SG':32,'float_accumulators_per_lane':1,'packed_shuffle_per_SG':16,'weight_SLM_logical_B_read_per_fullWG':16384,'input_load_lanes_per_SG':8}},crop_sg_histogram=hist,limits='Cached weight read multicast/cache effects unknown; same64active scalar pixel lanes in pixel variant distributed across8SG, not more total SIMD activity. GRF allocation unknown; forbid new scratch. New cache load may delay existing barrier; measured end-to-end must include that.'))
+
+# Cache uses only a normal-path retired area, before an existing WG publish barrier.
+marker='    barrier();\n\n    // ============ stage 6:'
+assert src.count(marker)==1
+cached=src.replace(marker,'''    // Normal context remains in registers; debug context owns this region instead.
+    if(!debug && sg==0u) {
+        for(uint i=lane;i<128u;i+=32u) shArena[6144u+i]=wb[17024u+i];
+    }
+'''+marker)
+fetch='''float16_t boundary_weight(uint offset) {
+    if(pc.p0.z!=0) return wb[17024u+offset];
+    return shArena[6144u+offset];
+}
+'''
+parent_math=A/'c32-rest-20261026/f20-row-pairs/candidate.spv'
+for name in ['pixel-local','broadcast-local']:
+ d=D/name;d.mkdir(exist_ok=True);(d/'run').mkdir(exist_ok=True);s=cached
+ a=s.index('vec4 boundary_project(');b=s.index('\nvoid main(',a)
+ if name=='pixel-local':
+  helper=s[a:b]
+  for base in (17024,17056,17088,17120):
+   helper=helper.replace(f'wb[{base}u+c]',f'boundary_weight({base-17024}u+c)').replace(f'wb[{base+1}u+c]',f'boundary_weight({base+1-17024}u+c)')
+  s=s[:a]+fetch+helper+s[b:]
+ else:
+  helper='''float boundary_project(uint row,uint channel,uint lane) {
+    precise float residual=0.0;
+    for(uint c=0u;c<32u;c+=2u) {
+        uint pair=0u;
+        if((lane&3u)==0u) pair=packFloat2x16(f16vec2(shX[row*32u+c],shX[row*32u+c+1u]));
+        f16vec2 input_pair=unpackFloat2x16(subgroupShuffle(pair,lane&~3u));
+        f16vec2 weight_pair=f16vec2(boundary_weight(channel*32u+c),boundary_weight(channel*32u+c+1u));
+        float value=float(input_pair.x);
+        residual=residual+value*float(weight_pair.x);
+        value=float(input_pair.y);
+        residual=residual+value*float(weight_pair.y);
+    }
+    return residual;
+}
+'''
+  s=s[:a]+fetch+helper+s[b:]
+ a=s.index('    barrier(); // stage9 producer');b=s.index('    // Debug O continues',a)
+ if name=='pixel-local':
+  ep='''    subgroupMemoryBarrierShared();subgroupBarrier();
+    if(lane<8u) {
+        uint t=sg*8u+lane,q=t/16u,r=t%16u;
+        int px=(2*int(wx)+shift+int(q&1u))*4+int(r%4u);
+        int py=(2*int(wy)+pc.p3.w+int(q>>1u))*4+int(r/4u);
+        if(px>=0 && px<1280 && py>=0 && py<720) {
+            vec4 value=boundary_project(t);
+            uint address=(uint(py)*1280u+uint(px))*4u;
+            residual_out[address]=value.x;residual_out[address+1u]=value.y;
+            residual_out[address+2u]=value.z;residual_out[address+3u]=value.w;
+        }
+    }
+'''
+ else:
+  ep='''    subgroupMemoryBarrierShared();subgroupBarrier();
+    {
+        uint t=sg*8u+lane/4u,channel=lane%4u,q=t/16u,r=t%16u;
+        int px=(2*int(wx)+shift+int(q&1u))*4+int(r%4u);
+        int py=(2*int(wy)+pc.p3.w+int(q>>1u))*4+int(r/4u);
+        if(px>=0 && px<1280 && py>=0 && py<720)
+            residual_out[(uint(py)*1280u+uint(px))*4u+channel]=boundary_project(t,channel,lane);
+    }
+'''
+ s=s[:a]+ep+s[b:]
+ spv,info=build(d,'candidate',s,parent_math,'boundary_project');plan=d/'plan.txt';pt=(P/'plan.txt').read_text(encoding='utf-8-sig');assert pt.count((P/'candidate.spv').as_posix())==1;plan.write_text(pt.replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8');tickets(d,plan,[spv])
+ save(d/'PROOF.json',dict(baseline=ident(P/'plan.txt'),source=ident(d/'candidate.comp'),spv=ident(spv),NC=info,pipeline_indices=[38],pass_indices=[230],cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check'])))
+r=(A/'c32-boundary-followup-20261026/review.py').read_text();r=r.replace("P=R.parent/'c32-boundary-candidates-20261026/f01-direct-a'","P=R.parent/'c32-boundary-followup-20261026/f20-pixel-owner'");(D/'review.py').write_text(r,encoding='utf-8')
+print('CPU_READY_TWO_LOCAL_OWNER_ARMS')

@@ -1,0 +1,132 @@
+"""Read-only ISA scanner for the F05 C64 group (card n04a-f05-c64-feed).
+
+Parses one IGC .asm dump and prints/spits structured facts:
+  - instruction census by mnemonic
+  - every SEND with its descriptor registers and the comment-annotated kind
+  - every DPAS with source/destination registers
+  - SWSB dependency tokens ($n / .dst / .src) and the register writes that
+    follow them, so an address payload written on top of a return region is
+    visible without guessing.
+
+No GPU, no writes outside the card directory.
+"""
+import json
+import re
+import sys
+from pathlib import Path
+
+ASM = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+           r'fullnet-mechanism-transfer-20261026/f05-kv-consumer-layout/family/'
+           r'captures/native-f20-pixel-owner/ISA/'
+           r'CS_asm6a22246177be2653_simd32_0000000000000006_5_orig.asm')
+
+LINE = re.compile(r'^/\* \[(?P<off>[0-9A-F]+)\]\s*\*/\s*(?P<rest>.*)$')
+
+
+def parse(path):
+    out = []
+    label = None
+    for raw in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        if s.startswith('//'):
+            continue
+        if re.match(r'^L\d+:$', s):
+            label = s[:-1]
+            continue
+        m = LINE.match(s)
+        if not m:
+            continue
+        rest = m.group('rest')
+        # predicate + exec mask, e.g. "(W&f1.0) cmp (32|M0) ..."
+        pred = None
+        pm = re.match(r'^\((W|~W)?(&?~?f\d+\.\d)?\)\s*', rest)
+        if pm:
+            pred = pm.group(0).strip()
+            rest = rest[pm.end():]
+        dm = re.search(r'\((\d+)\|M\d\)', rest)
+        execmask = int(dm.group(1)) if dm else None
+        body = re.split(r'\s{2,}', rest, maxsplit=1)
+        head = body[0].strip()
+        tail = body[1].strip() if len(body) > 1 else ''
+        mn = head.split()[0] if head else ''
+        full = rest.split('//')[0].rstrip()
+        out.append(dict(off=int(m.group('off'), 16), label=label, pred=pred,
+                        execmask=execmask, mnemonic=mn, head=head, tail=tail,
+                        full=full))
+    return out
+
+
+def census(ins):
+    c = {}
+    for i in ins:
+        c[i['mnemonic']] = c.get(i['mnemonic'], 0) + 1
+    return dict(sorted(c.items(), key=lambda kv: -kv[1]))
+
+
+def regs(text):
+    return re.findall(r'\br(\d+)(?:\.(\d+))?', text)
+
+
+def send_rows(ins):
+    rows = []
+    for i in ins:
+        if not i['mnemonic'].startswith('send'):
+            continue
+        cm = re.search(r'//\s*(.*)$', i['tail'])
+        kind = cm.group(1).strip() if cm else ''
+        tok = re.findall(r'\$(\d+)', i['tail'])
+        rows.append(dict(off=i['off'], label=i['label'], pred=i['pred'],
+                         mnemonic=i['mnemonic'], head=i['head'], kind=kind,
+                         tokens=tok))
+    return rows
+
+
+def dpas_rows(ins):
+    rows = []
+    for i in ins:
+        if i['mnemonic'] != 'dpas':
+            continue
+        dst = re.search(r'r(\d+)\.(\d+)<', i['head'])
+        srcs = re.findall(r'r(\d+)\.(\d+)<', i['head'])
+        rows.append(dict(off=i['off'], label=i['label'], pred=i['pred'],
+                         dst=('r' + dst.group(1)) if dst else None,
+                         all=('r' + srcs[0][0]) if srcs else None,
+                         head=i['head'], tail=i['tail']))
+    return rows
+
+
+def writes_to(ins, reg):
+    """Instructions whose destination is register `reg`."""
+    pat = re.compile(r'\br' + str(reg) + r'\.\d+<')
+    outs = []
+    for i in ins:
+        if pat.search(i['head']) and not i['mnemonic'].startswith('dpas') \
+                and not i['mnemonic'].startswith('send'):
+            outs.append(i)
+        elif pat.search(i['head']) and i['mnemonic'].startswith('send'):
+            outs.append(i)
+    return outs
+
+
+if __name__ == '__main__':
+    ins = parse(ASM)
+    print('file:', ASM.name)
+    print('instructions:', len(ins))
+    print('census:', json.dumps(census(ins), indent=1)[:1500])
+    sr = send_rows(ins)
+    print('send sites:', len(sr))
+    kinds = {}
+    for s in sr:
+        base = re.sub(r'\[.*?\]', '', s['kind'])
+        base = re.sub(r'load\.ugm\.\S+|store\.\S+|load\.slm\.\S+|store\.slm\.\S+',
+                      lambda m: m.group(0), base)
+        kinds[s['kind']] = kinds.get(s['kind'], 0) + 1
+    print('send kinds:')
+    for k, v in sorted(kinds.items(), key=lambda kv: -kv[1])[:40]:
+        print('  %4d  %s' % (v, k))
+    dr = dpas_rows(ins)
+    print('dpas sites:', len(dr))
+    for d in dr[:6]:
+        print('  ', hex(d['off']), d['pred'], d['head'])

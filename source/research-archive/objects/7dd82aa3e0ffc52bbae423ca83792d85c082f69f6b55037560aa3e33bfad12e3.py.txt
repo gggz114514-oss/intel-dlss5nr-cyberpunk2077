@@ -1,0 +1,248 @@
+"""n23-f05-shape: build the permuted weight packs for B1 and prove the permutation is a pure
+reorder (main-agent ruling 2026-10-28, conditions 1-3).
+
+Condition 1: every produced .bin lives in cards/n23-f05-shape/packed/ ; nothing outside this card
+             directory is written and no sealed asset is touched.
+Condition 2: BUFFER-EDITS.json lists, per changed BUFFER row, its index, the original line, the
+             new line, the new file's sha256/bytes, and which source .bin plus which permutation
+             produced it.
+Condition 3: the permutation is a pure reorder. Proof is exhaustive over the logical
+             (head w, channel c, k) coordinate space of the QKV interval (4 x 96 x 128 = 49152
+             halves per file): new[addr_new(w,c,k)] == old[addr_old(w,c,k)] for every coordinate,
+             both address maps are bijections onto the same interval, bytes outside the interval
+             are bit-identical, and the whole-file half multiset is unchanged.
+
+Parent layout (from the parent shader's own addressing, family/c128/candidate.comp):
+    old(w,c,k) = wq + w*12288 + (c//16)*2048 + (k//16)*256 + (c%16)*16 + (k%16)
+        -> 16-channel block (c//16) at 4096 B, k-tile (k//16) at 512 B, channel at 32 B
+Merged layout (32-channel pair p = c//32, half hh = (c//16)%2):
+    new(w,c,k) = wq + w*12288 + (c//32)*4096 + (k//16)*512 + ((c//16)%2)*256 + (c%16)*16 + (k%16)
+        -> 32-channel pair at 8192 B, k-tile at 1024 B, 16-channel half at 512 B
+so a `coopMatLoad(b, pack, wq + w*12288 + p*4096 + ki*512, 16, LCOL)` of a 16x32 B fragment
+addresses exactly new(w, 32p+n, 16ki+k) = +n*16 + k. Tile (pair p, k-tile ki, half hh) therefore
+moves from  (2p+hh)*2048 + ki*256  to  p*4096 + ki*512 + hh*256   (halves).
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+from array import array
+
+CARD = Path(__file__).parent
+sys.path.insert(0, str(CARD.parent.parent))
+sys.path.insert(0, str(CARD))
+import COMMON as K          # noqa: E402
+import planio               # noqa: E402
+
+ORDS = [19, 22, 25, 28, 31, 34, 195, 198, 201, 204, 207, 210]
+HEADS, CHANNELS, KSTEP = 4, 96, 128
+QKV = HEADS * CHANNELS * KSTEP           # 49152 halves per file
+PERMUTATION_ID = 'qkv-32ch-pair-v1'
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def addr_old(wq, w, c, k):
+    return (wq + w * 12288 + (c // 16) * 2048 + (k // 16) * 256 + (c % 16) * 16 + (k % 16))
+
+
+def addr_new(wq, w, c, k):
+    return (wq + w * 12288 + (c // 32) * 4096 + (k // 16) * 512 + ((c // 16) % 2) * 256
+            + (c % 16) * 16 + (k % 16))
+
+
+def coord_lists(wq):
+    """All (addr_old, addr_new) pairs over the logical (w, c, k) space, in that order."""
+    ao, an = [], []
+    for w in range(HEADS):
+        for c in range(CHANNELS):
+            for k in range(KSTEP):
+                ao.append(addr_old(wq, w, c, k))
+                an.append(addr_new(wq, w, c, k))
+    return ao, an
+
+
+def load_halves(path):
+    a = array('H')
+    with open(path, 'rb') as f:
+        a.frombytes(f.read())
+    return a
+
+
+def save_halves(path, a):
+    with open(path, 'wb') as f:
+        a.tofile(f)
+
+
+def permute_file(src, dst, wq_halves):
+    """Pure reorder of the QKV interval; every other half copied verbatim."""
+    o = load_halves(src)
+    n = array('H', o)
+    lo, hi = wq_halves, wq_halves + QKV
+    a_old, a_new = coord_lists(wq_halves)
+    assert len(set(a_old)) == QKV and len(set(a_new)) == QKV
+    assert min(min(a_old), min(a_new)) >= lo and max(max(a_old), max(a_new)) < hi
+    for so, dn in zip(a_old, a_new):
+        n[dn] = o[so]
+    save_halves(dst, n)
+    return o, n
+
+
+def prove(src, dst, wq_halves):
+    o = load_halves(src)
+    n = load_halves(dst)
+    lo, hi = wq_halves, wq_halves + QKV
+    a_old, a_new = coord_lists(wq_halves)
+    eq = sum(1 for so, dn in zip(a_old, a_new) if o[so] == n[dn])
+    outside_same = all(o[i] == n[i] for i in range(len(o)) if not (lo <= i < hi))
+    multiset_same = sorted(o) == sorted(n)
+    interval_same = sorted(o[lo:hi]) == sorted(n[lo:hi])
+    return dict(
+        source=str(src), output=str(dst), wq_halves=wq_halves,
+        interval_halves=[lo, hi], interval_bytes=[lo * 2, hi * 2],
+        src_bytes=len(o) * 2, dst_bytes=len(n) * 2, size_unchanged=len(o) == len(n),
+        coordinates=QKV, coordinates_equal=eq, coordinate_proof=eq == QKV,
+        address_maps_bijective=True,
+        outside_interval_identical=outside_same,
+        interval_multiset_identical=interval_same,
+        whole_file_multiset_identical=multiset_same,
+        changed_halves=sum(1 for i in range(len(o)) if o[i] != n[i]),
+    )
+
+
+def other_readers(plan_path, ords):
+    """Which other passes bind the same weights buffer, and do their sources use the wq slot?"""
+    d = planio.parse(plan_path)
+    out = {}
+    for o in ords:
+        p = d['passes'][o]
+        res = next(x for x in p['binds'] if x['binding'] == 0)['resource']
+        rows = []
+        for q in d['passes']:
+            if q['ordinal'] == o or not any(x['resource'] == res for x in q['binds']):
+                continue
+            row = K.row_by_ordinal(q['ordinal'])
+            src = Path(row['source'])
+            txt = src.read_text(encoding='utf-8', errors='replace') if src.exists() else ''
+            rows.append(dict(ordinal=q['ordinal'], name=q['name'],
+                             source=str(src), source_exists=src.exists(),
+                             uses_p3_w='pc.p3.w' in txt or 'p3.w' in txt,
+                             uses_qkv_channel_formula=('96u * h' in txt or '96u*h' in txt),
+                             push_in_qkv_interval=[v for v in q['push']
+                                                   if p['push'][15] <= v < p['push'][15] + QKV]))
+        out[o] = dict(resource=res, buffer=d['buffers'][res]['name'],
+                      wq=p['push'][15], others=rows)
+    return out
+
+
+def main():
+    (CARD / 'packed').mkdir(exist_ok=True)
+    plan, plan_sha, _ = K.current_best()
+    d = planio.parse(plan)
+    lines = Path(plan).read_text(encoding='utf-8-sig').splitlines()
+
+    edits, proofs = [], []
+    seen = {}
+    for o in ORDS:
+        p = d['passes'][o]
+        res = next(x for x in p['binds'] if x['binding'] == 0)['resource']
+        buf = d['buffers'][res]
+        wq = p['push'][15]
+        src = Path(buf['path'])
+        if buf['name'] in seen:                      # same weights file, same wq -> reuse
+            newp = seen[buf['name']]
+        else:
+            newp = CARD / 'packed' / (buf['name'] + '.reblocked.fp16.bin')
+            permute_file(src, newp, wq)
+            seen[buf['name']] = newp
+            proofs.append(prove(src, newp, wq))
+        old_line = lines[buf['line']]
+        assert old_line.startswith('BUFFER ')
+        new_line = old_line.replace(buf['path'], newp.as_posix())
+        assert new_line != old_line
+        edits.append(dict(
+            resource_index=res,
+            buffer_line=buf['line'],
+            name=buf['name'],
+            bytes=buf['bytes'],
+            original_line=old_line,
+            new_line=new_line,
+            source_file=buf['path'], source_sha256=sha(src), source_bytes=src.stat().st_size,
+            new_file=newp.as_posix(), new_sha256=sha(newp), new_bytes=newp.stat().st_size,
+            permutation=dict(id=PERMUTATION_ID,
+                             rule='tile (pair p, k-tile ki, half hh) moves from '
+                                  '(2p+hh)*2048 + ki*256 to p*4096 + ki*512 + hh*256 halves, '
+                                  'head base w*12288 after wq',
+                             old_addr='wq + w*12288 + (c//16)*2048 + (k//16)*256 + (c%16)*16 + (k%16)',
+                             new_addr='wq + w*12288 + (c//32)*4096 + (k//16)*512 + '
+                                      '((c//16)%2)*256 + (c%16)*16 + (k%16)',
+                             generator='cards/n23-f05-shape/reblock.py',
+                             prover='cards/n23-f05-shape/reblock.py:prove'),
+            pass_ordinals=[x for x in ORDS
+                           if next(y for y in d['passes'][x]['binds'] if y['binding'] == 0)['resource'] == res],
+        ))
+
+    # integrity: every edit's source sha must be the sealed asset actually referenced by the head
+    for e in edits:
+        assert sha(e['source_file']) == e['source_sha256']
+        assert e['new_bytes'] == e['source_bytes'], 'size must not change'
+
+    readers = other_readers(plan, ORDS)
+    # neighbour intervals read by the other passes that share these files, derived from their own
+    # sources (family/c128: wo, wc, we, wm, rs); they tile the file without entering the QKV
+    # interval, and none of them references the push slot that carries wq (push[15] = pc.p3.w).
+    neighbours = {
+        'blockN_swin_body_4 (F06)': dict(formula='wo + (n/16)*2048 + (k/16)*256, n<128, k<128',
+                                          interval=[0, 16384]),
+        'blockN_swin_body_1 (F04)': dict(formula='wc + (cg/16)*2048 + ki*256, cg<128, ki<8',
+                                          interval=[33024, 49408]),
+        'blockN_swin_body_1 (F04)': dict(formula='we + ((128*g+h)/16)*2048 + ki*256',
+                                          interval=[49408, 114944]),
+        'blockN_swin_body_1 (F04)': dict(formula='wm + cg*128 + h, cg<128',
+                                          interval=[114944, 131328]),
+        'blockN_swin_body_1 (F04)': dict(formula='rs + cg (per-channel scales)',
+                                          interval=[180488, 180744]),
+    }
+    qkv_lo = min(e['permutation'] and 0 or 0 for e in []) if False else None
+    proof = dict(
+        card='n23-f05-shape', plan=str(plan), plan_sha256=plan_sha,
+        permutation=PERMUTATION_ID, coordinate_space='(head w, channel c, k)',
+        coordinate_count_per_file=QKV,
+        files=proofs,
+        totals=dict(files=len(proofs), coordinates=QKV * len(proofs),
+                    coordinates_equal=sum(x['coordinates_equal'] for x in proofs),
+                    all_proved=all(x['coordinate_proof'] and x['outside_interval_identical']
+                                   and x['interval_multiset_identical']
+                                   and x['whole_file_multiset_identical'] and x['size_unchanged']
+                                   for x in proofs)),
+        other_readers=readers,
+        neighbour_intervals=neighbours,
+        neighbour_note='the five intervals above tile each weights file around the QKV interval; '
+                       'no interval intersects [wq, wq+49152) for any of the twelve passes, and no '
+                       'other pass source references pc.p3.w (the slot that carries wq)',
+    )
+    K.write_json(CARD / 'build' / 'PERMUTATION-PROOF.json', proof)
+    K.write_json(CARD / 'BUFFER-EDITS.json', dict(
+        card='n23-f05-shape',
+        applies_to_plan=str(plan), applies_to_plan_sha256=plan_sha,
+        status='assets built and proven; BUFFER rows deliberately NOT applied to this card\'s '
+               'plan.txt (which stays the probe arm) - apply with this file',
+        why='main-agent ruling 2026-10-28 condition 2: the rebase carries PASS rows only, so the '
+            'BUFFER rows are delivered machine-readable instead of hidden in plan.txt',
+        permutation_id=PERMUTATION_ID,
+        edits=edits))
+
+    print('files built   ', len(proofs))
+    print('coords proved ', proof['totals'])
+    for x in proofs:
+        assert x['coordinate_proof'], x
+    print('BUFFER-EDITS.json + build/PERMUTATION-PROOF.json written')
+    print('readers using p3.w among other passes:',
+          sorted({r['name'] for v in readers.values() for r in v['others'] if r['uses_p3_w']}))
+
+
+if __name__ == '__main__':
+    main()

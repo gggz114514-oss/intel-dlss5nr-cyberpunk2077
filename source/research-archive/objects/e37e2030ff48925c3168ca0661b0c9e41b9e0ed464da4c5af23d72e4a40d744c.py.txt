@@ -1,0 +1,70 @@
+"""Why does a 1.94x better block exit make the network worse?
+
+Compares the block-4 exit (skip4) of the two GPU arms and the FP16 teacher, in the
+same flat layout, and checks it against the *downstream* static input scale.
+"""
+import sys, json
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+HERE = Path(__file__).resolve().parent.parent
+D = L.D
+arms = {
+    "frozen_minmax": D / "c32-minmax/local-b4/replayed-network.bin",
+    "x_equalised": D / "c32-equalized-b4/local-b4/replayed-network.bin",
+    "x_plus_e": HERE / "runs/S01-B4-LOCAL/replayed-network.bin",
+}
+teacher = D / "dump-fp16/dump_skip4.bin"
+
+
+def tile_view(flat):
+    """(16128, 16 cols, 32 ch) float32"""
+    v = flat.reshape(-1, 512)
+    out = np.empty((v.shape[0], 16, 32), np.float32)
+    for c in range(32):
+        off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+        out[:, :, c] = v[:, off: off + 16 * 16: 16]
+    return out
+
+
+te = tile_view(np.fromfile(teacher, dtype="<f2"))
+rows = {}
+for name, path in arms.items():
+    a = tile_view(np.fromfile(path, dtype="<f2"))
+    rows[name] = dict(
+        rel_l2_vs_teacher=L.rel_l2(a, te),
+        absmax=float(np.abs(a).max()), teacher_absmax=float(np.abs(te).max()),
+        rms=float(np.sqrt((a ** 2).mean())), teacher_rms=float(np.sqrt((te ** 2).mean())),
+        ch_absmax=np.abs(a).max(axis=(0, 1)).tolist(),
+        ch_absmax_teacher=np.abs(te).max(axis=(0, 1)).tolist(),
+        p999=float(np.quantile(np.abs(a), 0.999)),
+        p999_teacher=float(np.quantile(np.abs(te), 0.999)),
+        frac_over_teacher_absmax=float(np.mean(np.abs(a) > np.abs(te).max())),
+    )
+    r = rows[name]
+    print(f"{name:14s} relL2={r['rel_l2_vs_teacher']:.6f} absmax={r['absmax']:.3f} "
+          f"(teacher {r['teacher_absmax']:.3f}) rms={r['rms']:.4f} (teacher {r['teacher_rms']:.4f}) "
+          f"p99.9={r['p999']:.3f}")
+
+# downstream static input scale of the C64 block that consumes skip4
+b5 = np.fromfile(L.B / "candidates/int8-coverage-v2-20261020/B/pack/c64_b5_scales.f32.bin", dtype="<f4")
+print("\nC64 block5 static sX =", float(b5[0]), "-> full-scale range", float(b5[0]) * 127)
+print("  block-4 exit absmax per arm vs that range:")
+for name, r in rows.items():
+    print(f"   {name:14s} absmax {r['absmax']:.2f} -> {r['absmax'] / (b5[0] * 127):.3f} of full scale, "
+          f"fraction of elements above full scale {float(np.mean(np.abs(tile_view(np.fromfile(arms[name], dtype='<f2'))) > b5[0] * 127)):.3e}")
+
+# what the downstream sees: qX code saturation for a static scale
+for name, r in rows.items():
+    a = tile_view(np.fromfile(arms[name], dtype="<f2"))
+    codes = np.clip(np.rint(a / float(b5[0])), -127, 127)
+    sat = int(np.count_nonzero(np.abs(codes) >= 127))
+    print(f"   {name:14s} static-code saturation {sat}/{codes.size} = {sat / codes.size:.3e}")
+    r["downstream_saturation_fraction"] = sat / codes.size
+te_codes = np.clip(np.rint(te / float(b5[0])), -127, 127)
+print(f"   {'teacher':14s} static-code saturation {int(np.count_nonzero(np.abs(te_codes) >= 127))}/{te_codes.size}")
+
+(HERE / "CPU" / "exit_distribution.json").write_text(json.dumps(rows, indent=2))

@@ -1,0 +1,122 @@
+"""S05 step 8: is the gate dump block9's own data at all?  (no GPU)
+
+Tests, in order of decisiveness:
+  T1 per-channel correlation of the dumped qX against the teacher X, plus the best-match
+     mapping: a permuted-but-genuine qX would give one strong |rho| per dumped channel;
+     stale pool memory gives none.
+  T2 is the dumped M a function of the dumped qX?  (mid = f(qX) in this pack)
+  T3 is the dumped Y a function of the dumped M?  (contract = f(M))
+  T4 first differing byte of the dump vs the prediction, and the value pairs, so the
+     report can state "first difference" honestly.
+  T5 what the runner receipt says about the pool / output dump (raw text scan).
+"""
+import json
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import s05_common as C
+
+G = C.CARD / 'GPU/gate-34189'
+QW = C.CARD / 'PACK/c128_b9_weights.i8.bin'
+QS = C.CARD / 'PACK/c128_b9_scales.f32.bin'
+ver = json.loads((C.CARD / 'evidence/PACK-VERIFY.json').read_text())
+
+qx_gpu = C.i8(G / 'block9_qx.bin')
+m_gpu = C.i8(G / 'block9_M.bin')
+y_gpu = C.f16(G / 'block9_Y.bin').reshape(C.TOK, 128)
+pred = C.i8(C.CARD / 'evidence/qx-pred-34189.i8.bin')
+X = C.load_x(C.D / 'dump-fp16/dump_block8_out.bin')
+Y = C.load_y(C.D / 'dump-fp16/dump_swin_9_Y.bin')
+
+# calibration D (3-frame), the one baked into the shipped pack
+D = np.array(ver['D'], np.float32)
+sc = C.f32(QS)
+w8 = C.i8(QW).astype(np.int32)
+we8, wm8, wc8 = w8[0:65536].reshape(512, 128), w8[65536:81920].reshape(128, 128), w8[81920:98304].reshape(128, 128)
+invX = (np.float32(sc[1]) / D).astype(np.float32)
+
+idx_m8 = ((np.arange(C.WIN_X * C.WIN_Y)[:, None, None] * 8192
+           + (np.arange(64)[None, :, None] >> 3) * 1024
+           + np.arange(128)[None, None, :] * 8
+           + (np.arange(64)[None, :, None] & 7)).reshape(-1))
+qx_m8 = qx_gpu[idx_m8].reshape(C.TOK, 128).astype(np.float32)
+m_m8 = m_gpu[idx_m8].reshape(C.TOK, 128).astype(np.float32)
+
+out = dict(card='S05-c128', step='gate dump validity', gpu_dir=str(G))
+
+# ---- T1 correlation / permutation
+Xc = X - X.mean(axis=0, keepdims=True)
+Qc = qx_m8 - qx_m8.mean(axis=0, keepdims=True)
+den = np.sqrt((Xc ** 2).sum(axis=0))[:, None] * np.sqrt((Qc ** 2).sum(axis=0))[None, :]
+rho = (Xc.T @ Qc) / np.maximum(den, 1e-9)          # rho[teacher_ch, dumped_ch]
+best = np.abs(rho).max(axis=0)                     # per dumped channel
+out['T1_correlation'] = dict(
+    max_abs_rho_per_dumped_channel=dict(median=float(np.median(best)), p10=float(np.percentile(best, 10)),
+                                        p90=float(np.percentile(best, 90)), max=float(best.max())),
+    diag_rho=dict(median=float(np.median(np.diag(rho))), abs_median=float(np.median(np.abs(np.diag(rho))))),
+    verdict='a genuine (even permuted) qX would show max|rho| ~ 0.9+ per channel; '
+            'a stale buffer shows the near-zero values above',
+)
+
+# ---- T2/T3 functional consistency of the dumps with each other
+def mid_from_qx(q):
+    de = np.rint(q @ we8.astype(np.float32).T)
+    a = C.act(C.half(de * sc[16:528][None, :]))
+    qa = C.code(a * np.float32(sc[2]))
+    mo = np.empty((q.shape[0], 128), np.float32)
+    for g in range(4):
+        mo[:, g * 32:(g + 1) * 32] = qa[:, g * 128:(g + 1) * 128] @ wm8[g * 32:(g + 1) * 32].astype(np.float32).T
+    qm = C.code(np.rint(mo) * np.float32(sc[528:656])[None, :] * np.float32(sc[3]))
+    return qa, qm
+
+
+qa_pred, qm_pred = mid_from_qx(C.code(X * invX[None, :]))
+qa_dump, qm_from_dump = mid_from_qx(qx_m8)
+_, qm_from_pred = mid_from_qx(C.code(X * invX[None, :]))
+out['T2_mid'] = dict(
+    m_dump_vs_m_from_predicted_qx=float((m_m8 == qm_from_pred).mean()),
+    m_dump_vs_m_from_dumped_qx=float((m_m8 == qm_from_dump).mean()),
+    note='if the qX and M dumps came from the same execution, one of these must be ~1.0',
+)
+dc_dump = np.rint(qm_from_dump @ wc8.astype(np.float32).T)
+y_from_dump = C.half(dc_dump * np.float32(sc[656:784])[None, :] + qx_m8 * np.float32(sc[784:912])[None, :])
+out['T3_contract'] = dict(
+    y_dump_vs_y_from_dumped_M_and_qX=dict(rel_l2=C.rel(y_gpu, y_from_dump)),
+    y_dump_vs_teacher=dict(rel_l2=C.rel(y_gpu, Y)),
+    y_from_dump_vs_teacher=dict(rel_l2=C.rel(y_from_dump, Y)),
+)
+
+# ---- T4 first differing byte / value pairs
+diff = np.where(pred != qx_gpu)[0]
+if diff.size:
+    b = int(diff[0])
+    off = b % 8192
+    m_in_win = ((off // 1024) << 3) | (off % 8)
+    c_dec = (off % 1024) // 8
+else:
+    b, off, m_in_win, c_dec = None, None, None, None
+out['T4_first_diff'] = dict(
+    first_byte=b,
+    first_byte_window=int(b // 8192) if b is not None else None,
+    first_byte_offset_in_window=off,
+    decoded_token_in_window=m_in_win, decoded_channel=c_dec,
+    predicted_value=int(pred[b]) if b is not None else None,
+    dumped_value=int(qx_gpu[b]) if b is not None else None,
+    equal_fraction=float((pred == qx_gpu).mean()),
+    max_abs_diff=int(np.abs(pred.astype(np.int32) - qx_gpu.astype(np.int32)).max()),
+)
+
+# ---- T5 receipt scan
+rec = G / 'port_network_receipt.json'
+txt = rec.read_text(errors='replace')
+hits = {}
+for pat in ('pool', 'transient', 'resident', 'alias', 'reuse', 'slot', 'block8_out', 'swin_9_Y', 'block9_qx'):
+    hits[pat] = len(re.findall(pat, txt, flags=re.I))
+out['T5_receipt'] = dict(path=str(rec), bytes=rec.stat().st_size, pattern_hits=hits,
+                         head=txt[:600].replace('\n', ' ')[:600])
+(C.CARD / 'evidence/GATE-DIAG2.json').write_text(json.dumps(out, indent=2))
+print(json.dumps(out, indent=2)[:6000])

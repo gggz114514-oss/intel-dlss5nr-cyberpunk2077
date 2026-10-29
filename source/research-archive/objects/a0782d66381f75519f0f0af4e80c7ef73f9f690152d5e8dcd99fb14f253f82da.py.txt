@@ -1,0 +1,68 @@
+from common import *
+import sys, subprocess
+sys.path.insert(0,str(A/'fullnet-continuous-20261027'))
+import COMMON as K
+ST=K.ST
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True,encoding='utf8',errors='replace')
+ assert r.returncode==0,r.stdout+r.stderr
+ return r.stdout+r.stderr
+def change(s,a,b,count=1):
+ assert s.count(a)==count,(a,s.count(a),count)
+ return s.replace(a,b)
+def migrate(parent,raw,dst):
+ pm=ST.Module(parent);cm=ST.Module(raw)
+ keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[])
+ ST.set_no_contraction(cm,keep,dst)
+ return dict(parent_NC=len(ST.no_contraction_ids(pm)),child_NC=len(keep),mapping=info)
+recipes=read(A/'fullnet-continuous-20261027/evidence/RECIPES.json')
+r=recipes['c853148407be055e7e2fc71ef87614f7ec003468baeb8954ed2e998ff89047fd']['compile']
+c64=B/'work/zcode-fp16-fullnet-handoff-20261024/candidates/f07dp-f3-combined'
+jobs=[('f3c64',c64/'source/candidate-c64/fused_c64_body_ds.comp',c64/'spv/c64_combined.spv',[c64/'source/candidate-c64']),
+ ('f3c256',A/'fullnet-continuous-20261027/cards/n27-f07/candidate.comp',A/'fullnet-continuous-20261027/cards/n27-f07/candidate.spv',[Path(r['pinned_include_dir'])]+[Path(x) for x in r['include_dirs']]),
+ ('f2',A/'c32-rest-20261026/root-f2/candidate.comp',A/'c32-rest-20261026/root-f2/candidate.spv',[B/'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1/source'])]
+receipts=[]
+for name,src,parent,inc in jobs:
+ out=D/'shaders'/name;out.mkdir(parents=True,exist_ok=True)
+ control=out/'control.raw.spv';K.compile_glsl(src,control,inc)
+ cr=out/'control.spv';migrate(parent,control,cr)
+ assert sha(cr)==sha(parent),('parent reproduction',name,sha(cr),sha(parent))
+ s=src.read_text(encoding='utf-8-sig')
+ if name=='f3c64':
+  s=change(s,'const uint px = 4u * wx + 2u * (sg >> 2u) + dx;','const int px = 4 * int(wx) - 2 + 2 * int(sg >> 2u) + int(dx);',4)
+  s=change(s,'tile_ok && px < uint(pc.p7.x) && py >= 0','tile_ok && px >= 0 && uint(px) < uint(pc.p7.x) && py >= 0',4)
+  s=change(s,'const int  px0 = 4 * int(wx);','const int  px0 = 4 * int(wx) - 2;')
+ elif name=='f3c256':
+  s=change(s,'const uint px = 4u * wx + 2u * sx1 + dx;','const int px = 4 * int(wx) - 2 + 2 * int(sx1) + int(dx);')
+  s=change(s,'if (px < uint(pc.p7.x) && px < uint(pc.p5.y) &&','if (px >= 0 && uint(px) < uint(pc.p7.x) && uint(px) < uint(pc.p5.y) &&')
+  s=change(s,'const int  px0 = 4 * int(wx);','const int  px0 = 4 * int(wx) - 2;')
+  s=change(s,'    if (!half_ok) return;\n','')
+  s=change(s,'uint px = uint(px0i) + (m & 3u);\n        uint py = uint(py0i) + (m >> 2u);','int px = px0i + int(m & 3u);\n        int py = py0i + int(m >> 2u);\n        if(px < 0 || py < 0 || uint(px)>=OW || uint(py)>=OH) continue;')
+  s=change(s,'nrf_ds_at(px, py, group','nrf_ds_at(uint(px), uint(py), group')
+ else:
+  # Existing shV is dead before QKV. Gather 16x64 halves there, consume them
+  # before the projection barrier, then reuse shV for the later attention V.
+  anchor='    // ---- projection: SG role (row half = sg2>>1, channel group = sg2&1) ----'
+  gather='''    for(uint e=tid2;e<1024u;e+=128u){
+        uint p=e/pc.p5.x,k=e%pc.p5.x;
+        int x=4*int(wx2)-2+int(p%4u), y=4*int(wy2)+int(p/4u);
+        float16_t v=float16_t(0.0);
+        if(x>=0 && y>=0 && x<int(pc.p6.z) && y<int(pc.p6.w))
+            v=x65[pc.p4.x+nrf2_io_at0(uint(x),uint(y),k,pc.p6.z,pc.p5.x)];
+        shV[e]=v;
+    }
+    barrier();
+'''
+  s=change(s,anchor,gather+anchor)
+  s=change(s,'coopMatLoad(a, x65, abase + (kc / 16u) * 256u, 16u, LROW);','coopMatLoad(a, shV, rh * 8u * pc.p5.x + kc, pc.p5.x, LROW);')
+  s=change(s,'uint px=(2u*gl_WorkGroupID.x+(sg2&1u))*4u+sx;\n uint py=(2u*gl_WorkGroupID.y+(sg2>>1u))*4u+sy;', '''int qx=2*int(gl_WorkGroupID.x)+pc.p0.y+int(sg2&1u);
+ int qy=2*int(gl_WorkGroupID.y)+pc.p3.w+int(sg2>>1u);
+ if(qx<0 || qy<0 || qx>=pc.p0.x || qy>=pc.p3.z) return f16vec2(0.0);
+ uint px=uint(qx)*4u+sx;
+ uint py=uint(qy)*4u+sy;''')
+ comp=out/'candidate.comp';comp.write_text(s,encoding='utf8')
+ raw=out/'candidate.raw.spv';dst=out/'candidate.spv';K.compile_glsl(comp,raw,inc)
+ nc=migrate(parent,raw,dst);validation=run([K.VALIDATE,dst])
+ receipts.append(dict(name=name,source=str(src),parent=str(parent),parent_sha=sha(parent),control_sha=sha(cr),candidate=str(dst),sha256=sha(dst),includes=list(map(str,inc)),NC=nc,validation=validation))
+ print(name,sha(dst),flush=True)
+save(D/'SHIFT-BUILD.json',receipts)

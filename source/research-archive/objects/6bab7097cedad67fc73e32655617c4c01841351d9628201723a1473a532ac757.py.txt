@@ -1,0 +1,204 @@
+"""n22-f15-den-pv build: parent byte reproduction, candidate compile, SPV validation,
+plan generation on the CURRENT CHAIN HEAD (8 F15 PASS lines only), cpu-check, BUILD.json.
+
+CPU only: glslang + spv_validate_cpu + clock_runner --cpu-check. No Vulkan device, no GPU.
+Run:  python build.py
+"""
+import sys, json, hashlib, struct, shutil
+from pathlib import Path
+
+CAMP = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(CAMP))
+import COMMON as K
+
+CARD = CAMP / 'cards/n22-f15-den-pv'
+F15 = [96, 101, 106, 111, 116, 121, 126, 131]          # census row ordinals
+F15_PLAN_LABELS = [59, 64, 69, 74, 79, 84, 89, 94]     # PASS line numbers in the plan
+
+OPNAME = {224: 'OpControlBarrier', 345: 'OpGroupNonUniformShuffle', 346: 'OpGroupNonUniformShuffleXor',
+          4457: 'OpCooperativeMatrixLoadKHR', 4458: 'OpCooperativeMatrixStoreKHR',
+          4459: 'OpCooperativeMatrixMulAddKHR', 4456: 'OpTypeCooperativeMatrixKHR',
+          129: 'OpFAdd', 133: 'OpFMul', 115: 'OpFConvert', 61: 'OpLoad', 62: 'OpStore', 169: 'OpSelect',
+          80: 'OpCompositeConstruct', 81: 'OpCompositeExtract', 65: 'OpAccessChain', 196: 'OpShiftLeftLogical',
+          199: 'OpBitwiseAnd', 124: 'OpBitcast', 128: 'OpIAdd', 132: 'OpIMul', 134: 'OpUDiv', 176: 'OpULessThan',
+          83: 'OpCopyObject', 12: 'OpExtInst', 245: 'OpPhi', 249: 'OpBranch', 250: 'OpBranchConditional',
+          57: 'OpFunctionCall', 127: 'OpFNegate', 184: 'OpFOrdLessThan', 54: 'OpFunction', 56: 'OpFunctionEnd'}
+TRACK = [12, 224, 345, 346, 4457, 4458, 4459, 129, 133, 115, 169, 80, 81, 196, 199, 124, 128, 83, 57]
+
+
+def sh(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def ident(p):
+    p = Path(p)
+    return dict(path=str(p), sha256=sh(p), size=p.stat().st_size)
+
+
+def spv_stats(p):
+    b = Path(p).read_bytes()
+    u = struct.unpack('<%dI' % (len(b) // 4), b)
+    assert u[0] == 0x07230203, 'not SPIR-V'
+    i, hist, nc = 5, {}, set()
+    while i < len(u):
+        w = u[i]; op = w & 0xFFFF; ln = w >> 16
+        hist[op] = hist.get(op, 0) + 1
+        if op == 71 and ln >= 3 and u[i + 2] == 42:
+            nc.add(u[i + 1])
+        i += ln
+    RESULT_SET = {12, 61, 80, 81, 83, 115, 124, 127, 128, 129, 133, 169, 345, 346, 4457, 4459}
+    rid2op, i = {}, 5
+    while i < len(u):
+        op = u[i] & 0xFFFF; ln = u[i] >> 16
+        if ln >= 3 and op in RESULT_SET:
+            rid2op.setdefault(u[i + 2], op)
+        i += ln
+    nc_ops = {}
+    for t in nc:
+        op = rid2op.get(t, 0)
+        nc_ops[OPNAME.get(op, 'op%d' % op)] = nc_ops.get(OPNAME.get(op, 'op%d' % op), 0) + 1
+    return dict(total_instructions=sum(hist.values()),
+                tracked={OPNAME[o]: hist.get(o, 0) for o in TRACK if hist.get(o, 0)},
+                opcodes={str(k): v for k, v in sorted(hist.items())},
+                no_contraction=len(nc), no_contraction_opcodes=dict(sorted(nc_ops.items())))
+
+
+def main():
+    rep = dict(card='n22-f15-den-pv', family='F15', pass_ordinals=F15,
+               local_size_x=256, note='CPU-only build; no GPU, no device, no deployment',
+               mechanism='P->PV repack de-duplication inside nrh_join_rows_to_B '
+                         '(24 -> 4 subgroup operations per call, bit-identical)')
+
+    # ---- 1. parent byte reproduction (recipe: raw, headers from the parent source dir)
+    repro = K.reproduce_current(96, CARD / 'build/repro96')
+    rep['parent_reproduce'] = repro
+    assert repro['raw_match'], 'parent byte reproduction FAILED'
+    rep['parent'] = ident(repro['target'])
+    shutil.copyfile(CARD / 'build/repro96/rebuild.spv', CARD / 'parent-rebuild.spv')
+    rep['parent_rebuilt'] = ident(CARD / 'parent-rebuild.spv')
+    assert rep['parent']['sha256'] == rep['parent_rebuilt']['sha256']
+
+    # ---- 2. candidate compile (card-local headers only) --------------------
+    comp = CARD / 'candidate.comp'
+    spv = CARD / 'candidate.spv'
+    incs = [CARD]
+    K.compile_glsl(comp, spv, incs)
+    K.validate_spv(spv)
+    rep['compile'] = dict(glslang=str(K.GLSLANG),
+                          argv=['-V', '--target-env', 'vulkan1.3'] + ['-I' + str(d) for d in incs] +
+                               [str(comp), '-o', str(spv)],
+                          include_dirs=[str(d) for d in incs])
+    rep['source'] = ident(comp)
+    rep['source_is_parent_bytes'] = (rep['source']['sha256'] ==
+                                     '12861485194b1d92e3d38f9f7994a50fbc88033a45c018da5bd2bc0e776e9a68')
+    rep['candidate'] = ident(spv)
+    rep['headers'] = {p.name: ident(p) for p in (CARD / 'register_handoff.glsl', CARD / 'vit_common.glsl')}
+    rep['header_pins_expected'] = {
+        'register_handoff.glsl': 'dd8307b1c59c76e41d705442207fafd1c87e2a87fe57d04f343af5c27caa5f26',
+        'vit_common.glsl': '15c832e2e797ad6583c210b791587bf8a61efc4c124d2fcd1de3fe5050521346',
+    }
+    # vit_common.glsl must be byte-identical to the parent pin; register_handoff.glsl may not be
+    rep['headers_pinned_match'] = (rep['headers']['vit_common.glsl']['sha256'] ==
+                                   rep['header_pins_expected']['vit_common.glsl'])
+    rep['register_handoff_parent_sha'] = rep['header_pins_expected']['register_handoff.glsl']
+
+    # ---- 3. SPV statistics, parent vs candidate ---------------------------
+    ps = spv_stats(rep['parent']['path'])
+    cs = spv_stats(spv)
+    rep['spv_stats'] = dict(parent=ps, candidate=cs)
+    rep['float_NC_checked'] = cs['no_contraction']
+    rep['float_NC_parent'] = ps['no_contraction']
+    rep['NC_multiset_equal'] = cs['no_contraction_opcodes'] == ps['no_contraction_opcodes']
+    rep['spv_delta'] = {k: [ps['tracked'].get(k, 0), cs['tracked'].get(k, 0)]
+                        for k in sorted(set(ps['tracked']) | set(cs['tracked']))
+                        if ps['tracked'].get(k, 0) != cs['tracked'].get(k, 0)}
+    rep['spv_delta_total'] = cs['total_instructions'] - ps['total_instructions']
+
+    # ---- 4. plan: replace only this group's 8 PASS lines on the CHAIN HEAD --
+    head, head_sha, _chain = K.current_best()
+    plan = CARD / 'plan.txt'
+    n = K.make_plan(spv, plan, parent_plan=head, spv_shas={rep['parent']['sha256']})
+    rep['plan'] = ident(plan)
+    rep['plan_replaced_passes'] = n
+    assert n == 8, n
+    rep['chain_head_plan'] = dict(path=str(head), sha256=head_sha)
+    assert head_sha == sh(head), 'chain head sha mismatch'
+    base = Path(head).read_text(encoding='utf-8-sig').splitlines()
+    card = plan.read_text(encoding='utf-8-sig').splitlines()
+    assert len(base) == len(card), (len(base), len(card))
+    diff = [(i, a, b) for i, (a, b) in enumerate(zip(base, card)) if a != b]
+    rep['plan_changed_lines'] = len(diff)
+    rep['plan_changed_pass_ordinals'] = sorted(int(a.split()[1]) for _, a, _ in diff)
+    rep['plan_changed_passes_all_f15'] = all('vit_attn_f15l' in a for _, a, _ in diff)
+    rep['plan_pass_lines_total'] = sum(1 for l in card if l.startswith('PASS '))
+    rep['plan_scope_ok'] = (len(diff) == 8 and rep['plan_changed_passes_all_f15']
+                            and rep['plan_changed_pass_ordinals'] == F15_PLAN_LABELS)
+    assert rep['plan_scope_ok'], rep['plan_changed_pass_ordinals']
+    rep['plan_grid_fields_unchanged'] = all(' 32 8192 9 32 5 32 1' in b for _, _, b in diff)
+
+    # ---- 5. cpu-check -----------------------------------------------------
+    out = K.cpu_check(plan)
+    rep['cpu_check'] = out.strip()
+    rep['CPU'] = out.strip()
+
+    # ---- 6. shuffle census side artifacts ---------------------------------
+    for src, dst in ((rep['parent']['path'], 'build/SHUF-CENSUS-parent.json'),
+                     (str(spv), 'build/SHUF-CENSUS-candidate.json')):
+        try:
+            import shuf_census
+            r = shuf_census.dump(src, CARD / dst)
+            rep.setdefault('shuffle_census', {})[Path(dst).stem] = dict(
+                path=dst, sha256=sh(CARD / dst), shuffle_count=r['shuffle_count'],
+                hist=r['hist'], duplicated_groups=r['duplicated_groups'],
+                redundant_copies=r['redundant_copies'])
+        except Exception as e:      # census is evidence, not a gate
+            rep.setdefault('shuffle_census', {})[Path(dst).stem] = 'FAILED: %s' % e
+
+    # ---- 7. verdict + side evidence (all produced on CPU in this card) ----
+    rep['verdict'] = dict(
+        status='BLOCKED_WITH_CANDIDATE_ARTIFACT',
+        triage='C (mechanism realised, no materialised work removed at this identity)',
+        reason='parent ISA materialises 4 subgroup shuffles per nrh_join_rows_to_B call = the '
+               'information floor (70 indirect r[a0.0] reads = 2 x 35 = 2 x (4x8 join + 2 den + 1 epilogue)); '
+               'the 16 identity and 4 duplicate source shuffles cost zero instructions in the parent',
+        next='F15 den/PV axis closed; only the SLM layout (atile) or the workgroup query span remain')
+    side = {}
+    for rel, keys in (
+        ('build/IDENTITY-CHECK.json', ('all_expected_unchanged', 'changed_functions',
+                                       'dropped_functions', 'nc_multiset_equal',
+                                       'nc_parent_count', 'nc_candidate_count',
+                                       'parent_total_instructions', 'candidate_total_instructions')),
+        ('build/JOIN-BITS.json', ('join_bit_identical', 'trials', 'mismatches',
+                                  'all_maps_bijective', 'unpack2_identity')),
+        ('build/ISA-COST.json', ('instructions', 'dpas_count', 'sync_count', 'fence_histogram',
+                                 'sync_histogram', 'slm_roundtrips_count')),
+        ('build/ISA-CLASSES.json', ('instructions', 'mov_total', 'mov_classes', 'sync', 'branches')),
+    ):
+        p = CARD / rel
+        if p.exists():
+            d = K.read_json(p)
+            side[Path(rel).stem] = dict(path=rel, sha256=sh(p),
+                                        **{k: d[k] for k in keys if k in d})
+    rep['side_checks'] = side
+    rep['isa_census_model'] = dict(
+        indirect_grf_reads=70, split={'16|M0': 35, '16|M16': 35},
+        a0_writes=141, a0_split={'zero_init': 71, 'add_M0': 35, 'add_M16': 35},
+        materialised_shuffles=35,
+        decomposition={'nrh_join_rows_to_B': 4 * 8, 'den_shuffle_xor': 2, 'epilogue_broadcast': 1},
+        residual=0,
+        floor_argument='PV B operand = 4 dwords/lane; one shuffle moves 1 dword/lane => 4 shuffles minimum')
+
+    K.write_json(CARD / 'BUILD.json', rep)
+    print(json.dumps({k: rep[k] for k in ('cpu_check', 'plan_changed_lines', 'float_NC_checked',
+                                          'float_NC_parent', 'NC_multiset_equal',
+                                          'headers_pinned_match', 'plan_replaced_passes')}, indent=2))
+    print('parent ', rep['parent']['sha256'], rep['parent']['size'])
+    print('cand   ', rep['candidate']['sha256'], rep['candidate']['size'])
+    print('plan   ', rep['plan']['sha256'], 'head', rep['chain_head_plan']['sha256'])
+    print('spv', ps['total_instructions'], '->', cs['total_instructions'], 'delta', rep['spv_delta_total'])
+    print('spv delta:', json.dumps(rep['spv_delta'], indent=2))
+    print('NC', ps['no_contraction_opcodes'], '->', cs['no_contraction_opcodes'])
+
+
+if __name__ == '__main__':
+    main()

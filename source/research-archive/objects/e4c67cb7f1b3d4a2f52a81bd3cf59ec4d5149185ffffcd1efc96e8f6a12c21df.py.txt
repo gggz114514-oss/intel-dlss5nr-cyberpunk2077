@@ -1,0 +1,217 @@
+"""Exhaustive mapping / equivalence proof for the n24 gM fold (CPU only, integers).
+
+Proves, by enumeration over the real grid, that
+
+  (A) the folded layout  new(w,t,c) = w*8192 + (t/8)*1024 + (c/16)*128 + (t%8)*16 + (c%16)
+      is a bijection [0,264)x[0,64)x[0,128) -> [0, 2,162,688)  (same 4,325,376 B),
+  (B) the producer's two folded stores write exactly new(w,t,c) for every
+      (w,t,c) reachable in the plan (grid 22x12x4, 8 subgroups, 2 accumulators),
+  (C) the consumer's 32 A-tile loads read exactly the set the producer wrote
+      (no read outside the write domain), with the same 4x per-workgroup
+      amplification as the parent,
+  (D) parent and candidate read the *same logical element set*: for every loaded
+      fragment element the (window, token, channel) triple is identical, so the
+      byte value is identical (only addresses changed),
+  (E) every index stays inside the buffer and the last tile ends exactly at the
+      last element.
+
+Everything is derived from the plan's real grid (22,12,4 / 22,12,1) and the push
+constants, not from a reduced model.
+"""
+import json
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent
+OUT = CARD / 'mapping-proof.json'
+
+WINDOWS = 264          # 22 x 12
+TOKENS = 64
+CHANNELS = 128
+HALVES = WINDOWS * TOKENS * CHANNELS          # 2,162,688
+BYTES = HALVES * 2                            # 4,325,376
+GRID_X, GRID_Y, GRID_Z = 22, 12, 4
+
+
+def old_addr(w, t, c):
+    return (w * 64 + t) * 128 + c
+
+
+def new_addr(w, t, c):
+    return w * 8192 + (t // 8) * 1024 + (c // 16) * 128 + (t % 8) * 16 + (c % 16)
+
+
+def producer_stores(layout):
+    """[(w, g, sg, acc)] -> dict of element positions written, per layout."""
+    written = {}                     # addr -> (w,t,c)
+    dup = []
+    for w in range(WINDOWS):
+        for g in range(GRID_Z):
+            for sg in range(8):
+                m0 = sg * 8
+                for acc in (0, 1):
+                    if layout == 'new':
+                        base = (w * 64 + m0) * 128 + 256 * g + (128 if acc else 0)
+                        stride = 16
+                    else:
+                        base = (w * 64 + m0) * 128 + 32 * g + (16 if acc else 0)
+                        stride = 128
+                    for i in range(8):
+                        for j in range(16):
+                            a = base + i * stride + j
+                            if a in written:
+                                dup.append((w, g, sg, acc, i, j))
+                            written[a] = (w, m0 + i, 32 * g + 16 * acc + j)
+    return written, dup
+
+
+def consumer_reads(layout):
+    """[(w, sg, r, ki, which)] -> list of (addr, (w,t,c)) read, with multiplicity."""
+    reads = {}
+    order = []
+    for w in range(WINDOWS):
+        for sg in range(8):
+            for r in (0, 1):
+                mA = (sg // 4 + 4 * r) * 8
+                mB = mA + 16
+                for ki in range(8):
+                    k0 = ki * 16
+                    for which, m in (('A', mA), ('B', mB)):
+                        if layout == 'new':
+                            base = (w * 64 + m) * 128 + k0 * 8
+                            stride = 16
+                        else:
+                            base = (w * 64 + m) * 128 + k0
+                            stride = 128
+                        for i in range(8):
+                            for j in range(16):
+                                a = base + i * stride + j
+                                reads[a] = reads.get(a, 0) + 1
+                                order.append((a, (w, m + i, k0 + j), w, sg, r, ki, which))
+    return reads, order
+
+
+def main():
+    rep = {'card': 'n24-s5-gm-fold', 'constants': {}, 'checks': {}}
+
+    # (A) layout bijection, window by window and globally
+    per_window_sets = []
+    for w in range(WINDOWS):
+        s = {new_addr(w, t, c) - w * 8192 for t in range(TOKENS) for c in range(CHANNELS)}
+        per_window_sets.append(len(s))
+    bitmap = bytearray(HALVES)
+    double = 0
+    for w in range(WINDOWS):
+        for t in range(TOKENS):
+            for c in range(CHANNELS):
+                a = new_addr(w, t, c)
+                if bitmap[a]:
+                    double += 1
+                bitmap[a] = 1
+    marked = sum(bitmap)
+    rep['constants'] = {'windows': WINDOWS, 'tokens': TOKENS, 'channels': CHANNELS,
+                        'halves': HALVES, 'bytes': BYTES, 'grid': [GRID_X, GRID_Y, GRID_Z]}
+    rep['checks']['A_layout_bijection'] = {
+        'per_window_distinct': sorted(set(per_window_sets)),
+        'per_window_expected': 8192,
+        'global_marked': marked, 'global_expected': HALVES,
+        'double_marked': double,
+        'min_index': min(new_addr(w, t, c) for w in (0,) for t in (0,) for c in (0,)),
+        'max_index': new_addr(WINDOWS - 1, TOKENS - 1, CHANNELS - 1),
+        'max_index_expected': HALVES - 1,
+        'old_layout_identity_holds': all(
+            old_addr(w, t, c) == (w * 64 + t) * 128 + c
+            for w in (0, 1, 263) for t in (0, 63) for c in (0, 127)),
+    }
+
+    # (B) producer coverage
+    wr_new, dup_new = producer_stores('new')
+    wr_old, dup_old = producer_stores('old')
+    rep['checks']['B_producer_write'] = {
+        'new': {'distinct_addresses': len(wr_new), 'expected': HALVES,
+                'duplicate_writes': len(dup_new),
+                'address_matches_layout': all(
+                    a == new_addr(*tc) for a, tc in wr_new.items()),
+                'covers_all_elements': sorted(wr_new.values()) ==
+                    sorted((w, t, c) for w in range(WINDOWS)
+                           for t in range(TOKENS) for c in range(CHANNELS))},
+        'old': {'distinct_addresses': len(wr_old), 'expected': HALVES,
+                'duplicate_writes': len(dup_old),
+                'address_matches_layout': all(
+                    a == old_addr(*tc) for a, tc in wr_old.items()),
+                'covers_all_elements': sorted(wr_old.values()) ==
+                    sorted((w, t, c) for w in range(WINDOWS)
+                           for t in range(TOKENS) for c in range(CHANNELS))},
+        'same_logical_mapping': wr_new.values() and
+            sorted(wr_new.values()) == sorted(wr_old.values()),
+    }
+
+    # (C)+(D) consumer reads
+    rd_new, order_new = consumer_reads('new')
+    rd_old, order_old = consumer_reads('old')
+    read_elems_new = sorted({tc for _, tc, *_ in order_new})
+    read_elems_old = sorted({tc for _, tc, *_ in order_old})
+    writes_new = sorted(wr_new.values())
+    writes_old = sorted(wr_old.values())
+    mult = {}
+    for _, tc, *_ in order_new:
+        mult[tc] = mult.get(tc, 0) + 1
+    rep['checks']['C_consumer_read'] = {
+        'new': {'distinct_addresses': len(rd_new),
+                'total_tile_loads_per_window': 8 * 2 * 2 * 8,   # sg * r * (A,B) * ki
+                'total_element_reads': sum(rd_new.values()),
+                'expected_element_reads': WINDOWS * 8192 * 4,
+                'reads_outside_write_domain': len([a for a in rd_new if a not in wr_new]),
+                'address_matches_layout': all(
+                    a == new_addr(*tc) for a, tc, *_ in order_new),
+                'max_read_index': max(rd_new)},
+        'old': {'distinct_addresses': len(rd_old),
+                'total_element_reads': sum(rd_old.values()),
+                'reads_outside_write_domain': len([a for a in rd_old if a not in wr_old]),
+                'address_matches_layout': all(
+                    a == old_addr(*tc) for a, tc, *_ in order_old)},
+    }
+    rep['checks']['D_logical_identity'] = {
+        'read_element_sets_equal': read_elems_new == read_elems_old,
+        'read_set_equals_write_set_new': read_elems_new == writes_new,
+        'read_set_equals_write_set_old': read_elems_old == writes_old,
+        'write_maps_equal': writes_new == writes_old,
+        'read_multiplicity_values': sorted(set(mult.values())),
+        'read_multiplicity_expected': 4,
+        'num_elements_read': len(mult),
+    }
+
+    # (E) bounds
+    rep['checks']['E_bounds'] = {
+        'buffer_bytes': BYTES,
+        'max_index_new': max(rd_new),
+        'max_byte_offset_new': 2 * max(rd_new),
+        'last_element_byte': 2 * max(rd_new) + 2,
+        'inside_buffer': 2 * max(rd_new) + 2 <= BYTES,
+        'tile_alignment_halves': 128,     # every tile base is a multiple of 128 halves (256 B)
+        'tile_bases_aligned': all(
+            (((w * 64 + (m)) * 128 + k0 * 8) % 128 == 0)
+            for w in (0, 1, 263) for m in (0, 8, 56) for k0 in (0, 16, 112)),
+    }
+
+    ok = (rep['checks']['A_layout_bijection']['global_marked'] == HALVES
+          and rep['checks']['A_layout_bijection']['double_marked'] == 0
+          and rep['checks']['B_producer_write']['new']['duplicate_writes'] == 0
+          and rep['checks']['B_producer_write']['new']['address_matches_layout']
+          and rep['checks']['B_producer_write']['new']['covers_all_elements']
+          and rep['checks']['B_producer_write']['old']['covers_all_elements']
+          and rep['checks']['B_producer_write']['same_logical_mapping']
+          and rep['checks']['C_consumer_read']['new']['reads_outside_write_domain'] == 0
+          and rep['checks']['C_consumer_read']['new']['address_matches_layout']
+          and rep['checks']['D_logical_identity']['read_element_sets_equal']
+          and rep['checks']['D_logical_identity']['read_set_equals_write_set_new']
+          and rep['checks']['D_logical_identity']['read_multiplicity_values'] == [4]
+          and rep['checks']['E_bounds']['inside_buffer'])
+    rep['verdict'] = 'PASS' if ok else 'FAIL'
+    OUT.write_text(json.dumps(rep, indent=2), encoding='utf-8')
+    print(json.dumps(rep, indent=2))
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

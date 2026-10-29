@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""CPU quality report for replayed PORT_NETWORK_1 network outputs.
+
+Scope and honest labelling
+  * the reference is the *captured FP16 network output* of the same frame, i.e. the
+    value the production FP16 backend produced for exactly that captured input bundle
+    (which itself carried the captured FP16 history).  It is a teacher/relative
+    baseline, NOT ground truth: no HR/clean plate exists for these captures.
+  * every number below is therefore "INT8 vs captured FP16 output".  It must not be
+    reported as "vs ground truth", and no PSNR value is an acceptance threshold here.
+    `quality_accepted` is always false and `autonomous_feedback` is never inferred.
+  * the outputs were produced with captured FP16 history for every frame, so this
+    report cannot by itself say anything about accumulated feedback error; it reports
+    the measurable quantities that bound the first feedback step (history-plane error
+    and history substitution distance).
+
+Metrics
+  application RGB : output plane 0, channels 0..2 (peak 1.0)
+  history RGB     : output plane 1, channels 0..2
+  spatial         : 8x8 tile map of mean absolute error, error concentration
+  temporal        : frame-to-frame difference of the candidate vs the frame-to-frame
+                    difference of the reference (flicker / temporal residual)
+  colour          : signed channel bias (mean signed error per channel)
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029"
+SELF_DIR = Path(__file__).resolve().parent
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+JOBS = D / "JOBS.json"
+QUALITY_24 = D / "c64-family-static/QUALITY-24.json"
+
+HEIGHT, WIDTH, CHANNELS, PLANES = 720, 1280, 4, 2
+OUTPUT_BYTES = PLANES * HEIGHT * WIDTH * CHANNELS * 4
+PLANE_VALUES = HEIGHT * WIDTH * CHANNELS
+OUTPUT_CANDIDATES = ("replayed-network.bin", "feedback-network.bin", "frame_out.bin")
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def resolve_output(run_dir: Path, explicit: Optional[str] = None) -> Path:
+    if explicit:
+        p = Path(explicit)
+        if not p.is_absolute():
+            p = run_dir / p
+        if not p.is_file():
+            raise FileNotFoundError(f"declared output missing: {p}")
+        return p
+    for name in OUTPUT_CANDIDATES:
+        p = run_dir / name
+        if p.is_file():
+            return p
+    found = sorted(p for p in run_dir.glob("*network*.bin") if p.is_file())
+    if len(found) == 1:
+        return found[0]
+    raise FileNotFoundError(f"cannot identify the network output under {run_dir}")
+
+
+def load_output(path: Path) -> np.ndarray:
+    size = path.stat().st_size
+    if size != OUTPUT_BYTES:
+        raise ValueError(f"{path}: {size} bytes, expected {OUTPUT_BYTES} (2 x 720x1280x4 float32)")
+    arr = np.fromfile(path, dtype="<f4")
+    return arr.reshape(PLANES, HEIGHT, WIDTH, CHANNELS)
+
+
+def plane_rgb(arr: np.ndarray, plane: int) -> np.ndarray:
+    return arr[plane, :, :, :3]
+
+
+def _stats(diff: np.ndarray) -> dict:
+    """diff is float32/float64 array (H, W, 3) of x - ref."""
+    d = diff.astype(np.float64, copy=False)
+    if not np.isfinite(d).all():
+        finite = np.isfinite(d)
+        return {"nonfinite": int((~finite).sum()), "finite_fraction": float(finite.mean())}
+    sq = d * d
+    mse = float(sq.mean())
+    return {
+        "mse": mse,
+        "rmse": float(math.sqrt(mse)),
+        "psnr_db": float(-10.0 * math.log10(max(mse, 1e-30))),
+        "mae": float(np.abs(d).mean()),
+        "max_abs": float(np.abs(d).max()),
+        "p99_abs": float(np.percentile(np.abs(d), 99.0)),
+        "bias_rgb": [float(d[:, :, c].mean()) for c in range(3)],
+        "mse_rgb": [float(sq[:, :, c].mean()) for c in range(3)],
+        "frac_abs_gt_0.02": float((np.abs(d) > 0.02).mean()),
+        "frac_abs_gt_0.05": float((np.abs(d) > 0.05).mean()),
+        "frac_abs_gt_0.10": float((np.abs(d) > 0.10).mean()),
+        "nonfinite": 0,
+    }
+
+
+def _tiles(diff: np.ndarray, grid: int = 8, with_mse: bool = False) -> dict:
+    d = np.abs(diff.astype(np.float64, copy=False))
+    if not np.isfinite(d).all():
+        return {}
+    h, w = d.shape[:2]
+    th, tw = h // grid, w // grid
+    tiled = d[: th * grid, : tw * grid].reshape(grid, th, grid, tw, 3).mean(axis=(1, 3, 4))
+    energy = d[: th * grid, : tw * grid].reshape(grid, th, grid, tw, 3)
+    tile_energy = (energy * energy).sum(axis=(1, 3, 4))
+    total = float(tile_energy.sum()) or 1e-30
+    flat_order = np.argsort(tile_energy.ravel())[::-1]
+    top_k = max(1, int(round(tile_energy.size * 0.1)))
+    share = float(tile_energy.ravel()[flat_order[:top_k]].sum() / total)
+    ranked = sorted(
+        ({"row": int(i), "col": int(j), "mean_abs": float(tiled[i, j]),
+          "energy_share": float(tile_energy[i, j] / total)}
+         for i in range(grid) for j in range(grid)),
+        key=lambda t: t["energy_share"], reverse=True)
+    out = {
+        "grid": [grid, grid],
+        "tile_pixels": [th, tw],
+        "mean_abs": tiled.round(8).tolist(),
+        "top_energy_tiles": ranked[:5],
+        "top10pct_energy_share": share,
+    }
+    if with_mse:
+        per_pixel = th * tw * 3
+        out["mse"] = (tile_energy / per_pixel).round(10).tolist()
+    return out
+
+
+def _output_identity(path: Path) -> dict:
+    return {"path": str(path), "bytes": path.stat().st_size, "sha256": sha256_file(path)}
+
+
+def load_jobs(jobs_path: Path) -> List[dict]:
+    rows = json.loads(jobs_path.read_text(encoding="utf-8"))
+    frames = []
+    for job in rows:
+        if job.get("dump"):
+            continue
+        frames.append({
+            "sequence": job["sequence"],
+            "frame": int(job["frame"]),
+            "reference": Path(job["reference"]),
+            "baseline_run": Path(job["out"]),
+        })
+    frames.sort(key=lambda r: (r["sequence"], r["frame"]))
+    return frames
+
+
+def expand_arms(arm_specs: Sequence[str]) -> List[Tuple[str, str]]:
+    arms: List[Tuple[str, str]] = []
+    for spec in arm_specs:
+        if "=" not in spec:
+            raise SystemExit(f"--arm expects name=template, got {spec!r}")
+        name, template = spec.split("=", 1)
+        arms.append((name, template))
+    names = [n for n, _ in arms]
+    if len(set(names)) != len(names):
+        raise SystemExit("duplicate arm names")
+    return arms
+
+
+def arm_run_dir(template: str, sequence: str, frame: int) -> Path:
+    return Path(template.format(sequence=sequence, frame=frame))
+
+
+def report(args: argparse.Namespace) -> dict:
+    frames = load_jobs(args.jobs)
+    if args.limit:
+        frames = frames[: args.limit]
+    arms = expand_arms(args.arm)
+    names = [n for n, _ in arms]
+    if args.baseline:
+        baseline = args.baseline
+    elif "fine_c32" in names:
+        baseline = "fine_c32"          # previous best candidate
+    else:
+        baseline = names[0] if names else None
+    if baseline and baseline not in names:
+        raise SystemExit(f"--baseline {baseline!r} is not one of the arms")
+
+    per_frame: List[dict] = []
+    # temporal state: keep previous planes per arm
+    prev_app: Dict[str, Dict[str, np.ndarray]] = {}
+    prev_hist: Dict[str, Dict[str, np.ndarray]] = {}
+    temporal: List[dict] = []
+    history_drift: List[dict] = []
+    substitutions: List[dict] = []
+    sequence_of_prev: Optional[str] = None
+
+    for job in frames:
+        sequence, frame = job["sequence"], job["frame"]
+        ref_file = job["reference"]
+        if not ref_file.is_file():
+            raise FileNotFoundError(f"reference missing: {ref_file}")
+        ref = load_output(ref_file)
+        ref_app = plane_rgb(ref, 0).astype(np.float64)
+        ref_hist = plane_rgb(ref, 1).astype(np.float64)
+        row = {
+            "sequence": sequence,
+            "frame": frame,
+            "reference": _output_identity(ref_file),
+            "reference_content": {
+                "app_mean_rgb": [float(ref_app[:, :, c].mean()) for c in range(3)],
+                "app_std_rgb": [float(ref_app[:, :, c].std()) for c in range(3)],
+                "history_mean_rgb": [float(ref_hist[:, :, c].mean()) for c in range(3)],
+                "history_minus_application_rms": float(np.sqrt(((ref_hist - ref_app) ** 2).mean())),
+                "history_minus_application_max_abs": float(np.abs(ref_hist - ref_app).max()),
+                "history_outside_unit_range": int(((ref_hist < 0.0) | (ref_hist > 1.0)).sum()),
+            },
+            "arms": {},
+        }
+        new_sequence = sequence != sequence_of_prev
+        if new_sequence:
+            prev_app.clear()
+            prev_hist.clear()
+        for name, template in arms:
+            run_dir = arm_run_dir(template, sequence, frame)
+            out_path = resolve_output(run_dir, args.output_name)
+            out = load_output(out_path)
+            app = plane_rgb(out, 0).astype(np.float64)
+            hist = plane_rgb(out, 1).astype(np.float64)
+            d_app = app - ref_app
+            d_hist = hist - ref_hist
+            arm_row = {
+                "run_dir": str(run_dir),
+                "output": _output_identity(out_path),
+                "application_rgb": _stats(d_app),
+                "history_rgb": _stats(d_hist),
+                "application_spatial": _tiles(d_app, with_mse=True),
+                "history_spatial": _tiles(d_hist),
+            }
+            # temporal residual and flicker energy
+            if not new_sequence and name in prev_app:
+                dt_ref = ref_app - prev_app[name]["ref"]
+                dt_x = app - prev_app[name]["x"]
+                d_dt = dt_x - dt_ref
+                motion_energy = float((dt_ref * dt_ref).mean())
+                temporal_energy = float((dt_x * dt_x).mean())
+                err_energy = float((d_dt * d_dt).mean())
+                arm_row["temporal"] = {
+                    "reference_motion_energy": motion_energy,
+                    "candidate_motion_energy": temporal_energy,
+                    "motion_energy_ratio": temporal_energy / max(motion_energy, 1e-30),
+                    "temporal_error_energy": err_energy,
+                    "temporal_psnr_db": float(-10.0 * math.log10(max(err_energy, 1e-30))),
+                    "extra_temporal_energy_ratio": err_energy / max(motion_energy, 1e-30),
+                }
+                temporal.append({"sequence": sequence, "frame": frame, "arm": name,
+                                 **arm_row["temporal"], "motion_energy_ref_abs": motion_energy})
+            # history drift vs the reference history of this frame
+            history_drift.append({
+                "sequence": sequence, "frame": frame, "arm": name,
+                "history_rgb": {k: arm_row["history_rgb"].get(k) for k in
+                                ("mse", "psnr_db", "mae", "max_abs", "bias_rgb")},
+                "history_top_tiles": arm_row["history_spatial"].get("top_energy_tiles", [])[:3],
+            })
+            # first-step feedback substitution: the history a chain would inject at frame f is
+            # arm's own history plane of frame f-1; the frame actually consumed the FP16 history
+            # plane of frame f-1 (that is exactly what the capture bundle carried).
+            if not new_sequence and name in prev_hist:
+                d_sub = prev_hist[name]["x"] - prev_hist[name]["ref"]
+                sub_mse = float((d_sub * d_sub).mean())
+                natural = ref_hist - prev_hist[name]["ref"]
+                natural_rms = float(math.sqrt((natural * natural).mean()))
+                sub_rms = float(math.sqrt(sub_mse))
+                substitutions.append({
+                    "sequence": sequence,
+                    "frame": frame,
+                    "arm": name,
+                    "feedback_would_feed": f"history plane of arm {name} at frame {frame - 1}",
+                    "history_consumed_by_this_frame": f"captured FP16 history plane of frame {frame - 1}",
+                    "substitution_rms": sub_rms,
+                    "substitution_max_abs": float(np.abs(d_sub).max()),
+                    "substitution_psnr_db": float(-10.0 * math.log10(max(sub_mse, 1e-30))),
+                    "reference_history_change_rms": natural_rms,
+                    "ratio_to_reference_history_change": sub_rms / max(natural_rms, 1e-30),
+                })
+            row["arms"][name] = arm_row
+            prev_app[name] = {"x": app, "ref": ref_app}
+            prev_hist[name] = {"x": hist, "ref": ref_hist}
+        per_frame.append(row)
+        sequence_of_prev = sequence
+
+    # per-frame direction vs baseline
+    for row in per_frame:
+        if baseline is None or baseline not in row["arms"]:
+            continue
+        base = row["arms"][baseline]["application_rgb"]
+        for name, arm in row["arms"].items():
+            if name == baseline:
+                continue
+            arm["direction_vs_baseline"] = {
+                "baseline": baseline,
+                "psnr_delta_db": arm["application_rgb"]["psnr_db"] - base["psnr_db"],
+                "mse_delta": arm["application_rgb"]["mse"] - base["mse"],
+                "improved": bool(arm["application_rgb"]["mse"] < base["mse"]),
+            }
+
+    summary = {}
+    for name, _template in arms:
+        rows = [r["arms"][name]["application_rgb"] for r in per_frame if name in r["arms"]]
+        hrows = [r["arms"][name]["history_rgb"] for r in per_frame if name in r["arms"]]
+        if not rows:
+            continue
+        psnrs = [r["psnr_db"] for r in rows]
+        worst = min(range(len(rows)), key=lambda i: rows[i]["psnr_db"])
+        best = max(range(len(rows)), key=lambda i: rows[i]["psnr_db"])
+        pooled_rmse = math.sqrt(sum(r["mse"] for r in rows) / len(rows))
+        improved = None
+        if baseline and baseline != name:
+            deltas = [(r["frame"], r["arms"][name]["direction_vs_baseline"]["psnr_delta_db"])
+                      for r in per_frame if name in r["arms"] and baseline in r["arms"]
+                      and "direction_vs_baseline" in r["arms"][name]]
+            regressed = [f for f, d in deltas if d < 0]
+            deltas_sorted = sorted(deltas, key=lambda t: t[1])
+            improved = {
+                "baseline": baseline,
+                "improved_frames": int(sum(1 for _f, d in deltas if d > 0)),
+                "frames": len(deltas),
+                "regressed_frames": regressed,
+                "smallest_improvement": (None if not deltas_sorted else
+                                         {"frame": deltas_sorted[0][0], "psnr_delta_db": deltas_sorted[0][1]}),
+                "largest_improvement": (None if not deltas_sorted else
+                                        {"frame": deltas_sorted[-1][0], "psnr_delta_db": deltas_sorted[-1][1]}),
+            }
+        summary[name] = {
+            "frames": len(rows),
+            "mean_psnr_db": float(np.mean(psnrs)),
+            "min_psnr_db": float(min(psnrs)),
+            "min_frame": per_frame[worst]["frame"],
+            "max_psnr_db": float(max(psnrs)),
+            "max_frame": per_frame[best]["frame"],
+            "pooled_rmse": float(pooled_rmse),
+            "pooled_psnr_db": float(-10.0 * math.log10(max(sum(r["mse"] for r in rows) / len(rows), 1e-30))),
+            "mean_mae": float(np.mean([r["mae"] for r in rows])),
+            "max_abs_over_frames": float(max(r["max_abs"] for r in rows)),
+            "mean_bias_rgb": [float(np.mean([r["bias_rgb"][c] for r in rows])) for c in range(3)],
+            "history_mean_psnr_db": float(np.mean([r["psnr_db"] for r in hrows])),
+            "history_min_psnr_db": float(min(r["psnr_db"] for r in hrows)),
+            "improved_vs_baseline": improved,
+        }
+
+    temporal_summary = {}
+    for name, _ in arms:
+        rows = [t for t in temporal if t["arm"] == name]
+        if not rows:
+            continue
+        temporal_summary[name] = {
+            "pairs": len(rows),
+            "mean_temporal_psnr_db": float(np.mean([t["temporal_psnr_db"] for t in rows])),
+            "min_temporal_psnr_db": float(min(t["temporal_psnr_db"] for t in rows)),
+            "max_extra_temporal_energy_ratio": float(max(t["extra_temporal_energy_ratio"] for t in rows)),
+            "mean_motion_energy_ratio": float(np.mean([t["motion_energy_ratio"] for t in rows])),
+            "note": ("motion_energy_ratio > 1 means the candidate changes more between adjacent frames than "
+                     "the FP16 reference (added temporal energy / flicker); it is not a visibility verdict"),
+        }
+    history_summary = {}
+    history_trend = {}
+    for name, _ in arms:
+        rows = [d for d in history_drift if d["arm"] == name]
+        if not rows:
+            continue
+        history_summary[name] = {
+            "frames": len(rows),
+            "mean_history_psnr_db": float(np.mean([d["history_rgb"]["psnr_db"] for d in rows])),
+            "min_history_psnr_db": float(min(d["history_rgb"]["psnr_db"] for d in rows)),
+            "mean_history_bias_rgb": [float(np.mean([d["history_rgb"]["bias_rgb"][c] for d in rows])) for c in range(3)],
+            "per_sequence": {
+                seq: {
+                    "mean_history_psnr_db": float(np.mean([d["history_rgb"]["psnr_db"] for d in rows if d["sequence"] == seq])),
+                    "frames": [d["frame"] for d in rows if d["sequence"] == seq],
+                    "history_psnr_db": [round(d["history_rgb"]["psnr_db"], 4) for d in rows if d["sequence"] == seq],
+                } for seq in sorted({d["sequence"] for d in rows})
+            },
+        }
+        history_trend[name] = {}
+        for seq in sorted({d["sequence"] for d in rows}):
+            series = [d["history_rgb"]["psnr_db"] for d in rows if d["sequence"] == seq]
+            if len(series) < 2:
+                continue
+            x = np.arange(len(series), dtype=np.float64)
+            slope = float(np.polyfit(x, np.asarray(series), 1)[0])
+            history_trend[name][seq] = {
+                "history_psnr_db": [round(v, 4) for v in series],
+                "slope_db_per_frame": slope,
+                "range_db": float(max(series) - min(series)),
+                "max_abs_step_db": float(max(abs(np.diff(series)))),
+            }
+    sub_summary = {}
+    for name, _ in arms:
+        rows = [s for s in substitutions if s.get("arm") == name]
+        if not rows:
+            continue
+        sub_summary[name] = {
+            "links": len(rows),
+            "mean_substitution_rms": float(np.mean([s["substitution_rms"] for s in rows])),
+            "max_substitution_rms": float(max(s["substitution_rms"] for s in rows)),
+            "mean_substitution_psnr_db": float(np.mean([s["substitution_psnr_db"] for s in rows])),
+            "mean_ratio_to_reference_history_change": float(
+                np.mean([s["ratio_to_reference_history_change"] for s in rows])),
+            "note": ("RMS of (previous candidate history plane - the FP16 history plane this frame consumed). "
+                     "This is the perturbation a first autonomous-feedback step would inject; it is NOT the "
+                     "accumulated feedback error, which needs a real chained GPU run."),
+        }
+
+    focus = []
+    if args.focus:
+        focus = [localize(frame_id, per_frame, arms, baseline) for frame_id in args.focus]
+
+    out = {
+        "schema": 1,
+        "kind": "CURRENT-QUALITY-ANALYSIS",
+        "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "scope": {
+            "reference_kind": "captured FP16 network output (network-output.bin) of the same frame, replay equality closed previously",
+            "reference_is_ground_truth": False,
+            "history_mode": "captured FP16 history injected for every frame (independent-frame replay)",
+            "autonomous_feedback": "NOT_TESTED",
+            "quality_accepted": False,
+            "acceptance_note": ("No universal PSNR pass line. The user target is a near-invisible difference and stable "
+                               "continuous feedback; this report measures relative error only and must not be cited as "
+                               "quality acceptance."),
+            "metric_geometry": {"planes": PLANES, "height": HEIGHT, "width": WIDTH, "channels": CHANNELS,
+                                "application_rgb": "plane 0 channels 0..2", "history_rgb": "plane 1 channels 0..2",
+                                "peak": 1.0},
+            "baseline_arm": baseline,
+        },
+        "arms": {name: template for name, template in arms},
+        "summary": summary,
+        "temporal_summary": temporal_summary,
+        "history_summary": history_summary,
+        "history_trend": history_trend,
+        "history_accumulation": {
+            "observable_in_this_dataset": False,
+            "reason": ("every replayed frame consumed the captured FP16 history, so a feedback loop was never closed; "
+                       "any within-sequence trend here is content/scale related, not accumulated drift"),
+            "measured_instead": ("per-frame history-plane error versus the FP16 history plane and the first-step "
+                                 "substitution distance (see feedback_substitution_summary)"),
+            "what_would_be_needed": "the chained autonomous-feedback runs listed in GPU-JOBS-TEMPLATE.json",
+        },
+        "feedback_substitution_summary": sub_summary,
+        "history_drift": history_drift,
+        "temporal": temporal,
+        "feedback_substitution": substitutions,
+        "focus_localization": focus,
+        "per_frame": per_frame,
+        "reproduce": args.reproduce or "",
+    }
+    return out
+
+
+def localize(frame_id: int, per_frame: List[dict], arms: List[Tuple[str, str]], baseline: Optional[str]) -> dict:
+    rows = [r for r in per_frame if r["frame"] == frame_id]
+    if not rows:
+        return {"frame": frame_id, "status": "NOT_IN_JOB_SET"}
+    row = rows[0]
+    entry = {
+        "frame": frame_id,
+        "sequence": row["sequence"],
+        "reference_content": row["reference_content"],
+        "arms": {},
+        "relative_to_baseline": {},
+        "attribution": "NOT_ESTABLISHED",
+        "proven_facts": [],
+        "not_proven": [],
+    }
+    for name, _ in arms:
+        arm = row["arms"].get(name)
+        if not arm:
+            continue
+        app = arm["application_rgb"]
+        entry["arms"][name] = {
+            "application_psnr_db": app["psnr_db"],
+            "application_mse": app["mse"],
+            "application_mae": app["mae"],
+            "application_bias_rgb": app["bias_rgb"],
+            "application_frac_abs_gt_0.05": app["frac_abs_gt_0.05"],
+            "application_top_tiles": arm["application_spatial"].get("top_energy_tiles", [])[:5],
+            "top10pct_energy_share": arm["application_spatial"].get("top10pct_energy_share"),
+            "history_psnr_db": arm["history_rgb"]["psnr_db"],
+            "history_top_tiles": arm["history_spatial"].get("top_energy_tiles", [])[:3],
+            "temporal_vs_previous_frame": arm.get("temporal"),
+        }
+    if baseline and baseline in row["arms"]:
+        base_tiles = np.asarray(row["arms"][baseline]["application_spatial"]["mean_abs"])
+        base_mse = row["arms"][baseline]["application_spatial"].get("mse")
+        for name, _ in arms:
+            if name == baseline or name not in row["arms"]:
+                continue
+            tiles = np.asarray(row["arms"][name]["application_spatial"]["mean_abs"])
+            delta = tiles - base_tiles
+            order = np.dstack(np.unravel_index(np.argsort(delta.ravel())[::-1], delta.shape))[0][:5]
+            entry["relative_to_baseline"][name] = {
+                "baseline": baseline,
+                "psnr_delta_db": row["arms"][name]["application_rgb"]["psnr_db"] - row["arms"][baseline]["application_rgb"]["psnr_db"],
+                "worse_tiles_top5": [{"row": int(i), "col": int(j), "mae_increase": float(delta[i, j])}
+                                     for i, j in order],
+                "better_tiles_top5": [{"row": int(i), "col": int(j), "mae_decrease": float(-delta[i, j])}
+                                      for i, j in np.dstack(np.unravel_index(np.argsort(delta.ravel()), delta.shape))[0][:5]],
+                "mean_abs_delta": float(delta.mean()),
+            }
+            mse_tiles = row["arms"][name]["application_spatial"].get("mse")
+            if base_mse is not None and mse_tiles is not None:
+                d_mse = np.asarray(mse_tiles) - np.asarray(base_mse)
+                morder = np.dstack(np.unravel_index(np.argsort(d_mse.ravel())[::-1], d_mse.shape))[0][:5]
+                entry["relative_to_baseline"][name]["mse_delta_total"] = float(d_mse.sum())
+                entry["relative_to_baseline"][name]["worse_tiles_top5_by_mse"] = [
+                    {"row": int(i), "col": int(j), "mse_increase": float(d_mse[i, j])} for i, j in morder]
+                entry["relative_to_baseline"][name]["better_tiles_top5_by_mse"] = [
+                    {"row": int(i), "col": int(j), "mse_decrease": float(-d_mse[i, j])}
+                    for i, j in np.dstack(np.unravel_index(np.argsort(d_mse.ravel()), d_mse.shape))[0][:5]]
+    entry["proven_facts"] = [
+        "application and history metrics for this frame versus the captured FP16 output are listed above",
+        "the per-frame direction versus the baseline arm is listed under relative_to_baseline",
+    ]
+    entry["not_proven"] = [
+        "why this frame behaves differently is not established: it needs an autonomous-feedback run and an "
+        "isolated block-level trace, neither of which exists in this CPU-only card",
+        "no causal link to a specific quantized edge, weight change or capture property is claimed",
+    ]
+    return entry
+
+
+def selftest(args: argparse.Namespace, out: dict) -> dict:
+    """Reproduce the previously published 24-frame numbers as a regression guard."""
+    checks = []
+    reference = Path(args.selftest_reference) if args.selftest_reference else QUALITY_24
+    if not reference.is_file():
+        return {"status": "SKIPPED", "reason": f"no reference quality file at {reference}"}
+    known = json.loads(reference.read_text(encoding="utf-8"))
+    mapping = {"original": "original", "fine_c32": "fine_c32", "static_c64": "static_c64"}
+    for arm, known_name in mapping.items():
+        if arm not in out["summary"] or known_name not in known["summary"]:
+            continue
+        got = out["summary"][arm]["mean_psnr_db"]
+        want = known["summary"][known_name]["mean_psnr"]
+        checks.append({"check": f"mean PSNR reproduces QUALITY-24.json for arm {arm}",
+                       "got": got, "expected": want, "ok": abs(got - want) < 1e-6})
+        got_min = out["summary"][arm]["min_psnr_db"]
+        want_min = known["summary"][known_name]["min_psnr"]
+        checks.append({"check": f"min PSNR reproduces QUALITY-24.json for arm {arm}",
+                       "got": got_min, "expected": want_min, "ok": abs(got_min - want_min) < 1e-6})
+        got_rmse = out["summary"][arm]["pooled_rmse"]
+        want_rmse = known["summary"][known_name]["pooled_rmse"]
+        checks.append({"check": f"pooled RMSE reproduces QUALITY-24.json for arm {arm}",
+                       "got": got_rmse, "expected": want_rmse, "ok": abs(got_rmse - want_rmse) < 1e-12})
+    if "static_c64" in out["summary"] and "fine_c32" in out["summary"]:
+        improved = sum(1 for r in out["per_frame"]
+                       if "static_c64" in r["arms"] and "fine_c32" in r["arms"] and
+                       r["arms"]["static_c64"]["application_rgb"]["mse"] < r["arms"]["fine_c32"]["application_rgb"]["mse"])
+        checks.append({"check": "improved-frame count reproduces the published 23/24 (static_c64 vs fine_c32)",
+                       "got": improved, "expected": 23, "ok": improved == 23})
+    # per-frame cross check for the static arm
+    if "static_c64" in out["summary"]:
+        by_frame = {r["frame"]: r["static_c64"]["mse"] for r in known["rows"] if "static_c64" in r}
+        worst = 0.0
+        checked = 0
+        for row in out["per_frame"]:
+            arm = row["arms"].get("static_c64")
+            if arm and row["frame"] in by_frame:
+                worst = max(worst, abs(arm["application_rgb"]["mse"] - by_frame[row["frame"]]))
+                checked += 1
+        checks.append({"check": "per-frame application MSE reproduces QUALITY-24.json (static_c64)",
+                       "frames_checked": checked, "max_abs_delta": worst, "ok": checked > 0 and worst < 1e-12})
+    ok = all(c["ok"] for c in checks)
+    return {"status": "PASS" if ok else "FAIL", "checks": checks,
+            "reference": str(reference), "reference_sha256": sha256_file(reference)}
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--jobs", type=Path, default=JOBS, help="JOBS.json with reference and per-frame run dirs")
+    ap.add_argument("--arm", action="append", default=None,
+                    help="name=run-dir-template (may repeat); template fields: {sequence}, {frame}")
+    ap.add_argument("--baseline", default=None, help="arm name used for per-frame direction")
+    ap.add_argument("--out", type=Path, default=SELF_DIR / "CURRENT-QUALITY-ANALYSIS.json")
+    ap.add_argument("--output-name", default=None, help="output file name inside each run dir")
+    ap.add_argument("--focus", type=int, action="append", default=None, help="frame id to localize (repeatable)")
+    ap.add_argument("--limit", type=int, default=None, help="debug: only the first N frames")
+    ap.add_argument("--selftest", action="store_true", help="compare with the published QUALITY-24.json")
+    ap.add_argument("--selftest-reference", default=None)
+    args = ap.parse_args(argv)
+    if not args.arm:
+        d = D.as_posix()
+        args.arm = [f"original={d}/run-{{frame}}",
+                    f"fine_c32={d}/c32-equalized/run-{{frame}}",
+                    f"static_c64={d}/c64-family-static/run-{{frame}}"]
+    args.reproduce = " ".join([sys.executable, "-X", "utf8", str(Path(__file__).resolve())] + sys.argv[1:])
+    out = report(args)
+    if args.selftest:
+        out["selftest"] = selftest(args, out)
+    out["summary_notes"] = {
+        "reference": "captured FP16 output, not ground truth",
+        "worst_frame": "the frame with the lowest application PSNR of that arm",
+        "direction": "per-frame improved flag is computed against --baseline",
+        "no_verdict": "quality_accepted stays false; this file contains measurements, not acceptance",
+    }
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+    brief = {
+        "out": str(args.out),
+        "frames": len(out["per_frame"]),
+        "summary": {k: {"mean_psnr_db": round(v["mean_psnr_db"], 6), "min_psnr_db": round(v["min_psnr_db"], 6),
+                        "pooled_rmse": round(v["pooled_rmse"], 9),
+                        "mean_history_psnr_db": round(v["history_mean_psnr_db"], 4)}
+                    for k, v in out["summary"].items()},
+        "selftest": out.get("selftest", {}).get("status"),
+    }
+    print(json.dumps(brief, indent=2, ensure_ascii=False))
+    if out.get("selftest", {}).get("status") == "FAIL":
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

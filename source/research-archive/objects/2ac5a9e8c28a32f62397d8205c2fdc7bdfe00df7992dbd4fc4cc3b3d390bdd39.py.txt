@@ -1,0 +1,113 @@
+"""Base-arm ISA probe for n05d-f05-c64-mbatch (CPU only, read-only capture).
+
+Reads the existing native ISA capture of the *current accepted* F05 C64 shader
+(n04a base arm, SPV 0d83192b...) and reports exactly the quantities this card's
+budget and native prediction are written against:
+
+  * DPAS destinations inside the QKV window, in program order -> the accumulator
+    count and the register spacing that gives "8 GRF per accumulator";
+  * message counts (weight tiles, A rows, DPAS, total sends) kernel-wide and
+    inside the QKV window;
+  * largest register index touched, and the working-set peak of the QKV window.
+
+No GPU, no Vulkan; nothing outside this card directory is written.
+"""
+import json
+import re
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+BUILD = CARD / '_build'
+Q = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+         'fullnet-continuous-20261027/queue')
+BASE = Q / 'n04a-f05-c64-feed/native/captures/native-native-base/ISA/' \
+          'CS_asm6a22246177be2653_simd32_0000000000000006_5_orig.asm'
+
+LINE = re.compile(r'/\* \[([0-9A-Fa-f]+)\]\s*\*/\s*(\([^)]*\))?\s*([a-zA-Z0-9_.]+)\s*(.*)$')
+REG = re.compile(r'\br(\d+)(?:\.(\d+))?')
+
+
+def parse(path):
+    out = []
+    for raw in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+        m = LINE.match(raw.strip())
+        if not m:
+            continue
+        pc, pred, op, rest = int(m.group(1), 16), m.group(2) or '', m.group(3), m.group(4)
+        rest = re.sub(r'^\s*\((\d+)\|[^)]*\)\s*', r'(EXEC\1) ', rest)
+        code, _, comment = rest.partition('//')
+        out.append(dict(pc=pc, op=op, pred=pred, text=code.strip(), comment=comment.strip()))
+    return out
+
+
+def main():
+    ins = parse(BASE)
+    wt = [d['pc'] for d in ins if d['op'].startswith('send') and 'load.ugm.d32x8.' in d['comment']]
+    slm = [d['pc'] for d in ins if d['op'].startswith('send') and 'store.slm' in d['comment']]
+    lo = min(wt)
+    hi = min([p for p in slm if p > lo])
+
+    qkv = [d for d in ins if lo <= d['pc'] <= hi]
+
+    def count(ds, needle):
+        return sum(1 for d in ds if needle in d['comment'])
+
+    dpas_all = [d for d in ins if d['op'].startswith('dpas')]
+    dpas_qkv = [d for d in qkv if d['op'].startswith('dpas')]
+
+    def dst(d):
+        m = REG.search(d['text'])
+        return int(m.group(1)) if m else None
+
+    bases_qkv = [dst(d) for d in dpas_qkv]
+    distinct = sorted(set(bases_qkv))
+    # split the QKV section at the first shared publication: phase 0 body, epilogue, phase 1
+    def gaps(xs):
+        return sorted({b - a for a, b in zip(xs, xs[1:])})
+
+    kernel_msgs = {}
+    for d in ins:
+        if d['op'].startswith('send') and d['comment']:
+            msg = d['comment'].split(';')[-1].strip()
+            kernel_msgs[msg] = kernel_msgs.get(msg, 0) + 1
+
+    res = dict(
+        capture=str(BASE), instructions=len(ins),
+        dpas_all=len(dpas_all), dpas_qkv=len(dpas_qkv),
+        # exact message variants (the ones the source can produce)
+        weight_tile_msgs=kernel_msgs.get('load.ugm.d32x8.a32.bss[a0.2]', 0),
+        weight_other_msgs=kernel_msgs.get('load.ugm.d32x8.a32.bss[a0.0]', 0),
+        a_row_msgs=kernel_msgs.get('load.ugm.d32x8t.a32.bss[a0.0]', 0),
+        weight_load_msgs_all=count(ins, 'load.ugm.d32x8.a32'),
+        a_row_msgs_all=count(ins, 'load.ugm.d32x8t.a32'),
+        weight_load_msgs_qkv=count(qkv, 'load.ugm.d32x8.a32'),
+        a_row_msgs_qkv=count(qkv, 'load.ugm.d32x8t.a32'),
+        qkv_window=[hex(lo), hex(hi)],
+        qkv_window_note='first weight send .. first shared publication; because the first '
+                        'A-row messages of the kernel are issued before the first weight '
+                        'send, this window holds 24 of the 48 QKV-section DPAS (phase 0 '
+                        'only) and is used here for the accumulator bases, not for totals',
+        qkv_dpas_dst_bases_in_order=bases_qkv,
+        qkv_dpas_distinct_bases=distinct,
+        qkv_dpas_distinct_gaps=gaps(distinct),
+        qkv_dpas_gap_histogram={g: sum(1 for a, b in zip(distinct, distinct[1:])
+                                       if b - a == g) for g in gaps(distinct)},
+        sends_total=sum(v for k, v in kernel_msgs.items()),
+        messages=kernel_msgs,
+        max_reg_index=max((int(m.group(1)) for d in ins for m in REG.finditer(d['text']))),
+        scratch_mentions=sum(1 for d in ins if 'scratch' in d['text'].lower()),
+    )
+    (BUILD / 'isa-probe.json').write_text(json.dumps(res, indent=2), encoding='utf-8')
+    print('instructions', res['instructions'], 'dpas', res['dpas_all'], 'qkv dpas', res['dpas_qkv'])
+    print('weight tile msgs', res['weight_tile_msgs'], 'other d32x8', res['weight_other_msgs'],
+          'A row msgs', res['a_row_msgs'])
+    print('qkv window', res['qkv_window'])
+    print('qkv dpas dst in order', bases_qkv)
+    print('distinct', distinct)
+    print('gaps', res['qkv_dpas_distinct_gaps'], res['qkv_dpas_gap_histogram'])
+    print('sends total', res['sends_total'], 'max_r', res['max_reg_index'],
+          'scratch mentions', res['scratch_mentions'])
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,98 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,shlex,shutil,collections,re
+D=Path(__file__).resolve().parent;A=D.parent;B=A.parent.parent;R=D/'ups-c64-eight-sg-direct';R.mkdir(exist_ok=True);P=D/'coefficient-reuse-combined';T=D/'f05-owner-concurrency/subgroup-owner-family'
+read=lambda p:json.loads(p.read_text(encoding='utf-8-sig'));sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+def ident(p):return dict(path=str(p),sha256=sha(p))
+def save(p,x):p.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding='utf-8')
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def restore(pm,cm,out):
+ ints={128,130,132,134,135,137,138,139};allnc=set(ST.no_contraction_ids(pm));nc={ST.result_id_of(op,a) for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in allnc and op not in ints};ops={op for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in nc};pr=ST.function_regions(pm);cr=ST.function_regions(cm);assert len(pr)==len(cr);keep=[];checked=0
+ for p,c in zip(pr,cr):
+  ps=[pm.instructions[i] for i in p if pm.instructions[i][0] in ops];cs=[cm.instructions[i] for i in c if cm.instructions[i][0] in ops];assert len(ps)==len(cs)
+  for x,y in zip(ps,cs):
+   assert (x[0],x[3])==(y[0],y[3]);a=ST.result_id_of(x[0],x[1]);b=ST.result_id_of(y[0],y[1]);assert pm.operand_signature(a,3)==cm.operand_signature(b,3);checked+=1
+   if a in nc:keep.append(b)
+ assert len(keep)==len(nc);raw=set(ST.no_contraction_ids(cm));keepint=[ST.result_id_of(op,a) for op,a,_,_ in cm.instructions if op in ints and ST.result_id_of(op,a) in raw];ST.set_no_contraction(cm,keep+keepint,out);return dict(checked=checked,float_NC=len(keep),integer_NC=len(keepint))
+
+
+
+scan=read(D/'CURRENT-CENSUS.json')['rows'];pt=(P/'plan.txt').read_text(encoding='utf-8');planrows=[shlex.split(l) for l in pt.splitlines() if l.startswith('PASS ')];S=R/'c64';S.mkdir(exist_ok=True);ordinal=212;C=64;src=Path(scan[ordinal]['source']);parent=Path(planrows[ordinal][3]);assert sha(parent)==scan[ordinal]['sha256'];d=S
+lines=pt.splitlines();ix=next(i for i,l in enumerate(lines) if l.startswith('PASS ') and shlex.split(l)==planrows[ordinal]);push=next(l for l in lines[ix+1:] if l.startswith('PUSH '));words=list(map(int,push.split()[1:]));assert words[:4]==[84,48,0,0] and words[20:22]==[128,64] and words[24]==336
+cells=collections.Counter()
+def addr(px,py,c,W=336,C=64):
+ t=((py//4)*(W//4)+px//4)*16+4*(py%4)+px%4
+ return ((t//16)*(C//16)+c//16)*256+(t%16)*16+c%16
+for sg in range(8):
+ for lane in range(32):
+  for ci in range(4):
+   ps=(sg//4)*8+2*ci+lane//16;c=(sg%4)*16+lane%16
+   for child in range(4):
+    px=2*(ps%4)+(child&1);py=2*(ps//4)+(child>>1)
+    t=(py//4)*32+(px//4)*16+(py%4)*4+px%4
+    oldpx=4*((t//16)&1)+(t%16)%4;oldpy=4*((t//16)>>1)+(t%16)//4
+    assert (px,py)==(oldpx,oldpy);assert (py//2)*4+px//2==ps
+    assert addr(px,py,c)==addr(2*(ps%4),2*(ps//4),c)+(child&1)*16+(child>>1)*64
+    cells[px,py,c]+=1
+assert cells==collections.Counter((px,py,c) for px in range(8) for py in range(8) for c in range(64))
+# Everygrid origin is8-aligned, no childcross4tile, and 42*8=336,24*8=192.
+assert list(map(int,planrows[ordinal][-3:]))==[42,24,1]
+def compile(label,t):
+ f=d/(label+'.comp');o=d/(label+'.spv');f.write_text(t,encoding='utf-8');run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(src.parent),f,'-o',o]);return o
+original=src.read_text(encoding='utf-8-sig');pm=ST.Module(parent);rb=compile('parent-rebuild',original);rm=ST.Module(rb);keep,info=ST.transfer_decoration_pattern_aligned(pm,rm,set());ST.set_no_contraction(rm,keep,rb);assert sha(rb)==sha(parent)
+cut=original.index('    // ---- projection:')
+newtail="""
+    const uint lane=gl_SubgroupInvocationID;
+    const uint rh=sg>>2u,cg=sg&3u;
+    const uint tile=wy*uint(pc.p1.x)+wx;
+    const uint abase=pc.p4.x+tile*(pc.p5.x/16u)*256u+rh*128u;
+    const uint wbase=pc.p4.y+cg*(pc.p5.x/16u)*256u;
+    MAT_C acc=MAT_C(0.0);
+    for(uint kc=0u;kc<pc.p5.x;kc+=16u) {
+        MAT_A a;MAT_B b;
+        coopMatLoad(a,x65,abase+(kc/16u)*256u,16u,LROW);
+        coopMatLoad(b,pw,wbase+(kc/16u)*256u,16u,LCOL);
+        acc=coopMatMulAdd(a,b,acc);
+    }
+    MAT_H h=MAT_H(acc);
+    const uint c=cg*16u+(lane&15u);
+    for(uint ci=0u;ci<4u;++ci) {
+        const uint ps=rh*8u+2u*ci+(lane>>4u);
+        const uint px0=8u*wx+2u*(ps%4u),py0=8u*wy+2u*(ps/4u);
+        const uint base=nr3_io_at0(px0,py0,c,uint(pc.p0.x)*4u,pc.p5.y);
+        for(uint child=0u;child<4u;++child) {
+            const uint ba=base+(child&1u)*16u+(child>>1u)*64u;
+            precise float16_t main_scaled=h[ci];
+            if(pc.p5.w==1u) main_scaled=main_scaled*pw[pc.p5.z+pc.p5.y+c];
+            const float16_t skip_gain=pw[pc.p5.z+c];
+            const float16_t skip_input=sk[pc.p4.z+ba];
+            precise float16_t skip_v=skip_input*skip_gain;
+            precise float16_t value=main_scaled+skip_v;
+            blout[ba]=value;
+        }
+    }
+}
+"""
+changed=original[:cut].replace('shared float16_t nr3_proj[1024u];','// Projection-to-blend scratch retired.')+newtail;o=compile('candidate',changed);cm=ST.Module(o)
+parts=planrows[ordinal].copy();parts[3]=o.as_posix();parts[5]='0';newline='PASS '+parts[1]+' "'+parts[2]+'" "'+parts[3]+'" '+' '.join(parts[4:]);newplan=pt.replace(lines[ix],newline)
+# Float op/type sequence and NC mask; transport operands intentionally change.
+ints={128,130,132,134,135,137,138,139};nc=set(ST.no_contraction_ids(pm));ops={op for op,a,_,_ in pm.instructions if ST.result_id_of(op,a) in nc and op not in ints};keep=[];checked=[]
+assert len(ST.function_regions(pm))==len(ST.function_regions(cm))
+for p,c in zip(ST.function_regions(pm),ST.function_regions(cm)):
+ ps=[pm.instructions[i] for i in p if pm.instructions[i][0] in ops];cs=[cm.instructions[i] for i in c if cm.instructions[i][0] in ops];assert len(ps)==len(cs),(len(ps),len(cs))
+ for x,y in zip(ps,cs):
+  assert (x[0],x[3])==(y[0],y[3]);a=ST.result_id_of(x[0],x[1]);b=ST.result_id_of(y[0],y[1]);checked.append([x[0],a,b])
+  if a in nc:keep.append(b)
+assert len(keep)==sum(ST.result_id_of(op,a) in nc and op not in ints for op,a,_,_ in pm.instructions)
+raw=set(ST.no_contraction_ids(cm));keepint=[ST.result_id_of(op,a) for op,a,_,_ in cm.instructions if op in ints and ST.result_id_of(op,a) in raw];ST.set_no_contraction(cm,keep+keepint,o)
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',o]);sources=[dict(width=C,ordinal=ordinal,ordinals=[ordinal],parent=ident(parent),parent_rebuilt=ident(rb),source=ident(o.with_suffix('.comp')),candidate=ident(o),arithmetic_alignment=dict(float_NC=len(keep),operations=checked,scope='Float op/type sequence matches; operand transport changed with exhaustive address proof.'))]
+plan=S/'plan.txt';plan.write_text(newplan,encoding='utf-8');cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check']);save(S/'BUILD.json',dict(parent=ident(P/'plan.txt'),plan=ident(plan),sources=sources,CPU=cpu));save(S/'PROOF.json',dict(elements_perWG=len(cells),frame_elements=336*192*64,unique_writers=True,push=words,owner='8SG:rh=sg/4,cg=sg%4;8rowsx16channels each. Previous4SG8rowsx32channels. Eachhalfvalue directlyfeeds4children. All8SG participate throughprojection/blend.',mapping='CH row2ci+lane/16 plusrh8;col lane%16 pluscg16. Onebase withchilddx16/dy64, skipwidth=outwidth336. Every4,096WGoutput andsourceprojectionrow proved.',lifetime='OneFP32acc narrows toonehalf4components8B/lane, then16childoutputs/lane. No extraweightprefetch orcrossSG exchange; sourceSLM1024halves removed. Reject scratch.',cost='PerWG unchanged8M8N16 products perK; weights8Bfragments/K unchanged. A loads4->8fragments/K (input128x16:logical4096->8192half/WG, notphysicalDRAM). No duplicatedMMA. Blend8SG retained, projection4->8. ProjectionSLMstores1024half + blendreads4096half andoneWGbarrier removed. Shared2048->0.',rounding='Each scalar follows parentvector component graph: FP32K,halfcast,optionalhalfmainmul,halfskipmul,halfadd. Pair lanes independent;NC retained. Frozenzero shifts/currentPUSHonly.'))
+(S/'run').mkdir(exist_ok=True)
+for kind in ['GATES','RESOURCES','NATIVE','ORDINARY']:
+ t=read(T/f'LUNA-{kind}.json');ex=S/(kind.lower()+'-execution');ex.mkdir(exist_ok=True);t['output_root']=str(ex);t['identities']=[v for v in t['identities'] if not v['path'].endswith('.spv')]+[x['candidate'] for x in sources]+[x['parent'] for x in sources]
+ for j in t['jobs']:
+  jp=P/'plan.txt' if kind=='ORDINARY' and j['candidate']=='parent' else plan;j['plan']=ident(jp);j['runner_output']=str(S/'run'/j['id']);ar=j['argv'];ar[ar.index('--plan')+1]=str(jp);ar[ar.index('--out')+1]=j['runner_output']
+  if kind=='NATIVE':ar[ar.index('--output_dir')+1]=str(S/'captures');ar[ar.index('--msg_file')+1]=str(S/'native.log');j['capture_output']=str(S/'captures'/ar[ar.index('--profile_dir')+1])
+ save(S/f'LUNA-{kind}.json',t)
+(S/'execute.ps1').write_text((T/'execute.ps1').read_text(encoding='utf-8').replace('LUNA-F05-SUBGROUP-OWNER-FAMILY','LUNA-UPS-C64-EIGHT-SG-DIRECT').replace('F05 owner concurrency','UPS C64 eight subgroup direct'),encoding='utf-8');shutil.copyfile(T/'review_timing.py',S/'review_timing.py');print(cpu)

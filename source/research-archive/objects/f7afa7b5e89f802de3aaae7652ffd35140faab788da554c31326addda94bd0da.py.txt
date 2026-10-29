@@ -1,0 +1,83 @@
+from pathlib import Path
+import hashlib,json,subprocess,sys
+R=Path(__file__).resolve().parent; A=R.parent; B=A.parents[1]
+P=A/'c32-norm-owner-20261025/f20-den-pv-owner'
+N=R/'f20-score-owner'; N.mkdir(exist_ok=True)
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True)
+ assert r.returncode==0,r.stdout+r.stderr
+ return r.stdout
+# Enumerate every scalar output and its original ordered reduction leaves.
+old={};new={}
+for sg in range(8):
+ for j in range(2):
+  for n in range(32):
+   for m in range(8):
+    old[(8*(sg//2+4*j)+m,32*(sg%2)+n)]=(sg,j)
+    new[(8*sg+m,32*j+n)]=(sg,j)
+assert old.keys()==new.keys() and len(new)==4096
+for sg in range(8):
+ for lane in range(32):
+  for d in range(4):
+   for j in range(4):
+    row=8*sg+2*d+lane//16; key=16*j+lane%16
+    assert new[row,key][0]==sg
+proof=dict(parent=ident(P/'plan.txt'),all_4096_P_elements_unique=True,
+ mapping='Score, den, and PV now all own query rows 8*sg..8*sg+7. CH and A coordinates: row=8*sg+2*d+(lane>>4), key=16*j+(lane&15).',
+ rounding='Every score has K0 then K16, f32 bias add then half then unchanged scalar exp. Den source and reduction tree unchanged, cache contains original unnormalized half exponentials. PV has original half normalization and K0/K16/K32/K48 order.',
+ lifetime='Q0/Q1 born at score entry, consumed by four key tiles, retire before den. Two score accumulators per j; first pair of half P fragments survives second pair. All four P fragments then feed unchanged den and PV. No raw Q/K norm or residual lifecycle change.',
+ logical_score_peak_payload_B_per_lane=dict(parent_Q=8,parent_B_pair=32,parent_C_pair=32,parent_subtotal=72,candidate_Q_pair=16,candidate_B_pair=32,candidate_C_pair=32,candidate_prior_P_pair=16,candidate_subtotal=96,increment=24),
+ peak_caveat='Fragment payload subtotal excludes compiler temporaries and register packing. Native and driver scratch must be checked; no physical peak/occupancy assertion.',
+ cost_per_WG=dict(threads_before=256,threads_after=256,score_MMA_before=64,score_MMA_after=64,score_K_tile_loads_before=64,score_K_tile_loads_after=64,score_Q_tile_loads_before=32,score_Q_tile_loads_after=16,P_store_bytes_removed=8192,P_load_bytes_removed=8192,Q_load_bytes_removed=4096,normal_barriers_removed=1,declared_shared_before=29184,declared_shared_after=25088,weight_read_delta=0),
+ synchronization='Final Q/K scale publication remains. Score P has no cross-SG reader after owner change; its publication barrier is removed. shX now only holds 2048 early fold values or 2048 debug output values, never 4096 P values. Debug PV/ctx and output barriers retained.')
+(N/'PROOF.json').write_text(json.dumps(proof,indent=2),encoding='utf-8')
+s=(P/'candidate.comp').read_text(encoding='utf-8-sig')
+start=s.index('    // ============ stage 6:')
+end=s.index('    // Den is reduced',start)
+score=s[start:end]
+score=score.replace('    for (uint j = 0u; j < 2u; ++j) {','''    f16vec4 p_cache[4];
+    {
+    MAT_A score_q0,score_q1;
+    coopMatLoad(score_q0,shArena,sg*8u*32u,32u,LROW);
+    coopMatLoad(score_q1,shArena,sg*8u*32u+16u,32u,LROW);
+    for (uint j = 0u; j < 2u; ++j) {''',1)
+score=score.replace('uint m0 = (sg / 2u + 4u * j) * 8u;','uint m0 = sg * 8u;').replace('uint n0 = (sg % 2u) * 32u;','uint n0 = j * 32u;')
+score=score.replace('MAT_A a; coopMatLoad(a, shArena, m0 * 32u + k0, 32u, LROW);          // Q rows','MAT_A a=score_q0; if(ki==1u) a=score_q1; // original K0 then K16')
+for i,offset in [(0,''),(1,' + 16u')]:
+ oldstore=f'coopMatStore(half_score, shP, m0 * 64u + n0{offset}, 64u, LROW);'
+ assert score.count(oldstore)==1
+ score=score.replace(oldstore,f'p_cache[2u*j+{i}u]=f16vec4(half_score[0],half_score[1],half_score[2],half_score[3]);')
+score=score.replace('    barrier();\n','    } // Q and score accumulators retire; P remains for same-owner den/PV.\n')
+score=score.replace('// Nc=4, Np=2; j=0..1: r = sg/2 + 4j, b = sg%2; key cols 0/16, 32/48.','// Complete-query owner: 8 SG, each produces all four key tiles for its PV rows.')
+tail=s[end:].replace('    f16vec4 p_cache[4];\n','',1)
+oldload='''            MAT_A pa; coopMatLoad(pa,shP,sg*8u*64u+j*16u,64u,LROW);
+            p_cache[j]=f16vec4(pa[0],pa[1],pa[2],pa[3]);'''
+assert tail.count(oldload)==1
+tail=tail.replace(oldload,'            MAT_A pa; for(int d=0;d<4;++d) pa[d]=p_cache[j][d];')
+candidate=s[:start]+score+tail
+assert candidate[:start]==s[:start]  # Fold, FFN, QKV and norm code unchanged.
+assert candidate[candidate.index('    // ============ stage 8:'):]==s[s.index('    // ============ stage 8:'):]
+candidate=candidate.replace('shared float16_t shXP[4096];      // early X / late P / debug O, 8192 B','shared float16_t shXP[2048];      // early X / debug O only; P stays in its consumer owner')
+candidate=candidate.replace('// ---- shared: 29184 B; register seed replaces float scratch; X/P/O lifetimes share one half slab ----','// ---- shared: 25088 B; no shared score P publication ----')
+assert 'coopMatLoad(pa,shP' not in candidate and 'coopMatStore(half_score, shP' not in candidate
+src=N/'candidate.comp';spv=N/'candidate.spv';src.write_text(candidate,encoding='utf-8')
+run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv])
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+pm=ST.Module(P/'candidate.spv');cm=ST.Module(spv)
+keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[])
+assert len(keep)==len(ST.no_contraction_ids(pm))==7
+ST.set_no_contraction(cm,set(keep),spv)
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+text=(P/'plan.txt').read_text(encoding='utf-8-sig'); assert text.count((P/'candidate.spv').as_posix())==1
+plan=N/'plan.txt';plan.write_text(text.replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8')
+T=R/'f20-peer8-fouracc'
+runner=Path(json.loads((T/'LUNA-GATES.json').read_text())['identities'][0]['path'])
+(N/'CANDIDATE.json').write_text(json.dumps(dict(source=ident(src),spv=ident(spv),plan=ident(plan),parent=ident(P/'plan.txt'),cpu=run([runner,'--plan',plan,'--cpu-check']),no_contraction_count=7,decoration_alignment=info),indent=2),encoding='utf-8')
+for kind in ['GATES','NATIVE']:
+ task=json.loads((T/f'LUNA-{kind}.json').read_text().replace('f20-peer8-fouracc','f20-score-owner'))
+ task['identities']=[v for v in task['identities'] if not v['path'].endswith('.spv')]+[ident(spv)]
+ for j in task['jobs']:
+  j['plan']=ident(plan);j['argv'][j['argv'].index('--plan')+1]=str(plan)
+ (N/f'LUNA-{kind}.json').write_text(json.dumps(task,indent=2),encoding='utf-8')
+print(json.dumps(ident(spv)))

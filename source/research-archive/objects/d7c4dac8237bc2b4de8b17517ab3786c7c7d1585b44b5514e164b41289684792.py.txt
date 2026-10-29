@@ -1,0 +1,358 @@
+"""Register budget evidence for n05c-f05-mbatch  (CPU only, read-only inputs).
+
+Reads the *existing* native ISA captures of the two F05 shaders this card would
+have modified:
+
+  C128 : queue/n04b-f05-c128-feed/native/captures/native-native-base/ISA/
+         CS_asmf98d5ab4e239dd54_simd32_000000000000000a_9_orig.asm   (pipeline 9)
+  C64  : queue/n04a-f05-c64-feed/native/captures/native-native-base/ISA/
+         CS_asm6a22246177be2653_simd32_0000000000000006_5_orig.asm   (pipeline 5)
+
+and reports, for the QKV-projection window of each:
+
+  1. every DPAS with its destination base -> the accumulator footprint.  The
+     six QKV accumulators sit at bases 8 GRF apart in both kernels (42,50,58,
+     66,74,82 for C128 and the same pattern for C64), i.e. one 8x16 f32
+     accumulator reserves 8 GRF on this target;
+  2. a *per-definition* live-range model (a register's live range starts at a
+     write and ends at the last read before the next write) -> the peak number
+     of simultaneously live GRF, kernel-wide and inside the QKV window;
+  3. the composition of the live set at that peak by role: accumulators,
+     weight-return zones (rd:8 UGM loads), A-row returns (rd:1 UGM loads) and
+     the scalar/address floor;
+  4. the same for a hypothetical M-doubled form, by adding the extra
+     accumulators (12 instead of 6) on top of the measured non-accumulator set.
+
+Writes only _build/budget-isa.json inside this card directory.  No GPU, no
+Vulkan, no plan, no baseline file is touched.
+"""
+import json
+import re
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent
+Q = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+         'fullnet-continuous-20261027/queue')
+
+TARGETS = {
+    'C128': Q / 'n04b-f05-c128-feed/native/captures/native-native-base/ISA/'
+                'CS_asmf98d5ab4e239dd54_simd32_000000000000000a_9_orig.asm',
+    'C64': Q / 'n04a-f05-c64-feed/native/captures/native-native-base/ISA/'
+               'CS_asm6a22246177be2653_simd32_0000000000000006_5_orig.asm',
+}
+
+LINE = re.compile(r'/\* \[([0-9A-Fa-f]+)\]\s*\*/\s*(\([^)]*\))?\s*([a-zA-Z0-9_.]+)\s*(.*)$')
+REG = re.compile(r'\br(\d+)(?:\.(\d+))?')
+NGRF = 128
+
+BPE = {'ud': 4, 'd': 4, 'f': 4, 'w': 2, 'uw': 2, 'hf': 2, 'bf': 2,
+       'ub': 1, 'b': 1, 'q': 8, 'uq': 8, 'df': 8, 'v': 2, 'uv': 2, 'vf': 2}
+
+
+def parse(path):
+    out = []
+    for raw in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+        m = LINE.match(raw.strip())
+        if not m:
+            continue
+        pc, pred, op, rest = int(m.group(1), 16), m.group(2) or '', m.group(3), m.group(4)
+        ex = 1
+        me = re.match(r'\s*\((\d+)\|[^)]*\)\s*', rest)
+        if me:
+            ex = int(me.group(1))
+            rest = rest[me.end():]
+        code, _, comment = rest.partition('//')
+        out.append(dict(pc=pc, op=op, pred=pred, execsize=ex,
+                        text=code.strip(), comment=comment.strip()))
+    return out
+
+
+def region_span(execsize, typ):
+    """GRF touched by one operand region of `execsize` elements of type `typ`."""
+    n = execsize * BPE.get((typ or 'd').lower(), 4)
+    return max(1, (n + 31) // 32)
+
+
+def typ_of(tok):
+    m = re.search(r':([a-z]+)', tok)
+    return m.group(1) if m else 'd'
+
+
+def operands(text):
+    return [t for t in re.split(r'(?<=\S)\s+', text.strip()) if t]
+
+
+def analyse(tag, path):
+    ins = parse(path)
+    if not ins:
+        return dict(tag=tag, error='parse failed', path=str(path))
+
+    # ---- pass 1: DPAS map (dst base, src A base, src B base)
+    dpas = []
+    for i, d in enumerate(ins):
+        if not d['op'].startswith('dpas'):
+            continue
+        ops = operands(d['text'])
+        m = REG.search(ops[0]) if ops else None
+        if not m:
+            continue
+        a = REG.search(ops[3]) if len(ops) > 3 else None
+        b = REG.search(ops[4]) if len(ops) > 4 else None
+        dpas.append(dict(idx=i, pc=d['pc'], shape=d['op'], execsize=d['execsize'],
+                         acc=int(m.group(1)),
+                         a=int(a.group(1)) if a else None,
+                         b=int(b.group(1)) if b else None,
+                         text=d['text'][:90]))
+    acc_bases = sorted({x['acc'] for x in dpas})
+    # an accumulator reserves 8 GRF: verify bases are >=8 apart inside one program point
+    acc_blocks = {}
+    for base in acc_bases:
+        acc_blocks[base] = list(range(base, min(base + 8, NGRF)))
+
+    # ---- pass 2: writes / reads per GRF, per definition (proper live ranges)
+    writes = {}   # grf -> [(pc, role)]
+    reads = {}    # grf -> [(pc, role)]
+    role_by_pc = {}
+
+    def add(d, grfs, is_write, role):
+        tgt = writes if is_write else reads
+        for g in grfs:
+            tgt.setdefault(g, []).append((d['pc'], role))
+
+    for d in ins:
+        ops = operands(d['text'])
+        if not ops:
+            continue
+        if d['op'].startswith('dpas'):
+            m = REG.search(ops[0])
+            if m:
+                add(d, range(int(m.group(1)), min(int(m.group(1)) + 8, NGRF)), True, 'acc')
+                role_by_pc.setdefault(d['pc'], set()).add('acc')
+            for tok in ops[3:5]:
+                mm = REG.search(tok)
+                if not mm:
+                    continue
+                base = int(mm.group(1))
+                span = 8 if 'dpas' in d['op'] else 1
+                add(d, range(base, min(base + span, NGRF)), False, 'dpas_operand')
+            continue
+        if d['op'].startswith('send'):
+            m = REG.search(ops[0])
+            rd = re.search(r'rd:(\d+)', d['comment'])
+            span = int(rd.group(1)) if rd else 1
+            msg = d['comment'].split(';')[-1].strip()
+            if m:
+                base = int(m.group(1))
+                if 'load.' in msg:
+                    role = ('weight_return' if 'd32x8.' in msg else
+                            'a_return' if 'd32x8t' in msg else 'other_return')
+                else:
+                    role = 'send_src'
+                if 'store.' in msg:
+                    add(d, range(base, min(base + span, NGRF)), False, role)
+                    role_by_pc.setdefault(d['pc'], set()).add(role)
+                else:
+                    add(d, range(base, min(base + span, NGRF)), True, role)
+                    role_by_pc.setdefault(d['pc'], set()).add(role)
+            for tok in ops[1:2]:
+                mm = REG.search(tok)
+                if mm:
+                    add(d, [int(mm.group(1))], False, 'send_hdr')
+            continue
+        # generic ALU
+        if ops and not ops[0].startswith('null'):
+            m = REG.search(ops[0])
+            if m:
+                span = region_span(d['execsize'], typ_of(ops[0]))
+                add(d, range(int(m.group(1)), min(int(m.group(1)) + span, NGRF)),
+                    True, 'alu')
+                role_by_pc.setdefault(d['pc'], set()).add('alu_dst')
+        for tok in ops[1:]:
+            if re.match(r'^[a-z0-9.]+:', tok):
+                continue
+            for mm in REG.finditer(tok):
+                base = int(mm.group(1))
+                span = region_span(d['execsize'], typ_of(tok))
+                add(d, range(base, min(base + span, NGRF)), False, 'alu')
+                role_by_pc.setdefault(d['pc'], set()).add('alu_src')
+
+    # ---- build per-definition live ranges and sweep
+    events = []           # (start_pc, end_pc, grf, role)
+    for grf, ws in writes.items():
+        ws = sorted(ws)
+        rs = sorted(reads.get(grf, []))
+        for k, (wpc, role) in enumerate(ws):
+            nxt = ws[k + 1][0] if k + 1 < len(ws) else None
+            end = None
+            for (rpc, rrole) in rs:
+                if rpc < wpc:
+                    continue
+                if nxt is not None and rpc >= nxt:
+                    break
+                end = rpc
+            if end is None:
+                continue
+            events.append((wpc, end, grf, role))
+    # registers read before any write (kernel params) are live from entry
+    for grf, rs in reads.items():
+        if grf in writes:
+            continue
+        events.append((ins[0]['pc'], max(p for p, _ in rs), grf, 'param'))
+
+    def peaks_in(lo, hi, top=6):
+        out = []
+        pcs = sorted({e[0] for e in events if lo <= e[0] <= hi} |
+                     {e[1] for e in events if lo <= e[1] <= hi})
+        for p in pcs:
+            live = [e for e in events if e[0] <= p <= e[1]]
+            out.append((len(live), p, live))
+        out.sort(key=lambda x: (-x[0], x[1]))
+        return out[:top]
+
+    def peak_in(lo, hi):
+        p = peaks_in(lo, hi, top=1)
+        return p[0] if p else (0, None, [])
+
+    # QKV window: first weight send .. last weight send of the QKV phase.  The
+    # phase boundary is the first `store.slm` publication (Q/K/V -> shared), so
+    # the window stops before the attention part starts.
+    wt = [d['pc'] for d in ins if d['op'].startswith('send') and 'load.ugm.d32x8.' in d['comment']]
+    slm_st = [d['pc'] for d in ins if d['op'].startswith('send') and 'store.slm' in d['comment']]
+    lo = min(wt) if wt else ins[0]['pc']
+    hi = (min([p for p in slm_st if p > lo]) if slm_st else (max(wt) if wt else ins[-1]['pc']))
+    peak_all = peak_in(ins[0]['pc'], ins[-1]['pc'])
+    peak_qkv = peak_in(lo, hi)
+    # body vs epilogue inside the QKV phase: the first shared publication store
+    # opens the epilogue (all six accumulators still live, narrowing one by one)
+    first_pub = min([p for p in slm_st if p > lo], default=hi)
+    peak_body = peak_in(lo, first_pub)
+    peak_epi = peak_in(first_pub, hi)
+
+    def compose(live):
+        by = {}
+        for (s, e, g, role) in live:
+            key = role
+            if role == 'alu':
+                # scalar/address/data ALU destination or source
+                key = 'alu_data' if g in acc_blocks else 'alu'
+            by.setdefault(key, []).append(g)
+        out = {}
+        for k, v in by.items():
+            out[k] = dict(n=len(v), grf=sorted(set(v)))
+        return out
+
+    comp_qkv = compose(peak_qkv[2])
+    comp_all = compose(peak_all[2])
+    top_qkv = [dict(n=n, pc=hex(p), comp=compose(live)) for (n, p, live) in peaks_in(lo, hi)]
+    top_all = [dict(n=n, pc=hex(p), comp=compose(live)) for (n, p, live) in peaks_in(ins[0]['pc'], ins[-1]['pc'])]
+
+    weight_rd = sorted({int(re.search(r'rd:(\d+)', d['comment']).group(1))
+                        for d in ins if 'load.' in d['comment'] and 'rd:' in d['comment']})
+    messages = {}
+    for d in ins:
+        if d['op'].startswith('send') and d['comment']:
+            msg = d['comment'].split(';')[-1].strip()
+            messages[msg] = messages.get(msg, 0) + 1
+
+    return dict(
+        tag=tag, path=str(path), instructions=len(ins), dpas=len(dpas),
+        dpas_shapes=sorted({x['shape'] for x in dpas}),
+        dpas_execsizes=sorted({x['execsize'] for x in dpas}),
+        acc_bases=acc_bases,
+        acc_base_gaps=sorted({b - a for a, b in zip(acc_bases, acc_bases[1:])}),
+        acc_block_size=8,
+        n_acc_blocks=len(acc_bases),
+        max_reg_index=max((int(m.group(1)) for d in ins for m in REG.finditer(d['text'])),
+                          default=None),
+        qkv_window=[hex(lo), hex(hi)],
+        peak_kernel=dict(n=peak_all[0], pc=hex(peak_all[1]) if peak_all[1] is not None else None,
+                         comp=comp_all),
+        peak_qkv=dict(n=peak_qkv[0], pc=hex(peak_qkv[1]) if peak_qkv[1] is not None else None,
+                      comp=comp_qkv),
+        peak_qkv_body=dict(n=peak_body[0],
+                           pc=hex(peak_body[1]) if peak_body[1] is not None else None,
+                           comp=compose(peak_body[2])),
+        peak_qkv_epilogue=dict(n=peak_epi[0],
+                               pc=hex(peak_epi[1]) if peak_epi[1] is not None else None,
+                               comp=compose(peak_epi[2])),
+        top_qkv=top_qkv,
+        top_kernel=top_all,
+        messages=messages,
+        messages_n=len(messages),
+        weight_rd=weight_rd,
+    )
+
+
+def project(r):
+    """M-doubled projection: 12 accumulators on top of the measured non-acc set."""
+    q = r['peak_qkv']
+    acc_grf = sum(v['n'] for k, v in q['comp'].items() if k == 'acc')
+    other = q['n'] - acc_grf
+    scalar_floor = sum(v['n'] for k, v in q['comp'].items()
+                       if k in ('alu', 'param', 'send_hdr'))
+    out = dict(measured=dict(total=q['n'], acc=acc_grf, non_acc=other,
+                             scalar_floor=scalar_floor,
+                             weight_return=sum(v['n'] for k, v in q['comp'].items()
+                                               if k == 'weight_return'),
+                             a_return=sum(v['n'] for k, v in q['comp'].items()
+                                          if k == 'a_return')),
+               forms={})
+    for name, nacc in (('D0_parent_6acc', 6), ('D1_alldouble_12acc', 12),
+                       ('D2_qk_double_8acc', 8), ('D3_three_pass_4acc', 4)):
+        acc = nacc * r['acc_block_size']
+        out['forms'][name] = dict(
+            acc=nacc, acc_grf=acc,
+            peak_measured_nonacc=acc + other,
+            peak_against_scalar_floor=acc + scalar_floor,
+            fits_128=bool(acc + other <= 120),
+            fits_128_hard=bool(acc + scalar_floor <= 128),
+        )
+    return out
+
+
+def main():
+    res = {}
+    for tag, p in TARGETS.items():
+        if not p.exists():
+            res[tag] = dict(error='missing capture', path=str(p))
+            continue
+        r = analyse(tag, p)
+        r['projection'] = project(r)
+        res[tag] = r
+    (CARD / 'budget-isa.json').write_text(json.dumps(res, indent=2), encoding='utf-8')
+    for tag, r in res.items():
+        print('==', tag)
+        if 'error' in r:
+            print('  ', r['error'])
+            continue
+        print('  instructions=%d dpas=%d shapes=%s exec=%s' %
+              (r['instructions'], r['dpas'], r['dpas_shapes'], r['dpas_execsizes']))
+        print('  acc bases=%s gaps=%s  -> %d blocks x %d GRF' %
+              (r['acc_bases'], r['acc_base_gaps'], r['n_acc_blocks'], r['acc_block_size']))
+        print('  qkv window=%s' % (r['qkv_window'],))
+        print('  peak kernel n=%d @%s' % (r['peak_kernel']['n'], r['peak_kernel']['pc']))
+        print('  peak qkv    n=%d @%s' % (r['peak_qkv']['n'], r['peak_qkv']['pc']))
+        print('  peak qkv body n=%d @%s  %s' % (r['peak_qkv_body']['n'], r['peak_qkv_body']['pc'], {k:v['n'] for k,v in sorted(r['peak_qkv_body']['comp'].items())}))
+        print('  peak qkv epi  n=%d @%s  %s' % (r['peak_qkv_epilogue']['n'], r['peak_qkv_epilogue']['pc'], {k:v['n'] for k,v in sorted(r['peak_qkv_epilogue']['comp'].items())}))
+        for k, v in sorted(r['peak_qkv']['comp'].items()):
+            print('     %-14s %3d  %s' % (k, v['n'], v['grf']))
+        print('  max_reg_index=%s weight_rd=%s' % (r['max_reg_index'], r['weight_rd']))
+        print('  top QKV peaks:')
+        for t in r['top_qkv']:
+            print('     n=%3d @%s  %s' % (t['n'], t['pc'],
+                  {k: v['n'] for k, v in sorted(t['comp'].items())}))
+        print('  top kernel peaks:')
+        for t in r['top_kernel']:
+            print('     n=%3d @%s  %s' % (t['n'], t['pc'],
+                  {k: v['n'] for k, v in sorted(t['comp'].items())}))
+        print('  projection:')
+        for name, f in r['projection']['forms'].items():
+            print('     %-20s acc=%2d grf=%3d peak(measured nonacc)=%3d '
+                  'peak(scalar floor)=%3d fits<=120:%s hard<=128:%s' %
+                  (name, f['acc'], f['acc_grf'], f['peak_measured_nonacc'],
+                   f['peak_against_scalar_floor'], f['fits_128'], f['fits_128_hard']))
+
+
+if __name__ == '__main__':
+    main()
+

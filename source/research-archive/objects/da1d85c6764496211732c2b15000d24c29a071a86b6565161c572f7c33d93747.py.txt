@@ -1,0 +1,35 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys
+N=Path(__file__).resolve().parent;A=N.parent;B=Path('@NR_WORKSPACE@');T=A/'c32-family-next-20261025';P=A/'bridge-optimization-20261025/f20-linear-scale2';BASE=A/'c32-feed-owner-20261025/kv-tile/plan.txt';sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+def rd(p):return json.loads(p.read_text(encoding='utf-8-sig'))
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+# Complete producer, den-owner and A-consumer coordinate coverage.
+producer={}
+for sg in range(8):
+ for j in range(2):
+  for r in range(8):
+   for k in range(32):
+    coord=((sg//2+4*j)*8+r,(sg%2)*32+k);assert coord not in producer;producer[coord]=(sg,j)
+assert len(producer)==4096
+assert sorted(8*sg+lane for sg in range(8) for lane in range(8))==list(range(64))
+consumer={}
+for sg in range(8):
+ for ki in range(4):
+  for lane in range(32):
+   for c in range(4):
+    owner=2*c+(lane>>4);assert 0<=owner<8;coord=(8*sg+owner,16*ki+(lane&15));assert coord in producer and coord not in consumer;consumer[coord]=(sg,lane,c)
+assert set(consumer)==set(producer)
+s=(P/'candidate.comp').read_text(encoding='utf-8-sig');s=s.replace('#extension GL_KHR_shader_subgroup_basic : require','#extension GL_KHR_shader_subgroup_basic : require\n#extension GL_KHR_shader_subgroup_shuffle : require')
+start=s.index('    // ============ stage 7:');end=s.index('    // ============ stage 8:',start);old=s[start:end];tree=old[old.index('    if (t_local < 64u) {'):old.index('    barrier();')];tree=tree.replace('if (t_local < 64u)','if (lane < 8u)').replace('uint i = t_local;','uint i = sg * 8u + lane;').replace('shNorm[128u + i] = inv;','local_inv = inv;')
+new='    // den keeps its original half tree; move each query to its PV subgroup.\n    float16_t pv_inv[4];\n    {\n    float16_t local_inv = float16_t(0.0);\n'+tree+'    uint packed_inv = packHalf2x16(vec2(float(local_inv),0.0));\n'
+for c in range(4):new+=f'    pv_inv[{c}] = float16_t(unpackHalf2x16(subgroupShuffle(packed_inv,{2*c}u+(lane>>4u))).x);\n'
+new+='    }\n\n';s=s[:start]+new+s[end:]
+needle='            MAT_A a; coopMatLoad(a, shP, m0 * 64u + k0, 64u, LROW);   // shared A';assert s.count(needle)==1
+insert='\n'.join(f'            a[{c}] = a[{c}] * pv_inv[{c}];' for c in range(4));s=s.replace(needle,needle+'\n'+insert+'\n            if (debug) coopMatStore(a,dbg,14336u+m0*64u+k0,64u,LROW);')
+src=N/'candidate.comp';src.write_text(s,encoding='utf-8');spv=N/'candidate.spv';run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv]);pm=ST.Module(P/'candidate.spv');cm=ST.Module(spv);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[]);assert len(keep)==len(ST.no_contraction_ids(pm))==7;ST.set_no_contraction(cm,set(keep),spv);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv]);text=BASE.read_text(encoding='utf-8-sig');assert text.count((P/'candidate.spv').as_posix())==1;plan=N/'plan.txt';plan.write_text(text.replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8');runner=A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe';m=dict(source=ident(src),spv=ident(spv),plan=ident(plan),baseline=ident(BASE),parent_spv=ident(P/'candidate.spv'),cpu_check=run([runner,'--plan',plan,'--cpu-check']),no_contraction=7,producer_elements=len(producer),consumer_elements=len(consumer),slm_bytes=29184,removed_source_slm_request_bytes_per_WG=24704,added_inv_half_payload_bytes_per_lane=8,removed_normal_WG_barriers=2);(N/'CANDIDATE.json').write_text(json.dumps(m,indent=2));(N/'run').mkdir(exist_ok=True)
+t=rd(T/'LUNA-GATES.json');t['output_root']=str(N);t['identities']=[t['identities'][0],m['spv']]
+for j in t['jobs']:
+ j['id']='gate-pv-owner-'+j['mode'];j['candidate']='pv-owner';j['plan']=m['plan'];j['runner_output']=str(N/'run'/j['id']);j['argv'][2]=m['plan']['path'];j['argv'][4]=j['runner_output']
+(N/'LUNA-GATES.json').write_text(json.dumps(t,indent=2));print(json.dumps(m,indent=2))

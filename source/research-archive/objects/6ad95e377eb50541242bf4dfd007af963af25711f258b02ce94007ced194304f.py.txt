@@ -1,0 +1,155 @@
+"""S07 verify: rebuild the b23 l0/l1 CPU result using ONLY the shipped plan's
+own buffers (candidate-34189.txt), so the check does not trust the builder's
+in-memory state.  Writes QUALITY.json and VERIFY.json."""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029"
+S = W / "S07-split16"
+sys.path.insert(0, str(W / "tools"))
+sys.path.insert(0, str(S / "tools"))
+from planlib import Plan, sha256_file  # noqa: E402
+import model as M  # noqa: E402
+
+D = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+BASE = D / "c64-family-static/combo-34189.txt"
+CAND = S / "candidate-34189.txt"
+TEACHERS = [("34189", D / "dump-fp16"),
+            ("41444", D / "teacher-diagnostics/teacher-41444"),
+            ("43654", D / "teacher-diagnostics/teacher-43654")]
+
+
+class Arm:
+    """Everything read from one plan file."""
+
+    def __init__(self, plan_path):
+        p = Plan(plan_path)
+        self.plan = p
+        d0 = p.dispatch_by_name("split16_b23_l0")
+        d1 = p.dispatch_by_name("split16_b23_l1")
+        dqx = p.dispatch_by_name("split16_b23_l0_qx_producer")
+        push = [int(x) for x in d0.push]
+        self.p2, self.p3 = push[8:12], push[12:16]
+        self.wpath = Path(p.buffers[d0.binds[0].buffer].file)
+        l0 = Path(p.buffers[d0.binds[10].buffer].file).read_bytes()
+        l1 = Path(p.buffers[d1.binds[10].buffer].file).read_bytes()
+        self.pk = M.Pack(l0, l1, self.wpath, self.p2, self.p3)
+        self.sR = 1.0 / float(self.pk.invs[0])
+        self.sA = 1.0 / float(self.pk.invs[1])
+        self.sF = 1.0 / float(np.fromfile(p.buffer("split16_b23_l1qxinv").file, dtype="<f4")[0])
+        # X inverse: per-channel buffer if the producer binds one, else the push scalar
+        invfile = None
+        for b in dqx.binds:
+            nm = p.buffers[b.buffer].name
+            if nm.endswith("l0qxinv"):
+                invfile = Path(p.buffers[b.buffer].file)
+        if invfile is not None:
+            self.invX = np.fromfile(invfile, dtype="<f4")
+            self.invX_kind = f"per-channel {invfile.name} ({invfile.stat().st_size} B)"
+        else:
+            self.invX = np.float32(np.frombuffer(np.uint32(int(dqx.push[1])).tobytes(), "<f4")[0])
+            self.invX_kind = "push scalar word 1"
+        self.sX = float(1.0 / np.float64(self.invX[0] if self.invX.ndim else self.invX))
+        self.files = {"plan": [str(p.path), sha256_file(p.path)],
+                      "l0_pack": [str(p.buffers[d0.binds[10].buffer].file),
+                                  sha256_file(p.buffers[d0.binds[10].buffer].file)],
+                      "l1_pack": [str(p.buffers[d1.binds[10].buffer].file),
+                                  sha256_file(p.buffers[d1.binds[10].buffer].file)],
+                      "fp16_weights": [str(self.wpath), sha256_file(self.wpath)],
+                      "spv": [d0.spv, sha256_file(d0.spv)],
+                      "producer_spv": [dqx.spv, sha256_file(dqx.spv)]}
+
+    def forward(self, X, seed):
+        pk = self.pk
+        qx = M.code(np.asarray(X, np.float32) * (self.invX if self.invX.ndim else np.float32(self.invX)))
+        sr = M.f16((qx @ pk.W1q_m.T) * pk.wsc1)
+        qr = M.code(sr / np.float32(self.sR))
+        sa = np.empty((X.shape[0], 2048), np.float32)
+        for g in range(8):
+            sa[:, g * 256:(g + 1) * 256] = M.f16((qr[:, g * 64:(g + 1) * 64] @ pk.W2q_m[g * 256:(g + 1) * 256].T)
+                                                * pk.wsc2[g * 256:(g + 1) * 256])
+        act = M.activation(sa)
+        qa = M.code(act / np.float32(self.sA))
+        F = np.empty((X.shape[0], 512), np.float32)
+        for g in range(8):
+            F[:, g * 64:(g + 1) * 64] = M.f16((qa[:, g * 256:(g + 1) * 256] @ pk.W3q_m[g * 64:(g + 1) * 64].T)
+                                              * pk.wsc3[g * 64:(g + 1) * 64])
+        qf = M.code(F / np.float32(self.sF))
+        A = (qf @ pk.Wcq_m.T) * pk.wscL
+        Y = M.f16(A + seed)
+        return {"F": F, "Y": Y, "qx": qx, "qr": qr, "qa": qa, "qf": qf}
+
+
+def main():
+    old = Arm(BASE)
+    new = Arm(CAND)
+    rep = {"old": {"plan": str(BASE), "files": old.files, "invX_kind": old.invX_kind,
+                   "scales": {"sX": old.sX, "sR": old.sR, "sA": old.sA, "sF": old.sF}},
+           "new": {"plan": str(CAND), "files": new.files, "invX_kind": new.invX_kind,
+                   "scales": {"sX": new.sX, "sR": new.sR, "sA": new.sA, "sF": new.sF}},
+           "frames": []}
+    for tag, td in TEACHERS:
+        X = M.load_half(td / "dump_block22_out.bin")
+        Ft = M.load_half(td / "dump_split16_b23_F.bin")
+        Yt = M.load_half(td / "dump_split16_b23_Y.bin")
+        seed = M.f16(X * old.pk.rs)
+        row = {"frame": tag}
+        for name, arm in [("old", old), ("new", new)]:
+            r = arm.forward(X, seed)
+            row[name] = {
+                "F_rel_l2_vs_dump": M.rel_l2(r["F"], Ft),
+                "Y_rel_l2_vs_dump": M.rel_l2(r["Y"], Yt),
+                "Y_abs_rms": float(np.sqrt(np.mean((r["Y"][:1056] - Yt[:1056]) ** 2))),
+                "sat": {"qx": int(np.sum(np.abs(r["qx"]) >= 127)),
+                        "qr": int(np.sum(np.abs(r["qr"]) >= 127)),
+                        "qa": int(np.sum(np.abs(r["qa"]) >= 127)),
+                        "qf": int(np.sum(np.abs(r["qf"]) >= 127))},
+                "used": {"qx": float(np.abs(r["qx"]).max()), "qr": float(np.abs(r["qr"]).max()),
+                         "qa": float(np.abs(r["qa"]).max()), "qf": float(np.abs(r["qf"]).max())},
+            }
+        rep["frames"].append(row)
+        print(json.dumps(row, indent=1), flush=True)
+    ys_o = [f["old"]["Y_rel_l2_vs_dump"] for f in rep["frames"]]
+    ys_n = [f["new"]["Y_rel_l2_vs_dump"] for f in rep["frames"]]
+    fs_o = [f["old"]["F_rel_l2_vs_dump"] for f in rep["frames"]]
+    fs_n = [f["new"]["F_rel_l2_vs_dump"] for f in rep["frames"]]
+    rep["summary"] = {
+        "old_mean_Y_rel_l2": float(np.mean(ys_o)), "new_mean_Y_rel_l2": float(np.mean(ys_n)),
+        "old_mean_F_rel_l2": float(np.mean(fs_o)), "new_mean_F_rel_l2": float(np.mean(fs_n)),
+        "old_pooled_Y_mse": float(np.mean(np.square(ys_o))), "new_pooled_Y_mse": float(np.mean(np.square(ys_n))),
+        "Y_gain": float(np.mean(ys_o) / np.mean(ys_n)), "F_gain": float(np.mean(fs_o) / np.mean(fs_n)),
+        "worst_frame_old": float(np.max(ys_o)), "worst_frame_new": float(np.max(ys_n)),
+    }
+    (S / "VERIFY.json").write_text(json.dumps(rep, indent=1))
+    q = {
+        "card": "S07 split16 b23 l0/l1",
+        "scope": "CPU only; GPU_VERIFICATION=NOT_RUN; not a deployment candidate (binds capture 34189)",
+        "target": "teacher FP16 dump_split16_b23_Y (contract output); F = dump_split16_b23_F",
+        "frames": [f["frame"] for f in rep["frames"]],
+        "tokens": 1056,
+        "old": {"Y_rel_l2_per_frame": ys_o, "mean_Y_rel_l2": rep["summary"]["old_mean_Y_rel_l2"],
+                "F_rel_l2_per_frame": fs_o, "mean_F_rel_l2": rep["summary"]["old_mean_F_rel_l2"]},
+        "new": {"Y_rel_l2_per_frame": ys_n, "mean_Y_rel_l2": rep["summary"]["new_mean_Y_rel_l2"],
+                "F_rel_l2_per_frame": fs_n, "mean_F_rel_l2": rep["summary"]["new_mean_F_rel_l2"]},
+        "gain": {"Y": rep["summary"]["Y_gain"], "F": rep["summary"]["F_gain"]},
+        "gpu": {"status": "NOT_RUN", "reason": "S07 is CPU-only by construction; see JOBS.json",
+                "minimum_job_set": ["plan=candidate-34189.txt with -Y/-F dump outputs",
+                                    "compare against the same-frame FP16 teacher dumps",
+                                    "then 3-frame end-to-end vs c64-family-static combo baseline"]},
+        "cpu_audit": "the same code path reproduces the FP16 teacher with Y relL2 <= 3.9e-6 and "
+                     "F equal-fraction >= 0.9998 (AUDIT.json), so the layout/scale decode is proven",
+        "saturation_old_vs_new": {f["frame"]: {"old": f["old"]["sat"], "new": f["new"]["sat"]}
+                                  for f in rep["frames"]},
+        "scale_kind": "all four steps are static constants inside packs; no runtime amax, no "
+                      "per-frame value, no histogram, no adaptive precision",
+    }
+    (S / "QUALITY.json").write_text(json.dumps(q, indent=1))
+    print(json.dumps(rep["summary"], indent=1))
+
+
+if __name__ == "__main__":
+    main()

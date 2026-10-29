@@ -1,0 +1,480 @@
+"""n34-f19-latency: emit the remaining card deliverables (no candidate: BLOCKED).
+
+Writes ANALYSIS.md, PROOF.json, COST-LEDGER.json, BUILD.json,
+NATIVE-PREDICTION.md, GPU-REQUEST.json, RESUME.txt, SOURCE-DIFF.patch and
+DIAG-REORDER.patch from the measured JSON in this directory.  CPU only.
+"""
+import difflib
+import json
+from pathlib import Path
+
+HERE = Path(__file__).parent
+A = json.loads((HERE / 'A-AUDIT.json').read_text(encoding='utf-8'))
+R = json.loads((HERE / 'REDUNDANCY.json').read_text(encoding='utf-8'))
+X = json.loads((HERE / 'N33-CROSSCHECK.json').read_text(encoding='utf-8'))
+S = json.loads((HERE / 'SPV-STRUCTURE.json').read_text(encoding='utf-8'))
+D = json.loads((HERE / 'SPV-DEP.json').read_text(encoding='utf-8'))
+EXP = A['expensive']
+ALUWR = A['aluwr_pass']
+FRAME = 17.142
+PARENT_SRC = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                  'c32-rest-20261026/root-f2/candidate.comp')
+SRC_SHA = 'd82eb7dd23e4a38a9547a4f23f82cf1e990a57036c148953d115560bdbe299e3'
+SPV_SHA = '7f1ad115cb46d710336c536dd8009b8f3af93206202f96cb8b262617b42796a2'
+PLAN = 'accepted/n29-f01-alu-chain-20261027/plan.txt'
+PLAN_SHA = 'd8875665548ebc9cb945037051567933b04ab0ff2354a4e375f159364eccd99d'
+RAW_SHA = 'd7f89a2bb0f7446441c413ab18e3c8263b066fe01917724a8cdec7ec115363ff'
+CPU_CHECK = (HERE / 'CPU-CHECK.txt').read_text(encoding='utf-8').strip()
+
+
+def w(path, text):
+    (HERE / path).write_text(text, encoding='utf-8')
+
+
+# ------------------------------------------------------------------ ANALYSIS
+sites = R['sites']
+rows = '\n'.join('| %d | `%s` | `%s` | `%s` | `%s` | %d |' % (
+    i, s['addr'], s['op'], s['src_text'][0], s['consumer_addrs'][0],
+    len(s['consumer_addrs'])) for i, s in enumerate(sites, 1))
+
+w('ANALYSIS.md', """# ANALYSIS — n34-f19-latency（F19 / ord 226，六问）
+
+本卡结论是 **BLOCKED（A 类）**：本核的 24 条贵操作**没有可删的冗余副本**，
+而「延迟隐藏」这一层已被 n32 的 native 实测（L26）否掉，且其收益天花板在帧级检测门之下。
+因此本卡**不产出候选**，六问按「如果做/为什么不做」逐条回答，全部带可核对清单。
+
+---
+
+## 1. 映射：每个 (lane, component) 实际代表什么？消费者要什么？
+
+**网格与 lane**：grid 84 × 48 × 1，`local_size_x=128` → 每 WG 4 个 subgroup × 32 lane；
+4032 个 WG，无尾块（grid 由 push constant 的 `tiles_x/tiles_y` 精确给出，越界 WG 只丢最终 store，
+见 n19 §7）。`if(sg<4u)` 对 `local_size_x=128` 恒真，4 个 SG 全程活跃。
+`full_norm` 里有一个 2-lane 的 `col==15u` 分支（`lane&15==15`，每 SG 两条 lane），
+它把 `q=qh+qh` 换成 `fma(qhi,qhi,qs)`（**不同的舍入点，故意保留**）；
+它不改变 `inversesqrt` 的条数（根在分支汇合之后）。
+
+**16 条 `math.rsqt` 的映射**（ISA 侧逐条）：
+
+| # | 站点 | 源 | 消费者 | 消费者数 |
+|---|---|---|---|---|
+__ROWS__
+
+* 16 = `full_norm()` 的 2 条 `inversesqrt` × 8 个内联调用点；
+  每个调用点的实参是 `(qLo,qHi,kLo,kHi)` = 两个累加器的同一分量（c=0..3），
+  前 4 个用 `q00/q01/k00/k01`，后 4 个用 `q10/q11/k10/k11`；
+* 每条 `rsqt` 只被 **1 个** `mov (:f→:hf)` 读取，之后进入该分量的 scale 乘法；
+  16 个消费者地址两两不同 ⇒ **一一覆盖、无漏读、无重复写**；
+* 8 个调用点覆盖 8 个 `(数组组, 分量)` 组合，无遗漏（源码 738/743/748/753/766/771/776/781）。
+
+**8 条 `math.inv` 的映射**：4 个 softmax 分母组 × 2 个分量：
+
+| 组 | 规约输入分量 | 分母消费者 | 写回 |
+|---|---|---|---|
+| A | `p00..p03[0],[1]` | `p00[0],p00[1],p01[0..1],p02[0..1],p03[0..1]` | 8 条 half 乘法 |
+| B | `p00..p03[2],[3]` | 同上 `[2],[3]` | 8 条 |
+| C | `p10..p13[0],[1]` | `p10..p13[0],[1]` | 8 条 |
+| D | `p10..p13[2],[3]` | `p10..p13[2],[3]` | 8 条 |
+
+四组的分量互斥（`[0],[1]` vs `[2],[3]`，`p0*` vs `p1*`），每组 2 条 `1/max(...)`；
+8 条各有 1 个私有消费者。**尾块/边界**：该 PASS 没有尾块；`inversesqrt`/`1/x` 的
+`max(...,eps)` 边界在源码里显式存在（`6.2e-05` / `6.103515625e-05`），本卡不改。
+
+---
+
+## 2. 删什么真实工作？（正常执行路径上）
+
+**没有可删的贵操作。** 逐条判定见 `LATENCY-AUDIT.md` §2 与 `REDUNDANCY-PROOF.md`：
+
+| 检查项 | 结论 |
+|---|---|
+| 16 条 `rsqt` 是否重复副本 | **否**：24/24 达到定义互异（两套独立判定）；相邻同文本站点之间源寄存器被改写 1–46 次 |
+| 8 条 `inv` 是否重复副本 | **否**：8 个分母来自 4 组互斥分量的规约 |
+| `max(...,eps)` 的 `sel` 16 条 | 不能删（数学边界） |
+| `mov :hf←:f`（narrowing） | 不能删（half 舍入点） |
+| `mov :f←:hf`（widen） | 不能删（开方/比较的操作数） |
+| shuffle 的 `join/goto`/间接读 | 不能删（CH 布局下 `subgroupShuffleXor` 的展开） |
+| 地址整数运算 | 不能删（L1：fold 了 IGC 会重新展开） |
+| debug 回显（1203 条） | 不删：本夹具 `debug=0` 整段跳过，L17 证明不可计收益 |
+
+---
+
+## 3. 重叠：独立工作原来如何重叠？RAW/WAR/WAW 在哪？
+
+当前调度（ISA 实测）是「**规约树 → 开方 → 立刻消费 → 下一棵规约树 → …**」：
+
+| 段 | 生产者 | 首消费者 | 距离 | 之间是什么 | 依赖类型 |
+|---|---|---|---|---|---|
+| norm c=0..3（前半） | 6 条 `rsqt` 于 `0x9fa0..0xaec0` | 紧随的 `:f→:hf` mov | 0–4 | *上一分量的* scale 乘法 | 消费者对 `q00[c],q01[c],k00[c],k01[c]` 是 **RAW**（读后写），对下一分量的树是 **无依赖** |
+| norm c=0..3（后半） | 5 条 rsqt 于 `0xb950..0xc880` | 同上 | 0–4（其中一条 64） | 下一分量的树（65–72 条） | 同上 |
+| softmax A..D | 6 条 `inv` 于 `0xf490..0x108f0`、2 条于 `0x11040/0x110b0` | 紧随的 mov | 0–3 | *下一组*的 4 步 shuffle 规约（124–128 条） | `p… = p…*inv` 是 **RAW on inv / WAR on p**；组间分量互斥 ⇒ 无跨组依赖 |
+
+**关键**：独立工作（下一组/下一分量的规约）**大量存在且就在消费者后面**（`LATENCY-AUDIT.md` §1 的窗口表），
+所以「挪动独立工作到生产者与消费者之间」在源码层总是可行的；不可行的是让 **IGC 保留**这个顺序
+（n32 native 实测：ISA 距离 2–3 → 2–6，C256 完全不动，L26）。
+本卡没有改动，所以重叠结构、liveness、WAR 关系全部不变。
+
+---
+
+## 4. 新增成本
+
+**本卡无候选 ⇒ 新增 0。** 诊断件（`DIAG-reorder-full.comp`，**不交付、不测**）的新增成本，作为记录：
+
+| 项 | 量 | 说明 |
+|---|---|---|
+| 活值峰值 | +4 dword（norm 段 4 个 `f16vec2`；softmax 段 4 个 `d` 与 4 个 `inv` 交错，峰值同 +4） | 未上 GPU，无法核实 GRF；这是 B 类风险的主项 |
+| 静态 SPIR-V | 8754 → 8752 条（−2） | 只是块结构变化，不是删工作 |
+| NC 装饰 | **无法封印**：父的 253 个 NoContraction 装饰在重排后无法逐站点对齐（`transfer_decoration_pattern_aligned` 断言失败） | 说明「重排 + 保持父 NC 逐站点一致」不是闭合操作 |
+| 分支/barrier | 0 | 诊断件仍是直线代码 |
+| 消息/共享内存/DPAS | 0 变化（同 opcode 直方图、同 129 dpas） | — |
+
+---
+
+## 5. 是否真落到 native？（预测 + 判据，不声称已实现）
+
+**删除路线**：没有候选可落地——24/24 达到定义互异，删任一条都会用别的分量的值顶替。
+
+**重排路线**（若有人仍要测 `DIAG-reorder-full`）：预期 native 签名 = 计数全不变
+（rsqt 16、inv 8、dpas 129、send 604/43/4、scratch 0、max_r 127），
+**距离直方图不变**（rsqt 仍 0–4；inv 仍 0–3），即 **A 类**。
+判据与反证见 `NATIVE-PREDICTION.md`。
+
+---
+
+## 6. 整体是否更快？
+
+**不值得测。** 归因算术：
+
+* 该 PASS 0.2628 ms = 全帧 1.53 %；
+* 24 条贵操作只解释该 PASS ALUWR 的 **18.0 %（0.0148 ms）**，全帧 **0.087 %**；
+* 15 条暴露点全藏住 = **0.0093 ms/PASS = 全帧 0.054 %**；
+* L13 的检测门是 **0.03 ms**（且需两批复现）——比该上限大 **3.2 倍**（0.03 / 0.0093）。
+
+即使有人做出完美实现，ordinary 也读不出来；唯一可观测的是该 PASS 的 **ALUWR 计数器**
+（0.0826 → 0.0733，−11.2 %），而 L22 明确说计数器只能在同一批内排序、不能跨批读小差。
+**结论：本核的贵操作既不可删也不可藏，帧级无意义。**
+""".replace('__ROWS__', rows))
+
+# ------------------------------------------------------------------ PROOF
+proof = dict(
+    card='n34-f19-latency', family='F19', ordinal=226, pass_name='f2c32_block66_fused',
+    status='BLOCKED',
+    identity=dict(
+        baseline_plan=PLAN, baseline_plan_sha256=PLAN_SHA,
+        pass_147_spv='c32-rest-20261026/root-f2/candidate.spv', spv_sha256=SPV_SHA,
+        source='c32-rest-20261026/root-f2/candidate.comp', source_sha256=SRC_SHA,
+        isa='queue/n29-f01-alu-chain/native/captures/native-native-base/ISA/'
+            'CS_asmf3942341c6275bc3_simd32_0000000000000026_37_orig.asm',
+        isa_sha256=A['isa_sha256'],
+        parent_rebuild=dict(
+            raw_sha256=RAW_SHA, raw_match=False,
+            nc_recipe='cards/idt-identity-recipe/RECIPES.json[%s] mode=parent '
+                      'drop_region=full_norm, decoration parent c32-entry-chain-20261025/f2-direct' % SPV_SHA,
+            rebuilt_sha256=SPV_SHA, verified=True,
+            float_NC_checked=253),
+        plan_identity_unchanged=dict(path='plan.txt', sha256=PLAN_SHA,
+                                     same_as_chain_head=True, pass_replacements=0),
+    ),
+    mapping=dict(
+        rsqt_sites=16, inv_sites=8,
+        rsqt_provenance='2 OpExtInst Inversesqrt in the single full_norm callee x 8 call sites '
+                        '(source lines 738/743/748/753/766/771/776/781)',
+        inv_provenance='4 softmax denominator groups x 2 components '
+                       '(source lines 959/996/1037/1074)',
+        consumers_per_site=1,
+        distinct_consumer_addresses=len({s['consumer_addrs'][0] for s in sites}),
+        cover='one-to-one: 16 + 8 sites, 24 private consumers, 0 sites feeding two consumers',
+        sites=[dict(addr=s['addr'], op=s['op'], src=s['src_text'][0],
+                    reaching_def=s['producer_addr'], first_consumer=s['consumer_addrs'][0])
+               for s in sites],
+    ),
+    redundancy=dict(
+        verdict='0 of 24 expensive ops are duplicate values',
+        census_claim='math.rsqt 16 copies / 7 sources / 9 redundant; math.inv 8 copies / 3 sources / 5 redundant',
+        census_claim_refuted=True,
+        n_distinct_reaching_defs=len({s['producer_addr'] for s in sites}),
+        same_producer_groups=0,
+        same_value_groups=0,
+        per_text_group=[dict(src=g['source_text'], copies=g['n'],
+                             distinct_producers=g['distinct_producers'])
+                        for g in R['text_groups']],
+        cross_check=dict(method='n33-f02-latency _c1_redundancy.py (re-run on F19)',
+                         n_sites=X['n_sites'],
+                         n_distinct_producers=X['n_distinct_producers'],
+                         actual_same_value_pairs=X['actual_same_value_pairs'],
+                         keeps=X['verdict']['keep']),
+        method_self_check='without modelling the a0 register-indirect address, the value signature '
+                          'reported 3+2 false "identical" sites; after modelling a0 they split and 0 remain',
+    ),
+    numeric_contract=dict(
+        note='no candidate exists, so no floating-point expression, rounding point, K order or '
+             'reduction tree was changed; the pass still dispatches the recorded baseline SPV',
+        K_order_unchanged=True, rounding_points_unchanged=True, reduction_tree_unchanged=True,
+        residual_seed_order_unchanged=True,
+    ),
+    lifetime=dict(note='not applicable: no candidate, no instruction was moved in the shipped plan'),
+    tail=dict(note='not applicable: grid 84x48x1 with local_size 128 has no partial workgroup; '
+                   'rsqt/inv sites are unconditional inside the always-executed region'),
+    per_lane_independent_chains=dict(measured=A['max_concurrent'],
+                                     at=A['max_concurrent_at'], chains=A['chains'],
+                                     chain_instructions=A['chain'], depth=A['depth'],
+                                     weighted_depth=A['depth_weighted'],
+                                     criterion='must not decrease; unchanged because no candidate'),
+    invariants=dict(dpas=A['invariants']['dpas'], send_ugm=A['invariants']['send_ugm'],
+                    send_slm=A['invariants']['send_slm'],
+                    send_gtwy=A['invariants']['send_gtwy'], eot=A['invariants']['eot'],
+                    scratch=A['invariants']['scratch'], max_r=A['invariants']['max_r'],
+                    distinct_r=A['invariants']['distinct_r']),
+    latency=dict(islands=A['islands'], histogram=A['island_hist'],
+                 island_note='distance = live instructions between a math.rsqt/math.inv and its first reader'),
+    aluwr=dict(measured_pass=ALUWR, w_alu=A['w_alu'],
+               expensive_ops=EXP, frame_ms=FRAME,
+               expensive_share_of_frame_pct=round(100.0 * EXP['ll_ms_all'] / FRAME, 4)),
+    spv_structure=dict(
+        inversesqrt_count=S['parent_baseline']['inversesqrt']['count'],
+        inversesqrt_functions=[s['function'] for s in S['parent_baseline']['inversesqrt']['sites']],
+        fdiv_count=S['parent_baseline']['fdiv']['count'],
+        full_norm_call_sites=S['parent_baseline']['full_norm_call_sites']['count'],
+        statement='the 16 SASS math.rsqt are produced by IGC inlining one callee; a source-level '
+                  'reorder of the call sites cannot move them in SPIR-V'),
+    spv_reorder_ceiling=dict(
+        note='diagnostic only (DIAG-reorder-full), not a candidate',
+        parent_fdiv_positions=D['rebuild.spv']['fdiv'],
+        parent_fdiv_span=D['rebuild.spv']['span'],
+        diag_fdiv_positions=D['raw.spv']['fdiv'],
+        diag_fdiv_span=D['raw.spv']['span'],
+        parent_gap_range='8-14', diag_gap_range='36-216',
+    ),
+    triage='A (no work exists on this kernel: neither deletable redundancy nor a scheduler the '
+           'source can move), BLOCKED; not a direction ban',
+)
+w('PROOF.json', json.dumps(proof, indent=1))
+
+# ------------------------------------------------------------------ ledger
+ledger = dict(
+    card='n34-f19-latency',
+    status='BLOCKED - no candidate',
+    removed=[],
+    added=[],
+    unknown=[
+        dict(item='DRAM bytes of the 24 expensive ops', why='not derivable from the ISA text; L11'),
+        dict(item='per-op latency in cycles on this SKU', why='no GPU in this card; L24 weights are a model'),
+        dict(item='IGC scheduling decision for a block-boundary probe', why='needs a native capture; L26 only covers the straight-line case'),
+        dict(item='GRF cost of the diagnostic reorder (+4 live dwords)', why='needs a native capture; never dispatched'),
+    ],
+    considered_and_rejected=[
+        dict(item='delete 9 redundant math.rsqt', verdict='refuted',
+             basis='REDUNDANCY-PROOF.md: 16/16 distinct reaching defs, 1-46 intervening writes'),
+        dict(item='delete 5 redundant math.inv', verdict='refuted',
+             basis='REDUNDANCY-PROOF.md: 8/8 distinct reaching defs, 4 disjoint component groups'),
+        dict(item='straight-line reorder to hide rsqt/inv latency', verdict='A-class (L26)',
+             basis='n32 native: ISA distance 2-3 -> 2-6, C256 unchanged'),
+        dict(item='block-boundary reorder', verdict='not worth GPU',
+             basis='ceiling 0.0093 ms/PASS = 0.054 % of the frame, below the L13 0.03 ms gate'),
+        dict(item='delete sel/mov/add instead', verdict='priced out',
+             basis='sel 0.0075 ms/PASS and n31 measured 144 sel with no gain; mov/add are rounding points'),
+    ],
+    ceiling=dict(
+        expensive_ops_ms_per_pass=EXP['ll_ms_all'],
+        exposed_15_ms_per_pass=round(EXP['ll_ms_all'] * 15 / 24, 6),
+        exposed_17_ms_per_pass=EXP['exposed_ms_upper'],
+        pass_aluwr_ms=ALUWR, frame_ms=FRAME,
+        share_of_frame_pct=round(100.0 * EXP['ll_ms_all'] / FRAME, 4),
+        l13_gate_ms=0.03,
+        gate_over_ceiling=round(0.03 / (EXP['ll_ms_all'] * 15 / 24), 1),
+    ),
+)
+w('COST-LEDGER.json', json.dumps(ledger, indent=1))
+
+# ------------------------------------------------------------------ BUILD
+build = dict(
+    card='n34-f19-latency', status='BLOCKED',
+    candidate=None,
+    candidate_note='no candidate by design: 0/24 expensive ops are deletable and the reorder route '
+                   'is pre-registered A-class (L26)',
+    parent=dict(plan=PLAN, plan_sha256=PLAN_SHA, spv_sha256=SPV_SHA, source_sha256=SRC_SHA),
+    parent_rebuild=dict(
+        recipe='cards/idt-identity-recipe/RECIPES.json[%s]' % SPV_SHA,
+        argv=['glslang -V --target-env vulkan1.3',
+              '-I cards/idt-identity-recipe/evidence/headers/7f1ad115cb46',
+              'c32-rest-20261026/root-f2/candidate.comp'],
+        raw_sha256=RAW_SHA, raw_match=False,
+        decoration_parent='c32-entry-chain-20261025/f2-direct/candidate.spv sha ca283b9bda245527c7b620220a996789f33a267094ea13b02e3f56f347fbce88',
+        drop_region='full_norm', dropped_ids=16, own_region_ids=16,
+        rebuilt_sha256=SPV_SHA, byte_verified=True,
+        file='parent-rebuild.spv'),
+    float_NC_checked=253,
+    float_NC_rule='parent NoContraction set transferred 1:1 by the recorded recipe; no candidate exists',
+    spv_validate_cpu=None,
+    cpu_check=dict(plan='plan.txt', sha256=PLAN_SHA, output=CPU_CHECK,
+                   note='plan.txt is the chain-head plan byte-for-byte (0 PASS replacements); it is '
+                        'here so the harness is exercised, not to dispatch a candidate'),
+    diagnostics=[
+        dict(file='DIAG-reorder-full.comp',
+             what='the straight-line reorder n32 tried (all 8 full_norm calls + 4 inv statements hoisted)',
+             spv='DIAG-reorder-full.spv',
+             spv_sha256=__import__('hashlib').sha256((HERE / 'DIAG-reorder-full.spv').read_bytes()).hexdigest()
+             if (HERE / 'DIAG-reorder-full.spv').exists() else None,
+             sealed=False,
+             why_not_sealed='the parent NoContraction pattern cannot be aligned after the reorder '
+                            '(transfer_decoration_pattern_aligned assertion); see ANALYSIS.md section 4',
+             dispatched=False),
+    ],
+    invariants=A['invariants'],
+    chain_head_plan=PLAN_SHA,
+)
+w('BUILD.json', json.dumps(build, indent=1))
+
+# ------------------------------------------------------------------ native prediction
+w('NATIVE-PREDICTION.md', """# NATIVE-PREDICTION — n34-f19-latency（预测 + 判据，不声称已实现）
+
+本卡 **没有提交任何候选**。下面的表是「如果有人仍然要测」时**必须先写下的预测与反证条件**，
+用来防止事后用整体毫秒倒推机制有效（合同 §8.5）。
+
+---
+
+## 0. 若测 `DIAG-reorder-full`（直线重排，非候选）
+
+| 观测量 | 父（本卡捕获） | 预测（候选） | 「未落地」判据 |
+|---|---|---|---|
+| `math.rsqt` 条数 | 16 | **16** | 任何 ≠16 ⇒ 编译/内联行为变了，先查身份 |
+| `math.inv` 条数 | 8 | **8** | 同上 |
+| `dpas.8x8` | 129 | **129** | ≠129 ⇒ 候选不是纯重排 |
+| send.ugm / send.slm / send.gtwy / eot | 604 / 43 / 4 / 1 | 同 | 任何消息数变化 ⇒ 不是纯重排 |
+| scratch ops / max_r | 0 / 127 | **0 / ≤127** | scratch>0 ⇒ B 类（溢出），直接否 |
+| rsqt→首消费者距离直方图（live 指令） | 17×≤2、6×3–10、1×≥20 | **与父相同**（按 L26） | 若不变 ⇒ **A 类**（实现未落地）；若真的右移 ≥8 ⇒ 才允许进 ordinary |
+| inv→首消费者距离直方图 | 22×≤2、2×3–10 | 相同 | 同上 |
+| 每 lane 独立链数 | 9 | **9** | <9 ⇒ 违反 L25，直接否 |
+| SPIR-V 侧（可先验，CPU） | 8×OpFDiv 跨 814 条，gap 8–14 | 8×OpFDiv 跨 **48** 条，gap **36–216**（实测，`SPV-DEP.json`） | SPIR-V 已动而 ISA 不动 = IGC 重新调度（L26 复现） |
+
+**预期结论**：counters 全不变、距离不变、ALUWR 不变 ⇒ **A 类（实现未落地）**，
+不要用任何整体时间差去论证这个方法。
+
+## 1. 若有人做删除型候选（本卡已证否）
+
+必须先满足三判据（普查自己写的 `proof_requirement`）：
+
+1. 同文本组内两条**共享同一个 reaching definition**（dword 粒度）；
+2. 或两条之间**没有任何对该 dword 的写**，且值来自 push constant / 循环不变量；
+3. 每个消费者读到的确实是同一个值（消费者清单一一对应）。
+
+本卡对 F19 实测：**24 个站点 / 24 个 different reaching def / 0 对同值 / 0 条可删**
+（`REDUNDANCY.json` 与 n33 方法的 `N33-CROSSCHECK.json` 一致）。
+⇒ 任何声称「删 9 条 rsqt / 5 条 inv」的候选在本核上都是**用别的分量的值顶替**，
+金帧必然不过（或只在巧合输入上过），应直接判 **E 类（数值失败）**。
+
+## 2. 判据汇总（写进 GPU manifest 时必须带）
+
+* 实现落地：rsqt 16、inv 8、dpas 129、send 604/43/4、scratch 0、max_r ≤127；
+* 机制落地：rsqt/inv→首消费者距离 **≥8**（本卡建议的门；普查的 ≥20 在本核连 SPIR-V 都只有 inv 能达到）；
+* 数值：fixed `1755…` / fb2 `9c3e…` / ordinary `2b63…` 三套金帧逐字节；
+* 资源：XMX/GpuTime 单 PASS 对照；
+* 归因：先看 native 是否形成处理，再看 counters，最后才看 ordinary（合同 §8.5）。
+""")
+
+# ------------------------------------------------------------------ GPU request
+w('GPU-REQUEST.json', json.dumps(dict(
+    card='n34-f19-latency',
+    submit=False,
+    reason='BLOCKED: 0/24 expensive ops are deletable (two independent value-level proofs) and the '
+           'reorder route is pre-registered A-class by L26; the payoff ceiling of the whole card is '
+           '0.0093 ms/PASS = 0.054 % of the frame, below the L13 0.03 ms gate',
+    shader_group=dict(spv_sha256_baseline=[SPV_SHA], pass_ordinals=[226]),
+    plan=dict(path='cards/n34-f19-latency/plan.txt', sha256=PLAN_SHA,
+              note='chain-head plan, byte-identical; 0 PASS replacements'),
+    arms=[],
+    gates=[],
+    native=False,
+    resources=False,
+    ordinary=dict(design='not-requested', reps=0, warm=0, feedback=False),
+    hypothesis='not applicable',
+    native_observables=[],
+    optional_diagnostic=dict(
+        file='DIAG-reorder-full.spv',
+        sealed=False,
+        note='raw compile only; the parent NoContraction pattern cannot be transferred after the '
+             'reorder, so it is not dispatchable as-is.  It exists only to document the SPIR-V '
+             'ceiling (inv gap 8-14 -> 36-216; rsqt immovable inside full_norm).'),
+), indent=1))
+
+# ------------------------------------------------------------------ resume
+w('RESUME.txt', """n34-f19-latency — RESUME
+=======================
+
+状态: BLOCKED (A 类). 不产出候选、不申请 GPU。
+
+一句话
+------
+F19 / ord 226 (f2c32_block66_fused) 的 24 条贵操作 math.rsqt 16 + math.inv 8：
+(1) 删除路线: 0 条真冗余（24/24 达到定义互异，两套独立实现 + 源码三方一致）；
+(2) 重排路线: 纯源码重排改不动 IGC 的调度（n32 native 实测 L26），且本核 16 条 rsqt
+    全在 full_norm 一个 SPIR-V 函数体内，调用点重排在 SPIR-V 层面都不改变它们的位置；
+(3) 天花板: 24 条只解释该 PASS ALUWR 的 18.0%（0.0148 ms），15 条暴露点全藏住
+    = 0.0093 ms/PASS = 全帧 0.054%，比 L13 的 0.03 ms 门低 3.2 倍。
+
+已证（可复跑）
+------------
+1. 身份: PASS 147 SPV sha 7f1ad115cb46…；源 d82eb7dd23e4…；ISA f3942341c6275bc3
+   (5384 条, live 4181, debug-skipped 1203, dpas 129, scratch 0, max_r 127, distinct_r 126)。
+2. 父字节复现: raw d7f89a2b… + RECIPES[7f1ad115] 的 drop_region=full_norm NC 传递
+   → 7f1ad115… 逐字节相同（253 个 NoContraction）；产物 parent-rebuild.spv。
+3. 24 个 island 距离: 17×≤2、6×3–10、1×≥20（0xbdb0, 64）；每 lane 独立链数 9 @ 0xac00。
+4. 冗余证否: 24 个站点 / 24 个 different reaching def / 同文本组内相邻站之间源 dword
+   被写 1–46 次 / 24 个私有消费者 / same-value groups = 0。
+   n33 方法独立复核（N33-CROSSCHECK.json）同结论 0。
+5. SPIR-V 结构: 模块里只有 2 条 OpExtInst Inversesqrt（都在 full_norm）+ 8 个 OpFunctionCall；
+   16 条 ISA rsqt 是 IGC 内联出来的 ⇒ 调用点重排无法移动它们。
+6. 重排的 SPIR-V 天花板（诊断件，非候选）: 8 条 OpFDiv 跨度 814→48；单条 FDiv→首个
+   OpFMul 消费者 8–14→36–216。IGC 是否跟随需 native；n32 已测不跟随。
+
+未证 / 未做
+----------
+* 未做 block-boundary 探针（唯一可能把 ISA 距离推到 ≥8 的源码手段：在生产者与消费者之间
+  插真实控制流）。判断: 上限 0.0093 ms/PASS，不值得 GPU；若主代理坚持要一个数据点，
+  最省的做法是把 softmax 组 A 的 inv 提前、消费者放进 `if(debug){...}else{...}` 两支
+  （两支都写消费者以保 debug=1 语义），期望 ISA 距离 ≥ 整段块间距。
+* 未核实诊断件重排后的 GRF（无法在 CPU 侧看 IGC 分配）；若有人继续该方向，先查 scratch。
+* 附带发现: 卡面「不变量 send 601」与 ISA 实测不符（604+43+4+1=652），
+  建议主代理在 native 复核时统一按实测口径。
+
+恢复点
+------
+* 本卡任何后续工作只需读: A-AUDIT.json / REDUNDANCY.json / N33-CROSSCHECK.json /
+  SPV-STRUCTURE.json / SPV-DEP.json / LATENCY-AUDIT.md / REDUNDANCY-PROOF.md。
+* 不要重跑 _b1_make_candidate.py 之外的构建（它会写 DIAG-*）；不要提交 plan.txt（它是链头原样）。
+* 若要重开本族: 目标应是「ALUWR 占比高且真冗余」的核（如 F21 的 575e6253 有 12 条 1/x 重复），
+  不是 F19。
+""")
+
+# ------------------------------------------------------------------ patches
+src_old = PARENT_SRC.read_text(encoding='utf-8-sig').splitlines(keepends=True)
+diag = HERE / 'DIAG-reorder-full.comp'
+if diag.exists():
+    src_new = diag.read_text(encoding='utf-8').splitlines(keepends=True)
+    d = list(difflib.unified_diff(src_old, src_new,
+                                  fromfile='c32-rest-20261026/root-f2/candidate.comp',
+                                  tofile='cards/n34-f19-latency/DIAG-reorder-full.comp',
+                                  n=3))
+    w('DIAG-REORDER.patch', ''.join(d))
+w('SOURCE-DIFF.patch', """# n34-f19-latency — SOURCE-DIFF.patch
+#
+# 本卡不产出候选，因此没有「父源码 -> 候选源码」的 diff。
+#
+# 理由（详见 REDUNDANCY-PROOF.md 与 ANALYSIS.md）：
+#   * 删除路线: 24 条贵操作 = 24 个不同的 reaching definition，0 条真冗余；
+#     卡面的 rsqt 16->4 / inv 8-><=3 只能靠用别的分量的值顶替，等于改数学。
+#   * 重排路线: 纯源码重排改不动 IGC 的调度（n32 的 native 实测，L26）；
+#     且本核 16 条 rsqt 全部住在 full_norm 一个 SPIR-V 函数体内，
+#     调用点重排在 SPIR-V 层面也不改变它们的位置。
+#
+# 诊断件（不是候选、不提交、不测）：
+#   DIAG-reorder-full.comp -> DIAG-REORDER.patch
+#   （8 个 full_norm 调用点 + 4 个 inv 语句全部提前；SPIR-V 里 8 条 OpFDiv 的跨度
+#     814 -> 48，单条到首个算术消费者 8-14 -> 36-216；该件无法用记录的 NC recipe 封印，
+#     见 ANALYSIS.md §4）
+""")
+
+print('wrote ANALYSIS.md PROOF.json COST-LEDGER.json BUILD.json NATIVE-PREDICTION.md '
+      'GPU-REQUEST.json RESUME.txt SOURCE-DIFF.patch DIAG-REORDER.patch')
+print('DIAG-REORDER.patch bytes', (HERE / 'DIAG-REORDER.patch').stat().st_size
+      if (HERE / 'DIAG-REORDER.patch').exists() else 'missing')

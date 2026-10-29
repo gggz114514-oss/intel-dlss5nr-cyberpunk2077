@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Assemble the R07 delivery artifacts from the evidence this card produced.
+
+  evidence/RESIDUAL-MMA-AFTER.json   the re-enumerated FP16 matrix inventory per
+                                     width family and per *new* module type
+  CANDIDATE.json                     identity of every artifact (sha256 + bytes)
+  build-receipt.json                 full argv / inputs / outputs / rc / time
+  run/r07-output-proj/jobs.json      gate + ordinary submission definitions
+                                     (listed, never run)
+
+usage: python deliverables.py
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+R = Path("@NR_WORKSPACE@")
+W = R / "work/dsh-xmx-handoff-validation-20261024"
+CARD = W / "candidates/r07-output-proj"
+BUILD = W / "build/r07-output-proj"
+RUN = W / "run/r07-output-proj"
+AUDIT = R / "work/codex-astra-fp16-int8-audit-20261024"
+RUNNER = R / "build/gpa-b321-prep/port_network_model_runner.exe"
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def j(p):
+    return json.loads(Path(p).read_text(encoding="utf-8"))
+
+
+def residual():
+    reg = j(CARD / "evidence/SITE-REGISTRY.json")
+    ident = j(CARD / "evidence/SPV-IDENTITY-C64.json")
+    cand_f16 = ident["P3_matrix_sites"]["candidate_fp16"]
+    cand_i32 = ident["P3_matrix_sites"]["candidate_int8"]
+    per_family = {}
+    per_pass = []
+    for p in reg["passes"]:
+        fam = {"C64": "C64", "C128": "C128", "C256": "C256"}[
+            reg["modules"][p["module_key"]]["family"]]
+        n = p["fp16_static_mma_count"]
+        if fam == "C64":
+            per_pass.append({"pass": p["pass_name"], "family": fam,
+                             "module_before": p["module_file"],
+                             "mma_before": n,
+                             "module_after": "r07_c64_output_wo_i8.spv",
+                             "mma_after": cand_f16,
+                             "int8_mma_after": cand_i32,
+                             "status": "INT8 (this card)"})
+        else:
+            per_pass.append({"pass": p["pass_name"], "family": fam,
+                             "module_before": p["module_file"],
+                             "mma_before": n,
+                             "module_after": p["module_file"] + " (unchanged)",
+                             "mma_after": n, "int8_mma_after": 0,
+                             "status": "OPEN, named gap"})
+        d = per_family.setdefault(fam, {"passes": 0, "fp16_before": 0,
+                                        "fp16_after": 0, "int8_after": 0,
+                                        "module_types": {}})
+        d["passes"] += 1
+        d["fp16_before"] += n
+        if fam == "C64":
+            d["fp16_after"] += cand_f16
+            d["int8_after"] += cand_i32
+            d["module_types"]["r07_c64_output_wo_i8.spv"] = {
+                "sha256": ident["candidate"]["path"] and sha(CARD / "spv/r07_c64_output_wo_i8.spv"),
+                "fp16_mma": cand_f16, "int8_mma": cand_i32,
+                "passes": d["passes"]}
+        else:
+            d["fp16_after"] += n
+            mt = d["module_types"].setdefault(p["module_file"], {"fp16_mma": n, "passes": 0})
+            mt["passes"] += 1
+    tot = {"fp16_before": sum(v["fp16_before"] for v in per_family.values()),
+           "fp16_after": sum(v["fp16_after"] for v in per_family.values())}
+    out = {"card": "R07", "families": per_family, "passes": per_pass, "totals": tot,
+           "rule": "re-enumerated on the modules that the child plan actually binds, "
+                   "in their own word-offset space, not by subtracting from the parent list",
+           "closed_by_this_card": tot["fp16_before"] - tot["fp16_after"]}
+    (CARD / "evidence/RESIDUAL-MMA-AFTER.json").write_text(json.dumps(out, indent=1) + "\n",
+                                                           encoding="utf-8")
+    return out
+
+
+def main():
+    BUILD.mkdir(parents=True, exist_ok=True)
+    RUN.mkdir(parents=True, exist_ok=True)
+    res = residual()
+    parent_replay = j(BUILD / "parent-replay.json")
+    cand_build = j(BUILD / "candidate-build.json")
+    ident = j(CARD / "evidence/SPV-IDENTITY-C64.json")
+    plan = j(CARD / "evidence/PLAN-DELTA.json")
+    plan_val = j(CARD / "evidence/PLAN-VALIDATION.json")
+    oracle = j(CARD / "evidence/ORACLE-C64.json")
+    packmeta = j(CARD / "packs/PACK-META.json")
+    reg = j(CARD / "evidence/SITE-REGISTRY.json")
+
+    files = {}
+    for p in sorted(CARD.rglob("*")):
+        if p.is_file() and p.suffix in (".spv", ".comp", ".glsl", ".bin", ".txt",
+                                        ".json", ".py", ".md"):
+            files[str(p.relative_to(CARD)).replace("\\", "/")] = {
+                "bytes": p.stat().st_size, "sha256": sha(p)}
+    cand = {
+        "card": "R07", "title": "independent output projection (WO) as INT8, C64 arm",
+        "date": "2026-10-24", "business_root": str(R), "write_area": str(W),
+        "gpu": "not used: no device, pipeline, runner, GPU.lock or game was touched",
+        "qualification": ["CPU_STRUCT", "OFFLINE_COMPILE", "SPV_IDENTITY", "PLAN_IDENTITY"],
+        "not_run": ["NATIVE", "GATE", "ORDINARY", "QUALITY"],
+        "scope": {
+            "ledger_positions": 33, "static_fp16_mma": 80,
+            "per_width_family": {"C64": 7, "C128": 11, "C256": 15},
+            "implemented_family": "C64", "implemented_passes": 7,
+            "closed_static_fp16_mma": res["closed_by_this_card"],
+            "remaining_static_fp16_mma": res["totals"]["fp16_after"],
+        },
+        "identity": {
+            "parent_modules": {k: {"path": v["deployed_spv"], "sha256": v["deployed_sha256"],
+                                   "repro_sha256": v.get("sha256"),
+                                   "byte_identical": v["byte_identical"],
+                                   "argv": v["argv"], "defines": [a for a in v["argv"]
+                                                                  if a.startswith("-D")]}
+                               for k, v in parent_replay["parents"].items()},
+            "candidate_module": {"path": str(CARD / "spv/r07_c64_output_wo_i8.spv"),
+                                 "sha256": cand_build["sha256"],
+                                 "bytes": cand_build["bytes"],
+                                 "validate": cand_build["validate_stdout"],
+                                 "argv": cand_build["argv"]},
+            "plan": {"path": plan["child"]["path"], "sha256": plan["child"]["sha256"],
+                     "bytes": plan["child"]["bytes"], "buffers": plan["child"]["buffers"],
+                     "passes": plan["child"]["passes"],
+                     "parent": plan["parent"]},
+            "packs": {b: {"weights": {"file": "packs/r07_c64_b%d_wo.i8.bin" % int(b[5:]),
+                                      "sha256": v["weights_sha256"],
+                                      "bytes": v["weights_bytes"]},
+                          "scales": {"file": "packs/r07_c64_b%d_wosc.f32.bin" % int(b[5:]),
+                                     "sha256": v["scales_sha256"],
+                                     "bytes": v["scales_bytes"]},
+                          "wo_patch_cross_check": v.get("wo_patch_matches_pack_region")}
+                      for b, v in packmeta["blocks"].items()},
+        },
+        "checks": {
+            "parent_replay_all_byte_identical": parent_replay["all_byte_identical"],
+            "spv_identity_verdict": ident["verdict"],
+            "spv_identity_unexplained": ident["P4_opcodes"]["unexplained"],
+            "plan_lint": "0 problems", "strict_bind": plan_val["strict_bind"],
+            "plan_validation_verdict": plan_val["verdict"],
+            "changed_pass_lines": plan_val["changed_count"],
+            "int8_reference": {
+                "kind": "segment-local integer oracle over a captured frame",
+                "capture": oracle["inputs"]["T"],
+                "capture_sha256": oracle["inputs"]["T_sha256"],
+                "parent_replay_vs_capture_bit_identical_share":
+                    oracle["A_replay_vs_capture"]["bit_identical_share"],
+                "int8_vs_fp16": oracle["C_int8_vs_fp16"],
+                "int32_exact": oracle["B_int8_exactness"],
+                "passes": "one of seven (block6); the other six have packs and scales "
+                          "but no captured T for this arm",
+            },
+            "site_registry": {"passes": reg["totals"]["r07_passes"],
+                              "registered_sites": reg["totals"]["registered_sites"],
+                              "word_offsets_match_ledger":
+                                  reg["totals"]["all_word_offsets_match"],
+                              "result_ids_match_ledger":
+                                  reg["totals"]["all_result_ids_match"],
+                              "class_totals": reg["totals"]["class_totals"]},
+        },
+        "files": files,
+        "claims_not_made": ["numeric gate", "ordinary timing", "milliseconds",
+                            "native SLM/GRF/scratch", "quality/PSNR",
+                            "whole-network INT8 coverage",
+                            "that the C128/C256 arms are implemented"],
+    }
+    (CARD / "CANDIDATE.json").write_text(json.dumps(cand, indent=1) + "\n", encoding="utf-8")
+
+    receipt = {
+        "card": "R07", "date": "2026-10-24",
+        "toolchain": {"glslang": parent_replay["glslang"],
+                      "glslang_sha256": parent_replay["glslang_sha256"],
+                      "validator": parent_replay["validator"],
+                      "validator_sha256": parent_replay["validator_sha256"]},
+        "steps": {
+            "parent_replay": parent_replay,
+            "candidate_build": cand_build,
+        },
+        "replay": {
+            "parents": "python candidates/r07-output-proj/tools/build.py parents",
+            "candidate": "python candidates/r07-output-proj/tools/build.py candidate",
+            "packs": "python packs/gen_r07_c64_packs.py [--check]",
+            "sites": "python tools/sites.py",
+            "identity": "python tools/spv_identity.py",
+            "oracle": "python tools/oracle.py [--window N]",
+            "plan": "python tools/make_plan.py && python tools/strict_plan_check.py",
+            "python": "@NR_USER_HOME@/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/python/python.exe (numpy 2.3.5) for packs/oracle; run/python312/python.exe for the SPIR-V tools",
+        },
+    }
+    (CARD / "build-receipt.json").write_text(json.dumps(receipt, indent=1) + "\n",
+                                             encoding="utf-8")
+
+    # ---------------------------------------------------------------- jobs
+    runner_sha = sha(RUNNER) if RUNNER.exists() else None
+    base = ["--plan", plan["child"]["path"], "--out", None]
+    def gate(label, arm, plan_path, purpose):
+        out = (RUN / label).as_posix()
+        args = ["--plan", plan_path, "--out", out, "--pool", "--warm", "0",
+                "--reps", "1"]
+        return {"label": label, "kind": "gate", "arm": arm, "purpose": purpose,
+                "exe": RUNNER.as_posix(), "plan": plan_path, "out": out,
+                "fresh_out": True, "gold": None, "args": args}
+    def ordn(label, arm, plan_path, pair, reps=30):
+        out = (RUN / label).as_posix()
+        args = ["--plan", plan_path, "--out", out, "--pool", "--warm", "1",
+                "--reps", str(reps), "--feedback"]
+        return {"label": label, "kind": "ordinary", "arm": arm, "pair": pair,
+                "purpose": "ordinary whole-graph %s sample set %d" % (arm, pair),
+                "exe": RUNNER.as_posix(), "plan": plan_path, "out": out,
+                "fresh_out": True, "gold": None, "args": args}
+    pp = plan["parent"]["path"]
+    cp = plan["child"]["path"]
+    jobs = [
+        gate("r07-parent-fixed", "parent", pp, "deployed FP16 reference frame"),
+        gate("r07-parent-fb2", "parent", pp, "deployed FP16 reference feedback chain"),
+        gate("r07-cand-fixed", "candidate", cp, "C64 INT8 arm frame"),
+        gate("r07-cand-fb2", "candidate", cp, "C64 INT8 arm feedback chain"),
+        gate("r07-cand-fixed-2", "candidate", cp,
+             "second run of the same candidate plan: self-determinism arm"),
+    ]
+    for i in (1, 2, 3):
+        jobs.append(ordn("r07-parent-ord%d" % i, "parent", pp, i))
+        jobs.append(ordn("r07-cand-ord%d" % i, "candidate", cp, i))
+    jd = {
+        "label": "r07-output-proj", "card": "R07", "status": "LISTED_NOT_RUN",
+        "why_not_run": "no GPU slot was allocated to this card; CONVENTIONS.md §0 "
+                       "forbids creating a device, pipeline, runner process or touching "
+                       "GPU.lock. Every job below is a submission definition only.",
+        "runner": RUNNER.as_posix(), "runner_sha256": runner_sha,
+        "parent_plan": pp, "parent_plan_sha256": plan["parent"]["sha256"],
+        "candidate_plan": cp, "candidate_plan_sha256": plan["child"]["sha256"],
+        "expected_passes": plan["child"]["passes"],
+        "gate_design": {
+            "named_int8_reference": "candidates/r07-output-proj/evidence/ORACLE-C64.json: "
+                                    "segment-local integer oracle on a captured frame, "
+                                    "INT8 arm vs FP16 arm rel L2 %.4f%%, SNR %.2f dB on "
+                                    "block6" % (100 * oracle["C_int8_vs_fp16"]["rel_L2"],
+                                                oracle["C_int8_vs_fp16"]["snr_db"]),
+            "byte_equality_is_not_the_rule": "the C64 WO matrix multiply is replaced by an "
+                                             "INT8 path, so the candidate frame is not "
+                                             "expected to be byte-equal to the FP16 parent "
+                                             "frame. Byte equality is asserted only between "
+                                             "two runs of the same candidate plan.",
+            "no_threshold_asserted_here": "this card sets no numeric tolerance between the "
+                                          "candidate and the parent frame; the delta "
+                                          "statistics are recorded for the coordinating "
+                                          "entry to judge against the named reference.",
+            "required_nonzero_checks": ["nan == false", "inf == false",
+                                        "status == GPU_EXECUTED_NUMERIC_PENDING or better",
+                                        "normal_close == true"],
+        },
+        "jobs": jobs,
+        "protocol": {
+            "order": "fixed parent -> fixed candidate -> fixed candidate (again) -> fb2 pair "
+                     "-> ordinary pairs 1..3, never concurrent with the game",
+            "slots": len(jobs), "gate": 5, "ordinary": 6,
+            "gate_compare": "frame_out.bin of r07-cand-fixed and r07-cand-fixed-2 must be "
+                            "byte-identical (self-determinism); the parent-vs-candidate "
+                            "delta is recorded, not thresholded here",
+            "ordinary": "3 process pairs x 30 samples per arm, same runner/input/allocation",
+        },
+        "blocked_on": "no GPU slot assigned; see tickets/ for the request",
+        "named_gaps": [
+            "C128 arm (11 passes, 22 static FP16 MMA) not implemented",
+            "C256 arm (15 passes, 30 static FP16 MMA) not implemented",
+            "block21/55 have no qX branch at all (C256_QX_LAST=1); their downstream must be "
+            "wired separately",
+            "six of the seven C64 passes have packs and scales but no captured T for the "
+            "segment oracle",
+        ],
+    }
+    (RUN / "jobs.json").write_text(json.dumps(jd, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps({"candidate": str(CARD / "CANDIDATE.json"),
+                      "residual": res["totals"],
+                      "closed": res["closed_by_this_card"],
+                      "jobs": len(jobs), "runner_sha256": runner_sha}, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

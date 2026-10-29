@@ -1,0 +1,150 @@
+"""S05 step 11: inside the REAL qX domain, what is fixable without touching the producer?
+
+1. consistency: ffn_from_codes(round(X*sc[1])) must reproduce the teacher-domain 5.72%
+2. the real per-channel slope  slope_c = sum(q*X)/sum(X^2)  -> gain error a_c = slope_c*sc[0]
+3. can a static per-channel gain correction (folded into the expand columns + the residual
+   table, both inside this card's slots) reduce the real-domain error?
+4. re-tune (sA, sM) on top of that.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import s05_common as C
+
+CAP = C.B / 'work/dsh-fullnet-static-20261029/gpu/runs/input-capture/xq-c128-b9.bin'
+data = C.rows()
+buf = data['buffers']
+r1 = C.row_by_name('block9_swin_body_1', data)
+b1 = {int(k): v for k, v in r1['bindings'].items()}
+OLD_W, OLD_S = buf[b1[0][0]]['file'], buf[b1[1][0]]['file']
+idx_m8 = ((np.arange(C.WIN_X * C.WIN_Y)[:, None, None] * 8192
+           + (np.arange(64)[None, :, None] >> 3) * 1024
+           + np.arange(128)[None, None, :] * 8
+           + (np.arange(64)[None, :, None] & 7)).reshape(-1))
+qx_real = C.i8(CAP)[idx_m8].reshape(C.TOK, 128).astype(np.float32)
+X = C.load_x(C.D / 'dump-fp16/dump_block8_out.bin')
+Y = C.load_y(C.D / 'dump-fp16/dump_swin_9_Y.bin')
+w_old = C.i8(OLD_W).astype(np.int32)
+sc_old = C.f32(OLD_S)
+sX = np.float32(sc_old[0])
+
+
+def split(w):
+    return w[0:65536].reshape(512, 128), w[65536:81920].reshape(128, 128), w[81920:98304].reshape(128, 128)
+
+
+def ffn(qx, we8, wm8, wc8, sc, keep=None):
+    de = np.rint(qx @ we8.astype(np.float32).T)
+    a = C.act(C.half(de * sc[16:528][None, :]))
+    qa = C.code(a * np.float32(sc[2]))
+    mo = np.empty((qx.shape[0], 128), np.float32)
+    for g in range(4):
+        mo[:, g * 32:(g + 1) * 32] = qa[:, g * 128:(g + 1) * 128] @ wm8[g * 32:(g + 1) * 32].astype(np.float32).T
+    qm = C.code(np.rint(mo) * np.float32(sc[528:656])[None, :] * np.float32(sc[3]))
+    dc = np.rint(qm @ wc8.astype(np.float32).T)
+    y = C.half(dc.astype(np.float32) * np.float32(sc[656:784])[None, :] + qx * np.float32(sc[784:912])[None, :])
+    if keep:
+        keep.update(qa=qa, qm=qm)
+    return y
+
+
+out = dict(card='S05-c128', step='real-domain headroom')
+we, wm, wc = split(w_old)
+qx_proxy = C.code(X * np.float32(sc_old[1]))
+y_proxy = ffn(qx_proxy, we, wm, wc, sc_old)
+y_real = ffn(qx_real, we, wm, wc, sc_old)
+out['consistency'] = dict(proxy_rel_l2=C.rel(y_proxy, Y), real_rel_l2=C.rel(y_real, Y),
+                          note='proxy must reproduce the teacher-domain 5.7249%')
+
+# ---- per-channel slope / gain
+slope = (qx_real * X).sum(axis=0) / (X * X).sum(axis=0)
+a = (slope * sX).astype(np.float32)
+out['gain'] = dict(slope=[float(v) for v in slope],
+                   a_min=float(a.min()), a_med=float(np.median(a)), a_max=float(a.max()),
+                   a_std=float(a.std()), implied_step_min=float((1 / slope).min()),
+                   implied_step_max=float((1 / slope).max()),
+                   step_uniform_expected=float(sX),
+                   note='a_c = slope_c*sc[0]: 1 means the bound uniform-step assumption holds for that channel')
+
+# ---- gain-corrected pack: fold 1/a_k into the expand columns and the residual table
+wfloat = we.astype(np.float32) * sc_old[16:528][:, None]          # dequantised expand, (n,k)
+wcorr = wfloat / a[None, :]                                       # undo the per-channel gain
+sWe2 = (np.max(np.abs(wcorr), axis=1) / np.float32(127)).astype(np.float32)
+we2 = np.clip(np.rint(wcorr * (np.float32(1) / sWe2)[:, None]), -127, 127).astype(np.int8)
+sc_g = sc_old.copy()
+sc_g[16:528] = sX * sWe2 * sX / sX          # = sX*sWe2 ; written plainly below
+sc_g[16:528] = (sX * sWe2).astype(np.float32)
+sc_g[784:912] = (sc_old[784:912] / a).astype(np.float32)          # residual compensation
+y_gain = ffn(qx_real, we2.reshape(512, 128).astype(np.int32), wm, wc, sc_g)
+out['gain_correction'] = dict(rel_l2=C.rel(y_gain, Y),
+                              expand_code_change_frac=float((we2 != we.astype(np.int8)).mean()))
+
+# ---- retune sA / sM on top of the gain-corrected pack
+FACT = [0.4, 0.5, 0.65, 0.8, 1.0, 1.2, 1.5]
+best = (C.rel(y_gain, Y), 1.0, 1.0)
+hist = []
+sWm = sc_old[528:656] * np.float32(sc_old[2])
+sWc = sc_old[656:784] * np.float32(sc_old[3])
+for fa in FACT:
+    for fm in FACT:
+        s = sc_g.copy()
+        s[2] = np.float32(sc_old[2]) / np.float32(fa)
+        s[3] = np.float32(sc_old[3]) / np.float32(fm)
+        s[528:656] = sWm / s[2]
+        s[656:784] = sWc / s[3]
+        r = C.rel(ffn(qx_real, we2.reshape(512, 128).astype(np.int32), wm, wc, s), Y)
+        hist.append(dict(sa_factor=fa, sm_factor=fm, rel_l2=r))
+        if r < best[0]:
+            best = (r, fa, fm)
+fa, fm = best[1], best[2]
+for fa2 in [fa * k for k in (0.8, 0.9, 1.0, 1.1, 1.25)]:
+    for fm2 in [fm * k for k in (0.8, 0.9, 1.0, 1.1, 1.25)]:
+        s = sc_g.copy()
+        s[2] = np.float32(sc_old[2]) / np.float32(fa2)
+        s[3] = np.float32(sc_old[3]) / np.float32(fm2)
+        s[528:656] = sWm / s[2]
+        s[656:784] = sWc / s[3]
+        r = C.rel(ffn(qx_real, we2.reshape(512, 128).astype(np.int32), wm, wc, s), Y)
+        hist.append(dict(sa_factor=fa2, sm_factor=fm2, rel_l2=r, refined=True))
+        if r < best[0]:
+            best = (r, fa2, fm2)
+sc_final = sc_g.copy()
+sc_final[2] = np.float32(sc_old[2]) / np.float32(best[1])
+sc_final[3] = np.float32(sc_old[3]) / np.float32(best[2])
+sc_final[528:656] = sWm / sc_final[2]
+sc_final[656:784] = sWc / sc_final[3]
+y_final = ffn(qx_real, we2.reshape(512, 128).astype(np.int32), wm, wc, sc_final)
+out['retuned'] = dict(rel_l2=C.rel(y_final, Y), sa_factor=best[1], sm_factor=best[2],
+                      evaluations=len(hist), top=hist[:0] or sorted(hist, key=lambda h: h['rel_l2'])[:6])
+
+# ---- the cleanest single number: how much of the real-domain error is input-code noise?
+qx_ideal = (X / sX)
+out['decomposition'] = dict(
+    input_code_mae=float(np.abs(qx_real - qx_ideal).mean()),
+    input_code_rms_ratio=float(np.sqrt(((qx_real - qx_ideal) ** 2).mean()) / np.sqrt((qx_ideal ** 2).mean())),
+    output_if_input_were_exact=C.rel(ffn(qx_ideal, we, wm, wc, sc_old), Y),
+    note='input_code_rms_ratio is the relative input noise the FFN sees; compare with the 41.8% output error',
+)
+
+# ---- write the real-domain pack (weights + scale table)
+wp = w_old.copy()
+wp[0:65536] = we2.reshape(-1)
+(C.CARD / 'PACK/c128_b9_weights_v3.i8.bin').write_bytes(wp.astype(np.int8).tobytes())
+(C.CARD / 'PACK/c128_b9_scales_v3.f32.bin').write_bytes(sc_final.astype('<f4').tobytes())
+out['v3_pack'] = dict(
+    weights=dict(path=str(C.CARD / 'PACK/c128_b9_weights_v3.i8.bin'),
+                 sha256=C.sha256(C.CARD / 'PACK/c128_b9_weights_v3.i8.bin'), bytes=106496,
+                 changed='expand codes 0..65535 only'),
+    scales=dict(path=str(C.CARD / 'PACK/c128_b9_scales_v3.f32.bin'),
+                sha256=C.sha256(C.CARD / 'PACK/c128_b9_scales_v3.f32.bin'), bytes=4160),
+    producer_untouched=bool(np.array_equal(sc_final[912:1040], sc_old[912:1040])),
+    rel_l2_real_domain=C.rel(y_final, Y),
+    rel_l2_old_real_domain=C.rel(y_real, Y),
+)
+(C.CARD / 'evidence/REAL-QX-HEADROOM.json').write_text(json.dumps(out, indent=2))
+print(json.dumps({k: out[k] for k in ('consistency', 'gain', 'gain_correction', 'retuned',
+                                      'decomposition', 'v3_pack')}, indent=2)[:4500])

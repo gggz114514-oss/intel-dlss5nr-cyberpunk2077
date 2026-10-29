@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""R07 site enumeration and classification (CPU only).
+
+Reads the six deployed R07 modules straight from their raw SPIR-V words and
+registers every OpCooperativeMatrixMulAddKHR: word offset, result id, function,
+operand dtypes, and the *provenance* of both the A and the B operand (which
+buffer, which address expression, after following glslang's materialised
+OpVariable/OpLoad/OpStore chain for cooperative-matrix locals).
+
+Classification is derived, never taken from a file or pass name:
+
+  WO     the B operand is a weight tile loaded from the pack buffer (binding 0)
+         with a half component -> the site *is* the attention output projection
+         matrix multiply;
+  QX     a static matrix multiply performed inside the qX (next-FFN input)
+         production epilogue;
+  OTHER  anything else, reported, never silently dropped.
+
+The dtype rule is the audit's rule (TOOL-DEFECTS.md D2): operand 0 of 4459 is
+the accumulator type; f32 accumulator = FP16 matrix multiply, i32 = INT8.
+
+usage: python sites.py
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CARD = HERE.parent
+sys.path.insert(0, str(HERE))
+import spvlib  # noqa: E402
+
+R = Path("@NR_WORKSPACE@")
+AUDIT = R / "work/codex-astra-fp16-int8-audit-20261024"
+
+MODULES = [
+    # key, family, deployed path (relative to R), ledger sha256, module flavour
+    ("c64_output", "C64",
+     "candidates/amd-map-20261015/round4-integrated/candidate/spv/output-c64.spv",
+     "cd0e196874b19414e9a94490793ebc766070f8a96924f384a22553fafccfcde1",
+     "half-image output, no qX branch"),
+    ("c128_output", "C128",
+     "candidates/amd-map-20261015/s1-integrated/candidate/spv/output-c128-full.spv",
+     "a8b8915562fdc8db52cbb4246ee45eadb86a1881e307575f47dbbef4235cd8bc",
+     "half-image output, no qX branch"),
+    ("c128_producer_b9", "C128",
+     "candidates/codex-sol-int8-pilot-20261018/v6-m8col-20261019/C-producer.spv",
+     "a2fa72d6276964c71bc42b891709ed4bf6ef43c44152fbe496b2da95654a59f5",
+     "int8-only qX output (imgout is int8), fused qX production"),
+    ("c128_producer_b10", "C128",
+     "candidates/codex-sol-int8-nextblock11-20261019/v3-m8col-scale-repair/C-producer.spv",
+     "eb39c1392039444bdff99d8d9da0ff7b73e7fce3f14ba743bd52ab1efd875318",
+     "int8-only qX output (imgout is int8), fused qX production"),
+    ("c256_qx_v5", "C256",
+     "candidates/codex-sol-int8-long-008-20261019/c256-int8-v5-precise-half/spv/c256_output_qx_int8_v5.spv",
+     "4807138a84db58285fd47fe5aa71a83d5f567e01a76cf6e6b2e477c6991e6d27",
+     "half imgout + fused int8 qX store to binding 8 (C256_QX_LAST=0)"),
+    ("c256_qx_last_v5", "C256",
+     "candidates/codex-sol-int8-long-008-20261019/c256-int8-v5-precise-half/spv/c256_output_qx_last_int8_v5.spv",
+     "120e05306220e366b40009ab7d35130a3b4febba33cb72d909df67a4fb76ab62",
+     "half imgout, qX branch compiled out (C256_QX_LAST=1)"),
+]
+
+SLOT = {
+    "PackBuf": "pack(b0)",
+    "AuxBuf": "aux(b1)",
+    "ImageIn": "imgin(b2)",
+    "ImageOut": "imgout(b3)",
+    "DbgBuf": "dbg(b4)",
+    "YBuf": "gY(b6,residual)",
+    "TBuf": "gT(b7,context)",
+    "DestQX": "d_qx(b8)",
+}
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+class Trace(object):
+    """follow glslang's cooperative-matrix materialisation chain"""
+
+    def __init__(self, m):
+        self.m = m
+        self.stores = {}          # var id -> [(inst idx, value id)]
+        for it in m.insts:
+            if it.name == "OpStore":
+                self.stores.setdefault(self.var_of(it.a[0]), []).append((it.idx, it.a[1]))
+
+    def var_of(self, ptr):
+        b = self.m.base_var(ptr)
+        return b if b is not None else ptr
+
+    def def_of(self, vid, before):
+        """value id that defined `vid` most recently before instruction `before`"""
+        it = self.m.byid.get(vid)
+        if it is None:
+            return None, None
+        if it.name == "OpCopyObject":
+            return self.def_of(it.a[2], before)
+        if it.name != "OpLoad":
+            return vid, it
+        var = self.var_of(it.a[2])
+        best = None
+        for idx, val in self.stores.get(var, []):
+            if idx < before:
+                best = (idx, val)
+        if best is None:
+            return vid, it
+        return self.def_of(best[1], best[0])
+
+    def origin(self, vid, before, depth=0):
+        """(producer instruction, cooperative-load record or None)"""
+        if depth > 8:
+            return None
+        d, it = self.def_of(vid, before)
+        if it is None:
+            return None
+        if it.name == "OpCooperativeMatrixLoadKHR":
+            buf = self.m.block_name(self.m.base_var(it.a[2]) or it.a[2]) or "?"
+            return {"kind": "cm_load", "op": it, "buffer": buf,
+                    "slot": SLOT.get(buf, buf),
+                    "address": self.m.resolve(it.a[2])[0],
+                    "stride": self.stride(it.a[4]),
+                    "layout": "ColumnMajor" if self.m.fval(it.a[3]) == 1 else "RowMajor",
+                    "cmat": self.m.cm_type(it.a[0])}
+        if it.name == "OpCooperativeMatrixMulAddKHR":
+            return {"kind": "mma", "op": it, "result_id": it.a[1]}
+        if it.name == "OpCooperativeMatrixConvertKHR":
+            return {"kind": "cm_convert", "op": it, "from": it.a[2],
+                    "cmat": self.m.cm_type(it.a[0])}
+        if it.name in ("OpCompositeConstruct", "OpCompositeExtract", "OpBitcast"):
+            return {"kind": it.name, "op": it}
+        return {"kind": it.name, "op": it}
+
+    def chain(self, vid, before, depth=0):
+        """leaf-to-root provenance tree of a cooperative-matrix value"""
+        if depth > 6:
+            return {"kind": "depth_limit"}
+        d, it = self.def_of(vid, before)
+        if it is None:
+            return {"kind": "unknown"}
+        if it.name == "OpCooperativeMatrixLoadKHR":
+            buf = self.m.block_name(self.m.base_var(it.a[2]) or it.a[2]) or "?"
+            return {"kind": "load", "slot": SLOT.get(buf, buf),
+                    "address": self.m.resolve(it.a[2])[0],
+                    "stride": self.stride(it.a[4]),
+                    "layout": "ColumnMajor" if self.m.fval(it.a[3]) == 1 else "RowMajor"}
+        if it.name == "OpCooperativeMatrixMulAddKHR":
+            return {"kind": "mma", "woff": it.woff, "result_id": it.a[1],
+                    "A": self.chain(it.a[2], it.idx, depth + 1),
+                    "B": self.chain(it.a[3], it.idx, depth + 1),
+                    "C": self.chain(it.a[4], it.idx, depth + 1)}
+        if it.name in ("OpFConvert", "OpCopyObject", "OpBitcast", "OpQuantizeToF16",
+                       "OpSConvert", "OpUConvert", "OpCooperativeMatrixConvertKHR"):
+            return {"kind": it.name, "of": self.chain(it.a[2], it.idx, depth + 1)}
+        if it.name in ("OpFMul", "OpFAdd", "OpFSub", "OpFDiv"):
+            return {"kind": it.name,
+                    "l": self.chain(it.a[2], it.idx, depth + 1),
+                    "r": self.chain(it.a[3], it.idx, depth + 1)}
+        if it.name == "OpCompositeConstruct":
+            return {"kind": it.name,
+                    "elems": [self.chain(x, it.idx, depth + 1) for x in it.a[1:]]}
+        if it.name == "OpCompositeExtract":
+            return {"kind": it.name, "of": self.chain(it.a[2], it.idx, depth + 1)}
+        if it.name in ("OpConstant", "OpConstantComposite", "OpConstantNull"):
+            return {"kind": it.name}
+        return {"kind": it.name}
+
+    def stride(self, sid):
+        v = self.m.fval(sid)
+        return v if v is not None else self.m.resolve(sid)[0]
+
+
+LAYOUT = {0: "RowMajor", 1: "ColumnMajor"}
+
+
+def cm_record(m, it):
+    rec = {"idx": it.idx, "word_offset": it.woff, "opcode": it.name}
+    if it.name == "OpCooperativeMatrixMulAddKHR":
+        rec["result_id"] = it.a[1]
+        rec["result_cmat"] = m.cm_type(it.a[0])
+        rec["A"] = it.a[2]
+        rec["B"] = it.a[3]
+        rec["C"] = it.a[4]
+        rec["A_cmat"] = m.cm_type(m.byid[it.a[2]].a[0]) if it.a[2] in m.byid else None
+        rec["B_cmat"] = m.cm_type(m.byid[it.a[3]].a[0]) if it.a[3] in m.byid else None
+        rec["C_cmat"] = m.cm_type(m.byid[it.a[4]].a[0]) if it.a[4] in m.byid else None
+    elif it.name == "OpCooperativeMatrixLoadKHR":
+        # operands: Result Type, Result, Pointer, Memory Layout, Stride, [ColumnMajor]
+        buf = m.block_name(m.base_var(it.a[2]) or it.a[2]) or "?"
+        rec.update(result_id=it.a[1], cmat=m.cm_type(it.a[0]),
+                   buffer=buf, slot=SLOT.get(buf, buf),
+                   address=m.resolve(it.a[2])[0],
+                   stride=m.fval(it.a[4]) if m.fval(it.a[4]) is not None else m.resolve(it.a[4])[0],
+                   layout="ColumnMajor" if m.fval(it.a[3]) == 1 else "RowMajor")
+    elif it.name == "OpCooperativeMatrixStoreKHR":
+        # operands: Pointer, Object, Memory Layout, Stride, [ColumnMajor]
+        obj = it.a[1]
+        buf = m.block_name(m.base_var(it.a[0]) or it.a[0]) or "?"
+        rec.update(result_id=None, object_id=obj,
+                   cmat=m.cm_type(m.byid[obj].a[0]) if obj in m.byid else None,
+                   buffer=buf, slot=SLOT.get(buf, buf),
+                   address=m.resolve(it.a[0])[0],
+                   stride=m.fval(it.a[3]) if m.fval(it.a[3]) is not None else m.resolve(it.a[3])[0],
+                   layout="ColumnMajor" if m.fval(it.a[2]) == 1 else "RowMajor")
+    return rec
+
+
+def classify(m, tr, s):
+    """WO / QX / OTHER, derived from the B operand provenance"""
+    o = tr.origin(s["B"], s["idx"])
+    s["B_origin"] = {k: v for k, v in (o or {}).items() if k != "op"}
+    b = s["B_cmat"] or {}
+    if o is None:
+        return "OTHER", "B has no traceable definition"
+    if o["kind"] == "cm_load" and o["buffer"] == "PackBuf" and b.get("component") == "f16":
+        return "WO", ("B is an fp16 weight tile loaded from pack(b0) at %s"
+                      % o["address"])
+    if o["kind"] == "cm_load" and b.get("component") == "i8":
+        return "QX", "B is an int8 tile from %s" % o["slot"]
+    if o["kind"] == "mma":
+        return "QX", "B is the result of another matrix multiply (chained)"
+    return "OTHER", "B comes from %s (%s)" % (o.get("slot", o["kind"]), b.get("component"))
+
+
+def main():
+    ev = CARD / "evidence"
+    ev.mkdir(parents=True, exist_ok=True)
+    led = json.load(open(AUDIT / "FULLNET-INT8-IMPLEMENTATION-LEDGER.json", encoding="utf-8"))
+    res = json.load(open(AUDIT / "FULLNET-RESIDUAL-MMA-SITES.json", encoding="utf-8"))
+    by_path = {e["path"]: e for e in res}
+    r07 = [p for p in led["positions"] if p["card"] == "R07"]
+
+    registry = {"modules": {}, "r07_passes": len(r07)}
+    path2key = {}
+    for key, fam, rel, want, flavour in MODULES:
+        p = (R / rel)
+        path2key[p.as_posix()] = key
+        got = sha(p)
+        m = spvlib.Mod(p)
+        tr = Trace(m)
+        cm = [cm_record(m, it) for it in m.insts
+              if it.name in ("OpCooperativeMatrixMulAddKHR",
+                             "OpCooperativeMatrixLoadKHR",
+                             "OpCooperativeMatrixStoreKHR")]
+        mma = [c for c in cm if c["opcode"] == "OpCooperativeMatrixMulAddKHR"]
+        fp16, i32 = [], []
+        for s in mma:
+            c = s["result_cmat"] or {}
+            (fp16 if c.get("component") == "f32" else i32).append(s)
+        for s in fp16:
+            cls, why = classify(m, tr, s)
+            s["class"], s["class_reason"] = cls, why
+            s["C_chain"] = tr.chain(s["C"], s["idx"])
+            s["A_chain"] = tr.chain(s["A"], s["idx"])
+        rec = {
+            "key": key, "family": fam, "flavour": flavour,
+            "path": str(p).replace("\\", "/"), "sha256": got,
+            "sha256_matches_ledger": got == want, "bytes": p.stat().st_size,
+            "words": len(m.w), "bound": m.bound,
+            "static_muladd": len(mma), "static_fp16_muladd": len(fp16),
+            "static_int_muladd": len(i32),
+            "dtype_histogram": {
+                "%s/%s->%s" % ((s["A_cmat"] or {}).get("component"),
+                               (s["B_cmat"] or {}).get("component"),
+                               (s["result_cmat"] or {}).get("component")): 1
+                for s in mma},
+            "lds_bytes": sum(v["bytes"] for v in m.lds()),
+            "lds": [{"name": v["name"], "bytes": v["bytes"]} for v in m.lds()],
+            "cm_loads": [c for c in cm if c["opcode"] == "OpCooperativeMatrixLoadKHR"],
+            "cm_stores": [c for c in cm if c["opcode"] == "OpCooperativeMatrixStoreKHR"],
+            "fp16_sites": [{k: s.get(k) for k in
+                            ("idx", "word_offset", "result_id", "class", "class_reason",
+                             "B_origin", "C_chain")} for s in fp16],
+            "int_sites": [{k: s.get(k) for k in ("idx", "word_offset", "result_id",
+                                                 "B_origin")} for s in i32],
+        }
+        # non-MMA epilogue evidence -------------------------------------------
+        rec["quantize_ops"] = [it.woff for it in m.insts
+                               if it.name in ("OpFConvert", "OpSConvert", "OpQuantizeToF16")]
+        rec["f32_to_f16_narrow_sites"] = [
+            it.woff for it in m.insts
+            if it.name == "OpFConvert" and m.ctype(it.a[0]) == "f16"
+            and it.a[2] in m.byid and m.ctype(m.byid[it.a[2]].a[0]) == "f32"]
+        rec["int8_conv_sites"] = [it.woff for it in m.insts
+                                  if it.name in ("OpSConvert", "OpBitcast")
+                                  and m.ctype(it.a[0]) == "i8"]
+        rec["round_even_sites"] = [it.woff for it in m.insts if it.name == "OpRoundEven"]
+        rec["clamp_sites"] = [it.woff for it in m.insts
+                              if it.name in ("OpExtInst",) and False] or \
+                             [it.woff for it in m.insts if it.name == "OpExtInst"]
+        rec["has_int8_store"] = any(
+            (c["cmat"] or {}).get("component") == "i8" for c in rec["cm_stores"])
+        rec["int8_store_sites"] = [c for c in rec["cm_stores"]
+                                   if (c["cmat"] or {}).get("component") == "i8"]
+        rec["half_store_sites"] = [c["word_offset"] for c in rec["cm_stores"]
+                                   if (c["cmat"] or {}).get("component") == "f16"]
+        registry["modules"][key] = rec
+        print("%-18s muladd=%d f16=%d i32=%d cls=%-6s shared=%5dB qx=%s" % (
+            key, len(mma), len(fp16), len(i32),
+            ",".join(sorted({s["class"] for s in fp16})) or "-",
+            rec["lds_bytes"], rec["has_int8_store"]))
+
+    # ---- register the 33 passes / 80 sites --------------------------------
+    per_pass = []
+    for p in r07:
+        key = path2key[p["spv"]]
+        mod = registry["modules"][key]
+        ledger_sites = by_path[p["spv"]]["fp16_mma_sites"]
+        mine = mod["fp16_sites"]
+        per_pass.append({
+            "pass_name": p["pass_name"], "plan_order": p["plan_order"],
+            "grid": p["grid"], "module_key": key,
+            "module_file": p["spv"].split("/")[-1],
+            "module_sha256": p["sha256"],
+            "fp16_static_mma_count": p["fp16_static_mma_count"],
+            "sites": [{"word_offset": s["word_offset"], "result_id": s["result_id"],
+                       "function": s["function"], "class": c["class"],
+                       "class_reason": c["class_reason"]}
+                      for s, c in zip(ledger_sites, mine)],
+            "word_offsets_match_ledger": [s["word_offset"] for s in ledger_sites] ==
+                                         [s["word_offset"] for s in mine],
+            "result_ids_match_ledger": [s["result_id"] for s in ledger_sites] ==
+                                       [s["result_id"] for s in mine],
+        })
+    class_tot = {}
+    for p in per_pass:
+        for s in p["sites"]:
+            class_tot[s["class"]] = class_tot.get(s["class"], 0) + 1
+    registry["passes"] = per_pass
+    registry["totals"] = {
+        "r07_passes": len(per_pass),
+        "fp16_static_mma_in_ledger": sum(p["fp16_static_mma_count"] for p in per_pass),
+        "registered_sites": sum(len(p["sites"]) for p in per_pass),
+        "class_totals": class_tot,
+        "all_word_offsets_match": all(p["word_offsets_match_ledger"] for p in per_pass),
+        "all_result_ids_match": all(p["result_ids_match_ledger"] for p in per_pass),
+        "passes_with_fused_qx_store": sorted(
+            k for k, v in registry["modules"].items() if v["has_int8_store"]),
+    }
+    (ev / "SITE-REGISTRY.json").write_text(json.dumps(registry, indent=1) + "\n",
+                                           encoding="utf-8")
+    print(json.dumps(registry["totals"], indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

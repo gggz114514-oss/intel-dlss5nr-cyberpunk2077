@@ -1,0 +1,43 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys
+D=Path(__file__).resolve().parent;A=D.parent;B=A.parent.parent;R=A/'c32-rest-20261026';P=A/'c32-no-gain-diagnosis-20261026/combined-no-root-body';F=R/'f20-row-pairs';N=D/'f20-score-den-stream';N.mkdir(exist_ok=True);(N/'run').mkdir(exist_ok=True)
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+ident=lambda p:dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+s=(F/'candidate.comp').read_text(encoding='utf-8-sig');a=s.index('        f16vec4 partial=f16vec4(float16_t(0.0));');b=s.index('        {',s.index('        }',a)+9);old=s[a:b]
+assert 'for(uint j=0u;j<4u;++j)' in old and 'partial[d]=partial[d]+pair;' in old
+s=s[:a]+s[b:]
+anchor='    // ============ stage 6: score + bias/exp';assert s.count(anchor)==1;s=s.replace(anchor,'    f16vec4 partial=f16vec4(float16_t(0.0));\n'+anchor)
+for which,idx in [('0u','2u*j+0u'),('1u','2u*j+1u')]:
+ line=f'p_cache[{idx}]=f16vec4(half_score[0],half_score[1],half_score[2],half_score[3]);'
+ assert s.count(line)==1,line
+ add=f"""\n            {{
+                MAT_A pa; for(int d=0;d<4;++d) pa[d]=p_cache[{idx}][d];
+                vec2 b01=unpackHalf2x16(subgroupShuffleXor(packHalf2x16(vec2(float(pa[0]),float(pa[1]))),8u));
+                vec2 b23=unpackHalf2x16(subgroupShuffleXor(packHalf2x16(vec2(float(pa[2]),float(pa[3]))),8u));
+                f16vec4 peer=f16vec4(b01,b23);
+                if((lane&8u)==0u){{
+                    for(int d=0;d<4;++d){{
+                        float16_t pair=p_cache[{idx}][d]+peer[d];
+                        partial[d]=partial[d]+pair;
+                    }}
+                }}
+            }}"""
+ s=s.replace(line,line+add)
+assert s.count('partial=f16vec4')==1 and s.count('partial[d]=partial[d]+pair;')==2
+# The nested j/half visitation is exactly the previous linear chunk ordering.
+assert [2*j+h for j in range(2) for h in range(2)]==list(range(4))
+src=N/'candidate.comp';spv=N/'candidate.spv';src.write_text(s,encoding='utf-8')
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv]);pm=ST.Module(F/'candidate.spv');cm=ST.Module(spv);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[]);assert len(keep)==len(ST.no_contraction_ids(pm));ST.set_no_contraction(cm,keep,spv);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv]);plan=N/'plan.txt';text=(P/'plan.txt').read_text();assert text.count((F/'candidate.spv').as_posix())==1;plan.write_text(text.replace((F/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8')
+for kind in ['GATES','NATIVE','RESOURCES','ORDINARY']:
+ x=json.loads((P/f'LUNA-{kind}.json').read_text());x['output_root']=str(N)
+ for i,z in enumerate(x['identities']):
+  if Path(z['path'])==F/'candidate.spv':x['identities'][i]=ident(spv)
+ for j in x['jobs']:
+  jp=P/'plan.txt' if kind=='ORDINARY' and j['candidate']=='parent' else plan;j['plan']=ident(jp);j['argv'][j['argv'].index('--plan')+1]=str(jp);j['runner_output']=str(N/'run'/j['id']);j['argv'][j['argv'].index('--out')+1]=j['runner_output']
+  if kind=='NATIVE':
+   ar=j['argv'];ar[ar.index('--output_dir')+1]=str(N/'captures');ar[ar.index('--msg_file')+1]=str(N/'native.log');j['capture_output']=str(N/'captures'/ar[ar.index('--profile_dir')+1])
+ (N/f'LUNA-{kind}.json').write_text(json.dumps(x,indent=2),encoding='utf-8')
+cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check'])
+(N/'PROOF.json').write_text(json.dumps(dict(baseline=ident(P/'plan.txt'),parent_spv=ident(F/'candidate.spv'),source=ident(src),spv=ident(spv),plan=ident(plan),pipeline_indices=[38],pass_indices=[230],NC=info,cpu=cpu,mechanism='Same 4 chunk half pair sums/order and XOR8 followed XOR2/4/1 root tree. Accumulate each chunk immediately after P production, retain original P cache for PV. No added arithmetic, shuffle, input/weight loads, barrier, or changed consumer map. partial8B/lane spans score; peer8B transient overlaps score phase. Native must establish shortened post-score reduction tail and no scratch before timing.'),indent=2),encoding='utf-8');print(ident(spv))

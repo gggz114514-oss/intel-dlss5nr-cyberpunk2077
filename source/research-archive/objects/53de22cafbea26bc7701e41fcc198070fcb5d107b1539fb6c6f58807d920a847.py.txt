@@ -1,0 +1,68 @@
+"""S06 block15 post-GPU diagnosis, part 2: is the local Y gain in the metric the
+downstream actually consumes?
+
+The next stage (c256_attn_full_i8) reads Y, forms per-32-channel square sums
+(c256_norm_sum32) and then quantises with a *dynamic* per-workgroup amax.  A
+gain that lives in the per-token or per-group scale is invisible downstream;
+only the normalised direction survives.  This script reports both.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+import c256b15 as L
+
+W = L.W
+src = (W / "tools/08_emit.py").read_text(encoding="utf-8-sig").split("arms = {")[0]
+ns = {"__name__": "emit", "__file__": str(W / "tools/08_emit.py")}
+exec(compile(src, "08_emit_head", "exec"), ns)
+run, PACKS, raw_old = ns["run"], ns["PACKS"], ns["raw_old"]
+idx, valid, NW = ns["idx"], ns["valid"], ns["NW"]
+
+FRAMES = [("34189", L.D / "dump-fp16"),
+          ("41444", L.D / "teacher-diagnostics/teacher-41444"),
+          ("43654", L.D / "teacher-diagnostics/teacher-43654")]
+ev = {"metric_note": ("raw = elementwise relL2 (what the calibration minimised); "
+                      "tok = per-token mean/std normalised (LayerNorm-projected); "
+                      "g32 = per-32-channel RMS normalised (what c256_norm_sum32 feeds)")}
+acc = {k: dict(raw=[], tok=[], g32=[], cos_tok=[]) for k in ("old", "A_mse")}
+for name, td in FRAMES:
+    Xc = L.load_x_canonical(td / "dump_block14_out.bin")
+    Y = np.fromfile(td / "dump_swin_15_Y.bin", dtype="<f2").reshape(NW, 256).astype(np.float32)
+    Xw = np.zeros((NW, 256), dtype=np.float32)
+    Xw[valid] = Xc[idx[valid]]
+
+    def norms(y):
+        y = y[valid].astype(np.float64)
+        t = Y[valid].astype(np.float64)
+        raw = np.sqrt(np.mean((y - t) ** 2) / np.mean(t ** 2))
+        ym = y - y.mean(axis=1, keepdims=True); tm = t - t.mean(axis=1, keepdims=True)
+        ys = ym / np.maximum(np.sqrt((ym ** 2).mean(axis=1, keepdims=True)), 1e-12)
+        ts = tm / np.maximum(np.sqrt((tm ** 2).mean(axis=1, keepdims=True)), 1e-12)
+        tok = np.sqrt(np.mean((ys - ts) ** 2))
+        cos = float(np.mean(np.sum(ys * ts, axis=1) / 256.0))
+        yg = y.reshape(-1, 8, 32); tg = t.reshape(-1, 8, 32)
+        ygn = yg / np.maximum(np.sqrt((yg ** 2).mean(axis=2, keepdims=True)), 1e-12)
+        tgn = tg / np.maximum(np.sqrt((tg ** 2).mean(axis=2, keepdims=True)), 1e-12)
+        g32 = np.sqrt(np.mean((ygn - tgn) ** 2))
+        return raw, tok, g32, cos
+
+    for tag, raw_pack, use_tab in (("old", raw_old, False), ("A_mse", PACKS["A_mse"]["raw"], True)):
+        r = run(raw_pack, Xw, use_tab)
+        raw, tok, g32, cos = norms(r["y"])
+        acc[tag]["raw"].append(raw); acc[tag]["tok"].append(tok)
+        acc[tag]["g32"].append(g32); acc[tag]["cos_tok"].append(cos)
+    ev[name] = {k: dict(raw=float(acc[k]["raw"][-1]), tok=float(acc[k]["tok"][-1]),
+                        g32=float(acc[k]["g32"][-1]), cos_tok=float(acc[k]["cos_tok"][-1]))
+                for k in ("old", "A_mse")}
+    print(name, json.dumps(ev[name]), flush=True)
+q = {k: dict(raw=float(np.mean(acc[k]["raw"])), tok=float(np.mean(acc[k]["tok"])),
+             g32=float(np.mean(acc[k]["g32"])), cos_tok=float(np.mean(acc[k]["cos_tok"])))
+     for k in acc}
+ev["mean"] = q
+ev["improvement"] = {m: float(1 - q["A_mse"][m] / q["old"][m]) for m in ("raw", "tok", "g32")}
+(W / "evidence/13-ln-metric.json").write_text(json.dumps(ev, indent=1), encoding="utf-8")
+print(json.dumps({k: ev[k] for k in ("mean", "improvement")}, indent=1))

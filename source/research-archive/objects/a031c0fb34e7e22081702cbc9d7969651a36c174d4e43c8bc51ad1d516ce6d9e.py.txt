@@ -1,0 +1,86 @@
+"""Is the network regression an E-saturation effect under the real (INT8-fed) input?
+
+The local arm feeds block 4 the FP16 block-3 exit (what every number so far used).
+In the combo, block 4 is fed the INT8 block-3 exit.  The per-channel E scales are
+max-calibrated, so they have almost no headroom; the old single scale had 20-50x
+headroom on the quiet channels.  This script measures both regimes.
+"""
+import sys, json
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+HERE = Path(__file__).resolve().parent.parent
+info = L.block_bindings(L.D / "c32-equalized-b4/local-b4.txt", ordinal=4)
+we, wc = L.load_w8(info["w8"])
+fsc_old = L.load_fsc(info["fsc"])                       # 324 entries, scalar invE
+wb = np.fromfile(info["wb"], dtype="<f2")
+rs = wb[info["rs_base"] + 8:info["rs_base"] + 40].astype(np.float16)
+invX = fsc_old[L.FSC_INVX:L.FSC_INVX + 32].copy()
+tap_e = fsc_old[4:132].astype(np.float32)
+tap_c_old = fsc_old[132:164].astype(np.float32)
+sX = np.float32(fsc_old[0]); sE_old = np.float32(fsc_old[2])
+sWc_old = tap_c_old / sE_old
+Wc_real = wc.astype(np.float32) * sWc_old[:, None]
+invE_old = np.float32(fsc_old[L.FSC_INV_E])
+
+# this card's pack
+fsc_new = L.load_fsc(HERE / "PACK/c32_block4_xe_scales.f32.bin")
+we_new, wc_new = L.load_w8(HERE / "PACK/c32_block4_xe_weights.i8.bin")
+tap_c_new = fsc_new[132:164].astype(np.float32)
+invE_new = fsc_new[L.FSC_INVE:L.FSC_INVE + 128].copy()
+
+FEEDS = {
+    "fp16_teacher_feed": L.D / "dump-fp16/dump_block3_out.bin",
+    "int8_block3_feed": L.D / "c32-equalized/local-b3/replayed-network.bin",
+}
+rng = np.random.default_rng(4242)
+tiles = np.sort(rng.choice(168 * 96, size=2000, replace=False))
+TT, CC = np.meshgrid(tiles, np.arange(16), indexing="ij")
+TT = TT.ravel(); CC = CC.ravel()
+
+
+def fwd(a_h, seed, wcq, tapc, invE):
+    eq = L.code8_ch(a_h, invE)
+    sat_mask = np.abs(eq) >= 127
+    sat = int(np.count_nonzero(sat_mask))
+    sat_ch = np.count_nonzero(sat_mask, axis=1)
+    acc = np.rint(wcq.astype(np.float64) @ eq.astype(np.float64)).astype(np.int32)
+    return acc.astype(np.float32) * tapc[:, None] + seed, sat, sat_ch
+
+
+out = {}
+for feed, path in FEEDS.items():
+    x_flat = np.fromfile(path, dtype="<f2")
+    x = L.gather(x_flat, TT, CC)
+    xq = L.code8_ch(x, invX)
+    acc_e = np.rint(we.astype(np.float64) @ xq.astype(np.float64)).astype(np.int32)
+    a_h = L.act_h(L.to_half(acc_e.astype(np.float32) * tap_e[:, None]))
+    seed = L.widen(L.to_half(x * rs[:, None]))
+    y_ref = Wc_real @ a_h.astype(np.float32) + seed
+    y_old, sat_old, satch_old = fwd(a_h, seed, wc, tap_c_old, invE_old)
+    y_new, sat_new, satch_new = fwd(a_h, seed, wc_new, tap_c_new, invE_new)
+    am = np.abs(a_h.astype(np.float32)).max(axis=1)
+    head_new = (1.0 / invE_new) * 127.0 / np.maximum(am, 1e-12)
+    out[feed] = dict(
+        path=str(path).replace("\\", "/"), columns=int(TT.size),
+        x_absmax=float(np.abs(x.astype(np.float32)).max()),
+        e_absmax=float(am.max()),
+        e_amax_ratio=float(am.max() / max(am.min(), 1e-12)),
+        old_rel_l2=L.rel_l2(y_old, y_ref), new_rel_l2=L.rel_l2(y_new, y_ref),
+        old_saturated=sat_old, new_saturated=sat_new, codes=int(y_old.size / 32 * 128),
+        old_sat_channels=int(np.count_nonzero(satch_old)),
+        new_sat_channels=int(np.count_nonzero(satch_new)),
+        new_headroom_min=float(head_new.min()),
+        new_headroom_p05=float(np.quantile(head_new, 0.05)),
+        channels_headroom_below_1=int(np.count_nonzero(head_new < 1.0)),
+    )
+    r = out[feed]
+    print(f"{feed:18s} |X|max={r['x_absmax']:7.3f} E|max|={r['e_absmax']:7.3f} "
+          f"old={r['old_rel_l2']:.5f} new={r['new_rel_l2']:.5f} "
+          f"sat_old={r['old_saturated']} sat_new={r['new_saturated']}/{r['codes']} "
+          f"ch_headroom<1: {r['channels_headroom_below_1']}/128 min={r['new_headroom_min']:.3f}")
+
+(HERE / "CPU" / "feed_regimes.json").write_text(json.dumps(out, indent=2))

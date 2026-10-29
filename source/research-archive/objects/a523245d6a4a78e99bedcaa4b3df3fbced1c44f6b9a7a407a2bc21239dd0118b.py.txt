@@ -1,0 +1,401 @@
+"""c32blk.py - CPU reference of the C32 body_1 unified INT8 block (blocks 67/68/69).
+
+Implements exactly the arithmetic of
+  int8-v15-offline-20261028/corrected-20261029/source/c32_body1_i8.comp
+(+ c32_i8_common.glsl, c2_i8_regk32.glsl, register_handoff.glsl), which is the
+body1.spv (sha 90356f47...) bound by plan ordinals 282/283/284.
+
+Pipeline per 8x8 window (64 tokens, 4 subgroups x 16):
+  X (half, io_at0 v1 layout) -> int8 code(fsc[1])
+  expand   E[128]  = We[128,32] @ Xc        (int32 exact), dequant fsc[4+f]
+  act      E       = half(half(acc*tap)) -> MpCubicSilu in half
+  contract E code  = code(E, fsc[3]);  Y = half(acc*tap_c[o] + half(X*rs[o]))
+  QKV      Y code  = per-token amax;  Z = half(acc*(tap_z[o]*sY[t]))
+  norm     per-token half sum-of-squares tree; Qn = half(half(Q*nq)*scalar0)
+  QK       P = exp_h2(half(acc*(sK[k]*sQ[q]) + bias[q,k]))
+  pnorm    per-query 64-key half denominator + half reciprocal
+  PV       Ctx = half(acc*(sV[d]*sP[q]))
+  WO       O = half(acc*(tap_o[ch]*sCtx[t]) + half(Y*ars[ch]))
+  store    io_at0 v1 layout, OOB tiles skipped
+
+All matrix products are integer and exactly representable in float32
+(|sum| <= 128*127*127 < 2**24), so BLAS sgemm reproduces the int32 accumulators.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+H = np.float16
+F = np.float32
+
+TILES_X = 168          # 4x4-pixel tiles per row (672/4)
+TILES_Y = 96           # 384/4
+NWIN_X = 84            # 8x8-pixel windows per row
+NWIN_Y = 48
+NWIN = NWIN_X * NWIN_Y  # 4032
+TOKENS = NWIN * 64      # 258048
+CH = 32
+
+# fsc slots
+FSC_SX, FSC_INVX, FSC_SE, FSC_INVE = 0, 1, 2, 3
+FSC_TAP_E = 4      # +128
+FSC_TAP_C = 132    # +32
+FSC_DQ_Q = 164
+FSC_DQ_K = 196
+FSC_DQ_V = 228
+FSC_DQ_O = 260
+FSC_ENTRIES = 292
+
+
+# --------------------------------------------------------------------- layout
+def token_index(shift_x, shift_y):
+    """(N,32) half-address table for the io_at0 v1 layout used by blocks 66..69.
+
+    addr(t, slot, ch) = t*512 + (ch//16)*256 + slot*16 + ch%16,
+    t = ty*168 + tx, tx = 2*wx + shift_x + (q&1), ty = 2*wy + shift_y + (q>>1).
+    Returns (idx, valid) with idx (N,32) int32 and valid (N,) bool.
+    """
+    idx = np.zeros((TOKENS, CH), np.int32)
+    valid = np.zeros(TOKENS, bool)
+    ch = np.arange(CH, dtype=np.int32)
+    n = 0
+    # vectorised over windows
+    win = np.arange(NWIN)
+    wx = (win % NWIN_X).astype(np.int32)
+    wy = (win // NWIN_X).astype(np.int32)
+    base = np.zeros((NWIN, 4), np.int32)
+    ok = np.zeros((NWIN, 4), bool)
+    for q in range(4):
+        tx = 2 * wx + shift_x + (q & 1)
+        ty = 2 * wy + shift_y + (q >> 1)
+        o = (tx >= 0) & (ty >= 0) & (tx < TILES_X) & (ty < TILES_Y)
+        tcx = np.clip(tx, 0, TILES_X - 1)
+        tcy = np.clip(ty, 0, TILES_Y - 1)
+        base[:, q] = (tcy * TILES_X + tcx) * 512
+        ok[:, q] = o
+    for q in range(4):
+        for slot in range(16):
+            rows = np.arange(NWIN) * 64 + q * 16 + slot
+            idx[rows] = (base[:, q][:, None]
+                         + (ch // 16)[None, :] * 256
+                         + slot * 16
+                         + (ch % 16)[None, :])
+            valid[rows] = ok[:, q]
+    return idx, valid
+
+
+def load_block(path, shift_x, shift_y):
+    idx, valid = token_index(shift_x, shift_y)
+    raw = np.fromfile(path, dtype="<f2")
+    assert raw.size == TOKENS * CH, (path, raw.size)
+    x = raw[idx]
+    x[~valid] = H(0)
+    return x, valid
+
+
+def store_block(path, y, valid, shift_x, shift_y):
+    idx, _ = token_index(shift_x, shift_y)
+    out = np.zeros(TOKENS * CH, H)
+    out[idx[valid]] = y[valid]
+    out.astype("<f2").tofile(path)
+
+
+# ------------------------------------------------------------------ quantisers
+def scale_pair(amax):
+    a = np.asarray(amax, F)
+    s = np.where(a > 0, a * F(1.0 / 127.0), F(0.0)).astype(F)
+    inv = np.where(a > 0, F(127.0) / np.maximum(a, F(1e-30)), F(0.0)).astype(F)
+    return s, inv
+
+
+def q_code(v_half, inv):
+    """nr_i8_code: precise float(v)*inv, roundEven, clamp +-127."""
+    v = np.asarray(v_half, np.float16).astype(F)
+    c = v * np.asarray(inv, F)
+    return np.clip(np.rint(c), -127.0, 127.0).astype(np.int16)
+
+
+def code_ch(v_half, inv_col):
+    return q_code(v_half, inv_col[:, None])
+
+
+def act_h(x_half):
+    x = np.asarray(x_half, H)
+    t = np.clip(x, H(-4.0), H(4.0))
+    u = (t.astype(F) * F(-0.055908203125) + F(0.447265625)).astype(H)      # fma
+    inner = (t.astype(F) * u.astype(F) + F(0.89453125)).astype(H)          # fma
+    return (x.astype(F) * inner.astype(F)).astype(H)
+
+
+def exp_h2(x_half):
+    y = (np.asarray(x_half, H).astype(F) * F(0.044921875) + F(1.30078125)).astype(H)  # fma
+    y = np.clip(y, H(1.03125), H(1.5693359375))
+    b = y.view(np.uint16)
+    return (((b & np.uint16(0x03FF)) << np.uint16(5))).view(H)
+
+
+def fma_h(a, b, c):
+    """one-rounding half fma (exact product, exact add, single half rounding)."""
+    return (np.float64(a) * np.float64(b) + np.float64(c)).astype(H)
+
+
+# --------------------------------------------------------------------- weights
+def w_addr(n, k):
+    return (n // 16) * 512 + (k // 16) * 256 + (n % 16) * 16 + (k % 16)
+
+
+def gather(wb, base, n, k):
+    nn, kk = np.meshgrid(np.arange(n), np.arange(k), indexing="ij")
+    return wb[base + w_addr(nn, kk)]
+
+
+def load_half_pack(path):
+    wb = np.fromfile(path, dtype="<f2")
+    return wb
+
+
+def load_rs(wb, base):
+    return wb[base + 8: base + 40].copy()
+
+
+def load_int8_weights(path):
+    raw = np.fromfile(path, dtype=np.int8)
+    assert raw.size == 49152, raw.size
+    ex = raw[0:16384].reshape(16, 32, 32)
+    we = ex[:, :, :8].transpose(0, 2, 1).reshape(128, 32)
+    ct = raw[16384:32768].reshape(16, 32, 32)
+    wc = np.zeros((32, 128), np.int8)
+    for step in range(4):
+        for g in range(4):
+            t = ct[g * 4 + step][:, :8]
+            for m in range(8):
+                wc[g * 8 + m, step * 32: step * 32 + 32] = t[:, m]
+    tail = raw[32768:49152]
+    tail = tail.reshape(4, 4, 1024)
+
+    def plane(pi):
+        c = np.zeros((32, 32), np.int8)
+        b = tail[pi]
+        for blk in range(4):
+            for m in range(8):
+                c[blk * 8 + m] = b[blk][m::32]
+        return c
+
+    return we, wc, [plane(i) for i in range(4)]
+
+
+# ------------------------------------------------------------------ reductions
+# half sum-of-squares tree of nr_norm32_pair: parity p = channel & 1
+def norm32_pair(x_half, tag):
+    x = np.asarray(x_half, H)
+    n = x.shape[0]
+
+    def part(parity, fma_last):
+        sq = {}
+        for f in range(4):
+            for c in range(4):
+                ch = 8 * f + 2 * c + parity
+                sq[(f, c)] = (x[:, ch].astype(F) * x[:, ch].astype(F)).astype(H)
+        S = []
+        for c in range(4):
+            A = (sq[(0, c)].astype(F) + sq[(2, c)].astype(F)).astype(H)
+            if fma_last and c == 3:
+                B = fma_h(x[:, 31], x[:, 31], sq[(1, 3)])
+            else:
+                B = (sq[(1, c)].astype(F) + sq[(3, c)].astype(F)).astype(H)
+            S.append((A.astype(F) + B.astype(F)).astype(H))
+        lo = (S[0].astype(F) + S[2].astype(F)).astype(H)
+        hi = (S[1].astype(F) + S[3].astype(F)).astype(H)
+        return (lo.astype(F) + hi.astype(F)).astype(H)
+
+    pe = part(0, False)
+    po = part(1, True)
+    tot = (pe.astype(F) + po.astype(F)).astype(H)
+    mx = np.maximum(tot.astype(F), F(np.float16(0.000062)))
+    inv = (F(1.0) / np.sqrt(mx)).astype(H)
+    return inv
+
+
+def pnorm64(p_half):
+    """per-query 64-key denominator tree + half reciprocal (matches the kernel)."""
+    p = np.asarray(p_half, H)          # (...,64 queries,64 keys)
+    dens = {}
+    parts = []
+    for par in (0, 1):
+        S = []
+        for c in range(4):
+            acc = np.zeros(p.shape[:-1], H)
+            for f in (0, 2, 4, 6):
+                pair = (p[..., 8 * f + 2 * c + par].astype(F)
+                        + p[..., 8 * (f + 1) + 2 * c + par].astype(F)).astype(H)
+                acc = (acc.astype(F) + pair.astype(F)).astype(H)
+            S.append(acc)
+        parts.append(((S[0].astype(F) + S[2].astype(F)).astype(H).astype(F)
+                      + (S[1].astype(F) + S[3].astype(F)).astype(H).astype(F)).astype(H))
+    tot = (parts[0].astype(F) + parts[1].astype(F)).astype(H)
+    inv = (F(1.0) / np.maximum(tot.astype(F), F(6.103515625e-05))).astype(H)
+    return (p.astype(F) * inv[..., None].astype(F)).astype(H)
+
+
+# ---------------------------------------------------------------------- block
+class Block:
+    def __init__(self, half_pack, int8_pack, scales, aux, push):
+        self.wb = load_half_pack(half_pack)
+        self.we, self.wc, tail = load_int8_weights(int8_pack)
+        self.wq, self.wk, self.wv, self.wo = tail
+        self.fsc = np.fromfile(scales, dtype="<f4").astype(F)
+        assert self.fsc.size == FSC_ENTRIES
+        self.aux = np.fromfile(aux, dtype="<f4").astype(F)
+        self.push = [int(x) if -2**31 <= int(x) < 2**31 else int(x) - 2**32 for x in push]
+        self.shift_x = int(self.push[1])
+        self.shift_y = int(self.push[15])
+        self.rs_base, self.ars_base = int(self.push[8]), int(self.push[9])
+        self.scalar0_idx, self.bias_base = int(self.push[10]), int(self.push[11])
+        self.tiles_y = int(self.push[14])
+        self.rs = load_rs(self.wb, self.rs_base)
+        self.ars = self.wb[self.ars_base:self.ars_base + 32].copy()
+        self.scalar0 = H(self.aux[self.scalar0_idx])
+        # bias[q,k] = aux[base + (q//16)*1024 + (q%16)*64 + k]
+        q = np.arange(64)[:, None]
+        k = np.arange(64)[None, :]
+        self.bias = self.aux[self.bias_base + (q // 16) * 1024 + (q % 16) * 64 + k].astype(F)
+        self.even = np.arange(32) % 2 == 0
+
+    # -- scale overrides ---------------------------------------------------
+    def with_scales(self, sx=None, invx=None, se=None, inve=None,
+                    tap_e_effective_from_sx=True, tap_c_effective_from_se=True):
+        """Return a copy whose X/E static quantisers (and the matching weight taps)
+        are replaced.  The *effective* dequantised weight is preserved: the tap
+        family is rescaled by new_s/old_s, so only the activation quantisation
+        changes."""
+        b = object.__new__(Block)
+        b.__dict__.update(self.__dict__)
+        fsc = self.fsc.copy()
+        old_sx, old_se = self.fsc[FSC_SX], self.fsc[FSC_SE]
+        if sx is not None:
+            fsc[FSC_SX] = sx
+            fsc[FSC_INVX] = invx if invx is not None else F(1.0) / F(sx)
+            if tap_e_effective_from_sx:
+                fsc[FSC_TAP_E:FSC_TAP_E + 128] *= F(sx) / old_sx
+        elif invx is not None:
+            fsc[FSC_INVX] = invx
+            fsc[FSC_SX] = F(127.0) / F(invx)
+        if se is not None:
+            fsc[FSC_SE] = se
+            fsc[FSC_INVE] = inve if inve is not None else F(1.0) / F(se)
+            if tap_c_effective_from_se:
+                fsc[FSC_TAP_C:FSC_TAP_C + 32] *= F(se) / old_se
+        elif inve is not None:
+            fsc[FSC_INVE] = inve
+            fsc[FSC_SE] = F(127.0) / F(inve)
+        b.fsc = fsc
+        return b
+
+    # -- forward -----------------------------------------------------------
+    def forward(self, x_half, valid, chunk_windows=504, trace=False):
+        x_half = np.asarray(x_half, H)
+        fsc = self.fsc
+        invx = fsc[FSC_INVX]
+        inve = fsc[FSC_INVE]
+        tap_e = fsc[FSC_TAP_E:FSC_TAP_E + 128]
+        tap_c = fsc[FSC_TAP_C:FSC_TAP_C + 32]
+        tap_q = fsc[FSC_DQ_Q:FSC_DQ_Q + 32]
+        tap_k = fsc[FSC_DQ_K:FSC_DQ_K + 32]
+        tap_v = fsc[FSC_DQ_V:FSC_DQ_V + 32]
+        tap_o = fsc[FSC_DQ_O:FSC_DQ_O + 32]
+        out = np.zeros((TOKENS, CH), H)
+        seeds = np.zeros((TOKENS, CH), H) if trace else None
+        attns = np.zeros((TOKENS, CH), H) if trace else None
+        tr = {}
+        cw = chunk_windows
+        for w0 in range(0, NWIN, cw):
+            w1 = min(w0 + cw, NWIN)
+            a, b = w0 * 64, w1 * 64
+            x = x_half[a:b]
+            v = valid[a:b]
+            # ---- FFN -----------------------------------------------------
+            xc = q_code(x, F(1.0) * invx).astype(F)
+            e_acc = xc @ self.we.T.astype(F)                    # (n,128) exact
+            e_h = (e_acc * tap_e[None, :]).astype(H)            # dequant + narrow
+            a_h = act_h(e_h)
+            ec = q_code(a_h, inve).astype(F)
+            y_acc = ec @ self.wc.T.astype(F)                    # (n,32) exact
+            seed = (x.astype(F) * self.rs[None, :].astype(F)).astype(H).astype(F)
+            y = (y_acc * tap_c[None, :] + seed).astype(H)
+            # ---- QKV -----------------------------------------------------
+            ymx = np.abs(y.astype(F)).max(axis=1)
+            sy, iy = scale_pair(ymx)
+            yc = q_code(y, iy[:, None]).astype(F)
+            q = (yc @ self.wq.T.astype(F) * (tap_q[None, :] * sy[:, None])).astype(H)
+            k = (yc @ self.wk.T.astype(F) * (tap_k[None, :] * sy[:, None])).astype(H)
+            vv = (yc @ self.wv.T.astype(F) * (tap_v[None, :] * sy[:, None])).astype(H)
+            # ---- norm ----------------------------------------------------
+            nq = norm32_pair(q, "q")
+            nk = norm32_pair(k, "k")
+            qn = ((q.astype(F) * nq[:, None].astype(F)).astype(H).astype(F)
+                  * self.scalar0.astype(F)).astype(H)
+            kn = (k.astype(F) * nk[:, None].astype(F)).astype(H)
+            # ---- Q/K quantise -------------------------------------------
+            qmx = np.abs(qn.astype(F)).max(axis=1)
+            kmx = np.abs(kn.astype(F)).max(axis=1)
+            qs, iq = scale_pair(qmx)
+            ks, ik = scale_pair(kmx)
+            qc = q_code(qn, iq[:, None]).astype(F)
+            kc = q_code(kn, ik[:, None]).astype(F)
+            # ---- per-window attention -----------------------------------
+            nw = w1 - w0
+            Qc = qc.reshape(nw, 64, 32)
+            Kc = kc.reshape(nw, 64, 32)
+            Vh = vv.reshape(nw, 64, 32)
+            qs_w = qs.reshape(nw, 64)
+            ks_w = ks.reshape(nw, 64)
+            sc = np.matmul(Kc, Qc.transpose(0, 2, 1))            # (w,key,query)
+            sc = sc * (ks_w[:, :, None] * qs_w[:, None, :])
+            sc = (sc + self.bias[None, :, :]).astype(H)
+            p = exp_h2(sc)                                       # (w,64q,64k)
+            pn = pnorm64(p)
+            # ---- P quantise (per query) ---------------------------------
+            pmx = np.abs(pn.astype(F)).max(axis=2)
+            ps, ip = scale_pair(pmx)
+            pc = q_code(pn, ip[:, :, None]).astype(F)
+            # ---- V scale (per window, per dim over 64 keys) --------------
+            vmx = np.abs(Vh.astype(F)).max(axis=1)                # (w,32)
+            vs = np.where(vmx > 0, vmx * F(1.0 / 127.0), F(0.0)).astype(F)
+            iv = np.where(vs > 0, F(1.0) / np.maximum(vs, F(1e-30)), F(0.0)).astype(F)
+            vc = q_code(Vh, iv[:, None, :]).astype(F)
+            # ---- PV ------------------------------------------------------
+            ctx = np.matmul(pc, vc)                              # (w,query,dim)
+            ctx = ctx * (vs[:, None, :] * ps[:, :, None])
+            ctx_h = ctx.astype(H)
+            # ---- Ctx quantise + WO --------------------------------------
+            cmx = np.abs(ctx_h.astype(F)).max(axis=2)
+            cs, ic = scale_pair(cmx)
+            cc = q_code(ctx_h, ic[:, :, None]).astype(F)
+            o_acc = cc.reshape(-1, 32) @ self.wo.T.astype(F)
+            yseed = (y.astype(F) * self.ars[None, :].astype(F)).astype(H).astype(F)
+            attn = o_acc * (tap_o[None, :] * cs.reshape(-1)[:, None])
+            o = (attn + yseed).astype(H)
+            out[a:b] = o
+            if trace:
+                seeds[a:b] = yseed.astype(H)
+                attns[a:b] = attn.astype(H)
+            if trace and w0 == 0:
+                tr = {"x": x, "e_h": e_h, "y": y, "q_raw": q, "k_raw": k, "v": vv,
+                      "q_norm": qn, "p": p, "pn": pn, "ctx": ctx_h, "o": o,
+                      "sy": sy, "qs": qs, "ks": ks, "ps": ps, "vs": vs, "cs": cs,
+                      "seed": seeds, "attn": attns, "valid": valid}
+        return out, tr
+
+
+def rel_l2(a, b):
+    a = np.asarray(a, np.float64)
+    b = np.asarray(b, np.float64)
+    return float(np.sqrt(np.sum((a - b) ** 2) / max(np.sum(b ** 2), 1e-30)))
+
+
+def corr(a, b):
+    a = np.asarray(a, np.float64).ravel()
+    b = np.asarray(b, np.float64).ravel()
+    a = a - a.mean()
+    b = b - b.mean()
+    return float(a @ b / max(np.linalg.norm(a) * np.linalg.norm(b), 1e-30))

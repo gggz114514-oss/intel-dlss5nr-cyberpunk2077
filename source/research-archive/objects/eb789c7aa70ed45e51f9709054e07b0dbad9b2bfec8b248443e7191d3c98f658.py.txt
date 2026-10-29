@@ -1,0 +1,235 @@
+import datetime
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+GAME_PLUGINS = Path(r"@NR_GAME@\bin\x64\plugins")
+PKG_CFG = Path(r"@NR_WORKSPACE@\work\github-experimental-game-install-20261024\package\config")
+OUT_DIR = Path(r"@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\prep-gpu-handoff-20261028\latelatch-eval-20261028")
+CTL_INI = GAME_PLUGINS / "dsh_diag_control.ini"
+SNAPSHOTS_PATH = OUT_DIR / "window-snapshots.jsonl"
+META_PATH = OUT_DIR / "window-metadata.json"
+PROGRESS_PATH = OUT_DIR / "capture-progress.json"
+
+
+def write_ctl_ini(mode: int, window_id: int, arm_reuse: int, late_latch: int, flush_seq: int) -> None:
+    content = (
+        f"[diag]\r\n"
+        f"mode={mode}\r\n"
+        f"window_id={window_id}\r\n"
+        f"arm_reuse={arm_reuse}\r\n"
+        f"late_latch={late_latch}\r\n"
+        f"flush_seq={flush_seq}\r\n"
+        f"out_dir={OUT_DIR}\r\n"
+    )
+    tmp = CTL_INI.with_suffix(".ini.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, CTL_INI)
+
+
+def read_json_safe(path: Path):
+    for _ in range(5):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            time.sleep(0.05)
+    return None
+
+
+def update_progress(state: str, detail: dict) -> None:
+    payload = {
+        "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "state": state,
+        **detail,
+    }
+    try:
+        PROGRESS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    print(json.dumps(payload), flush=True)
+
+
+def wait_for_stationary_scene() -> None:
+    update_progress("WAITING_FOR_STATIONARY_SCENE", {"instruction": "Please enter the in-game 3D save scene"})
+    last_frames = None
+    last_change_t = time.perf_counter()
+    consecutive_active_updates = 0
+    polls = 0
+    while True:
+        polls += 1
+        now_t = time.perf_counter()
+        comp = read_json_safe(PKG_CFG / "component_status.json") or {}
+        panel = read_json_safe(PKG_CFG / "panel_state.json") or {}
+        diag = read_json_safe(OUT_DIR / "DIAG-LIVE-STATUS.json") or {}
+        stage = panel.get("stage") or {}
+        handoff = panel.get("handoff") or {}
+
+        valid_context = (
+            comp.get("build_id") == "optimized-full-gpu-handoff-v1"
+            and comp.get("init_state") == 2
+            and comp.get("gpu_timeout") == 0
+            and comp.get("fallback") == 0
+            and panel.get("backend") == "small"
+            and panel.get("mounted") == 1
+            and (handoff.get("bypasses") or 0) > 0
+            and bool(diag.get("active"))
+        )
+        frames = int(diag.get("nr_completed") or stage.get("frames") or 0)
+        total_ms = float(stage.get("total") or 0.0)
+
+        if last_frames is None:
+            last_frames = frames
+            last_change_t = now_t
+        elif frames != last_frames:
+            delta = frames - last_frames
+            last_frames = frames
+            last_change_t = now_t
+            in_save_scene = (frames >= 150 and 15.0 <= total_ms <= 40.0) or (frames > 3000)
+            if valid_context and in_save_scene and delta >= 8:
+                consecutive_active_updates += 1
+            else:
+                consecutive_active_updates = 0
+        else:
+            if (now_t - last_change_t) > 2.5:
+                consecutive_active_updates = 0
+
+        if polls % 8 == 0:
+            update_progress(
+                "WAITING_STATUS",
+                {
+                    "valid_context": valid_context,
+                    "nr_completed": frames,
+                    "panel_total_ms": total_ms,
+                    "consecutive_active_updates": consecutive_active_updates,
+                },
+            )
+
+        if valid_context and consecutive_active_updates >= 5:
+            update_progress(
+                "SCENE_READY",
+                {
+                    "nr_completed": frames,
+                    "panel_total_ms": total_ms,
+                    "consecutive_active_updates": consecutive_active_updates,
+                },
+            )
+            return
+
+        time.sleep(0.25)
+
+
+def wait_for_diag_ack(mode: int, window_id: int, arm_reuse: int, late_latch: int, timeout_s: float = 10.0) -> dict:
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        diag = read_json_safe(OUT_DIR / "DIAG-LIVE-STATUS.json") or {}
+        if (
+            diag.get("active") is True
+            and int(diag.get("mode", -1)) == mode
+            and int(diag.get("window_id", -1)) == window_id
+            and int(diag.get("arm_reuse", -1)) == arm_reuse
+            and int(diag.get("late_latch", -1)) == late_latch
+        ):
+            return diag
+        time.sleep(0.1)
+    return read_json_safe(OUT_DIR / "DIAG-LIVE-STATUS.json") or {}
+
+
+def main() -> None:
+    if SNAPSHOTS_PATH.exists():
+        SNAPSHOTS_PATH.unlink()
+    if (OUT_DIR / "DIAG-LIVE-STATUS.json").exists():
+        (OUT_DIR / "DIAG-LIVE-STATUS.json").unlink()
+
+    flush_seq = 0
+    write_ctl_ini(mode=0, window_id=0, arm_reuse=1, late_latch=1, flush_seq=flush_seq)
+    wait_for_stationary_scene()
+
+    windows = [
+        {"name": "W1_SYNC_1", "window_id": 1, "mode": 2, "arm_reuse": 1, "late_latch": 0, "settling_s": 1.5, "min_duration_s": 8.0, "target_frames": 250},
+        {"name": "W2_LATELATCH_1", "window_id": 2, "mode": 2, "arm_reuse": 1, "late_latch": 1, "settling_s": 1.5, "min_duration_s": 8.0, "target_frames": 250},
+        {"name": "W3_SYNC_2", "window_id": 3, "mode": 2, "arm_reuse": 1, "late_latch": 0, "settling_s": 1.5, "min_duration_s": 8.0, "target_frames": 250},
+        {"name": "W4_LATELATCH_2", "window_id": 4, "mode": 2, "arm_reuse": 1, "late_latch": 1, "settling_s": 1.5, "min_duration_s": 8.0, "target_frames": 250},
+    ]
+
+    window_meta = []
+
+    with SNAPSHOTS_PATH.open("w", encoding="utf-8", newline="\n") as snap_file:
+        for idx, w in enumerate(windows):
+            write_ctl_ini(w["mode"], w["window_id"], w["arm_reuse"], w["late_latch"], flush_seq)
+            ack_diag = wait_for_diag_ack(w["mode"], w["window_id"], w["arm_reuse"], w["late_latch"])
+            win_start_frame = int(ack_diag.get("nr_completed") or 0)
+            settling_end_frame = None
+
+            update_progress(
+                "RUNNING_WINDOW",
+                {
+                    "window_name": w["name"],
+                    "window_id": w["window_id"],
+                    "mode": w["mode"],
+                    "late_latch": w["late_latch"],
+                    "win_start_frame": win_start_frame,
+                    "flush_seq": flush_seq,
+                },
+            )
+
+            start_t = time.perf_counter()
+            i = 0
+            last_seen_frames = win_start_frame
+            while True:
+                target_t = start_t + i * 0.5
+                now_t = time.perf_counter()
+                if now_t < target_t:
+                    time.sleep(target_t - now_t)
+                elapsed = time.perf_counter() - start_t
+                is_settling = elapsed < (w["settling_s"] - 1e-3)
+
+                diag = read_json_safe(OUT_DIR / "DIAG-LIVE-STATUS.json")
+                cur_frames = int((diag or {}).get("nr_completed") or 0)
+                last_seen_frames = cur_frames
+
+                if not is_settling and settling_end_frame is None and diag:
+                    settling_end_frame = cur_frames
+
+                rec = {
+                    "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "window_name": w["name"],
+                    "window_id": w["window_id"],
+                    "mode": w["mode"],
+                    "late_latch": w["late_latch"],
+                    "elapsed_sec": round(elapsed, 3),
+                    "settling": is_settling,
+                    "diag_live_status": diag,
+                }
+                snap_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                snap_file.flush()
+
+                post_settling_frames = cur_frames - settling_end_frame if settling_end_frame else 0
+                if (not is_settling) and (elapsed >= w["min_duration_s"]) and (post_settling_frames >= w["target_frames"]):
+                    break
+                i += 1
+
+            meta = {
+                "window_name": w["name"],
+                "window_id": w["window_id"],
+                "mode": w["mode"],
+                "late_latch": w["late_latch"],
+                "win_start_frame": win_start_frame,
+                "settling_end_frame": settling_end_frame,
+                "win_end_frame": last_seen_frames,
+                "post_settling_frames": (last_seen_frames - settling_end_frame) if settling_end_frame else 0,
+                "duration_sec": round(time.perf_counter() - start_t, 3),
+            }
+            window_meta.append(meta)
+            update_progress("WINDOW_FINISHED", meta)
+
+    flush_seq += 1
+    write_ctl_ini(mode=0, window_id=0, arm_reuse=1, late_latch=1, flush_seq=flush_seq)
+    time.sleep(1.0)
+    META_PATH.write_text(json.dumps(window_meta, indent=2), encoding="utf-8")
+    update_progress("ALL_WINDOWS_COMPLETED", {"flush_seq": flush_seq, "windows": window_meta})
+
+
+if __name__ == "__main__":
+    main()

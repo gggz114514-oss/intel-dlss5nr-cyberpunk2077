@@ -1,0 +1,40 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys
+R=Path(__file__).resolve().parent;A=R.parent;B=A.parents[1]
+P=R/'f20-score-owner';N=R/'f20-den-late-approx';N.mkdir(exist_ok=True)
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+ return r.stdout
+s=(P/'candidate.comp').read_text(encoding='utf-8-sig');lo=s.index('        for(uint j=0u;j<4u;++j){',s.index('// Den is reduced'));hi=s.index('        {\n            vec2 b01=',lo+1)
+new='''        // APPROXIMATION: round local partials before the lane-8 exchange.
+        // No term is dropped; the half-add tree deliberately differs from P03.
+        for(uint j=0u;j<4u;++j)
+            for(int d=0;d<4;++d) partial[d]=partial[d]+p_cache[j][d];
+        {
+            vec2 b01=unpackHalf2x16(subgroupShuffleXor(packHalf2x16(vec2(float(partial[0]),float(partial[1]))),8u));
+            vec2 b23=unpackHalf2x16(subgroupShuffleXor(packHalf2x16(vec2(float(partial[2]),float(partial[3]))),8u));
+            f16vec4 peer=f16vec4(b01,b23);
+            if((lane&8u)==0u) for(int d=0;d<4;++d) partial[d]=partial[d]+peer[d];
+        }
+'''
+c=s[:lo]+new+s[hi:];src=N/'candidate.comp';spv=N/'candidate.spv';src.write_text(c,encoding='utf-8')
+run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv])
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+pm=ST.Module(P/'candidate.spv');cm=ST.Module(spv);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[]);assert len(keep)==7;ST.set_no_contraction(cm,set(keep),spv)
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+t=(P/'plan.txt').read_text();assert t.count((P/'candidate.spv').as_posix())==1
+plan=N/'plan.txt';plan.write_text(t.replace((P/'candidate.spv').as_posix(),spv.as_posix()))
+proto=json.loads((P/'LUNA-GATES.json').read_text());runner=Path(proto['identities'][0]['path'])
+(N/'CANDIDATE.json').write_text(json.dumps(dict(source=ident(src),spv=ident(spv),plan=ident(plan),parent=ident(P/'plan.txt'),cpu=run([runner,'--plan',plan,'--cpu-check']),approximation='Half den order: sum_j H(p_j+peer_j) becomes H(sum_j p_j + sum_j peer_j). Downstream unchanged.',scope='Only den block changed; all terms present, same owners. p_cache32B/lane and partial8B/lane unchanged; no new long-lived fragment.',expected_work='Lane-8 packed shuffle calls 8->2 per SG; remaining XOR2/4/1 and inv broadcast unchanged. No extra memory/barriers/MMA. More lanes compute local partials; no claim equal ALU work.',quality='User prioritizes visual and feedback stability; no PSNR acceptance threshold invented.'),indent=2))
+task=dict(working_directory=str(B),output_root=str(N),identities=[ident(runner),ident(P/'candidate.spv'),ident(spv)],jobs=[],rules=['Approximation measurement, NOT byte-exact gate. Parent must known gold on frame0/1. Candidate differences expected; do not stop merely for different hash. Stop on process error/nonfinite/wrong dimensions. Two serial warm0/reps16 feedback/save-frames runs. Unique GPU lock. No optimization or other runs.'])
+for arm,base in [('parent',P),('candidate',N)]:
+ dest=N/'run'/('quality-'+arm)
+ task['jobs'].append(dict(id='quality-'+arm,candidate=arm,plan=ident(base/'plan.txt'),runner_output=str(dest),argv=[str(runner),'--plan',str(base/'plan.txt'),'--out',str(dest),'--pool','--warm','0','--reps','16','--feedback','--save-frames'],expected_frames=16,expected_frame_bytes=29491200,expected_gpu_passes=232))
+(N/'LUNA-QUALITY.json').write_text(json.dumps(task,indent=2))
+native=json.loads((P/'LUNA-NATIVE.json').read_text().replace('f20-score-owner','f20-den-late-approx'))
+native['identities']=[x for x in native['identities'] if not x['path'].endswith('.spv')]+[ident(spv)]
+for j in native['jobs']:
+ j['plan']=ident(plan);j.pop('expected_fixed_frame_out',None)
+native['rules']=['Approximation native capture. Frame must match candidate quality frame0, not parent gold. No ordinary until main review. Unique lock, errors stop.']
+(N/'LUNA-NATIVE.json').write_text(json.dumps(native,indent=2));print(ident(spv))

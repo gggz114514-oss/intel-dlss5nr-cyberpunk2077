@@ -1,0 +1,235 @@
+"""Host-side reader for the n02d 8x64 lane-map probe dump (CPU only).
+
+Input is what the GPU arm produces with
+
+    clock_runner.exe --plan probe-plan.txt --out <fresh> --pool --warm 0 --reps 1 \
+                     --dump-intermediates
+
+i.e. `dump_swin_1_debug.bin` (float16 elements, the `dbg` storage buffer) plus the
+static bias table `swin_1_aux.bin` (that pass's `fb` binding, float32 elements).
+
+Layout written by probe.comp (inside `if(debug && sg==0u)`):
+    dbg[24448 + k*32 + lane] = float16(band0[k])   band0 = rows t0..t0+7, cols 0..63
+    dbg[10240 + k*32 + lane] = float16(band1[k])   k = 0..3 only
+    dbg[12288 + c*32 + lane] = float16(narrow[c])  the existing 8x16 site (h0,b0)
+
+Method (no assumption about the lane map, and immune to repeated bias values):
+  for each band component k and each candidate role (col block b, component c) ask
+  "does comp k of lane L equal the tile element that role needs, for ALL 32 lanes?".
+  A wrong role survives only if the table repeats the same value in 32 different
+  places, so the 16x16 consistency matrix is essentially diagonal.  The measured
+  permutation is then a bijection check, not a heuristic.
+
+Verdicts
+  H1          component k = 4b+c holds exactly the (b,c) element -> the candidate as
+              written is numerically exact; the bias add is a register rename.
+  PERM        a different within-lane permutation of the same 16 elements -> still a
+              register rename; re-point NRH_C64_AT() with the printed perm, rebuild.
+  CROSS-LANE  some component holds an element no site of this lane can use -> the band
+              read needs cross-lane transport, the mechanism is net-negative, report
+              it as such (do not "fix" it by adding shuffles).
+  NO-BASE / AMBIGUOUS-BASE  the dump does not line up with fb; nothing is concluded.
+
+`--synthetic H1|NAIVE` fabricates a dump from the same fb table and runs the whole
+pipeline, so this reader is unit-tested before a GPU slot is spent on it.
+"""
+import argparse
+import json
+import struct
+import sys
+from pathlib import Path
+
+BAND0_BASE = 24448          # must match probe.comp NRH_PROBE_BAND0
+BAND1_BASE = 10240
+NARROW_BASE = 12288
+WIDE, TALL = 64, 8          # band geometry: 8 rows x 64 columns
+
+
+def read_f16(path, offset_elems, count):
+    b = Path(path).read_bytes()
+    return list(struct.unpack_from('<%de' % count, b, offset_elems * 2))
+
+
+def read_f32(path, count=None):
+    b = Path(path).read_bytes()
+    n = len(b) // 4 if count is None else count
+    return list(struct.unpack_from('<%df' % n, b, 0))
+
+
+def h16(x):
+    """Round a python float to an IEEE binary16 value (same as float16_t())."""
+    return struct.unpack('<e', struct.pack('<e', float(x)))[0]
+
+
+def site_element(row_half, col_block, comp, lane):
+    """(row, col) that an 8x16 accumulator component must hold, from the sealed law
+    row = 2*comp + (lane>>4), col = lane & 15 (register_handoff.glsl nrh_coord_C)."""
+    return (row_half * TALL + 2 * comp + (lane >> 4), col_block * 16 + (lane & 15))
+
+
+def tile_index(row, col):
+    return row * WIDE + col
+
+
+def band_pred(fb, W, row_half, col_block, comp, lane):
+    r, c = site_element(row_half, col_block, comp, lane)
+    return h16(fb[W + tile_index(r, c)])
+
+
+def role_matrix(fb, W, band, row_half):
+    """match[k][b][c] = number of lanes where comp k equals the (b,c) role value."""
+    out = [[[0] * 4 for _ in range(4)] for _ in range(16)]
+    for k in range(16):
+        for b in range(4):
+            for c in range(4):
+                n = sum(1 for lane in range(32)
+                        if band[k * 32 + lane] == band_pred(fb, W, row_half, b, c, lane))
+                out[k][b][c] = n
+    return out
+
+
+def best_assignment(mat, need=32):
+    """k -> (b,c) with 32/32 lanes, plus how many candidates survive."""
+    out, multi = {}, 0
+    for k in range(16):
+        cands = [(b, c) for b in range(4) for c in range(4) if mat[k][b][c] == need]
+        if len(cands) > 1:
+            multi += 1
+        out[k] = cands[0] if cands else None
+    return out, multi
+
+
+def analyse(args):
+    fb = read_f32(args.fb)
+    report = {'dump': str(args.dump), 'fb': str(args.fb), 'fb_elements': len(fb),
+              'mode': args.mode}
+    if args.mode == 'real':
+        band0 = read_f16(args.dump, BAND0_BASE, 16 * 32)
+        band1 = read_f16(args.dump, BAND1_BASE, 4 * 32)
+        narrow = read_f16(args.dump, NARROW_BASE, 4 * 32)
+    else:
+        band0 = [band_pred(fb, args.synthetic_base, 0, k // 4, k % 4, lane)
+                 if args.synthetic == 'H1'
+                 else h16(fb[args.synthetic_base + 32 * k + lane])
+                 for k in range(16) for lane in range(32)]
+        band1 = [band_pred(fb, args.synthetic_base, 1, k // 4, k % 4, lane)
+                 for k in range(4) for lane in range(32)]
+        narrow = [band_pred(fb, args.synthetic_base, 0, 0, c, lane)
+                  for c in range(4) for lane in range(32)]
+        report['synthetic'] = args.synthetic
+        report['synthetic_base'] = args.synthetic_base
+    report['band0_entries'] = len(band0)
+
+    # ---- 1. locate the band base inside fb -------------------------------
+    # the base is the push-constant bias base (t0 = 0 for sg 0); scan for the offset
+    # where the 16x64 tile explains the dump.  The scan is cheap and removes the need
+    # to trust the plan's PUSH words.
+    best = None
+    W_hits = []
+    for W in range(0, max(1, len(fb) - 512) + 1, 1):
+        if any(fb[W + z] != fb[W + z] for z in range(0, 8)):     # cheap NaN probe
+            continue
+        mat = role_matrix(fb, W, band0, 0)
+        good = sum(1 for k in range(16) if max(mat[k][b][c] for b in range(4)
+                                               for c in range(4)) >= 31)
+        if good >= 16:
+            W_hits.append(W)
+            if best is None:
+                best = W
+    report['base_candidates'] = W_hits[:8]
+    if not W_hits:
+        # Did the read happen at all?  If every dumped value exists somewhere in fb, the
+        # band was read but its layout is not a lane-local assignment of the 16x64 tile.
+        present = {h16(v) for v in fb}
+        seen = sum(1 for v in band0 if v in present)
+        report['dumped_values_present_in_fb'] = '%d/%d' % (seen, len(band0))
+        if seen >= 0.99 * len(band0):
+            report['verdict'] = 'CROSS-LANE'
+            report['within_lane_permutation'] = False
+            report['meaning'] = ('the band was read (all dumped values exist in fb) but no '
+                                 'lane-local role assignment explains them: the component map '
+                                 'mixes rows/columns across lanes.  Extracting the 8x16 sites '
+                                 'would then need cross-lane transport (>=64 subgroup shuffles '
+                                 'per subgroup against 56 saved uniform messages): report the '
+                                 'mechanism as blocked, do not add the shuffles.')
+        else:
+            report['verdict'] = 'NO-BASE'
+            report['meaning'] = ('the dumped band does not come from fb: either the dump '
+                                 'offsets moved or the probe arm did not execute '
+                                 '(--dump-intermediates + debug hard-wired in probe.comp).')
+        return report
+    W = best
+    report['base'] = W
+
+    # ---- 2. the 16x16 role matrix at that base ---------------------------
+    mat = role_matrix(fb, W, band0, 0)
+    assign, multi = best_assignment(mat)
+    report['role_matrix_matches'] = {('k%d' % k):
+                                     {('b%dc%d' % (b, c)): mat[k][b][c]
+                                      for b in range(4) for c in range(4)}
+                                     for k in range(16)}
+    report['components_fully_consistent'] = sum(1 for k in range(16) if assign[k])
+    report['components_with_more_than_one_role'] = multi
+    report['assignment_k_to_bc'] = {('k%d' % k): ([assign[k][0], assign[k][1]]
+                                                  if assign[k] else None)
+                                    for k in range(16)}
+
+    # ---- 3. verdict ------------------------------------------------------
+    if all(assign[k] for k in range(16)):
+        pairs = [assign[k] for k in range(16)]
+        bij = (len({p[0] for p in pairs}) == 4 and len({p[1] for p in pairs}) == 4
+               and len(set(pairs)) == 16)
+        h1 = all(assign[k] == (k // 4, k % 4) for k in range(16))
+        report['bijective'] = bij
+        report['within_lane_permutation'] = True
+        if h1:
+            report['verdict'] = 'H1'
+            report['action'] = ('none: candidate.comp already indexes 4*b+c; the adds are a '
+                                'register rename, so the f32 add order and the nrh_narrow '
+                                'rounding point are unchanged')
+        elif bij:
+            report['verdict'] = 'PERM'
+            report['action'] = ('re-point NRH_C64_AT(b,c) from the measured map (one line, '
+                                'zero instructions) and rebuild; numerics then exact')
+        else:
+            report['verdict'] = 'PERM-NONBIJECTIVE'
+            report['action'] = 'two band components hold the same role: implementation error'
+    else:
+        report['verdict'] = 'CROSS-LANE'
+        report['within_lane_permutation'] = False
+        report['meaning'] = ('some band component holds a tile element no 8x16 site of that '
+                            'lane can use, so extracting the sites would need cross-lane '
+                            'transport (subgroup shuffles).  The read saves 56 uniform '
+                            'messages per subgroup but would add >=64 lane shuffles: net '
+                            'negative -> report the mechanism as blocked, do not build it.')
+    # ---- 4. cross checks -------------------------------------------------
+    report['narrow_site_matches_sealed_law'] = '%d/128' % sum(
+        1 for c in range(4) for lane in range(32)
+        if narrow[c * 32 + lane] == band_pred(fb, W, 0, 0, c, lane))
+    if args.mode == 'real':
+        report['band1_first4_matches_same_rule'] = '%d/128' % sum(
+            1 for k in range(4) for lane in range(32)
+            if band1[k * 32 + lane] == band_pred(fb, W, 1, k // 4, k % 4, lane))
+    return report
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument('--dump', required=False)
+    p.add_argument('--fb', required=True)
+    p.add_argument('--out', default=None)
+    p.add_argument('--mode', default='real', choices=('real', 'synthetic'))
+    p.add_argument('--synthetic', default='H1', choices=('H1', 'NAIVE'))
+    p.add_argument('--synthetic-base', type=int, default=0)
+    a = p.parse_args(argv)
+    rep = analyse(a)
+    text = json.dumps({k: v for k, v in rep.items() if k != 'role_matrix_matches'}, indent=1)
+    if a.out:
+        Path(a.out).write_text(json.dumps(rep, indent=1), encoding='utf-8')
+    print(text)
+    return rep
+
+
+if __name__ == '__main__':
+    sys.dont_write_bytecode = True
+    main()

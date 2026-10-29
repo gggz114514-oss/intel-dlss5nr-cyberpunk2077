@@ -1,0 +1,186 @@
+"""S05 step 14: fold the GPU attempt, the invalid-gate finding and the real-qX-domain analysis
+into CONTRACT.json / QUALITY.json / CALIBRATION.json / JOBS.json (in-place, keyed updates).
+
+Nothing here re-derives numbers: every figure is read from the evidence files that hold it.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import s05_common as C
+sys.path.insert(0, str(C.B / 'work/dsh-fullnet-static-20261029/tools'))
+import planlib
+
+E = C.CARD / 'evidence'
+rd = json.loads((E / 'REAL-QX-DOMAIN.json').read_text())
+ra = json.loads((E / 'REAL-QX-ABLATION.json').read_text())
+rm = json.loads((E / 'REAL-QX-MAPPING.json').read_text())
+vd = json.loads((E / 'V2-FIX.json').read_text())
+gd2 = json.loads((E / 'GATE-DIAG2.json').read_text())
+
+# ---- receipts: prove the v1 gate dumps lived in recycled pool slots
+def offsets(path):
+    j = json.loads(Path(path).read_text())
+    return ({m['name']: (m['resident'], m['memory_offset']) for m in j['memory']}, j.get('status'))
+
+
+gate_off, gate_status = offsets(C.CARD / 'GPU/gate-34189/port_network_receipt.json')
+cap_off, cap_status = offsets(C.B / 'work/dsh-fullnet-static-20261029/gpu/runs/input-capture/port_network_receipt.json')
+cap_run = C.B / 'work/dsh-fullnet-static-20261029/gpu/runs/input-capture'
+cap_net_sha = C.sha256(cap_run / 'replayed-network.bin')
+control_sha = '56318ff6d8e7c57dafaa82f4fd10f1ffd817be5075b15d3e4b38c7e8fb2c37c0'
+alias = {}
+for name in ('block8_out', 'swin_9_M', 'swin_9_Y'):
+    r, off = gate_off[name]
+    mates = sorted({n for n, (rr, oo) in gate_off.items() if oo == off and n != name})
+    alias[name] = dict(resident_in_gate=bool(r), offset=off, shares_slot_with=mates)
+pool_proof = dict(gate_receipt=dict(path=str(C.CARD / 'GPU/gate-34189/port_network_receipt.json'),
+                                   status=gate_status, per_buffer=alias),
+                  capture_receipt=dict(path=str(cap_run / 'port_network_receipt.json'), status=cap_status,
+                                       block8_out=dict(resident=bool(cap_off['block8_out'][0]),
+                                                       offset=cap_off['block8_out'][1],
+                                                       shares_slot_with=[n for n, (rr, oo) in cap_off.items()
+                                                                         if oo == cap_off['block8_out'][1] and n != 'block8_out']),
+                                       replayed_network_sha256=cap_net_sha,
+                                       equals_control=bool(cap_net_sha == control_sha),
+                                       note='the plan declares the int8 dumps as float16, so the runner\'s '
+                                            'finiteness scan reports NONFINITE (nan 245877 / inf 3706) while the '
+                                            'network output is byte-identical to the control; the dump bytes are '
+                                            'raw int8 codes'))
+(E / 'POOL-ALIAS-PROOF.json').write_text(json.dumps(pool_proof, indent=2))
+
+# ---- CONTRACT.json
+p = C.CARD / 'CONTRACT.json'
+c = json.loads(p.read_text())
+c['this_card_change']['v1_REJECTED']['status'] = (
+    'REJECTED ON GPU (-0.082..-0.242 dB over 3 frames). Cause: sc[912..1039] was divided by (D*f0) while the '
+    'FFN dequant moved to the new sX, leaving producer_step/ffn_dequant = %.2f on every channel; block9 output '
+    'x%.5f, i.e. the block behaves like a disabled FFN. The gate dumps of that run are invalid, so the 3.17%% '
+    'code agreement says nothing about the pack; the dB numbers do.'
+    % (vd['identities']['v1_signal_gain']['gain_inverse'], vd['identities']['v1_signal_gain']['gain']))
+c['this_card_change']['v2']['status'] = (
+    'COMPUTED, NOT RECOMMENDED YET. The algebraic identity is satisfied (producer step == FFN dequant to '
+    '%.1e), but v2 still relies on the assumption that the bound producer step equals sc[0], which the real '
+    'captured domain contradicts (see real_domain).  Gate j2 is emitted; do not ship before j1/j2 pass.'
+    % vd['identities']['producer_step_v2_equals_ffn_step']['max_rel_err'])
+c['this_card_change']['v3_real_domain'] = dict(
+    packs=dict(weights=str(C.CARD / 'PACK/c128_b9_weights_v3.i8.bin'),
+               weights_sha256=C.sha256(C.CARD / 'PACK/c128_b9_weights_v3.i8.bin'),
+               scales=str(C.CARD / 'PACK/c128_b9_scales_v3.f32.bin'),
+               scales_sha256=C.sha256(C.CARD / 'PACK/c128_b9_scales_v3.f32.bin')),
+    status='NOT RECOMMENDED: in the real code domain it makes the local error worse (%0.4f vs %0.4f).'
+           % (ra['variants']['V2_expand_fold_plus_residual'], ra['variants']['V0_bound']))
+c['gate_attempt']['pool_alias_proof'] = pool_proof['gate_receipt']
+c['gate_attempt']['why'].append(
+    'proved from the runner receipt itself: in the v1 gate, block8_out shares its offset with swin_9_T, '
+    'swin_9_M with block9_out, swin_9_Y with swin_8_M, and all three are resident=false')
+c['gate_attempt']['valid_dump_available'] = dict(
+    path=str(cap_run / 'xq-c128-b9.bin'), sha256=C.sha256(cap_run / 'xq-c128-b9.bin'), bytes=2064384,
+    why_valid='block8_out was resident=true with its own offset 218308672 in that run, and that run\'s network '
+              'output is byte-identical to the control (%s)' % control_sha[:16])
+c['real_domain'] = dict(
+    input='the captured int8 qX of frame 34189 (block8_out as the FFN really consumes it)',
+    decode='m8col, w*8192 + ((m>>3)*128 + c)*8 + (m&7), pinned by r09 source:350',
+    correlation_with_teacher_X=rd['A_domain']['corr_flat'],
+    per_channel_r2=dict(median=rm['T3_scale_only']['rho2_median'], min=rm['T3_scale_only']['rho2_min'],
+                        unexplained_var_median=rm['T3_scale_only']['unexplained_var_frac']),
+    per_channel_step=dict(min=ra['steps']['min'], median=ra['steps']['median'], max=ra['steps']['max'],
+                          uniform_sX=ra['steps']['uniform_sX'],
+                          ratio_min=ra['steps']['ratio_min'], ratio_max=ra['steps']['ratio_max']),
+    token_matching=rm['T1_token_match'],
+    local_error_bound_pack=ra['variants']['V0_bound'],
+    local_error_teacher_codes=ra['variants']['V5_teacher_codes_oracle'],
+    table_only_variants={k: v for k, v in ra['variants'].items() if k not in ('V0_bound', 'V5_teacher_codes_oracle')},
+    verdict='in the real domain block9 is at %.2f%% local error and NO table-only change inside this card '
+            '(residual refit, per-input-channel gain fold, sA/sM retune) improves it; the teacher-domain 5.86%% '
+            'needs codes the real chain never produces.  Teacher-domain calibration does not apply here.'
+            % (100 * ra['variants']['V0_bound']),
+)
+p.write_text(json.dumps(c, indent=2, ensure_ascii=False))
+
+# ---- QUALITY.json
+p = C.CARD / 'QUALITY.json'
+q = json.loads(p.read_text())
+q['gpu_status'] = dict(v1='FAILED on GPU (-0.082..-0.242 dB) - rejected',
+                       v1_gate='invalid dumps (pool aliasing proved from the receipt)',
+                       real_domain='captured int8 qX analysed on CPU: block9 = %.2f%% local error, no table-only '
+                                   'gain available' % (100 * ra['variants']['V0_bound']),
+                       v2='NOT_RUN, not recommended before j1/j2',
+                       v3='NOT_RUN, already worse on CPU in the real domain')
+q['real_domain'] = dict(
+    capture=dict(path=str(cap_run / 'xq-c128-b9.bin'), sha256=C.sha256(cap_run / 'xq-c128-b9.bin')),
+    bound_local_rel_l2=ra['variants']['V0_bound'],
+    teacher_code_oracle_rel_l2=ra['variants']['V5_teacher_codes_oracle'],
+    variants=ra['variants'],
+    steps=ra['steps'],
+    residual_structure=rm['T2_residual'],
+    token_match=rm['T1_token_match'],
+    honest_statement='this is the "actual quantised upstream input" number the card asks to keep separate '
+                     'from the common-input number; it is 7x the teacher-domain figure and is dominated by the '
+                     'input codes, not by block9 weights/scales',
+)
+p.write_text(json.dumps(q, indent=2, ensure_ascii=False))
+
+# ---- CALIBRATION.json
+p = C.CARD / 'CALIBRATION.json'
+cal = json.loads(p.read_text())
+cal['gpu_outcome'] = dict(
+    v1_rejected_db=[-0.2051, -0.2424, -0.0820],
+    v1_mechanism='producer step / FFN dequant = %.2f; block9 output scaled by %.5f'
+                 % (vd['identities']['v1_signal_gain']['gain_inverse'], vd['identities']['v1_signal_gain']['gain']),
+    v1_gate_dumps='INVALID (pool aliasing, proved in evidence/POOL-ALIAS-PROOF.json)',
+    named_conclusion='the teacher-domain calibration (5.7249%% -> 3.1393%%) does NOT transfer to the real chain: '
+                     'with the captured int8 qX the same pack gives %.2f%% and every table-only variant is '
+                     'worse.  The 3.14%% figure is a statement about an input the real chain never produces.'
+                     % (100 * ra['variants']['V0_bound']),
+)
+cal['real_domain'] = c['real_domain']
+p.write_text(json.dumps(cal, indent=2, ensure_ascii=False))
+
+# ---- JOBS.json
+p = C.CARD / 'JOBS.json'
+j = json.loads(p.read_text())
+old = {x['id']: x for x in j['jobs']}
+gate_out = C.CARD / 'GPU'
+runner = ('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+          'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe')
+jobs = [
+    dict(id='j1-anchor-gate-34189', priority=1,
+         purpose='THE decisive job: dump block9 qX/M/Y of the BOUND pack with resident=1 so the CPU model can be '
+                 'closed against the GPU (<1e-3).  This is the instrument that resolves whether the 41.8% real-domain '
+                 'error is upstream code noise or a mapping mistake in this card.',
+         plan=str(C.CARD / 'gate-34189-anchor.txt'),
+         plan_sha256=planlib.sha256_file(C.CARD / 'gate-34189-anchor.txt'),
+         out=str(gate_out / 'anchor-34189'),
+         argv=[runner, '--plan', str(C.CARD / 'gate-34189-anchor.txt'), '--out', str(gate_out / 'anchor-34189'),
+               '--pool', '--warm', '0', '--reps', '1'],
+         expected_output_sha256=control_sha,
+         dump=True, resident_dumps=True, dump_format='raw (do NOT declare int8 buffers as float16: the runner\'s '
+                                                    'finiteness scan then reports NONFINITE and the receipt '
+                                                    'status is misleading)',
+         compare=dict(qx='evidence/qx-pred-anchor-34189.i8.bin',
+                      y='evidence/y-pred-anchor-34189.f16.bin',
+                      pass_criterion='qX code agreement > 0.99 AND Y relL2 < 1e-3'),
+         conditional=None),
+    dict(id='j2-v2-gate-34189', priority=2,
+         purpose='only if j1 shows a mapping error: re-test the fixed table',
+         plan=str(C.CARD / 'candidate-34189-v2-gate.txt'),
+         plan_sha256=planlib.sha256_file(C.CARD / 'candidate-34189-v2-gate.txt'),
+         out=str(gate_out / 'gate-v2-34189'), expected_output_sha256=None, dump=True, resident_dumps=True,
+         conditional='j1 must first prove the CPU/GPU chain closes; otherwise v2 is meaningless'),
+    dict(id='j3-v2-frames', priority=3, purpose='3-frame network check of v2', plan=str(C.CARD / 'candidate-34189-v2.txt'),
+         plan_sha256=planlib.sha256_file(C.CARD / 'candidate-34189-v2.txt'),
+         out=str(gate_out / 'cand-v2-34189'), expected_output_sha256=None, dump=False,
+         conditional='only after j2; do not run 24 frames before that'),
+]
+j['jobs'] = jobs
+j['superseded'] = dict(note='the first job set of this card is void: its gate dumps were pooled (invalid) and its '
+                            'v1 pack is rejected', old_ids=list(old))
+j['note'] = 'the card does not run GPU; the main executor schedules these.  Every dump job must declare raw ' \
+            'format and resident=1 on its dump buffers.'
+p.write_text(json.dumps(j, indent=2, ensure_ascii=False))
+print(json.dumps(dict(contract=str(C.CARD / 'CONTRACT.json'), jobs=[x['id'] for x in jobs],
+                      bound=ra['variants']['V0_bound'], oracle=ra['variants']['V5_teacher_codes_oracle']), indent=2))

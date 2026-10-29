@@ -1,0 +1,73 @@
+param([string]$ManifestPath)
+$ErrorActionPreference='Stop'
+function SaveJson($p,$v){[IO.File]::WriteAllText($p,($v|ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))}
+function HF([string]$p){(Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()}
+$task=Get-Content -Raw $ManifestPath|ConvertFrom-Json
+$root=Join-Path $task.output_root 'NATIVE-COMBO-EXECUTION'
+$super=Join-Path $root 'supervisor'
+$jobsRoot=Join-Path $root 'jobs'
+$resultPath=Join-Path $root 'LUNA-FEED-OWNER-COMBO-NATIVE-RESULTS.json'
+$statusPath=Join-Path $root 'STATUS.json'
+$childTemplate='@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/phase-diagnosis-20261025/execute-nativeonly-pilot.ps1'
+$lock='@NR_GPU_WORKSPACE@/artifacts/parallel-port-20261013/GPU.lock'
+$results=[Collections.ArrayList]::new();$stop=$null
+try {
+ if(Test-Path $root){throw 'NATIVE-EXECUTION already exists'}
+ foreach($i in $task.identities){if((HF $i.path) -ne $i.sha256){throw ('Identity mismatch '+$i.path)}}
+ foreach($j in $task.jobs){
+  if((HF $j.plan.path) -ne $j.plan.sha256){throw ('Plan SHA mismatch '+$j.id)}
+  $pi=[Array]::IndexOf($j.argv,'--plan');$oi=[Array]::IndexOf($j.argv,'--out')
+  if($pi -lt 0 -or $j.argv[$pi+1] -ne $j.plan.path -or $oi -lt 0 -or $j.argv[$oi+1] -ne $j.runner_output){throw ('argv mismatch '+$j.id)}
+  if(Test-Path $j.runner_output){throw ('Runner output not fresh '+$j.id)}
+  if(Test-Path $j.capture_output){throw ('Capture output not fresh '+$j.id)}
+  $mi=[Array]::IndexOf($j.argv,'--msg_file');if($mi -lt 0 -or (Test-Path $j.argv[$mi+1])){throw ('Message log not fresh '+$j.id)}
+ }
+ if(@(Get-Process|Where-Object {$_.ProcessName -match 'Cyberpunk|REDlauncher|port_network|profile_zprof|gtpin|clock_runner|clock_query'}).Count){throw 'Active game/GPU process before first job'}
+ $li=Get-Content -Raw $lock|ConvertFrom-Json;if($li.state -ne 'FINISHED'){throw ('GPU lock unavailable '+$li.owner)}
+ New-Item -ItemType Directory -Path $super,$jobsRoot -Force|Out-Null
+ $childScriptText=Get-Content -Raw $childTemplate
+ $childScriptText=$childScriptText.Replace('[DateTime]::UtcNow()','[DateTime]::UtcNow').Replace('LUNA-NATIVEONLY-PILOT-20261025','LUNA-FEED-OWNER-COMBO-NATIVE-20261025').Replace('Parent authorized one exact NativeOnly ISA capture job.','Parent authorized native-only capture for the listed feed-owner candidate.')
+ $childScript=Join-Path $root 'execute-native-child.ps1'
+ [IO.File]::WriteAllText($childScript,$childScriptText,[Text.UTF8Encoding]::new($false))
+ SaveJson $statusPath ([ordered]@{status='RUNNING';updated_at=[DateTime]::UtcNow.ToString('o');planned_jobs=@($task.jobs).Count;executed_jobs=0;skipped_jobs=0;next_job=$task.jobs[0].id;stop_reason=$null;lock_state='released before first job';results_path=$resultPath})
+ foreach($job in $task.jobs){
+  if($stop){[void]$results.Add([ordered]@{id=$job.id;status='SKIPPED_AFTER_STOP';reason=$stop});continue}
+  if(@(Get-Process|Where-Object {$_.ProcessName -match 'Cyberpunk|REDlauncher|port_network|profile_zprof|gtpin|clock_runner|clock_query'}).Count){throw ('Active process before '+$job.id)}
+  $currentLock=Get-Content -Raw $lock|ConvertFrom-Json;if($currentLock.state -ne 'FINISHED'){throw ('Lock not FINISHED before '+$job.id)}
+  $sub=Join-Path $jobsRoot $job.id;New-Item -ItemType Directory -Path $sub -Force|Out-Null
+  $one=$task|ConvertTo-Json -Depth 50|ConvertFrom-Json;$one.output_root=$sub;$one.jobs=@($job);$mf=Join-Path $sub ($job.id+'.json');SaveJson $mf $one
+  $start=[DateTime]::UtcNow.ToString('o')
+  $psi=[Diagnostics.ProcessStartInfo]::new();$psi.FileName='powershell.exe';$psi.Arguments='-NoProfile -ExecutionPolicy Bypass -File "'+$childScript+'" -ManifestPath "'+$mf+'"';$psi.WorkingDirectory=$task.working_directory;$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true
+  $proc=[Diagnostics.Process]::new();$proc.StartInfo=$psi;[void]$proc.Start();$ao=$proc.StandardOutput.ReadToEndAsync();$ae=$proc.StandardError.ReadToEndAsync();$proc.WaitForExit();$childExit=$proc.ExitCode;$out=$ao.GetAwaiter().GetResult();$err=$ae.GetAwaiter().GetResult();$end=[DateTime]::UtcNow.ToString('o')
+  $os=Join-Path $super ($job.id+'.orchestrator.stdout.txt');$es=Join-Path $super ($job.id+'.orchestrator.stderr.txt');[IO.File]::WriteAllText($os,$out,[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText($es,$err,[Text.UTF8Encoding]::new($false))
+  $oneResult=Join-Path $sub 'LUNA-NATIVEONLY-PILOT-RESULTS.json';$oneStatus=Join-Path $sub 'LUNA-NATIVEONLY-PILOT-STATUS.json'
+  if(-not (Test-Path $oneResult)){throw ('Native child result missing '+$job.id)}
+  $rr=Get-Content -Raw $oneResult|ConvertFrom-Json;$entry=$rr.jobs[0]
+  $maps=@(Select-String -LiteralPath $entry.stdout_path -Pattern '^NATIVE_MAP\s+'|ForEach-Object {$_.Line})
+  $seqOK=($maps.Count -eq 232)
+  if($seqOK){for($n=0;$n -lt 232;$n++){if($maps[$n] -notmatch ('^NATIVE_MAP '+$n+'\s+')){$seqOK=$false;break}}}
+  $ok=($childExit -eq 0 -and $rr.status -eq 'COMPLETED' -and $entry.exit_code -eq 0 -and $entry.normal_close -eq $true -and $entry.frame_matches_gold -eq $true -and $entry.isa_files.Count -gt 0 -and $seqOK)
+  $entry|Add-Member -NotePropertyName native_map_count -NotePropertyValue $maps.Count -Force
+  $entry|Add-Member -NotePropertyName native_map_contiguous_0_231 -NotePropertyValue $seqOK -Force
+  $entry|Add-Member -NotePropertyName native_map_log_path -NotePropertyValue $entry.stdout_path -Force
+  $entry|Add-Member -NotePropertyName orchestrator_started_utc -NotePropertyValue $start -Force
+  $entry|Add-Member -NotePropertyName orchestrator_ended_utc -NotePropertyValue $end -Force
+  $entry|Add-Member -NotePropertyName orchestrator_status -NotePropertyValue $(if($ok){'COMPLETED'}else{'FAILED'}) -Force
+  $entry|Add-Member -NotePropertyName job_manifest_path -NotePropertyValue $mf -Force
+  $entry|Add-Member -NotePropertyName child_status_path -NotePropertyValue $oneStatus -Force
+  $entry|Add-Member -NotePropertyName child_result_path -NotePropertyValue $oneResult -Force
+  [void]$results.Add($entry)
+  if(-not $ok){$stop='native-only capture failed runner/receipt/frame/ISA/232map gate for '+$job.id}
+  SaveJson $resultPath ([ordered]@{status=if($stop){'STOPPED'}else{'RUNNING'};jobs=@($results);planned_jobs=@($task.jobs).Count;executed_jobs=@($results).Count;skipped_jobs=0;stop_reason=$stop;manifest_path=$ManifestPath;manifest_sha256=(HF $ManifestPath);authorization='Parent authorized exact zero-instruction native capture for combo-eager; no ordinary timing.';lock_evidence_paths=@($task.jobs|ForEach-Object {(Join-Path (Join-Path $jobsRoot $_.id) 'LUNA-NATIVEONLY-PILOT-LOCK.json')})})
+  SaveJson $statusPath ([ordered]@{status=if($stop){'STOPPED'}else{'RUNNING'};updated_at=[DateTime]::UtcNow.ToString('o');planned_jobs=@($task.jobs).Count;executed_jobs=@($results).Count;skipped_jobs=0;next_job=if($stop){$null}else{'next listed job'};stop_reason=$stop;lock_state='released between jobs';results_path=$resultPath})
+  if($stop){break}
+ }
+ $finalLock=Get-Content -Raw $lock|ConvertFrom-Json;if($finalLock.state -ne 'FINISHED'){throw ('Final GPU lock not FINISHED '+$finalLock.owner)}
+ SaveJson $resultPath ([ordered]@{status=if($stop){'STOPPED'}else{'COMPLETED'};jobs=@($results);planned_jobs=@($task.jobs).Count;executed_jobs=@($results).Count;skipped_jobs=@($results|Where-Object status -eq 'SKIPPED_AFTER_STOP').Count;stop_reason=$stop;manifest_path=$ManifestPath;manifest_sha256=(HF $ManifestPath);authorization='Parent authorized exact zero-instruction native capture for combo-eager; no ordinary timing.';final_lock_owner=$finalLock.owner;final_lock_state=$finalLock.state})
+ SaveJson $statusPath ([ordered]@{status=if($stop){'STOPPED'}else{'COMPLETED'};updated_at=[DateTime]::UtcNow.ToString('o');planned_jobs=@($task.jobs).Count;executed_jobs=@($results).Count;skipped_jobs=@($results|Where-Object status -eq 'SKIPPED_AFTER_STOP').Count;next_job=$null;stop_reason=$stop;lock_state='released; FINISHED';results_path=$resultPath})
+} catch {
+ $msg=$_.Exception.Message
+ SaveJson $resultPath ([ordered]@{status='FAILED_OR_STOPPED';jobs=@($results);planned_jobs=@($task.jobs).Count;executed_jobs=@($results).Count;failure=$msg;manifest_path=$ManifestPath})
+ SaveJson $statusPath ([ordered]@{status='FAILED_OR_STOPPED';updated_at=[DateTime]::UtcNow.ToString('o');failure=$msg;results_path=$resultPath})
+ throw
+}

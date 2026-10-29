@@ -27,3 +27,6 @@ add_executable(nrvk_bridge_cpu_abi nrvk_bridge_cpu_abi.cpp)
 enable_testing()
 add_test(NAME backend_record COMMAND port_queue_backend_cpu "${NR_MODEL_DIR}/manifest" "$<TARGET_FILE:port_network_bridge_backend>")
 add_test(NAME component_abi COMMAND nrvk_bridge_cpu_abi "$<TARGET_FILE:nrvk_bridge>" "$<TARGET_FILE:port_network_bridge_backend>" "${NR_MODEL_DIR}/manifest")
+
+# Offline experimental runner: opt-in target, never executed by default builds.
+add_executable(port_network_model_runner EXCLUDE_FROM_ALL port_network_model_runner.cpp)

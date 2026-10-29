@@ -1,0 +1,62 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys
+R=Path(__file__).resolve().parent;A=R.parent;B=A.parents[1]
+P=R/'f20-peer8-dualweight';N=R/'f20-peer8-fouracc';N.mkdir(exist_ok=True)
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+# Proof generated before source. Two adjacent hidden N16 tiles share X, not results.
+seen={}
+for sg in range(8):
+ for hbase in [0,2]:
+  for h in [hbase,hbase+1]:
+   k=(sg%2)*4+h
+   for m in [sg,sg^1]:
+    assert (m,k) not in seen;seen[m,k]=sg
+assert len(seen)==64
+proof=dict(source_parent=ident(P/'candidate.spv'),mapping_64_tiles_unique=True,
+ change='Only expansion batches: 2M x1N ->2M x2N; contraction dualweights and all downstream source identical',
+ rounding='Each of four outputs: zero -> K0 -> K16 -> half -> original nr_act_h. No partial sums. Contract K order unchanged.',
+ lifecycle='Four X half fragments remain readonly throughout expansion. Batch 0 produces own0/1, then its four f32 C retire; batch1 starts fresh four C and produces own2/3. At batch1 start only own0/1 are live. B0/B1 live within each K step, then last two M consumers retire them. No contract C until original publication completes.',
+ logical_compute_peak_B_per_lane=dict(X=32,existing_own_at_pair0=0,existing_own_at_pair1=16,four_C=64,two_B=32,batch0=128,batch1=144,old_twoC_last_batch=104,increment=40),
+ caveat='144 is fragment payload subtotal, excludes address/temp/allocator packing; not measured physical GRF peak. Old 104 uses three existing own tiles24+X32+C32+B16. Logical peak increases40; native no-spill and preserved independent groups are mandatory. No claim exact allocation or occupancy unchanged.',
+ unchanged=dict(expansion_weight_tiles_per_WG=64,expansion_MMA_per_WG=128,contract_MMA_per_WG=128,own_tiles=32,peer_tiles=32,SLM_bytes=True,barriers=True,WG_threads=256),
+ acceptance='fixed/fb2 gold; native four independent accumulators before their K16 recursion, dualweight contract overlap retained, no scratch; only then same-batch P03/dualweight/fouracc ordinary')
+(N/'PROOF.json').write_text(json.dumps(proof,indent=2))
+s=(P/'candidate.comp').read_text(encoding='utf-8-sig');start=s.index('            {\n                uint ki=0u');end=s.index('        }\n        barrier(); // All peer tiles',start)
+ls=[]
+for hb in [0,2]:
+ ls+=['            {',f'                uint kA={hb}u+(sg&1u)*4u,kB=kA+1u;',
+      '                MAT_C eo0=MAT_C(float16_t(0.0)),ep0=MAT_C(float16_t(0.0));',
+      '                MAT_C eo1=MAT_C(float16_t(0.0)),ep1=MAT_C(float16_t(0.0));']
+ for k in [0,1]:
+  ls+=['                {','                    MAT_B b0,b1;',
+       f'                    coopMatLoad(b0,wb,uint(pc.p1.x)+kA*512u+{k*256}u,16u,LCOL);',
+       f'                    coopMatLoad(b1,wb,uint(pc.p1.x)+kB*512u+{k*256}u,16u,LCOL);',
+       f'                    eo0=coopMatMulAdd(xaO{k},b0,eo0);',f'                    eo1=coopMatMulAdd(xaO{k},b1,eo1);',
+       f'                    ep0=coopMatMulAdd(xaP{k},b0,ep0);',f'                    ep1=coopMatMulAdd(xaP{k},b1,ep1);','                }']
+ for v in [0,1]:
+  kn='kA' if v==0 else 'kB'
+  ls+=['                {',f'                    MAT_H ho=MAT_H(eo{v}),hp=MAT_H(ep{v});',
+       f'                    if(debug) {{ coopMatStore(ho,dbg,m0*128u+{kn}*16u,128u,LROW); coopMatStore(hp,dbg,mp*128u+{kn}*16u,128u,LROW); }}',
+       '                    for(int d=0;d<4;++d) { ho[d]=nr_act_h(ho[d]); hp[d]=nr_act_h(hp[d]); }',
+       f'                    for(int d=0;d<4;++d) own{hb+v}[d]=ho[d];',f'                    coopMatStore(hp,shArena,mp*128u+{kn}*16u,128u,LROW);','                }']
+ ls+=['            }']
+candidate=s[:start]+'\n'.join(ls)+'\n'+s[end:]
+assert candidate[candidate.index('        barrier(); // All peer tiles'):]==s[s.index('        barrier(); // All peer tiles'):]
+src=N/'candidate.comp';spv=N/'candidate.spv';src.write_text(candidate,encoding='utf-8')
+run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv])
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+pm=ST.Module(P/'candidate.spv');cm=ST.Module(spv);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[]);assert len(keep)==len(ST.no_contraction_ids(pm))==7;ST.set_no_contraction(cm,set(keep),spv)
+run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+text=(P/'plan.txt').read_text();assert text.count((P/'candidate.spv').as_posix())==1
+plan=N/'plan.txt';plan.write_text(text.replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8')
+runner=Path(json.loads((P/'LUNA-GATES.json').read_text())['identities'][0]['path'])
+(N/'CANDIDATE.json').write_text(json.dumps(dict(source=ident(src),spv=ident(spv),plan=ident(plan),parent=ident(P/'plan.txt'),cpu=run([runner,'--plan',plan,'--cpu-check']),no_contraction_count=7),indent=2))
+for kind in ['GATES','NATIVE']:
+ task=json.loads((P/f'LUNA-{kind}.json').read_text().replace('f20-peer8-dualweight','f20-peer8-fouracc'))
+ task['identities']=[v for v in task['identities'] if not v['path'].endswith('.spv')]+[ident(spv)]
+ for j in task['jobs']:j['plan']=ident(plan);j['argv'][j['argv'].index('--plan')+1]=str(plan)
+ task['rules']=['Exact GPU jobs only; unique lock serial; gates both gold then native. Any error/nongold stop, no retry. No ordinary until main native review.']
+ (N/f'LUNA-{kind}.json').write_text(json.dumps(task,indent=2))
+print(ident(spv))

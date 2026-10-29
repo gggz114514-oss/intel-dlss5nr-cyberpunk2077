@@ -1,0 +1,61 @@
+"""Build the reverse occupancy probe: pad the 32 KB staging array to 48 KB (no maths change).
+
+Residency per SM is (SLM pool / declared SLM). At 32 KB two workgroups fit; at 48 KB only one
+does, so this halves residency with zero change to the computation. If the frame slows down by X,
+X is the occupancy elasticity we would be trying to win back; if it does not move, the whole
+occupancy route is dead and no restructuring card is worth writing.
+
+The 15 F06 C256 PASS rows are repointed at the padded SPIR-V; the plan's `shared` field is raised
+to 49152 (the runner rejects anything above that) so the declaration matches the module.
+"""
+import shutil, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+from audit_card import pass_lines
+
+SHA = '881dff8c51454f79181a567d6b976ea21ec7c81174bf075ca7be723b09c4a3f0'
+rec = K.read_json(K.C / 'evidence' / 'RECIPES.json')[SHA]
+src = Path(rec['source'])
+out = K.C / 'queue' / 'probe-occ'
+out.mkdir(parents=True, exist_ok=True)
+
+# 1. baseline reproduction check first: compile the untouched source and compare to the target
+K.compile_glsl(src, out / 'parent-check.spv',
+               include_dirs=[rec['compile']['pinned_include_dir']] + rec['compile']['include_dirs'],
+               defines=rec['compile'].get('defines', ()))
+same = K.sha(out / 'parent-check.spv') == SHA
+print('parent reproduced byte-exactly:', same)
+
+# 2. padded source
+text = src.read_text(encoding='utf-8')
+assert 'shared float16_t shT[16384];' in text, 'staging declaration not found'
+padded = text.replace('shared float16_t shT[16384];', 'shared float16_t shT[24576];')
+assert padded != text
+(out / 'pad.comp').write_text(padded, encoding='utf-8')
+K.compile_glsl(out / 'pad.comp', out / 'pad.spv',
+               include_dirs=[rec['compile']['pinned_include_dir']] + rec['compile']['include_dirs'],
+               defines=rec['compile'].get('defines', ()))
+K.validate_spv(out / 'pad.spv')
+print('padded spv', K.sha(out / 'pad.spv'), (out / 'pad.spv').stat().st_size)
+
+# 3. plan: 15 rows repointed, shared field 32768 -> 49152
+cur = K.read_json(K.C / 'CURRENT.json')
+head = Path(cur['best_plan']['path'])
+lines = head.read_text(encoding='utf-8-sig').splitlines()
+recs = pass_lines(head)
+sel = [r['ordinal'] for r in K.rows()
+       if recs[r['ordinal']]['line'].split()[-6] == '32768' and r['family'] == 'F06']
+n = 0
+for o in sel:
+    line = recs[o]['line']
+    toks = line.split()
+    toks[-6] = '49152'
+    new_line = ' '.join(toks).replace(Path(recs[o]['spv']).as_posix(), (out / 'pad.spv').as_posix())
+    idx = next(i for i, l in enumerate(lines) if l == line)
+    lines[idx] = new_line
+    n += 1
+plan = out / 'plan.txt'
+plan.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+print('rows repointed:', n, 'plan sha', K.sha(plan))
+print(K.cpu_check(plan).strip()[-90:])

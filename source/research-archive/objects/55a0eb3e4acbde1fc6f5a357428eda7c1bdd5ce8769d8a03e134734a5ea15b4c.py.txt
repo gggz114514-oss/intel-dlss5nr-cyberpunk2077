@@ -1,0 +1,113 @@
+"""n31: executed-mask of the F01 kernel *after* 0x4A90 (static, from ISA + fixture constants).
+
+Branch resolution used here (all from the captured ISA of the chain head):
+
+  * 33 branches are `(W&f1.0) jmpi Lxxxx` with f1.0 defined exactly once, at
+    0x44C0: `cmp (eq)f1.0 null r86.9, 0`.  r86.9 is the push constant that the
+    source calls `pc.p0.z` (= `debug`); the plan writes p0.z = 0, and every
+    skipped span is a `coopMatStore(x, dbg, ...)` (8x store.ugm.d32x8t with
+    offsets {0,64,...,448} from one base).  f1.0 = (debug == 0) -> branch taken
+    -> debug stores skipped, exactly as the source says.
+  * f3.0 / f2.0 branches (0x14AB0 / 0x15490) are the token/lane tail gates and
+    are kept as executed (worst case for the audit).
+
+Writes tools/exec-mask.json.  CPU only.
+"""
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+CAMP = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(CAMP))
+import ISA  # noqa: E402
+
+ISA_PATH = CAMP / 'queue/n29-f01-alu-chain/native/captures/native-native-cand/ISA/CS_asma0888c5a3c6703a9_simd32_0000000000000001_0_orig.asm'
+ENTRY_END = 0x4A90
+OUT = CAMP / 'cards/n31-f01-dpas-chain/tools/exec-mask.json'
+
+
+def load():
+    isa = ISA.parse(ISA_PATH)
+    return isa
+
+
+def debug_spans(isa):
+    """(branch_addr, target_addr) for every (W&f1.0) jmpi whose flag is the debug cmp."""
+    spans = []
+    for k, ins in enumerate(isa):
+        if ins['addr'] < ENTRY_END or ins['op'] != 'jmpi':
+            continue
+        if 'f1.0' not in ins['raw']:
+            continue
+        m = re.match(r'L(\d+)', ins['ops'][0]) if ins['ops'] else None
+        if not m:
+            continue
+        spans.append((ins['addr'], int(m.group(1))))
+    return spans
+
+
+def main():
+    isa = load()
+    post = [i for i in isa if i['addr'] >= ENTRY_END]
+    spans = debug_spans(isa)
+    skipped = []
+    for a, b in spans:
+        skipped.extend([i for i in post if a < i['addr'] < b])
+    skipped_addr = {i['addr'] for i in skipped}
+    live = [i for i in post if i['addr'] not in skipped_addr]
+
+    def stat(body, name):
+        ops = Counter(i['op'] for i in body)
+        sends = Counter((i['comment'] or '').split(';')[-1].strip()
+                        for i in body if i['op'].startswith('send') and i['comment'])
+        return dict(name=name, instructions=len(body),
+                    opcodes=dict(ops.most_common()),
+                    messages=dict(sends.most_common()),
+                    store_ugm=sum(1 for i in body if i['op'].startswith('send')
+                                  and 'store.ugm' in (i['comment'] or '')),
+                    dpas=sum(1 for i in body if i['op'].startswith('dpas')),
+                    math_inv=sum(1 for i in body if i['op'] == 'math.inv'),
+                    math_rsqt=sum(1 for i in body if i['op'] == 'math.rsqt'),
+                    slm=sum(1 for i in body if i['op'] == 'send.slm'))
+
+    out = dict(isa=str(ISA_PATH), entry_end=hex(ENTRY_END),
+               post=stat(post, 'post-0x4A90'),
+               skipped=stat(skipped, 'skipped-debug'),
+               live=stat(live, 'live'),
+               debug_branches=len(spans),
+               spans=[[hex(a), hex(b)] for a, b in spans],
+               skipped_ranges=[])
+    # merge ranges for the report
+    rng = []
+    for a, b in spans:
+        rng.append([a, b])
+    rng.sort()
+    merged = []
+    for a, b in rng:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    out['skipped_ranges'] = [[hex(a), hex(b), b - a] for a, b in merged]
+    OUT.write_text(json.dumps(out, indent=1), encoding='utf-8')
+
+    for k in ('post', 'skipped', 'live'):
+        s = out[k]
+        print('== %-6s n=%4d  dpas=%3d  send.slm=%2d  store.ugm=%3d  math.inv=%d  math.rsqt=%d'
+              % (k, s['instructions'], s['dpas'], s['slm'], s['store_ugm'],
+                 s['math_inv'], s['math_rsqt']))
+        print('   ops:', dict(Counter(s['opcodes']).most_common(14)))
+    print('\ndebug branches:', len(spans))
+    print('skipped ranges (merged):', len(merged))
+    print('skipped instruction count:', len(skipped))
+    print('live instruction count   :', len(live))
+    print('\nlive message mix:')
+    for k, v in Counter((i['comment'] or '').split(';')[-1].strip()
+                        for i in live if i['op'].startswith('send') and i['comment']).most_common():
+        print('  %5d  %s' % (v, k))
+
+
+if __name__ == '__main__':
+    main()

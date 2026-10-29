@@ -1,0 +1,101 @@
+"""n11b-vit-projection-hoist: build-identity rehearsal (CPU only, no GPU).
+
+1. Recompile the parent source bytes -> parent-rebuild.spv and require byte equality
+   with the baseline F16 SPV (ae5cb966...).
+2. Recompile the candidate wrapper twice, both include orders, to prove that
+   candidate-glsl/ must win over parent-src/ and that the recorded recipe is the
+   one that produced candidate.spv.
+3. spv_validate_cpu.exe on both modules.
+4. SPIR-V census: opcode histogram diff, NoContraction decorations, capability set.
+
+Writes _tools/build-rehearsal.json.
+"""
+import hashlib, json, subprocess, sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+W = Path('@NR_WORKSPACE@')
+GLSLANG = W / 'src/project/tools/glslang-16.5.0/bin/glslang.exe'
+VALIDATE = W / 'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'
+BASE_SPV = W / 'candidates/codex-fp16-continuation-20261021/A/u03-f18-v2/shader.spv'
+BASE_SRC = W / 'candidates/codex-fp16-continuation-20261021/A/u03-f18-v2/source/vit_nb04_projection_fp16.comp'
+LANG = dict(encoding='utf-8', errors='replace')
+
+T = CARD / '_tools'
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def run(argv):
+    r = subprocess.run([str(x) for x in argv], capture_output=True, text=True, **LANG)
+    return r.returncode, (r.stdout or '') + (r.stderr or '')
+
+
+def compile_(src, out, incs):
+    argv = [GLSLANG, '-V', '--target-env', 'vulkan1.3']
+    for d in incs:
+        argv.append('-I' + str(d))
+    argv += [str(src), '-o', str(out)]
+    rc, log = run(argv)
+    if rc != 0:
+        raise RuntimeError('compile failed %s\n%s' % (argv, log))
+    return dict(argv=[str(x).replace(str(CARD), '<card>') for x in argv], rc=rc, log=log.strip())
+
+
+res = {'card': 'n11b-vit-projection-hoist'}
+
+# ---------------------------------------------------------------- parent
+p_out = T / 'parent-rebuild-check.spv'
+res['parent'] = {
+    'source': {'path': str(BASE_SRC), 'sha256': sha(BASE_SRC)},
+    'target': {'path': str(BASE_SPV), 'sha256': sha(BASE_SPV)},
+    'rebuild': compile_(CARD / 'parent-src/vit_nb04_projection_fp16.comp', p_out,
+                        [CARD / 'parent-src']),
+}
+res['parent']['rebuild_sha256'] = sha(p_out)
+res['parent']['rebuild_byte_identical_target'] = res['parent']['rebuild_sha256'] == sha(BASE_SPV)
+res['parent']['rebuild_byte_identical_card'] = res['parent']['rebuild_sha256'] == sha(CARD / 'parent-rebuild.spv')
+res['parent']['headers'] = {n: sha(CARD / 'parent-src' / n) for n in
+                            ('vit_common.glsl', 'vit_nb04_mpair.glsl')}
+res['parent']['wrapper'] = {'path': str(BASE_SRC), 'sha256': sha(BASE_SRC),
+                            'same_as_candidate_comp': sha(BASE_SRC) == sha(CARD / 'candidate.comp')}
+
+# ---------------------------------------------------------------- candidate, both include orders
+cand_first = T / 'cand-candidateglsl-first.spv'
+cand_last = T / 'cand-candidateglsl-last.spv'
+res['candidate'] = {
+    'recorded_spv_sha256': sha(CARD / 'candidate.spv'),
+    'wrapper_sha256': sha(CARD / 'candidate.comp'),
+    'glsl': {n: sha(CARD / 'candidate-glsl' / n) for n in ('vit_common.glsl', 'vit_nb04_mpair.glsl')},
+    'glsl_in_parent': {n: sha(CARD / 'parent-src' / n) for n in ('vit_common.glsl', 'vit_nb04_mpair.glsl')},
+}
+res['candidate']['order_candidate_glsl_first'] = compile_(
+    CARD / 'candidate.comp', cand_first, [CARD / 'candidate-glsl'])
+res['candidate']['order_candidate_glsl_first']['sha256'] = sha(cand_first)
+res['candidate']['order_parent_src_first'] = compile_(
+    CARD / 'candidate.comp', cand_last, [CARD / 'parent-src'])
+res['candidate']['order_parent_src_first']['sha256'] = sha(cand_last)
+res['candidate']['order_candidate_glsl_first']['equals_recorded'] = (
+    res['candidate']['order_candidate_glsl_first']['sha256'] == res['candidate']['recorded_spv_sha256'])
+res['candidate']['order_parent_src_first']['equals_recorded'] = (
+    res['candidate']['order_parent_src_first']['sha256'] == res['candidate']['recorded_spv_sha256'])
+res['candidate']['order_parent_src_first']['equals_parent'] = (
+    res['candidate']['order_parent_src_first']['sha256'] == res['parent']['rebuild_sha256'])
+
+# ---------------------------------------------------------------- validate
+res['validate'] = {}
+for tag, p in (('parent', CARD / 'parent-rebuild.spv'), ('candidate', CARD / 'candidate.spv')):
+    rc, log = run([VALIDATE, p])
+    res['validate'][tag] = {'rc': rc, 'log': log.strip(), 'path': str(p), 'sha256': sha(p)}
+    if rc != 0:
+        raise RuntimeError('validate failed for %s: %s' % (tag, log))
+
+Path(T / 'build-rehearsal.json').write_text(json.dumps(res, indent=2), encoding='utf-8')
+print(json.dumps({k: res[k] for k in ('parent', 'validate')}, indent=2)[:2500])
+print('candidate.first == recorded:', res['candidate']['order_candidate_glsl_first']['equals_recorded'])
+print('candidate.last  == parent  :', res['candidate']['order_parent_src_first']['equals_parent'])
+print('candidate.last  == recorded:', res['candidate']['order_parent_src_first']['equals_recorded'])
+print('candidate sha:', res['candidate']['recorded_spv_sha256'])
+print('parent    sha:', res['parent']['rebuild_sha256'])

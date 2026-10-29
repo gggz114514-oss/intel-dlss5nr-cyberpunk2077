@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""R07 build driver (CPU only).
+
+Two duties:
+  1. replay every parent module of R07 from its frozen source with the frozen
+     glslang, and refuse to continue unless the replay is byte-identical to the
+     deployed SPV recorded in FULLNET-INT8-IMPLEMENTATION-LEDGER.json;
+  2. build the C64 output-projection candidate.
+
+No GPU, no pipeline, no runner, no GPU.lock.  Every record carries the full
+argv, the sha256 of every input, the sha256 of the output and the wall time.
+"""
+import hashlib
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+R = Path("@NR_WORKSPACE@")
+W = R / "work/dsh-xmx-handoff-validation-20261024"
+CARD = W / "candidates/r07-output-proj"
+SRC = CARD / "source"
+SPV = CARD / "spv"
+BUILD = W / "build/r07-output-proj"
+GLSLANG = R / "src/project/tools/glslang-16.5.0/bin/glslang.exe"
+VALIDATOR = (R / "candidates/amd-map-20261015/s4-final-output-fusion-fix"
+             / "production-repair/spv_validate_cpu.exe")
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def run(entry, srcdir, out, defines, cwd=None):
+    out = Path(out)
+    argv = [str(GLSLANG), "-V", "--target-env", "vulkan1.3"]
+    argv += ["-D" + d for d in defines]
+    argv += ["-I" + str(srcdir)]
+    argv += ["-o", str(out), str(Path(srcdir) / entry)]
+    t0 = time.time()
+    p = subprocess.run(argv, cwd=str(cwd or srcdir), capture_output=True, text=True)
+    dt = time.time() - t0
+    rec = {"argv": argv, "cwd": str(cwd or srcdir), "rc": p.returncode,
+           "stdout": p.stdout.strip(), "stderr": p.stderr.strip(),
+           "out": str(out), "seconds": round(dt, 3)}
+    if p.returncode == 0:
+        v = subprocess.run([str(VALIDATOR), str(out)], capture_output=True, text=True)
+        rec.update(bytes=out.stat().st_size, sha256=sha(out),
+                   validate_rc=v.returncode, validate_stdout=v.stdout.strip(),
+                   validate_ok=("result=0" in v.stdout))
+    return rec
+
+
+PARENTS = [
+    # (key, entry, source dir, defines, deployed spv, deployed sha256)
+    ("c64_output", "c64_complete_d4_fp16.comp", SRC / "parent", [],
+     R / "candidates/amd-map-20261015/round4-integrated/candidate/spv/output-c64.spv",
+     "cd0e196874b19414e9a94490793ebc766070f8a96924f384a22553fafccfcde1"),
+    ("c128_output", "c128_d4_full.comp", SRC / "parent/c128_full", [],
+     R / "candidates/amd-map-20261015/s1-integrated/candidate/spv/output-c128-full.spv",
+     "a8b8915562fdc8db52cbb4246ee45eadb86a1881e307575f47dbbef4235cd8bc"),
+    ("c128_producer_b9", "producer_quant.comp", SRC / "parent/c128_producer_b9", ["NATIVE=1"],
+     R / "candidates/codex-sol-int8-pilot-20261018/v6-m8col-20261019/C-producer.spv",
+     "a2fa72d6276964c71bc42b891709ed4bf6ef43c44152fbe496b2da95654a59f5"),
+    ("c128_producer_b10", "producer_quant.comp", SRC / "parent/c128_producer_b10", ["NATIVE=1"],
+     R / "candidates/codex-sol-int8-nextblock11-20261019/v3-m8col-scale-repair/C-producer.spv",
+     "eb39c1392039444bdff99d8d9da0ff7b73e7fce3f14ba743bd52ab1efd875318"),
+    ("c256_qx_v5", "c256_output_qx_int8.comp", SRC / "parent/c256_v5",
+     ["NATIVE=1", "C256_QX_LAST=0", "C256_QX_HALF_MODE=1"],
+     R / "candidates/codex-sol-int8-long-008-20261019/c256-int8-v5-precise-half/spv/c256_output_qx_int8_v5.spv",
+     "4807138a84db58285fd47fe5aa71a83d5f567e01a76cf6e6b2e477c6991e6d27"),
+    ("c256_qx_last_v5", "c256_output_qx_int8.comp", SRC / "parent/c256_v5",
+     ["NATIVE=1", "C256_QX_LAST=1", "C256_QX_HALF_MODE=1"],
+     R / "candidates/codex-sol-int8-long-008-20261019/c256-int8-v5-precise-half/spv/c256_output_qx_last_int8_v5.spv",
+     "120e05306220e366b40009ab7d35130a3b4febba33cb72d909df67a4fb76ab62"),
+]
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "parents"
+    BUILD.mkdir(parents=True, exist_ok=True)
+    if mode == "parents":
+        rec = {"parents": {}, "glslang": str(GLSLANG),
+               "glslang_sha256": sha(GLSLANG),
+               "validator": str(VALIDATOR), "validator_sha256": sha(VALIDATOR)}
+        ok = True
+        for key, entry, sd, defs, deployed, want in PARENTS:
+            out = SPV / ("parent_repro-%s.spv" % key)
+            r = run(entry, sd, out, defs)
+            r["entry"] = entry
+            r["source_inventory"] = {str(p.relative_to(sd)).replace("\\", "/"): sha(p)
+                                     for p in sorted(sd.rglob("*")) if p.is_file()}
+            r["deployed_spv"] = str(deployed)
+            r["deployed_sha256"] = sha(deployed) if deployed.exists() else None
+            r["expected_sha256"] = want
+            r["byte_identical"] = r.get("sha256") == want and r["deployed_sha256"] == want
+            ok = ok and r["byte_identical"]
+            rec["parents"][key] = r
+            print("%-18s sha=%s identical=%s validate=%s" %
+                  (key, r.get("sha256"), r["byte_identical"], r.get("validate_ok")))
+        rec["all_byte_identical"] = ok
+        (BUILD / "parent-replay.json").write_text(json.dumps(rec, indent=1) + "\n",
+                                                  encoding="utf-8")
+        return 0 if ok else 1
+
+    if mode == "candidate":
+        out = SPV / "r07_c64_output_wo_i8.spv"
+        r = run("c64_complete_d4_int8.comp", SRC / "candidate", out, [])
+        r["entry"] = "c64_complete_d4_int8.comp"
+        r["source_inventory"] = {str(p.relative_to(SRC / "candidate")).replace("\\", "/"): sha(p)
+                                 for p in sorted((SRC / "candidate").rglob("*")) if p.is_file()}
+        (BUILD / "candidate-build.json").write_text(json.dumps(r, indent=1) + "\n", encoding="utf-8")
+        print(json.dumps({k: r.get(k) for k in ("sha256", "bytes", "rc", "validate_ok",
+                                               "validate_stdout")}, indent=1))
+        print(r.get("stderr", ""))
+        return 0 if r.get("validate_ok") else 1
+
+    if mode == "trydefines":
+        # diagnostic only: find which define set reproduces a deployed SPV
+        key = sys.argv[2]
+        want = dict((k, (e, s, w)) for k, e, s, d, p, w in PARENTS)[key]
+        entry, sd, wanthash = want[0], want[1], want[2]
+        for defs in ([], ["NATIVE=1"], ["NATIVE=0"], ["NATIVE=1", "C256_QX_LAST=0"],
+                     ["NATIVE=1", "C256_QX_HALF_MODE=1"]):
+            out = BUILD / ("probe-%s-%s.spv" % (key, "_".join(defs) or "none"))
+            r = run(entry, sd, out, defs)
+            print(defs, r.get("sha256"), r.get("bytes"), r.get("sha256") == wanthash)
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

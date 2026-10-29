@@ -1,0 +1,112 @@
+"""receipt.py - reproduce both modules and write the card's build receipt.
+
+Runs exactly two glslang invocations (parent replay, candidate) and two CPU
+validations, in the frozen toolchain of CONVENTIONS.md, and records argv, input
+and output sha256, byte counts, rc, stdout and the identity check.
+
+CPU only: glslang and spv_validate_cpu are the two allowed offline tools; no
+device, no pipeline, no runner, no GPU.lock.
+"""
+import hashlib
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CARD = Path(r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024/"
+            r"candidates/r02-c32-body")
+BUILD = Path(r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024/"
+             r"build/r02-c32-body")
+GLSLANG = Path(r"@NR_WORKSPACE@/src/project/tools/glslang-16.5.0/bin/glslang.exe")
+VALIDATE = Path(r"@NR_WORKSPACE@/candidates/amd-map-20261015/"
+                r"s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe")
+DEPLOYED = Path(r"@NR_WORKSPACE@/candidates/int8-coverage-v2-20261020/"
+                r"C/c32-i8-debug-eact-v1/spv/c32_body1_i8.spv")
+RUNNER = Path(r"@NR_WORKSPACE@/build/gpa-b321-prep/"
+              r"port_network_model_runner.exe")
+
+SOURCES = ("c32_body1_i8.comp", "c32_i8_common.glsl", "register_handoff.glsl")
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def run(argv, cwd):
+    t0 = time.time()
+    p = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True)
+    return {"argv": [str(a) for a in argv], "cwd": str(cwd), "rc": p.returncode,
+            "stdout": p.stdout.strip()[-4000:], "stderr": p.stderr.strip()[-4000:],
+            "seconds": round(time.time() - t0, 2)}
+
+
+def build(label, srcdir, out):
+    argv = [GLSLANG, "-V", "--target-env", "vulkan1.3", "-I" + str(srcdir),
+            "-o", str(out), "c32_body1_i8.comp"]
+    rec = run(argv, srcdir)
+    rec["label"] = label
+    rec["inputs"] = {str(srcdir / n): sha(srcdir / n) for n in SOURCES}
+    rec["output"] = {"path": str(out), "sha256": sha(out) if out.is_file() else None,
+                     "bytes": out.stat().st_size if out.is_file() else 0}
+    val = run([VALIDATE, str(out)], CARD)
+    rec["validate_cpu"] = {"argv": val["argv"], "rc": val["rc"],
+                           "stdout": val["stdout"], "stderr": val["stderr"],
+                           "result_zero": "result=0" in val["stdout"]}
+    (BUILD / (label + "-compile.stderr.txt")).write_text(rec["stderr"], encoding="utf-8")
+    (BUILD / (label + "-validate.stdout.txt")).write_text(val["stdout"], encoding="utf-8")
+    return rec
+
+
+def main():
+    BUILD.mkdir(parents=True, exist_ok=True)
+    parent = build("parent_repro", CARD / "source/parent", CARD / "spv/parent_repro.spv")
+    parent["identity"] = {
+        "deployed_parent_spv": str(DEPLOYED), "deployed_sha256": sha(DEPLOYED),
+        "repro_sha256": parent["output"]["sha256"],
+        "byte_identical": sha(DEPLOYED) == parent["output"]["sha256"]}
+    cand = build("r02_body1_qkv_i8", CARD / "source/candidate",
+                 CARD / "spv/r02_body1_qkv_i8.spv")
+    evidence = {p.name: {"bytes": p.stat().st_size, "sha256": sha(p)}
+                for p in sorted((CARD / "evidence").glob("*.json"))}
+    pack = {p.name: {"bytes": p.stat().st_size, "sha256": sha(p)}
+            for p in sorted((CARD / "pack").glob("*.bin"))}
+    rec = {
+        "card": "r02-c32-body",
+        "purpose": "C32 body (blocks 1,2,3,4,67,68,69): close the QKV segment of the "
+                   "four remaining FP16 matrix segments with an INT8 K32 path",
+        "time_jst": time.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
+        "compiler": {"path": str(GLSLANG), "sha256": sha(GLSLANG),
+                     "version": "glslang 16.5.0 (tools/glslang-16.5.0)"},
+        "validator": {"path": str(VALIDATE), "sha256": sha(VALIDATE)},
+        "runner_listed_not_executed": {"path": str(RUNNER),
+                                       "sha256": sha(RUNNER) if RUNNER.is_file() else None},
+        "builds": [parent, cand],
+        "evidence": evidence,
+        "pack": pack,
+        "replay": {
+            "parent": "cd %s && %s -V --target-env vulkan1.3 -I%s -o %s c32_body1_i8.comp"
+                      % (CARD / "source/parent", GLSLANG, CARD / "source/parent",
+                         CARD / "spv/parent_repro.spv"),
+            "candidate": "cd %s && %s -V --target-env vulkan1.3 -I%s -o %s c32_body1_i8.comp"
+                         % (CARD / "source/candidate", GLSLANG, CARD / "source/candidate",
+                            CARD / "spv/r02_body1_qkv_i8.spv"),
+            "validate": "%s <spv>   # must print result=0" % VALIDATE,
+        },
+        "gpu": "none. No device, pipeline, runner, GPU.lock or game was touched. All "
+               "qualifications are CPU_STRUCT / OFFLINE_COMPILE / SPV_IDENTITY / "
+               "PLAN_IDENTITY.",
+    }
+    (CARD / "build-receipt.json").write_text(
+        json.dumps(rec, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps({
+        "parent": {"sha256": parent["output"]["sha256"], "bytes": parent["output"]["bytes"],
+                   "rc": parent["rc"], "result_zero": parent["validate_cpu"]["result_zero"],
+                   "byte_identical": parent["identity"]["byte_identical"]},
+        "candidate": {"sha256": cand["output"]["sha256"], "bytes": cand["output"]["bytes"],
+                      "rc": cand["rc"], "result_zero": cand["validate_cpu"]["result_zero"]},
+        "evidence_files": len(evidence), "pack_files": len(pack)}, indent=1))
+
+
+if __name__ == "__main__":
+    main()

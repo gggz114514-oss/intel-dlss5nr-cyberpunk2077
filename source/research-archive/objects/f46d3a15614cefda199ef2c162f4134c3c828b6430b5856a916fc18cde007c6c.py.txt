@@ -1,0 +1,162 @@
+"""Task 3c: error attribution through block65 on the ACTUAL chain state.
+
+   X_g = chain-block64_out.bin            (INT8 network state, canonical layout)
+   Y_g = CPU INT8 FFN(X_g)                (validated model, see step3)
+   out_g = chain-block65_out.bin
+   r = out_g - ars*Y_g  ->  T_eff = (Wf^T)^+ r   (inverse-probe of the attention
+                                                 output the D4 pass actually saw)
+
+Compared against the FP16 teacher's Y / T at the same token positions.
+"""
+import json
+import numpy as np
+from pathlib import Path
+
+B = Path("@NR_WORKSPACE@")
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+W = B / "work/dsh-fullnet-static-20261029"
+TEACH = Q / "real-int8-24/dump-fp16"
+CHAIN = W / "C00-color-baseline/runs/diag-chain62-66"
+SC = Q / "real-int8-24/c64-family-static/b65-scales.bin"
+W8 = Q / "real-int8-24/c64-family-static/b65-weights.bin"
+PACK = B / "candidates/amd-map-20261015/round4-integrated/candidate/packs/swin_65_weights.fp16.bin"
+
+TILES_X, TILES_Y = 84, 48
+GRID_X, GRID_Y = 42, 25
+SHIFT_X, SHIFT_Y = 0, -1
+WO_HALF, ARS_HALF = 0, 12288
+
+
+def f16(a):
+    return np.asarray(a, dtype=np.float16)
+
+
+def rne_clamp(x, inv):
+    v = np.rint(np.asarray(x, dtype=np.float32) * np.float32(inv))
+    return np.clip(v, -127.0, 127.0).astype(np.int8)
+
+
+def act_h(x):
+    x = f16(x)
+    t = np.clip(x, f16(-4.0), f16(4.0))
+    u = f16(f16(-0.055908203125) * np.abs(t) + f16(0.447265625))
+    return f16(x * f16(t * u + f16(0.89453125)))
+
+
+def ffn(Xc, sc, w8):
+    inv_qx = sc[464:528].astype(np.float32)
+    qx = rne_clamp(Xc.astype(np.float32), inv_qx[None, :])
+    we = w8[:16384].reshape(256, 64); wm = w8[16384:24576].reshape(64, 128)
+    wc = w8[24576:28672].reshape(64, 64)
+    rs = f16(sc[528:592])
+    n = Xc.shape[0]
+    M = np.empty((n, 64), np.int8)
+    for s in range(0, n, 8192):
+        e = min(s + 8192, n)
+        acc = qx[s:e].astype(np.int32) @ we.T
+        e_f = f16(acc.astype(np.float32) * sc[16:272].astype(np.float32)[None, :])
+        qa = rne_clamp(act_h(e_f), sc[2])
+        mm = np.concatenate([qa[:, 0:128].astype(np.int32) @ wm[0:32].T,
+                             qa[:, 128:256].astype(np.int32) @ wm[32:64].T], 1).astype(np.float32)
+        M[s:e] = rne_clamp(mm * sc[272:336].astype(np.float32)[None, :], sc[3])
+    Y = np.empty((n, 64), np.float16)
+    for s in range(0, n, 8192):
+        e = min(s + 8192, n)
+        acc = M[s:e].astype(np.int32) @ wc.T
+        realv = acc.astype(np.float32) * sc[336:400].astype(np.float32)[None, :]
+        seed = f16(f16(Xc[s:e]) * rs[None, :])
+        Y[s:e] = f16(realv + seed.astype(np.float32))
+    return Y
+
+
+def canon_of_window():
+    """canonical flat index -> window-major flat index (w*64+m), -1 if unused."""
+    out = np.full(TILES_X * TILES_Y * 1024, -1, np.int64)
+    for wy in range(GRID_Y):
+        for wx in range(GRID_X):
+            w = wy * GRID_X + wx
+            for m in range(64):
+                q, sl = m >> 4, m & 15
+                tx = 2 * wx + SHIFT_X + (q & 1)
+                ty = 2 * wy + SHIFT_Y + (q >> 1)
+                if 0 <= tx < TILES_X and 0 <= ty < TILES_Y:
+                    base = (ty * TILES_X + tx) * 1024 + sl * 16
+                    for g in range(4):
+                        out[base + g * 256 + np.arange(16)] = w * 64 + m
+    return out
+
+
+def main():
+    sc = np.fromfile(SC, dtype="<f4")
+    w8 = np.fromfile(W8, dtype="i1").astype(np.int32)
+    pk = np.fromfile(PACK, dtype="<f2").astype(np.float32)
+    n = np.arange(64)[:, None]; k = np.arange(64)[None, :]
+    Wf = pk[WO_HALF + (n // 16) * 1024 + (k // 16) * 256 + (n % 16) * 16 + (k % 16)].astype(np.float32)
+    ars = pk[ARS_HALF:ARS_HALF + 64]
+
+    Xg = np.fromfile(CHAIN / "chain-block64_out.bin", dtype="<f2").astype(np.float16)
+    outg = np.fromfile(CHAIN / "chain-block65_out.bin", dtype="<f2").astype(np.float32)
+    Xc = Xg.reshape(TILES_X * TILES_Y, 4, 16, 16).transpose(0, 2, 1, 3).reshape(-1, 64)
+
+    c2w = canon_of_window()
+    tokmap = c2w.reshape(-1, 64, 16)[:, :, 0].reshape(-1)   # (tile*16+slot) -> w*64+m
+    ok = tokmap >= 0
+
+    Yg = ffn(Xc, sc, w8)                          # [64512,64] canonical order
+    Yt_all = np.fromfile(TEACH / "dump_swin_65_Y.bin", dtype="<f2").astype(np.float32).reshape(-1, 64)
+    Tt_all = np.fromfile(TEACH / "dump_swin_65_T.bin", dtype="<f2").astype(np.float32).reshape(-1, 64)
+    Yt = Yt_all[tokmap[ok]]                        # teacher Y at the same tokens
+    Tt = Tt_all[tokmap[ok]]
+    Yg_ok = Yg[ok].astype(np.float64)
+
+    # canonical flat -> compare on the valid (tile,slot) positions
+    idx_ok = np.where(ok)[0]
+    outg_tok = np.fromfile(CHAIN / "chain-block65_out.bin", dtype="<f2").astype(np.float32)
+    outg_tok = outg_tok.reshape(TILES_X * TILES_Y, 4, 16, 16).transpose(0, 2, 1, 3).reshape(-1, 64)
+    Og = outg_tok[idx_ok].astype(np.float64)
+
+    res = {"n_tokens": int(idx_ok.size)}
+
+    def rel(a, b):
+        return float(np.linalg.norm(a - b) / np.linalg.norm(b))
+
+    res["Y_stage"] = {
+        "rms_Ygpu_chain": float(np.sqrt((Yg_ok ** 2).mean())),
+        "rms_Yteacher": float(np.sqrt((Yt.astype(np.float64) ** 2).mean())),
+        "ratio": float(np.sqrt((Yg_ok ** 2).mean() / (Yt.astype(np.float64) ** 2).mean())),
+        "relL2": rel(Yg_ok, Yt.astype(np.float64)),
+        "corr": float(np.corrcoef(Yg_ok.ravel(), Yt.ravel())[0, 1]),
+        "slope": float((Yg_ok * Yt).sum() / (Yt.astype(np.float64) ** 2).sum()),
+    }
+    res["out_stage"] = {
+        "rms_outg": float(np.sqrt((Og ** 2).mean())),
+        "relL2": rel(Og, np.fromfile(TEACH / "dump_block65_out.bin", dtype="<f2")
+                     .astype(np.float32).reshape(TILES_X * TILES_Y, 4, 16, 16)
+                     .transpose(0, 2, 1, 3).reshape(-1, 64)[idx_ok].astype(np.float64)),
+    }
+    # ---- inverse probe of T -------------------------------------------------
+    seed = f16(Yg_ok.astype(np.float32) * f16(ars)[None, :]).astype(np.float64)
+    r = Og - seed
+    Wp = np.linalg.pinv(Wf.T.astype(np.float64))   # [64,64]: T = Wp @ r
+    Teff = r @ Wp.T
+    Tt64 = Tt.astype(np.float64)
+    res["T_probe"] = {
+        "rms_Teff": float(np.sqrt((Teff ** 2).mean())),
+        "rms_Tteacher": float(np.sqrt((Tt64 ** 2).mean())),
+        "ratio": float(np.sqrt((Teff ** 2).mean() / (Tt64 ** 2).mean())),
+        "relL2": rel(Teff, Tt64),
+        "corr": float(np.corrcoef(Teff.ravel(), Tt64.ravel())[0, 1]),
+        "slope": float((Teff * Tt64).sum() / (Tt64 ** 2).sum()),
+        "WO_cond": float(np.linalg.cond(Wf.astype(np.float64))),
+        "residual_relL2_of_probe": rel(Og - (Teff @ Wf.astype(np.float64).T + seed), Og),
+    }
+    res["energy"] = {
+        "rms_seed_from_Yg": float(np.sqrt((seed ** 2).mean())),
+        "rms_wo_term_teacher": 5.803,
+        "rms_out_chain": float(np.sqrt((Og ** 2).mean())),
+    }
+    print(json.dumps(res, indent=1))
+
+
+if __name__ == "__main__":
+    main()

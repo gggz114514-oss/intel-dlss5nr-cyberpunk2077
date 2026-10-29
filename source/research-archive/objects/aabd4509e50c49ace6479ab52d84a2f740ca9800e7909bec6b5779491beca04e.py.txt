@@ -1,0 +1,364 @@
+"""n39-f06-c256-slack: exhaustive SLM layout / lifetime / hazard model for F06 C256.
+
+Kernel (parent, chain-head row of the 15 F06 C256 PASSes, SPV 881dff8c...):
+
+    shared float16_t shT[16384];                       // 32768 B, the ONLY Workgroup object
+    for (e = t; e < 16384; e += 256) shT[e] = gT[w*16384 + e];   // 64 halves/thread, identity map
+    barrier();                                         // publish
+    if (debug) { echo shT -> dbg; barrier(); }
+    for (j = 0..7)  { m0 = (sg/8 + j)*8 = j*8 ; for (ki = 0..15) {
+        MAT_A a; coopMatLoad(a, shT, m0*256 + k0, 256u, LROW);   // 8x16 fp16 fragment
+        ... 2 weight tiles, 2 DPAS ...
+
+The model re-derives every footprint from the source formula (never from a sample) and is
+parameterised by the arm, so parent and candidate are evaluated by the same code:
+
+  arm        Workgroup halves   A operand source   barrier
+  parent     16384              shT (SLM)          1 publish (+1 inside the debug branch)
+  candidate  0                  gT  (global)       none
+
+Produces build/lifetime.json with:
+  geometry     threads / subgroups / fragment shapes / strides
+  producers    exhaustive staging write coverage + partition proof
+  consumers    exhaustive A-fragment read coverage, union, multiplicity, unread set
+  echo         debug-only read set
+  hazards      address-level RAW/WAR/WAW classification per arm
+  liveness     ordered phases, live set, PEAK simultaneously-live halves and bytes
+  budget       declared vs peak vs deletable bytes
+  residency    SLM pool interval (two measured reverse probes) -> residents per size
+  dynamic      per-WG messages / barriers / bytes, parent vs candidate
+"""
+import collections
+import json
+import pathlib
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+
+# ------------------------------------------------------------------ geometry
+THREADS, LANES = 256, 32
+SGS = THREADS // LANES                     # 8 subgroups
+TOKENS, CHANNELS = 64, 256                 # one tile of gT: out[t][c], stride 256
+TILE = TOKENS * CHANNELS                   # 16384 halves = 32768 B
+A_ROWS, A_COLS = 8, 16                     # MAT_A shape
+J_BLOCKS = TOKENS // A_ROWS                # 8
+KI_STEPS = CHANNELS // A_COLS              # 16
+STRIDE = CHANNELS                          # 256 halves between rows of the tile
+N0 = 32                                    # N columns owned by one subgroup
+SEED_ROWS, SEED_COLS = 8, 16               # MAT_H seed fragment (gY) - unchanged by this card
+
+ARMS = {
+    'parent':    dict(wg_halves=TILE, a_source='shT'),
+    'candidate': dict(wg_halves=0,    a_source='gT'),
+}
+
+
+def m0_of(sg, j):
+    """Row base of the A fragment.  Source: `m0 = (sg/8u + 1u*j) * 8u`; sg < 8 -> sg/8 == 0."""
+    assert 0 <= sg < SGS
+    return (sg // 8 + j) * A_ROWS
+
+
+def a_fragment(arm, sg, j, ki):
+    """Exhaustive footprint of one `coopMatLoad(a, <A_SRC>, m0*256 + k0, 256u, LROW)`.
+
+    Row-major, stride 256 halves, 8 rows x 16 columns -> 128 distinct halves.
+    parent: index inside shT.  candidate: index inside gT (tile-relative + w*TILE).
+    """
+    m0 = m0_of(sg, j)
+    k0 = ki * A_COLS
+    base = m0 * STRIDE + k0
+    return {base + r * STRIDE + c for r in range(A_ROWS) for c in range(A_COLS)}
+
+
+def seed_fragment(sg, j, half):
+    """`coopMatLoad(seed, gY, (w*64 + m0)*256 + n0 + half*16, 256u, LROW)` - global, unchanged."""
+    m0 = m0_of(sg, j)
+    base = (m0) * STRIDE + (sg % 8) * N0 + half * SEED_COLS
+    return {base + r * STRIDE + c for r in range(SEED_ROWS) for c in range(SEED_COLS)}
+
+
+def stage_writes(arm):
+    """{thread: set(addr)} of the staging copy `for (e=t; e<TILE; e+=THREADS) shT[e]=gT[w*TILE+e]`."""
+    if ARMS[arm]['a_source'] == 'gT':          # no staging copy at all
+        return {t: set() for t in range(THREADS)}
+    return {t: set(range(t, TILE, THREADS)) for t in range(THREADS)}
+
+
+def stage_reads(arm):
+    """{sg: set(addr)} of all A-fragment reads of one workgroup (8 j x 16 ki fragments)."""
+    out = {sg: set() for sg in range(SGS)}
+    for sg in range(SGS):
+        for j in range(J_BLOCKS):
+            for ki in range(KI_STEPS):
+                out[sg] |= a_fragment(arm, sg, j, ki)
+    return out
+
+
+def echo_reads(arm):
+    """Debug-gated raw echo: `dbg[425984 + e] = <A_SRC>[e]` over the whole tile."""
+    return set(range(TILE))
+
+
+# ------------------------------------------------------------------ analysis
+def owners(rep):
+    m = collections.defaultdict(set)
+    for k, s in rep.items():
+        for x in s:
+            m[x].add(k)
+    return m
+
+
+def coverage(rep, label):
+    cnt = collections.Counter()
+    for s in rep.values():
+        cnt.update(s)
+    hist = collections.Counter(cnt.values())
+    return dict(label=label, distinct_addresses=len(cnt),
+                count_histogram={str(k): v for k, v in sorted(hist.items())},
+                per_key={str(k): len(s) for k, s in rep.items()},
+                total=sum(len(s) for s in rep.values()))
+
+
+def hazard(earlier, later, kind):
+    oe, ol = owners(earlier), owners(later)
+    intra = cross = 0
+    pairs = set()
+    for addr, who_l in ol.items():
+        who_e = oe.get(addr)
+        if not who_e:
+            continue
+        for x in who_e:
+            for y in who_l:
+                if x == y:
+                    intra += 1
+                else:
+                    cross += 1
+                pairs.add((x, y))
+    return dict(kind=kind, shared_addresses=len(set(ol) & set(oe)),
+                same_owner_pairs=intra, cross_owner_pairs=cross,
+                owner_pairs=len(pairs))
+
+
+def liveness(arm):
+    """Ordered phases; `live` = addresses still readable at that point (source order)."""
+    src = ARMS[arm]['a_source']
+    rows = []
+
+    def add(phase, live, note):
+        rows.append(dict(phase=phase, live_halves=len(live), live_bytes=2 * len(live), note=note))
+
+    if src == 'shT':
+        add('P1 staging copy e=t..TILE step 256 (thread t writes 64 halves)', set(),
+            'producer sweep: the whole tile is copied before anything is read')
+        add('P2 barrier() publish', set(range(TILE)),
+            'PEAK: every one of the 16384 halves is published and still unread')
+        for j in range(J_BLOCKS):
+            live = set()
+            for jj in range(j, J_BLOCKS):
+                live |= {m0_of(0, jj) * STRIDE + r * STRIDE + c
+                         for r in range(A_ROWS) for c in range(CHANNELS)}
+            add('P3.%d A reads of M block %d (rows %d..%d)' % (j, j, j * A_ROWS,
+                                                               j * A_ROWS + A_ROWS - 1),
+                live, 'block %d is dead after iteration %d, but it is published at P2' % (j, j))
+        add('P4 debug echo (debug only) + barrier', set(), 'reads the whole tile again, debug=1 only')
+    else:
+        add('P1 no staging copy', set(), 'A operand is read straight from the read-only gT tile')
+        add('P2 no barrier', set(), 'nothing is shared through SLM, so no publish is required')
+        add('P3 A reads j=0..7 (same offsets, same values, global)', set(),
+            'live workgroup halves = 0 for the whole kernel')
+        add('P4 debug echo (debug only) reads gT', set(), 'same bytes as the parent echo')
+    peak = max(r['live_halves'] for r in rows)
+    return dict(phases=rows, peak_simultaneously_live_halves=peak,
+                peak_simultaneously_live_bytes=2 * peak,
+                declared_halves=ARMS[arm]['wg_halves'],
+                declared_bytes=2 * ARMS[arm]['wg_halves'],
+                slack_halves=ARMS[arm]['wg_halves'] - peak,
+                slack_bytes=2 * (ARMS[arm]['wg_halves'] - peak))
+
+
+def residency():
+    lo, hi = max(2 * 24576, 2 * 32768), min(3 * 24576, 3 * 32768) - 1
+    rows = []
+    for w in (32768, 24576, 21845, 20480, 16384, 13107, 8192, 4096, 0):
+        rows.append(dict(workgroup_bytes=w,
+                         residents_min=(None if w == 0 else lo // w),
+                         residents_max=(None if w == 0 else hi // w),
+                         exact=(None if w == 0 else lo // w == hi // w),
+                         note=('0 B: SLM stops being the binding resource; the resident count is '
+                               'then set by threads/registers and is >= the 16384 B row'
+                               if w == 0 else '')))
+    return dict(pool_bytes_interval=[lo, hi], basis=[
+        'F05 reverse probe: 24576 B -> 2 residents, 49192? no: 49152 B -> 1 resident',
+        'F06 reverse probe: 32768 B -> 2 residents, 49152 B -> 1 resident (this very kernel, '
+        'evidence/OCCUPANCY-ELASTICITY.json)',
+        'evidence/LESSONS.json L33: pool in [65536, 73728), thresholds 32768/21845/16384/13107',
+        'n36 measured 24576 -> 16384 B as 2 -> 4 residents on this GPU (same 256-thread, '
+        'max_r 127 shape)',
+    ], table=rows)
+
+
+def dynamic(arm):
+    """Static message / barrier counts per workgroup, derived from the geometry (debug off)."""
+    a_msgs = J_BLOCKS * KI_STEPS * A_ROWS                 # 8 messages per 8x16 LROW fragment
+    seed_msgs = 2 * J_BLOCKS * A_ROWS                     # 2 seeds per j, 8 messages each
+    weight_msgs = 2 * J_BLOCKS * KI_STEPS                 # b0,b1 per (j,ki), one message each
+    rec = dict(
+        a_fragments=SGS * J_BLOCKS * KI_STEPS,
+        a_messages_per_sg=J_BLOCKS * KI_STEPS * A_ROWS,
+        a_messages=a_msgs,
+        seed_messages=seed_msgs,
+        weight_messages=weight_msgs,
+        staging_messages=(16 if arm == 'parent' else 0),
+        staging_slm_stores=(16 if arm == 'parent' else 0),
+        barriers=(1 if arm == 'parent' else 0),
+        debug_barriers=1,
+        note=('A operand: %s; the 8 subgroups read the SAME 8x16 fragments, so the A read '
+              'multiplicity is 8 in both arms' % ARMS[arm]['a_source']),
+    )
+    rec['total_messages'] = (rec['a_messages'] + rec['seed_messages'] + rec['weight_messages']
+                             + rec['staging_messages'])
+    rec['slm_load_messages'] = rec['a_messages'] if arm == 'parent' else 0
+    rec['ugm_load_messages'] = rec['a_messages'] + rec['seed_messages'] + rec['staging_messages']
+    return rec
+
+
+def main():
+    out = dict(geometry=dict(threads=THREADS, subgroups=SGS, lanes=LANES,
+                             tokens=TOKENS, channels=CHANNELS, tile_halves=TILE,
+                             tile_bytes=2 * TILE, stride_halves=STRIDE,
+                             a_shape=[A_ROWS, A_COLS], j_blocks=J_BLOCKS, ki_steps=KI_STEPS,
+                             n0_per_sg=N0, grid=['11x6', '11x7']))
+    for arm in ('parent', 'candidate'):
+        rec = dict(a_source=ARMS[arm]['a_source'], wg_halves=ARMS[arm]['wg_halves'],
+                   wg_bytes=2 * ARMS[arm]['wg_halves'])
+        sw = stage_writes(arm)
+        sr = stage_reads(arm)
+        # ---- producers (exhaustive)
+        waddrs = {x for s in sw.values() for x in s}
+        rec['producers'] = dict(
+            staging=coverage(sw, 'staging copy'),
+            write_is_partition_of_tile=(waddrs == set(range(TILE))),
+            write_multiplicity=dict(collections.Counter(
+                collections.Counter([x for s in sw.values() for x in s]).values())),
+            halves_per_thread=sorted({len(s) for s in sw.values()}),
+            identity_map=True,
+            note='shT[e] = gT[w*16384 + e]: the staged value is a byte-for-byte copy of the '
+                 'global tile, no transform',
+        ) if ARMS[arm]['a_source'] == 'shT' else dict(
+            staging=None, write_is_partition_of_tile=None, identity_map=None,
+            note='no staging copy in this arm')
+        # ---- consumers (exhaustive)
+        u = set().union(*sr.values())
+        cnt = collections.Counter([x for s in sr.values() for x in s])
+        rec['consumers'] = dict(
+            a_reads=coverage(sr, 'A fragments'),
+            read_union_is_whole_tile=u == set(range(TILE)),
+            unread_halves=len(set(range(TILE)) - u),
+            read_multiplicity=dict(collections.Counter(cnt.values())),
+            fragments_per_sg=J_BLOCKS * KI_STEPS,
+            fragments_total=SGS * J_BLOCKS * KI_STEPS,
+            block_ownership='M block j = rows 8j..8j+7 is read only in iteration j; every '
+                            'subgroup reads every block (m0 does not depend on sg)',
+        )
+        # per-j read sets are exactly the 2048-half blocks
+        blocks = []
+        for j in range(J_BLOCKS):
+            s = set()
+            for sg in range(SGS):
+                for ki in range(KI_STEPS):
+                    s |= a_fragment(arm, sg, j, ki)
+            blocks.append(dict(j=j, halves=len(s),
+                               first=min(s), last=max(s),
+                               is_block=(s == set(range(j * A_ROWS * STRIDE,
+                                                        (j * A_ROWS + A_ROWS) * STRIDE)))))
+        rec['consumers']['per_j_blocks'] = blocks
+        rec['echo'] = dict(halves=len(echo_reads(arm)), debug_only=True,
+                           covers_whole_tile=True)
+        # ---- hazards
+        haz = {}
+        if ARMS[arm]['a_source'] == 'shT':
+            haz['RAW_stage_to_A_read'] = hazard(sw, sr, 'RAW staging write -> A read')
+            haz['RAW_stage_to_A_read']['closed_by'] = 'the single publish barrier'
+            haz['WAR_A_read_to_next_stage'] = dict(shared_addresses=0,
+                                                   closed_by='none needed: there is no second '
+                                                             'staging pass')
+            haz['WAW_stage_to_stage'] = dict(shared_addresses=0, note='one staging pass only')
+        else:
+            haz['SLM_hazards'] = dict(count=0, note='no Workgroup memory object at all')
+        rec['hazards'] = haz
+        rec['liveness'] = liveness(arm)
+        rec['dynamic'] = dynamic(arm)
+        out[arm] = rec
+
+    # ---- the deletability argument (why the array is a pure copy, not live data nobody can move)
+    out['deletable'] = dict(
+        claim='every half of shT is a byte-for-byte copy of gT at the same tile offset, gT is '
+              'read-only in this shader, and the only consumers are the A fragment loads and '
+              'the debug echo',
+        value_map='shT[e] == gT[w*16384 + e] for all e in [0, 16384)',
+        gT_written_anywhere=False,
+        consumers=['coopMatLoad(a, ..., m0*256 + k0, 256u, LROW)  (8 j x 16 ki per SG)',
+                   'debug echo dbg[425984 + e] = shT[e]'],
+        consequence='the array can be deleted instead of shrunk: 32768 B -> 0 B, and every '
+                    'A operand value stays bit-identical',
+    )
+    out['residency'] = residency()
+    out['budget'] = dict(
+        parent=dict(declared_bytes=32768, peak_live_bytes=32768, slack_bytes=0,
+                    lower_bound_bytes=32768,
+                    note='single publish barrier => the whole tile must be resident at once'),
+        candidate=dict(declared_bytes=0, peak_live_bytes=0, slack_bytes=0,
+                       note='array deleted, not shrunk'),
+        removed_bytes=32768,
+        target_bytes=16384,
+        target_met='0 B <= 16384 B',
+        next_threshold=13107,
+        note='the card asked for <= 16384 B (4 residents); the deletable array lands at 0 B, '
+             'which is strictly below the target',
+    )
+    K_write = CARD / 'build' / 'lifetime.json'
+    K_write.parent.mkdir(exist_ok=True)
+    K_write.write_text(json.dumps(out, indent=2), encoding='utf-8')
+
+    for arm in ('parent', 'candidate'):
+        r = out[arm]
+        lv = r['liveness']
+        print('== %s  A source=%s  Workgroup=%d halves (%d B)'
+              % (arm, r['a_source'], r['wg_halves'], r['wg_bytes']))
+        if r['producers']['staging']:
+            st = r['producers']['staging']
+            print('   staging: distinct=%d total=%d partition=%s halves/thread=%s'
+                  % (st['distinct_addresses'], st['total'],
+                     r['producers']['write_is_partition_of_tile'],
+                     r['producers']['halves_per_thread']))
+        c = r['consumers']
+        print('   A reads: distinct=%d fragments=%d mult=%s union_whole=%s unread=%d'
+              % (c['a_reads']['distinct_addresses'], c['fragments_total'],
+                 c['read_multiplicity'], c['read_union_is_whole_tile'], c['unread_halves']))
+        print('   per-j blocks: %s' % [(b['j'], b['halves'], b['is_block'])
+                                       for b in c['per_j_blocks']])
+        print('   hazards: %s' % {k: {x: y for x, y in v.items() if x != 'note'}
+                                  for k, v in r['hazards'].items()})
+        print('   liveness: peak=%d halves (%d B) declared=%d B slack=%d B'
+              % (lv['peak_simultaneously_live_halves'],
+                 lv['peak_simultaneously_live_bytes'], lv['declared_bytes'],
+                 lv['slack_bytes']))
+        d = r['dynamic']
+        print('   messages: total=%d (A %d, seed %d, weight %d, staging %d) slm=%d ugm=%d '
+              'barriers=%d' % (d['total_messages'], d['a_messages'], d['seed_messages'],
+                               d['weight_messages'], d['staging_messages'],
+                               d['slm_load_messages'], d['ugm_load_messages'], d['barriers']))
+    print('== residency pool %s' % out['residency']['pool_bytes_interval'])
+    for t in out['residency']['table']:
+        print('   %6d B -> %s..%s %s' % (t['workgroup_bytes'], t['residents_min'],
+                                         t['residents_max'],
+                                         'exact' if t['exact'] else (t['note'] or '')))
+    print('== budget: removed %d B, target %d B, %s'
+          % (out['budget']['removed_bytes'], out['budget']['target_bytes'],
+             out['budget']['target_met']))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

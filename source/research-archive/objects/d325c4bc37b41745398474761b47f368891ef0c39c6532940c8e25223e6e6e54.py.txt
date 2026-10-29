@@ -1,0 +1,177 @@
+"""n23-f05-shape evidence generator (CPU only, read-only outside this card).
+
+Produces the three exhaustive artefacts the card has to prove:
+  build/overlap.json    the QKV weight interval is disjoint from every other reader's interval
+  build/writeset.json   every (token, channel, head) has exactly one owning subgroup/phase/fragment
+                        and exactly one published address (the enumeration is exhaustive, 2 heads x
+                        64 tokens x 96 channels per workgroup)
+  build/budget.json     live-value / GRF model for the parent six 8x16 accumulators and for the
+                        merged three 8x32 accumulators under both candidate lane laws
+  build/rounding.json   the per-output-element accumulation order and the single half rounding point
+"""
+import json
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).parent
+sys.path.insert(0, str(CARD.parent.parent))
+sys.path.insert(0, str(CARD))
+import COMMON as K          # noqa: E402
+import planio               # noqa: E402
+
+ORDS = [19, 22, 25, 28, 31, 34, 195, 198, 201, 204, 207, 210]
+QKV_HALVES = 49152            # 4 heads x (96 channels x 128 k) halves
+HEADS_PER_WG = 2
+TOKENS_PER_WG = 64
+CHANNELS_PER_HEAD = 96
+
+
+def main():
+    b = CARD / 'build'
+    b.mkdir(exist_ok=True)
+    plan, plan_sha, _ = K.current_best()
+    d = planio.parse(plan)
+
+    # ---------------------------------------------------------------- overlap
+    over = {'plan': str(plan), 'plan_sha256': plan_sha, 'qkv_halves': QKV_HALVES, 'passes': []}
+    for o in ORDS:
+        p = d['passes'][o]
+        b0 = next(x for x in p['binds'] if x['binding'] == 0)
+        res = d['buffers'][b0['resource']]
+        wq = p['push'][15]
+        lo, hi = wq, wq + QKV_HALVES
+        others = []
+        for q in d['passes']:
+            if q['ordinal'] == o or not any(x['resource'] == res['index'] for x in q['binds']):
+                continue
+            others.append(dict(ordinal=q['ordinal'], name=q['name'],
+                               push_values_in_interval=[v for v in q['push'] if lo <= v < hi]))
+        over['passes'].append(dict(ordinal=o, name=p['name'], resource=res['index'],
+                                   buffer=res['name'], bytes=res['bytes'],
+                                   wq=wq, interval=[lo, hi],
+                                   interval_bytes=[lo * 2, hi * 2],
+                                   fits=hi <= res['bytes'] // 2,
+                                   other_passes=others,
+                                   other_readers_inside_interval=[x['name'] for x in others
+                                                                  if x['push_values_in_interval']
+                                                                  and x['name'].endswith('_swin_body_3')]))
+    K.write_json(b / 'overlap.json', over)
+
+    # ---------------------------------------------------------------- write set
+    # parent projection ownership: SG (q, h) writes, per phase p, tokens m0 = 8q + 32p .. +7 and
+    # channels 0..95 of head h; score/PV ownership: SG (q,h) reads queries 16q..16q+15, all keys.
+    ws = {'workgroup': dict(subgroups=8, heads=HEADS_PER_WG, tokens=TOKENS_PER_WG,
+                            channels_per_head=CHANNELS_PER_HEAD,
+                            shared_halves=12288, shared_per_head=6144),
+          'rules': dict(
+              head='h = gid.z*2 + sg/4',
+              query_owner='q = sg%4  (score/PV: queries 16q..16q+15, keys 0..63)',
+              projection_owner='q = (t>>3)&3, phase p = t>>5, tokens 8q+32p..+7',
+              channel_blocks='Q 0..31 (two 16-blocks), K 32..63, V 64..95'),
+          'enumeration': {}, 'checks': {}}
+    owners = {}
+    for h in range(HEADS_PER_WG):
+        for t in range(TOKENS_PER_WG):
+            q = (t >> 3) & 3
+            p = t >> 5
+            for c in range(CHANNELS_PER_HEAD):
+                blk = c // 16
+                frag = (q, h, p, blk)
+                key = (h, t, c)
+                assert key not in owners, key
+                owners[key] = frag
+    ws['checks']['cells'] = len(owners)
+    ws['checks']['expected_cells'] = HEADS_PER_WG * TOKENS_PER_WG * CHANNELS_PER_HEAD
+    ws['checks']['bijective_writer_per_cell'] = len(owners) == ws['checks']['expected_cells']
+    # each (SG of the 8, phase, block) writes exactly 8 tokens x 16 channels = 128 cells
+    per_frag = {}
+    for key, f in owners.items():
+        per_frag[f] = per_frag.get(f, 0) + 1
+    ws['checks']['fragments'] = len(per_frag)
+    ws['checks']['cells_per_fragment'] = sorted(set(per_frag.values()))
+    ws['checks']['fragment_owners'] = sorted('%d/%d/%d/%d' % f for f in per_frag)
+    # published addresses (parent layout) and their uniqueness
+    addr = {}
+    for (h, t, c), f in owners.items():
+        base = h * 6144
+        if c < 32:      # Q: [token][dim]  (m0*32 + dim), dim = c
+            a = base + t * 32 + c
+        elif c < 64:    # K: [keyblock][dim] col-major 8, key block = t//8
+            kb = t // 8
+            a = base + 2048 + kb * 256 + (c - 32) * 8 + (t % 8)
+        else:           # V: [token][dim]
+            a = base + 4096 + t * 32 + (c - 64)
+        assert a not in addr, ('published address collision', a, (h, t, c), addr.get(a))
+        addr[a] = (h, t, c)
+    ws['checks']['published_cells'] = len(addr)
+    ws['checks']['published_bijective'] = len(addr) == len(owners)
+    ws['checks']['published_halves'] = HEADS_PER_WG * 6144
+    ws['checks']['no_collision'] = True
+    K.write_json(b / 'writeset.json', ws)
+
+    # ---------------------------------------------------------------- GRF / live model
+    # 8x16 fp32 DPAS accumulator occupies 8 GRF (measured: the parent ISA places the six
+    # projection accumulators at r42..r89 = 48 GRF, 8 apart; queue/n04b .../ISA))
+    g16 = 8
+    budget = {
+        'source': 'queue/n04b-f05-c128-feed/native/captures/native-native-base/ISA/'
+                  'CS_asmf98d5ab4e239dd54_simd32_000000000000000a_9_orig.asm',
+        'measured_parent': dict(acc_regs=['r42', 'r50', 'r58', 'r66', 'r74', 'r82'],
+                                acc_grf=6 * g16, stride=8, dpas_shape='dpas.8x8 (16|M0)',
+                                dpas_static=128, sends=518, slm_store_sends=68,
+                                ugm_b_loads=96, max_r=127, first_dpas=2560),
+        'parent': dict(accumulators=6, grf_per_acc=g16, acc_grf=6 * g16,
+                       live_b_fragments=2, b_grf_each=8, peak_model=6 * g16 + 2 * 8),
+        'merged_nested': dict(accumulators=3, grf_per_acc=2 * g16, acc_grf=3 * 2 * g16,
+                              live_b_fragments=1, b_grf_each=16,
+                              peak_model=3 * 2 * g16 + 16,
+                              note='equal acc GRF, one wider B instead of two narrow ones'),
+        'merged_lanecol': dict(accumulators=3, grf_per_acc=g16, acc_grf=3 * g16,
+                               live_b_fragments=1, b_grf_each=16,
+                               peak_model=3 * g16 + 16,
+                               note='a 32-column acc is 8 dwords/lane, i.e. the same 8 GRF footprint'),
+        'gate': 'acc GRF must not exceed the parent 48; both candidate laws satisfy it '
+                '(48 equal / 24 half)',
+        'reference_n05e': 'twelve 8x16 accumulators = 96 GRF measured 119..126 peak and cost '
+                          '-0.349 ms; that budget stays closed either way',
+    }
+    K.write_json(b / 'budget.json', budget)
+
+    # ---------------------------------------------------------------- rounding / K order
+    rnd = {
+        'element': 'one (token, channel) of one head',
+        'parent': dict(steps=['ki = 0..7 in program order, one coopMatMulAdd per step',
+                              'each step accumulates 16 products into an fp32 accumulator',
+                              'one MC->MH narrowing after the loop (Q,K via MAT_H(acc), V via narrowed)',
+                              'Q/K then multiplied once by half(norm*scale) or half(norm) and rounded '
+                              'to half once per element'],
+                     half_rounding_points=['MAT_H(accQ0/1)', 'MAT_H(accK0/1)', 'MAT_H(accV0/1)',
+                                           'q0/q1/k0/k1 scale products']),
+        'merged': dict(steps=['ki = 0..7 in program order, one coopMatMulAdd on the 32-wide acc',
+                              'each step accumulates 16 products into the same fp32 column',
+                              'one MC->MH narrowing after the loop',
+                              'same scale product, same single rounding per element'],
+                       half_rounding_points=['MAT_H32(accQ)', 'MAT_H32(accK)', 'MAT_H32(accV)',
+                                             'same scale products'],
+                       equivalence='per element the sequence of fp32 additions inside the '
+                                   'accumulator is the same 8 steps in the same order; only the '
+                                   'number of columns per instruction changes, and a wider DPAS '
+                                   'accumulates each column independently in the same k order'),
+        'norm_tree': dict(
+            terms='sq[c] + sq[c+16] for c = 0..15, then xor8, xor4, xor2, xor1 over (lane&15)',
+            parent_expression='f16vec2(q0[i],k0[i]) and f16vec2(q1[i],k1[i]) -> v = q0[i]^2 + q1[i]^2',
+            merged_expression_if_NESTED='component i vs component i+4 of the merged accumulator',
+            merged_expression_if_LANECOL='lane L vs lane L+16 (xor16) before the xor8 tree',
+            status='BLOCKED on the lane-map probe (SHAPE-PROBE.md A.3)'),
+        'forbidden': ['reassociating the 8 k-steps', 'splitting the sum into even/odd k tiles',
+                      'changing the number of MC->MH narrowings', 'changing any scale product'],
+    }
+    K.write_json(b / 'rounding.json', rnd)
+    print('wrote build/overlap.json build/writeset.json build/budget.json build/rounding.json')
+    print('write-set cells', ws['checks']['cells'], 'fragments', ws['checks']['fragments'],
+          'per fragment', ws['checks']['cells_per_fragment'])
+    print('published halves', ws['checks']['published_halves'])
+
+
+if __name__ == '__main__':
+    main()

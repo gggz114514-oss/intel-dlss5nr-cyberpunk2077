@@ -1,0 +1,130 @@
+"""Short census: does any other pass group of the 232 have the same kind of
+'workgroup reorder' (two independent axes: token block x weight/channel group)
+that could be transposed without changing workgroup content?
+
+Read-only over the plan + the 39 unique shader sources.  Writes census.json
+inside this card directory.  No GPU.
+"""
+import sys, json, re
+from pathlib import Path
+
+CAMPAIGN = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(CAMPAIGN))
+import COMMON as K
+
+CARD = CAMPAIGN / 'cards' / 'n08b-f08-order'
+
+# Manual classification keyed by (family, name) with the reason; the verbatim
+# gl_WorkGroupID lines extracted from the source are stored next to it as evidence.
+CLASS = {
+    ('F01', 'f1c32_image_pre'): ('spatial_xy', 'WGID.x/y are image window coords (px/py from 4x4 body tiles); swapping them transposes the image, so the workgroup content would change'),
+    ('F02', 'block1_swin_body_1'): ('spatial_xy', 'wx/wy = window origin, used for spatial tokens; not content-preserving'),
+    ('F03', 'ioport_block4_0'): ('mn_2d', 'm0 = WGID.x*8 (M/token tiles, 8064 values), n0 = WGID.y*32 (N channels, 2 values): two independent domains, so a swap would be order-only; same tiny-y shape as F08 l0'),
+    ('F04', 'block5_swin_body_1'): ('spatial_xy', 'wx/wy window origin; not content-preserving'),
+    ('F04', 'block9_swin_body_1'): ('xy_spatial_z_group', 'wx/wy spatial + WGID.z*32 token slab inside the window; 3-axis, not a pure x/y swap'),
+    ('F04', 'block15_swin_body_1'): ('xy_spatial_z_group', 'wx/wy spatial + WGID.z*16 token slab inside the window; 3-axis'),
+    ('F05', 'block5_swin_body_3'): ('xy_spatial_z_group', 'wx/wy spatial + h = WGID.z*2 + sg/4 (head); 3-axis'),
+    ('F05', 'block9_swin_body_3'): ('xy_spatial_z_group', 'wx/wy spatial + h = WGID.z*2 + sg/4 (head); 3-axis'),
+    ('F05', 'block15_swin_body_3'): ('xy_spatial_z_group', 'wx/wy spatial + h = WGID.z*2 + sg/4 (head); 3-axis'),
+    ('F06', 'block5_swin_body_4'): ('spatial_xy', 'wx/wy window origin; not content-preserving'),
+    ('F06', 'block9_swin_body_4'): ('spatial_xy', 'wx/wy window origin; not content-preserving'),
+    ('F06', 'block15_swin_body_4'): ('spatial_xy', 'wx/wy window origin; not content-preserving'),
+    ('F07', 'f3c64_body_ds'): ('spatial_xy', 'wx/wy window origin; not content-preserving'),
+    ('F07', 'f3c128_body_ds'): ('spatial_xy', 'wx/wy window origin; not content-preserving'),
+    ('F07', 'f3c256_body_ds'): ('spatial_xy', 'wx/wy window origin; not content-preserving'),
+    ('F08', 'split16_b23_l0'): ('token_x_group_y', 'token = WGID.x*16+(sg%2)*8, g = WGID.y*4+sg/2: two independent domains (1056 tokens x 8 groups) -> this card'),
+    ('F09', 'split16_b23_l1'): ('token_x_group_y', 'spatial token = WGID.x, output-channel group ng = WGID.y; a swap would be order-only (per-WG content 1 token16 x 1 ng, no sg dependence on the axis)'),
+    ('F10', 'split16_b23_l2'): ('xy_spatial_z_group', 'wx/wy spatial window + h = WGID.z (16 heads); 3-axis, not a pure x/y swap'),
+    ('F11', 'split16_b23_l3'): ('token_x_group_y', 't0 = WGID.x*32 (token block), n0 = WGID.y*64+sg*16 (output channels); a swap would be order-only'),
+    ('F12', 'split16_b30_l3'): ('token_x_group_y', 'spatial token = WGID.x, ng = WGID.y; order-only swap'),
+    ('F12', 'split16_b30_l4'): ('token_x_group_y', 'spatial token = WGID.x, ng = WGID.y; order-only swap'),
+    ('F13', 'vit_block31_ffn_expand'): ('single_dim', 'no gl_WorkGroupID in the source (1-D dispatch / local ids only)'),
+    ('F13', 'vit_block31_ffn_contract'): ('single_dim', 'no gl_WorkGroupID in the source'),
+    ('F14', 'vit_block31_qkv'): ('mn_2d', 'mA = WGID.x*128+sg*8 (3 M blocks), n0 = WGID.y*32 (96 N groups): independent domains, order-only; already channel-major (x small)'),
+    ('F15', 'vit_block31_attention'): ('mn_2d', 'q0 = WGID.x*64 (5 query blocks), h = WGID.y (32 heads): independent domains, order-only'),
+    ('F16', 'vit_block31_projection'): ('single_dim', 'no gl_WorkGroupID in the source'),
+    ('F17', 't3_b39_project_blend'): ('mn_2d', 'm0 = WGID.x*8, n0 = WGID.y*16*PROJECT_PAIR: independent domains, order-only'),
+    ('F18', 'c3x_pre_c256'): ('xy_spatial_z_group', 'wx/wy spatial + WGID.z half selector; 3-axis'),
+    ('F18', 'c3x_body_c256'): ('xy_spatial_z_group', 'wx/wy spatial + g = WGID.z/2, t0 = (WGID.z%2)*32; 3-axis'),
+    ('F18', 'block48_swin_body_2'): ('spatial_xy', 'wx/wy window origin; not content-preserving'),
+    ('F18', 'c3x_pre_c128'): ('spatial_xy', 'wx/wy window origin'),
+    ('F18', 'c3x_body_c128'): ('xy_spatial_z_group', 'wx/wy spatial + g = WGID.z; 3-axis'),
+    ('F18', 'block56_swin_body_2'): ('spatial_xy', 'wx/wy window origin'),
+    ('F18', 'c3x_pre_c64'): ('spatial_xy', 'wx/wy window origin'),
+    ('F18', 'c3x_body_c64'): ('xy_spatial_z_group', 'wx/wy spatial + g = WGID.z; 3-axis'),
+    ('F18', 'block62_swin_body_2'): ('spatial_xy', 'wx/wy window origin'),
+    ('F19', 'f2c32_block66_fused'): ('spatial_xy', 'px/py from WGID.x/y 4x4 body tiles plus wx/wy window; spatial'),
+    ('F20', 's37_fold_body_r1a_v1'): ('spatial_xy', 'wx/wy window origin'),
+    ('F21', 'ioport_block70_2'): ('single_dim', 'no gl_WorkGroupID in the source'),
+}
+
+
+def grids_from_plan(plan_path):
+    out = {}
+    for line in Path(plan_path).read_text(encoding='utf-8-sig').split('\n'):
+        if not line.startswith('PASS '):
+            continue
+        p = line.split(' ')
+        out.setdefault(p[3].strip('"').replace('\\', '/'), set()).add((p[-3], p[-2], p[-1]))
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def main():
+    plan_path, plan_sha, _ = K.current_best()
+    grids = grids_from_plan(plan_path)
+    rows_by_spv = {}
+    for r in K.rows():
+        rows_by_spv.setdefault(r['spv'].strip('"').replace('\\', '/'), set()).add(
+            tuple(r['grid']) if r.get('grid') else None)
+    uniq = K.unique_shaders()
+    rows = []
+    for u in uniq:
+        src = Path(u['source'])
+        txt = src.read_text(encoding='utf-8-sig', errors='replace') if src.exists() else ''
+        hits = [ln.strip() for ln in txt.splitlines() if 'gl_WorkGroupID' in ln]
+        key = (u['family'], u['name'])
+        cls, reason = CLASS.get(key, ('unclassified', ''))
+        g = grids.get(u['spv'].strip('"').replace('\\', '/'), [])
+        if not g:
+            g = sorted(x for x in rows_by_spv.get(u['spv'].strip('"').replace('\\', '/'), set()) if x)
+        rows.append({
+            'family': u['family'], 'name': u['name'],
+            'spv_sha256': u['spv_sha256'], 'ordinals': u['ordinals'],
+            'passes': len(u['ordinals']),
+            'segments_covered': len(u['ordinals']),
+            'grids': g,
+            'grid_y_values': sorted({int(x[1]) for x in g}) if g else [],
+            'wgrid_lines': hits[:8],
+            'class': cls, 'transposable_without_content_change': cls in ('token_x_group_y', 'mn_2d'),
+            'reason': reason,
+        })
+    by_class = {}
+    for r in rows:
+        by_class.setdefault(r['class'], []).append(r['family'] + '/' + r['name'])
+
+    summary = {
+        'n03d': 'short census: which of the 39 unique shaders could host the same *kind* of '
+                'workgroup reorder (transpose of two independent dispatch axes) without changing '
+                'workgroup content',
+        'plan': K.ident(plan_path),
+        'unique_shaders': len(rows), 'passes': 232,
+        'classes': {k: {'shaders': v, 'count': len(v)} for k, v in sorted(by_class.items())},
+        'transposable_shaders': [r['family'] + '/' + r['name'] for r in rows
+                                 if r['transposable_without_content_change']],
+        'f08_l0': {
+            'grid': [r['grids'] for r in rows if r['name'] == 'split16_b23_l0'],
+            'class': [r['class'] for r in rows if r['name'] == 'split16_b23_l0'],
+            'note': 'F08 has a single width (C512, 16 PASS); its sibling layers l1/l2/l3 are '
+                    'separate families (F09/F10/F11) with their own grids (66,4,1) / (6,3..4,16) / (33,8,1)',
+        },
+        'rows': rows,
+    }
+    K.write_json(CARD / 'census.json', summary)
+    print(json.dumps({k: summary[k] for k in ('unique_shaders', 'classes', 'transposable_shaders', 'f08_l0')}, indent=1))
+    print('grids per family:')
+    for r in rows:
+        print('  %-4s %-28s %-40s %s' % (r['family'], r['name'], r['grids'], r['class']))
+
+
+if __name__ == '__main__':
+    main()

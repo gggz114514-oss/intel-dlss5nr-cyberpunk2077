@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""Resource-level MODEL diff between two PORT_NETWORK_1 plans (DSH S00).
+
+S00 needs one production-mergeable list of *model* differences for
+``c64-family-static/combo-34189.txt`` against its parent
+``c32-equalized/combo-34189.txt``, with every difference classified and with the
+captured frame inputs kept strictly out of that list.
+
+Classification (one category per item):
+
+* ``MODEL_WEIGHT``  - a weight pack file (or its size) changed
+* ``SCALE``         - a scale pack file (or its size) changed
+* ``SPV``           - the SPIR-V a dispatch loads changed (path and/or SHA)
+* ``BIND``          - an existing BIND range changed (offset/bytes/buffer), e.g.
+                      follows a scale-pack resize
+* ``PUSH``          - a PUSH word changed
+* ``OUTPUT_PATH``   - the OUTPUT file name/format/index changed
+* ``INPUT_BINDING`` - the *set* of bindings changed: a binding slot was added or
+                      removed, or a non-weight/scale resource was retargeted
+
+``CAPTURE_INPUT`` is deliberately **not** one of the model categories: buffers
+that read captured frame fixtures (``dataset/`` paths, ``pre.bin``, ``post.bin``,
+``network-output.bin``) are collected in their own ``capture_input`` section and
+are never emitted as model items.  A hard check re-scans every emitted model
+item and fails the run if a capture resource leaked in.
+
+Usage::
+
+    python model_diff.py --base <plan> --candidate <plan> --out MODEL-DIFF.json \
+                         [--sibling <same-family other-frame plan>]
+
+``--sibling`` runs the same diff between the candidate and another frame of the
+same family.  Because only capture paths may differ there, the model list must
+come out empty; that is recorded as ``checks.capture_isolation`` and is the
+proof that capture bindings cannot masquerade as model deltas.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+HERE = Path(__file__).resolve()
+DEFAULT_PLANLIB_DIR = HERE.parents[1] / "tools"
+if str(DEFAULT_PLANLIB_DIR) not in sys.path:
+    sys.path.insert(0, str(DEFAULT_PLANLIB_DIR))
+
+import planlib  # noqa: E402
+
+SCHEMA = "dsh-model-diff/1"
+CATEGORIES = ["MODEL_WEIGHT", "SCALE", "SPV", "BIND", "PUSH", "OUTPUT_PATH", "INPUT_BINDING"]
+CAPTURE_BASENAMES = {"pre.bin", "post.bin", "network-output.bin"}
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def posix(path: Path | str) -> str:
+    return Path(path).as_posix()
+
+
+def is_capture(path: str) -> bool:
+    p = Path(path)
+    return "/dataset/" in posix(path) or p.name.lower() in CAPTURE_BASENAMES
+
+
+def resource_class(name: str, file: str) -> str:
+    n = name.lower()
+    f = Path(file).name.lower()
+    if "scale" in n or "scale" in f:
+        return "SCALE"
+    if "weight" in n or "weight" in f or f.endswith(".i8.bin") or f.endswith(".int8.bin"):
+        return "MODEL_WEIGHT"
+    return "OTHER"
+
+
+def norm_out(outputs: List[Tuple[int, str, str, int]]) -> List[Dict[str, Any]]:
+    return [{"index": i, "format": fmt, "name": name} for i, fmt, name, _ in outputs]
+
+
+def dispatch_model(plan: planlib.Plan) -> List[Dict[str, Any]]:
+    out = []
+    for p in plan.passes:
+        out.append({
+            "ordinal": p.ordinal,
+            "name": p.name,
+            "spv": p.spv,
+            "push": p.push,
+            "binds": [{"binding": b.binding, "buffer": b.buffer,
+                       "buffer_name": plan.buffers[b.buffer].name if b.buffer < len(plan.buffers) else None,
+                       "offset": b.offset, "bytes": b.bytes} for b in p.binds],
+        })
+    return out
+
+
+def diff_plans(base: planlib.Plan, cand: planlib.Plan,
+               hash_cache: Dict[str, Optional[str]]) -> Dict[str, Any]:
+    def sha(path: Optional[str]) -> Optional[str]:
+        if not path or path == "-":
+            return None
+        if path not in hash_cache:
+            p = Path(path)
+            hash_cache[path] = planlib.sha256_file(p) if p.is_file() else None
+        return hash_cache[path]
+
+    bbuf = {b.name: b for b in base.buffers}
+    cbuf = {b.name: b for b in cand.buffers}
+    bcapture = {b.index for b in base.buffers if b.file != "-" and is_capture(b.file)}
+    ccapture = {b.index for b in cand.buffers if b.file != "-" and is_capture(b.file)}
+    items: List[Dict[str, Any]] = []
+    capture: List[Dict[str, Any]] = []
+    structure: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+
+    # ---- buffers -------------------------------------------------------
+    for name in sorted(set(bbuf) | set(cbuf)):
+        if name not in bbuf:
+            structure.append({"kind": "buffer_added", "buffer": name, "bytes": cbuf[name].bytes,
+                              "file": cbuf[name].file})
+            continue
+        if name not in cbuf:
+            structure.append({"kind": "buffer_removed", "buffer": name, "bytes": bbuf[name].bytes,
+                              "file": bbuf[name].file})
+            continue
+        x, y = bbuf[name], cbuf[name]
+        if (x.file, x.bytes) == (y.file, y.bytes):
+            continue
+        capture_related = (x.file != "-" and is_capture(x.file)) or (y.file != "-" and is_capture(y.file))
+        record = {
+            "buffer": name,
+            "file_before": x.file, "file_after": y.file,
+            "bytes_before": x.bytes, "bytes_after": y.bytes,
+            "sha256_before": sha(x.file) if x.file != "-" else None,
+            "sha256_after": sha(y.file) if y.file != "-" else None,
+        }
+        if capture_related:
+            capture.append({"kind": "buffer", **record})
+            continue
+        cls = resource_class(name, y.file if y.file != "-" else x.file)
+        if cls == "SCALE":
+            items.append({"category": "SCALE", "kind": "scale_pack", **record})
+        elif cls == "MODEL_WEIGHT":
+            items.append({"category": "MODEL_WEIGHT", "kind": "weight_pack", **record})
+        else:
+            items.append({"category": "INPUT_BINDING", "kind": "resource_swap",
+                          "cause": "non-weight/scale BUFFER file changed", **record})
+
+    # ---- dispatches: SPV / PUSH / BIND ---------------------------------
+    bdisp = dispatch_model(base)
+    cdisp = dispatch_model(cand)
+    common = min(len(bdisp), len(cdisp))
+    if len(bdisp) != len(cdisp):
+        structure.append({"kind": "dispatch_count", "before": len(bdisp), "after": len(cdisp)})
+    for k in range(common):
+        a, b = bdisp[k], cdisp[k]
+        a_coupled = any(x["buffer"] in bcapture for x in a["binds"])
+        b_coupled = any(x["buffer"] in ccapture for x in b["binds"])
+        capture_coupled = a_coupled or b_coupled
+        if a["name"] != b["name"]:
+            structure.append({"kind": "dispatch_renamed", "ordinal": k,
+                              "before": a["name"], "after": b["name"],
+                              "capture_coupled": capture_coupled})
+            continue
+        if a["spv"] != b["spv"]:
+            items.append({
+                "category": "SPV", "kind": "spirv", "ordinal": k, "dispatch": a["name"],
+                "spv_before": a["spv"], "spv_after": b["spv"],
+                "sha256_before": sha(a["spv"]), "sha256_after": sha(b["spv"]),
+                "bytes_before": Path(a["spv"]).stat().st_size if Path(a["spv"]).is_file() else None,
+                "bytes_after": Path(b["spv"]).stat().st_size if Path(b["spv"]).is_file() else None,
+            })
+        if a["push"] != b["push"]:
+            if a["push"] is None or b["push"] is None:
+                structure.append({"kind": "push_line", "ordinal": k, "dispatch": a["name"],
+                                  "capture_coupled": capture_coupled})
+            else:
+                for word in range(max(len(a["push"]), len(b["push"]))):
+                    before = a["push"][word] if word < len(a["push"]) else None
+                    after = b["push"][word] if word < len(b["push"]) else None
+                    if before != after:
+                        rec = {"kind": "push_word", "ordinal": k,
+                               "dispatch": a["name"], "word": word,
+                               "value_before": before, "value_after": after}
+                        # A dispatch that reads a captured fixture also carries
+                        # capture metadata in PUSH (e.g. input geometry); that is
+                        # part of the capture binding, not a model delta.
+                        if capture_coupled:
+                            capture.append(rec)
+                        else:
+                            items.append({"category": "PUSH", **rec})
+        abinds = {x["binding"]: x for x in a["binds"]}
+        bbinds = {x["binding"]: x for x in b["binds"]}
+        for binding in sorted(set(abinds) | set(bbinds)):
+            x = abinds.get(binding)
+            y = bbinds.get(binding)
+            if x is None or y is None:
+                rec = {"kind": "binding_slot", "ordinal": k, "dispatch": a["name"],
+                       "binding": binding, "action": "added" if x is None else "removed",
+                       "buffer": (y or x)["buffer_name"], "offset": (y or x)["offset"],
+                       "bytes": (y or x)["bytes"]}
+                target = (y or x)["buffer_name"]
+                if target and is_capture(buf_file(bbuf, cbuf, target)):
+                    capture.append(rec)
+                else:
+                    items.append({"category": "INPUT_BINDING", **rec})
+                continue
+            if (x["buffer_name"], x["offset"], x["bytes"]) == (y["buffer_name"], y["offset"], y["bytes"]):
+                continue
+            if is_capture(x["buffer_name"] or "") or is_capture(y["buffer_name"] or ""):
+                capture.append({"kind": "binding_range", "ordinal": k, "dispatch": a["name"],
+                                "binding": binding, "before": x, "after": y})
+                continue
+            cause = "retarget"
+            if x["buffer_name"] == y["buffer_name"] and x["offset"] == y["offset"]:
+                cause = "buffer_resize"
+            items.append({"category": "BIND", "kind": "binding_range", "ordinal": k,
+                          "dispatch": a["name"], "binding": binding,
+                          "buffer": y["buffer_name"],
+                          "offset_before": x["offset"], "offset_after": y["offset"],
+                          "bytes_before": x["bytes"], "bytes_after": y["bytes"],
+                          "cause": cause})
+
+    # ---- outputs -------------------------------------------------------
+    bout, cout = norm_out(base.outputs), norm_out(cand.outputs)
+    if bout != cout:
+        items.append({"category": "OUTPUT_PATH", "kind": "output", "before": bout, "after": cout})
+
+    # ---- header / policies (structural only) ---------------------------
+    if base.header != cand.header:
+        structure.append({"kind": "header", "before": list(base.header), "after": list(cand.header)})
+    bp = [(p.buffer, p.resident, p.first, p.last, p.clear_first) for p in base.policies]
+    cp = [(p.buffer, p.resident, p.first, p.last, p.clear_first) for p in cand.policies]
+    if bp != cp:
+        structure.append({"kind": "policies", "before_count": len(bp), "after_count": len(cp)})
+
+    # ---- capture summary ----------------------------------------------
+    cap_names = sorted({b["buffer"] for b in capture if "buffer" in b} |
+                       {n for n in set(bbuf) | set(cbuf)
+                        if (n in bbuf and bbuf[n].file != "-" and is_capture(bbuf[n].file))
+                        or (n in cbuf and cbuf[n].file != "-" and is_capture(cbuf[n].file))})
+    capture_buffers = []
+    for name in cap_names:
+        x = bbuf.get(name)
+        y = cbuf.get(name)
+        record = {
+            "buffer": name,
+            "base": {"file": x.file, "bytes": x.bytes, "sha256": sha(x.file)} if x else None,
+            "candidate": {"file": y.file, "bytes": y.bytes, "sha256": sha(y.file)} if y else None,
+        }
+        record["differs"] = (x is not None and y is not None and (x.file, x.bytes) != (y.file, y.bytes))
+        capture_buffers.append(record)
+
+    # ---- hard check: capture must not appear in the model list --------
+    leaked = []
+    for item in items:
+        for key in ("buffer", "dispatch", "file_before", "file_after"):
+            value = item.get(key)
+            if isinstance(value, str) and is_capture(value):
+                leaked.append({"item": item.get("category"), "key": key, "value": value})
+    capture_names = {c["buffer"] for c in capture_buffers}
+    for item in items:
+        if item.get("buffer") in capture_names and item.get("kind") != "binding_slot":
+            leaked.append({"item": item.get("category"), "key": "buffer", "value": item.get("buffer")})
+
+    summary = {cat: sum(1 for i in items if i["category"] == cat) for cat in CATEGORIES}
+    summary["total"] = len(items)
+    coupled = []
+    for a, b in zip(bdisp, cdisp):
+        if a["name"] != b["name"]:
+            continue
+        binds = [{"binding": x["binding"], "buffer": x["buffer_name"]}
+                 for x in b["binds"] if x["buffer"] in ccapture]
+        if binds:
+            coupled.append({"ordinal": a["ordinal"], "dispatch": a["name"], "capture_bindings": binds})
+    return {
+        "model_items": items,
+        "capture_items": capture,
+        "capture_buffers": capture_buffers,
+        "capture_coupled_dispatches": coupled,
+        "structure": structure,
+        "warnings": warnings,
+        "summary": summary,
+        "leaked": leaked,
+    }
+
+
+def buf_file(bbuf: Dict[str, planlib.Buffer], cbuf: Dict[str, planlib.Buffer], name: str) -> str:
+    if name in cbuf:
+        return cbuf[name].file
+    if name in bbuf:
+        return bbuf[name].file
+    return ""
+
+
+def frame_of(path: Path) -> str:
+    stem = path.stem
+    return stem.split("-", 1)[1] if "-" in stem else stem
+
+
+def describe(plan: planlib.Plan) -> Dict[str, Any]:
+    return {
+        "path": posix(plan.path),
+        "frame": frame_of(plan.path),
+        "sha256": plan.sha256(),
+        "bytes": plan.path.stat().st_size,
+        "header": list(plan.header),
+        "buffers": len(plan.buffers),
+        "dispatches": len(plan.passes),
+        "spv_count": len({p.spv for p in plan.passes}),
+        "outputs": norm_out(plan.outputs),
+        "planlib_validate": plan.validate() or "ok",
+    }
+
+
+def build(base_path: Path, cand_path: Path, sibling: Optional[Path]) -> Dict[str, Any]:
+    base = planlib.Plan(base_path)
+    cand = planlib.Plan(cand_path)
+    cache: Dict[str, Optional[str]] = {}
+    diff = diff_plans(base, cand, cache)
+    result: Dict[str, Any] = {
+        "schema": SCHEMA,
+        "tool": "model_diff.py",
+        "created": now(),
+        "purpose": "S00 model-only delta list for merging the C64-family model onto a production baseline. Capture-bound frame inputs are excluded by construction and listed separately; this candidate is NOT deployable.",
+        "base": describe(base),
+        "candidate": describe(cand),
+        "method": {
+            "identity": "buffer NAME (not index), dispatch ordinal + PASS name, OUTPUT index",
+            "categories": CATEGORIES,
+            "capture_input_rule": "BUFFER file under '/dataset/' or basename in {pre.bin, post.bin, network-output.bin}; any BIND into such a buffer is capture too",
+            "capture_excluded_from_model": True,
+            "side_note": "plan SHA anchors: base and candidate; hashes are computed on the files as found",
+        },
+        "capture_input": {
+            "definition": "per-frame captured replay fixtures (dataset pre/post/network-output), every binding into them, and the PUSH metadata of the dispatches that read them",
+            "buffers": diff["capture_buffers"],
+            "items": diff["capture_items"],
+            "coupled_dispatches": diff["capture_coupled_dispatches"],
+            "differs": [c["buffer"] for c in diff["capture_buffers"] if c["differs"]],
+            "excluded_from_model_diff": True,
+            "note": "the capture binding is not just a path: dispatches that read pre/post also carry per-frame capture metadata in PUSH, so a production merge must not copy whole PASS blocks or PUSH lines from this candidate",
+        },
+        "model_diff": {
+            "summary": diff["summary"],
+            "items": diff["model_items"],
+        },
+        "structure": diff["structure"],
+        "warnings": diff["warnings"],
+        "checks": {
+            "capture_absent_from_model_list": not diff["leaked"],
+            "capture_leaks": diff["leaked"],
+            "categories_only": sorted({i["category"] for i in diff["model_items"]} - set(CATEGORIES)) == [],
+            "model_items_have_category": all(i["category"] in CATEGORIES for i in diff["model_items"]),
+            "planlib_validate": {"base": "ok" if not base.validate() else base.validate(),
+                                 "candidate": "ok" if not cand.validate() else cand.validate()},
+        },
+        "verdict": {
+            "capture_free_model_list": not diff["leaked"],
+            "deployable": False,
+            "reason": "candidate plan is bound to captured frame inputs (pre/post paths plus capture PUSH metadata) and has no GPU/quality acceptance; production integration must apply only the model_diff items onto the production baseline and keep its own inputs and history semantics",
+            "quality_accepted": False,
+            "gpu_verification": "NOT_RUN",
+        },
+    }
+    if sibling is not None:
+        sib = planlib.Plan(sibling)
+        sdiff = diff_plans(cand, sib, cache)
+        result["checks"]["capture_isolation"] = {
+            "description": "same-family different-frame diff: only capture fixtures/metadata may differ, so the model list must be empty",
+            "base": describe(cand)["frame"],
+            "candidate": describe(sib)["frame"],
+            "model_items": len(sdiff["model_items"]),
+            "model_summary": sdiff["summary"],
+            "capture_differs": [c["buffer"] for c in sdiff["capture_buffers"] if c["differs"]],
+            "capture_items": [{"kind": i["kind"], "dispatch": i.get("dispatch"), "word": i.get("word"),
+                               "buffer": i.get("buffer")} for i in sdiff["capture_items"]],
+            "capture_leaks": sdiff["leaked"],
+            "ok": not sdiff["model_items"] and not sdiff["structure"] and not sdiff["leaked"],
+            "model_list_sample": sdiff["model_items"][:5],
+        }
+    return result
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--base", required=True)
+    ap.add_argument("--candidate", required=True)
+    ap.add_argument("--sibling")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+
+    base_path, cand_path = Path(args.base), Path(args.candidate)
+    for p in (base_path, cand_path):
+        if not p.is_file():
+            raise SystemExit(f"plan not found: {posix(p)}")
+    sibling = Path(args.sibling) if args.sibling else None
+    if sibling is not None and not sibling.is_file():
+        raise SystemExit(f"sibling plan not found: {posix(sibling)}")
+    result = build(base_path, cand_path, sibling)
+    out = Path(args.out)
+    if not out.is_absolute():
+        raise SystemExit("--out must be an absolute path")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(result, indent=2, ensure_ascii=False)
+    out.write_text(payload + "\n", encoding="utf-8")
+    if args.json:
+        print(payload)
+    else:
+        print(json.dumps({
+            "ok": result["checks"]["capture_absent_from_model_list"],
+            "out": posix(out),
+            "base": result["base"]["frame"],
+            "candidate": result["candidate"]["frame"],
+            "model_summary": result["model_diff"]["summary"],
+            "capture_differs": result["capture_input"]["differs"],
+            "structure": result["structure"],
+            "capture_isolation": result["checks"].get("capture_isolation", {}).get("ok"),
+        }, indent=2, ensure_ascii=False))
+    return 0 if result["checks"]["capture_absent_from_model_list"] else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

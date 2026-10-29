@@ -1,0 +1,748 @@
+#!/usr/bin/env python3
+"""Strict JSON patch merger for PORT_NETWORK_1 plans (DSH S00).
+
+Why this exists
+---------------
+The legacy builders (`build_c64_family_static.py`, `build_c32_equalized.py`)
+rewrite plans with ``text.replace(old_path, new_path)`` and edit lines by
+buffer *number*.  That silently rewrites every occurrence of a path, misses
+renames, cannot tell two same-named/dispatch-adjacent resources apart, and
+never proves that only the intended lines moved.  This tool replaces that
+approach:
+
+* BUFFERs are addressed by NAME, dispatches by 0-based ORDINAL + expected
+  PASS name, PUSH by (ordinal, word), OUTPUT by index.
+* Edits are applied to individual parsed lines through ``planlib`` primitives;
+  after the patch every unchanged line is compared byte-for-byte with the base.
+* Every patch must carry ``base_sha256``; every replacement file must exist and
+  be hashed; SPV replacements must carry the expected new SHA.
+* All conflicts are collected and reported together (exit code 3), never
+  applied partially: the output file is only written after every check passes.
+
+Patch schema ``dsh-plan-patch/1``::
+
+    {
+      "schema": "dsh-plan-patch/1",
+      "comment": "optional human note",
+      "base_sha256": "<64 hex, required>",
+      "replace_buffers": [
+        {"name": "c64_b5_scales",              # required, must exist
+         "file": "E:/abs/path/b5-scales.bin",  # optional; absolute, forward slashes
+         "bytes": 2368,                        # optional; must equal on-disk size
+         "expect_old": {"file": "...", "bytes": 1856},   # optional drift guard
+         "expect_old_sha256": "<64 hex>",      # optional: hash of current resource
+         "expect_new_sha256": "<64 hex>",      # optional: hash of new file
+         "note": "..."}
+      ],
+      "replace_spv": [
+        {"ordinal": 6, "name": "c64_b5_qx_producer", "spv": "E:/abs/x.spv",
+         "expect_old_sha256": "<64 hex, optional>",
+         "expect_new_sha256": "<64 hex, REQUIRED>"}
+      ],
+      "set_push": [
+        {"ordinal": 7, "name": "block5_swin_body_1", "word": 9,
+         "value": 9, "expect_old": 9}
+      ],
+      "output": {"index": 0, "name": "replayed-network.bin",
+                 "expect_old": "replayed-network.bin"}
+    }
+
+Exit codes: 0 = applied, 2 = unusable input, 3 = conflict(s) reported.
+
+Usage::
+
+    python patch_merge.py --base <plan> --patch <patch.json> --out <plan>
+                          [--report <json>] [--dry-run] [--force]
+
+The tool never writes outside the ``--out`` path (plus ``--report``); callers
+must keep both inside their own construction card directory.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+HERE = Path(__file__).resolve()
+DEFAULT_PLANLIB_DIR = HERE.parents[1] / "tools"
+if str(DEFAULT_PLANLIB_DIR) not in sys.path:
+    sys.path.insert(0, str(DEFAULT_PLANLIB_DIR))
+
+import planlib  # noqa: E402
+
+SCHEMA = "dsh-plan-patch/1"
+EXIT_OK, EXIT_INPUT, EXIT_CONFLICT = 0, 2, 3
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+TOP_KEYS = {
+    "schema", "comment", "notes", "base_sha256", "replace_buffers", "replace_spv",
+    "set_push", "output", "allow_shared_files",
+}
+BUFFER_KEYS = {
+    "name", "file", "bytes", "expect_old", "expect_old_sha256", "expect_new_sha256",
+    "split_shared_resource", "allow_alias", "note",
+}
+SPV_KEYS = {"ordinal", "name", "spv", "expect_old_sha256", "expect_new_sha256", "note"}
+PUSH_KEYS = {"ordinal", "name", "word", "value", "expect_old", "note"}
+OUTPUT_KEYS = {"index", "name", "expect_old", "note"}
+
+
+class InputError(RuntimeError):
+    """Patch or base plan cannot be used at all (exit 2)."""
+
+
+class ConflictLog:
+    def __init__(self) -> None:
+        self.items: List[Dict[str, Any]] = []
+
+    def add(self, code: str, message: str, **detail: Any) -> None:
+        entry = {"code": code, "message": message}
+        if detail:
+            entry["detail"] = detail
+        self.items.append(entry)
+
+    def __bool__(self) -> bool:
+        return bool(self.items)
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def posix(path: Path | str) -> str:
+    return Path(path).as_posix()
+
+
+def require_abs_posix(path: str, what: str, conflicts: ConflictLog) -> None:
+    if "\\" in path:
+        conflicts.add("PATH_BACKSLASH", f"{what}: path must use forward slashes, got {path!r}")
+    if not Path(path).is_absolute():
+        conflicts.add("PATH_NOT_ABSOLUTE", f"{what}: path must be absolute, got {path!r}")
+
+
+def sha_or_none(path: str) -> Optional[str]:
+    p = Path(path)
+    return planlib.sha256_file(p) if p.is_file() else None
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def load_patch(path: Path) -> Dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise InputError(f"cannot read patch {path}: {exc}") from exc
+    try:
+        patch = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise InputError(f"patch is not valid JSON: {exc}") from exc
+    if not isinstance(patch, dict):
+        raise InputError("patch must be a JSON object")
+    return patch
+
+
+def normalise_lists(patch: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """Accept dict-keyed-by-name for replace_buffers, otherwise require lists."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for key in ("replace_buffers", "replace_spv", "set_push"):
+        value = patch.get(key)
+        if value is None:
+            out[key] = []
+        elif isinstance(value, list):
+            out[key] = value
+        elif key == "replace_buffers" and isinstance(value, dict):
+            out[key] = [{"name": name, **(spec if isinstance(spec, dict) else {})} for name, spec in value.items()]
+        else:
+            raise InputError(f"{key} must be a list")
+        for item in out[key]:
+            if not isinstance(item, dict):
+                raise InputError(f"{key} entries must be objects, got {type(item).__name__}")
+    output = patch.get("output")
+    if output is not None and not isinstance(output, (str, dict)):
+        raise InputError("output must be a string or an object")
+    return out
+
+
+class Patcher:
+    """Applies one patch to one plan, line by line, collecting every conflict."""
+
+    def __init__(self, base: planlib.Plan, patch: Dict[str, Any], conflicts: ConflictLog):
+        self.plan = base
+        self.patch = patch
+        self.conflicts = conflicts
+        self.orig_lines = list(base.lines)
+        self.edits: Dict[int, Dict[str, str]] = {}   # line index -> {old, new}
+        self.changes: List[Dict[str, Any]] = []
+        self.warnings: List[str] = []
+        self.new_hashes: Dict[str, str] = {}
+        self._buffer_old_files = {b.name: b.file for b in base.buffers}
+        self._old_file_owners: Dict[str, List[str]] = {}
+        for b in base.buffers:
+            if b.file != "-":
+                self._old_file_owners.setdefault(b.file, []).append(b.name)
+        self.allow_shared_files = bool(patch.get("allow_shared_files", False))
+        self._policy_snapshot = [(p.buffer, p.resident, p.first, p.last, p.clear_first)
+                                 for p in base.policies]
+
+    # ---------- line editing ----------
+    def _edit(self, line: int, new_text: str, kind: str, detail: Dict[str, Any]) -> None:
+        old = self.orig_lines[line]
+        current = self.plan.lines[line]
+        if new_text == current:
+            return  # identical re-edit (e.g. two PUSH words rebuilt the same line, or no-op)
+        self.plan.lines[line] = new_text
+        entry = self.edits.setdefault(line, {"old": old, "new": new_text})
+        entry["new"] = new_text
+        detail = dict(detail)
+        detail.update({"line": line + 1, "kind": kind,
+                       "before": current, "after": new_text})
+        self.changes.append(detail)
+
+    # ---------- buffers ----------
+    def replace_buffer(self, item: Dict[str, Any], seen_names: set) -> None:
+        name = item["name"]
+        if not isinstance(name, str) or not name:
+            self.conflicts.add("BUFFER_NAME_INVALID", f"replace_buffers: bad name {name!r}")
+            return
+        if name in seen_names:
+            self.conflicts.add("DUPLICATE_BUFFER_EDIT", f"replace_buffers: buffer {name!r} appears more than once")
+            return
+        seen_names.add(name)
+        if name not in self.plan.buffers_by_name:
+            self.conflicts.add("UNKNOWN_BUFFER", f"replace_buffers: no BUFFER named {name!r} in base plan",
+                               known_sample=sorted(self.plan.buffers_by_name)[:8])
+            return
+        buf = self.plan.buffers_by_name[name]
+        old_file, old_bytes = buf.file, buf.bytes
+        new_file = item.get("file")
+        new_bytes = item.get("bytes")
+
+        expect_old = item.get("expect_old")
+        if expect_old is not None:
+            if not isinstance(expect_old, dict):
+                self.conflicts.add("EXPECT_OLD_INVALID", f"{name}: expect_old must be an object")
+            else:
+                if "file" in expect_old and Path(expect_old["file"]).as_posix() != old_file:
+                    self.conflicts.add(
+                        "EXPECT_OLD_FILE_MISMATCH",
+                        f"{name}: base file is {old_file!r}, patch expects {expect_old['file']!r}")
+                if "bytes" in expect_old and int(expect_old["bytes"]) != old_bytes:
+                    self.conflicts.add(
+                        "EXPECT_OLD_BYTES_MISMATCH",
+                        f"{name}: base bytes {old_bytes}, patch expects {expect_old['bytes']}")
+        want_old_sha = item.get("expect_old_sha256")
+        if want_old_sha is not None and old_file != "-":
+            got = sha_or_none(old_file)
+            if got != want_old_sha:
+                self.conflicts.add("OLD_RESOURCE_SHA_MISMATCH",
+                                   f"{name}: current file SHA {got} != expected {want_old_sha}",
+                                   path=old_file)
+
+        # shared old resource: replacing one name would split a shared file
+        owners = self._old_file_owners.get(old_file, []) if old_file != "-" else []
+        if len(owners) > 1 and not item.get("split_shared_resource"):
+            self.conflicts.add(
+                "SHARED_OLD_RESOURCE",
+                f"{name}: old file is shared by {owners}; replacing one name would split the resource. "
+                f"Replace all owners with the same file, or set split_shared_resource=true explicitly.",
+                owners=owners)
+
+        if new_file is not None:
+            if not isinstance(new_file, str) or not new_file:
+                self.conflicts.add("NEW_FILE_INVALID", f"{name}: file must be a non-empty string")
+                return
+            require_abs_posix(new_file, f"buffer {name} file", self.conflicts)
+            p = Path(new_file)
+            if not p.is_file():
+                self.conflicts.add("NEW_FILE_MISSING", f"{name}: new file does not exist: {new_file}")
+                return
+            disk = p.stat().st_size
+            if disk <= 0:
+                self.conflicts.add("NEW_FILE_EMPTY", f"{name}: new file is empty: {new_file}")
+                return
+            got_new = planlib.sha256_file(p)
+            self.new_hashes[new_file] = got_new
+            want_new = item.get("expect_new_sha256")
+            if want_new is not None and got_new != want_new:
+                self.conflicts.add("NEW_RESOURCE_SHA_MISMATCH",
+                                   f"{name}: new file SHA {got_new} != expected {want_new}", path=new_file)
+            if new_bytes is None:
+                if disk != old_bytes:
+                    self.conflicts.add(
+                        "SIZE_CHANGE_UNDECLARED",
+                        f"{name}: new file is {disk} B but current buffer is {old_bytes} B; "
+                        f"declare bytes explicitly to confirm the resize")
+                    return
+                new_bytes = disk
+            else:
+                if int(new_bytes) != disk:
+                    self.conflicts.add(
+                        "BYTES_FILE_MISMATCH",
+                        f"{name}: declared bytes {new_bytes} != on-disk size {disk}; "
+                        f"file-backed BUFFER bytes must equal the file size",
+                        path=new_file)
+                    return
+                new_bytes = int(new_bytes)
+            if Path(new_file).as_posix() != old_file:
+                owner = [n for n, f in self._buffer_old_files.items() if f == new_file and n != name]
+                if owner and not item.get("allow_alias"):
+                    self.conflicts.add(
+                        "NEW_FILE_ALREADY_OWNED",
+                        f"{name}: new file is already referenced by {owner}; set allow_alias=true to alias deliberately",
+                        owners=owner, path=new_file)
+        else:
+            if new_bytes is None:
+                self.conflicts.add("BUFFER_NO_EFFECT", f"{name}: patch entry changes neither file nor bytes")
+                return
+            new_bytes = int(new_bytes)
+            if new_bytes <= 0:
+                self.conflicts.add("BUFFER_BYTES_INVALID", f"{name}: bytes must be positive, got {new_bytes}")
+                return
+            if new_bytes == old_bytes:
+                self.conflicts.add("BUFFER_NO_EFFECT", f"{name}: bytes unchanged ({new_bytes})")
+                return
+
+        # resize consequences on BIND ranges (same rule as planlib: full-range binds follow)
+        bind_edits = 0
+        if new_bytes != old_bytes:
+            for p in self.plan.passes:
+                for bind in p.binds:
+                    if bind.buffer != buf.index:
+                        continue
+                    if bind.offset == 0 and bind.bytes == old_bytes:
+                        self._edit(bind.line, f"BIND {bind.binding} {bind.buffer} 0 {new_bytes}",
+                                   "BIND", {"ordinal": p.ordinal, "dispatch": p.name,
+                                            "binding": bind.binding, "buffer": name,
+                                            "cause": "buffer_resize", "old_bytes": old_bytes,
+                                            "new_bytes": new_bytes})
+                        bind.bytes = new_bytes
+                        bind_edits += 1
+                    elif bind.offset + bind.bytes > new_bytes:
+                        self.conflicts.add(
+                            "BIND_OVERRUN_ON_RESIZE",
+                            f"{name}: resize {old_bytes}->{new_bytes} breaks BIND {bind.binding} "
+                            f"({bind.offset}+{bind.bytes}) at dispatch {p.ordinal} {p.name}",
+                            ordinal=p.ordinal)
+            hits = []
+            for p in self.plan.passes:
+                for word, token in enumerate(p.push or []):
+                    if token.isdigit() and int(token) == old_bytes:
+                        hits.append({"ordinal": p.ordinal, "dispatch": p.name, "word": word, "value": token})
+            if hits:
+                self.warnings.append(
+                    f"{name}: {len(hits)} PUSH word(s) equal the old size {old_bytes}; they are not edited "
+                    f"automatically - confirm they are not buffer-size constants: {hits[:5]}")
+        # address the BUFFER line last so a failing resize leaves it untouched
+        final_file = old_file if new_file is None else new_file
+        if final_file == old_file and new_bytes == old_bytes:
+            self.warnings.append(f"{name}: patch entry is a no-op (file and bytes unchanged)")
+            return
+        self._edit(buf.line, f'BUFFER "{buf.name}" {new_bytes} "{final_file}"', "BUFFER",
+                   {"buffer": name, "old_bytes": old_bytes, "new_bytes": new_bytes,
+                    "old_file": old_file, "new_file": final_file,
+                    "new_sha256": self.new_hashes.get(final_file) if final_file != "-" else None,
+                    "bind_lines_followed": bind_edits})
+        buf.bytes, buf.file = new_bytes, final_file
+
+    # ---------- SPVs ----------
+    def replace_spv(self, item: Dict[str, Any], seen_ordinals: set) -> None:
+        ordinal = item.get("ordinal")
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool):
+            self.conflicts.add("ORDINAL_INVALID", f"replace_spv: ordinal must be an integer, got {ordinal!r}")
+            return
+        if ordinal in seen_ordinals:
+            self.conflicts.add("DUPLICATE_SPV_EDIT", f"replace_spv: ordinal {ordinal} appears more than once")
+            return
+        seen_ordinals.add(ordinal)
+        if not 0 <= ordinal < len(self.plan.passes):
+            self.conflicts.add("ORDINAL_OUT_OF_RANGE",
+                               f"replace_spv: ordinal {ordinal} outside 0..{len(self.plan.passes) - 1}")
+            return
+        p = self.plan.passes[ordinal]
+        name = item.get("name")
+        if name is None:
+            self.conflicts.add("SPV_NAME_REQUIRED",
+                               f"replace_spv: ordinal {ordinal} must state the expected PASS name "
+                               f"(base has {p.name!r}) to prevent ordinal drift")
+            return
+        if name != p.name:
+            self.conflicts.add("SPV_NAME_MISMATCH",
+                               f"replace_spv: ordinal {ordinal} is {p.name!r}, patch expects {name!r}")
+            return
+        spv = item.get("spv")
+        if not isinstance(spv, str) or not spv:
+            self.conflicts.add("SPV_PATH_INVALID", f"replace_spv {ordinal} {name}: spv must be a non-empty string")
+            return
+        require_abs_posix(spv, f"SPV at dispatch {ordinal}", self.conflicts)
+        if not spv.lower().endswith(".spv"):
+            self.conflicts.add("SPV_NOT_SPV", f"replace_spv {ordinal} {name}: {spv!r} is not a .spv file")
+        target = Path(spv)
+        if not target.is_file():
+            self.conflicts.add("SPV_MISSING", f"replace_spv {ordinal} {name}: new SPV does not exist: {spv}")
+            return
+        new_sha = planlib.sha256_file(target)
+        want_new = item.get("expect_new_sha256")
+        if want_new is None:
+            self.conflicts.add("SPV_NEW_SHA_REQUIRED",
+                               f"replace_spv {ordinal} {name}: expect_new_sha256 is required "
+                               f"(actual new SHA {new_sha})")
+        elif not HEX64.match(str(want_new)):
+            self.conflicts.add("SPV_NEW_SHA_INVALID", f"replace_spv {ordinal} {name}: expect_new_sha256 is not 64 hex")
+        elif new_sha != want_new:
+            self.conflicts.add("SPV_NEW_SHA_MISMATCH",
+                               f"replace_spv {ordinal} {name}: new SPV SHA {new_sha} != expected {want_new}",
+                               path=spv)
+        old_sha = sha_or_none(p.spv)
+        want_old = item.get("expect_old_sha256")
+        if want_old is not None and old_sha != want_old:
+            self.conflicts.add("SPV_OLD_SHA_MISMATCH",
+                               f"replace_spv {ordinal} {name}: current SPV SHA {old_sha} != expected {want_old}",
+                               path=p.spv)
+        self.new_hashes[spv] = new_sha
+        if spv == p.spv:
+            self.warnings.append(f"replace_spv {ordinal} {name}: SPV path unchanged (identity re-asserted)")
+        m = planlib.PASS_RE.match(self.orig_lines[p.line])
+        if not m:
+            self.conflicts.add("SPV_LINE_UNPARSEABLE", f"replace_spv: cannot re-read PASS line {p.line + 1}")
+            return
+        self._edit(p.line, f'PASS {m.group(1)} "{m.group(2)}" "{spv}"{m.group(4)}', "SPV",
+                   {"ordinal": ordinal, "dispatch": name, "old_spv": p.spv, "new_spv": spv,
+                    "old_sha256": old_sha, "new_sha256": new_sha})
+        p.spv = spv
+
+    # ---------- PUSH ----------
+    def set_push(self, item: Dict[str, Any], seen: set) -> None:
+        ordinal = item.get("ordinal")
+        word = item.get("word")
+        value = item.get("value")
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool):
+            self.conflicts.add("ORDINAL_INVALID", f"set_push: ordinal must be an integer, got {ordinal!r}")
+            return
+        if not isinstance(word, int) or isinstance(word, bool):
+            self.conflicts.add("PUSH_WORD_INVALID", f"set_push: word must be an integer, got {word!r}")
+            return
+        if not isinstance(value, int) or isinstance(value, bool):
+            self.conflicts.add("PUSH_VALUE_INVALID", f"set_push: value must be an integer, got {value!r}")
+            return
+        if not 0 <= value <= 0xFFFFFFFF:
+            self.conflicts.add("PUSH_VALUE_RANGE", f"set_push: value {value} outside uint32")
+            return
+        if (ordinal, word) in seen:
+            self.conflicts.add("DUPLICATE_PUSH_EDIT", f"set_push: (ordinal {ordinal}, word {word}) appears twice")
+            return
+        seen.add((ordinal, word))
+        if not 0 <= ordinal < len(self.plan.passes):
+            self.conflicts.add("ORDINAL_OUT_OF_RANGE",
+                               f"set_push: ordinal {ordinal} outside 0..{len(self.plan.passes) - 1}")
+            return
+        p = self.plan.passes[ordinal]
+        name = item.get("name")
+        if name is not None and name != p.name:
+            self.conflicts.add("PUSH_NAME_MISMATCH",
+                               f"set_push: ordinal {ordinal} is {p.name!r}, patch expects {name!r}")
+            return
+        if p.push is None or p.push_line is None:
+            self.conflicts.add("PUSH_MISSING", f"set_push: dispatch {ordinal} {p.name} has no PUSH line")
+            return
+        if not 0 <= word < len(p.push):
+            self.conflicts.add("PUSH_WORD_OUT_OF_RANGE",
+                               f"set_push: dispatch {ordinal} {p.name} has {len(p.push)} push words, word {word}")
+            return
+        current = p.push[word]
+        expect_old = item.get("expect_old")
+        if expect_old is not None and not push_equal(current, expect_old):
+            self.conflicts.add("PUSH_EXPECT_OLD_MISMATCH",
+                               f"set_push: dispatch {ordinal} {p.name} word {word} is {current!r}, "
+                               f"patch expects {expect_old!r}")
+            return
+        p.push[word] = str(value)
+        self._edit(p.push_line, "PUSH " + " ".join(p.push), "PUSH",
+                   {"ordinal": ordinal, "dispatch": p.name, "word": word,
+                    "old": current, "new": str(value)})
+    # ---------- OUTPUT ----------
+    def set_output(self, spec: Any) -> None:
+        if spec is None:
+            return
+        if isinstance(spec, str):
+            spec = {"name": spec}
+        if not isinstance(spec, dict):
+            self.conflicts.add("OUTPUT_INVALID", "output must be a string or an object")
+            return
+        bad = set(spec) - OUTPUT_KEYS
+        if bad:
+            self.conflicts.add("OUTPUT_UNKNOWN_FIELD", f"output: unknown field(s) {sorted(bad)}")
+        index = spec.get("index", 0)
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            self.conflicts.add("OUTPUT_INDEX_INVALID", f"output: bad index {index!r}")
+            return
+        if len(self.plan.outputs) != 1:
+            self.conflicts.add("OUTPUT_STRUCTURE",
+                               f"output edit expects exactly one OUTPUT line, plan has {len(self.plan.outputs)}")
+            return
+        if index >= len(self.plan.outputs):
+            self.conflicts.add("OUTPUT_INDEX_OUT_OF_RANGE",
+                               f"output: index {index} outside 0..{len(self.plan.outputs) - 1}")
+            return
+        name = spec.get("name")
+        if not isinstance(name, str) or not name:
+            self.conflicts.add("OUTPUT_NAME_INVALID", "output: name must be a non-empty string")
+            return
+        if "/" in name or "\\" in name or ":" in name or name in {".", ".."}:
+            self.conflicts.add("OUTPUT_NOT_BASENAME",
+                               f"output: name must be a bare file name (no directory), got {name!r}")
+            return
+        idx, fmt, old_name, line = self.plan.outputs[index]
+        expect_old = spec.get("expect_old")
+        if expect_old is not None and expect_old != old_name:
+            self.conflicts.add("OUTPUT_EXPECT_OLD_MISMATCH",
+                               f"output: current name is {old_name!r}, patch expects {expect_old!r}")
+            return
+        self._edit(line, f'OUTPUT {idx} {fmt} "{name}"', "OUTPUT",
+                   {"index": index, "format": fmt, "old_name": old_name, "new_name": name})
+        self.plan.outputs[index] = (idx, fmt, name, line)
+
+    # ---------- post-conditions ----------
+    def finish(self) -> None:
+        if self.conflicts:
+            return
+        if len(self.plan.lines) != len(self.orig_lines):
+            self.conflicts.add("LINE_COUNT_CHANGED",
+                               f"line count changed {len(self.orig_lines)} -> {len(self.plan.lines)}")
+            return
+        for i, (old, cur) in enumerate(zip(self.orig_lines, self.plan.lines)):
+            rec = self.edits.get(i)
+            if old == cur:
+                continue
+            if rec is None or rec["new"] != cur:
+                self.conflicts.add("UNEXPECTED_LINE_CHANGE",
+                                   f"line {i + 1} changed outside the patch plan: {old!r} -> {cur!r}")
+                return
+        for i, rec in self.edits.items():
+            if self.plan.lines[i] != rec["new"]:
+                self.conflicts.add("EDIT_NOT_APPLIED", f"line {i + 1} does not hold the recorded edit")
+                return
+        if [(p.buffer, p.resident, p.first, p.last, p.clear_first) for p in self.plan.policies] != self._policy_snapshot:
+            self.conflicts.add("POLICY_CHANGED", "POLICY lines changed although the patch does not edit POLICY")
+            return
+        # buffers that should share a file (aliases) are checked globally
+        if not self.allow_shared_files:
+            owners: Dict[str, List[str]] = {}
+            for b in self.plan.buffers:
+                if b.file != "-":
+                    owners.setdefault(b.file, []).append(b.name)
+            shared = {f: names for f, names in owners.items() if len(names) > 1}
+            if shared:
+                self.conflicts.add(
+                    "SHARED_NEW_FILE",
+                    "patch would leave multiple BUFFER names on the same file; "
+                    "use allow_alias/split_shared_resource deliberately",
+                    shared=[{"file": f, "buffers": n} for f, n in shared.items()])
+                return
+        # reparsed plan must equal the intended model and be structurally valid
+        text = self.plan.to_text()
+        tmp = TEMP_PATH
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_bytes(text.encode("utf-8"))
+        try:
+            reparsed = planlib.Plan(tmp)
+            problems = reparsed.validate()
+            if problems:
+                for msg in problems:
+                    self.conflicts.add("PLAN_INVALID", msg)
+                return
+            self._compare(reparsed)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    def _compare(self, other: planlib.Plan) -> None:
+        a, b = self.plan, other
+        if a.header != b.header:
+            self.conflicts.add("HEADER_MISMATCH", f"header {a.header} != reparsed {b.header}")
+        if len(a.buffers) != len(b.buffers):
+            self.conflicts.add("BUFFER_COUNT_MISMATCH", "buffer count differs after reparse")
+            return
+        for x, y in zip(a.buffers, b.buffers):
+            if (x.index, x.name, x.bytes, x.file) != (y.index, y.name, y.bytes, y.file):
+                self.conflicts.add("BUFFER_REPARSE_MISMATCH", f"buffer {x.name} did not round-trip")
+                return
+        if len(a.passes) != len(b.passes):
+            self.conflicts.add("DISPATCH_COUNT_MISMATCH", "dispatch count differs after reparse")
+            return
+        for x, y in zip(a.passes, b.passes):
+            if (x.ordinal, x.name, x.spv, x.push) != (y.ordinal, y.name, y.spv, y.push):
+                self.conflicts.add("DISPATCH_REPARSE_MISMATCH", f"dispatch {x.ordinal} {x.name} did not round-trip")
+                return
+            if [(z.binding, z.buffer, z.offset, z.bytes) for z in x.binds] != \
+               [(z.binding, z.buffer, z.offset, z.bytes) for z in y.binds]:
+                self.conflicts.add("BIND_REPARSE_MISMATCH", f"dispatch {x.ordinal} {x.name} BINDs did not round-trip")
+                return
+        if a.outputs != b.outputs:
+            self.conflicts.add("OUTPUT_REPARSE_MISMATCH", "OUTPUT lines did not round-trip")
+        if [(p.buffer, p.resident, p.first, p.last, p.clear_first) for p in a.policies] != \
+           [(p.buffer, p.resident, p.first, p.last, p.clear_first) for p in b.policies]:
+            self.conflicts.add("POLICY_REPARSE_MISMATCH", "POLICY lines did not round-trip")
+
+
+TEMP_PATH = Path(__file__).resolve().parent / "out" / ".patch_merge_reparse.tmp"
+
+
+def push_equal(current: str, expected: Any) -> bool:
+    if isinstance(expected, bool):
+        return False
+    if isinstance(expected, int):
+        try:
+            return int(current, 0) == expected
+        except ValueError:
+            return False
+    return str(expected) == current
+
+
+def check_patch_shape(patch: Dict[str, Any], conflicts: ConflictLog) -> None:
+    extra = set(patch) - TOP_KEYS
+    if extra:
+        conflicts.add("UNKNOWN_PATCH_FIELD", f"unknown top-level patch field(s): {sorted(extra)}")
+    schema = patch.get("schema")
+    if schema is not None and schema != SCHEMA:
+        conflicts.add("PATCH_SCHEMA", f"schema must be {SCHEMA!r}, got {schema!r}")
+    base_sha = patch.get("base_sha256")
+    if not isinstance(base_sha, str) or not HEX64.match(base_sha):
+        conflicts.add("BASE_SHA_REQUIRED", "base_sha256 is required (64 lowercase hex) so the base cannot drift")
+    for key, allowed in (("replace_buffers", BUFFER_KEYS), ("replace_spv", SPV_KEYS),
+                         ("set_push", PUSH_KEYS)):
+        for item in patch.get(key) or []:
+            if isinstance(item, dict):
+                bad = set(item) - allowed
+                if bad:
+                    conflicts.add("UNKNOWN_ITEM_FIELD", f"{key}: unknown field(s) {sorted(bad)} in {item.get('name') or item.get('ordinal')!r}")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--base", required=True)
+    ap.add_argument("--patch", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--report")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true", help="overwrite an existing --out file")
+    args = ap.parse_args(argv)
+
+    conflicts = ConflictLog()
+    result: Dict[str, Any] = {"tool": "patch_merge", "schema": SCHEMA, "created": now(),
+                              "base": {"path": posix(args.base)}, "patch": {"path": posix(args.patch)},
+                              "out": {"path": posix(args.out)}, "dry_run": args.dry_run}
+    try:
+        patch = load_patch(Path(args.patch))
+        lists = normalise_lists(patch)
+        check_patch_shape(patch, conflicts)
+        base_path = Path(args.base)
+        if not base_path.is_file():
+            raise InputError(f"base plan does not exist: {args.base}")
+        base = planlib.Plan(base_path)
+        base_problems = base.validate()
+        base_sha = base.sha256()
+        result["base"].update({"sha256": base_sha, "header": list(base.header),
+                               "buffers": len(base.buffers), "dispatches": len(base.passes),
+                               "outputs": [list(o[:3]) for o in base.outputs],
+                               "planlib_validate": base_problems or "ok"})
+        declared = patch.get("base_sha256")
+        if isinstance(declared, str) and HEX64.match(declared) and declared != base_sha:
+            conflicts.add("BASE_SHA_MISMATCH",
+                          f"base plan SHA {base_sha} != patch base_sha256 {declared}")
+        if base_problems:
+            conflicts.add("BASE_INVALID", "base plan already fails planlib.validate",
+                          problems=base_problems[:20])
+        out_path = Path(args.out)
+        if not out_path.is_absolute():
+            raise InputError("--out must be an absolute path")
+        if out_path.resolve() == base_path.resolve():
+            conflicts.add("OUT_REWRITES_BASE", "--out is the base plan; patching must never overwrite the base")
+        if out_path.exists() and not args.force:
+            conflicts.add("OUT_EXISTS", f"--out already exists: {args.out} (refusing to overwrite; use --force)")
+        if not conflicts:
+            patcher = Patcher(base, patch, conflicts)
+            seen_buf: set = set()
+            for item in lists["replace_buffers"]:
+                patcher.replace_buffer(item, seen_buf)
+            seen_ord: set = set()
+            for item in lists["replace_spv"]:
+                patcher.replace_spv(item, seen_ord)
+            seen_push: set = set()
+            for item in lists["set_push"]:
+                patcher.set_push(item, seen_push)
+            patcher.set_output(patch.get("output"))
+            patcher.finish()
+            result["changes"] = patcher.changes
+            result["warnings"] = patcher.warnings
+            result["new_file_sha256"] = patcher.new_hashes
+        if conflicts:
+            result["ok"] = False
+            result["conflicts"] = conflicts.items
+            result["conflict_count"] = len(conflicts.items)
+            emit(result, args.report)
+            return EXIT_CONFLICT
+
+        text = base.to_text()
+        out_bytes = text.encode("utf-8")
+        out_sha = sha256_bytes(out_bytes)
+        identical = out_bytes == base_path.read_bytes()
+        result["out"].update({"sha256": out_sha, "bytes": len(out_bytes),
+                              "byte_identical_to_base": identical,
+                              "changed_lines": len(patcher.edits)})
+        result["verified"] = {
+            "base_sha256_checked": True,
+            "new_files_hashed": len(patcher.new_hashes),
+            "planlib_validate": "ok",
+            "only_planned_lines_changed": True,
+            "reparse_matches_model": True,
+            "line_count_unchanged": True,
+            "output_line_count": len(base.outputs),
+            "outputs_before_policy": bool(base.outputs and base.policies
+                                          and max(o[3] for o in base.outputs) < min(p.line for p in base.policies)),
+            "policies_untouched": True,
+            "buffer_names_unique": len({b.name for b in base.buffers}) == len(base.buffers),
+            "bind_bounds_ok": True,
+        }
+        result["ok"] = True
+        if not args.dry_run:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(out_bytes)
+            written_sha = planlib.sha256_file(out_path)
+            if written_sha != out_sha:
+                result["ok"] = False
+                result["conflicts"] = [{"code": "WRITE_SHA_MISMATCH",
+                                        "message": f"written SHA {written_sha} != computed {out_sha}"}]
+                emit(result, args.report)
+                return EXIT_CONFLICT
+            result["out"]["written"] = True
+        else:
+            result["out"]["written"] = False
+        emit(result, args.report)
+        return EXIT_OK
+    except (InputError, planlib.PlanError, OSError) as exc:
+        result["ok"] = False
+        result["input_error"] = str(exc)
+        result["conflicts"] = conflicts.items
+        emit(result, args.report)
+        return EXIT_INPUT
+
+
+def emit(result: Dict[str, Any], report: Optional[str]) -> None:
+    payload = json.dumps(result, indent=2, ensure_ascii=False)
+    print(payload)
+    if report:
+        rp = Path(report)
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        rp.write_text(payload + "\n", encoding="utf-8")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

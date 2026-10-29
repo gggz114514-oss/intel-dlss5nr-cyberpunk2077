@@ -1,0 +1,139 @@
+"""S06 post-GPU step 3: audit in the REAL upstream domain.
+
+Input: gpu/runs/input-capture/xq-c256-b15.bin -- block14_out as the candidate
+chain actually produces it (frame 34189).  It differs from the FP16 teacher by
+relL2 0.5310 / corr 0.853 while absmax and rms are almost identical, so the
+question is how much of the realised Y error ANY scale choice can influence.
+
+Arms on the SAME real input, target = FP16 teacher Y:
+  floor   unquantised FP16 reference from the real input (no scale beats this)
+  old     shipped pack + shipped scales (uniform invX)
+  A_mse   teacher-domain calibrated pack (this card's candidate)
+  search  real-domain (sX,sA,sM) search with the shipped weight codes
+Writes evidence/18-real-domain.json
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+import c256b15 as L
+
+W = L.W
+CAP = W.parent / "gpu/runs/input-capture/xq-c256-b15.bin"
+idx, oob = L.window_to_canonical()
+valid = idx >= 0
+NW = L.N_TOK
+We, Wm, Wc, rs = L.decode_weights()
+Yteach = np.fromfile(L.D / "dump-fp16/dump_swin_15_Y.bin", dtype="<f2").reshape(NW, 256).astype(np.float32)
+Xc = L.load_x_canonical(CAP)
+Xw = np.zeros((NW, 256), dtype=np.float32)
+Xw[valid] = Xc[idx[valid]]
+raw_old = np.fromfile(L.PACK_OLD, dtype=np.uint8)
+qWm_pack = L.from_pack_bytes(raw_old[L.WM_OFF:L.SC_OFF].view(np.int8), 256, 128).astype(np.int64)
+qWc_pack = L.from_pack_bytes(raw_old[L.WC_OFF:L.WE_OFF].view(np.int8), 256, 256).astype(np.int64)
+qWe_pack = L.from_pack_bytes(raw_old[L.WE_OFF:L.WM_OFF].view(np.int8), 1024, 256).astype(np.int64)
+sWe_s = np.frombuffer(raw_old[L.SWE_OFF:L.SWE_OFF + 4096].tobytes(), dtype="<f4").astype(np.float64)
+sWm_s = np.frombuffer(raw_old[L.SWM_OFF:L.SWM_OFF + 1024].tobytes(), dtype="<f4").astype(np.float64)
+sWc_s = np.frombuffer(raw_old[L.SWC_OFF:L.SWC_OFF + 1024].tobytes(), dtype="<f4").astype(np.float64)
+Yv = Yteach[valid].astype(np.float64)
+
+
+def st(y):
+    d = y[valid].astype(np.float64) - Yv
+    return dict(rel_l2=float(np.sqrt(np.mean(d * d) / np.mean(Yv ** 2))),
+                rms=float(np.sqrt(np.mean(d * d))), max_abs=float(np.abs(d).max()))
+
+
+# ------------------------------------------------------------------- floor --
+Araw = (Xw.astype(np.float64) @ We.astype(np.float64).T).astype(np.float32)
+Aact = L.act_half32(L.narrow_half(Araw))
+Mref = np.empty((NW, 256), dtype=np.float32)
+for g in range(L.MID_GROUPS):
+    sl = slice(32 * g, 32 * g + 32)
+    Mref[:, sl] = (Aact[:, 128 * g:128 * g + 128].astype(np.float64) @ Wm[sl].astype(np.float64).T).astype(np.float32)
+seed = L.narrow_half(Xw * rs[None, :])
+Yfloor = np.float32((L.narrow_half(Mref).astype(np.float64) @ Wc.astype(np.float64).T).astype(np.float32) + seed).astype(np.float16).astype(np.float32)
+ev = {"input": dict(path=str(CAP), sha256=L.sha256(CAP)),
+      "floor_real_input": st(Yfloor),
+      "floor_note": "the residual seed is X*rs and the real input differs from the teacher input by relL2 0.531; "
+                    "the seed carries 90 % of |Y|, so the realised Y error cannot go far below ~0.48"}
+
+# ------------------------------------------------------------ named chains --
+dec = dict(we=qWe_pack, wm=qWm_pack, wc=qWc_pack)
+
+
+def chain(inv_tab, sX, sA, sM, ew, mw, alpha, use_tab=True):
+    inv = inv_tab if use_tab else np.full(256, float(inv_tab))
+    qx = np.clip(np.rint(Xw.astype(np.float64) * inv[None, :]), -127.0, 127.0)
+    acc = qx @ qWe_pack.T
+    ha = L.act_half32(L.narrow_half(np.float32(acc.astype(np.float32) * ew.astype(np.float32)[None, :])))
+    qa = np.clip(np.rint((ha * np.float32(1.0 / sA)).astype(np.float64)), -127.0, 127.0).astype(np.int64)
+    qf = qa.astype(np.float64)
+    mreal = np.empty((NW, 256), dtype=np.float32)
+    for g in range(L.MID_GROUPS):
+        sl = slice(32 * g, 32 * g + 32)
+        r = qf[:, 128 * g:128 * g + 128] @ qWm_pack[sl].T
+        mreal[:, sl] = r.astype(np.float32) * mw.astype(np.float32)[sl][None, :]
+    qm = np.clip(np.rint((mreal * np.float32(1.0 / sM)).astype(np.float64)), -127.0, 127.0).astype(np.int64)
+    acc3 = qm @ qWc_pack.T
+    y = np.float32(acc3.astype(np.float32) * alpha.astype(np.float32)[None, :] + seed)
+    return dict(y=y.astype(np.float16).astype(np.float32), qx=qx, ha=ha, mreal=mreal,
+                sat=dict(qx=int((np.abs(qx) >= 127).sum()), qa=int((np.abs(qa) >= 127).sum()),
+                         qm=int((np.abs(qm) >= 127).sum())),
+                qx_rms=float(np.sqrt(np.mean(qx.astype(np.float64) ** 2))))
+
+
+def load_pack(raw):
+    s = np.frombuffer(raw[L.SCAL_OFF:L.SCAL_OFF + 128].tobytes(), dtype="<f4")
+    return dict(invX=float(s[0]), invA=float(s[1]), invM=float(s[2]),
+                sX=float(s[3]), sA=float(s[4]), sM=float(s[5]),
+                ew=np.frombuffer(raw[L.EW_OFF:L.EW_OFF + 4096].tobytes(), dtype="<f4"),
+                mw=np.frombuffer(raw[L.MW_OFF:L.MW_OFF + 1024].tobytes(), dtype="<f4"),
+                alpha=np.frombuffer(raw[L.ALPHA_OFF:L.ALPHA_OFF + 1024].tobytes(), dtype="<f4"),
+                tab=np.frombuffer(raw[L.PAD_OFF:L.PAD_OFF + 1024].tobytes(), dtype="<f4"))
+
+
+pold = load_pack(raw_old)
+pA = load_pack(np.fromfile(W / "PACK/c256_b15_int8_qxeq.bin", dtype=np.uint8))
+arms = {}
+arms["old"] = chain(np.float64(pold["invX"]), pold["sX"], pold["sA"], pold["sM"], pold["ew"], pold["mw"], pold["alpha"], use_tab=False)
+arms["A_mse"] = chain(pA["tab"].astype(np.float64), pA["sX"], pA["sA"], pA["sM"], pA["ew"], pA["mw"], pA["alpha"], use_tab=True)
+for k, v in arms.items():
+    ev[k] = dict(**st(v["y"]), sat=v["sat"], qx_rms_code=v["qx_rms"])
+
+# -------------------------------------------------- real-domain scale search
+am = np.abs(Xw[valid]).max(axis=0).astype(np.float64)
+amax = float(am.max())
+A_real_max = float(np.abs(Aact[valid]).max())
+M_real_max = float(np.abs(Mref[valid]).max())
+sX0, sA0, sM0 = amax / 127.0, A_real_max / 127.0, M_real_max / 127.0
+cache = {}
+hist = []
+best = None
+for f0 in (0.7, 0.8, 0.9, 1.0, 1.1):
+    for f1 in (0.7, 0.85, 1.0, 1.2):
+        for f2 in (0.7, 0.85, 1.0, 1.2):
+            sX, sA, sM = sX0 * f0, sA0 * f1, sM0 * f2
+            r = chain(np.float64(1.0 / sX), sX, sA, sM,
+                      (sX * sWe_s), (sA * sWm_s), (sM * sWc_s), use_tab=False)
+            s = st(r["y"])
+            hist.append(dict(f=[f0, f1, f2], rel_l2=s["rel_l2"]))
+            if best is None or s["rel_l2"] < best[0]:
+                best = (s["rel_l2"], dict(f0=f0, f1=f1, f2=f2, sX=sX, sA=sA, sM=sM,
+                                          sat=r["sat"], qx_rms=r["qx_rms"]))
+ev["real_domain_stats"] = dict(x_absmax=amax, a_absmax=A_real_max, m_absmax=M_real_max,
+                               sX_absmax=sX0, sA_absmax=sA0, sM_absmax=sM0,
+                               teacher_domain=dict(sX=pA["sX"], sA=pA["sA"], sM=pA["sM"]),
+                               ratio_real_over_teacher=dict(
+                                   sX=sX0 / 0.011095903051181102,
+                                   sA=sA0 / 0.5885826771653544,
+                                   sM=sM0 / 0.2733396825396825))
+ev["real_domain_search"] = dict(best=best[1], best_rel_l2=best[0], n_trials=len(hist), history=hist)
+ev["interpretation"] = ("compare best_rel_l2 with floor_real_input.rel_l2: the gap is the whole quantisation "
+                        "budget on this node, and the arms differ only inside that gap")
+(W / "evidence/18-real-domain.json").write_text(json.dumps(ev, indent=1), encoding="utf-8")
+print(json.dumps({k: ev[k] for k in ("floor_real_input", "old", "A_mse", "real_domain_stats")}, indent=1))
+print("real-domain best:", json.dumps(ev["real_domain_search"]["best"]), "rel_l2", ev["real_domain_search"]["best_rel_l2"])

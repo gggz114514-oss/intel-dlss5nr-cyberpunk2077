@@ -1,0 +1,63 @@
+from pathlib import Path
+import json,re,hashlib,subprocess
+B=Path('@NR_WORKSPACE@');A=B/'work/codex-astra-fp16-int8-audit-20261024';D=A/'fullnet-mechanism-transfer-20261026';P=D/'f05-four-weight-window-20261027';S=D/'f05-kv-ready-split-20261027';S.mkdir(exist_ok=True);(S/'tool').mkdir(exist_ok=True);(S/'run').mkdir(exist_ok=True);(S/'captures').mkdir(exist_ok=True)
+cpp=r'''#include "gtpin_api.h"
+#include "gtpin_tool_utils.h"
+#include <map>
+#include <iostream>
+using namespace gtpin;
+Knob<bool> split("split",false,"Split K/V readiness; default clones original group");
+Knob<bool> execute("execute_modified",false,"Execute instrumented code only after main native review");
+struct Site {uint32_t wait,k0,k1,v0,last,all,kmask,vmask;};
+static Site sites[]={{0x1750,0x1760,0x1770,0x1780,0x1780,0xb80,0x180,0xa00},{0x6630,0x6640,0x6650,0x6660,0x6670,0xd80,0x180,0xc00}};
+class Split final:public GtTool {
+public:
+ const char* Name() const override{return "kvready";}
+ void OnKernelBuild(IGtKernelInstrument& inst) override {
+  if(inst.Kernel().HashId()!=0x0f0860f340d97767ULL)return;
+  std::map<uint32_t,const IGtIns*> ins;
+  for(auto b:inst.Cfg().Bbls())for(auto i:b->Instructions())ins[inst.Cfg().GetInstructionOffset(*i)]=i;
+  auto& f=inst.Coder().InstructionFactory();
+  for(auto s:sites){
+   const auto* w=ins.at(s.wait);
+   GTPIN_ASSERT_MSG(w->IsSync() && w->NumSources()==1 && w->SrcRegFile(0).IsImm(),"expected allwr immediate");
+   GTPIN_ASSERT_MSG(w->SrcImmOperand(0).Value()==s.all,"allwr mask differs");
+   GtGenProcedure p;
+   auto& kw=f.Make(*w);if(split)kw.SetSrcImmOperand(0,GtImmU32(s.kmask));p+=kw;
+   for(uint32_t pc=s.k0;pc<=s.last;pc+=16){
+    if(split && pc==s.v0){auto& vw=f.Make(*w);vw.SetSrcImmOperand(0,GtImmU32(s.vmask));p+=vw;}
+    auto& op=f.Make(*ins.at(pc));if(split && pc==s.k1)op.SetThreadCtrl(GED_THREAD_CTRL_Normal);p+=op;
+   }
+   GTPIN_ASSERT(inst.InstrumentInstruction(*w,GtIpoint::Before(),p));
+   GTPIN_ASSERT(inst.RemoveInstruction(*w));
+   for(uint32_t pc=s.k0;pc<=s.last;pc+=16)GTPIN_ASSERT(inst.RemoveInstruction(*ins.at(pc)));
+   std::cout<<"KVREADY_SITE "<<std::hex<<s.wait<<" split="<<split.GetValue()<<" dry="<<!execute.GetValue()<<std::dec<<std::endl;
+  }
+ }
+ void OnKernelRun(IGtKernelDispatch& d) override {bool on=execute.GetValue()&&d.Kernel().HashId()==0x0f0860f340d97767ULL&&d.Kernel().IsInstrumented();d.SetProfilingMode(on);std::cout<<"KVREADY_RUN "<<std::hex<<d.Kernel().HashId()<<std::dec<<" modified="<<on<<std::endl;}
+ void OnKernelComplete(IGtKernelDispatch&) override{}
+};
+EXPORT_C_FUNC void GTPin_Entry(int argc,const char* argv[]){ConfigureGTPin(argc,argv);static Split tool;tool.Register();}
+'''
+(S/'tool/kvready.cpp').write_text(cpp,encoding='utf-8')
+cm=(A/'phase-diagnosis-20261025/native-tool/CMakeLists.txt').read_text().replace('nativeonly','kvready');(S/'tool/CMakeLists.txt').write_text(cm,encoding='utf-8')
+cmake='E:/VS2022BT/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe'
+for args in [[cmake,'-S',str(S/'tool'),'-B',str(S/'build'),'-G','Visual Studio 17 2022','-A','x64'],[cmake,'--build',str(S/'build'),'--config','Release']]:
+ r=subprocess.run(args,capture_output=True,text=True,encoding='utf-8',errors='replace');(S/('configure.txt' if '-S' in args else 'build.txt')).write_text(r.stdout+r.stderr,encoding='utf-8');assert r.returncode==0,r.stdout+r.stderr
+read=lambda p:json.loads(p.read_text(encoding='utf-8-sig'));ident=lambda p:dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest());t=read(P/'LUNA-NATIVE.json');base=t['jobs'][0];runner=Path(base['argv'][base['argv'].index('--')+1]);gtpin=Path(base['argv'][0]);tool=S/'build/Release/kvready.dll';plan=P/'c128-isolated/plan.txt';jobs=[]
+for mode in ['clone','split']:
+ name='dry-'+mode;ar=base['argv'][:base['argv'].index('--')];ar[ar.index('-t')+1]=str(tool);ar[ar.index('--profile_dir')+1]=name;ar[ar.index('--output_dir')+1]=str(S/'captures');ar[ar.index('--msg_file')+1]=str(S/(name+'.log'))
+ ar+=['--filter','I:hash:0f0860f340d97767']
+ if mode=='split':ar+=['--split']
+ ar+=['--',str(runner),'--plan',str(plan),'--out',str(S/'run'/name),'--pool','--warm','0','--reps','1']
+ jobs.append(dict(id=name,plan=ident(plan),argv=ar,runner_output=str(S/'run'/name),expected_fixed_frame_out=base['expected_fixed_frame_out']))
+(S/'LUNA-DRY.json').write_text(json.dumps(dict(working_directory=str(B),output_root=str(S/'dry-execution'),identities=[ident(gtpin),ident(runner),ident(tool)],jobs=jobs,rules=['Native build inspection only. execute_modified absent, original kernel must run. No modified execution permitted before primary dependency/native review.','Serial lock, fresh outputs, gold, stop errors; require KVREADY_RUN modified=0.']),indent=2),encoding='utf-8')
+(S/'execute.ps1').write_text((P/'execute.ps1').read_text(encoding='utf-8-sig').replace('LUNA-F05-FOUR-WEIGHT-WINDOW','LUNA-F05-NATIVE-SPLIT'),encoding='utf-8')
+(S/'PROOF.txt').write_text('''DIAGNOSTIC NATIVE CONTROL, NOT PRODUCTION OPTIMIZATION.
+Immutable rollingC128 0f0860f340d97767; accepted F10 retained. Two groups in rowphase0/1 only. Default dry mode builds instrumented code but OnKernelRun modified=false always; original executes. No added virtual registers, no timestamp/profile buffer, no source shader changes.
+Site0 1750: allwr7/8/9/11 before K0(r20..27),K1(r12..19),V1(r52..59). K read weight91..98/83..90,A79..82 and ownacc; V readweight60..67 andacc52..59. K output disjoint from all Vread/Vwrite/A. Proposed K wait7/8; move9/11 to V entry; clear K1 Atomic to terminate K pair. Keep instruction operands/order and V computation identical.
+Site1 6630: allwr7/8/10/11 before K0(r26..33),K1(r18..25),V0(r10..17),V1(r2..9). K weights83..90/75..82,A71..74; Vweights60..67/52..59 andownacc. DisjointK output/V inputs/outputs/A. K0 original9.dst must remain (previous accumulator dependency); proposed Kwait7/8, Vwait10/11. Terminate Kpair, preserve Vpair. No reg newly live, and V waits retained at first true consumer.
+CRITICAL: splitting Atomic groups changes scoreboard token allocation requirements. Do not assume clone preserves raw SWSB or that reg-disjoint proof is sufficient. First inspect generated native of clone and split: A/send addresses/returns/order and all arithmetic operands must stay fixed; K and V completion must have correct independent downstream RAW/WAW/WAR protection. If tool rejects sync or changes register supply, no modified GPU execution. No perf inference from dry gold.
+Matched clone arm undergoes same remove/reinsert machinery without semantic changes. If tool cannot manipulate sync masks, close as TOOL_CAPABILITY_LIMIT rather than retry shader spellings. Existing numeric assets unchanged.
+''',encoding='utf-8')
+print(S)

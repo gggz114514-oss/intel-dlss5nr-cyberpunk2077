@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Wire the R03 candidate into the 278-pass INT8 control plan.
+
+Only these lines change (everything else is byte-identical to the host plan):
+  * header buffer count +2
+  * two BUFFER lines appended (int8 weight pack, scale table) so that every
+    existing buffer index stays valid
+  * PASS 4 "ioport_block4_0": SPV path -> candidate, shared 512 -> 256
+  * its BIND 0 (fp16 DS_WB pack) -> the int8 pack, its BIND 4 (4-byte dummy) -> scales
+The PUSH line, the grid, the bindings 1/2/3/5/6/7 and every other pass are untouched.
+"""
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+R = Path("@NR_WORKSPACE@")
+CARD = R / "work/dsh-xmx-handoff-validation-20261024/candidates/r03-ioport4"
+HOST = R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt"
+OUT = CARD / "plan-r03-ioport4-g3.txt"
+TOKEN = re.compile(r'"[^"]*"|\S+')
+
+
+def main():
+    text = HOST.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    head = lines[0].split()
+    assert head[0] == "PORT_NETWORK_1"
+    nb, npass, nout = int(head[2]), int(head[3]), int(head[4])
+    bufs = lines[1:1 + nb]
+    rest = lines[1 + nb:]
+
+    wpath = CARD / "packs/r03_ioport4_ds_w.i8.bin"
+    spath = CARD / "packs/r03_ioport4_ds_scales.f32.bin"
+    wres, sres = nb, nb + 1
+    new_bufs = [f'BUFFER "r03_ioport4_ds_w_i8" {wpath.stat().st_size} "{wpath.as_posix()}"',
+                f'BUFFER "r03_ioport4_ds_scales" {spath.stat().st_size} "{spath.as_posix()}"']
+
+    # locate the pass record
+    idx = None
+    i = 0
+    for pi in range(npass):
+        t = TOKEN.findall(rest[i])
+        nbind, npush = int(t[6]), int(t[7])
+        if t[2].strip('"') == "ioport_block4_0":
+            idx = i
+            break
+        i += 1 + nbind + 1
+    assert idx is not None, "pass not found"
+    t = TOKEN.findall(rest[idx])
+    old_spv = t[3].strip('"')
+    old_shared = int(t[5])
+    assert old_shared == 512, old_shared
+    new_spv = (CARD / "spv/r03_ioport4_i8.spv").as_posix()
+    rest[idx] = rest[idx].replace(old_spv, new_spv).replace(" 512 ", " 256 ")
+
+    nbind = int(t[6])
+    b0 = rest[idx + 1]
+    assert b0.split()[1] == "0" and b0.split()[2] == "456", b0
+    rest[idx + 1] = f"BIND 0 {wres} 0 {wpath.stat().st_size}"
+    b4 = rest[idx + 5]
+    assert b4.split()[1] == "4" and b4.split()[2] == "457", b4
+    rest[idx + 5] = f"BIND 4 {sres} 0 {spath.stat().st_size}"
+    # bindings 1,2,3,5,6,7 unchanged
+    assert rest[idx + 2].split()[2] == "457" and rest[idx + 3].split()[2] == "15"
+    assert rest[idx + 4].split()[2] == "19"
+
+    out_head = f"PORT_NETWORK_1 {head[1]} {nb + 2} {npass} {nout}"
+    out = "\n".join([out_head] + bufs + new_bufs + rest) + "\n"
+    OUT.write_text(out, encoding="utf-8", newline="\n")
+
+    # diff summary: compare against the host with the two inserted BUFFER lines removed
+    old_lines = text.splitlines()
+    new_lines = out.splitlines()
+    stripped = new_lines[:1 + nb] + new_lines[1 + nb + 2:]
+    assert len(stripped) == len(old_lines)
+    changed = [(k, a, b) for k, (a, b) in enumerate(zip(old_lines, stripped)) if a != b]
+    rec = {
+        "card": "r03-ioport4",
+        "host_plan": {"path": HOST.as_posix(), "sha256": hashlib.sha256(HOST.read_bytes()).hexdigest(),
+                      "buffers": nb, "passes": npass, "outputs": nout, "lines": len(old_lines)},
+        "candidate_plan": {"path": OUT.as_posix(), "sha256": hashlib.sha256(OUT.read_bytes()).hexdigest(),
+                           "buffers": nb + 2, "passes": npass, "outputs": nout, "lines": len(new_lines)},
+        "changed_lines": [
+            {"line_no_0based": k, "host": a[:200], "candidate": b[:200]} for k, a, b in changed],
+        "added_lines": [{"after_line_no_0based": nb, "line": ln} for ln in new_bufs],
+        "delta": {
+            "pass_spv": {"host": old_spv, "candidate": new_spv},
+            "pass_shared_bytes": {"host": old_shared, "candidate": 256},
+            "bind0": {"host": "res 456 (ioport_4_ioport_pack 37632 B fp16)", "candidate": f"res {wres} (int8 pack 2048 B)"},
+            "bind4": {"host": "res 457 (4-byte dummy)", "candidate": f"res {sres} (scales 5120 B)"},
+            "push": "unchanged", "grid": "unchanged", "all_other_passes": "unchanged",
+        },
+    }
+    (CARD / "evidence/PLAN-DELTA.json").write_text(json.dumps(rec, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps({"changed_lines": len(changed), "added": len(new_bufs),
+                      "plan": OUT.as_posix(),
+                      "sha256": rec["candidate_plan"]["sha256"]}, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

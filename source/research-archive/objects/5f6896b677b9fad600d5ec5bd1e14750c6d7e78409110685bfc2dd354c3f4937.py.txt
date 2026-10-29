@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""R04 receipts: source change set, build receipt, candidate identity."""
+import difflib
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+ROOT = r"@NR_WORKSPACE@"
+W = ROOT + "/work/dsh-xmx-handoff-validation-20261024"
+CARD = W + "/candidates/r04-c64-attn"
+BUILD = W + "/build/r04-c64-attn"
+sys.path.insert(0, BUILD)
+import spv_r04 as S  # noqa: E402
+
+GLSLANG = ROOT + "/src/project/tools/glslang-16.5.0/bin/glslang.exe"
+VALIDATOR = ROOT + "/candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe"
+LINT = ROOT + "/work/dsh-int8-same-family-20261023/tools/plan_lint.py"
+PYPATH = ROOT + "/run/python312/python.exe"
+
+
+def sha(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest()
+
+
+def info(p):
+    return {"path": p.replace("\\", "/"), "bytes": os.path.getsize(p), "sha256": sha(p)}
+
+
+PARENT_FILES = ["b3_10_c64_common.glsl", "b3_20_c64_ownership_fp16.comp", "register_handoff.glsl"]
+CAND_FILES = ["b3_10_c64_common.glsl", "b3_20_c64_ownership_pv_int8.comp", "register_handoff.glsl"]
+
+
+def change_set():
+    p = CARD + "/source/parent/b3_20_c64_ownership_fp16.comp"
+    c = CARD + "/source/candidate/b3_20_c64_ownership_pv_int8.comp"
+    a = open(p, encoding="utf-8").read().splitlines(keepends=True)
+    b = open(c, encoding="utf-8").read().splitlines(keepends=True)
+    diff = list(difflib.unified_diff(a, b, "parent/b3_20_c64_ownership_fp16.comp",
+                                     "candidate/b3_20_c64_ownership_pv_int8.comp", n=2))
+    changes = [
+        {"id": "C1", "kind": "add", "where": "after line 23 of the parent header comment",
+         "what": "R04 note block: scope, the 16/23 sites converted, and the preserved items",
+         "why": "card header; no instruction"},
+        {"id": "C2", "kind": "add", "where": "parent line 60 (extension list)",
+         "what": "#extension GL_EXT_shader_explicit_arithmetic_types_int8 + "
+                 "GL_EXT_shader_8bit_storage",
+         "why": "int8 arithmetic and int8 in shared memory; the control build proves these two "
+                "lines alone change nothing but OpSourceExtension",
+         "control": "build/r04-c64-attn/control-ext/ctl.spv"},
+        {"id": "C3", "kind": "add", "where": "parent line 70 (shared declarations)",
+         "what": "shared int8_t sv8[2048]; shared uint shVMax;",
+         "why": "V as int8 keeps the parent's ch-major addressing; shVMax is the per-workgroup "
+                "V absmax", "shared_delta_bytes": 2052},
+        {"id": "C4", "kind": "add", "where": "parent line 72 (type macros)",
+         "what": "CIAI int8 A 8x32, CIBI int8 B 32x16, CACC int32 C 8x16",
+         "why": "the measured M8N16K32 tuple"},
+        {"id": "C5", "kind": "add", "where": "before c64_score_block",
+         "what": "i8code / i8pack4 / i8s / i8_join_B; i8code+i8pack4+i8s are the measured "
+                 "adapter's arithmetic verbatim, i8_join_B is the adapter's byte routing in "
+                 "closed form (verified equal to the generated tables over 32x16)",
+         "why": "one quantisation per P element, then pure byte routing; no re-quantisation",
+         "proven_in": "evidence/ABI-MAP.json"},
+        {"id": "C6", "kind": "add", "where": "parent line 120, before the QKV block",
+         "what": "if (t_local == 0u) shVMax = 0u;",
+         "why": "the initialisation rides the existing post-QKV barrier; zero new barriers"},
+        {"id": "C7", "kind": "add", "where": "end of the norm owner pass (parent 179-191)",
+         "what": "uint vb = max over 32 channels of |qkv[4096+c*64+t]|; atomicMax(shVMax, vb)",
+         "why": "V absmax with the workgroup's existing 64 owner threads; published by the "
+                "existing post-norm barrier"},
+        {"id": "C8", "kind": "add", "where": "after the post-norm barrier (parent 192)",
+         "what": "sV = shVMax/127 (1.0 when the slab is all zero), sVinv = 1/sV",
+         "why": "per-head V dequant/quant factor"},
+        {"id": "C9", "kind": "add", "where": "end of the scale pass (parent 196-201)",
+         "what": "for f in [t_local,2048): sv8[f] = int8(i8code(qkv[4096+f], sVinv))",
+         "why": "V -> int8 once, stride-1 copy (sv8[k] and qkv[4096+k] are the same ch*64+tok "
+                "index), published by the existing post-scale barrier"},
+        {"id": "C10", "kind": "add", "where": "after the P rescale (parent 326-342)",
+         "what": "pmx = max of the lane's 32 half P values, one subgroupShuffleXor(pmx,16) and "
+                 "max; pScale = pmx/127, pInv = 127/pmx (both 0 when pmx==0); 8 x i8pack4",
+         "why": "per-query probability scale; the xor closes the query column because a lane "
+                "owns 4 of the 8 rows of every 8-key block", "new_shuffle_xor": 1},
+        {"id": "C11", "kind": "replace", "where": "parent 344-396 (16 FP16 MMAs)",
+         "what": "8 int8 MMAs: 2 K32 slices x 4 dim tiles, A = coopMatLoad(sv8, dim*64 + "
+                 "{0,32}, 64, LROW), B = i8_join_B(4 code words)",
+         "why": "PV becomes M8N16K32; K order, owner, dim tiles unchanged"},
+        {"id": "C12", "kind": "replace", "where": "parent 398-401 (4 narrows)",
+         "what": "MAT_H(MAT_C(c_i) * MAT_C(sV * pScale))",
+         "why": "one FP32 dequant before the parent's single MC->MH narrowing per tile"},
+    ]
+    return {
+        "label": "R04-CHANGE-SET",
+        "parent": info(p), "candidate": info(c),
+        "changed_files": [{"file": "b3_20_c64_ownership_fp16.comp -> "
+                                   "b3_20_c64_ownership_pv_int8.comp",
+                           "changes": changes},
+                          {"file": "b3_10_c64_common.glsl", "changes": "none (byte-identical "
+                           "copy: %s)" % sha(CARD + "/source/candidate/b3_10_c64_common.glsl")},
+                          {"file": "register_handoff.glsl", "changes": "none (byte-identical "
+                           "copy: %s)" % sha(CARD + "/source/candidate/register_handoff.glsl")}],
+        "unified_diff": "".join(diff),
+        "diff_stat": {
+            "added_lines": sum(1 for l in diff if l.startswith("+") and not l.startswith("+++")),
+            "removed_lines": sum(1 for l in diff if l.startswith("-") and not l.startswith("---")),
+        },
+        "invariants_kept": [
+            "the QKV projection block, its 6 FP16 MMA, weight layout and stores are untouched",
+            "the score block function c64_score_block(...) is untouched (opcode multiset "
+            "identical in the SPV, source region byte-identical)",
+            "the sealed C64 denominator tree, the reciprocal, the lane&15 broadcast and the "
+            "single half rounding of P are untouched",
+            "the four workgroup barriers are the parent's four",
+            "the canonical T store addresses, the LCOL layout and the debug echoes are untouched",
+        ],
+    }
+
+
+def build_receipt():
+    parent_src = CARD + "/source/parent"
+    cand_src = CARD + "/source/candidate"
+    out = CARD + "/spv/r04_c64_pv_i8.spv"
+    rep = CARD + "/spv/parent_repro.spv"
+    val = subprocess.run([VALIDATOR, out], capture_output=True, text=True)
+    valp = subprocess.run([VALIDATOR, rep], capture_output=True, text=True)
+    lint = subprocess.run([PYPATH, LINT, CARD + "/plan-r04-g3-base.txt"],
+                          capture_output=True, text=True)
+    return {
+        "status": "OFFLINE_COMPILE + CPU ONLY; no GPU, no pipeline, no GPU.lock",
+        "qualification": ["OFFLINE_COMPILE", "SPV_IDENTITY", "CPU_STRUCT", "PLAN_IDENTITY"],
+        "compiler": info(GLSLANG),
+        "validator": info(VALIDATOR),
+        "python": {"tool": PYPATH, "note": "the shipped repo interpreter; the numpy oracle "
+                                          "used the bundled DSH runtime python (numpy 2.3.5) "
+                                          "because the repo interpreter has no numpy"},
+        "parent_reproduction": {
+            "argv": [GLSLANG, "-V", "--target-env", "vulkan1.3", "-I" + parent_src,
+                     "-o", rep, "b3_20_c64_ownership_fp16.comp"],
+            "cwd": parent_src, "rc": 0,
+            "inputs": [info(parent_src + "/" + f) for f in PARENT_FILES],
+            "output": info(rep),
+            "deployed": info(ROOT + "/candidates/amd-netorg-t2-20261018/c64-ownership-v1/"
+                                    "attention-c64-ownership.spv"),
+            "byte_identical": sha(rep) == sha(ROOT + "/candidates/amd-netorg-t2-20261018/"
+                                                     "c64-ownership-v1/attention-c64-ownership.spv"),
+            "validator": valp.stdout.strip(),
+        },
+        "candidate_build": {
+            "argv": [GLSLANG, "-V", "--target-env", "vulkan1.3", "-I" + cand_src,
+                     "-o", out, "b3_20_c64_ownership_pv_int8.comp"],
+            "cwd": cand_src, "rc": 0,
+            "inputs": [info(cand_src + "/" + f) for f in CAND_FILES],
+            "output": info(out),
+            "validator_stdout": val.stdout.strip(),
+            "validator_result": "result=0" if "result=0" in val.stdout else "FAILED",
+        },
+        "plan": {
+            "base": info(ROOT + "/candidates/int8-coverage-v2-20261020/plan-g3-production.txt"),
+            "candidate": info(CARD + "/plan-r04-g3-base.txt"),
+            "delta": "8 PASS lines (block5/6/7/8/62/63/64/65 _swin_body_3): SPV path -> the "
+                     "candidate, declared shared 12800 -> 14852; nothing else changes",
+            "lint_argv": [PYPATH, LINT, CARD + "/plan-r04-g3-base.txt"],
+            "lint_rc": lint.returncode, "lint_stdout": lint.stdout.strip(),
+        },
+        "control_build": {
+            "argv": [GLSLANG, "-V", "--target-env", "vulkan1.3",
+                     "-I" + BUILD + "/control-ext", "-o", BUILD + "/control-ext/ctl.spv", "ctl.comp"],
+            "what": "parent source plus the two #extension lines only",
+            "output": info(BUILD + "/control-ext/ctl.spv"),
+            "effect": "OpSourceExtension 7 -> 9 and nothing else",
+        },
+    }
+
+
+def candidate_json(br):
+    return {
+        "card": "r04-c64-attn",
+        "card_scope": "C64 attention blocks 5-8, 62-65 (8 PASS, swin_body_3): QKV, QK, PV",
+        "implemented_segment": "PV (16 of the module's 23 static FP16 MMA)",
+        "qualification": ["CPU_STRUCT", "OFFLINE_COMPILE", "SPV_IDENTITY", "PLAN_IDENTITY"],
+        "not_qualified": {
+            "NATIVE": "no pipeline created; GRF/scratch/SLM unknown",
+            "GATE": "not run (no GPU slot)",
+            "ORDINARY": "not run", "QUALITY": "not run",
+        },
+        "parent": {
+            "source": info(CARD + "/source/parent/b3_20_c64_ownership_fp16.comp"),
+            "spv_deployed": info(ROOT + "/candidates/amd-netorg-t2-20261018/c64-ownership-v1/"
+                                        "attention-c64-ownership.spv"),
+            "repro": br["parent_reproduction"]["output"],
+            "byte_identical_repro": br["parent_reproduction"]["byte_identical"],
+        },
+        "candidate": {
+            "source": info(CARD + "/source/candidate/b3_20_c64_ownership_pv_int8.comp"),
+            "spv": info(CARD + "/spv/r04_c64_pv_i8.spv"),
+            "validator": br["candidate_build"]["validator_result"],
+            "shared_bytes": {"parent": 12800, "candidate": 14852,
+                             "delta": 2052, "why": "sv8[2048] + shVMax(4)"},
+            "mmа": None,
+        },
+        "replay": {
+            "compile": br["candidate_build"]["argv"],
+            "validate": [VALIDATOR, CARD + "/spv/r04_c64_pv_i8.spv"],
+            "spv_diff": [PYPATH, BUILD + "/spv_r04.py", "diff", CARD + "/spv/parent_repro.spv",
+                         CARD + "/spv/r04_c64_pv_i8.spv", BUILD + "/spv-diff-raw.json"],
+            "evidence": [CARD + "/tools/make_sites_abi.py", CARD + "/tools/make_delta.py"],
+            "lint": br["plan"]["lint_argv"],
+        },
+        "plan_identity": {
+            "base": br["plan"]["base"], "candidate": br["plan"]["candidate"],
+            "delta_lines": 8, "lint_ok": '"ok": true' in br["plan"]["lint_stdout"],
+        },
+        "evidence_index": {
+            "sites_184": "evidence/SITES-184.json",
+            "abi_map": "evidence/ABI-MAP.json",
+            "pv_int8_scheme": "evidence/PV-INT8-SCHEME.json",
+            "spv_delta": "evidence/SPV-DELTA.json",
+            "mma_residual": "evidence/MMA-RESIDUAL.json",
+            "oracle": "evidence/ORACLE-PV.json",
+            "change_set": "evidence/CHANGE-SET.json",
+        },
+    }
+
+
+def main():
+    cs = change_set()
+    json.dump(cs, open(CARD + "/evidence/CHANGE-SET.json", "w", encoding="utf-8"), indent=1)
+    br = build_receipt()
+    json.dump(br, open(CARD + "/build-receipt.json", "w", encoding="utf-8"), indent=1)
+    cj = candidate_json(br)
+    json.dump(cj, open(CARD + "/CANDIDATE.json", "w", encoding="utf-8"), indent=1)
+    print("diff stat", cs["diff_stat"])
+    print("parent identical", br["parent_reproduction"]["byte_identical"])
+    print("validator", br["candidate_build"]["validator_result"],
+          br["candidate_build"]["validator_stdout"][:80])
+    print("lint rc", br["plan"]["lint_rc"], "ok" if cj["plan_identity"]["lint_ok"] else "NOT OK")
+
+
+if __name__ == "__main__":
+    main()

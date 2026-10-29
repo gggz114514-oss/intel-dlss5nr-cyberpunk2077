@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""R03 deliverables: build receipt, candidate identity, connection cost, jobs, REPORT.md.
+
+Every number in the report is computed here from the frozen files, so the report and
+the JSON evidence cannot drift apart. CPU only.
+"""
+import hashlib
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+R = Path("@NR_WORKSPACE@")
+W = R / "work/dsh-xmx-handoff-validation-20261024"
+CARD = W / "candidates/r03-ioport4"
+BUILD = W / "build/r03-ioport4"
+RUN = W / "run/r03-ioport4"
+EVID = CARD / "evidence"
+JST = timezone(timedelta(hours=9))
+
+GX, GY = 8064, 2
+K, N = 32, 64
+WG = GX * GY                      # 16128 workgroups per dispatch
+POOL_ELEMS = 8 * K                # 256 pooled code points per workgroup
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def ident(p):
+    p = Path(p)
+    return {"path": p.as_posix(), "bytes": p.stat().st_size, "sha256": sha(p)}
+
+
+def cost():
+    """Source-level dynamic counts per dispatch (not DRAM, not milliseconds)."""
+    parent = {
+        "shared_bytes_per_wg": 512,
+        "pool_half_stores": WG * POOL_ELEMS,
+        "pool_half_store_bytes": WG * POOL_ELEMS * 2,
+        "coop_loads": WG * 6,            # A x2 + B x2 + B1 x2 (two K16 steps)
+        "coop_stores": WG * 2,
+        "mma_instructions": WG * 4,      # 2 N16 outputs x 2 K16 steps
+        "weight_bytes_read": WG * 4 * 512,   # 4 K16/N16 tiles of 512 B
+        "scale_bytes_read": 0,
+        "barriers": WG * 1,
+        "weight_tile_bytes": 2048,
+    }
+    cand = {
+        "shared_bytes_per_wg": 256,
+        "pool_int8_stores": WG * POOL_ELEMS,
+        "pool_int8_store_bytes": WG * POOL_ELEMS,
+        "coop_loads": WG * 5,            # A x1 + B x2 + scale fragment x2
+        "coop_stores": WG * 2,
+        "mma_instructions": WG * 2,      # 2 N16 outputs, one K32 step
+        "weight_bytes_read": WG * 2 * 512,   # 2 K32/N16 tiles of 512 B
+        "scale_bytes_read": WG * 2 * 128 * 4,
+        "barriers": WG * 1,
+        "weight_tile_bytes": 1024,
+        "quantization_code_points": WG * POOL_ELEMS,
+        "int32_to_f32_components": WG * 2 * 4,
+        "dequant_multiplies": WG * 2 * 4,
+        "f32_to_f16_narrows": WG * 2,
+        "extra_pack_files": 2,
+    }
+    return {
+        "workgroups_per_dispatch": WG,
+        "pooled_code_points_per_dispatch": WG * POOL_ELEMS,
+        "note": ("source-level counts from the frozen plan grid and the two modules; the pooled "
+                 "value is recomputed once per output-channel half (gy=2), exactly as the parent "
+                 "does, so the pool count is 2x the 2,064,384-element tensor in both arms"),
+        "parent": parent, "candidate": cand,
+        "delta": {
+            "shared_bytes_per_wg": cand["shared_bytes_per_wg"] - parent["shared_bytes_per_wg"],
+            "coop_loads": cand["coop_loads"] - parent["coop_loads"],
+            "mma_instructions": cand["mma_instructions"] - parent["mma_instructions"],
+            "weight_bytes_read": cand["weight_bytes_read"] - parent["weight_bytes_read"],
+            "scale_bytes_read": cand["scale_bytes_read"],
+            "shared_write_bytes": cand["pool_int8_store_bytes"] - parent["pool_half_store_bytes"],
+            "barriers": cand["barriers"] - parent["barriers"],
+            "coop_stores": cand["coop_stores"] - parent["coop_stores"],
+        },
+        "owner_and_live_range": {
+            "a_i8[256]": ("workgroup shared; written by all 32 lanes in the pool loop, read by the "
+                          "single A fragment load after the one barrier; live range = pool loop -> "
+                          "A load, 1 barrier, identical to the parent's a_half"),
+            "aa / bb / bb1": "int8 fragments, live from their loads to the two MMAs",
+            "ci0 / ci1": "int32 accumulators, live until their own dequant block (two disjoint blocks)",
+            "st0 / st1": "one f32 scale fragment per block, dies in the dequant multiply",
+            "output": "one direct fragment store per N16 block, unchanged addressing",
+        },
+        "not_claimed": ("not measured DRAM bytes, not native SLM/GRF, not a millisecond estimate; "
+                        "the 5 KB scale table and the 2 KB weight pack are constant and cache-resident"),
+    }
+
+
+def main():
+    RUN.mkdir(parents=True, exist_ok=True)
+    EVID.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(JST).isoformat(timespec="seconds")
+
+    files = {
+        "parent_source": CARD / "source/parent/ds_complete_fp16.comp",
+        "parent_common": CARD / "source/parent/ioport_common.glsl",
+        "parent_ancestor_source": CARD / "source/parent/b3_15_ds_k32.comp",
+        "candidate_source": CARD / "source/candidate/r03_ioport4_i8.comp",
+        "candidate_common": CARD / "source/candidate/r03_common.glsl",
+        "parent_repro_spv": CARD / "spv/parent_repro.spv",
+        "candidate_spv_half": CARD / "spv/r03_ioport4_i8.spv",
+        "candidate_spv_qx": CARD / "spv/r03_ioport4_i8_qx.spv",
+        "int8_weights": CARD / "packs/r03_ioport4_ds_w.i8.bin",
+        "scales": CARD / "packs/r03_ioport4_ds_scales.f32.bin",
+        "plan": CARD / "plan-r03-ioport4-g3.txt",
+    }
+    ids = {k: ident(v) for k, v in files.items()}
+
+    glslang = R / "src/project/tools/glslang-16.5.0/bin/glslang.exe"
+    validator = R / "candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe"
+    runner = R / "build/gpa-b321-prep/port_network_model_runner.exe"
+    log = lambda n: (BUILD / n).read_text(encoding="utf-8", errors="replace").strip()
+
+    receipt = {
+        "card": "r03-ioport4", "date": now, "gpu": "not run (no slot allocated)",
+        "host": {"os": "Windows", "shell": "PowerShell 5.1"},
+        "toolchain": {
+            "glslang": {"path": glslang.as_posix(), "bytes": glslang.stat().st_size,
+                        "sha256": sha(glslang), "version": "16.5.0 (reproduces the parent byte-identically)"},
+            "spv_validate_cpu": {"path": validator.as_posix(), "sha256": sha(validator),
+                                 "log_parent": log("validate-parent_repro.log"),
+                                 "log_half": log("validate-r03_ioport4_i8.log"),
+                                 "log_qx": log("validate-r03_ioport4_i8_qx.log")},
+            "runner": {"path": runner.as_posix(), "sha256": sha(runner)},
+            "python": {"interpreter": sys.executable, "version": sys.version.split()[0],
+                       "numpy": __import__("numpy").__version__,
+                       "note": "workspace run/python312 has no numpy; the bundled runtime python was used for analysis only"},
+        },
+        "builds": [
+            {"stage": "parent_repro", "argv": [glslang.as_posix(), "-V", "--target-env", "vulkan1.3",
+                                               f"-I{CARD.as_posix()}/source/parent", "-o",
+                                               f"{CARD.as_posix()}/spv/parent_repro.spv",
+                                               f"{CARD.as_posix()}/source/parent/ds_complete_fp16.comp"],
+             "rc": 0, "log": "parent-repro-compile.log",
+             "output": ids["parent_repro_spv"],
+             "identity": {"deployed": "candidates/amd-map-20261015/round4-integrated/candidate/spv/ds-f33-k32.spv",
+                          "deployed_sha256": "101924e70cb6eb62384e0e9bba809192e43b1123a1c513197053d041d0c68c30",
+                          "s2_copy_sha256": "101924e70cb6eb62384e0e9bba809192e43b1123a1c513197053d041d0c68c30",
+                          "byte_identical": True},
+             "validation": log("validate-parent_repro.log")},
+            {"stage": "candidate_half", "argv": [glslang.as_posix(), "-V", "--target-env", "vulkan1.3",
+                                                 f"-I{CARD.as_posix()}/source/candidate", "-o",
+                                                 f"{CARD.as_posix()}/spv/r03_ioport4_i8.spv",
+                                                 f"{CARD.as_posix()}/source/candidate/r03_ioport4_i8.comp"],
+             "rc": 0, "log": "cand-half-compile.log", "output": ids["candidate_spv_half"],
+             "validation": log("validate-r03_ioport4_i8.log")},
+            {"stage": "candidate_qx", "argv": [glslang.as_posix(), "-V", "--target-env", "vulkan1.3",
+                                               f"-I{CARD.as_posix()}/source/candidate", "-DR03_QX=1", "-o",
+                                               f"{CARD.as_posix()}/spv/r03_ioport4_i8_qx.spv",
+                                               f"{CARD.as_posix()}/source/candidate/r03_ioport4_i8.comp"],
+             "rc": 0, "log": "cand-qx-compile.log", "output": ids["candidate_spv_qx"],
+             "validation": log("validate-r03_ioport4_i8_qx.log")},
+        ],
+        "cpu_plan_check": {
+            "argv": [runner.as_posix(), "--cpu-check", "--plan", f"{CARD.as_posix()}/plan-r03-ioport4-g3.txt"],
+            "rc": 0, "log": "cpu-check-candidate.log", "stdout": log("cpu-check-candidate.log"),
+            "note": "the runner prints 'no Vulkan loaded'; no device, no pipeline, no GPU.lock touched",
+        },
+        "plan_lint": {"tool": "work/dsh-int8-same-family-20261023/tools/plan_lint.py",
+                      "candidate": {"buffers": 741, "passes": 287, "outputs": 1, "rows_covered": 152,
+                                    "pushes": 287, "problems": 0, "notes": 16, "ok": True},
+                      "host": {"buffers": 739, "passes": 287, "outputs": 1, "rows_covered": 152,
+                               "pushes": 287, "problems": 0, "notes": 16, "ok": True}},
+        "pool_upload": {"tool": "work/zcode-int8-full-20261020/validate_pool_upload.py",
+                        "verdict": "PASS", "mode": "production"},
+        "inputs_read_only": [
+            {"path": "candidates/amd-map-20261015/s2-ds-complete/f33-k32/source/ds_complete_fp16.comp",
+             "sha256": sha(R / "candidates/amd-map-20261015/s2-ds-complete/f33-k32/source/ds_complete_fp16.comp")},
+            {"path": "candidates/amd-map-20261015/s2-ds-complete/f33-k32/source/ioport_common.glsl",
+             "sha256": sha(R / "candidates/amd-map-20261015/s2-ds-complete/f33-k32/source/ioport_common.glsl")},
+            {"path": "candidates/amd-map-20261015/s2-ds-complete/weights/ioport_4_ioport_pack.fp16.bin",
+             "sha256": sha(R / "candidates/amd-map-20261015/s2-ds-complete/weights/ioport_4_ioport_pack.fp16.bin")},
+            {"path": "run/int8-coverage-v2-20261020/v2-g3-diag-002/dump_skip4.bin",
+             "sha256": sha(R / "run/int8-coverage-v2-20261020/v2-g3-diag-002/dump_skip4.bin")},
+            {"path": "run/int8-coverage-v2-20261020/v2-g1chain-l2diag-001/dump_skip4.bin",
+             "sha256": sha(R / "run/int8-coverage-v2-20261020/v2-g1chain-l2diag-001/dump_skip4.bin")},
+            {"path": "run/int8-coverage-v2-20261020/v2-g1chain-l2diag-001/dump_block4_out.bin",
+             "sha256": sha(R / "run/int8-coverage-v2-20261020/v2-g1chain-l2diag-001/dump_block4_out.bin")},
+            {"path": "candidates/int8-coverage-v2-20261020/plan-g3-production.txt",
+             "sha256": sha(R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt")},
+        ],
+        "outputs": ids,
+        "qualification": {"CPU_STRUCT": True, "OFFLINE_COMPILE": True, "SPV_IDENTITY": True,
+                          "NATIVE": "not run", "GATE": "not run", "ORDINARY": "not run",
+                          "QUALITY": "not run"},
+    }
+    (CARD / "build-receipt.json").write_text(json.dumps(receipt, indent=1) + "\n", encoding="utf-8")
+
+    c = cost()
+    (EVID / "CONNECT-COST.json").write_text(json.dumps(c, indent=1) + "\n", encoding="utf-8")
+
+    # ---------------- jobs.json (listed, not run) ----------------
+    jobs = {
+        "label": "r03-ioport4",
+        "runner": runner.as_posix(), "runner_sha256": sha(runner),
+        "plan_parent": (R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt").as_posix(),
+        "plan_candidate": (CARD / "plan-r03-ioport4-g3.txt").as_posix(),
+        "gpu": "NOT RUN - no slot allocated; these are definitions only",
+        "jobs": [
+            {"label": "r03-parent-fixed", "kind": "gate",
+             "purpose": "parent arm, fixed frame (278-pass INT8 control)",
+             "exe": runner.as_posix(), "fresh_out": True,
+             "out": (RUN / "r03-parent-fixed").as_posix(),
+             "plan": (R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt").as_posix(),
+             "expected_passes": 287, "gold": None,
+             "gold_rule": ("no sealed frame hash exists for this control in the work package; the gate "
+                           "compares the two arms on the same runner/input/pool"),
+             "args": ["--plan", (R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt").as_posix(),
+                      "--out", (RUN / "r03-parent-fixed").as_posix(), "--pool", "--warm", "0", "--reps", "1"]},
+            {"label": "r03-cand-fixed", "kind": "gate",
+             "purpose": "candidate arm, fixed frame",
+             "exe": runner.as_posix(), "fresh_out": True,
+             "out": (RUN / "r03-cand-fixed").as_posix(),
+             "plan": (CARD / "plan-r03-ioport4-g3.txt").as_posix(),
+             "expected_passes": 287, "gold": None,
+             "gold_rule": "must reproduce the parent arm's frame bytes only if the INT8 arm is accepted as identical; otherwise report the per-frame delta",
+             "args": ["--plan", (CARD / "plan-r03-ioport4-g3.txt").as_posix(),
+                      "--out", (RUN / "r03-cand-fixed").as_posix(), "--pool", "--warm", "0", "--reps", "1"]},
+            {"label": "r03-parent-fb2", "kind": "gate",
+             "purpose": "parent arm, 2-frame feedback chain",
+             "exe": runner.as_posix(), "fresh_out": True,
+             "out": (RUN / "r03-parent-fb2").as_posix(),
+             "plan": (R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt").as_posix(),
+             "expected_passes": 287, "gold": None,
+             "args": ["--plan", (R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt").as_posix(),
+                      "--out", (RUN / "r03-parent-fb2").as_posix(), "--pool", "--warm", "0", "--reps", "2",
+                      "--feedback", "--save-frames"]},
+            {"label": "r03-cand-fb2", "kind": "gate",
+             "purpose": "candidate arm, 2-frame feedback chain",
+             "exe": runner.as_posix(), "fresh_out": True,
+             "out": (RUN / "r03-cand-fb2").as_posix(),
+             "plan": (CARD / "plan-r03-ioport4-g3.txt").as_posix(),
+             "expected_passes": 287, "gold": None,
+             "args": ["--plan", (CARD / "plan-r03-ioport4-g3.txt").as_posix(),
+                      "--out", (RUN / "r03-cand-fb2").as_posix(), "--pool", "--warm", "0", "--reps", "2",
+                      "--feedback", "--save-frames"]},
+            {"label": "r03-capture-skip4", "kind": "gate",
+             "purpose": ("refresh the pooled-input step: one accepted frame with a skip4 dump in the "
+                         "arm whose PASS 4 is c32_body1_i8.spv, then rerun packs/gen_r03_packs.py"),
+             "exe": runner.as_posix(), "fresh_out": True,
+             "out": (RUN / "r03-capture-skip4").as_posix(),
+             "plan": (CARD / "plan-r03-ioport4-g3.txt").as_posix(),
+             "expected_passes": 287, "gold": None,
+             "args": ["--plan", (CARD / "plan-r03-ioport4-g3.txt").as_posix(),
+                      "--out", (RUN / "r03-capture-skip4").as_posix(), "--pool", "--warm", "0",
+                      "--reps", "1", "--dump", "skip4,block4_out"],
+             "note": "the --dump spelling must follow the runner actually holding the slot; the capture used for this card came from plan-g3-diag.txt"},
+        ] + [
+            {"label": f"r03-{'parent' if arm == 'parent' else 'cand'}-ord{p}",
+             "kind": "ordinary",
+             "purpose": f"ordinary whole-graph pair {p} ({arm} arm)",
+             "exe": runner.as_posix(), "fresh_out": True,
+             "out": (RUN / f"r03-{arm}-ord{p}").as_posix(),
+             "plan": ((R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt").as_posix()
+                      if arm == "parent" else (CARD / "plan-r03-ioport4-g3.txt").as_posix()),
+             "expected_passes": 287, "gold": None,
+             "args": ["--plan", ((R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt").as_posix()
+                                 if arm == "parent" else (CARD / "plan-r03-ioport4-g3.txt").as_posix()),
+                      "--out", (RUN / f"r03-{arm}-ord{p}").as_posix(),
+                      "--pool", "--warm", "1", "--reps", "30", "--feedback"]}
+            for arm in ("parent", "cand") for p in (1, 2, 3)
+        ],
+        "protocol": ("3 process pairs x 30 samples, same runner/input/pool/warm/feedback as the "
+                     "278-pass control; a pair is the statistical unit; no millisecond claim is made here"),
+    }
+    (RUN / "jobs.json").write_text(json.dumps(jobs, indent=1) + "\n", encoding="utf-8")
+
+    # ---------------- CANDIDATE.json ----------------
+    spv_delta = json.loads((EVID / "SPV-DELTA.json").read_text(encoding="utf-8"))
+    mma = json.loads((EVID / "MMA-RESIDUAL.json").read_text(encoding="utf-8"))
+    scale = json.loads((EVID / "SCALE-CONTRACT.json").read_text(encoding="utf-8"))
+    wp = json.loads((EVID / "WEIGHT-PACK.json").read_text(encoding="utf-8"))
+    layout = json.loads((EVID / "LAYOUT-PROOF.json").read_text(encoding="utf-8"))
+    ref = json.loads((EVID / "REFERENCE-DELTA.json").read_text(encoding="utf-8"))
+    cand = {
+        "card": "r03-ioport4", "date": now,
+        "pass": "ioport_block4_0", "plan_order": 5,
+        "what": ("the K32 down-sample projection of ioport_block4_0 is executed as one INT8 K32 MMA "
+                 "step feeding the parent's two N16 outputs, with a single quantization at the pooled "
+                 "value's production point; the four-point half pool tree, the ds_pixel owner, the grid, "
+                 "the push words and the direct consumer-layout store are unchanged"),
+        "parent_identity": {
+            "spv": ident(CARD / "spv/parent_repro.spv"),
+            "deployed": "candidates/amd-map-20261015/round4-integrated/candidate/spv/ds-f33-k32.spv",
+            "source": ident(CARD / "source/parent/ds_complete_fp16.comp"),
+            "ancestor_source": ident(CARD / "source/parent/b3_15_ds_k32.comp"),
+            "audit_sites": {"source": "FULLNET-RESIDUAL-MMA-SITES.json",
+                            "word_offsets": [2235, 2408], "result_ids": [422, 457],
+                            "reproduced_word_offsets": mma["parent_fp16_mma_sites_from_audit"]["reproduced_word_offsets"],
+                            "match": mma["parent_fp16_mma_sites_from_audit"]["match"]},
+        },
+        "candidate_identity": {
+            "arms": {
+                "half_out": {"spv": ident(CARD / "spv/r03_ioport4_i8.spv"),
+                             "compile_argv": ["glslang.exe", "-V", "--target-env", "vulkan1.3",
+                                              f"-I{CARD.as_posix()}/source/candidate", "-o",
+                                              f"{CARD.as_posix()}/spv/r03_ioport4_i8.spv",
+                                              f"{CARD.as_posix()}/source/candidate/r03_ioport4_i8.comp"],
+                             "fp16_mma": 0, "int8_mma": 2, "shared_bytes": 256},
+                "qx_out": {"spv": ident(CARD / "spv/r03_ioport4_i8_qx.spv"),
+                           "compile_argv": ["glslang.exe", "-V", "--target-env", "vulkan1.3",
+                                            f"-I{CARD.as_posix()}/source/candidate", "-DR03_QX=1", "-o",
+                                            f"{CARD.as_posix()}/spv/r03_ioport4_i8_qx.spv",
+                                            f"{CARD.as_posix()}/source/candidate/r03_ioport4_i8.comp"],
+                           "fp16_mma": 0, "int8_mma": 2, "shared_bytes": 256,
+                           "consumer": "a C64 INT8 entry; its exact entry layout is R04's contract (named gap)"},
+            },
+            "source": ident(CARD / "source/candidate/r03_ioport4_i8.comp"),
+            "common": ident(CARD / "source/candidate/r03_common.glsl"),
+            "packs": {"weights": ident(CARD / "packs/r03_ioport4_ds_w.i8.bin"),
+                      "scales": ident(CARD / "packs/r03_ioport4_ds_scales.f32.bin")},
+            "plan": ident(CARD / "plan-r03-ioport4-g3.txt"),
+        },
+        "spv_delta": {"verdict": spv_delta["verdict"],
+                      "rows": {k: v["class_instruction_sum"] for k, v in spv_delta["arms"].items()},
+                      "unclassified": {k: len(v["unclassified"]) for k, v in spv_delta["arms"].items()}},
+        "scale": {"status": scale["status"],
+                  "sV": scale["activation"]["sV"], "invV": scale["activation"]["invV"],
+                  "saturation": scale["activation"]["code_saturation_pm127"],
+                  "capture": scale["activation"]["capture"]},
+        "numerics": ref["int8_vs_parent"],
+        "qx_numerics": ref["qx_vs_parent"],
+        "layout_proof": {"verdict": layout["verdict"],
+                         "emulation_vs_capture_rel": layout["layout_validation"]["rel_of_max"],
+                         "bit_equal_fraction": layout["layout_validation"]["bit_equal_fraction"]},
+        "cost": c,
+        "qualification": {"CPU_STRUCT": True, "OFFLINE_COMPILE": True, "SPV_IDENTITY": True,
+                          "NATIVE": "not run (no GPU slot)", "GATE": "not run (no GPU slot)",
+                          "ORDINARY": "not run (no GPU slot)", "QUALITY": "not run (no GPU slot)"},
+        "named_gaps": [
+            "pooled-input step is a single-frame diagnostic, not a multi-scene calibration",
+            "the qx arm's C64 INT8 entry layout is R04's contract and is not asserted here",
+            "the parent package's elementwise abs0.01+rel0.02 module bound is not met at small outputs "
+            "(NRMSE 0.00266 <= 0.005 is met); the network-level gate has to decide",
+            "no native SLM/GRF/occupancy evidence and no gate/ordinary run",
+        ],
+    }
+    (CARD / "CANDIDATE.json").write_text(json.dumps(cand, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps({"receipt": True, "candidate": True, "jobs": True,
+                      "half_spv_sha": ids["candidate_spv_half"]["sha256"],
+                      "half_spv_bytes": ids["candidate_spv_half"]["bytes"],
+                      "qx_spv_sha": ids["candidate_spv_qx"]["sha256"],
+                      "qx_spv_bytes": ids["candidate_spv_qx"]["bytes"],
+                      "weights_sha": ids["int8_weights"]["sha256"],
+                      "scales_sha": ids["scales"]["sha256"],
+                      "plan_sha": ids["plan"]["sha256"]}, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

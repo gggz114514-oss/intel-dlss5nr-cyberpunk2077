@@ -1,0 +1,95 @@
+"""Generate cards/n01-c32-chain/candidate.comp from the parent source.
+
+Exactly one mechanism: at every producer site whose *last half narrowing* has no
+consumer other than the consumer A fragment on the normal (debug=0) path, the
+narrowing writes the consumer A fragment element directly instead of first
+materialising the half accumulator fragment NRH_CH and copying it.
+
+Sites (20), all inside `main`:
+  * 8 expand blocks x {e0,e1} = 16  : narrow(ec) -> act -> A   becomes act_to_A(ec)
+  * 4 context fragments             : narrow(tc) -> A          becomes cvt_to_A(tc)
+Sites deliberately NOT changed (the half fragment has a second live consumer):
+  x (residual seed), y00..y11 (output-projection residual seed), q00..q11
+  (shared K publish), p00..p13 (den reduction)  -> see ANALYSIS.md Q1/Q2.
+
+Debug semantics are preserved bit-for-bit: the debug store still receives the
+pre-activation narrow of the same accumulator at the same dbg offset, only
+re-materialised inside the (uniform) debug branch.
+"""
+from pathlib import Path
+
+CARD = Path(__file__).parent
+PARENT = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+              'c32-rest-20261026/body-pv-den-overlap/candidate.comp')
+
+HELPERS = '''
+// --- n01-c32-chain -------------------------------------------------------
+// The producer's last half narrowing writes the consumer A fragment directly.
+// The measured lane map in register_handoff.glsl is the identity for this pair
+// (nrh_coord_A(c) == nrh_coord_CH(c) for every component c, and nrh_to_A()
+// copies component i to component i), so no layout is changed here: this only
+// drops the intermediate half accumulator fragment on the producer side.  Each
+// element keeps its single f32->f16 rounding and its activation op order.
+NRH_A nrh_cvt_to_A(NRH_C x){NRH_A o=NRH_A(float16_t(0.0));
+ o[0]=float16_t(x[0]);o[1]=float16_t(x[1]);o[2]=float16_t(x[2]);o[3]=float16_t(x[3]);
+ return o;}
+NRH_A nrh_act_to_A(NRH_C x){NRH_A o=NRH_A(float16_t(0.0));
+ o[0]=nr_act_h(float16_t(x[0]));o[1]=nr_act_h(float16_t(x[1]));
+ o[2]=nr_act_h(float16_t(x[2]));o[3]=nr_act_h(float16_t(x[3]));
+ return o;}
+'''
+
+ANCHOR = ("float16_t nr_act_h(float16_t x) {\n"
+          "    float16_t t = clamp(x, float16_t(-4.0), float16_t(4.0));\n"
+          "    float16_t u = fma(float16_t(-0.055908203125), abs(t), float16_t(0.447265625));\n"
+          "    return x * fma(t, u, float16_t(0.89453125));\n"
+          "}\n")
+
+
+def main():
+    text = PARENT.read_text(encoding='utf-8')
+    assert text.count(ANCHOR) == 1
+    text = text.replace(ANCHOR, ANCHOR + HELPERS, 1)
+
+    n_act = 0
+    for b in range(8):
+        for name, off in (('e0', b * 16), ('e1', 1024 + b * 16)):
+            comp = name[1]                       # '0' -> ec0 / '1' -> ec1
+            old = ("NRH_CH {n}=nrh_narrow(ec{c});\n"
+                   "if(debug) coopMatStore({n},dbg,t0*128u+{o}u,128u,LROW);\n"
+                   "{n}[0]=nr_act_h({n}[0]);\n"
+                   "{n}[1]=nr_act_h({n}[1]);\n"
+                   "{n}[2]=nr_act_h({n}[2]);\n"
+                   "{n}[3]=nr_act_h({n}[3]);\n"
+                   "NRH_A ea{c}=nrh_to_A({n});\n").format(n=name, c=comp, o=off)
+            new = ("NRH_A ea{c}=nrh_act_to_A(ec{c});\n"
+                   "if(debug) {{NRH_CH {n}_dbg=nrh_narrow(ec{c}); "
+                   "coopMatStore({n}_dbg,dbg,t0*128u+{o}u,128u,LROW);}}\n").format(
+                       n=name, c=comp, o=off)
+            assert text.count(old) == 1, (name, off, text.count(old))
+            text = text.replace(old, new, 1)
+            n_act += 1
+    assert n_act == 16
+
+    n_ctx = 0
+    for name, src, row in (('ctx00', 'tc00', '(t0+0u)*32u+0u'), ('ctx01', 'tc01', '(t0+0u)*32u+16u'),
+                           ('ctx10', 'tc10', '(t0+8u)*32u+0u'), ('ctx11', 'tc11', '(t0+8u)*32u+16u')):
+        ca = 'ca' + name[3:]
+        old = ("NRH_CH {n}=nrh_narrow({s});\n"
+               "if(debug) coopMatStore({n},dbg,18432u+{r},32u,LROW);\n"
+               "NRH_A {ca}=nrh_to_A({n});\n").format(n=name, s=src, ca=ca, r=row)
+        new = ("NRH_A {ca}=nrh_cvt_to_A({s});\n"
+               "if(debug) {{NRH_CH {n}_dbg=nrh_narrow({s}); "
+               "coopMatStore({n}_dbg,dbg,18432u+{r},32u,LROW);}}\n").format(
+                   n=name, s=src, ca=ca, r=row)
+        assert text.count(old) == 1, (name, text.count(old))
+        text = text.replace(old, new, 1)
+        n_ctx += 1
+    assert n_ctx == 4
+
+    (CARD / 'candidate.comp').write_text(text, encoding='utf-8')
+    print('candidate.comp written: 20 sites (16 act + 4 cvt)')
+
+
+if __name__ == '__main__':
+    main()

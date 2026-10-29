@@ -1,0 +1,132 @@
+"""S12 vertical slice — C256 block15 (ordinal 54) WO output projection, CPU reference.
+
+Everything is derived from bytes on disk + the candidate/parent source formulas:
+  pack  = plan BUFFER "swin_15_weights"                 (round4-integrated copy)
+  gT    = dump_swin_15_T.bin   66 windows x 64 tokens x 256 ch
+  gY    = dump_swin_15_Y.bin   residual source, same shape
+  out   = dump_block15_out.bin FP16 network output in the image/tile layout
+          written by c256_img_half_index()
+
+Step 1  reproduce the FP16 arm exactly (A = gT half, B = pack[wo + n*256 + k],
+        seed = gY*pack[ars+n]) and compare with dump_block15_out.
+        -> proves the extraction, the K order, the residual offset ars, the
+           write domain (incl. the OOB rule).
+Step 2  reproduce the DEPLOYED int8 candidate from its own packs (dynamic
+        per-window A scale, per-output-channel weight scale).
+"""
+import json
+import numpy as np
+
+D = r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+CAND = r"@NR_WORKSPACE@/work/dsh-int8-fullnet-impl-20261024/candidates/r07-c256-wo-merged"
+PACK = r"@NR_WORKSPACE@/candidates/amd-map-20261015/round4-integrated/candidate/packs/swin_15_weights.fp16.bin"
+WORK = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S12-proj/_work"
+
+NW, NT, NC = 66, 64, 256          # windows, tokens/window, channels
+TX, TY = 21, 12                   # tile grid from push p0 = (21,12,..)
+GX = 11                           # window row stride from push p1.x
+WO, RS, ARS = 0, 655752, 98304    # push p4 = (wo_half, rs_half, ars_half, bias)
+
+
+def nz(tid):
+    """Lin's int->numpy set, but vectorised index grammar (see img_index)."""
+    raise NotImplementedError
+
+
+def img_index_vec(t, c, wx, wy):
+    """c256_img_half_index for arrays t (tokens) and c (channels) of equal shape."""
+    q = t >> 4
+    s = t & 15
+    tx = 2 * wx + (q & 1)
+    ty = 2 * wy + (q >> 1)
+    oob = (tx < 0) | (ty < 0) | (tx >= TX) | (ty >= TY)
+    stx = np.clip(tx, 0, TX - 1)
+    sty = np.clip(ty, 0, TY - 1)
+    idx = ((sty * TX + stx) * 16 + (c // 16)) * 256 + s * 16 + (c % 16)
+    return idx, oob
+
+
+# ---- load ------------------------------------------------------------------
+pack = np.fromfile(PACK, dtype=np.float16).astype(np.float32)
+T = np.fromfile(f"{D}/dump-fp16/dump_swin_15_T.bin", dtype=np.float16).astype(np.float32)
+Y = np.fromfile(f"{D}/dump-fp16/dump_swin_15_Y.bin", dtype=np.float16).astype(np.float32)
+OUT = np.fromfile(f"{D}/dump-fp16/dump_block15_out.bin", dtype=np.float16).astype(np.float32)
+Wq_raw = np.fromfile(f"{CAND}/packs/c256_b15_wo.codes.i8.bin", dtype=np.int8)
+Wsc = np.fromfile(f"{CAND}/packs/c256_b15_wo.sc.f32.bin", dtype=np.float32)
+# r07 tile convention: idx = (n/16)*(K/32)*512 + (k/32)*512 + (n%16)*32 + (k%32)
+_n = np.arange(NC)[:, None]
+_k = np.arange(NC)[None, :]
+_widx = ((_n // 16) * (NC // 32) * 512 + (_k // 32) * 512 + (_n % 16) * 32 + (_k % 32))
+Wq = Wq_raw[_widx].astype(np.float32)
+
+T = T.reshape(NW, NT, NC)
+Y = Y.reshape(NW, NT, NC)
+Wf = pack[WO: WO + NC * NC].reshape(NC, NC)          # W[n, k]
+f_ar = pack[ARS: ARS + NC]                            # residual per-channel factor
+W8 = Wq.reshape(NC, NC)                               # int8 codes [n, k]
+assert W8.shape == (NC, NC) and Wsc.size == NC
+
+report = {"pack_source": PACK, "pack_sha_expected_prefix": "df8100f65b1ee727"}
+
+Yhat = np.einsum("wtk,nk->wtn", T, Wf) + Y * f_ar[None, None, :]
+
+# ---- scatter into the kernel's own write domain ----------------------------
+acc = np.zeros(OUT.size, dtype=np.float64)
+cnt = np.zeros(OUT.size, dtype=np.int64)
+tt = np.repeat(np.arange(NT), NC)
+cc = np.tile(np.arange(NC), NT)
+for wx in range(GX):
+    for wy in range(TY // 2):
+        w = wy * GX + wx
+        idx, oob = img_index_vec(tt, cc, wx, wy)
+        keep = ~oob
+        np.add.at(acc, idx[keep], Yhat[w].reshape(-1)[keep])
+        np.add.at(cnt, idx[keep], 1)
+mask = cnt > 0
+report["fp16_arm"] = {
+    "written_elements": int(mask.sum()),
+    "unwritten_elements": int((~mask).sum()),
+    "written_pixels_x_channels": int(mask.sum()),
+    "relL2_vs_dump_block15_out": float(
+        np.linalg.norm(acc[mask] - OUT[mask]) / np.linalg.norm(OUT[mask])),
+    "max_abs_err": float(np.max(np.abs(acc[mask] - OUT[mask]))),
+    "out_rms": float(np.sqrt(np.mean(OUT[mask] ** 2))),
+    "multi_write_elements": int((cnt > 1).sum()),
+}
+print(json.dumps(report["fp16_arm"], indent=1))
+
+# ---- deployed int8 arm (dynamic per-window A scale) ------------------------
+codes = np.zeros((NW, NT, NC), dtype=np.float32)
+sC = np.zeros(NW, dtype=np.float32)
+for w in range(NW):
+    m = float(np.max(np.abs(T[w])))
+    inv = 127.0 / m if m > 0 else 0.0
+    sC[w] = m / 127.0 if m > 0 else 0.0
+    codes[w] = np.clip(np.rint(T[w] * inv), -127, 127)
+Yold = np.einsum("wtk,nk->wtn", codes, W8) * (Wsc[None, None, :] * sC[:, None, None])
+Yold = Yold + Y * f_ar[None, None, :]
+report["old_int8_arm"] = {
+    "A_scale_granularity": "per-workgroup per-tensor over the whole 64x64 window tile (dynamic, in-kernel)",
+    "n_distinct_A_scales": int(NW),
+    "A_scale_min": float(sC.min()), "A_scale_max": float(sC.max()),
+    "relL2_vs_fp16_arm": float(np.linalg.norm(Yold - Yhat) / np.linalg.norm(Yhat)),
+    "relL2_vs_dump_block15_out": float(
+        np.linalg.norm(Yold.reshape(-1)[tt * 0 + 0:0].sum() if False else 0.0) if False else 0.0),
+}
+# token-space old error against the FP16 arm restricted to the written domain
+wmask = np.zeros((NW, NT, NC), dtype=bool)
+for wx in range(GX):
+    for wy in range(TY // 2):
+        w = wy * GX + wx
+        idx, oob = img_index_vec(tt, cc, wx, wy)
+        wmask[w] = (~oob).reshape(NT, NC)
+report["old_int8_arm"]["relL2_written_domain"] = float(
+    np.linalg.norm((Yold - Yhat)[wmask]) / np.linalg.norm(Yhat[wmask]))
+report["old_int8_arm"]["written_tokens"] = int(wmask.sum())
+print(json.dumps(report["old_int8_arm"], indent=1))
+
+np.save(f"{WORK}/Yhat.npy", Yhat)
+np.save(f"{WORK}/Yold.npy", Yold)
+np.save(f"{WORK}/wmask.npy", wmask)
+json.dump(report, open(f"{WORK}/slice1.json", "w", encoding="utf-8"), indent=1)
+print("saved", WORK)

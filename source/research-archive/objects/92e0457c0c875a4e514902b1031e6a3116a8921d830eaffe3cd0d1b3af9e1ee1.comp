@@ -1,0 +1,159 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x=256) in;
+#include "b3_04_vit_common.glsl"
+#include "vit_qkv_norm_owner_handoff.glsl"
+#define MH coopmat<float16_t,gl_ScopeSubgroup,8,16,gl_MatrixUseAccumulator>
+// n12b-f14-scale candidate (F14 package: the n12 norm tree carried over
+// unchanged, plus the Q scale coefficient hoisted out of the publication loop;
+// see the comment at the hoist site in main()).
+//
+// n12-vit-qkv candidate (F14, ordinals 95/100/105/110/115/120/125/130).
+//
+// One mechanism, one change: the Q/K norm reciprocal loses its single-owner
+// round trip (record -> owner rsqrt -> subgroupShuffle broadcast) and is
+// evaluated in place by every lane that consumes it.
+//
+// Parent (vit_qkv_norm_owner_v2) executes only the lower half of each tree step
+//   step 8/4/2/1:  if((lane&15u)<step) s = s + shuffleXor(s,step)
+// so only columns 0 and 16 ever hold a completed reduction; the reciprocal is
+// evaluated in that column (lane&15==0) and pushed to the other fifteen columns
+// by subgroupShuffle(pack, lane&16u).
+//
+// This candidate makes every lane evaluate the whole xor tree
+//   step 8/4/2/1:  s = s + shuffleXor(s,step)          (no column predicate)
+// and evaluates max/inversesqrt in place.  Lane l after step s holds the sum
+// over the block {l xor m : m subset of {8,4,...,s}}, which is the parent's node
+// for that block: at every internal node the two children are the same two
+// partial sums the parent's predicated tree adds, only possibly in the opposite
+// operand order.  IEEE-754 binary16 addition is commutative (round-to-nearest-
+// even of the exact sum), so every lane's value is bit-identical to the value
+// the parent's column-0 owner computes, and the broadcast becomes redundant.
+// Lane 0 and lane 16 keep the parent's node order unchanged.  See
+// cards/n12-vit-qkv/PROOF.json for the node-by-node and the exhaustive f16
+// check, and cards/n12-vit-qkv/evidence/LAYOUT-PROOF.json for the unchanged qkv
+// write domain (the F15 attention read direction).
+//
+// Unchanged on purpose: the projection loop and its operand order, the K=1024
+// accumulation order per accumulator, the MH narrowing point (one half narrowing
+// of the completed FP32 accumulator per side), the debug echo, the qkv write
+// address (t*3072 + n0 + d), the Q/K/V branch structure, and every half rounding
+// of the norm/scale tree.
+f16vec2 vq_tree_all(f16vec2 s) {
+    // Parent tree, all sixteen columns. The four half adds per component and
+    // their operand values are the parent's; only the d<step column predicate
+    // is gone, so the upper columns now also carry a (correct) partial.
+    uint w=packFloat2x16(s);
+    s=s+unpackFloat2x16(subgroupShuffleXor(w,8u));
+    w=packFloat2x16(s);
+    s=s+unpackFloat2x16(subgroupShuffleXor(w,4u));
+    w=packFloat2x16(s);
+    s=s+unpackFloat2x16(subgroupShuffleXor(w,2u));
+    w=packFloat2x16(s);
+    s=s+unpackFloat2x16(subgroupShuffleXor(w,1u));
+    return s;
+}
+// Parent: inv = float16_t(inversesqrt(float(max(s[0], float16_t(0.000062))))).
+// Same operation, same operand, evaluated where it is consumed instead of in
+// the column-0 owner plus a subgroupShuffle(pack, lane&16) broadcast.
+f16vec2 vq_rcp_own(f16vec2 s) {
+    return f16vec2(float16_t(inversesqrt(float(max(s.x,float16_t(0.000062))))),
+                   float16_t(inversesqrt(float(max(s.y,float16_t(0.000062))))));
+}
+void main() {
+    uint sg=gl_SubgroupID,lane=gl_SubgroupInvocationID;
+    uint mA=gl_WorkGroupID.x*128u+sg*8u,mB=mA+64u,n0=gl_WorkGroupID.y*32u;
+    const uint K=1024u;
+    {
+        MC accA0=MC(0.0),accA1=MC(0.0),accB0=MC(0.0),accB1=MC(0.0);
+        for(uint k0=0u;k0<K;k0+=16u) {
+            MB b0,b1;
+            coopMatLoad(b0,w,vit_wbase(pc.p1.z,n0,k0,K),16u,CM);
+            coopMatLoad(b1,w,vit_wbase(pc.p1.z,n0+16u,k0,K),16u,CM);
+            MA af;
+            if(mA<pc.p0.x) {
+                coopMatLoad(af,y,pc.p5.w+mA*K+k0,K,RM);
+                accA0=coopMatMulAdd(af,b0,accA0);
+                accA1=coopMatMulAdd(af,b1,accA1);
+            }
+            if(mB<pc.p0.x) {
+                coopMatLoad(af,y,pc.p5.w+mB*K+k0,K,RM);
+                accB0=coopMatMulAdd(af,b0,accB0);
+                accB1=coopMatMulAdd(af,b1,accB1);
+            }
+        }
+        // n12b-f14-scale: the Q scale coefficient is one value per workgroup
+        // (scales[p2.z + (n0%1024)/32], head = gy%32, independent of `group`),
+        // but it is read inside the publication loop.  The driver unrolls the
+        // two-iteration loop, so that read is emitted twice (parent ISA
+        // 0x17390 / 0x18950) with the group-0 qkv stores in between; a store to
+        // qkv blocks CSE of a readonly Scales load across it.  Read it once
+        // here, before the loop, and let both groups use the same half value.
+        // The expression, the float16_t conversion and the eight vq_scale_q
+        // calls per group (same operands, same order) are unchanged; the read is
+        // guarded by the same n0<1024u predicate as its consumer, so K/V
+        // workgroups (n0 >= 1024) still perform no read.  No numeric change: the
+        // address depends on nothing computed in the loop, Scales is never
+        // written, and the plan binds Scales (binding 1, 128 B) and QKV
+        // (binding 6, 1,769,472 B) to different pool buffers.
+        float16_t scale=float16_t(0.0);
+        if(n0<1024u) scale=float16_t(scales[pc.p2.z+(n0%1024u)/32u]);
+        // Parent publication order: group 0 (mA) then group 1 (mB), and inside a
+        // group side 0 (channels n0..n0+15) then side 1 (n0+16..n0+31).
+        for(uint group=0u;group<2u;++group) {
+            uint m=group==0u?mA:mB;
+            // m is subgroup uniform. The parent's per-row t<pc.p0.x qkv guard is
+            // equivalent to this group guard because live tokens (288 in every
+            // B5 call) are a multiple of the 8 fragment rows; blocks at or past
+            // live were skipped by the same value in the parent.
+            if(m>=pc.p0.x) continue;
+            MH h0,h1;
+            if(group==0u) {
+                h0=MH(accA0);
+                h1=MH(accA1);
+            } else {
+                h0=MH(accB0);
+                h1=MH(accB1);
+            }
+            if(pc.p0.w!=0u) {
+                coopMatStore(h0,dbg,pc.p6.z+pc.p3.y+m*3072u+n0,3072u,RM);
+                coopMatStore(h1,dbg,pc.p6.z+pc.p3.y+m*3072u+n0+16u,3072u,RM);
+            }
+            if(n0<2048u) {
+                // s[d] = z[d]^2 + z[d+16]^2, then the parent's 8/4/2/1 half tree.
+                f16vec2 s01=vq_pair_sum(f16vec2(h0[0],h0[1]),f16vec2(h1[0],h1[1]));
+                f16vec2 s23=vq_pair_sum(f16vec2(h0[2],h0[3]),f16vec2(h1[2],h1[3]));
+                s01=vq_tree_all(s01);
+                s23=vq_tree_all(s23);
+                f16vec2 inv01=vq_rcp_own(s01);
+                f16vec2 inv23=vq_rcp_own(s23);
+                if(n0<1024u) {
+                    h0[0]=vq_scale_q(h0[0],inv01.x,scale);
+                    h0[1]=vq_scale_q(h0[1],inv01.y,scale);
+                    h0[2]=vq_scale_q(h0[2],inv23.x,scale);
+                    h0[3]=vq_scale_q(h0[3],inv23.y,scale);
+                    h1[0]=vq_scale_q(h1[0],inv01.x,scale);
+                    h1[1]=vq_scale_q(h1[1],inv01.y,scale);
+                    h1[2]=vq_scale_q(h1[2],inv23.x,scale);
+                    h1[3]=vq_scale_q(h1[3],inv23.y,scale);
+                } else {
+                    h0[0]=vq_scale_k(h0[0],inv01.x);
+                    h0[1]=vq_scale_k(h0[1],inv01.y);
+                    h0[2]=vq_scale_k(h0[2],inv23.x);
+                    h0[3]=vq_scale_k(h0[3],inv23.y);
+                    h1[0]=vq_scale_k(h1[0],inv01.x);
+                    h1[1]=vq_scale_k(h1[1],inv01.y);
+                    h1[2]=vq_scale_k(h1[2],inv23.x);
+                    h1[3]=vq_scale_k(h1[3],inv23.y);
+                }
+            }
+            coopMatStore(h0,qkv,uint(pc.p6.x)+m*3072u+n0,3072u,RM);
+            coopMatStore(h1,qkv,uint(pc.p6.x)+m*3072u+n0+16u,3072u,RM);
+        }
+    }
+}

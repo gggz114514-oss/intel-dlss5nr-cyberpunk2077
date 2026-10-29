@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""cumulative-v2 = R13/R14 (pass insertion + POLICY remap) + the v1 card deltas.
+
+Why this shape: R13/R14's plan already contains the hard part — inserting
+`b30_qt_producer` at ordinal 116 and rewriting the 376 POLICY ordinals that move —
+and it keeps every other pass byte-identical to G3.  So v2 starts from that plan and
+re-applies the v1 cards **by pass name** (names survive an insertion; ordinals do not),
+remapping each card's tail BUFFER ids onto fresh ids after R13/R14's 742.
+
+Namespaces kept apart on purpose:
+  * BUFFER ids  — card tail ids (>= 739) are remapped; references only appear in BIND lines;
+  * PASS ordinals — never touched here (the base plan already owns the new numbering).
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+W = Path(r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024")
+BASE = W / "candidates/r13-r14-b30/plan-r13-r14-b30-g3merge.txt"
+G3 = Path(r"@NR_WORKSPACE@/candidates/int8-coverage-v2-20261020/plan-g3-production.txt")
+CARDS = [
+    ("R03", W / "candidates/r03-ioport4/plan-r03-ioport4-g3.txt"),
+    ("R07", W / "candidates/r07-output-proj/plan-r07-c64-output-i8.txt"),
+    ("R08", W / "candidates/r08-c128-ffn/plan-r08-c128-ffn.txt"),
+    ("R09", W / "candidates/r09-r11-f3ds/plan-r09-f3ds.txt"),
+    ("C2", W / "candidates/c2-c32-regk32/plan-c2-regk32-g3.txt"),
+]
+G3_NBUF = 739
+
+
+def parse(path):
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    header = lines[0].split()
+    bufs, passes, tail = {}, {}, []
+    i, bid, ordinal = 1, 0, 0
+    while i < len(lines):
+        l = lines[i]
+        if l.startswith("BUFFER "):
+            bufs[bid] = l
+            bid += 1
+            i += 1
+            continue
+        if l.startswith("PASS "):
+            nb = int(l.split()[6])
+            block = lines[i:i + nb + 2]
+            passes[l.split()[2].strip('"')] = block
+            ordinal += 1
+            i += nb + 2
+            continue
+        tail.append(l)
+        i += 1
+    return header, bufs, passes, tail
+
+
+def main():
+    h, bbufs, bpasses, btail = parse(BASE)
+    _h3, _b3, g3passes, _t3 = parse(G3)
+    base_nbuf = len(bbufs)
+    merged_bufs = dict(bbufs)
+    merged_passes = dict(bpasses)
+    next_buf = base_nbuf
+    report = {"base": {"path": str(BASE),
+                       "sha256": hashlib.sha256(BASE.read_bytes()).hexdigest(),
+                       "buffers": base_nbuf, "passes": len(bpasses)},
+              "g3": str(G3), "cards": [], "collisions": []}
+    for card, plan in CARDS:
+        ch, cbufs, cpasses, ctail = parse(plan)
+        remap = {}
+        for bid in sorted(cbufs):
+            if bid >= G3_NBUF:
+                remap[bid] = next_buf
+                next_buf += 1
+        changed = []
+        for name, block in cpasses.items():
+            if name not in bpasses:
+                report["collisions"].append({"missing_pass": name, "card": card})
+                continue
+            if block == bpasses[name]:
+                continue
+            # precedence: the base plan (R13/R14) owns any pass it already changed;
+            # a card must not overwrite it back to the G3 form.
+            if bpasses[name] != g3passes[name]:
+                report["collisions"].append({"skipped_already_owned_by_base": name, "card": card})
+                continue
+            new = []
+            for ln in block:
+                if ln.startswith("BIND "):
+                    f = ln.split()
+                    rid = int(f[2])
+                    if rid in remap:
+                        f[2] = str(remap[rid])
+                    new.append(" ".join(f))
+                else:
+                    new.append(ln)
+            merged_passes[name] = new
+            changed.append(name)
+        for bid in sorted(remap):
+            merged_bufs[remap[bid]] = cbufs[bid]
+        report["cards"].append({"card": card, "changed_pass_names": changed,
+                                "added_buffers": len(remap)})
+    # order: keep the base plan's order, then any pass the base did not have (none expected)
+    order = []
+    for name in bpasses:
+        order.append(name)
+    out = [" ".join([h[0], h[1], str(len(merged_bufs)), str(len(merged_passes)), h[4]])]
+    for bid in sorted(merged_bufs):
+        out.append(merged_bufs[bid])
+    for name in order:
+        out.extend(merged_passes[name])
+    out.extend(btail)
+    dst = W / "candidates/cumulative-v2/plan-cumulative-v2.txt"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text("\n".join(out) + "\n", encoding="utf-8", newline="\n")
+    report["cumulative_v2"] = {"path": str(dst),
+                               "sha256": hashlib.sha256(dst.read_bytes()).hexdigest(),
+                               "buffers": len(merged_bufs), "passes": len(merged_passes),
+                               "changed_passes": sum(len(c["changed_pass_names"]) for c in report["cards"])}
+    (W / "candidates/cumulative-v2/MERGE.json").write_text(
+        json.dumps(report, indent=1, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    print(json.dumps({"buffers": len(merged_bufs), "passes": len(merged_passes),
+                      "plan_sha": report["cumulative_v2"]["sha256"][:16],
+                      "collisions": len(report["collisions"])}, ensure_ascii=False))
+    for c in report["cards"]:
+        print(" ", c["card"], "changed", len(c["changed_pass_names"]), "bufs", c["added_buffers"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

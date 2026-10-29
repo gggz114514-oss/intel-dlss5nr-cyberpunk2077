@@ -1,0 +1,106 @@
+n12-vit-qkv  RESUME —— F14 ViT QKV / fragment norm owner（2026-10-27）
+========================================================================
+
+## 1. 状态
+
+**BUILT / AWAITING-GPU**（本卡未运行 GPU、未部署、未改基线 plan/指针/COMMON.py、未写其他卡目录）
+
+| 产物 | sha256 | 备注 |
+|---|---|---|
+| candidate.comp | b3c6e215f947cafd66b5f7880ab35b2725ee9499ec36bbd344b63ba543e89004 | 7013 B |
+| candidate.spv | d008f8fefca9e8fa881713302bb45fab4c23a5d4c8258a4b1cbca07e8577e4c7 | 18268 B，spv_validate_cpu result=0 words=4567 |
+| parent-rebuild.spv | 72e2df7c7b1e542f375f5c7c2bdc572433a08c5f1a1a0d706026efa54b9a1e87 | **与父 SPV 字节相同**（raw compile） |
+| plan.txt | 9a3c7c06827bc742cb8220331e3a37cf21725065107d65f0d9efd2ad658352c3 | 167811 B，只替换 8 行 PASS（1516/1571/1626/1681/1736/1791/1846/1901） |
+| cpu-check | `CPU_PLAN_OK 152 rows, 232 passes, 502 buffers; no Vulkan loaded` | 与基线 plan 的 cpu-check **逐字相同** |
+
+* 族的 8 个 PASS：ordinal 95,100,105,110,115,120,125,130（PASS 58/63/68/73/78/83/88/93），
+  共用同一个 SPV，F14 本轮字节此前**从未动过**（与 cov-232 的 C1 口径一致）。
+* `float_NC_checked = 7`（父 7 / 候选 7，同一 multiset：6×OpFMul + 1×OpFAdd；无 Fma OpExtInst 站点）。
+* 六问、映射与边界枚举、证据索引：`ANALYSIS.md` / `PROOF.json` / `evidence/*.json`。
+
+## 2. 改了什么（一句话）
+
+norm 的倒数从「只在 column-0 owner 里求 + `subgroupShuffle(lane&16)` 广播」改成
+「**每个 lane 各自跑完整 xor 归约树 + 原地求倒数**」；树本身（xor 8/4/2/1、每步 1 条 half 加法）
+和算子顺序**完全没变**，只是去掉了每步的 `(lane&15)<step` 列谓词。
+
+依据：lane l 在完成 4 步后持有块 `{l xor m | m ⊆ {8,4,2,1}}` 的和，正是父树对同一块的节点；
+每个内部节点的两个操作数就是父树的同一对 partial（**可能左右互换**），而 binary16 加法可交换，
+所以 16 个 column 的值与父 column-0 的值**逐位相同**，广播因此冗余。
+
+## 3. 已证 / 未证
+
+已证（CPU，可复核）：
+
+1. 父字节复现：raw compile 与父 SPV 字节相同（`evidence/PARENT-REBUILD.json`）。
+2. 归约同值：100,000 组真实分布（两个 half 平方和）+ 4,007 组对抗输入（±0、65504、次正规、
+   舍入平局邻域、混指数、上溢）→ **value_mismatches = 0**；
+   1,280,000 次逐节点（按无序对）比较 → **node_mismatches = 0**；
+   300,000 次 lane 0/16 的**有序**操作数比较 → **0**（owner 连左右顺序都没变）。
+   `evidence/TREE-PROOF.json`
+3. 写域/读域一一对应：884,736 个元素，`producer == consumer`，重复写 0，行外写 0，
+   padding token 0 次写；V 末端 n=3071；K/V chunk 基址 1024/2048；head 31 贴边；
+   `288 = 4×64 + 32`（F15 走 TAIL 尾块）。`evidence/LAYOUT-PROOF.json`
+4. SPIR-V：`OpGroupNonUniformShuffle` 1 → 0（广播消失），`OpGroupNonUniformShuffleXor` 4 → 4（归约保留），
+   coopMatrix 4/4/4 不变，module words 4871 → 4567。`evidence/SPV-STATICS.json`、`NC-MAP.json`
+5. plan/cpu-check/validate 三件套通过。
+
+未证（需要 GPU，交主代理）：
+
+- native 是否真的删掉 20 对 `goto/join` 与 8 条 `r[a0]` 间接读（判据见 `NATIVE-PREDICTION.md` 1–3）。
+- 8 个 F14 dispatch 的 GpuTime 方向、以及 ordinary 整体是否可分辨。
+- 候选 scratch 是否仍为 0（父 0；本改动的论证是"去掉暂存"，但只有驱动能回答）。
+
+## 4. 下一处具体代码改动（若本卡落 A 类：ISA 未形成处理）
+
+**同族同机制的下一步：把 `scale` 系数移出谓词与 group 循环，并按 head 一次性求出。**
+
+现状（可复核）：`vq_scale_q` 的 `scale` 在 `for(group)` 里、`if(n0<1024u)` 内读取，
+即 `scales[pc.p2.z + (n0%1024u)/32u]` 被读了 **2 次/workgroup**。native 里就是
+`send.ugm (1|M0) … load.ugm.d32x1t.a32.bss[a0.0]`（0630 段 0x17390 与 0x18950 两处，
+每 group 一份；连同 6 条 `flat[A+0x48/0x54/0x80]` 基址读，Q 段每组共 4 条 scalar load）。
+中间隔着 qkv store，编译器无法把 readonly 的这次读 CSE 到组外。
+
+改法（仍不改数学，仍是"系数 owner"）：
+
+```glsl
+// 在 for(uint group…) 之前，仍在两次 store 之前
+float16_t scale=float16_t(0.0);
+if(n0<1024u) scale=float16_t(scales[pc.p2.z+(n0%1024u)/32u]);
+for(uint group=0u;group<2u;++group) { … if(n0<1024u) { 用 scale } … }
+```
+
+预期：Q 段的这条 scalar load 由 **2 处（group 循环被展开成两份）降为 1 处**，
+即 native `send.ugm` 1224 → 1223 量级（静态条数），并且它的延迟可以藏到第一次 `MH()` 收窄后面。
+判据只认方向：`load.ugm.d32x1t.a32.bss[a0.0]` 在 Q 段从 2 处变 1 处、`send.ugm` 不增，
+`dpas 256 / math.rsqt 8 / scratch 0` 不变。**不要**把这个静态条数换算成毫秒。
+**先只做这一处，不与本卡的树改动同臂**（避免 F10 教训里的多变量首改）。
+
+若本卡落 B 类（有副作用），针对最大副作用修一版：优先看 `mov` 是否上升
+（可能是 `pack/unpack` 未沿树合并）→ 备选写法是把 4 步写成 2 个独立的 `uint` 链并让
+`shuffleXor` 直接作用在 `uint` 上、只在最后 `unpack` 一次（数学同值、shuffle 数不变）。
+
+## 5. 恢复点 / 复现命令（全部 CPU）
+
+```
+PY=@NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe
+CARD=@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/cards/n12-vit-qkv
+%PY% %CARD%\build.py all          # 父复现 + 候选构建 + validate + SPV 统计 + NC 映射
+%PY% %CARD%\make_plan.py          # plan.txt + cpu-check（父/候选各一次）
+%PY% %CARD%\tools\proof_tree.py   # 归约同值证明  -> evidence/TREE-PROOF.json
+%PY% %CARD%\tools\proof_layout.py # 布局/边界枚举  -> evidence/LAYOUT-PROOF.json
+%PY% %CARD%\tools\isa_account.py  # 基线 native 记账（只读 nat-index）
+%PY% %CARD%\emit_json.py          # BUILD/PROOF/COST-LEDGER/GPU-REQUEST
+```
+以上均为 CPU；`build.py` 使用 `COMMON.py`（只 import，不修改）。
+
+## 6. 未决项（按合同自行推断，不停等主代理）
+
+1. `NATIVE-PREDICTION.md` 的 instruction 区间 7200..7450 是**估计**：SPIR-V 侧已确定省 240 条执行指令，
+   但驱动对这些结构的展开倍率未知，故给区间而不断言单值。
+2. `evidence/ISA-ACCOUNT.json` 引用的是**旧批次**的捕获（plan sha 等于基线，SPV sha 等于当前身份，
+   nat-index 里 204 份同 hash）。按合同 §8.7，新捕获才是权威；本卡只把它当"父的现状参照"。
+3. 本卡未验证 V 段 workgroup（`n0 ≥ 2048`，96 个里的 32 个）是否受影响：它们不执行 norm，
+   静态 ISA 无法按 workgroup 分解，只能靠整体计时看。
+4. 若主代理要用本候选做 family 包，请注意 8 个 F14 位置本来就共用同一个 SPV，替换 8 行即可，
+   不存在"部分替换"的合法状态。

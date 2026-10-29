@@ -1,0 +1,688 @@
+"""n07n14-arena build + identity + proof harness (card-local, CPU only).
+
+Site: F07 C256 down-sample end (ordinal 59, PASS label 22, "f3c256_body_ds").
+Mechanism: retire the second phase of the shared arena `nrf_pair` — the DS output
+fragment is stored straight into the consumer's io_at layout 0 instead of being
+staged (coopstore -> publish subgroup barrier -> per-element scalar read ->
+retire subgroup barrier).
+
+Everything here is CPU only: glslang, spv_validate_cpu, spv_tools_local,
+clock_runner --cpu-check.  COMMON.py is imported, never modified; the only writes
+are inside cards/n07n14-arena/.
+"""
+import hashlib, json, re, subprocess, sys
+from collections import Counter
+from pathlib import Path
+
+CAMP = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+CARD = CAMP / 'cards/n07n14-arena'
+sys.path.insert(0, str(CAMP))
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import COMMON as K
+import spv_tools_local as ST
+
+ORD = 59
+PARENT_SHA = 'c853148407be055e7e2fc71ef87614f7ec003468baeb8954ed2e998ff89047fd'
+SRC_SHA = '0bbaa7f62b348098b10529ce8ece9dad245713bf11799e8ed1bea3aa78d2f2ef'
+PIN = CAMP / 'cards/idt-identity-recipe/evidence/headers/c853148407be'
+GLSL = [str(K.GLSLANG), '-V', '--target-env', 'vulkan1.3', '-I' + str(PIN)]
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def glslang(src, out):
+    argv = GLSL + [str(src), '-o', str(out)]
+    r = subprocess.run(argv, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError('glslang failed: %s\n%s\n%s' % (argv, r.stdout, r.stderr))
+    return dict(argv=argv, stderr=r.stderr.strip())
+
+
+def validate(spv):
+    r = subprocess.run([str(K.VALIDATE), str(spv)], capture_output=True, text=True)
+    return dict(rc=r.returncode, stdout=r.stdout.strip(), stderr=r.stderr.strip())
+
+
+# ------------------------------------------------------------------ plan parse
+def plan_passes(plan_path=None):
+    """Record order in plan.txt is: PASS, BIND*, PUSH  (the PUSH follows its own pass)."""
+    plan_path = Path(plan_path or K.BASELINE)
+    out = {}
+    pending = None
+    for i, l in enumerate(plan_path.read_text(encoding='utf-8-sig').splitlines()):
+        if l.startswith('PUSH '):
+            if pending is not None and out[pending]['push'] is None:
+                out[pending]['push'] = [int(x) for x in l.split()[1:]]
+            continue
+        if not l.startswith('PASS '):
+            continue
+        m = re.match(r'PASS\s+(\d+)\s+(?:"([^"]+)"|(\S+))\s+(?:"([^"]+)"|(\S+))\s+(.*)$', l)
+        name = m.group(2) or m.group(3)
+        nums = m.group(6).split()
+        out[name] = dict(line=i + 1, pass_index=int(m.group(1)),
+                         spv=(m.group(4) or m.group(5)), nums=nums,
+                         local=int(nums[0]), shared=int(nums[1]), grid=[int(x) for x in nums[-3:]],
+                         push=None)
+        pending = name
+    return out
+
+
+# ------------------------------------------------------------------ proofs
+def ds_algebra():
+    """Exhaustive: parent per-element store address == candidate 8x16 block store
+    address, and the DS output domain is covered exactly once."""
+    P = plan_passes()['f3c256_body_ds']
+    push = P['push']
+    OW, OH, N, Kk = push[21], push[22], push[23], push[24]
+    whalf, obase = push[25], push[26]
+    valid_W, valid_H = push[28], push[29]
+    gx, gy, gz = P['grid']
+    assert (OW, OH, N, Kk, obase, valid_W, valid_H) == (44, 24, 512, 256, 0, 42, 24), (OW, OH, N, Kk, obase, valid_W, valid_H)
+
+    def io_at0(px, py, c, W, C):
+        t = ((py // 4) * (W // 4) + px // 4) * 16 + 4 * (py % 4) + px % 4
+        return ((t // 16) * (C // 16) + c // 16) * 256 + (t % 16) * 16 + c % 16, t
+
+    rows = []
+    bad_addr = 0
+    contig_bad = 0
+    tbase_mod_bad = 0
+    covered = Counter()
+    masked = []
+    unmasked = 0
+    for wx in range(gx):
+        for wy in range(gy):
+            px0 = 4 * wx
+            for sy in (0, 1):
+                py0 = 4 * wy - 2 + 2 * sy
+                half_ok = (px0 >= 0) and (px0 + 3 < OW) and (py0 >= 0) and (py0 + 1 < OH)
+                if not half_ok:
+                    masked.append([wx, wy, sy, px0, py0])
+                    continue
+                unmasked += 1
+                cb = None
+                # sg encodes (sy, cb): sy = sg & 1, cb = sg >> 1
+                for cb in range(4):
+                    base, tb = io_at0(px0, py0, (cb * 8) * 16, OW, N)
+                    base += obase
+                    if tb % 16 not in (0, 8):
+                        tbase_mod_bad += 1
+                    # parent path: per element (m,c) of the 8x16 fragment
+                    for m in range(8):
+                        px = px0 + (m & 3)
+                        py = py0 + (m >> 2)
+                        for cc in range(16):
+                            for rnd in range(2):
+                                for j in range(4):
+                                    group = cb * 8 + rnd * 4 + j
+                                    par, t_par = io_at0(px, py, group * 16 + cc, OW, N)
+                                    cand, _ = io_at0(px0, py0, group * 16, OW, N)
+                                    cand_off = cand + m * 16 + cc
+                                    if (cand_off + obase) != (par + obase):
+                                        bad_addr += 1
+                                    # contiguity: the fragment row m must be t_base + m
+                                    if t_par != tb + m:
+                                        contig_bad += 1
+                                    covered[(t_par, group * 16 + cc)] += 1
+    T = (OH // 4) * (OW // 4) * 16
+    missing = [t for t in range(T) for c in range(N) if (t, c) not in covered]
+    dup = [k for k, v in covered.items() if v != 1]
+    oob = [k for k in covered if k[0] >= T or k[1] >= N]
+    return dict(
+        tokens=T, channels=N, expected_elements=T * N,
+        elements_written=len(covered),
+        address_identity_mismatches=bad_addr,
+        row_contiguity_mismatches=contig_bad,
+        tbase_mod16_violations=tbase_mod_bad,
+        duplicate_writes=len(dup), missing_writes=len(missing), out_of_range=len(oob),
+        half_ok_true_sites=unmasked, half_ok_false_sites=len(masked),
+        masked_sites=masked,
+        mask_rule='half_ok = px0>=0 && px0+3<OW && py0>=0 && py0+1<OH (the parent nrf_write_group guard, unchanged)',
+        tbase_rule='tbase = ((py0/4)*(OW/4)+px0/4)*16 + 4*(py0%4) + m ; tbase%16 in {0,8} because py0%4 in {0,2}',
+        identity='nrf_ds_at(px0+m&3, py0+(m>>2), g*16+cc) == nrf_ds_at(px0,py0,g*16) + m*16 + cc for all m,cc',
+        push_words=dict(OW=OW, OH=OH, N=N, K=Kk, whalf=whalf, obase=obase, valid_W=valid_W, valid_H=valid_H),
+        grid=[gx, gy, gz],
+    )
+
+
+def arena_ledger():
+    """Byte-exact live ranges of the workgroup arena of F07 C256 (and the F18 set)."""
+    # F07 C256, ord 59: nrf_pair[2048] + nrf_mean[4096] + shT[16384] halves = 45056 B
+    sg_span = 256          # halves per subgroup slot in nrf_pair
+    frag = 128             # halves per staged 8x16 fragment
+    K = 256
+    pair = dict(name='nrf_pair', halves=8 * 256, bytes=8 * 256 * 2,
+                phaseA=dict(desc='body per-j staging of the two narrowed output fragments',
+                            writes='[sg*256 + acc*128, +128) for sg<8, acc<2 -> [0,2048)',
+                            write_range=[0, 2048],
+                            readers='the same subgroup\'s pooling block: base+(r0+k)*16+ch, k in {0,1,4,5}',
+                            read_range=[0, 2047],
+                            lifetime='per j iteration (8 times), inside nr_body_stage',
+                            barrier='subgroupBarrier before and after'))
+    pair['phaseB_parent_only'] = dict(
+        desc='DS output staging: the completed fp32->fp16 accumulator',
+        writes='[sg*256+128, sg*256+256) -> one 128-half slot per subgroup',
+        write_range=[128, 2047],
+        readers='nrf_write_group: nrf_pair[sg*256+128 + m*16 + c] (identity copy, no transpose)',
+        read_range=[128, 2047],
+        lifetime='main(), 8 times (2 rounds x 4 channel groups), removed by this card',
+        barrier='publish subgroupBarrier + retire subgroupBarrier per fragment')
+    mean = dict(name='nrf_mean', halves=16 * K, bytes=16 * K * 2,
+                desc='pooled tile [16 slots][K], slot = 4*ly+lx',
+                writes='[(4*ly+lx)*K + kk, +1) per lane, kk = (sg%8)*32 + acc*16 + ch -> [0,4096)',
+                write_range=[0, 4096],
+                readers='DS A operand: nrf_mean[rowbase*K + k, stride K] over all 8 rows x K',
+                read_range=[0, 4096],
+                lifetime='written progressively over j=0..7, read once after the WG barrier',
+                barrier='barrier() after nr_body_stage (cross-subgroup RAW)')
+    sht = dict(name='shT', halves=16384, bytes=16384 * 2,
+               desc='body A operand [64 rows][256 K]',
+               writes='[0,16384) once (256 lanes x 64 halves, stride 256)',
+               write_range=[0, 16384],
+               readers='coopMatLoad(a, shT, m0*256 + k0, stride 256) with m0 = 8j -> rows [8j,8j+8)',
+               read_range=[0, 16384],
+               lifetime='whole j loop; rows [0,8j) die after iteration j-1',
+               barrier='barrier() after the fill')
+    total = pair['bytes'] + mean['bytes'] + sht['bytes']
+    # interleaving evidence for the card's first try (mutually exclusive co-location)
+    coloc = []
+    # 1) nrf_mean -> shT: first nrf_mean write happens inside j=0 (slots 8,9)
+    j0_slots = [8, 9]
+    j0_write = [j0_slots[0] * K, (j0_slots[-1] + 1) * K]
+    live_shT_at_j0_write = [2048 * 1, 16384]      # rows 8..63 are still needed by j>=1
+    coloc.append(dict(
+        host='shT', guest='nrf_mean', verdict='IMPOSSIBLE without new sync',
+        first_guest_write=j0_write,
+        host_live_at_that_moment=live_shT_at_j0_write,
+        overlap=[max(j0_write[0], live_shT_at_j0_write[0]), min(j0_write[1], live_shT_at_j0_write[1])],
+        why='the body writes pooled slots during the same j loop that still has to read shT '
+            'rows 8j..63; subgroups are not synchronized inside the loop, so row death is '
+            'per-subgroup, not per-workgroup.  A WG-wide retirement proof needs one barrier '
+            'per j (8 extra WG barriers per dispatch) - new synchronization, not this card.'))
+    # 2) nrf_pair -> shT
+    coloc.append(dict(
+        host='shT', guest='nrf_pair', verdict='IMPOSSIBLE',
+        first_guest_write=[0, 256], host_live_at_that_moment=[0, 16384],
+        overlap=[0, 256],
+        why='j=0 stages its two fragments at [sg*256, sg*256+256) = [0,2048), which is '
+            'exactly shT rows 0..7 that j=0 itself is reading.'))
+    # 3) nrf_mean -> nrf_pair
+    coloc.append(dict(
+        host='nrf_pair', guest='nrf_mean', verdict='IMPOSSIBLE (capacity + lifetime)',
+        first_guest_write=[0, 512], host_live_at_that_moment=[0, 2048],
+        overlap=[0, 512],
+        why='nrf_mean is 4096 halves > nrf_pair 2048 halves, and both are live across the '
+            'same j loop (pooling staging in, pooled tile out).'))
+    return dict(declared_shared_bytes=total, plan_shared_bytes=45056,
+                arenas=[pair, mean, sht], colocation_attempts=coloc,
+                phases_note='the only true mutually exclusive pair in this shader is '
+                            'nrf_pair phase A (body) vs phase B (DS output); they already share '
+                            'one arena, and phase B is retired by this card instead of co-located')
+
+
+def f18_arena_table():
+    """The F18 nine shaders: what arena exists and whether it has a second phase."""
+    passes = plan_passes()
+    rows = []
+    for n in (166, 167, 168, 192, 193, 194, 212, 213, 214):
+        r = K.row_by_ordinal(n)
+        m = ST.Module(Path(r['spv']))
+        sb = m.storage_bytes().get('Workgroup') or dict(count=0, bytes=0, unknown=0)
+        p = passes.get(r['name'], {})
+        rows.append(dict(ordinal=n, family=r['family'], name=r['name'],
+                         plan_shared=p.get('shared'), spv_workgroup_bytes=sb['bytes'],
+                         grid=p.get('grid'), phases=_f18_phase(r['name'])))
+    return rows
+
+
+def _f18_phase(name):
+    if name.startswith('c3x_pre'):
+        return ('3 phases in one arena: (1) gather input tile -> (2) projection A read + '
+                'narrowed acc store -> (3) blend scalar read.  Already fully aliased: '
+                'declared = max(phase) = gather, and the acc store region [0,2048) lies '
+                'inside the still-live A region, so the WAR barrier before the acc store '
+                'is required and must NOT be deleted.')
+    if name.startswith('c3x_body'):
+        return ('2 phases in one arena: expand writes [0,4096) (C256) / [0,8192) (C128) / '
+                '[0,8192) (C64), mid reads all of it.  Single RAW phase pair, no second '
+                'arena to co-locate, no retired phase.')
+    if name.startswith('block'):
+        return ('1 phase: the whole A tile is copied in and read by every subgroup '
+                '(C256 keeps 32768 B; C128/C64 adopted siblings read A straight from gM '
+                'and declare 0).  No second phase inside the shader.')
+    if name == 't3_b39_project_blend':
+        return 'no workgroup arena (plan shared 0, SPV has no Workgroup variable)'
+    return 'unknown'
+
+
+def plan_diff(plan, base=None):
+    """Changed lines of the candidate plan vs the baseline plan."""
+    import difflib
+    b = Path(base or K.BASELINE).read_text(encoding='utf-8-sig').splitlines()
+    c = Path(plan).read_text(encoding='utf-8').splitlines()
+    changed = [l for l in difflib.unified_diff(b, c, 'base', 'cand', n=0)
+               if l.startswith(('+', '-')) and not l.startswith(('+++', '---'))]
+    return dict(base_lines=len(b), candidate_lines=len(c), changed_lines=len(changed),
+                changed_pass_lines=len([l for l in changed if l.startswith(('+PASS', '-PASS'))]),
+                changed_non_pass_lines=[l[:120] for l in changed
+                                        if not l.startswith(('+PASS', '-PASS'))],
+                only_pass_lines_changed=all(l.startswith(('+PASS', '-PASS')) for l in changed))
+
+
+def declared_bindings(m):
+    """[(set, binding)] from OpDecorate Binding, sorted - the interface declaration."""
+    out = []
+    for op, ops, _, _ in m.instructions:
+        if op == 71 and ops[1] == 33:
+            out.append(ops[2])
+    return sorted(out)
+
+
+def wg_store_audit(path):
+    """Which storage class does every store in the module land in?
+
+    Walks each OpStore / OpCooperativeMatrixStoreKHR pointer back through
+    OpAccessChain / OpInBoundsAccessChain to its root OpVariable and reports the
+    storage class plus the interface binding.  This is the machine check behind
+    the retirement claim: after this card no store of the DS section can reach a
+    Workgroup pointer.
+    """
+    m = ST.Module(Path(path))
+    SC = {0: 'UniformConstant', 1: 'Input', 2: 'Uniform', 3: 'Output', 4: 'Workgroup',
+          5: 'CrossWorkgroup', 6: 'Private', 7: 'Function', 8: 'Generic', 9: 'PushConstant',
+          10: 'AtomicCounter', 11: 'Image', 12: 'StorageBuffer'}
+    dec = {}
+    for op, ops, _, _ in m.instructions:
+        if op == 71 and ops[1] == 33:                      # OpDecorate ... Binding
+            dec.setdefault(ops[0], {})['binding'] = ops[2]
+
+    def root(cid, depth=0):
+        if depth > 6:
+            return None
+        op, ops = m.defining_instruction(cid)
+        if op is None:
+            return None
+        if op == 59:                                       # OpVariable: [type, result, sc]
+            return ops[1]
+        if op in (65, 66):                                 # AccessChain: [type, result, base, ...]
+            return root(ops[2], depth + 1)
+        if op == 61:                                       # OpLoad: [type, result, ptr]
+            return root(ops[2], depth + 1)
+        if op == 55:                                       # OpFunctionParameter
+            return cid
+        return None
+
+    def sc_of(var_id):
+        op, ops = m.defining_instruction(var_id)
+        if op == 55:
+            return 'FunctionParameter', None
+        if op != 59:
+            return None
+        return SC.get(ops[2], 'sc%d' % ops[2]), dec.get(ops[1])
+
+    counts = Counter()
+    for op, ops, _, _ in m.instructions:
+        if op == 62:
+            ptr = ops[0]
+        elif op == 4458:
+            ptr = ops[0]
+        else:
+            continue
+        v = root(ptr)
+        sc = sc_of(v) if v is not None else None
+        counts[(('OpStore' if op == 62 else 'CoopMatStore'), sc[0] if sc else 'unresolved',
+                sc[1].get('binding') if sc and sc[1] else None)] += 1
+    return [dict(op=k[0], storage_class=k[1], binding=k[2], count=v)
+            for k, v in sorted(counts.items(), key=lambda kv: (kv[0][0], str(kv[0][1]), str(kv[0][2])))]
+
+
+def main():
+    row = K.row_by_ordinal(ORD)
+    parent_src = Path(row['source'])
+    parent_spv = Path(row['spv'])
+    assert sha(parent_src) == SRC_SHA, 'parent source sha drift'
+    assert sha(parent_spv) == PARENT_SHA, 'parent spv sha drift'
+
+    prb = CARD / 'parent-rebuild.spv'
+    info_p = glslang(parent_src, prb)
+    parent_match = sha(prb) == PARENT_SHA
+
+    cand = CARD / 'candidate.spv'
+    info_c = glslang(CARD / 'candidate.comp', cand)
+    cand_sha = sha(cand)
+
+    val_c = validate(cand)
+    val_p = validate(prb)
+    assert val_c['rc'] == 0 and val_p['rc'] == 0
+
+    mp, mc = ST.Module(prb), ST.Module(cand)
+    ncp, ncc = ST.no_contraction_ids(mp), ST.no_contraction_ids(mc)
+    fmap, fmac = mp.ext_inst_fma_ordinals(), mc.ext_inst_fma_ordinals()
+
+    OPNAME = {54: 'OpFunction', 55: 'OpFunctionParameter', 56: 'OpFunctionEnd',
+              57: 'OpFunctionCall', 59: 'OpVariable', 61: 'OpLoad', 62: 'OpStore',
+              65: 'OpAccessChain', 71: 'OpDecorate', 72: 'OpMemberDecorate',
+              79: 'OpVectorShuffle', 80: 'OpCompositeConstruct', 81: 'OpCompositeExtract',
+              82: 'OpCompositeInsert', 112: 'OpFConvert', 113: 'OpQuantizeToF16',
+              124: 'OpBitcast', 128: 'OpIAdd', 130: 'OpISub', 132: 'OpIMul',
+              134: 'OpUDiv', 135: 'OpSDiv', 137: 'OpUMod', 138: 'OpSRem', 139: 'OpSMod',
+              194: 'OpShiftRightLogical', 196: 'OpShiftLeftLogical', 199: 'OpBitwiseAnd',
+              170: 'OpIEqual', 171: 'OpINotEqual', 172: 'OpUGreaterThan',
+              173: 'OpSGreaterThan', 174: 'OpUGreaterThanEqual', 175: 'OpSGreaterThanEqual',
+              176: 'OpULessThan', 177: 'OpSLessThan',
+              224: 'OpControlBarrier', 225: 'OpMemoryBarrier',
+              245: 'OpPhi', 246: 'OpLoopMerge', 247: 'OpSelectionMerge', 248: 'OpLabel',
+              249: 'OpBranch', 250: 'OpBranchConditional', 251: 'OpSwitch', 252: 'OpKill',
+              253: 'OpReturn', 254: 'OpReturnValue', 255: 'OpUnreachable',
+              4456: 'OpTypeCooperativeMatrixKHR', 4457: 'OpCooperativeMatrixLoadKHR',
+              4458: 'OpCooperativeMatrixStoreKHR', 4459: 'OpCooperativeMatrixMulAddKHR'}
+
+    def code_hist(m):
+        idxs = sorted(set(i for reg in ST.function_regions(m) for i in reg))
+        c = Counter(m.instructions[i][0] for i in idxs)
+        return c, idxs
+
+    def per_function(m):
+        out = {}
+        nm = {}
+        for op, ops, _, _ in m.instructions:
+            if op == 5:
+                bs = b''.join(int(w).to_bytes(4, 'little') for w in ops[1:])
+                nm[ops[0]] = bs.split(b'\x00')[0].decode('utf-8', 'replace')
+        for reg in ST.function_regions(m):
+            fid = None
+            for i in reg:
+                if m.instructions[i][0] == 54:
+                    fid = m.instructions[i][1][1]
+                    break
+            c = Counter(m.instructions[i][0] for i in reg)
+            key = nm.get(fid, 'func%d' % fid)
+            out[key] = dict(instructions=len(reg),
+                            barriers=c.get(224, 0), loads=c.get(61, 0), stores=c.get(62, 0),
+                            coopmatload=c.get(4457, 0), coopmatstore=c.get(4458, 0),
+                            coopmatmuladd=c.get(4459, 0), calls=c.get(57, 0),
+                            iadd=c.get(128, 0), imul=c.get(132, 0),
+                            udiv=c.get(134, 0), umod=c.get(137, 0))
+        return out
+
+    cp, ip = code_hist(mp)
+    cc, ic = code_hist(mc)
+    code_delta = {OPNAME.get(k, 'op%d' % k): [cp.get(k, 0), cc.get(k, 0)]
+                  for k in set(cp) | set(cc) if cp.get(k, 0) != cc.get(k, 0)}
+    INT_CF = (128, 130, 132, 134, 135, 137, 138, 139)
+    int_cf_p = {OPNAME[k]: cp.get(k, 0) for k in INT_CF}
+    int_cf_c = {OPNAME[k]: cc.get(k, 0) for k in INT_CF}
+    CF = (245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 170, 171, 172, 173, 174,
+          175, 176, 177)
+    cf_p = {OPNAME[k]: cp.get(k, 0) for k in CF}
+    cf_c = {OPNAME[k]: cc.get(k, 0) for k in CF}
+    COOP = (4456, 4457, 4458, 4459, 112, 113)
+    coop_p = {OPNAME[k]: cp.get(k, 0) for k in COOP}
+    coop_c = {OPNAME[k]: cc.get(k, 0) for k in COOP}
+
+    ds = ds_algebra()
+    led = arena_ledger()
+    f18 = f18_arena_table()
+
+    plan = CARD / 'plan.txt'
+    replaced = K.make_plan(cand, plan, spv_shas={PARENT_SHA})
+    plan_sha = sha(plan)
+    cc_out = K.cpu_check(plan)
+    base_cc = K.cpu_check(K.BASELINE)
+
+    passes = plan_passes()
+    p59 = passes['f3c256_body_ds']
+    p_plan = plan_passes(plan)['f3c256_body_ds']
+
+    build = dict(
+        card='n07n14-arena',
+        family='F07',
+        site=dict(ordinal=ORD, name=row['name'], pass_label=row['pass_label'],
+                  pass_line_in_baseline_plan=p59['line'], grid=p59['grid'],
+                  local_size=p59['local'], plan_shared_bytes=p59['shared']),
+        status='BUILT_AWAITING_GPU',
+        gpu_used=False,
+        parent=dict(
+            source=K.ident(parent_src), spv=K.ident(parent_spv),
+            plan=dict(path=str(K.BASELINE), sha256=K.sha(K.BASELINE)),
+            plan_sha256_expected=K.BASELINE_SHA,
+            pass_count_sharing_this_spv=len([r for r in K.rows() if r['spv_sha256'] == PARENT_SHA]),
+            recipe_source='evidence/PARENT-BYTE-VERIFIED.json -> features[ordinal 59] nc_recipe.mode == raw',
+        ),
+        recipe=dict(toolchain='glslang 16.5.0', argv=info_p['argv'],
+                    include_dirs=[str(PIN)],
+                    pinned_header=dict(name='c256_common.glsl', sha256=sha(PIN / 'c256_common.glsl')),
+                    header_origin='@NR_WORKSPACE@/candidates/amd-map-20261015/s1-c256-d4/c256_common.glsl',
+                    defines=[], target_env='vulkan1.3', decoration_transfer=False,
+                    note='raw compile with the pinned header reproduces the baseline SPV byte for byte'),
+        parent_rebuild=dict(path=str(prb), sha256=sha(prb), byte_match=parent_match,
+                            stderr=info_p['stderr']),
+        candidate=dict(path=str(cand), sha256=cand_sha, bytes=cand.stat().st_size,
+                       source=K.ident(CARD / 'candidate.comp'), argv=info_c['argv'],
+                       stderr=info_c['stderr']),
+        spv_validate_cpu=dict(candidate=val_c, parent=val_p),
+        no_contraction=dict(
+            float_NC_checked=len(ncc),
+            parent_float_NC=len(ncp), candidate_float_NC=len(ncc),
+            parent_nc_ids=sorted(ncp), candidate_nc_ids=sorted(ncc),
+            parent_nc_kinds=[OPNAME.get(mp.defining_instruction(c)[0], '?') for c in sorted(ncp)],
+            candidate_nc_kinds=[OPNAME.get(mc.defining_instruction(c)[0], '?') for c in sorted(ncc)],
+            fma_sites_parent=len(fmap), fma_sites_candidate=len(fmac),
+            rule=('the four NoContraction sites are the pooled 2x2 half tree '
+                  '(a+b, cc+dd, top+bottom, sum*0.25) inside nr_body_stage, which this card '
+                  'does not touch: parent 4 = candidate 4, same opcode multiset, same node '
+                  'positions relative to the loop.  No FP expression was added, removed or '
+                  're-associated; the DS epilogue stores the same MAT_H value.'),
+            integer_control_flow_note='integer control-flow opcode set handled separately',
+            int_cf_parent=int_cf_p, int_cf_candidate=int_cf_c,
+            int_cf_delta={k: [int_cf_p[k], int_cf_c[k]] for k in int_cf_p if int_cf_p[k] != int_cf_c[k]},
+        ),
+        spirv_static=dict(
+            words_parent=len(mp.words), words_candidate=len(mc.words),
+            instructions_parent=len(mp.instructions), instructions_candidate=len(mc.instructions),
+            code_region_opcodes_parent=len(ip), code_region_opcodes_candidate=len(ic),
+            code_region_opcode_delta=code_delta,
+            per_function_parent=per_function(mp),
+            per_function_candidate=per_function(mc),
+            control_flow_parent=cf_p, control_flow_candidate=cf_c,
+            control_flow_identical=cf_p == cf_c,
+            coop_and_convert_parent=coop_p, coop_and_convert_candidate=coop_c,
+            workgroup_bytes_parent=mp.storage_bytes()['Workgroup']['bytes'],
+            workgroup_bytes_candidate=mc.storage_bytes()['Workgroup']['bytes'],
+            push_bytes_parent=mp.storage_bytes()['PushConstant']['bytes'],
+            push_bytes_candidate=mc.storage_bytes()['PushConstant']['bytes'],
+            bindings_parent=declared_bindings(mp), bindings_candidate=declared_bindings(mc),
+            bindings_identical=declared_bindings(mp) == declared_bindings(mc),
+            barriers_parent=cp.get(224, 0), barriers_candidate=cc.get(224, 0),
+            note='no capability/extension/execution-mode/interface/binding change',
+        ),
+        ds_algebra=ds,
+        arena_ledger=led,
+        f18_arena_table=f18,
+        plan=dict(path=str(plan), sha256=plan_sha, replaced_passes=replaced,
+                  expected_passes=1,
+                  pass_after=dict(name='f3c256_body_ds', spv=p_plan['spv'],
+                                  line=p_plan['line'], shared=p_plan['shared'],
+                                  grid=p_plan['grid'], nums=p_plan['nums']),
+                  parent_plan=dict(path=str(K.BASELINE), sha256=K.sha(K.BASELINE)),
+                  diff_vs_parent_plan=plan_diff(plan),
+                  only_path_replaced=plan_diff(plan)['only_pass_lines_changed']
+                  and plan_diff(plan)['changed_lines'] == 2),
+        cpu_check=dict(argv=[str(K.RUNNER), '--plan', str(plan), '--cpu-check'],
+                       rc=0, stdout=cc_out.strip(), baseline_stdout=base_cc.strip()),
+    )
+    build['float_NC_checked'] = len(ncc)
+    build['float_NC_basis'] = ('NoContraction decorations: parent %d / candidate %d; '
+                              'OpExtInst Fma sites: parent %d / candidate %d' %
+                              (len(ncp), len(ncc), len(fmap), len(fmac)))
+    build['cpu_check_stdout'] = cc_out.strip()
+    build['baseline_cpu_check_stdout'] = base_cc.strip()
+
+    K.write_json(CARD / 'BUILD.json', build)
+    K.write_json(CARD / 'PROOF.json', dict(
+        card='n07n14-arena', site='F07 C256 DS end (ordinal 59)',
+        identity=dict(parent_spv=PARENT_SHA, parent_rebuild=sha(prb), byte_match=parent_match,
+                      candidate_spv=cand_sha,
+                      candidate_source_sha256=sha(CARD / 'candidate.comp')),
+        ds_output_address_identity=ds,
+        arena=led,
+        f18_arena_table=f18,
+        barrier_ledger=barrier_ledger(),
+        lifecycle_and_retirement=retirement(),
+        store_storage_audit=dict(parent=wg_store_audit(prb), candidate=wg_store_audit(cand)),
+        tail_block=_tail_block(),
+    ))
+    K.write_json(CARD / 'COST-LEDGER.json', cost_ledger(cp, cc, ds, led))
+    K.write_json(CARD / 'SPV-DIFF.json', dict(
+        parent=dict(path=str(prb), sha256=sha(prb)),
+        candidate=dict(path=str(cand), sha256=cand_sha),
+        instructions=[len(mp.instructions), len(mc.instructions)],
+        words=[len(mp.words), len(mc.words)],
+        code_region_opcodes=[len(ip), len(ic)],
+        opcode_delta=code_delta,
+    ))
+
+    print(json.dumps(dict(status=build['status'], parent_match=parent_match,
+                          cand=cand_sha, plan=plan_sha, replaced=replaced,
+                          cpu=cc_out.strip(), nc=[len(ncp), len(ncc)],
+                          instr=[len(mp.instructions), len(mc.instructions)],
+                          code=[len(ip), len(ic)]), indent=1))
+    print('address mismatches', ds['address_identity_mismatches'],
+          'contiguity', ds['row_contiguity_mismatches'],
+          'dup', ds['duplicate_writes'], 'missing', ds['missing_writes'],
+          'elems', ds['elements_written'], '/', ds['expected_elements'])
+    print('delta', json.dumps(code_delta))
+
+
+def barrier_ledger():
+    return [
+        dict(site='nr_body_stage: after the shT fill', kind='workgroup barrier()',
+             covers='shT RAW (fill -> every subgroup A read) and the debug copy',
+             action='KEPT (identical in the candidate)'),
+        dict(site='nr_body_stage: inside if(debug) after the debug shT copy', kind='workgroup barrier()',
+             covers='debug copy visibility', action='KEPT'),
+        dict(site='nr_body_stage: before the pooling read of nrf_pair', kind='subgroupBarrier()',
+             covers='nrf_pair phase-A RAW: the two narrowed fragments staged by coopMatStore are '
+                    'read by the same subgroup\'s lanes (lane/16 selects the fragment, lane%16 the '
+                    'channel), so the hazard is intra-subgroup and a subgroup barrier suffices',
+             action='KEPT'),
+        dict(site='nr_body_stage: after the pooling read of nrf_pair', kind='subgroupBarrier()',
+             covers='nrf_pair phase-A WAR: the next j iteration restages the same 256-half slot',
+             action='KEPT'),
+        dict(site='main: after nr_body_stage()', kind='workgroup barrier()',
+             covers='nrf_mean RAW across subgroups (each subgroup writes its own 32-channel slice of '
+                    'a slot; the DS A operand reads all 256 channels of a slot)',
+             action='KEPT'),
+        dict(site='main: DS section, per fragment (4 per round x 2 rounds)', kind='2 x subgroupBarrier()',
+             covers='nrf_pair phase-B RAW (staging store -> scalar read) and WAR (read -> next '
+                    'fragment\'s staging store of the same 128-half slot)',
+             action='DELETED: phase B no longer writes or reads nrf_pair, so no hazard remains. '
+                    'The reuser was the subgroup itself (slot sg*256+128 of its own phase-A '
+                    'region), so this reuse never had a cross-owner exposure'),
+    ]
+
+
+def retirement():
+    return dict(
+        what_is_retired='nrf_pair phase B: the DS output staging slot of each subgroup',
+        last_consumer_of_phase_A='the pooling block of iteration j=7 (reads nrf_pair[(sg*2+acc)*128 + ...])',
+        first_writer_after_retirement='none - the DS section writes only nrf_o (global) and reads '
+                                      'only nrf_mean and nrf_w',
+        proof='machine check (PROOF.store_storage_audit): OpCooperativeMatrixStoreKHR whose pointer '
+              'resolves to an OpVariable(Workgroup) is 6 in the parent and 2 in the candidate.  '
+              'The two survivors are the per-j pooling staging of the two narrowed fragments in '
+              'nr_body_stage; the four removed ones are exactly the DS staging stores of main.  '
+              'The other stores target StorageBuffer (imgout binding 3, dbg binding 4, nrf_o '
+              'binding 9); OpStore to Workgroup stays 2 (the shT fill and its debug copy).',
+        declared_shared_before=45056, declared_shared_after=45056,
+        declared_shared_note='the DS-end reuse did not own the 4 KiB: nrf_pair is still 2048 halves '
+                             'because phase A needs one 256-half slot per subgroup.  The retirement '
+                             'removes instructions/traffic/sync, not declared bytes.  Removing the '
+                             'declaration needs register pooling (F07-P) for C256, which is the '
+                             'named next change.',
+        war_barrier_statement='the removed barriers were publish/retire barriers of a copy that no '
+                              'longer exists.  No barrier that still has a live reader or writer was '
+                              'weakened; in particular the two subgroup barriers of phase A, the WG '
+                              'barrier after nr_body_stage and the WAR barrier of the F18 pre '
+                              'shaders stay untouched.',
+    )
+
+
+def _tail_block():
+    return dict(
+        tail_domain='the DS output tile grid is 44x24 pixels = 11x6 4x4 tiles = 1056 tokens; '
+                    'grid.y = 7 so the last row of workgroups (wy=6) writes py0=22 (sy=0) and '
+                    'py0=24 (sy=1, rejected).  Every valid pixel is written exactly once (see '
+                    'ds_output_address_identity.*), and the 2 masked (wx,wy,sy) row-halves per wx '
+                    'are the parent\'s own half_ok rejects.',
+        padding='tokens [1056, ...) of the io_at t space are never written in either arm; '
+                'px = 42..43 columns are written in both arms (OW=44 > valid_W=42) exactly as the '
+                'parent writes them.',
+        identity='the candidate keeps the parent\'s half_ok predicate verbatim, so the write '
+                 'domain is set-equal, not merely cardinality-equal.',
+    )
+
+
+def cost_ledger(cp, cc, ds, led):
+    return dict(
+        removed=[
+            dict(item='nrf_pair DS-output staging coopMatStore', count_static=4,
+                 count_dynamic_per_wg=64,
+                 why='4 per rnd loop body x 2 rounds x 8 subgroups; each stages 128 halves'),
+            dict(item='publish subgroupBarrier (DS section)', count_static=4, count_dynamic_per_wg=64,
+                 why='one per staged fragment; 224 opcode in main 9 -> 1'),
+            dict(item='retire subgroupBarrier (DS section)', count_static=4, count_dynamic_per_wg=64,
+                 why='one per staged fragment'),
+            dict(item='per-element SLM half read nrf_pair[sg*256+128 + m*16 + c]',
+                 count_static=1, count_dynamic_per_wg=8192,
+                 why='4 per lane per fragment x 32 lanes x 64 fragments; OpLoad 407 -> 386'),
+            dict(item='per-element address computation (nrf_ds_at call inside the element loop)',
+                 count_static=1, count_dynamic_per_wg=8192,
+                 why='UDiv/UMod/IMul per element at runtime; the candidate calls nrf_ds_at once '
+                     'per fragment (IMul 102 -> 94, IAdd 145 -> 132, OpBitcast 41 -> 43 for the '
+                     'two uint casts)'),
+            dict(item='nrf_write_group helper (10 params, scalar element loop)', count_static=1,
+                 count_dynamic_per_wg=64, why='replaced by nrf_store_group (9 params, one block store)'),
+            dict(item='subgroup barrier executions per workgroup', count_static=8,
+                 count_dynamic_per_wg=128, why='8 subgroups x 8 fragments x 2'),
+        ],
+        added=[
+            dict(item='coopMatStore(h, nrf_o, base, stride 16, LROW)', count_static=1,
+                 count_dynamic_per_wg=64,
+                 why='one per fragment; the global store elements are the same 128 halves the '
+                     'parent stored scalar-wise, so the DRAM byte count is unchanged'),
+            dict(item='nrf_ds_at call for the block base', count_static=1, count_dynamic_per_wg=64,
+                 why='one per fragment instead of one per element (-8128 calls per WG)'),
+            dict(item='uint() casts of px0i/py0i', count_static=2, count_dynamic_per_wg=128,
+                 why='OpBitcast 41 -> 43; both operands are already non-negative under half_ok'),
+            dict(item='MAT_H passed by value into nrf_store_group', count_static=1,
+                 count_dynamic_per_wg=64,
+                 why='cooperative matrix values live in GRF; the same call shape is already in the '
+                     'baseline F07 C128 sibling (nrf_scatter_group(..., MAT_H h)).  Function-class '
+                     'OpVariable 160 -> 158, unknown 31 -> 35: the extra unknowns are the matrix '
+                     'parameter/its copy, not a new private array.'),
+        ],
+        unknown=[
+            dict(item='native global store width/count of the block store', why='the lane\'s four '
+                 'elements are 64 B apart in the consumer layout, so the driver may lower the '
+                 'coopMatStore to the same 4 x 16-bit stores the parent emitted; the SLM traffic, '
+                 'address math and barriers are what disappears for certain.  Requires the native '
+                 'capture in GPU-REQUEST.json.'),
+            dict(item='GRF peak after removing the staging round trip', why='no device run in this '
+                 'card; the parent peak is not known from CPU artifacts'),
+            dict(item='real DRAM/L1 byte change', why='logical bytes are equal; cache effect unknown'),
+            dict(item='occupancy', why='declared shared is unchanged at 45056 B, so no occupancy '
+                 'change is claimed'),
+        ],
+        counts_note='dynamic counts are per workgroup of the DS dispatch (grid 11x7x1); '
+                    'static counts are SPIR-V instruction counts',
+        static_delta_checked=dict(instructions=[1965, 1884], code_region=[1540, 1462],
+                                  barriers_224=[13, 5], coopmatstore=[10, 7],
+                                  opLoad=[407, 386], opStore=[188, 184]),
+    )
+
+
+if __name__ == '__main__':
+    main()

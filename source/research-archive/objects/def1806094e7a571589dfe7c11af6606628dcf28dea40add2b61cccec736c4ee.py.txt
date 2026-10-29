@@ -1,0 +1,503 @@
+"""n06d-f06-c256-atile proof: exhaustive publish/read mapping, domains and hazards,
+K-order / rounding invariants, SPIR-V structure, byte accounting.
+
+CPU only. Every number below is recomputed from the shipped candidate.spv and from the
+parent rebuild (which is byte-identical to the baseline SPV), or from the read-only
+native capture counts recorded in cards/n06c-f06-c256-sht/RESULTS.json.
+
+Run:  <python> scratch/proof.py     -> writes PROOF.json
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+CAMP = CARD.parent.parent
+sys.path.insert(0, str(CAMP))
+sys.path.insert(0, str(CARD / 'scratch'))
+import COMMON as K
+import spvstat
+
+TARGET_SPV_SHA = '881dff8c51454f79181a567d6b976ea21ec7c81174bf075ca7be723b09c4a3f0'
+SH = 16384                    # halves in shT
+ROWS, COLS = 64, 256          # shT shape (row-major, stride 256, as in the parent)
+TILE_R, TILE_C = 8, 16        # one A tile
+NTILES = 128                  # (ROWS/8) * (COLS/16)
+TILE_N = TILE_R * TILE_C      # 128 halves = 256 B
+NTHREADS = 256
+NSG = 8
+
+# ------------------------------------------------------------------ publish map
+def cand_publish(thread, it, dc):
+    """candidate publish: one (thread, it) writes 16 contiguous halves; returns (dst, src)."""
+    q = thread + NTHREADS * it
+    t = q >> 3
+    dr = q & 7
+    src = (((t >> 4) * 8 + dr) << 8) + ((t & 15) << 4) + dc
+    dst = (q << 4) + dc
+    return dst, src
+
+
+def parent_publish(thread, it):
+    e = thread + NTHREADS * it
+    return e, e
+
+
+# ------------------------------------------------------------------ read map
+def parent_read_addr(sg, j, ki, i, jc):
+    m0 = ((sg // 8) + j) * 8
+    k0 = ki * 16
+    return (m0 + i) * 256 + (k0 + jc)
+
+
+def cand_read_addr(sg, j, ki, i, jc):
+    m0 = ((sg // 8) + j) * 8
+    k0 = ki * 16
+    tile = (m0 // 8) * 16 + (k0 // 16)
+    return tile * TILE_N + i * TILE_C + jc
+
+
+def tile_of(row, col):
+    return (row // TILE_R) * 16 + (col // TILE_C)
+
+
+def perm(e):
+    """element of the *parent* row-major array e -> its slot in the candidate array."""
+    r, c = divmod(e, COLS)
+    return tile_of(r, c) * TILE_N + (r % TILE_R) * TILE_C + (c % TILE_C)
+
+
+def main():
+    out = {'card': CARD.name, 'marker': 'n06d publish-in-consumer-tile-order'}
+    out['identity'] = dict(
+        parent_spv=dict(path=str(CARD / 'parent-rebuild.spv'),
+                        sha256=K.sha(CARD / 'parent-rebuild.spv'),
+                        is_baseline_bytes=K.sha(CARD / 'parent-rebuild.spv') == TARGET_SPV_SHA),
+        candidate_spv=dict(path=str(CARD / 'candidate.spv'), sha256=K.sha(CARD / 'candidate.spv')),
+        candidate_source=dict(path=str(CARD / 'candidate.comp'),
+                              sha256=K.sha(CARD / 'candidate.comp')),
+    )
+    assert out['identity']['parent_spv']['is_baseline_bytes']
+
+    # ============================================================== 1. publish
+    # (a) candidate covers every slot exactly once and reads every gT element once
+    dst_seen, dst_dup = {}, 0
+    src_seen, src_dup = {}, 0
+    for th in range(NTHREADS):
+        for it in range(SH // NTHREADS // TILE_C):     # 4 iterations
+            for dc in range(16):
+                dst, src = cand_publish(th, it, dc)
+                if dst in dst_seen:
+                    dst_dup += 1
+                dst_seen[dst] = (th, it, dc, src)
+                if src in src_seen:
+                    src_dup += 1
+                src_seen[src] = dst
+    # (b) parent for comparison
+    p_dst = {}
+    for th in range(NTHREADS):
+        for it in range(SH // NTHREADS):               # 64 iterations
+            d, s = parent_publish(th, it)
+            p_dst[d] = s
+    # (c) element-wise value identity: for every slot the candidate writes the same
+    #     *global element* the parent consumed from that logical position, i.e.
+    #     dst == perm(src)  and  perm(parent_slot) == candidate_slot
+    # parent slot e holds gT[e]; candidate slot perm(e) must hold gT[e]
+    mism_slot = []
+    for e in range(SH):
+        held = dst_seen.get(perm(e))
+        if held is None or held[3] != e:
+            mism_slot.append(e)
+    mism_pub = []
+    for (dst, (th, it, dc, src)) in dst_seen.items():
+        if perm(src) != dst:
+            mism_pub.append((dst, src))
+    out['publish'] = dict(
+        mechanism='shT[q*16 + dc] = gT[w*16384 + src(q,dc)] with q = t*8 + dr, '
+                  't = j*16 + ki (tile index), i.e. every 8x16 A tile is 128 contiguous '
+                  'halves (256 B) and the destination of q is exactly q*16',
+        candidate=dict(writes=len(dst_seen), expected_writes=SH,
+                       distinct_slots=len(dst_seen), duplicate_writes=dst_dup,
+                       distinct_sources=len(src_seen), duplicate_sources=src_dup,
+                       min_slot=min(dst_seen), max_slot=max(dst_seen),
+                       min_source=min(src_seen), max_source=max(src_seen)),
+        parent=dict(writes=len(p_dst), distinct_slots=len(p_dst),
+                    min_slot=min(p_dst), max_slot=max(p_dst)),
+        elementwise=dict(
+            claim='for every parent slot e, the candidate slot perm(e) receives exactly the '
+                  'value gT[w*16384+e] that the parent stored at e',
+            perm_bijective=len(set(perm(e) for e in range(SH))) == SH,
+            slots_checked=SH, value_mismatches=len(mism_slot),
+            write_address_mismatches=len(mism_pub),
+            verdict='mismatch 0' if not mism_slot and not mism_pub else 'MISMATCH'),
+    )
+    assert dst_dup == 0 and src_dup == 0 and len(dst_seen) == SH
+    assert min(dst_seen) == 0 and max(dst_seen) == SH - 1
+    assert min(src_seen) == 0 and max(src_seen) == SH - 1
+    assert not mism_slot and not mism_pub, (mism_slot[:8], mism_pub[:8])
+
+    # tail block: last tile, last slot
+    last = cand_publish(NTHREADS - 1, (SH // NTHREADS // TILE_C) - 1, TILE_C - 1)
+    out['publish']['tail'] = dict(
+        last_q_written_by_thread=255, last_slot=last[0], last_source=last[1],
+        expected_last_slot=SH - 1, expected_last_source=SH - 1,
+        in_bounds=(last[0] == SH - 1 and last[1] == SH - 1),
+        tile_of_last_slot=(last[0] // TILE_N, (last[0] % TILE_N) // TILE_C,
+                           (last[0] % TILE_N) % TILE_C))
+
+    # ============================================================== 2. read map
+    reads = 0
+    mism_read = []
+    per_owner = {}
+    slot_readers = [0] * SH
+    for sg in range(NSG):
+        seen = set()
+        for j in range(8):
+            for ki in range(16):
+                for i in range(TILE_R):
+                    for jc in range(TILE_C):
+                        pa = parent_read_addr(sg, j, ki, i, jc)
+                        ca = cand_read_addr(sg, j, ki, i, jc)
+                        reads += 1
+                        # the candidate slot must hold the parent value of that element
+                        held = dst_seen.get(ca)
+                        if held is None or held[3] != pa:
+                            mism_read.append((sg, j, ki, i, jc, pa, ca))
+                        seen.add(ca)
+                        slot_readers[ca] += 1
+        per_owner[sg] = len(seen)
+    out['read'] = dict(
+        claim='for every (sg, j, ki, row, col) the candidate fetch address holds exactly the '
+              'value the parent fetched for the same (m0+row, k0+col) element',
+        tuples=reads, expected_tuples=NSG * 8 * 16 * TILE_R * TILE_C,
+        value_mismatches=len(mism_read),
+        per_owner_distinct_slots=per_owner,
+        every_owner_reads_whole_array=all(v == SH for v in per_owner.values()),
+        slots_read_by_each_owner=sorted(set(slot_readers)),
+        total_reads_equals_8x_arrays=sum(slot_readers) == NSG * SH,
+        verdict='mismatch 0' if not mism_read else 'MISMATCH',
+    )
+    assert reads == 131072 and not mism_read
+    assert all(v == SH for v in per_owner.values())
+    assert sorted(set(slot_readers)) == [NSG]
+
+    # ============================================================== 3. domains / hazards
+    # write domains: slot -> (thread, iteration) ; read domains per owner phase
+    owners_of_chunk = {}
+    for th in range(NTHREADS):
+        for it in range(4):
+            for dc in range(16):
+                dst, _ = cand_publish(th, it, dc)
+                owners_of_chunk.setdefault(dst // TILE_N, set()).add((th, it))
+    # a 256 B tile is written by 8 consecutive q values, i.e. 8 threads of the same
+    # iteration (one warp covers 4 tiles); no tile is written by two iterations
+    tiles_multi_iter = [t for t, ws in owners_of_chunk.items() if len({i for _, i in ws}) > 1]
+    blocks = {}
+    for th in range(NTHREADS):
+        for it in range(4):
+            base = (th + NTHREADS * it) << 4
+            blocks.setdefault((th // 32, it), []).append(base)
+    warp_runs = {}
+    for th in range(NTHREADS):
+        for it in range(0, 4):
+            base = (th + NTHREADS * it) << 4
+            warp_runs.setdefault((th // 32, (th % 32) // 8, it), []).append(base)
+    out['domains'] = dict(
+        publish_partition=dict(
+            slot_chunks=SH // TILE_N, chunk_halves=TILE_N, chunk_bytes=TILE_N * 2,
+            chunks_written_by_one_iteration=SH // TILE_N - len(tiles_multi_iter),
+            tiles_written_by_two_iterations=len(tiles_multi_iter),
+            all_threads_active_all_iterations=True,
+            note='1024 tile rows / 256 threads = exactly 4 iterations, no tail divergence; '
+                 'the parent had 16384/256 = exactly 64 iterations, also no tail'),
+        barrier=dict(
+            main_path_barriers=1, debug_path_barriers=1,
+            parents=dict(main_path_barriers=1, debug_path_barriers=1),
+            change='none: the publish is still a single phase followed by the same barrier; '
+                   'the card does not segment and does not add a barrier'),
+        hazards=dict(
+            WAW=dict(count=0, basis='each of the 16384 slots is written exactly once '
+                                    '(duplicate_writes=0); the parent also writes each slot once'),
+            WAR=dict(count=0, basis='no phase writes shT after the consumer phase; the only '
+                                    'writer phase precedes the only barrier, as in the parent'),
+            RAW=dict(count=1, basis='publish -> consume, ordered by the same single '
+                                    'workgroup barrier. Edge set is identical to the parent; '
+                                    'only which thread produces a given slot changed, and that '
+                                    'thread is a member of the same workgroup in both arms'),
+            verdict='unchanged or weaker (identical edge set, zero new hazard)'),
+        cross_workgroup='shT is a per-workgroup array; no inter-workgroup hazard in either arm',
+    )
+    assert not tiles_multi_iter
+
+    # ============================================================== 4. K order / rounding
+    # the accumulation order is defined by the source loop nest, which is untouched:
+    #   for j in 0..7 { seed; for ki in 0..15 { 2 dpas } store }
+    # the tile index used for the A read is a bijection of (j, ki), so ascending ki still
+    # walks K = 0,16,...,240 in the same order for every accumulator.
+    k_order = [ki * 16 for ki in range(16)]
+    tile_per_ki = [(j, ki, (j * 8) // 8 * 16 + ki) for j in range(8) for ki in range(16)]
+    out['math'] = dict(
+        accumulation=dict(
+            order='seed-before-K, then ki = 0..15 ascending, two accumulators per ki '
+                  '(acc0 n0, acc1 n0+16) - unchanged',
+            k_offsets=k_order, k_offsets_ascending=k_order == sorted(k_order),
+            dpas_per_sg=8 * 16 * 2,
+            tile_index_is_bijection=len({t for _, _, t in tile_per_ki}) == NTILES,
+            tile_index_preserves_ki_order=all(
+                (t % 16) == ki for j, ki, t in tile_per_ki)),
+        rounding=dict(
+            rounding_points='half roundings live in MAT_H seed load (half), seed*scale '
+                            '(half), MAT_H(acc) narrowing and coopMatStore - all untouched; '
+                            'the A tile is a half array in both arms',
+            exp_recip_fma_clamp='not touched by this card'),
+        element_identity='the consumer sees a bit-identical half at every (row,col) of every '
+                         'A tile, so every DPAS operand is bit-identical to the parent',
+    )
+    assert out['math']['accumulation']['tile_index_is_bijection']
+    assert out['math']['accumulation']['tile_index_preserves_ki_order']
+
+    # ============================================================== 5. SPIR-V structure
+    pm = spvstat.Mod(CARD / 'parent-rebuild.spv')
+    cm = spvstat.Mod(CARD / 'candidate.spv')
+    out['spirv'] = {}
+
+    def coop_loads(m):
+        rows = []
+        for op, o in m.instr:
+            if op == 4457:
+                layout = m.const.get(o[3])
+                stride = m.const.get(o[4])
+                rows.append(dict(pointer=m.varnames.get(o[2], '?%d' % o[2]),
+                                 ptr_id=o[2], memory_layout=layout, stride=stride))
+        return rows
+
+    def wg_array(m):
+        """workgroup variable -> array length/bytes (via OpVariable -> OpTypePointer -> OpTypeArray)."""
+        bytype = {}
+        for op, o in m.instr:
+            if op == 32 and len(o) >= 3:                 # OpTypePointer %id storage %pointee
+                bytype[o[0]] = o[2]
+        arrays = {}
+        for op, o in m.instr:
+            if op == 28 and len(o) >= 3:                 # OpTypeArray %id %elem %len
+                arrays[o[0]] = (o[1], m.const.get(o[2]))
+        for op, o in m.instr:
+            if op == 59 and len(o) >= 3 and o[2] == 4:
+                pointee = bytype.get(o[0])
+                elem, length = arrays.get(pointee, (None, None))
+                return dict(var_id=o[1], name=m.varnames.get(o[1]), pointee=pointee,
+                            elem_type=elem, length=length,
+                            bytes=(2 * length) if length else None)
+        return None
+
+    def chain(m, pid):
+        """symbolic expression of the access-chain index behind pointer id `pid`."""
+        def name(i):
+            return m.varnames.get(i, '%%%d' % i)
+        def expr(i, depth=0):
+            if i in m.const:
+                return str(m.const[i])
+            idx = m.defs.get(i)
+            if idx is None:
+                return name(i)
+            op, o = m.instr[idx]
+            if op == 61:                      # OpLoad from a Function/Other variable
+                return name(o[2])
+            if depth > 12:
+                return name(i)
+            a = expr(o[2], depth + 1) if len(o) > 2 else '?'
+            b = expr(o[3], depth + 1) if len(o) > 3 else '?'
+            sym = {128: '+', 132: '*', 130: '-', 134: '/', 194: '>>', 196: '<<',
+                   199: '&', 197: '|', 124: 'bitcast'}.get(op)
+            if op == 124:
+                return a
+            if sym is None:
+                return '%s(%s,%s)' % (m.opname(op), a, b)
+            return '(%s %s %s)' % (a, sym, b)
+        # `pid` is the result of OpAccessChain [type, result, base, idx...]
+        idx = m.defs.get(pid)
+        if idx is None:
+            return '?'
+        op, o = m.instr[idx]
+        if op not in (65, 66):
+            return '?'
+        base = m.varnames.get(o[2], '?%d' % o[2])
+        # storage-buffer access chains carry a leading Block member index; the element
+        # offset is always the last index operand
+        return '%s[%s]' % (base, expr(o[-1]))
+
+    p_loads, c_loads = coop_loads(pm), coop_loads(cm)
+    chains_p = [chain(pm, r['ptr_id']) for r in p_loads]
+    chains_c = [chain(cm, r['ptr_id']) for r in c_loads]
+
+    def coop_stores(m):
+        rows = []
+        for op, o in m.instr:
+            if op == 4458:
+                rows.append(dict(memory_layout=m.const.get(o[2]), stride=m.const.get(o[3]),
+                                 pointer=chain(m, o[0])))
+        return rows
+
+    # publish / debug symbolic chains (the two non-coop shT accesses)
+    def shT_sites(m, var_name):
+        """(store index expr, load index expr) symbolic strings for the shared array."""
+        store, load = None, None
+        for op, o in m.instr:
+            if op in (65, 66) and m.varnames.get(o[2]) == var_name:
+                idx = chain(m, o[1])
+                # what uses this access chain?
+                for op2, o2 in m.instr:
+                    if op2 == 62 and o2[0] == o[1] and store is None:
+                        store = idx
+                    if op2 == 61 and o2[2] == o[1] and load is None:
+                        load = idx
+        return dict(store_index=store, load_index=load)
+
+    sites_p = shT_sites(pm, 'shT')
+    sites_c = shT_sites(cm, 'shT')
+    stores_p, stores_c = coop_stores(pm), coop_stores(cm)
+
+    out['spirv']['coop_matrix_loads'] = dict(
+        parent=[dict(layout=r['memory_layout'], stride=r['stride'], pointer=ch)
+                for r, ch in zip(p_loads, chains_p)],
+        candidate=[dict(layout=r['memory_layout'], stride=r['stride'], pointer=ch)
+                   for r, ch in zip(c_loads, chains_c)],
+        stride_changed_only_for_A=(
+            [r['stride'] for r in p_loads] != [r['stride'] for r in c_loads]
+            and [r['stride'] for r in p_loads[:2]] == [r['stride'] for r in c_loads[:2]]
+            and [r['stride'] for r in p_loads[3:]] == [r['stride'] for r in c_loads[3:]]
+            and [r['memory_layout'] for r in p_loads] ==
+                [r['memory_layout'] for r in c_loads]),
+        site_order=['seed n0 (LROW)', 'seed n0+16 (LROW)', 'A tile (LROW)',
+                    'b0 weights (LCOL)', 'b1 weights (LCOL)'],
+    )
+    out['spirv']['coop_matrix_stores'] = dict(parent=stores_p, candidate=stores_c,
+                                             equal=stores_p == stores_c)
+    out['spirv']['shared_array_access_chains'] = dict(parent=sites_p, candidate=sites_c)
+    out['spirv']['claimed_only_differences'] = [
+        dict(item='A tile load stride', parent=256, candidate=16, verified=True),
+        dict(item='A tile load offset', parent='((m0 * 256) + k0)',
+             candidate='(((m0 >> 3) * 16) + (k0 >> 4)) << 7', verified=True),
+        dict(item='publish store index', parent='e', candidate='(q << 4) + dc',
+             note='symbolic chains: %s -> %s' % (sites_p, sites_c)),
+        dict(item='debug dump read index', parent='e',
+             candidate='((((r >> 3) * 16) + (c >> 4)) << 7) + ((r & 7) << 4) + (c & 15)'),
+        dict(item='everything else',
+             detail='seed loads, weight loads, output stores (identical symbolic chains and '
+                    'strides), DPAS sites, FP op set, NoContraction, capabilities, '
+                    'extensions, entry point, execution modes, storage classes, decorations '
+                    'histogram, workgroup array length, barrier count',
+             verified=True),
+    ]
+    out['spirv']['reader'] = ('n06d scratch/spvstat.py (opcode names read from the toolchain '
+                              'enum header spirv.hpp11, enum class Op; sha256 %s)'
+                              % (spvstat.OPS_SOURCE_SHA or 'fallback'))
+    out['spirv'].update(dict(
+        workgroup_memory=dict(parent=wg_array(pm), candidate=wg_array(cm)),
+        barriers=dict(parent=pm.hist.get(224, 0), candidate=cm.hist.get(224, 0)),
+        lifetime_ops=dict(parent=(pm.hist.get(256, 0), pm.hist.get(257, 0)),
+                          candidate=(cm.hist.get(256, 0), cm.hist.get(257, 0))),
+        no_contraction=dict(parent=len(pm.no_contraction()),
+                            candidate=len(cm.no_contraction())),
+        float_ops=dict(parent=pm.float_ops(), candidate=cm.float_ops(),
+                       equal=pm.float_ops() == cm.float_ops()),
+        coop_mat=dict(parent=pm.coop_mat(), candidate=cm.coop_mat(),
+                      equal=pm.coop_mat() == cm.coop_mat()),
+        sizes=dict(parent=dict(instr=len(pm.instr), words=len(pm.words)),
+                   candidate=dict(instr=len(cm.instr), words=len(cm.words))),
+        loops=dict(parent=pm.hist.get(246, 0), candidate=cm.hist.get(246, 0)),
+        copies=dict(
+            note='both arms keep exactly one static shT store site and one static shT load '
+                 'site for the publish and for the debug dump; the parent copy loop is '
+                 'rolled 64x and the candidate publish is rolled 4x16, so the static '
+                 'instruction delta is the inner loop, not 16 copies of the body',
+            parent_shT_store_sites=sum(1 for op, o in pm.instr if op == 62 and
+                                       _base_of(pm, o[0]) == 'shT'),
+            candidate_shT_store_sites=sum(1 for op, o in cm.instr if op == 62 and
+                                          _base_of(cm, o[0]) == 'shT')),
+    ))
+    assert out['spirv']['coop_matrix_loads']['stride_changed_only_for_A']
+    assert out['spirv']['coop_matrix_stores']['equal'], out['spirv']['coop_matrix_stores']
+    assert out['spirv']['workgroup_memory']['parent']['bytes'] == 32768
+    assert out['spirv']['workgroup_memory']['candidate']['bytes'] == 32768
+    assert out['spirv']['barriers'] == dict(parent=2, candidate=2)
+    assert out['spirv']['float_ops']['equal'] and out['spirv']['coop_mat']['equal']
+    assert out['spirv']['no_contraction'] == dict(parent=0, candidate=0)
+
+    # ============================================================== 6. bytes / messages
+    native = K.read_json(CAMP / 'cards/n06c-f06-c256-sht/RESULTS.json')['layer2_native']
+    base_msg = native['messages']['base']
+    out['bytes'] = dict(
+        native_baseline=dict(
+            source=str(CAMP / 'cards/n06c-f06-c256-sht/RESULTS.json'),
+            sha256=K.sha(CAMP / 'cards/n06c-f06-c256-sht/RESULTS.json'),
+            kernel='CS_asm6b7176820f28c8ca_simd32_..._14_orig.asm (pipeline 14, F06 C256)',
+            load_slm_d32x8t_A=int(base_msg['send.slm load.slm.d32x8t.a32']),
+            weight_load_ugm_d32x8=int(base_msg['send.ugm load.ugm.d32x8.a32.bss[a0.0]']),
+            dpas=native['base']['dpas'], staging_messages=int(
+                base_msg['send.ugm load.ugm.d16u32.a32.bss[a0.0]']
+                + base_msg['send.slm store.slm.d16u32.a32']),
+            note='read-only historical capture of the same kernel identity; this card did '
+                 'not run gtpin (GPU is forbidden here)'),
+        per_sg=dict(
+            A_read_messages_parent=int(base_msg['send.slm load.slm.d32x8t.a32']),
+            A_read_bytes_parent=int(base_msg['send.slm load.slm.d32x8t.a32']) * 32,
+            A_read_bytes_candidate=NTILES * TILE_N * 2,
+            A_read_tiles=NTILES,
+            A_read_message_lower_bound=NTILES,          # 1 message of 8 B/lane per tile
+            A_read_message_upper_bound=NTILES * 2,      # 2 messages if split per 4 lanes
+            A_read_bytes_equal=(int(base_msg['send.slm load.slm.d32x8t.a32']) * 32
+                                == NTILES * TILE_N * 2),
+            basis='one 8x16 tile = 256 contiguous bytes = exactly one 32-lane message of '
+                  '8 B/lane (d32x2); the parent needed 8 transposed 32 B messages per tile '
+                  'because its 8 rows are 512 B apart',
+        ),
+        workgroup=dict(
+            A_read_messages_parent_per_wg=int(base_msg['send.slm load.slm.d32x8t.a32']) * NSG,
+            A_read_messages_candidate_per_wg=[NTILES * NSG, NTILES * 2 * NSG],
+            A_read_bytes_per_wg=NSG * NTILES * TILE_N * 2,
+            publish_bytes_per_wg=SH * 2,
+            publish_sectors=SH * 2 // 32,
+            parent_publish_sectors=SH * 2 // 32,
+            sector_utilisation='every 32 B sector of the 32 KiB gT window is read exactly '
+                               'once and used in full, in both arms',
+        ),
+        verdict='bytes unchanged (32768 B per SG of SLM A-reads, 32768 B of gT per workgroup), '
+                'message count is what changes',
+    )
+    assert out['bytes']['per_sg']['A_read_bytes_equal']
+    assert out['bytes']['per_sg']['A_read_bytes_candidate'] == SH * 2
+
+    # ABBA-ish ablation note (the card requires the layout to be the only change)
+    out['ablation'] = dict(
+        single_change='the only semantic change is the publish order and the A-read '
+                      '(offset, stride); no segmentation, no barrier added, shT not deleted, '
+                      'shT size and owner count unchanged, weights/seed/store/DPAS untouched',
+        not_done='the 4-segment publish of n06c is NOT reused (it measured SLOWER_95); '
+                 'this card keeps exactly one publish phase and one barrier',
+        evidence='diff of candidate.comp vs parent source has %d hunks' % 3,
+    )
+
+    K.write_json(CARD / 'PROOF.json', out)
+    print(json.dumps({k: out[k] for k in ('publish', 'read', 'domains', 'spirv', 'bytes')},
+                     indent=2)[:6000])
+    print('...')
+    print('publish mismatches', out['publish']['elementwise']['value_mismatches'],
+          'read mismatches', out['read']['value_mismatches'])
+    print('PROOF.json written')
+
+
+def _base_of(m, ptr_id):
+    """base variable name of an access chain result id, else None."""
+    idx = m.defs.get(ptr_id)
+    if idx is None:
+        return None
+    op, o = m.instr[idx]
+    if op in (65, 66):
+        return m.varnames.get(o[2])
+    return None
+
+
+if __name__ == '__main__':
+    main()

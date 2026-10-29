@@ -1,0 +1,349 @@
+import json
+import math
+import statistics
+from pathlib import Path
+
+OUT_DIR = Path(r"@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\prep-gpu-handoff-20261028\dsh-time-diagnosis-20261028")
+
+CPU_METRICS = [
+    "prep_ms",
+    "host_ms",
+    "composite_submit_ms",
+    "tail_ms",
+    "total_ms",
+    "record_total_ms",
+    "record_resources_ms",
+    "record_hdr_ms",
+    "record_xess_ms",
+    "submit_gap_ms",
+    "end_to_end_ms",
+    "retire_prev_cpu_ms",
+    "prep_wait_cpu_ms",
+    "vk_wait_fences_cpu_ms",
+    "vk_record_submit_cpu_ms",
+    "composite_submit_cpu_ms",
+    "tail_sr_exec_cpu_ms",
+    "tail_post_sr_submit_cpu_ms",
+    "tail_submit_cpu_ms",
+    "tail_wait_cpu_ms",
+    "tail_retire_cpu_ms",
+]
+
+GPU_METRICS = [
+    "d3d_color_copy_gpu_ms",
+    "d3d_prepare_gpu_ms",
+    "d3d_prep_list_gpu_ms",
+    "d3d_prep_to_nrvk_copy_gap_gpu_ms",
+    "d3d_nrvk_copy_gpu_ms",
+    "d3d_nrvk_copy_to_composite_gap_gpu_ms",
+    "d3d_composite_gpu_ms",
+    "d3d_composite_to_sr_gap_gpu_ms",
+    "d3d_deferred_sr_gpu_ms",
+    "d3d_total_span_gpu_ms",
+    "vk_acquire_gpu_ms",
+    "vk_history_controls_gpu_ms",
+    "vk_gather_gpu_ms",
+    "vk_network_266_gpu_ms",
+    "vk_scatter_gpu_ms",
+    "vk_release_gpu_ms",
+    "vk_total_cb_gpu_ms",
+    "cross_api_handoff_overhead_gpu_ms",
+]
+
+
+def percentile(sorted_vals, p: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return float(sorted_vals[0])
+    k = (len(sorted_vals) - 1) * (p / 100.0)
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return float(sorted_vals[int(k)])
+    return float(sorted_vals[f] * (c - k) + sorted_vals[c] * (k - f))
+
+
+def summarize(vals):
+    clean = [float(v) for v in vals if v is not None and not math.isnan(float(v)) and float(v) >= 0.0]
+    if not clean:
+        return {"count": 0, "mean": 0.0, "stddev": 0.0, "min": 0.0, "p50": 0.0, "p90": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
+    s = sorted(clean)
+    return {
+        "count": len(s),
+        "mean": round(statistics.fmean(s), 6),
+        "stddev": round(statistics.stdev(s), 6) if len(s) > 1 else 0.0,
+        "min": round(s[0], 6),
+        "p50": round(percentile(s, 50.0), 6),
+        "p90": round(percentile(s, 90.0), 6),
+        "p95": round(percentile(s, 95.0), 6),
+        "p99": round(percentile(s, 99.0), 6),
+        "max": round(s[-1], 6),
+    }
+
+
+def delta_stats(stat_c, stat_b):
+    return {
+        k: round(stat_c.get(k, 0.0) - stat_b.get(k, 0.0), 6)
+        for k in ("mean", "p50", "p90", "p95", "p99", "min", "max")
+    }
+
+
+def main():
+    meta = json.loads((OUT_DIR / "window-metadata.json").read_text(encoding="utf-8"))
+    windows_by_id = {int(w["window_id"]): w for w in meta["windows"]}
+
+    snapshots = [
+        json.loads(line)
+        for line in (OUT_DIR / "window-snapshots.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    cpu_frames = [
+        json.loads(line)
+        for line in (OUT_DIR / "CPU-FRAMES.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    gpu_stages = [
+        json.loads(line)
+        for line in (OUT_DIR / "GPU-STAGES.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    for g in gpu_stages:
+        if g.get("bridge_d3d_valid") == 1 and g.get("nrvk_d3d_valid") == 1 and g.get("vk_valid") == 1:
+            g["cross_api_handoff_overhead_gpu_ms"] = (
+                float(g.get("d3d_nrvk_copy_to_composite_gap_gpu_ms", 0.0))
+                - float(g.get("vk_total_cb_gpu_ms", 0.0))
+            )
+        else:
+            g["cross_api_handoff_overhead_gpu_ms"] = -1.0
+
+    # Group frames directly by their exact C++ tagged window_id and skip the first 50 settling frames per window (~1.4s)
+    settling_cutoff_by_wid = {}
+    max_fid_by_wid = {}
+    for wid in windows_by_id:
+        fids = sorted(int(r["frame_id"]) for r in cpu_frames if int(r.get("window_id", 0)) == wid)
+        if len(fids) > 50:
+            settling_cutoff_by_wid[wid] = fids[49]
+            max_fid_by_wid[wid] = fids[-1]
+        elif fids:
+            settling_cutoff_by_wid[wid] = fids[0] - 1
+            max_fid_by_wid[wid] = fids[-1]
+        else:
+            settling_cutoff_by_wid[wid] = 0
+            max_fid_by_wid[wid] = -1
+
+    def is_post_settling(rec):
+        wid = int(rec.get("window_id", 0))
+        if wid not in settling_cutoff_by_wid:
+            return False
+        fid = int(rec.get("frame_id", 0))
+        return settling_cutoff_by_wid[wid] < fid <= max_fid_by_wid[wid]
+
+    panel_by_window = {}
+    for w in meta["windows"]:
+        wname = w["name"]
+        rows = [
+            s for s in snapshots
+            if s.get("window_name") == wname and not s.get("settling") and s.get("valid_context")
+        ]
+        stage_stats = {}
+        for k in ("prep", "host", "composite", "tail", "total", "last"):
+            stage_stats[k] = summarize([r["stage_ms"].get(k) for r in rows if r.get("stage_ms", {}).get(k) is not None])
+        panel_by_window[wname] = {
+            "total_snapshots": len([s for s in snapshots if s.get("window_name") == wname]),
+            "post_settling_valid_snapshots": len(rows),
+            "window_meta": w,
+            "panel_stage_ms": stage_stats,
+        }
+
+    cpu_by_window = {}
+    gpu_by_window = {}
+    partition_checks_by_window = {}
+
+    for w in meta["windows"]:
+        wid = int(w["window_id"])
+        wname = w["name"]
+        c_all_rows = [r for r in cpu_frames if int(r.get("window_id", 0)) == wid]
+        c_settling_rows = [r for r in c_all_rows if not is_post_settling(r)]
+        c_rows = [r for r in c_all_rows if is_post_settling(r)]
+        g_rows_all_window = [r for r in gpu_stages if int(r.get("window_id", 0)) == wid]
+        g_rows = [
+            r for r in gpu_stages
+            if int(r.get("window_id", 0)) == wid
+            and is_post_settling(r)
+            and int(r.get("bridge_d3d_valid", 0)) == 1
+            and int(r.get("nrvk_d3d_valid", 0)) == 1
+            and int(r.get("vk_valid", 0)) == 1
+        ]
+        g_all_rows = [r for r in gpu_stages if int(r.get("window_id", 0)) == wid and is_post_settling(r)]
+
+        cpu_stats = {m: summarize([r.get(m) for r in c_rows]) for m in CPU_METRICS}
+        cpu_settling_stats = {m: summarize([r.get(m) for r in c_settling_rows]) for m in ("prep_ms", "host_ms", "composite_submit_ms", "tail_ms", "total_ms", "tail_wait_cpu_ms")}
+        cpu_all_window_stats = {m: summarize([r.get(m) for r in c_all_rows]) for m in ("prep_ms", "host_ms", "composite_submit_ms", "tail_ms", "total_ms", "tail_wait_cpu_ms")}
+        gpu_stats = {m: summarize([r.get(m) for r in g_rows if float(r.get(m, -1.0)) >= 0.0]) for m in GPU_METRICS}
+
+        heap_kinds = {0: 0, 1: 0, 2: 0}
+        pool_kinds = {0: 0, 1: 0, 2: 0, 3: 0}
+        top_errs = []
+        tail_errs = []
+        for r in c_rows:
+            heap_kinds[int(r.get("composite_heap_kind", 0))] = heap_kinds.get(int(r.get("composite_heap_kind", 0)), 0) + 1
+            pool_kinds[int(r.get("pool_alloc_kind", 0))] = pool_kinds.get(int(r.get("pool_alloc_kind", 0)), 0) + 1
+            top_sum = (
+                float(r["prep_ms"])
+                + float(r["host_ms"])
+                + float(r["composite_submit_ms"])
+                + float(r["tail_ms"])
+            )
+            top_errs.append(abs(top_sum - float(r["total_ms"])))
+            if int(r.get("diag_mode", 0)) >= 1:
+                tail_sum = (
+                    float(r["tail_sr_exec_cpu_ms"])
+                    + float(r["tail_post_sr_submit_cpu_ms"])
+                    + float(r["tail_wait_cpu_ms"])
+                    + float(r["tail_retire_cpu_ms"])
+                )
+                tail_errs.append(abs(tail_sum - float(r["tail_ms"])))
+
+        cpu_by_window[wname] = {
+            "all_window_frame_count": len(c_all_rows),
+            "settling_frame_count": len(c_settling_rows),
+            "post_settling_frame_count": len(c_rows),
+            "composite_heap_kind_counts": {
+                "shared_0": heap_kinds.get(0, 0),
+                "pooled_composite_1": heap_kinds.get(1, 0),
+                "unique_create_2": heap_kinds.get(2, 0),
+            },
+            "pool_alloc_kind_counts": {
+                "none_0": pool_kinds.get(0, 0),
+                "pool_hit_1": pool_kinds.get(1, 0),
+                "pool_create_miss_2": pool_kinds.get(2, 0),
+                "unique_fallback_3": pool_kinds.get(3, 0),
+            },
+            "settling_metrics_ms": cpu_settling_stats,
+            "all_window_metrics_ms": cpu_all_window_stats,
+            "metrics_ms": cpu_stats,
+        }
+        gpu_by_window[wname] = {
+            "all_window_total_records": len(g_rows_all_window),
+            "post_settling_total_records": len(g_all_rows),
+            "post_settling_all_valid_records": len(g_rows),
+            "bridge_d3d_invalid_count": sum(1 for r in g_all_rows if int(r.get("bridge_d3d_valid", 0)) == 0),
+            "nrvk_d3d_invalid_count": sum(1 for r in g_all_rows if int(r.get("nrvk_d3d_valid", 0)) == 0),
+            "vk_invalid_count": sum(1 for r in g_all_rows if int(r.get("vk_valid", 0)) == 0),
+            "metrics_ms": gpu_stats,
+        }
+        partition_checks_by_window[wname] = {
+            "frames": len(c_rows),
+            "top_level_max_abs_err_ms": round(max(top_errs), 6) if top_errs else 0.0,
+            "top_level_mean_abs_err_ms": round(statistics.fmean(top_errs), 6) if top_errs else 0.0,
+            "top_level_pass_le_0_01ms": (max(top_errs) <= 0.01) if top_errs else True,
+            "tail_sub_max_abs_err_ms": round(max(tail_errs), 6) if tail_errs else 0.0,
+            "tail_sub_mean_abs_err_ms": round(statistics.fmean(tail_errs), 6) if tail_errs else 0.0,
+            "tail_sub_pass_le_0_01ms": (max(tail_errs) <= 0.01) if tail_errs else True,
+        }
+
+    off1_tot = cpu_by_window["D1_OFF_1"]["metrics_ms"]["total_ms"]["mean"]
+    off2_tot = cpu_by_window["D1_OFF_2"]["metrics_ms"]["total_ms"]["mean"]
+    off_mean_tot = 0.5 * (off1_tot + off2_tot)
+    off1_host = cpu_by_window["D1_OFF_1"]["metrics_ms"]["host_ms"]["mean"]
+    off2_host = cpu_by_window["D1_OFF_2"]["metrics_ms"]["host_ms"]["mean"]
+    off_mean_host = 0.5 * (off1_host + off2_host)
+
+    cpu_only_raw_tot = cpu_by_window["D1_CPU_ONLY"]["metrics_ms"]["total_ms"]["mean"]
+    cpu_gpu_raw_tot = cpu_by_window["D1_CPU_GPU"]["metrics_ms"]["total_ms"]["mean"]
+    cpu_only_raw_host = cpu_by_window["D1_CPU_ONLY"]["metrics_ms"]["host_ms"]["mean"]
+    cpu_gpu_raw_host = cpu_by_window["D1_CPU_GPU"]["metrics_ms"]["host_ms"]["mean"]
+
+    perturbation = {
+        "experiment": "D1_PERTURBATION_GATE",
+        "sequence": ["D1_OFF_1", "D1_CPU_ONLY", "D1_CPU_GPU", "D1_OFF_2"],
+        "arm_fixed": "control_B (arm_reuse=0)",
+        "windows_panel": {k: panel_by_window[k] for k in ("D1_OFF_1", "D1_CPU_ONLY", "D1_CPU_GPU", "D1_OFF_2")},
+        "windows_raw_cpu": {k: cpu_by_window[k] for k in ("D1_OFF_1", "D1_CPU_ONLY", "D1_CPU_GPU", "D1_OFF_2")},
+        "windows_raw_gpu": {"D1_CPU_GPU": gpu_by_window["D1_CPU_GPU"]},
+        "comparisons": {
+            "off_baseline_raw_mean_ms": {
+                "total_ms": round(off_mean_tot, 6),
+                "host_ms": round(off_mean_host, 6),
+                "off2_minus_off1_drift_total_ms": round(off2_tot - off1_tot, 6),
+            },
+            "cpu_only_minus_off_mean_raw_ms": {
+                "delta_total_ms": round(cpu_only_raw_tot - off_mean_tot, 6),
+                "delta_host_ms": round(cpu_only_raw_host - off_mean_host, 6),
+                "gate_total_le_0_15ms": abs(cpu_only_raw_tot - off_mean_tot) <= 0.15,
+                "gate_host_le_0_05ms": abs(cpu_only_raw_host - off_mean_host) <= 0.05,
+            },
+            "cpu_gpu_minus_cpu_only_raw_ms": {
+                "delta_total_ms": round(cpu_gpu_raw_tot - cpu_only_raw_tot, 6),
+                "delta_host_ms": round(cpu_gpu_raw_host - cpu_only_raw_host, 6),
+                "gate_total_le_0_25ms": abs(cpu_gpu_raw_tot - cpu_only_raw_tot) <= 0.25,
+            },
+        },
+        "final_diag_live": meta.get("final_diag_live", {}),
+    }
+    (OUT_DIR / "PERTURBATION.json").write_text(json.dumps(perturbation, indent=2), encoding="utf-8")
+
+    b_cpu_rows = [r for r in cpu_frames if int(r.get("window_id", 0)) in (11, 13) and is_post_settling(r)]
+    c_cpu_rows = [r for r in cpu_frames if int(r.get("window_id", 0)) in (12, 14) and is_post_settling(r)]
+    b_gpu_rows = [
+        r for r in gpu_stages
+        if int(r.get("window_id", 0)) in (11, 13)
+        and is_post_settling(r)
+        and int(r.get("bridge_d3d_valid", 0)) == 1
+        and int(r.get("nrvk_d3d_valid", 0)) == 1
+        and int(r.get("vk_valid", 0)) == 1
+    ]
+    c_gpu_rows = [
+        r for r in gpu_stages
+        if int(r.get("window_id", 0)) in (12, 14)
+        and is_post_settling(r)
+        and int(r.get("bridge_d3d_valid", 0)) == 1
+        and int(r.get("nrvk_d3d_valid", 0)) == 1
+        and int(r.get("vk_valid", 0)) == 1
+    ]
+
+    arm_b_cpu = {m: summarize([r.get(m) for r in b_cpu_rows]) for m in CPU_METRICS}
+    arm_c_cpu = {m: summarize([r.get(m) for r in c_cpu_rows]) for m in CPU_METRICS}
+    arm_b_gpu = {m: summarize([r.get(m) for r in b_gpu_rows if float(r.get(m, -1.0)) >= 0.0]) for m in GPU_METRICS}
+    arm_c_gpu = {m: summarize([r.get(m) for r in c_gpu_rows if float(r.get(m, -1.0)) >= 0.0]) for m in GPU_METRICS}
+
+    paired_results = {
+        "experiment": "D2_PAIRED_B_C_SAME_PROCESS_DIAGNOSIS",
+        "sequence": ["D2_B1", "D2_C1", "D2_B2", "D2_C2"],
+        "windows_panel": {k: panel_by_window[k] for k in ("D2_B1", "D2_C1", "D2_B2", "D2_C2")},
+        "windows_cpu": {k: cpu_by_window[k] for k in ("D2_B1", "D2_C1", "D2_B2", "D2_C2")},
+        "windows_gpu": {k: gpu_by_window[k] for k in ("D2_B1", "D2_C1", "D2_B2", "D2_C2")},
+        "combined_arms": {
+            "arm_B_control": {
+                "windows": ["D2_B1", "D2_B2"],
+                "cpu_frame_count": len(b_cpu_rows),
+                "gpu_frame_count": len(b_gpu_rows),
+                "cpu_metrics_ms": arm_b_cpu,
+                "gpu_metrics_ms": arm_b_gpu,
+            },
+            "arm_C_candidate": {
+                "windows": ["D2_C1", "D2_C2"],
+                "cpu_frame_count": len(c_cpu_rows),
+                "gpu_frame_count": len(c_gpu_rows),
+                "cpu_metrics_ms": arm_c_cpu,
+                "gpu_metrics_ms": arm_c_gpu,
+            },
+        },
+        "paired_deltas_C_minus_B": {
+            "combined_C_minus_B_cpu_ms": {m: delta_stats(arm_c_cpu[m], arm_b_cpu[m]) for m in CPU_METRICS},
+            "combined_C_minus_B_gpu_ms": {m: delta_stats(arm_c_gpu[m], arm_b_gpu[m]) for m in GPU_METRICS},
+            "pair1_C1_minus_B1_cpu_ms": {m: delta_stats(cpu_by_window["D2_C1"]["metrics_ms"][m], cpu_by_window["D2_B1"]["metrics_ms"][m]) for m in CPU_METRICS},
+            "pair2_C2_minus_B2_cpu_ms": {m: delta_stats(cpu_by_window["D2_C2"]["metrics_ms"][m], cpu_by_window["D2_B2"]["metrics_ms"][m]) for m in CPU_METRICS},
+            "drift_B2_minus_B1_cpu_ms": {m: delta_stats(cpu_by_window["D2_B2"]["metrics_ms"][m], cpu_by_window["D2_B1"]["metrics_ms"][m]) for m in CPU_METRICS},
+            "drift_C2_minus_C1_cpu_ms": {m: delta_stats(cpu_by_window["D2_C2"]["metrics_ms"][m], cpu_by_window["D2_C1"]["metrics_ms"][m]) for m in CPU_METRICS},
+        },
+        "d3_partition_checks": partition_checks_by_window,
+    }
+    (OUT_DIR / "PAIRED-RESULTS.json").write_text(json.dumps(paired_results, indent=2), encoding="utf-8")
+    print(json.dumps({"status": "RECONCILED", "cpu_frames": len(cpu_frames), "gpu_stages": len(gpu_stages)}))
+
+
+if __name__ == "__main__":
+    main()

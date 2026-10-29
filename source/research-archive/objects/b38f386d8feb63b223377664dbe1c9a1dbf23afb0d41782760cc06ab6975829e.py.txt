@@ -1,0 +1,102 @@
+"""Estimate the frame's message budget and what halving operand bytes would buy.
+
+Method: for every PASS, send executions per frame = send instructions in its ISA x
+subgroups per workgroup x workgroups. The per-message cost is calibrated from the campaign's
+own best message-deletion result (n05a: F05 C256, 96 weight loads/instance deleted for
++0.521 ms), so it is an empirical marginal cost, not a model.
+"""
+import json, struct, sys
+from collections import Counter
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+import ISA
+from audit_card import pass_lines
+
+cur = K.read_json(K.C / 'CURRENT.json')
+recs = pass_lines(Path(cur['best_plan']['path']))
+rows = K.rows()
+
+def local_size(spv):
+    d = Path(spv).read_bytes()
+    w = struct.unpack('<%dI' % (len(d) // 4), d[:len(d) // 4 * 4])
+    i = 5
+    while i < len(w):
+        wc = w[i] >> 16; op = w[i] & 0xFFFF
+        if wc == 0:
+            break
+        if op == 16 and w[i + 2] == 17:
+            return w[i + 3] * w[i + 4] * w[i + 5]
+        i += wc
+    return 32
+
+idx = K.read_json(K.C / 'evidence' / 'NATIVE-INDEX.json')
+by_ord = {}
+def walk(n):
+    if isinstance(n, dict):
+        if 'ordinal' in n and 'baseline_kernel_hash' in n:
+            by_ord.setdefault(int(n['ordinal']), n['baseline_kernel_hash'])
+        for v in n.values():
+            walk(v)
+    elif isinstance(n, list):
+        for v in n:
+            walk(v)
+walk(idx)
+want = {str(v)[:16] for v in by_ord.values()}
+found = {}
+for p in (K.C / 'queue').rglob('*.asm'):
+    for w in want:
+        if w and w in p.name:
+            found.setdefault(w, p)
+
+tot_send = 0
+tot_ugm = 0
+tot_slm = 0
+per = []
+for r in rows:
+    o = r['ordinal']
+    p = found.get(str(by_ord.get(o, ''))[:16])
+    if p is None:
+        continue
+    isa = ISA.parse(p)
+    c = Counter(i['op'] for i in isa)
+    sends = sum(v for k, v in c.items() if k.startswith('send'))
+    ugm = sum(v for k, v in c.items() if k.startswith('send.ugm'))
+    slm = sum(v for k, v in c.items() if k.startswith('send.slm'))
+    th = local_size(recs[o]['spv'])
+    sub = max(1, th // 32)
+    toks = recs[o]['line'].split()
+    wgs = int(toks[-3]) * int(toks[-2]) * int(toks[-1])
+    inst = sends * sub * wgs
+    tot_send += inst
+    tot_ugm += ugm * sub * wgs
+    tot_slm += slm * sub * wgs
+    per.append((inst, o, r['name'], sends, sub, wgs))
+
+print('passes counted: %d / 232' % len(per))
+print('total send executions per frame: %.3e' % tot_send)
+print('  of which ugm %.3e, slm %.3e' % (tot_ugm, tot_slm))
+# n05a calibration: F05 C256 deleted 96 weight loads per kernel instance for +0.521057 ms
+# 16 PASS in that group; workgroups per pass from the plan
+f05 = [x for x in per if x[1] in (62, 66, 70, 74, 78, 82, 86, 90, 136, 140, 144, 148, 152, 156, 160, 164)]
+instances = sum(x[4] * x[5] for x in f05)
+msgs_saved = 96.0 * instances
+ms_per_msg = 0.521057 / msgs_saved
+print('\nn05a calibration: %d kernel instances, %.3e messages deleted, 0.521057 ms' % (instances, msgs_saved))
+print('  => %.3e ms per message (%.2f ps)' % (ms_per_msg, ms_per_msg * 1e9))
+print('total message time if all messages cost that: %.3f ms (%.1f%% of a 17.8 ms frame)'
+      % (tot_send * ms_per_msg, 100 * tot_send * ms_per_msg / 17.8))
+print('halving operand bytes (int8) would remove ~half of the ugm+slm messages:')
+for frac in (1.0, 0.5, 0.25):
+    saved = (tot_ugm + tot_slm) * frac * ms_per_msg
+    print('  remove %.0f%% of data messages -> %.3f ms' % (100 * frac, saved))
+per.sort(reverse=True)
+print('\ntop 6 passes by send executions:')
+for inst, o, name, sends, sub, wgs in per[:6]:
+    print('  ord %3d %-28s send %4d x %d sg x %6d wg = %.3e' % (o, name, sends, sub, wgs, inst))
+K.write_json(K.C / 'evidence' / 'MESSAGE-BUDGET.json',
+             dict(total_send_per_frame=tot_send, ugm=tot_ugm, slm=tot_slm,
+                  ms_per_message=ms_per_msg,
+                  calibration='n05a F05 C256 deleted 96 weight loads per kernel instance for +0.521057 ms',
+                  total_message_time_ms=tot_send * ms_per_msg,
+                  halving_bytes_saving_ms=(tot_ugm + tot_slm) * 0.5 * ms_per_msg))

@@ -1,0 +1,35 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys
+R=Path(__file__).resolve().parent;A=R.parent;B=Path('@NR_WORKSPACE@');P=A/'f20-pv-owner-20261025/coop-den';N=R/'f20-qkv-owner';N.mkdir(exist_ok=True)
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+rd=lambda p:json.loads(p.read_text(encoding='utf-8-sig'))
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(args):
+ p=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert p.returncode==0,p.stdout+p.stderr;return p.stdout
+s=(P/'candidate.comp').read_text(encoding='utf-8-sig');original=s
+for marker in ['    // ============ stage 1: expand','    // ============ stage 9: projection']:
+ b=s.index(marker);a=s.rfind('    barrier();',0,b);assert s[a+len('    barrier();'):b].strip()=='';s=s[:a]+'    if (debug) barrier(); // No normal-path cross-SG publication or reuse here.'+s[a+len('    barrier();'):]
+old='    // Retain the original unconditional publication; debug O still uses shX.\n    barrier();';new='    // Only debug O uses shared shX; normal output has no within-WG reader.\n    if (debug) barrier();';assert s.count(old)==1;s=s.replace(old,new)
+# The only executable source edits are three barrier guards.
+assert s.count('if (debug) barrier();')==3
+# Contract owns exactly the next QKV row; retain its two narrowed fragments.
+mark='    // ============ stage 3: contract';s=s.replace(mark,'    MAT_A handoff0, handoff1;\n'+mark,1)
+a=s.index(mark);b=s.index('    // ============ stage 4:',a);part=s[a:b]
+for n in range(2):
+ anchor=f'MAT_H half{n} = MAT_H(acc{n});';assert part.count(anchor)==1
+ part=part.replace(anchor,anchor+'\n'+''.join(f'        handoff{n}[{c}]=half{n}[{c}];\n' for c in range(4)))
+s=s[:a]+part+s[b:]
+old='        uint p = sg + 8u * j;\n        uint m0 = (p / 3u) * 8u, n0 = (p % 3u) * 32u;';assert s.count(old)==1;s=s.replace(old,'        uint m0=sg*8u, n0=j*32u;')
+old='MAT_A a; coopMatLoad(a, shY, m0 * 32u + k0, 32u, LROW);   // shared A';assert s.count(old)==1;s=s.replace(old,'MAT_A a=handoff0; if(ki==1u) a=handoff1; // Same per-element K0 then K16.')
+old_tiles={( (sg+8*j)//3, (sg+8*j)%3) for sg in range(8) for j in range(3)};new_tiles={(sg,j) for sg in range(8) for j in range(3)};assert old_tiles==new_tiles and len(old_tiles)==24
+
+src=N/'candidate.comp';src.write_text(s,encoding='utf-8');spv=N/'candidate.spv';run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv]);pm=ST.Module(P/'candidate.spv');cm=ST.Module(spv);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[]);assert len(keep)==len(ST.no_contraction_ids(pm))==7;ST.set_no_contraction(cm,set(keep),spv);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+baseline=rd(R/'BASELINE.json');text=Path(baseline['plan']['path']).read_text();assert text.count((P/'candidate.spv').as_posix())==1;plan=N/'plan.txt';plan.write_text(text.replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8');tmpl=A/'c32-entry-chain-20261025/f01-residual';runner=Path(rd(tmpl/'LUNA-GATES.json')['identities'][0]['path']);m=dict(source=ident(src),spv=ident(spv),plan=ident(plan),parent_spv=ident(P/'candidate.spv'),parent_plan=baseline['plan'],no_contraction_count=7,shared_unchanged=True,new_arithmetic=0,new_barriers=0,removed_normal_WG_barriers=3,removed_qkv_half_reads_per_WG=6144,retained_input_half_bytes_per_lane=16,qkv_tiles_enumerated=24,cpu_check=run([runner,'--plan',plan,'--cpu-check']));(N/'CANDIDATE.json').write_text(json.dumps(m,indent=2));(N/'run').mkdir(exist_ok=True);(N/'captures').mkdir(exist_ok=True)
+for kind in ['GATES','NATIVE','ORDINARY']:
+ task=rd(tmpl/f'LUNA-{kind}.json');task['output_root']=str(N);task['identities']=[x for x in task['identities'] if not x['path'].endswith('.spv') and not x['path'].endswith('weights.bin')]+[m['spv']]
+ for j in task['jobs']:
+  j['id']=j['id'].replace('f01-residual','f20-qkv-owner');j['runner_output']=str(N/'run'/j['id']);j['argv'][j['argv'].index('--out')+1]=j['runner_output'];j['plan']=baseline['plan'] if j['candidate']=='parent' else m['plan'];j['argv'][j['argv'].index('--plan')+1]=j['plan']['path']
+  if j['candidate']!='parent':j['candidate']='candidate' if kind=='ORDINARY' else 'f20-qkv-owner'
+  if kind=='NATIVE':j['argv'][5]=j['id'];j['argv'][7]=str(N/'captures');j['argv'][9]=str(N/(j['id']+'.log'));j['capture_output']=str(N/'captures'/j['id'])
+ (N/f'LUNA-{kind}.json').write_text(json.dumps(task,indent=2))
+print(m['cpu_check'],m['spv'])

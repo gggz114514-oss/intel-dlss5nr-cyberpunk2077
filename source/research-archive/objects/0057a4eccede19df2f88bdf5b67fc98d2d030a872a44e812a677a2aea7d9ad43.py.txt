@@ -1,0 +1,82 @@
+"""Is the block-exit relL2 gain real in the bulk, or only in the extreme tail?
+
+skip4 has absmax 184 but p99.9 = 32.8, so a plain L2 is dominated by ~0.005% of the
+elements.  A local metric that only improves the tail can coexist with a worse bulk.
+"""
+import sys, json
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+HERE = Path(__file__).resolve().parent.parent
+D = L.D
+teacher = np.fromfile(D / "dump-fp16/dump_skip4.bin", dtype="<f2").astype(np.float32)
+arms = {
+    "frozen_minmax": D / "c32-minmax/local-b4/replayed-network.bin",
+    "x_equalised": D / "c32-equalized-b4/local-b4/replayed-network.bin",
+    "x_plus_e": HERE / "runs/S01-B4-LOCAL/replayed-network.bin",
+}
+rows = {}
+for name, path in arms.items():
+    a = np.fromfile(path, dtype="<f2").astype(np.float32)
+    e = a - teacher
+    ate = np.abs(teacher)
+    out = dict(rel_l2=L.rel_l2(a, teacher),
+               rms_err=float(np.sqrt(np.mean(e ** 2))),
+               med_abs_err=float(np.median(np.abs(e))),
+               mean_abs_err=float(np.mean(np.abs(e))))
+    for thr in (32.0, 16.0, 8.0):
+        m = ate <= thr
+        out[f"rel_l2_below_{int(thr)}"] = L.rel_l2(a[m], teacher[m])
+        out[f"rms_err_below_{int(thr)}"] = float(np.sqrt(np.mean(e[m] ** 2)))
+        out[f"coverage_below_{int(thr)}"] = float(m.mean())
+    # error energy share of the extreme tail
+    tail = ate > 32.0
+    out["tail_energy_share_of_err"] = float(np.sum(e[tail] ** 2) / np.sum(e ** 2))
+    out["tail_element_share"] = float(tail.mean())
+    rows[name] = out
+    print(f"{name:14s} relL2={out['rel_l2']:.6f} rms={out['rms_err']:.5f} med={out['med_abs_err']:.5f} "
+          f"relL2(<32)={out['rel_l2_below_32']:.6f} rms(<32)={out['rms_err_below_32']:.5f} "
+          f"med={out['med_abs_err']:.5f} tail_share_of_err={out['tail_energy_share_of_err']:.4f}")
+
+print("\nper-channel median |err| (bulk metric) ")
+for name, path in arms.items():
+    a = np.fromfile(path, dtype="<f2").astype(np.float32).reshape(-1, 32) if False else None
+rows2 = {}
+v_t = teacher.reshape(-1, 512)
+for name, path in arms.items():
+    v = np.fromfile(path, dtype="<f2").astype(np.float32).reshape(-1, 512)
+    # channel c of a tile sits at (c//16)*256 + ((c//8)%2)*8 + col*16 + c%8
+    med = np.empty(32); rms = np.empty(32)
+    for c in range(32):
+        off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+        idx = np.arange(off, off + 256, 16)          # 16 column offsets
+        idx = (np.arange(v.shape[0])[:, None] * 512 + idx[None, :]).ravel()
+        e = v.ravel()[idx] - np.concatenate([v_t[i].ravel()[idx[i * 0:(i + 1) * 0 + 16]]
+                                            for i in range(0)]) if False else None
+    # simple: use the flattened per-tile view
+    tv = v.reshape(-1, 16, 32) if False else None
+rows2 = None
+
+# cleaner per-channel view
+def tile_view(flat):
+    v = np.fromfile(flat, dtype="<f2").astype(np.float32).reshape(-1, 512)
+    out = np.empty((v.shape[0], 16, 32), np.float32)
+    for c in range(32):
+        off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+        out[:, :, c] = v[:, off: off + 16 * 16: 16]
+    return out
+
+
+te = tile_view(D / "dump-fp16/dump_skip4.bin")
+per_ch = {}
+for name, path in arms.items():
+    a = tile_view(path)
+    d = a - te
+    per_ch[name] = dict(median_abs=np.median(np.abs(d), axis=(0, 1)).tolist(),
+                        rms=np.sqrt((d ** 2).mean(axis=(0, 1))).tolist())
+    print(f"{name:14s} median|err| overall {float(np.median(np.abs(d))):.5f} "
+          f"bulk-rms(median channel) {float(np.median(per_ch[name]['rms'])):.5f}")
+(HERE / "CPU" / "exit_error_shape.json").write_text(json.dumps(dict(rows=rows, per_channel=per_ch), indent=2))

@@ -1,0 +1,73 @@
+from pathlib import Path
+import shutil,json,subprocess,hashlib
+B=Path('@NR_WORKSPACE@');A=B/'work/codex-astra-fp16-int8-audit-20261024';D=A/'game-latest-20261028';R=A/'prep-gpu-handoff-20261028';R.mkdir(exist_ok=False)
+SRC=B/'work/github-release-intel-dlss5nr-cyberpunk2077-20261023/validation/clean-002/repo/source'
+shutil.copytree(D/'full/source/vulkan',R/'source/vulkan');shutil.copytree(SRC/'bridge',R/'source/bridge')
+p=R/'source/vulkan/nrb_vulkan_processor.cpp';s=p.read_text(encoding='utf8')
+s=s.replace('uint64_t copy_fence_value = 0;', 'uint64_t copy_fence_value = 0;\n    VkSemaphore copy_ready = VK_NULL_HANDLE; // persistent imported D3D12 copy timeline')
+anchor='    c->init_ok = true; // Device/pool and actual backend both initialized.'
+init='''    if (!c->copy_ready) {
+        NRVK_DEV_FN(CreateSemaphore); NRVK_DEV_FN(ImportSemaphoreWin32HandleKHR);
+        VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        type.semaphoreType=VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo create{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,&type};
+        if(pfn_CreateSemaphore(c->device,&create,nullptr,&c->copy_ready)!=VK_SUCCESS) return NRB_PROCESS_ERROR;
+        VkImportSemaphoreWin32HandleInfoKHR import{VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR};
+        import.semaphore=c->copy_ready;import.handleType=VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;import.handle=c->copy_fence_nt;
+        if(pfn_ImportSemaphoreWin32HandleKHR(c->device,&import)!=VK_SUCCESS) {
+            NRVK_DEV_FN(DestroySemaphore);pfn_DestroySemaphore(c->device,c->copy_ready,nullptr);c->copy_ready=VK_NULL_HANDLE;
+            return NRB_PROCESS_ERROR;
+        }
+    }
+'''
+assert anchor in s;s=s.replace(anchor,init+anchor,1)
+start=s.index('    // [GPU 路径 3] 输入方向（T5 已验证）');end=s.index('    // [S1 v4]',start)
+s=s[:start]+'''    // The copy queue signals copy_fence_value after all input copies. Vulkan
+    // waits for that exact value in its submit; no CPU input wait is needed.
+
+'''+s[end:]
+anchor='        tsi.signalSemaphoreValueCount = 1; tsi.pSignalSemaphoreValues = &sv;'
+s=s.replace(anchor,anchor+'\n        tsi.waitSemaphoreValueCount=1;tsi.pWaitSemaphoreValues=&c->copy_fence_value;',1)
+anchor='        si.commandBufferCount = 1; si.pCommandBuffers = &slot.cb;'
+s=s.replace(anchor,anchor+'\n        VkPipelineStageFlags input_stage=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;\n        si.waitSemaphoreCount=1;si.pWaitSemaphores=&c->copy_ready;si.pWaitDstStageMask=&input_stage;',1)
+anchor='            for (auto& sl : c->slots) {'
+pos=s.index(anchor,s.index('int nrvk_retire'))
+s=s[:pos]+'            if(c->copy_ready){pfn_DestroySemaphore(c->device,c->copy_ready,nullptr);c->copy_ready=VK_NULL_HANDLE;}\n'+s[pos:]
+# The export is a versioned opt-in contract, queried from the module that owns process().
+export='''extern "C" __declspec(dllexport)
+int NRVK_PreparedGpuOrderedV1(void* context,ID3D12Device* device,ID3D12CommandQueue* queue) {
+    Ctx* c=static_cast<Ctx*>(context);
+    if(!c || c!=g_ctx || !device || !queue) return 0;
+    std::lock_guard<std::mutex> lock(c->mu);
+    // On every call process() enqueues copies on frame.queue, which is the
+    // same producer queue. The imported timeline gates every Vulkan command.
+    return c->d3d==device && c->init_ok && c->copy_ready!=VK_NULL_HANDLE;
+}
+
+'''
+s=s.replace('int NRVK_InteropSelfTestD3D12(',export+'int NRVK_InteropSelfTestD3D12(',1);p.write_text(s,encoding='utf8')
+identity=(D/'full/generated/nrvk_build_identity.inc').read_text().replace('optimized-full-20261028','optimized-full-gpu-handoff-v1');(R/'source/vulkan/nrvk_build_identity.inc').write_text(identity,encoding='utf8')
+p=R/'source/bridge/src/nr_gpu_handoff.cpp';s=p.read_text(encoding='utf8');anchor='    const bool bypass=gate.stats.requested && identity && gate.stats.cap_healthy && !motion;'
+replace='''    bool vulkan_ordered=false;
+#ifdef _WIN32
+    if(!motion && same_processor(p,gate.processor) && device && queue) {
+        HMODULE module=nullptr;
+        if(GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(p.process),&module)) {
+            using Query=int(*)(void*,ID3D12Device*,ID3D12CommandQueue*);
+            auto query=reinterpret_cast<Query>(GetProcAddress(module,"NRVK_PreparedGpuOrderedV1"));
+            vulkan_ordered=query && query(p.context,device,queue)==1;
+        }
+    }
+#endif
+    const bool bypass=vulkan_ordered || (gate.stats.requested && identity && gate.stats.cap_healthy && !motion);'''
+assert anchor in s;s=s.replace(anchor,replace,1);p.write_text(s,encoding='utf8')
+cm=Path('E:/VS2022BT/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe');deps=SRC.parent.parent/'deps/optiscaler'
+# deps is sibling of repo under clean-002
+assert deps.exists(),deps
+commands=[('vk-config',[str(cm),'-S',str(R/'source/vulkan'),'-B',str(R/'vk-build'),'-G','Visual Studio 17 2022','-A','x64','-DNR_MODEL_DIR='+str(D/'full'),'-DVULKAN_INCLUDE_DIR='+str(B/'src/project/third_party/Vulkan-Headers/include')]),('bridge-config',[str(cm),'-S',str(R/'source/bridge'),'-B',str(R/'bridge-build'),'-G','Visual Studio 17 2022','-A','x64','-DOPTISCALER_SOURCE='+str(deps),*['-D'+x+'=ON' for x in ['NRB_XESS_IDENTITY_TEST','NRB_DEFERRED_IDENTITY_TEST','NRB_TAIL_ORDER_PROBE','NRB_LIVE_NR_TEST','NRB_MULTI_ROUTE_LIVE']]])]
+for sub in ['vk','bridge']:
+ commands += [(sub+'-build',[str(cm),'--build',str(R/(sub+'-build')),'--config','Release','--parallel','4']),(sub+'-tests',[str(cm.parent/'ctest.exe'),'--test-dir',str(R/(sub+'-build')),'-C','Release','--output-on-failure'])]
+for name,args in commands:
+ r=subprocess.run(args,capture_output=True,encoding='utf8',errors='replace');(R/(name+'.log')).write_text(r.stdout+r.stderr,encoding='utf8');assert r.returncode==0,(name,r.stdout[-2500:],r.stderr[-1000:])
+print('Builds and CPU tests PASS')

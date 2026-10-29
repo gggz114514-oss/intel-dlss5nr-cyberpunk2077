@@ -1,0 +1,42 @@
+from pathlib import Path
+import hashlib,json
+import numpy as np
+R=Path('@NR_WORKSPACE@');O=R/'work/codex-astra-fp16-int8-audit-20261024'
+def identity(p):
+ b=p.read_bytes();return dict(path=p.as_posix(),sha256=hashlib.sha256(b).hexdigest(),bytes=len(b))
+rng=np.random.default_rng(20261024)
+# Four components represent four independent rows per lane half; exercise 128 rows per WG.
+z=rng.uniform(-2,2,(128,32)).astype(np.float16)
+z[:8]=0
+z[8:16]=np.float16(0.0001)
+z[16:24]=np.float16(0.25)
+# Exact parent half operations, with independent reference tree per token.
+s=(z[:,:16]*z[:,:16]+z[:,16:]*z[:,16:]).astype(np.float16)
+parent=s.copy()
+for step in [8,4,2,1]:parent[:,:step]=(parent[:,:step]+parent[:,step:2*step]).astype(np.float16)
+# Emulate lane-owned columns. Snapshot before each shuffle models subgroup lockstep.
+owner=s.copy()
+for step in [8,4,2,1]:
+ before=owner.copy()
+ for lane in range(16):
+  if lane<step:owner[:,lane]=(before[:,lane]+before[:,lane^step]).astype(np.float16)
+assert np.array_equal(parent[:,0].view(np.uint16),owner[:,0].view(np.uint16))
+# CPU reciprocal is deliberately shared oracle: does NOT model native GPU rsqrt accuracy.
+inv=(np.float32(1)/np.sqrt(np.maximum(parent[:,0],np.float16(0.000062)).astype(np.float32))).astype(np.float16)
+broadcast=np.repeat(inv[:,None],32,axis=1)
+scale=np.float16(0.75)
+counts={}
+for branch in ['Q','K','V']:
+ ref=z.copy();out=z.copy()
+ if branch=='Q':ref=(ref*np.float16(5.65625)).astype(np.float16);out=(out*np.float16(5.65625)).astype(np.float16)
+ if branch!='V':ref=(ref*inv[:,None]).astype(np.float16);out=(out*broadcast).astype(np.float16)
+ if branch=='Q':ref=(ref*scale).astype(np.float16);out=(out*scale).astype(np.float16)
+ assert np.array_equal(ref.view(np.uint16),out.view(np.uint16));counts[branch]=int(out.size)
+# Reproduce why using each lane's incomplete node as final norm is invalid.
+wrong=(np.float32(1)/np.sqrt(np.maximum(owner,np.float16(0.000062)).astype(np.float32))).astype(np.float16)
+wrong_count=int(np.count_nonzero(wrong.view(np.uint16)!=np.repeat(inv[:,None],16,axis=1).view(np.uint16)))
+assert wrong_count>0
+paths=[R/'candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-qkv-v2/source/vit_nb04_qkv_int8.comp',R/'candidates/zcode-fp16-b5-global-expansion-20261020/vit-qkv-norm-owner-v2/source/vit_qkv_norm_owner_handoff.glsl']
+result=dict(scope='CPU half reduction-tree/owner broadcast emulation only; shared CPU rsqrt oracle, not GPU numerical or compiler validation; finite sampled inputs only',rows=128,half_tree_mismatches=0,branch_output_components=counts,branch_bit_mismatches=0,incorrect_partial_node_reciprocal_mismatches=wrong_count,sources=[identity(p) for p in paths],register_schedule='Narrow all four INT32 fragments before norm; end wide lifetime; process two groups with static variables. Verify compiler liveness/native spills.',remaining=['SPIR-V identities and matrix component mapping','native half rounding and rsqrt','current-input INT8 gate and ordinary output','native GRF/scratch/SLM and allocated GPU timing'])
+(O/'VIT-NORM-OWNER-CPU-PROOF.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
+print(json.dumps(result))

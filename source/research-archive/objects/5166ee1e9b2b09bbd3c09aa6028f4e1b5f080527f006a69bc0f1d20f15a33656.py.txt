@@ -1,0 +1,90 @@
+"""Executed-region accounting for the F05 kernels (debug==0 main path).
+
+The Intel EU ISA listing has one instruction per line with the offset in the
+`[ADDR]` comment.  The debug echo path is compiled as `(W&~f2.0) jmpi Lskip`
+right before each echo block, so with debug==0 every instruction between such
+a jump and its target is not executed.  This script classifies each
+instruction as LIVE or DEBUG-SKIPPED by that rule and prints the opcode
+histograms of the two sets, plus the expensive-op sites (math.inv / math.rsqt /
+sel / cast-like mov / fp32 chains).
+
+It is a static listing analysis: no GPU, no driver.
+"""
+import re, sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+C = Path(r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027")
+CAP = C / "queue/n29-f01-alu-chain/native/captures/native-native-base/ISA"
+KERN = {64: "6a22246177be2653", 128: "f98d5ab4e239dd54", 256: "abd166013c088927"}
+LINE = re.compile(r"^/\* \[([0-9A-F]+)\]\s+\*/\s+(.*)$")
+LBL = re.compile(r"^L(\d+):")
+
+
+def load(width):
+    f = list(CAP.glob("CS_asm%s*" % KERN[width]))
+    assert len(f) == 1, f
+    lines = f[0].read_text(encoding="utf-8", errors="replace").splitlines()
+    ins, labels = [], {}
+    for ln in lines:
+        m = LBL.match(ln.strip())
+        if m:
+            labels[int(m.group(1))] = len(ins)
+            continue
+        m = LINE.match(ln)
+        if not m:
+            continue
+        text = m.group(2).strip()
+        toks = text.split()
+        pred, i = [], 0
+        while i < len(toks) and toks[i].startswith("(") and toks[i].endswith(")"):
+            pred.append(toks[i])
+            i += 1
+        ins.append(dict(idx=len(ins), addr=int(m.group(1), 16), text=text,
+                        pred=" ".join(pred), op=(toks[i] if i < len(toks) else ""),
+                        args=" ".join(toks[i + 1:]), live=True))
+    return ins, labels
+
+
+def classify(width, ins, labels):
+    """mark debug-skipped ranges.
+
+    The debug echo path is guarded by one jump per echo block whose predicate
+    is the *inverse* of the `cmp ... f2.0, r2.3, 0` at the prologue, so with
+    debug == 0 (pc.p1.w == 0, r2.3 == 0) the jump is taken and the block is
+    skipped.  Polarity: cmp is (ne) in C64/C128 -> guard (W&~f2.0);
+    cmp is (eq) in C256 -> guard (W&f2.0).  Verified against the cmp listing.
+    """
+    guard = None
+    for it in ins:
+        if it["op"] == "cmp" and "f2.0" in it["text"] and "r2.3" in it["text"]:
+            guard = "(W&~f2.0)" if "(ne)f2.0" in it["text"] else "(W&f2.0)"
+            break
+    assert guard, "no debug flag cmp found"
+    for it in ins:
+        if it["op"] == "jmpi" and it["pred"] == guard:
+            a = it["args"].split()
+            if a and a[0].startswith("L"):
+                tgt = labels.get(int(a[0][1:]))
+                if tgt is not None:
+                    for j in range(it["idx"], tgt):
+                        ins[j]["live"] = False
+    return ins, guard
+
+
+def hist(ins, live=True):
+    return Counter(i["op"] for i in ins if i["live"] is live)
+
+
+if __name__ == "__main__":
+    for w in (64, 128, 256):
+        ins, labels = load(w)
+        ins, guard = classify(w, ins, labels)
+        nl = sum(1 for i in ins if i["live"])
+        print("=" * 70)
+        print("c%d: %d instructions, live=%d, debug-skipped=%d (%.1f%%)"
+              % (w, len(ins), nl, len(ins) - nl, 100.0 * (len(ins) - nl) / len(ins)))
+        h = hist(ins, True)
+        print(" LIVE:", dict(sorted(h.items(), key=lambda kv: -kv[1])))
+        d = hist(ins, False)
+        print(" DEBUG:", dict(sorted(d.items(), key=lambda kv: -kv[1])[:12]))

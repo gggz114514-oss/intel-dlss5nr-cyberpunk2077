@@ -1,0 +1,164 @@
+"""S06 block15 final: build the equalised pack, then verify it from its own bytes.
+
+All reported numbers are produced by reading a pack *file* back from disk and
+replaying the exact shader arithmetic (expand_mid_int8 -> contract_int8), so the
+measurement does not depend on any in-memory history of the search.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+import c256b15 as L
+
+W = L.W
+PKG = W / "PACK"
+PKG.mkdir(exist_ok=True)
+FRAMES = [("34189", L.D / "dump-fp16"),
+          ("41444", L.D / "teacher-diagnostics/teacher-41444"),
+          ("43654", L.D / "teacher-diagnostics/teacher-43654")]
+
+search = json.loads((W / "evidence/06-calibration-search.json").read_text())
+diag = np.load(W / "evidence/06-diag.npy")
+sX = search["new"]["scales"]["sX"]
+sA = search["new"]["scales"]["sA"]
+sM = search["new"]["scales"]["sM"]
+
+idx, oob = L.window_to_canonical()
+valid = idx >= 0
+NW = L.N_TOK
+We, Wm, Wc, rs = L.decode_weights()
+raw_old = np.fromfile(L.PACK_OLD, dtype=np.uint8)
+
+# ---------------------------------------------------------------- build pack
+qWm, sWm = L.pack_codes(Wm, 128)
+qWc, sWc = L.pack_codes(Wc, 256)
+wt = We.astype(np.float64) * diag[None, :]
+sWe = np.maximum(np.abs(wt).max(axis=1) / 127.0, 1e-12)
+qWe = np.clip(np.rint(wt / sWe[:, None]), -127.0, 127.0).astype(np.int8)
+absX_eq = float(np.abs(wt).max() * 127.0 / sWe.max()) if False else float((np.max(np.abs(wt), axis=1) / sWe).max() * sX)
+invX = float(np.float32(1.0 / sX))
+invA = float(np.float32(1.0 / sA))
+invM = float(np.float32(1.0 / sM))
+invx_tab = (np.float32(1.0 / sX) / diag).astype("<f4")
+
+new = raw_old.copy()
+new[L.WC_OFF:L.WE_OFF] = L.to_pack_bytes(qWc, 256).view(np.uint8)
+new[L.WE_OFF:L.WM_OFF] = L.to_pack_bytes(qWe, 256).view(np.uint8)
+new[L.WM_OFF:L.SC_OFF] = L.to_pack_bytes(qWm, 128).view(np.uint8)
+new[L.EW_OFF:L.EW_OFF + 4096] = np.frombuffer((np.float64(sX) * sWe).astype("<f4").tobytes(), dtype=np.uint8)
+new[L.MW_OFF:L.MW_OFF + 1024] = np.frombuffer((np.float64(sA) * sWm).astype("<f4").tobytes(), dtype=np.uint8)
+new[L.ALPHA_OFF:L.ALPHA_OFF + 1024] = np.frombuffer((np.float64(sM) * sWc).astype("<f4").tobytes(), dtype=np.uint8)
+new[L.SWE_OFF:L.SWE_OFF + 4096] = np.frombuffer(sWe.astype("<f4").tobytes(), dtype=np.uint8)
+new[L.SWM_OFF:L.SWM_OFF + 1024] = np.frombuffer(sWm.astype("<f4").tobytes(), dtype=np.uint8)
+new[L.SWC_OFF:L.SWC_OFF + 1024] = np.frombuffer(sWc.astype("<f4").tobytes(), dtype=np.uint8)
+scal = np.zeros(32, dtype="<f4")
+scal[0] = invX; scal[1] = invA; scal[2] = invM
+scal[3] = sX; scal[4] = sA; scal[5] = sM
+scal[6] = float(np.max(np.abs(wt) / sWe[:, None])) if False else float(absX_eq)
+scal[7] = float(np.max(np.abs(qWe.astype(np.float32) * sWe[:, None]) * sX))
+scal[8] = float(sM * 127.0)
+scal[9:12] = [256.0, 128.0, 256.0]
+scal[12] = 1.0
+new[L.SCAL_OFF:L.SCAL_OFF + 128] = np.frombuffer(scal.tobytes(), dtype=np.uint8)
+# per-input-channel inverse table in the formerly-unused 2,944 B pad (373,888)
+pass
+new[L.PAD_OFF:L.PAD_OFF + 1024] = np.frombuffer(invx_tab.tobytes(), dtype=np.uint8)
+new[L.PAD_OFF + 1024:L.PAD_OFF + L.PAD_BYTES] = 0
+assert new[L.QX_OFF:L.QX_OFF + L.QX_BYTES].tobytes() == raw_old[L.QX_OFF:L.QX_OFF + L.QX_BYTES].tobytes()
+assert new[L.QA_OFF:].tobytes() == raw_old[L.QA_OFF:].tobytes()
+
+out_pack = PKG / "c256_b15_int8_qxeq.bin"
+out_pack.write_bytes(new.tobytes())
+pack_sha = L.sha256(out_pack)
+
+
+# -------------------------------------------------- replay from pack *bytes*
+def decode_pack(raw):
+    codes = dict(
+        wc=L.from_pack_bytes(raw[L.WC_OFF:L.WE_OFF].view(np.int8), 256, 256),
+        we=L.from_pack_bytes(raw[L.WE_OFF:L.WM_OFF].view(np.int8), 1024, 256),
+        wm=L.from_pack_bytes(raw[L.WM_OFF:L.SC_OFF].view(np.int8), 256, 128))
+    sc = np.frombuffer(raw[L.SCAL_OFF:L.SCAL_OFF + 128].tobytes(), dtype="<f4")
+    d = dict(invX=float(sc[0]), invA=float(sc[1]), invM=float(sc[2]),
+             sX=float(sc[3]), sA=float(sc[4]), sM=float(sc[5]),
+             absX=float(sc[6]), absA=float(sc[7]), absM=float(sc[8]))
+    d["ew"] = np.frombuffer(raw[L.EW_OFF:L.EW_OFF + 4096].tobytes(), dtype="<f4")
+    d["mw"] = np.frombuffer(raw[L.MW_OFF:L.MW_OFF + 1024].tobytes(), dtype="<f4")
+    d["alpha"] = np.frombuffer(raw[L.ALPHA_OFF:L.ALPHA_OFF + 1024].tobytes(), dtype="<f4")
+    rsv = np.frombuffer(raw[L.RS_OFF:L.RS_OFF + 1024].tobytes(), dtype="<f4").astype(np.float16)
+    tab = np.frombuffer(raw[L.PAD_OFF:L.PAD_OFF + 1024].tobytes(), dtype="<f4")
+    return codes, d, rsv, tab
+
+
+def run(raw, Xw, use_tab):
+    codes, d, rsv, tab = decode_pack(raw)
+    inv_tab = tab.astype(np.float64) if use_tab else np.full(256, d["invX"], dtype=np.float64)
+    qx = np.clip(np.rint(Xw.astype(np.float64) * inv_tab[None, :]), -127.0, 127.0)
+    acc = qx @ codes["we"].astype(np.float64).T
+    v = np.float32(acc.astype(np.float32) * d["ew"][None, :])
+    ha = L.act_half32(L.narrow_half(v))
+    qa = np.clip(np.rint((ha * d["invA"]).astype(np.float64)), -127.0, 127.0).astype(np.int64)
+    qa_f = qa.astype(np.float64)
+    mreal = np.empty((NW, 256), dtype=np.float32)
+    for g in range(L.MID_GROUPS):
+        sl = slice(32 * g, 32 * g + 32)
+        r = qa_f[:, 128 * g:128 * g + 128] @ codes["wm"][sl].astype(np.float64).T
+        mreal[:, sl] = r.astype(np.float32) * d["mw"][sl][None, :]
+    qm = np.clip(np.rint((mreal * np.float32(d["invM"])).astype(np.float64)), -127.0, 127.0).astype(np.int64)
+    acc3 = qm @ codes["wc"].astype(np.float64).T
+    real = acc3.astype(np.float32) * d["alpha"][None, :]
+    seed = L.narrow_half(Xw * rsv[None, :])
+    y = np.float32(real + seed).astype(np.float16)
+    st = dict(qx_sat=int((np.abs(qx) >= 127).sum()), qx_n=int(qx.size),
+              qa_sat=int((np.abs(qa) >= 127).sum()), qa_n=int(qa.size),
+              qm_sat=int((np.abs(qm) >= 127).sum()), qm_n=int(qm.size),
+              qx_zero=int((qx == 0).sum()), qa_zero=int((qa == 0).sum()), qm_zero=int((qm == 0).sum()))
+    return y.astype(np.float32), qx, qa, qm, st
+
+
+res = {"old": {}, "new": {}}
+se_old = se_new = se_ref = 0.0
+n_tot = 0
+for name, td in FRAMES:
+    Xc = L.load_x_canonical(td / "dump_block14_out.bin")
+    Y = np.fromfile(td / "dump_swin_15_Y.bin", dtype="<f2").reshape(NW, 256).astype(np.float32)
+    Xw = np.zeros((NW, 256), dtype=np.float32)
+    Xw[valid] = Xc[idx[valid]]
+    y_old, *_ = run(raw_old, Xw, False)
+    y_new, qx, qa, qm, st = run(new, Xw, True)
+    vY = Y[valid].astype(np.float64)
+    do = y_old[valid].astype(np.float64) - vY
+    dn = y_new[valid].astype(np.float64) - vY
+    se_old += float(np.sum(do * do)); se_new += float(np.sum(dn * dn))
+    se_ref += float(np.sum(vY * vY)); n_tot += vY.size
+    res["old"][name] = dict(rel_l2=float(np.sqrt(np.mean(do ** 2) / np.mean(vY ** 2))),
+                            max_abs=float(np.abs(do).max()), rms=float(np.sqrt(np.mean(do ** 2))))
+    res["new"][name] = dict(rel_l2=float(np.sqrt(np.mean(dn ** 2) / np.mean(vY ** 2))),
+                            max_abs=float(np.abs(dn).max()), rms=float(np.sqrt(np.mean(dn ** 2))),
+                            **st)
+    # per-channel error map (which channels improved/worsened)
+    ec = np.sqrt(np.mean(do ** 2, axis=0)); nc = np.sqrt(np.mean(dn ** 2, axis=0))
+    res["new"][name]["channel_err_improved"] = int((nc < ec).sum())
+    res["new"][name]["channel_err_worsened"] = int((nc > ec).sum())
+pooled_old = float(np.sqrt(se_old / se_ref))
+pooled_new = float(np.sqrt(se_new / se_ref))
+out = dict(
+    block=15, pack=str(out_pack), pack_sha256=pack_sha, pack_bytes=len(new),
+    old_pack=str(L.PACK_OLD), old_pack_sha256=L.PACK_OLD_SHA,
+    frames=[f[0] for f in FRAMES], tokens_per_frame=int(valid.sum()),
+    pooled=dict(old_rel_l2=pooled_old, new_rel_l2=pooled_new,
+                improvement=1 - pooled_new / pooled_old),
+    per_frame=res, scales=dict(sX=sX, invX=invX, sA=sA, invA=invA, sM=sM, invM=invM),
+    diagonal=dict(min=float(diag.min()), max=float(diag.max()),
+                  values=sorted(float(v) for v in np.unique(diag)),
+                  counts={str(float(v)): int((diag == v).sum()) for v in np.unique(diag)}),
+    sWe_change=dict(old_min=float(np.min(np.abs(L.pack_codes(We, 256)[1]))),
+                    new_min=float(sWe.min()), old_max=float(np.max(L.pack_codes(We, 256)[1])),
+                    new_max=float(sWe.max())),
+    round_trip=dict(note="numbers above are produced by reading the pack file back from disk"),
+)
+(W / "evidence/07-final.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
+print(json.dumps(out, indent=1)[:4000])

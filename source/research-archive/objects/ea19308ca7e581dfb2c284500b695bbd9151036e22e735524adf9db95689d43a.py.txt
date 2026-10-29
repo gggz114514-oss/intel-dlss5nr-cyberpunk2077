@@ -1,0 +1,54 @@
+"""Per-column alignment: the debug payload is a workgroup race mix (every workgroup
+writes the same dbg offsets), so match COLUMN BY COLUMN instead of by tile.
+
+For each (subgroup, column) we take the dumped X (32), E (128) and Y (32) and ask
+whether the dumped Y/E equal the CPU FFN applied to the dumped X.  A column that
+matches bit-exactly proves the address formula for X, E and Y at once.
+"""
+import sys, json
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+HERE = Path(__file__).resolve().parent.parent
+dbg = np.fromfile(HERE / "runs/S01-B4-ORACLE/swin_4_debug.bin", dtype="<f2")
+info = L.block_bindings(L.D / "c32-minmax/local-b4.txt", ordinal=4)
+we, wc = L.load_w8(info["w8"])
+fsc = L.load_fsc(info["fsc"])
+rs = L.load_rs(info["wb"], info["rs_base"])
+invx = np.full(32, np.float32(fsc[L.FSC_INV_X]))
+inve = np.full(128, np.float32(fsc[L.FSC_INV_E]))
+tap_e = fsc[L.FSC_TAP_E:L.FSC_TAP_E + 128]
+tap_c = fsc[L.FSC_TAP_C:L.FSC_TAP_C + 32]
+
+cols = []
+for sg in (0, 1):
+    for col in range(16):
+        X = dbg[22528 + sg * 512 + col * 32: 22528 + sg * 512 + col * 32 + 32]
+        E = dbg[sg * 2048 + col * 128: sg * 2048 + col * 128 + 128]
+        Y = dbg[8192 + sg * 512 + col * 32: 8192 + sg * 512 + col * 32 + 32]
+        cols.append((sg, col, X, E, Y))
+
+X = np.stack([c[2] for c in cols], axis=1).astype(np.float16)
+got = L.forward(X, we, wc, rs, invx, inve, tap_e, tap_c)
+
+rows = []
+for i, (sg, col, Xd, Ed, Yd) in enumerate(cols):
+    E_cpu = got["a_h"][:, i]
+    Y_cpu = got["y_half"][:, i]
+    rows.append(dict(sg=sg, col=col,
+                     X_absmax=float(np.abs(Xd.astype(np.float32)).max()),
+                     E_rel_l2=L.rel_l2(E_cpu, Ed), E_equal=float(np.mean(E_cpu == Ed)),
+                     Y_rel_l2=L.rel_l2(Y_cpu, Yd), Y_equal=float(np.mean(Y_cpu == Yd)),
+                     X_zero=bool(np.all(Xd == 0))))
+rows.sort(key=lambda r: r["Y_rel_l2"])
+for r in rows:
+    print(f"sg{r['sg']} col{r['col']:2d} |X|max={r['X_absmax']:.3f}  E relL2={r['E_rel_l2']:.4f} "
+          f"eq={r['E_equal']:.3f}  Y relL2={r['Y_rel_l2']:.4f} eq={r['Y_equal']:.3f}"
+          + ("  X==0" if r["X_zero"] else ""))
+ok = [r for r in rows if r["Y_equal"] > 0.99]
+print(f"\ncolumns with bit-exact Y: {len(ok)}/{len(rows)}; "
+      f"columns with bit-exact E: {sum(1 for r in rows if r['E_equal'] > 0.99)}")
+(HERE / "CPU" / "oracle_columns.json").write_text(json.dumps(rows, indent=2))

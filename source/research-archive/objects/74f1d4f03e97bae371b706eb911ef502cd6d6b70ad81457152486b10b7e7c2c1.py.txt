@@ -1,0 +1,197 @@
+"""N30 F20 ISA interval accounting (READ-ONLY, CPU only).
+
+Input: the captured ISA of THIS identity's ord 230
+  f20-coarse-owner-20261026/captures/native-f20-pixel-owner/ISA/
+    CS_asm76902ef344609c8a_simd32_0000000000000027_38_orig.asm
+  sha256 121a38aab2c6f26bb75eda1ec089a024cb21e2383c0471f4bf77c57cf248b8e1
+  kernel hash 76902ef344609c8a, pipe 38, ord 230, the dispatched baseline plan row.
+
+No GPU is used: this only re-reads a file that was captured earlier in the campaign.
+
+Output: build/isa.json
+  * every barrier group (send.gtwy signal barrier + sync.bar, with the nearest
+    preceding fence.slm) and its instruction offset,
+  * the message/instruction census of the interval between consecutive groups,
+  * the per-interval dpas.8x8 count, which is what identifies the stage each
+    interval belongs to (stage 1 = 16, stage 3 = 16, stage 4 = 12, stage 6 = 8,
+    stage 8 = 8, stage 9 = 4 per warp, all unrolled),
+  * totals that must reproduce evidence/cards COST-BREAKDOWN.md
+    (4754 instructions, send.slm 497, store.slm.d32x8t 160, load.slm.d32x8t 304,
+     dpas 64, sync.bar 12, sync.allwr 12, sync.allrd 16, fence.slm 11).
+"""
+import collections
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+ISA = pathlib.Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                   r'f20-coarse-owner-20261026/captures/native-f20-pixel-owner/ISA/'
+                   r'CS_asm76902ef344609c8a_simd32_0000000000000027_38_orig.asm')
+
+LINE = re.compile(r'^/\*\s*\[([0-9A-Fa-f]+)\]\s*\*/\s*(.*)$')
+MSGFIRST = re.compile(r'([a-z0-9_.]+)')
+
+
+def message_of(body):
+    """The message name from a send's trailing comment.
+
+    The comments look like `// wr:1+0, rd:1; load.ugm.d32x1t.a64.ca.cc.flat[A+0x68]`,
+    so take everything after the last ';' and read the leading dotted token (the
+    bracketed address that may follow is not part of the name).
+    """
+    if '//' not in body:
+        return None
+    tail = body.split('//', 1)[1].rsplit(';', 1)[-1].strip()
+    m = MSGFIRST.match(tail)
+    return m.group(1) if m else None
+
+
+def sha(p):
+    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+
+
+def parse():
+    ins = []
+    for ln, raw in enumerate(ISA.read_text(encoding='utf-8', errors='replace').splitlines()):
+        m = LINE.match(raw.strip())
+        if not m:
+            continue
+        off = int(m.group(1), 16)
+        body = m.group(2)
+        msg = message_of(body)
+        code = body.split('//')[0]
+        toks = code.split()
+        pred = ''
+        if toks and toks[0].startswith('('):
+            pred = toks[0]
+            toks = toks[1:]
+        op = toks[0] if toks else '?'
+        size = None
+        if any(t.startswith('(') and '|M0)' in t for t in toks):
+            for t in toks:
+                mm = re.match(r'^\((\d+)\|M0\)$', t)
+                if mm:
+                    size = int(mm.group(1))
+        ins.append(dict(line=ln + 1, off=off, pred=pred, op=op, exec=size, msg=msg,
+                        text=code.strip()))
+    return ins
+
+
+def cls(i):
+    if i['op'] in ('send.slm', 'send.ugm', 'send.gtwy') and i['msg']:
+        return i['op'] + ':' + i['msg']
+    if i['op'] in ('sync.bar', 'sync.allwr', 'sync.allrd', 'sync.nop', 'dpas.8x8',
+                   'jmpi', 'goto', 'join', 'fence.slm'):
+        return i['op']
+    return i['op']
+
+
+def msgs(counter, op, needle=None):
+    """{message name: count} for one send class, optionally filtered."""
+    out = {}
+    for k, v in counter.items():
+        if not k.startswith(op + ':'):
+            continue
+        name = k.split(':', 1)[1]
+        if needle and needle not in name:
+            continue
+        out[name] = out.get(name, 0) + v
+    return dict(sorted(out.items()))
+
+
+def main():
+    assert ISA.exists(), ISA
+    ins = parse()
+    census = collections.Counter(cls(i) for i in ins)
+    for i in ins:
+        if i['msg'] and i['msg'].startswith('fence.slm'):
+            census['fence.slm'] += 1
+
+    # barrier groups: (send.gtwy signal barrier) + sync.bar
+    groups = []
+    for k, i in enumerate(ins):
+        if i['op'] == 'sync.bar':
+            sig = None
+            fence = None
+            for j in range(k - 1, max(-1, k - 8), -1):
+                if ins[j]['op'] == 'send.gtwy' and (ins[j]['msg'] or '').startswith('signal'):
+                    sig = ins[j]['off']
+                if ins[j]['msg'] and ins[j]['msg'].startswith('fence.slm'):
+                    fence = ins[j]['off']
+                    break
+            groups.append(dict(sync_bar_off=i['off'], signal_off=sig, fence_slm_off=fence,
+                               index=k))
+    # intervals
+    bounds = [0] + [g['index'] for g in groups] + [len(ins)]
+    intervals = []
+    for a in range(len(bounds) - 1):
+        seg = ins[bounds[a]:bounds[a + 1]]
+        c = collections.Counter(cls(x) for x in seg)
+        intervals.append(dict(
+            interval=a,
+            first_off='0x%04X' % (seg[0]['off'] if seg else -1),
+            last_off='0x%04X' % (seg[-1]['off'] if seg else -1),
+            instructions=len(seg),
+            dpas=c.get('dpas.8x8', 0),
+            sync_allwr=c.get('sync.allwr', 0),
+            sync_allrd=c.get('sync.allrd', 0),
+            slm_stores=msgs(c, 'send.slm', 'store.'),
+            slm_loads=msgs(c, 'send.slm', 'load.'),
+            ugm=msgs(c, 'send.ugm'),
+            gtwy=sum(v for k, v in c.items() if k.startswith('send.gtwy:')),
+        ))
+
+    # message accounting: the campaign's constant is "8 SLM messages per fragment
+    # transfer", so the load/store split has to be reported separately.
+    send = collections.Counter()
+    for k, v in census.items():
+        if k.startswith('send.'):
+            send[k] += v
+    slm_load = sum(v for k, v in send.items() if ':load.slm' in k)
+    slm_store = sum(v for k, v in send.items() if ':store.slm' in k)
+    frag_load = sum(v for k, v in send.items() if k.endswith(':load.slm.d32x8t.a32'))
+    frag_store = sum(v for k, v in send.items() if k.endswith(':store.slm.d32x8t.a32'))
+    signals = sum(v for k, v in send.items() if k.startswith('send.gtwy:signal'))
+    gtwy = sum(v for k, v in send.items() if k.startswith('send.gtwy:'))
+    out = dict(
+        isa=dict(path=str(ISA), sha256=sha(ISA)),
+        instructions=len(ins),
+        census=dict(sorted(census.items())),
+        barrier_groups=groups,
+        barrier_count=len(groups),
+        messages=dict(send_slm_loads=slm_load, send_slm_stores=slm_store,
+                      send_slm_total=slm_load + slm_store,
+                      fragment_loads_d32x8t=frag_load,
+                      fragment_stores_d32x8t=frag_store,
+                      fragment_total=frag_load + frag_store,
+                      send_ugm=sum(v for k, v in send.items() if k.startswith('send.ugm:')),
+                      gtwy=gtwy, gtwy_signals=signals, gtwy_end_of_thread=gtwy - signals,
+                      fence_slm=census.get('send.slm:fence.slm.none.group', 0)),
+        intervals=intervals,
+    )
+    (CARD / 'build').mkdir(exist_ok=True)
+    (CARD / 'build/isa.json').write_text(json.dumps(out, indent=1), encoding='utf-8')
+
+    print('instructions:', out['instructions'])
+    print('census:', json.dumps(out['census'], indent=0)[:2000])
+    print()
+    print('%-4s %-7s %-7s %-6s %5s %5s %5s  %s' % ('#', 'first', 'last', 'instr', 'dpas',
+                                                   'allwr', 'allrd', 'slm stores / loads'))
+    for v in intervals:
+        print('%-4d %-7s %-7s %-6d %5d %5d %5d  S%s L%s' % (
+            v['interval'], v['first_off'], v['last_off'], v['instructions'], v['dpas'],
+            v['sync_allwr'], v['sync_allrd'],
+            json.dumps(v['slm_stores']), json.dumps(v['slm_loads'])))
+    print()
+    for g in groups:
+        print('barrier @0x%04X  signal=%s fence.slm=%s' % (
+            g['sync_bar_off'],
+            '0x%04X' % g['signal_off'] if g['signal_off'] else None,
+            '0x%04X' % g['fence_slm_off'] if g['fence_slm_off'] else None))
+
+
+if __name__ == '__main__':
+    main()

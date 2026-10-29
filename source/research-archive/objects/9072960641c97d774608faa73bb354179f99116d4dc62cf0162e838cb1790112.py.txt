@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""B3 multiset SPIR-V diff: opcode+word-count histogram delta, parent vs candidate.
+
+Required by the card: list every "parent has, child lacks" / "child has, parent
+lacks" class and attribute it.  Refuses (exit 1) when a delta class cannot be
+explained by the declared change set (copy elimination / temporary variables /
+conversion relocation / ID renumbering).
+
+Also proves the *placement* change: the widen call sites and the first K
+cooperative-matrix multiply-add of the contract phase are compared by program
+order in both modules.
+"""
+import json
+import sys
+
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024/candidates/b3-c32-seed/tools")
+from b3_spv import Module, OPNAME  # noqa: E402
+
+CARD = r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024/candidates/b3-c32-seed"
+BUILD = r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024/build/b3-c32-seed"
+
+# declared change classes: opcode -> class
+CLASS_OF = {
+    59: "temporary_variable",      # OpVariable
+    61: "copy_elimination",        # OpLoad
+    62: "copy_elimination",        # OpStore
+    57: "call_relocation",         # OpFunctionCall (widen moved, same count)
+    115: "conversion_instruction",  # OpFConvert
+    5: "debug_name",               # OpName of a removed local
+}
+
+
+def hist(mod):
+    h = {}
+    for ins in mod.insts:
+        k = (ins.op, ins.n)
+        h[k] = h.get(k, 0) + 1
+    return h
+
+
+def main():
+    P = Module(CARD + "/spv/parent_repro.spv")
+    C = Module(CARD + "/spv/b3_c32_body1_i8_seed.spv")
+    hp, hc = hist(P), hist(C)
+    keys = sorted(set(hp) | set(hc))
+    only_p, only_c = [], []
+    for k in keys:
+        a, b = hp.get(k, 0), hc.get(k, 0)
+        if a > b:
+            only_p.append({"opcode": k[0], "name": OPNAME.get(k[0], "op%d" % k[0]),
+                           "word_count": k[1], "parent": a, "child": b, "delta": b - a,
+                           "class": CLASS_OF.get(k[0], "UNCLASSIFIED")})
+        elif b > a:
+            only_c.append({"opcode": k[0], "name": OPNAME.get(k[0], "op%d" % k[0]),
+                           "word_count": k[1], "parent": a, "child": b, "delta": b - a,
+                           "class": CLASS_OF.get(k[0], "UNCLASSIFIED")})
+
+    words_p, words_c = len(P.words), len(C.words)
+    delta_words = words_p - words_c
+    accounted = 0
+    for e in only_p:
+        accounted += (-e["delta"]) * e["word_count"]
+    for e in only_c:
+        accounted += e["delta"] * e["word_count"]
+    net = accounted
+
+    unclassified = [e for e in only_p + only_c if e["class"] == "UNCLASSIFIED"]
+
+    # placement evidence: program order of seed mul / widen / first K muladd
+    def order(mod):
+        names = {}
+        for ins in mod.insts:
+            if ins.op == 5:
+                names[ins.ops[0]] = b"".join(x.to_bytes(4, "little") for x in ins.ops[1:]) \
+                    .split(b"\0")[0].decode()
+        fn = {}
+        for ins in mod.insts:
+            if ins.op == 54:
+                fn.setdefault(names.get(ins.ops[1], "").split("(")[0], []).append(ins.ops[1])
+        entry = next(i.ops[1] for i in mod.insts if i.op == 15)
+        fof, ev = [], []
+        cur = None
+        for ins in mod.insts:
+            if ins.op == 54:
+                cur = ins.ops[1]
+            fof.append(cur)
+        types = {i.ops[0]: i for i in mod.insts if i.op == 4456}
+        ch = [i for i in mod.insts if i.op == 133 and i.rtype in types
+              and types[i.rtype].ops[1] == 6]
+        wid = fn["nrh_widen_exact"][0]
+        nw = fn["nrh_narrow"][0]
+        da = fn["nr_i8_deq_add"][0]
+        seq = []
+        for k, ins in enumerate(mod.insts):
+            if fof[k] != entry:
+                continue
+            if ins.op == 57 and ins.ops[2] == wid:
+                seq.append(("widen", ins.pos))
+            elif ins.op == 57 and ins.ops[2] == da:
+                seq.append(("deq_add", ins.pos))
+            elif ins.op == 57 and ins.ops[2] == nw:
+                seq.append(("narrow", ins.pos))
+            elif ins.op == 133 and ins.rtype in [x.rid for x in ch]:
+                seq.append(("seed_mul_h16", ins.pos))
+            elif ins.op == 4459:
+                seq.append(("muladd", ins.pos))
+            elif ins.op == 246:
+                seq.append(("loop_header", ins.pos))
+        return seq
+
+    sp, sc = order(P), order(C)
+
+    # per-function instruction census: proves only `main` changed
+    def per_function(mod):
+        names = {}
+        for ins in mod.insts:
+            if ins.op == 5:
+                names[ins.ops[0]] = b"".join(x.to_bytes(4, "little") for x in ins.ops[1:]) \
+                    .split(b"\0")[0].decode()
+        out, cur = {}, None
+        for ins in mod.insts:
+            if ins.op == 54:
+                cur = names.get(ins.ops[1], "").split("(")[0]
+                out[cur] = {"n": 0, "hist": {}}
+                continue
+            if ins.op == 56:
+                cur = None
+                continue
+            if cur is None:
+                continue
+            out[cur]["n"] += 1
+            k = "%d:%d" % (ins.op, ins.n)
+            out[cur]["hist"][k] = out[cur]["hist"].get(k, 0) + 1
+        return out
+
+    fp, fc = per_function(P), per_function(C)
+    per_fn = {}
+    for k in sorted(set(fp) | set(fc)):
+        a, b = fp.get(k), fc.get(k)
+        per_fn[k] = {"parent_instructions": a["n"] if a else 0,
+                     "child_instructions": b["n"] if b else 0,
+                     "histogram_equal": (a["hist"] if a else {}) == (b["hist"] if b else {}),
+                     "delta": (b["n"] if b else 0) - (a["n"] if a else 0)}
+
+    # globals: descriptor bindings, workgroup memory, non-Function variables
+    def type_bytes(mod, tid, depth=0):
+        ins = mod.by_id.get(tid)
+        if ins is None or depth > 8:
+            return None
+        if ins.op == 21:                      # OpTypeInt
+            return ins.ops[1] // 8
+        if ins.op == 22:                      # OpTypeFloat
+            return ins.ops[1] // 8
+        if ins.op == 23:                      # OpTypeVector
+            b = type_bytes(mod, ins.ops[1], depth + 1)
+            return None if b is None else b * ins.ops[2]
+        if ins.op == 28:                      # OpTypeArray
+            e = type_bytes(mod, ins.ops[1], depth + 1)
+            c = mod.by_id.get(ins.ops[2])
+            n = c.ops[2] if c is not None and c.op == 43 else None
+            return None if (e is None or n is None) else e * n
+        if ins.op == 30:                      # OpTypeStruct
+            tot = 0
+            for m in ins.ops[1:]:
+                b = type_bytes(mod, m, depth + 1)
+                if b is None:
+                    return None
+                tot += b
+            return tot
+        return None
+
+    def globals_view(mod):
+        names, binds = {}, {}
+        for ins in mod.insts:
+            if ins.op == 5:
+                names.setdefault(ins.ops[0], b"".join(x.to_bytes(4, "little")
+                                                     for x in ins.ops[1:]).split(b"\0")[0].decode())
+            if ins.op == 71 and len(ins.ops) >= 3 and ins.ops[1] == 33:
+                binds.setdefault(ins.ops[0], {})["binding"] = ins.ops[2]
+            if ins.op == 71 and len(ins.ops) >= 3 and ins.ops[1] == 34:
+                binds.setdefault(ins.ops[0], {})["set"] = ins.ops[2]
+        wg, others, pointers = 0, [], []
+        for ins in mod.insts:
+            if ins.op != 59:
+                continue
+            storage = ins.ops[2]
+            if storage == 7:                  # Function: locals, expected to change
+                continue
+            ptype = mod.by_id.get(ins.ops[0])
+            target = ptype.ops[2] if ptype is not None and ptype.op == 32 else None
+            if storage == 4:
+                b = type_bytes(mod, target)
+                wg = None if (wg is None or b is None) else wg + b
+            others.append({"name": names.get(ins.ops[1], ""), "storage": storage,
+                           "set": binds.get(ins.ops[1], {}).get("set"),
+                           "binding": binds.get(ins.ops[1], {}).get("binding"),
+                           "type_bytes": type_bytes(mod, target)})
+        return {"workgroup_bytes": wg, "non_function_variables": sorted(
+            json.dumps(o, sort_keys=True) for o in others)}
+
+    gp, gc = globals_view(P), globals_view(C)
+    globals_delta = {"workgroup_bytes": [gp["workgroup_bytes"], gc["workgroup_bytes"]],
+                     "non_function_variables_equal":
+                         gp["non_function_variables"] == gc["non_function_variables"],
+                     "non_function_variable_count": [len(gp["non_function_variables"]),
+                                                     len(gc["non_function_variables"])],
+                     "identical": gp["workgroup_bytes"] == gc["workgroup_bytes"]
+                                  and gp["non_function_variables"] == gc["non_function_variables"]}
+
+    # first K0 muladd after the first widen (both modules) and the wide-seed span
+    def span(seq):
+        w = [p for k, p in seq if k == "widen"]
+        d = [p for k, p in seq if k == "deq_add"]
+        m = [p for k, p in seq if k == "muladd"]
+        lh = [p for k, p in seq if k == "loop_header"]
+        return {"widen_words": w, "deq_add_words": d,
+                "first_muladd_after_first_widen": next((x for x in m if x > w[0]), None),
+                "first_loop_header_after_first_widen": next((x for x in lh if x > w[0]), None),
+                "last_deq_add_word": d[-1] if d else None,
+                "wide_seed_live_words": (d[-1] - w[0]) if w and d else None}
+
+    doc = {
+        "card": "b3-c32-seed",
+        "parent": {"path": CARD + "/spv/parent_repro.spv", "words": words_p,
+                   "instructions": len(P.insts)},
+        "child": {"path": CARD + "/spv/b3_c32_body1_i8_seed.spv", "words": words_c,
+                  "instructions": len(C.insts)},
+        "word_delta_parent_minus_child": delta_words,
+        "instruction_delta_parent_minus_child": len(P.insts) - len(C.insts),
+        "multiset": {"parent_only": only_p, "child_only": only_c,
+                     "identical_sets": not only_p and not only_c},
+        "accounting": {
+            "delta_words_from_classes": net,
+            "matches_word_delta": net == delta_words,
+            "unclassified_classes": unclassified,
+        },
+        "placement": {"parent": span(sp), "child": span(sc)},
+        "per_function": per_fn,
+        "changed_functions": [k for k, v in per_fn.items() if not v["histogram_equal"]],
+        "globals": globals_delta,
+        "order_parent": sp[:14],
+        "order_child": sp[:14],
+        "order_child_after": sc[:14],
+    }
+    ok = (not unclassified) and net == delta_words
+    doc["verdict"] = "ATTRIBUTED" if ok else "FAIL"
+    out = CARD + "/evidence/SPV-DELTA.json"
+    open(out, "w", encoding="utf-8", newline="\n").write(json.dumps(doc, indent=1) + "\n")
+    print(json.dumps({k: doc[k] for k in ("word_delta_parent_minus_child",
+                                          "instruction_delta_parent_minus_child",
+                                          "accounting", "verdict")}, indent=1))
+    print("parent_only:")
+    for e in only_p:
+        print("  %-30s wc=%d  %d -> %d  [%s]" % (e["name"], e["word_count"], e["parent"],
+                                                  e["child"], e["class"]))
+    print("child_only:")
+    for e in only_c:
+        print("  %-30s wc=%d  %d -> %d  [%s]" % (e["name"], e["word_count"], e["parent"],
+                                                  e["child"], e["class"]))
+    print("placement parent:", json.dumps(doc["placement"]["parent"]))
+    print("placement child :", json.dumps(doc["placement"]["child"]))
+    print("per-function instruction counts (parent -> child, hist_equal):")
+    for k, v in per_fn.items():
+        print("  %-22s %5d -> %5d  delta=%+d  hist_equal=%s" %
+              (k, v["parent_instructions"], v["child_instructions"], v["delta"],
+               v["histogram_equal"]))
+    print("changed functions:", doc["changed_functions"])
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

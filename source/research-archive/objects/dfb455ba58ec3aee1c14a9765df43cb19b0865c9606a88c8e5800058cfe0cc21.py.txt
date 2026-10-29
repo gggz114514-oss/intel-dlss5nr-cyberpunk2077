@@ -1,0 +1,162 @@
+"""n21 step-4: code-region operand proof (parent -> candidate).
+
+Only the function bodies are compared, because the annotation/type/constant section
+legitimately renumbers ids when two constants disappear.  For the code region we:
+  1. align on (opcode, word count) with an LCS,
+  2. derive the id map from the matched pairs themselves,
+  3. require it to be a strictly increasing injection, and
+  4. require every operand of every matched instruction to satisfy it.
+"""
+import sys, re, json, collections
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent
+C = CARD.parent.parent
+sys.path.insert(0, str(C))
+import COMMON as K
+ST = K.ST
+
+HPP = Path('@NR_WORKSPACE@/src/project/tools/glslang-16.5.0/include/glslang/SPIRV/spirv.hpp11')
+NAMES = {}
+for m in re.finditer(r'\b(Op[A-Za-z0-9_]+)\s*=\s*(\d+)', HPP.read_text(encoding='utf-8', errors='replace')):
+    NAMES.setdefault(int(m.group(2)), m.group(1))
+
+RESULT_AT_ZERO = tuple(range(19, 40)) + (7, 11, 248, 4456, 5358)
+NO_RESULT = (0, 2, 3, 4, 5, 6, 8, 10, 14, 15, 16, 17, 62, 63, 64, 71, 72, 73, 74, 75, 77,
+             224, 225, 246, 247, 249, 250, 251, 252, 253, 254, 255, 4458, 5360)
+
+
+def result_id_of(op, ops):
+    if not ops or op in NO_RESULT:
+        return None
+    if op in RESULT_AT_ZERO:
+        return ops[0]
+    return ops[1] if len(ops) > 1 else None
+
+
+def result_pos(op):
+    if op in NO_RESULT:
+        return None
+    return 0 if op in RESULT_AT_ZERO else 1
+
+
+class Mod:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.m = ST.Module(self.path)
+        self.ins = self.m.instructions
+        self.names = {}
+        for op, ops, _, _ in self.ins:
+            if op == 5 and len(ops) >= 2:
+                b = b''.join(int(w).to_bytes(4, 'little') for w in ops[1:])
+                self.names.setdefault(ops[0], b.split(b'\0')[0].decode('utf-8', 'replace'))
+        self.def_at = {}
+        for i, (op, ops, _, _) in enumerate(self.ins):
+            rid = result_id_of(op, ops)
+            if rid is not None:
+                self.def_at.setdefault(rid, i)
+
+    def const(self, vid):
+        i = self.def_at.get(vid)
+        if i is None:
+            return None
+        op, ops, _, _ = self.ins[i]
+        return ops[1] if op == 43 else None
+
+    def text(self, i):
+        op, ops, _, _ = self.ins[i]
+        parts = []
+        for w in ops:
+            c = self.const(w)
+            parts.append('%s(%d)' % (self.names.get(w, '#%d' % w), c) if c is not None
+                         else self.names.get(w, '#%d' % w))
+        return '%s %s' % (NAMES.get(op, 'op%d' % op), ' '.join(parts))
+
+    def code_idx(self):
+        out, depth = [], 0
+        for i, (op, ops, _, _) in enumerate(self.ins):
+            if op == 54:
+                depth += 1
+            if depth:
+                out.append(i)
+            if op == 56:
+                depth -= 1
+        return out
+
+
+pm, cm = Mod(Path(K.row_by_ordinal(194)['spv'])), Mod(CARD / 'candidate.spv')
+P, Cc = pm.code_idx(), cm.code_idx()
+A = [(pm.ins[i][0], pm.ins[i][3]) for i in P]
+B = [(cm.ins[j][0], cm.ins[j][3]) for j in Cc]
+
+n, m = len(A), len(B)
+tbl = [[0] * (m + 1) for _ in range(n + 1)]
+for i in range(n - 1, -1, -1):
+    for j in range(m - 1, -1, -1):
+        tbl[i][j] = tbl[i + 1][j + 1] + 1 if A[i] == B[j] else max(tbl[i + 1][j], tbl[i][j + 1])
+pairs, i, j = [], 0, 0
+while i < n and j < m:
+    if A[i] == B[j]:
+        pairs.append((i, j)); i += 1; j += 1
+    elif tbl[i + 1][j] >= tbl[i][j + 1]:
+        i += 1
+    else:
+        j += 1
+mp = {p for p, _ in pairs}
+mc = {c for _, c in pairs}
+removed = [k for k in range(n) if k not in mp]
+added = [k for k in range(m) if k not in mc]
+
+fwd, conflicts = {}, []
+for (pi, ci) in pairs:
+    rp = result_id_of(pm.ins[P[pi]][0], pm.ins[P[pi]][1])
+    rc = result_id_of(cm.ins[Cc[ci]][0], cm.ins[Cc[ci]][1])
+    if rp is None and rc is None:
+        continue
+    if rp is None or rc is None:
+        conflicts.append(('presence', pi, ci)); continue
+    if rp in fwd and fwd[rp] != rc:
+        conflicts.append(('parent-twice', pi, rp, fwd[rp], rc))
+    fwd.setdefault(rp, rc)
+
+ks = sorted(fwd)
+mono = all(fwd[a] < fwd[b] for a, b in zip(ks, ks[1:])) if len(ks) > 1 else True
+
+bad = []
+ops_checked = 0
+for (pi, ci) in pairs:
+    pgi, cgi = P[pi], Cc[ci]
+    pop, pops, _, _ = pm.ins[pgi]
+    cop, cops, _, _ = cm.ins[cgi]
+    rpos = result_pos(pop)
+    if len(pops) != len(cops):
+        bad.append(dict(gi=pgi, why='len', text=pm.text(pgi))); continue
+    ok = True
+    for k, (w1, w2) in enumerate(zip(pops, cops)):
+        if k == rpos:
+            if fwd.get(w1) != w2:
+                bad.append(dict(gi=pgi, why='result-id', text=pm.text(pgi), child=cm.text(cgi))); ok = False; break
+            ops_checked += 1
+            continue
+        if w1 in pm.def_at:
+            want = fwd.get(w1)
+            if want != w2:
+                bad.append(dict(gi=pgi, why='id', k=k, parent_id=w1, child_id=w2, mapped=want,
+                                text=pm.text(pgi), child_text=cm.text(cgi))); ok = False; break
+        elif w1 != w2:
+            bad.append(dict(gi=pgi, why='literal', k=k, p=w1, c=w2, text=pm.text(pgi))); ok = False; break
+        ops_checked += 1
+
+res = dict(
+    code=dict(parent=n, candidate=m),
+    alignment=dict(matched=len(pairs), removed=len(removed), added=len(added)),
+    removed_grouped=dict(collections.Counter(NAMES.get(pm.ins[P[k]][0], pm.ins[P[k]][0]) for k in removed)),
+    removed_rows=[dict(gi=P[k], text=pm.text(P[k])) for k in removed],
+    added_rows=[dict(gj=Cc[k], text=cm.text(Cc[k])) for k in added],
+    id_map=dict(size=len(fwd), monotone_increasing=mono, n_conflicts=len(conflicts),
+                conflicts=conflicts[:10]),
+    operand_check=dict(operands_checked=ops_checked, instructions_with_mismatch=len(bad),
+                       mismatches=bad[:15]),
+)
+K.write_json(CARD / 'build' / 'code-proof.json', res)
+print(json.dumps({k: v for k, v in res.items() if k not in ('removed_rows',)}, indent=1)[:3000])

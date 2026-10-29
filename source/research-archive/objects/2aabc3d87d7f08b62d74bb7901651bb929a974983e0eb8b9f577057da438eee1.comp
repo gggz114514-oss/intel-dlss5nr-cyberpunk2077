@@ -1,0 +1,233 @@
+// C64 complete D4, R07: the attention output projection (WO) itself as INT8.
+//
+// Parent: source/parent/c64_complete_d4_fp16.comp (verbatim copy), which is the
+// byte-exact source of the deployed output-c64.spv
+// cd0e196874b19414e9a94490793ebc766070f8a96924f384a22553fafccfcde1.
+//
+// What changed (and only this):
+//   * the four static FP16 MulAdd sites (8x16x16, K=64 in four K16 steps) become
+//     four static INT8 MulAdd sites (8x16x32, K=64 in two K32 steps);
+//   * the FP16 WO tile stream (pack[wo + (n/16)*1024 + (k/16)*256], stride 16,
+//     column major) is replaced by the INT8 WO tile stream
+//     (wo8[(n/16)*1024 + (k/32)*512], stride 32, column major) plus a per
+//     output-channel f32 scale table;
+//   * the algebraically required activation quantiser: the K=64 context tile is
+//     staged once per workgroup as int8 in a 4 KiB shared tile, with a
+//     per-workgroup per-tensor scale (the amax of this window's own 64x64 tile,
+//     computed in the kernel from the same half values the FP16 arm multiplies).
+//
+// What is NOT changed:
+//   * the residual seed path: gY is loaded with the same address and the same
+//     stride 64, multiplied by the same per-channel pack[ars+n] f16 factor, and
+//     widened to FP32 by the same conversion.  The residual value itself is never
+//     rescaled, requantised or dropped;
+//   * the single narrow per output element: the INT8 accumulator is dequantised,
+//     the unchanged FP32 seed is added once, and exactly one f32->f16 conversion
+//     produces the value that is stored;
+//   * both store paths (debug dbg[110592...] and imgout with the original
+//     c64_img_half_index + OOB rule + stride 16), their order, the grid, the
+//     owner (subgroup-local, 8 subgroups, no cross-SG data) and the push
+//     constants;
+//   * this module produces no qX: the half image value is the final value and its
+//     reader is unchanged.
+//
+// DSH R07, CPU-only evidence.  No GPU was used to produce this file.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256) in;
+// diagnostics: NR_D4_SEED_ONLY / NR_D4_MMA_ONLY isolate the two O components
+#ifndef NR_D4_MODE
+#define NR_D4_MODE 0   // 0 = full, 1 = seed only, 2 = mma only
+#endif
+#include "c64_ffn_opt_common.glsl"
+
+layout(set = 0, binding = 6) buffer YBuf { float16_t gY[]; };
+layout(set = 0, binding = 7) buffer TBuf { float16_t gT[]; };
+// R07: static INT8 WO tiles, 4 output-channel groups x 2 K32 tiles x 512 B.
+layout(set = 0, binding = 8) readonly buffer Wo8Buf { int8_t gWo8[]; };
+// R07: per output channel scale of those tiles (64 f32 = amax_k|W[o][k]| / 127).
+layout(set = 0, binding = 9) readonly buffer WoScaleBuf { float gWosc[]; };
+
+#define MAT_H coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define I8A   coopmat<int8_t, gl_ScopeSubgroup, 8, 32, gl_MatrixUseA>
+#define I8B   coopmat<int8_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB>
+#define I8C   coopmat<int, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+
+// Context staging tile: element (token t, channel k) of this window sits at
+//   ((t / 32) * 64 + k) * 32 + (t % 32)
+// so that one 8-token x 32-channel K32 A fragment is a column-major stride-32
+// view, which is the measured I8A layout of this family (byte k*32 + m).
+// 4 KiB, one slot per workgroup, written and read by the same workgroup only.
+shared int8_t sT8[4096];
+// Per-workgroup activation scale reduction: one partial per invocation, then a
+// single serial reduction and a two-slot publication.
+shared float shMax[256];
+shared float shScale[2];
+
+void main() {
+    const uint t_local = gl_LocalInvocationID.x;
+    const uint sg = t_local / 32u;
+    const uint lane = t_local % 32u;
+    const uint wx = (pc.p1.z != 0) ? uint(pc.p2.x) : gl_WorkGroupID.x;
+    const uint wy = (pc.p1.z != 0) ? uint(pc.p2.y) : gl_WorkGroupID.y;
+    const uint w = wy * uint(pc.p1.x) + wx;
+    const bool debug = pc.p1.w != 0;
+    const uint ars = uint(pc.p4.z);   // p4.y is rs (used by D2) — ars is p4.z
+
+    if (debug) {
+        // Echo the same canonical producer values; these storage regions were live.
+        for (uint e=t_local;e<4096u;e+=256u) {
+            dbg[106496u+e]=gT[w*4096u+e];
+            dbg[40960u+e]=gY[w*4096u+e];
+        }
+        barrier();
+    }
+    const uint mA=(sg/2u)*8u,mB=mA+32u,n0=(sg%2u)*32u;
+    // ---- R07 activation quantiser (replaces the FP16 A operand stream) -----
+    // Pass 1: this window's activation amax, read from the same gT half values
+    // the FP16 arm multiplies.  Per tensor per workgroup, so no capture and no
+    // cross-frame calibration is needed for any of the seven passes.
+    {
+        float amax = 0.0;
+        for (uint e = t_local; e < 4096u; e += 256u)
+            amax = max(amax, abs(float(gT[w * 4096u + e])));
+        shMax[t_local] = amax;
+    }
+    barrier();
+    if (t_local == 0u) {
+        float m = 0.0;
+        for (uint i = 0u; i < 256u; ++i) m = max(m, shMax[i]);
+        precise float inv = (m > 0.0) ? 127.0 / m : 0.0;
+        precise float sC  = (m > 0.0) ? m / 127.0 : 0.0;
+        shScale[0] = inv;
+        shScale[1] = sC;
+    }
+    barrier();
+    const float invC = shScale[0];
+    const float sC = shScale[1];
+    // Pass 2: one code point per (token, channel), same rounding and clamp as the
+    // C32/C64 INT8 template: real * inv, roundEven, clamp to +-127.
+    for (uint e = t_local; e < 4096u; e += 256u) {
+        const uint t = e >> 6u;
+        const uint k = e & 63u;
+        sT8[((t >> 5u) * 64u + k) * 32u + (t & 31u)] =
+            int8_t(clamp(roundEven(float(gT[w * 4096u + e]) * invC), -127.0, 127.0));
+    }
+    barrier();
+
+    I8C accA0,accA1,accB0,accB1;
+    accA0=I8C(0);
+    accA1=I8C(0);
+    accB0=I8C(0);
+    accB1=I8C(0);
+    MAT_H scale0,scale1;
+    coopMatLoad(scale0,pack,ars+n0,0u,LROW);
+    coopMatLoad(scale1,pack,ars+n0+16u,0u,LROW);
+    for (uint ki=0u;ki<2u;++ki) {
+        const uint k0=ki*32u;
+        I8B b0,b1;
+        coopMatLoad(b0,gWo8,(n0/16u)*1024u+ki*512u,32u,LCOL);
+        coopMatLoad(b1,gWo8,((n0+16u)/16u)*1024u+ki*512u,32u,LCOL);
+        I8A a;
+        coopMatLoad(a,sT8,(mA/32u)*2048u+k0*32u+(mA%32u),32u,LCOL);
+#if NR_D4_MODE != 1
+        accA0=coopMatMulAdd(a,b0,accA0);
+        accA1=coopMatMulAdd(a,b1,accA1);
+#endif
+        coopMatLoad(a,sT8,(mB/32u)*2048u+k0*32u+(mB%32u),32u,LCOL);
+#if NR_D4_MODE != 1
+        accB0=coopMatMulAdd(a,b0,accB0);
+        accB1=coopMatMulAdd(a,b1,accB1);
+#endif
+    }
+    // ---- R07 INT8 post-epilogue --------------------------------------------
+    // acc * (sC * sWo[n]) + seed, seed = widen(H(Y * ars)) exactly as the parent,
+    // one dequant multiply, one add, and the one and only narrow.
+    {
+        MAT_H seed;
+        coopMatLoad(seed,gY,(w*64u+mA)*64u+n0+0u,64u,LROW);
+        seed=seed*scale0;
+#if NR_D4_MODE == 2
+        MAT_C seedc=MAT_C(0.0);
+#else
+        MAT_C seedc=MAT_C(seed);
+#endif
+        MAT_C fsc;
+        coopMatLoad(fsc,gWosc,n0,0u,LROW);
+        fsc=fsc*MAT_C(sC);
+        precise MAT_C prod=MAT_C(accA0)*fsc;
+        precise MAT_C sumv=prod+seedc;
+        MAT_H narrowed=MAT_H(sumv);
+        if (debug) coopMatStore(narrowed,dbg,110592u+mA*64u+n0+0u,64u,LROW);
+        bool oob;
+        uint addr=c64_img_half_index(mA,n0+0u,wx,wy,oob);
+        if (!oob) coopMatStore(narrowed,imgout,addr,16u,LROW);
+    }
+    {
+        MAT_H seed;
+        coopMatLoad(seed,gY,(w*64u+mA)*64u+n0+16u,64u,LROW);
+        seed=seed*scale1;
+#if NR_D4_MODE == 2
+        MAT_C seedc=MAT_C(0.0);
+#else
+        MAT_C seedc=MAT_C(seed);
+#endif
+        MAT_C fsc;
+        coopMatLoad(fsc,gWosc,n0+16u,0u,LROW);
+        fsc=fsc*MAT_C(sC);
+        precise MAT_C prod=MAT_C(accA1)*fsc;
+        precise MAT_C sumv=prod+seedc;
+        MAT_H narrowed=MAT_H(sumv);
+        if (debug) coopMatStore(narrowed,dbg,110592u+mA*64u+n0+16u,64u,LROW);
+        bool oob;
+        uint addr=c64_img_half_index(mA,n0+16u,wx,wy,oob);
+        if (!oob) coopMatStore(narrowed,imgout,addr,16u,LROW);
+    }
+    {
+        MAT_H seed;
+        coopMatLoad(seed,gY,(w*64u+mB)*64u+n0+0u,64u,LROW);
+        seed=seed*scale0;
+#if NR_D4_MODE == 2
+        MAT_C seedc=MAT_C(0.0);
+#else
+        MAT_C seedc=MAT_C(seed);
+#endif
+        MAT_C fsc;
+        coopMatLoad(fsc,gWosc,n0,0u,LROW);
+        fsc=fsc*MAT_C(sC);
+        precise MAT_C prod=MAT_C(accB0)*fsc;
+        precise MAT_C sumv=prod+seedc;
+        MAT_H narrowed=MAT_H(sumv);
+        if (debug) coopMatStore(narrowed,dbg,110592u+mB*64u+n0+0u,64u,LROW);
+        bool oob;
+        uint addr=c64_img_half_index(mB,n0+0u,wx,wy,oob);
+        if (!oob) coopMatStore(narrowed,imgout,addr,16u,LROW);
+    }
+    {
+        MAT_H seed;
+        coopMatLoad(seed,gY,(w*64u+mB)*64u+n0+16u,64u,LROW);
+        seed=seed*scale1;
+#if NR_D4_MODE == 2
+        MAT_C seedc=MAT_C(0.0);
+#else
+        MAT_C seedc=MAT_C(seed);
+#endif
+        MAT_C fsc;
+        coopMatLoad(fsc,gWosc,n0+16u,0u,LROW);
+        fsc=fsc*MAT_C(sC);
+        precise MAT_C prod=MAT_C(accB1)*fsc;
+        precise MAT_C sumv=prod+seedc;
+        MAT_H narrowed=MAT_H(sumv);
+        if (debug) coopMatStore(narrowed,dbg,110592u+mB*64u+n0+16u,64u,LROW);
+        bool oob;
+        uint addr=c64_img_half_index(mB,n0+16u,wx,wy,oob);
+        if (!oob) coopMatStore(narrowed,imgout,addr,16u,LROW);
+    }
+}

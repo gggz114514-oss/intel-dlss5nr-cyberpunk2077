@@ -11,6 +11,8 @@ Experimental **NR + FSR XMX upscaling + XeSS Frame Generation** on Intel Arc B58
 
 **Download current main via Code → Download ZIP or git clone. The v0.2.0 release archive is historical; main contains the optimized profiles documented here.**
 
+[实验工具与用法](tools/experiments/README.md) · [项目恢复与私人备份清单](docs/RECOVERY.md) · [研究源码档案](source/research-archive/README.md)
+
 ## What you need to supply
 
 Provide the appropriate **local `nvngx_dlssnr.dll`**. Both backends can now be extracted and built from source; **an existing VK102 package is not required**. DLLs are read as data and never executed. No model DLL, weights, extracted tensors, compiled shaders or third-party game DLLs are distributed.

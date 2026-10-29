@@ -1,0 +1,486 @@
+"""R09 SPV identity: parent f3c64_body_ds vs the INT8-WO candidate.
+
+CPU only, word level.  Five sections plus the NoContraction role analysis:
+
+  P0 identity        files, sha256, bytes, and a probe of the family's
+                     NoContraction-transfer step (run on the candidate as well,
+                     to show whether it is numerically inert here)
+  P1 interface       bindings, shared arrays, push-constant size, entry point,
+                     execution mode, cooperative-matrix type table, functions
+  P2 operand streams cooperative-matrix load/store streams compared one by one
+                     on (slot, address expression, stride, layout, component,
+                     rows, cols, use): the residual seed reads and the whole
+                     store stream must be kept; the FP16 WO operand loads must be
+                     removed and every added load must belong to a new stream
+  P3 matrix sites    four FP16 MulAdd sites gone, four INT8 MulAdd sites added,
+                     the two INT8 DS sites untouched, with A/B/C provenance
+  P4 opcode deltas   every per-opcode count delta with its source-level reason
+                     and, where it is mechanically determined, its derivation
+  P5 decorations     NoContraction / binding / stride deltas, and the role
+                     comparison of every NoContraction the parent carried
+
+usage: python tools/spv_identity.py
+"""
+import json
+import re
+import struct
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+CARD = HERE.parent
+sys.path.insert(0, str(HERE))
+import spvlib  # noqa: E402
+
+for _op, _name in ((3, "OpSource"), (4, "OpSourceExtension"),
+                   (185, "OpFOrdLessThan"), (186, "OpFOrdGreaterThan"),
+                   (42, "OpConstantFalse")):
+    spvlib.OP.setdefault(_op, _name)
+
+R = Path("@NR_WORKSPACE@")
+BUILD = R / "work/dsh-xmx-handoff-validation-20261024/build/r09-r11-f3ds"
+PARENT = CARD / "spv/parent_repro-f3c64_body_ds.spv"
+CAND = CARD / "spv/r09_f3c64_body_ds_wo_i8.spv"
+CAND_T = CARD / "spv/r09_f3c64_body_ds_wo_i8.transfer.spv"
+DONOR = R / "candidates/amd-netorg-acceleration-workbuddy-20261016/f3-c64-fused-half-patch-v1/fused_c64_body_ds.spv"
+
+SLOT = {"PackBuf": "pack(b0)", "AuxBuf": "aux(b1)", "ImageIn": "imgin(b2)",
+        "ImageOut": "imgout(b3)", "DbgBuf": "dbg(b4)", "DbgFloat": "dbgf(b4)",
+        "YBuf": "gY(b6)", "TBuf": "gT(b7)", "DsWeightBuf": "nrf_w(b8)",
+        "PackedFFNEntry": "entry_q(b10)", "EntryScale": "entry_sc(b11)",
+        "Wo8Buf": "gWo8(b12)", "WoScaleBuf": "gWosc(b13)"}
+SLOT_EXTRA = {"sT8": "sT8(shared)", "nrf_mean": "nrf_mean(shared)",
+              "nrf_pair": "nrf_pair(shared)", "shMax": "shMax(shared)",
+              "shScale": "shScale(shared)"}
+STORAGE = {0: "UniformConstant", 1: "Input", 2: "Uniform", 3: "Output", 4: "Workgroup",
+           5: "CrossWorkgroup", 6: "Private", 7: "Function", 9: "PushConstant",
+           12: "StorageBuffer"}
+
+LOAD_KEEP = lambda r: (r["slot"].startswith("gY") or
+                       (r["slot"] == "pack(b0)" and r["stride"] == 0))
+STORE_KEEP = lambda r: r["slot"] in ("dbg(b4)", "imgout(b3)", "nrf_pair(shared)",
+                                     "entry_q(b10)", "dbgf(b4)")
+
+
+def norm(s):
+    """Normalise an SSA-id-bearing symbol.
+
+    `emit_qx` is a real function, so its store strides/addresses read push-constant
+    values through OpLoad; those loads get fresh SSA ids in any recompile.  The
+    *expression* is what must be compared, so id numbers are folded.  No other
+    stream in this module uses a loaded stride (the four body stores use the
+    literal 64/16), so the fold cannot hide a real change.
+    """
+    return re.sub(r"load#\d+", "load#*", str(s))
+
+
+def sha(p):
+    import hashlib
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def slot_of(m, buf):
+    return SLOT.get(buf, SLOT_EXTRA.get(buf, buf))
+
+
+def stream(m):
+    loads, stores = [], []
+    for it in m.insts:
+        if it.name == "OpCooperativeMatrixLoadKHR":
+            bv = m.base_var(it.a[2])
+            buf = m.block_name(bv) if bv is not None else None
+            if buf is None:
+                buf = m.var_name(bv) if bv is not None else "?"
+            loads.append({"slot": slot_of(m, buf), "buffer": buf,
+                          "address": m.resolve(it.a[2])[0],
+                          "stride": m.fval(it.a[4]) if m.fval(it.a[4]) is not None
+                          else m.resolve(it.a[4])[0],
+                          "layout": "ColumnMajor" if m.fval(it.a[3]) == 1 else "RowMajor",
+                          "cmat": m.cm_type(it.a[0])})
+        elif it.name == "OpCooperativeMatrixStoreKHR":
+            obj = it.a[1]
+            bv = m.base_var(it.a[0])
+            buf = m.block_name(bv) if bv is not None else None
+            if buf is None:
+                buf = m.var_name(bv) if bv is not None else "?"
+            stores.append({"slot": slot_of(m, buf), "buffer": buf,
+                           "address": m.resolve(it.a[0])[0],
+                           "stride": m.fval(it.a[3]) if m.fval(it.a[3]) is not None
+                           else m.resolve(it.a[3])[0],
+                           "layout": "ColumnMajor" if m.fval(it.a[2]) == 1 else "RowMajor",
+                           "cmat": m.cm_type(m.byid[obj].a[0]) if obj in m.byid else None})
+    return loads, stores
+
+
+def tup(r):
+    c = r["cmat"] or {}
+    return (r["slot"], norm(r["address"]), norm(r["stride"]), r["layout"],
+            c.get("component"), c.get("rows"), c.get("cols"), c.get("use"))
+
+
+def mma(m):
+    out = []
+    for it in m.insts:
+        if it.name != "OpCooperativeMatrixMulAddKHR":
+            continue
+        rc = m.cm_type(it.a[0])
+        out.append({"word_offset": it.woff, "result_id": it.a[1],
+                    "function": m.funcs.get(it.func, "?"),
+                    "accumulator": rc and rc.get("component"),
+                    "A_cmat": m.cm_type(m.byid[it.a[2]].a[0]) if it.a[2] in m.byid else None,
+                    "B_cmat": m.cm_type(m.byid[it.a[3]].a[0]) if it.a[3] in m.byid else None,
+                    "C_id": it.a[4]})
+    return out
+
+
+def pc_bytes(m):
+    for vid, sc, tid in m.vars:
+        if STORAGE.get(sc) != "PushConstant":
+            continue
+        t = m.types.get(tid)
+        if t and t[0] == "ptr":
+            return m.size(t[2])
+    return None
+
+
+def iface(m):
+    bindings, shared = {}, []
+    for vid, sc, tid in m.vars:
+        d = m.decor.get(vid, {})
+        b = d.get(33, [[None]])[0][0]
+        if b is not None:
+            bindings[str(b)] = {"name": m.names.get(vid), "block": m.block_name(vid),
+                                "storage": STORAGE.get(sc), "bytes": m.size(tid)}
+        if STORAGE.get(sc) == "Workgroup":
+            shared.append({"name": m.var_name(vid), "bytes": m.size(tid)})
+    ep = [it for it in m.insts if it.name == "OpEntryPoint"]
+    ex = [[m.fval(x) if x in m.consts else x for x in it.a]
+          for it in m.insts if it.name == "OpExecutionMode"]
+    return {
+        "bindings": bindings, "shared": shared,
+        "lds_bytes": sum(s["bytes"] for s in shared),
+        "entry_point": {"model": ep[0].a[0], "id": ep[0].a[1],
+                        "name": bytes(b"".join(struct.pack("<I", x)
+                                               for x in ep[0].a[2:])).split(b"\0")[0].decode()}
+        if ep else None,
+        "execution_modes": ex,
+        "cm_types": sorted({(m.ctype(v[0]), m.fval(v[1]), m.fval(v[2]), m.fval(v[3]),
+                             m.fval(v[4])) for v in m.cm_types.values()}, key=str),
+        "push_constant_bytes": pc_bytes(m),
+        "functions": [m.funcs[k] for k in m.funcs],
+    }
+
+
+ATTRIB = {
+    "OpCooperativeMatrixMulAddKHR":
+        "static count unchanged (6); four of them flip from f16->f32 to i8->i32 "
+        "(the WO sites), the two DS sites are untouched",
+    "OpCooperativeMatrixLoadKHR":
+        "derived: -2 f16 WO B tiles (pack, stride 16, LCOL) -2 f16 context A tiles "
+        "(gT, stride 64, LROW) +2 int8 WO B tiles (gWo8, stride 32, LCOL) "
+        "+2 int8 staged A tiles (sT8, stride 32, LCOL) +4 f32 per-channel scales "
+        "(gWosc, stride 0, LROW) = +4; the 4 gY residual loads, the 2 pack[ars] "
+        "scale loads and the 3 DS loads are kept byte-identically (see P2)",
+    "OpCooperativeMatrixStoreKHR":
+        "unchanged (14): 4 debug + 4 imgout + 4 nrf_pair + 2 entry_q stores, the "
+        "whole store stream is identical (see P2)",
+    "OpFConvert": "derived: +2 = the two `float(gT[...])` widenings, one in the "
+                  "amax pass and one in the staging pass",
+    "OpConvertSToF": "derived: +4 = one int32 accumulator -> f32 conversion per "
+                     "epilogue block",
+    "OpConvertFToS": "derived: +1 = the single f32 -> int8 code-point conversion of "
+                     "the staging pass (one instruction for all 4096 elements)",
+    "OpFMul": "derived: +9 = 1 quantiser multiply (gT * invC) + 4 x (fsc = sWo * sC) "
+              "+ 4 x (acc * fsc)",
+    "OpFAdd": "derived: +4 = the FP32 residual add moves out of the accumulator seed "
+              "into the epilogue, one per output fragment",
+    "OpFDiv": "derived: +2 = the two per-workgroup scalars 127/amax and amax/127",
+    "OpExtInst": "derived: +5 = roundEven + clamp of the code point, abs + max of the "
+                 "amax pass, max of the serial reduction",
+    "OpCompositeConstruct": "derived: +4 = the broadcast MAT_C(sC) of each epilogue "
+                            "fragment",
+    "OpFOrdGreaterThan": "derived: +2 = the two `m > 0.0` degeneracy guards",
+    "OpControlBarrier": "derived: +3 = the staging publication sequence (amax "
+                        "publication, scale publication, staged-tile readiness); the "
+                        "parent's debug-echo barrier and the nr_body_stage->DS barrier "
+                        "are kept",
+    "OpTypeCooperativeMatrixKHR": "derived: -2 = -f16 8x16 A and f16 16x16 B (the FP16 "
+                                  "WO operand types disappear); +i8 8x32 A, i8 32x16 B "
+                                  "and i32 8x16 accumulator already exist for the DS "
+                                  "path and are reused, the f16 8x16 accumulator "
+                                  "(MAT_H) is kept",
+    "OpTypeArray": "derived: +3 = sT8[4096], shMax[256], shScale[2]",
+    "OpTypeRuntimeArray": "derived: +2 = gWo8[] and gWosc[]",
+    "OpTypeStruct": "derived: +2 = the two new storage blocks",
+    "OpTypePointer": "pointers to the new blocks, arrays and shared tile",
+    "OpMemberName": "derived: +2 = member names of the two new storage blocks",
+    "OpMemberDecorate": "derived: +4 = DescriptorSet + Binding for each of the two new "
+                        "storage blocks",
+    "OpDecorate": "derived: +24 = per new buffer 3 (DescriptorSet, Binding, "
+                  "NonWritable) + ArrayStride for the two runtime arrays + the "
+                  "Workgroup/ArrayStride decorations of the three new shared arrays + "
+                  "the f32 view stride",
+    "OpVariable": "derived: +34 = 2 storage-buffer variables + 3 shared arrays + the "
+                  "materialised function-scope locals of the staging passes and of the "
+                  "four epilogue fragments",
+    "OpName": "names of the new declarations and locals",
+    "OpLoad": "reads of the staged tile and the publication slots, the second gT read "
+              "of the staging pass, and the materialised epilogue locals (glslang "
+              "scalarises the cooperative-matrix epilogue into per-element locals)",
+    "OpStore": "the staged int8 context tile, the two publication slots, and the "
+               "materialised epilogue locals",
+    "OpAccessChain": "addressing of the staged tile, the two publication slots and the "
+                     "two new buffers",
+    "OpIAdd": "staging-tile and scale-address arithmetic",
+    "OpIMul": "staging-tile address arithmetic",
+    "OpUDiv": "index arithmetic of the staging tile (t/32, k/16) and loop bounds",
+    "OpUMod": "index arithmetic of the staging tile (t%32, k%32)",
+    "OpShiftRightLogical": "staging-tile index shifts (t >> 6, t >> 5)",
+    "OpBitwiseAnd": "staging-tile index masks (t & 63, t & 31)",
+    "OpULessThan": "derived: +3 = the three added loop headers (amax, staging, "
+                   "serial reduction)",
+    "OpIEqual": "the `t_local == 0` serial-reduction guard",
+    "OpConstant": "new literal constants of the staging tile and the epilogue",
+    "OpLabel": "labels of the new control flow (the staging passes and the reduction)",
+    "OpBranch": "branches of the new control flow",
+    "OpBranchConditional": "conditional branches of the new control flow",
+    "OpLoopMerge": "derived: +3 = the three added loops",
+    "OpSelectionMerge": "selection merges of the new guards",
+    "OpPhi": "loop-carried values of the new control flow",
+}
+MUST_ZERO = ["OpExecutionMode", "OpMemoryModel", "OpEntryPoint", "OpFunction",
+             "OpFunctionCall", "OpGroupNonUniformShuffle", "OpGroupNonUniformShuffleXor",
+             "OpGroupNonUniformBroadcast", "OpGroupNonUniformBroadcastFirst",
+             "OpGroupNonUniformIAdd", "OpGroupNonUniformFAdd", "OpAtomicIAdd",
+             "OpAtomicExchange", "OpAtomicCompareExchange", "OpExtension",
+             "OpMemoryBarrier"]
+MUST_KEEP = ["OpCooperativeMatrixStoreKHR", "OpCooperativeMatrixMulAddKHR"]
+
+
+def nc_roles(m):
+    """every NoContraction-decorated instruction with its opcode and word offset"""
+    ids = set()
+    for vid, d in m.decor.items():
+        if 42 in d:
+            ids.add(vid)
+    out = []
+    for it in m.insts:
+        if it.op in spvlib.NO_RESULT:
+            continue
+        rid = it.a[0] if it.op in spvlib.RESULT_FIRST else (it.a[1] if len(it.a) > 1 else None)
+        if rid in ids:
+            out.append({"word_offset": it.woff, "opcode": it.name,
+                        "function": m.funcs.get(it.func, "?"),
+                        "float_arith": it.name in ("OpFMul", "OpFAdd", "OpFSub", "OpFDiv",
+                                                   "OpFNegate", "OpExtInst"),
+                        "result_id": rid})
+    return out
+
+
+def main():
+    p, c = spvlib.Mod(PARENT), spvlib.Mod(CAND)
+    rec = {"parent": {"path": PARENT.as_posix(), "bytes": PARENT.stat().st_size,
+                      "sha256": sha(PARENT), "words": len(p.w)},
+           "candidate": {"path": CAND.as_posix(), "bytes": CAND.stat().st_size,
+                         "sha256": sha(CAND), "words": len(c.w)}}
+    # ---------------------------------------------------------------- P0
+    tprobe = {}
+    if CAND_T.exists():
+        tprobe = {"transfer_spv": {"path": CAND_T.as_posix(),
+                                   "bytes": CAND_T.stat().st_size,
+                                   "sha256": sha(CAND_T)},
+                  "donor": {"path": DONOR.as_posix(), "sha256": sha(DONOR)},
+                  "byte_identical_to_candidate": sha(CAND_T) == sha(CAND)}
+    rec["P0_identity"] = {
+        "parent_nocontraction_count": len([r for r in nc_roles(p)]),
+        "candidate_nocontraction_count": len([r for r in nc_roles(c)]),
+        "candidate_is_plain_compile": True,
+        "nocontraction_transfer_probe": tprobe,
+    }
+    # ---------------------------------------------------------------- P1
+    ip, ic = iface(p), iface(c)
+    tadd = [t for t in ic["cm_types"] if t not in ip["cm_types"]]
+    trem = [t for t in ip["cm_types"] if t not in ic["cm_types"]]
+    rec["P1_interface"] = {
+        "bindings_added": {k: ic["bindings"][k] for k in ic["bindings"]
+                           if k not in ip["bindings"]},
+        "bindings_removed": sorted(set(ip["bindings"]) - set(ic["bindings"])),
+        "bindings_kept": {k: ip["bindings"][k] for k in ip["bindings"] if k in ic["bindings"]},
+        "bindings_kept_identical": all(ip["bindings"][k]["block"] == ic["bindings"][k]["block"]
+                                       and ip["bindings"][k]["storage"] == ic["bindings"][k]["storage"]
+                                       for k in ip["bindings"] if k in ic["bindings"]),
+        "shared_before": ip["shared"], "shared_after": ic["shared"],
+        "lds_before": ip["lds_bytes"], "lds_after": ic["lds_bytes"],
+        "push_constant_bytes": [ip["push_constant_bytes"], ic["push_constant_bytes"]],
+        "entry_point": [ip["entry_point"], ic["entry_point"]],
+        "execution_modes": [ip["execution_modes"], ic["execution_modes"]],
+        "functions": [ip["functions"], ic["functions"]],
+        "cm_types_added": tadd, "cm_types_removed": trem,
+    }
+    # ---------------------------------------------------------------- P2
+    lp, sp = stream(p)
+    lc, sc = stream(c)
+    keep_p = Counter(tup(x) for x in lp if LOAD_KEEP(x))
+    keep_c = Counter(tup(x) for x in lc if LOAD_KEEP(x))
+    st_p = Counter(tup(x) for x in sp if STORE_KEEP(x))
+    st_c = Counter(tup(x) for x in sc if STORE_KEEP(x))
+    rec["P2_operand_streams"] = {
+        "residual_and_scale_loads_before": [list(k) for k in keep_p],
+        "residual_and_scale_loads_after": [list(k) for k in keep_c],
+        "residual_loads_identical": keep_p == keep_c,
+        "store_stream_identical": st_p == st_c,
+        "store_stream": [list(k) for k in st_p],
+        "loads_removed": {str(k): v for k, v in (Counter(tup(x) for x in lp) -
+                                                 Counter(tup(x) for x in lc)).items()},
+        "loads_added": {str(k): v for k, v in (Counter(tup(x) for x in lc) -
+                                               Counter(tup(x) for x in lp)).items()},
+        "stores_removed": {str(k): v for k, v in (Counter(tup(x) for x in sp) -
+                                                  Counter(tup(x) for x in sc)).items()},
+        "stores_added": {str(k): v for k, v in (Counter(tup(x) for x in sc) -
+                                                Counter(tup(x) for x in sp)).items()},
+        "parent_load_count": len(lp), "candidate_load_count": len(lc),
+        "parent_store_count": len(sp), "candidate_store_count": len(sc),
+        "normalisation": "SSA ids inside address/stride symbols are folded to 'load#*'; "
+                         "the only streams using a loaded stride are the two emit_qx "
+                         "stores of a real function, and the four body stores use the "
+                         "literal strides 64/16, so the fold cannot hide a real change",
+        "kept_load_stream": sorted(set(k[0] for k in keep_p)),
+    }
+    # ---------------------------------------------------------------- P3
+    mp, mc = mma(p), mma(c)
+    dsp = Counter((s["accumulator"], (s["A_cmat"] or {}).get("component"),
+                   (s["A_cmat"] or {}).get("rows"), (s["A_cmat"] or {}).get("cols"),
+                   (s["B_cmat"] or {}).get("component"), (s["B_cmat"] or {}).get("rows"),
+                   (s["B_cmat"] or {}).get("cols"))
+                  for s in mp if s["function"] == "main")
+    dsc = Counter((s["accumulator"], (s["A_cmat"] or {}).get("component"),
+                   (s["A_cmat"] or {}).get("rows"), (s["A_cmat"] or {}).get("cols"),
+                   (s["B_cmat"] or {}).get("component"), (s["B_cmat"] or {}).get("rows"),
+                   (s["B_cmat"] or {}).get("cols"))
+                  for s in mc if s["function"] == "main")
+    rec["P3_matrix_sites"] = {
+        "parent_count": len(mp),
+        "parent_fp16": sum(1 for s in mp if s["accumulator"] == "f32"),
+        "parent_int8": sum(1 for s in mp if s["accumulator"] == "i32"),
+        "candidate_count": len(mc),
+        "candidate_fp16": sum(1 for s in mc if s["accumulator"] == "f32"),
+        "candidate_int8": sum(1 for s in mc if s["accumulator"] == "i32"),
+        "parent_sites": mp, "candidate_sites": mc,
+        "ds_sites": {"parent": [list(k) + [v] for k, v in dsp.items()],
+                     "candidate": [list(k) + [v] for k, v in dsc.items()],
+                     "OPERANDS_UNCHANGED": dsp == dsc},
+        "ds_sites_preserved": [s for s in mc if s["function"] == "main"],
+        "no_fp16_matrix_multiply_left":
+            sum(1 for s in mc if s["accumulator"] == "f32") == 0,
+    }
+    # ---------------------------------------------------------------- P4
+    hp, hc = Counter(), Counter()
+    for it in p.insts:
+        hp[it.name] += 1
+    for it in c.insts:
+        hc[it.name] += 1
+    deltas, unexplained = {}, []
+    for k in sorted(set(hp) | set(hc)):
+        d = hc[k] - hp[k]
+        if not d:
+            continue
+        d_ = {"before": hp[k], "after": hc[k], "delta": d, "attribution": ATTRIB.get(k)}
+        deltas[k] = d_
+        if d_["attribution"] is None:
+            unexplained.append(k)
+    mz = {k: hc[k] - hp[k] for k in MUST_ZERO}
+    mk = {k: [hp[k], hc[k]] for k in MUST_KEEP}
+    rec["P4_opcodes"] = {"deltas": deltas, "unexplained": unexplained,
+                         "must_be_zero": mz,
+                         "must_be_zero_ok": all(v == 0 for v in mz.values()),
+                         "must_be_kept": mk,
+                         "must_be_kept_ok": all(v[0] == v[1] for v in mk.values()),
+                         "parent_histogram": dict(sorted(hp.items())),
+                         "candidate_histogram": dict(sorted(hc.items()))}
+    # ---------------------------------------------------------------- P5
+    def dec(m):
+        out = Counter()
+        for vid, d in m.decor.items():
+            for k, ops in d.items():
+                out[str(k)] += len(ops)
+        return out
+    dp, dc = dec(p), dec(c)
+    DNAME = {"2": "Block", "6": "ArrayStride", "11": "BuiltIn", "24": "NonWritable",
+             "33": "Binding", "34": "DescriptorSet", "42": "NoContraction"}
+    rp, rc_ = nc_roles(p), nc_roles(c)
+    role_p = Counter((r["function"], r["opcode"]) for r in rp if r["float_arith"])
+    role_c = Counter((r["function"], r["opcode"]) for r in rc_ if r["float_arith"])
+    rec["P5_decorations"] = {
+        "deltas": {DNAME.get(k, "decoration_" + k): {"before": dp.get(k, 0),
+                                                     "after": dc.get(k, 0)}
+                   for k in sorted(set(dp) | set(dc)) if dc.get(k, 0) != dp.get(k, 0)},
+        "nocontraction_before": dp.get("42", 0), "nocontraction_after": dc.get("42", 0),
+        "nocontraction_roles_parent": rp,
+        "nocontraction_roles_candidate": rc_,
+        "parent_float_arith_nc": sum(1 for r in rp if r["float_arith"]),
+        "candidate_float_arith_nc": sum(1 for r in rc_ if r["float_arith"]),
+        "parent_non_arith_nc": [r for r in rp if not r["float_arith"]],
+        "candidate_non_arith_nc": [r for r in rc_ if not r["float_arith"]],
+        "parent_role_multiset": {"%s / %s" % k: v for k, v in role_p.items()},
+        "candidate_role_multiset": {"%s / %s" % k: v for k, v in role_c.items()},
+        "PARENT_FLOAT_NC_ALL_PRESERVED": all(role_c[k] >= v for k, v in role_p.items()),
+        "candidate_nc_extra": {"%s / %s" % k: role_c[k] - role_p.get(k, 0)
+                               for k in role_c if role_c[k] > role_p.get(k, 0)},
+        "note": "NoContraction is emitted by glslang for every `precise` expression. "
+                "The parent's deployed SPV additionally carries four stray "
+                "NoContraction decorations on non-float instructions, inherited by the "
+                "family's NoContraction-transfer step (aligning a changed function "
+                "against the old FP16 body donor); the candidate is a plain compile and "
+                "carries none. The transfer probe (P0) shows that re-running the step on "
+                "the candidate adds four *different* stray decorations and leaves every "
+                "float-arithmetic one untouched, i.e. the step is numerically inert here.",
+    }
+    ok = (not unexplained
+          and rec["P4_opcodes"]["must_be_zero_ok"]
+          and rec["P4_opcodes"]["must_be_kept_ok"]
+          and rec["P1_interface"]["bindings_removed"] == []
+          and rec["P1_interface"]["bindings_kept_identical"]
+          and rec["P1_interface"]["push_constant_bytes"][0] == rec["P1_interface"]["push_constant_bytes"][1]
+          and rec["P1_interface"]["entry_point"][0] == rec["P1_interface"]["entry_point"][1]
+          and rec["P1_interface"]["execution_modes"][0] == rec["P1_interface"]["execution_modes"][1]
+          and rec["P2_operand_streams"]["residual_loads_identical"]
+          and rec["P2_operand_streams"]["store_stream_identical"]
+          and rec["P3_matrix_sites"]["no_fp16_matrix_multiply_left"]
+          and rec["P3_matrix_sites"]["candidate_int8"] == 6
+          and rec["P3_matrix_sites"]["ds_sites"]["OPERANDS_UNCHANGED"]
+          and rec["P5_decorations"]["PARENT_FLOAT_NC_ALL_PRESERVED"]
+          and not rec["P2_operand_streams"]["stores_removed"]
+          and not rec["P2_operand_streams"]["stores_added"])
+    rec["verdict"] = "ATTRIBUTED" if ok else "FAIL"
+    CARD.joinpath("evidence").mkdir(parents=True, exist_ok=True)
+    (CARD / "evidence/SPV-IDENTITY-R09.json").write_text(
+        json.dumps(rec, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(json.dumps({
+        "verdict": rec["verdict"], "unexplained": unexplained,
+        "deltas": {k: v["delta"] for k, v in deltas.items()},
+        "bindings_added": list(rec["P1_interface"]["bindings_added"]),
+        "cm_types_added": rec["P1_interface"]["cm_types_added"],
+        "cm_types_removed": rec["P1_interface"]["cm_types_removed"],
+        "lds": [rec["P1_interface"]["lds_before"], rec["P1_interface"]["lds_after"]],
+        "push": rec["P1_interface"]["push_constant_bytes"],
+        "residual_loads_identical": rec["P2_operand_streams"]["residual_loads_identical"],
+        "store_stream_identical": rec["P2_operand_streams"]["store_stream_identical"],
+        "stores_removed": rec["P2_operand_streams"]["stores_removed"],
+        "stores_added": rec["P2_operand_streams"]["stores_added"],
+        "mma": [rec["P3_matrix_sites"]["parent_fp16"],
+                rec["P3_matrix_sites"]["candidate_fp16"],
+                rec["P3_matrix_sites"]["candidate_int8"]],
+        "must_be_zero": mz, "must_be_kept": mk,
+        "nc": [rec["P0_identity"]["parent_nocontraction_count"],
+               rec["P0_identity"]["candidate_nocontraction_count"]],
+        "nc_float_arith": [rec["P5_decorations"]["parent_float_arith_nc"],
+                           rec["P5_decorations"]["candidate_float_arith_nc"]],
+        "nc_transfer_probe": tprobe,
+    }, indent=1))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

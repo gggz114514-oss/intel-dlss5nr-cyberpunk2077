@@ -1,0 +1,131 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,shutil,re
+D=Path(__file__).resolve().parent; A=D.parent; B=A.parent.parent
+P=A/'c32-no-gain-diagnosis-20261026/combined-no-root-body'
+T=A/'c32-next-chain-20261026/f20-score-den-stream'
+INC=B/'candidates/zcode-fp16-compute-backend-20261021/u09-join-c32-body1-v1/source'
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+ident=lambda p:dict(path=str(p),sha256=sha(p))
+read=lambda p:json.loads(p.read_text(encoding='utf-8-sig'))
+def save(p,x):p.write_text(json.dumps(x,indent=2),encoding='utf-8')
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+assert sha(P/'plan.txt')=='015da1d924457a436de18db2a0947001508e0d97c64f5cd20281a6c8ff32b019'
+def region(m,name):
+ names={ops[0]:b''.join(int(w).to_bytes(4,'little') for w in ops[1:]).split(bytes([0]))[0].decode() for op,ops,*_ in m.instructions if op==5}
+ fid=next(k for k,v in names.items() if v.startswith(name+'('))
+ return next(r for r in ST.function_regions(m) if m.instructions[r[0]][1][1]==fid)
+def build(d,name,source,parent,own=None):
+ src=d/(name+'.comp'); spv=d/(name+'.spv');src.write_text(source,encoding='utf-8')
+ run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(INC),src,'-o',spv])
+ info=None
+ if parent:
+  pm,cm=ST.Module(parent),ST.Module(spv);extra=set()
+  if own:extra={ST.result_id_of(cm.instructions[i][0],cm.instructions[i][1]) for i in region(cm,own)}&set(ST.no_contraction_ids(cm))
+  keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,extra)
+  assert len(keep)==len(ST.no_contraction_ids(pm))+len(extra)
+  ST.set_no_contraction(cm,keep,spv)
+ run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+ return spv,info
+
+def tickets(d,plan,spvs):
+ for kind in ['GATES','NATIVE','RESOURCES','ORDINARY']:
+  x=read(T/f'LUNA-{kind}.json');x['output_root']=str(d)
+  x['identities']=[z for z in x['identities'] if not z['path'].endswith('.spv')]+[ident(s) for s in spvs]
+  for j in x['jobs']:
+   if kind!='ORDINARY':j['id']=kind.lower()+'-'+d.name+('-'+j['mode'] if kind=='GATES' else '')
+   jp=P/'plan.txt' if kind=='ORDINARY' and j['candidate']=='parent' else plan
+   j['plan']=ident(jp);j['runner_output']=str(d/'run'/j['id']);ar=j['argv'];ar[ar.index('--plan')+1]=str(jp);ar[ar.index('--out')+1]=j['runner_output']
+   if kind!='ORDINARY':j['candidate']=d.name
+   if kind=='NATIVE':
+    ar[ar.index('--profile_dir')+1]=j['id'];ar[ar.index('--output_dir')+1]=str(d/'captures');ar[ar.index('--msg_file')+1]=str(d/'native.log');j['capture_output']=str(d/'captures'/j['id'])
+  save(d/f'LUNA-{kind}.json',x)
+
+# Before writing candidates: executable map/lifetime obligations.
+old=read(A/'c32-boundary-audit-20261026/EVIDENCE.json')
+assert old['entry_mapping_checks']==256 and old['f20_unique_pixels']==1032192
+for sg in range(4):
+ inputs={sg*256+t*16+c for t in range(16) for c in range(16)}
+ a={sg*256+(2*j+l//16+8*h)*16+l%16 for h in range(2) for l in range(32) for j in range(4)}
+ assert inputs==a
+ # Future K stores from every other SG do not overwrite this scratch region.
+ for other in range(4):
+  if other!=sg:assert inputs.isdisjoint(set(range(other*256,(other+1)*256))|set(range(1024+other*256,1024+(other+1)*256)))
+for sg in range(8):
+ assert len({(sg*8+l//4,l%4) for l in range(32)})==32
+ for l in range(32):
+  assert [c+h for c in range(0,32,2) for h in (0,1)]==list(range(32))
+proof=dict(baseline=ident(P/'plan.txt'),input='Each SG owns shK[q*256:q*256+256] before K publication. All 256 A elements equal existing route. Same producer arithmetic/rounding, one feature eval/pixel. Subgroup publish+retire barriers. Other SG future K writes disjoint.',output='F20 shX old readers end in contract before existing WG barrier at stage3 end. Stage9 SG owns rows8*sg..8*sg+7; subgroup publish before consumer. lane//4=row, lane%4=output. All 8SG/32lanes used away from crop. Each output keeps half output rounding, float product then float add c=0..31. Exactly one writer per residual. F27 remainder unchanged.',costs={'f01':{'removed_source_shuffles':18,'added_SLM_write_B_per_WG':2048,'added_SLM_read_B_per_WG':2048,'added_subgroup_barriers':2,'added_shared_allocation_B':0,'producer_active_lanes':16,'consumer_active_lanes':32},'f20':{'removed_global_logical_bytes_per_frame':95551488,'added_SLM_write_B_per_full_WG':4096,'added_SLM_read_B_per_full_WG':16384,'added_subgroup_barriers':1,'added_shared_allocation_B':0,'projection_active_lanes':32,'projection_float_accumulators_per_lane':1,'weight_scalar_elements_per_valid_pixel':128,'new_shuffle_calls':0}},limitations='Register peak, native reads/coalescing and speed unproven until GPU; arithmetic source and NC preserve intended order, JIT equality requires gates.')
+save(D/'PROOF-BEFORE-CODE.json',proof)
+
+# F01: remove B and register transpose, reuse retired (not yet produced) K storage.
+d=D/'f01-direct-a';d.mkdir(exist_ok=True);(d/'run').mkdir(exist_ok=True)
+f=A/'c32-no-gain-diagnosis-20261026/combined-existing/f01.comp';s=f.read_text(encoding='utf-8-sig')
+s=s.replace('NRH_B nrf_prepare_B(uint q);','void nrf_prepare_A(uint q,out NRH_A a0,out NRH_A a1);')
+s=s.replace('NRH_B feats=nrf_prepare_B(sg);NRH_A fa0,fa1;nr_feat_to_A(feats,fa0,fa1);','NRH_A fa0,fa1;nrf_prepare_A(sg,fa0,fa1);')
+s=s.replace('NRH_B nrf_prepare_B(uint q) {','void nrf_prepare_A(uint q,out NRH_A a0,out NRH_A a1) {')
+a=s.index('    // B[k][t]:');b=s.index('\n}',a)
+route='''    if(lane<16u) {
+'''
+for j in range(8):route+=f'        {{f16vec2 z=unpackFloat2x16(packed[{j}]);shK[q*256u+lane*16u+{2*j}u]=z.x;shK[q*256u+lane*16u+{2*j+1}u]=z.y;}}\n'
+route+='''    }
+    subgroupMemoryBarrierShared();subgroupBarrier();
+    coopMatLoad(a0,shK,q*256u,16u,LROW);
+    coopMatLoad(a1,shK,q*256u+128u,16u,LROW);
+    subgroupMemoryBarrierShared();subgroupBarrier();
+'''
+s=s[:a]+route+s[b:]
+spv,info=build(d,'candidate',s,f.with_suffix('.spv'))
+plan=d/'plan.txt';pt=(P/'plan.txt').read_text();assert pt.count(f.with_suffix('.spv').as_posix())==1;plan.write_text(pt.replace(f.with_suffix('.spv').as_posix(),spv.as_posix()),encoding='utf-8')
+tickets(d,plan,[spv]);save(d/'PROOF.json',dict(baseline=ident(P/'plan.txt'),source=ident(d/'candidate.comp'),spv=ident(spv),NC=info,pipeline_indices=[0],pass_indices=[0],cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check'])))
+
+# F20: retain rounded half in shX, all-lane ordered 32->4 scalar projection.
+d=D/'f20-four-output';d.mkdir(exist_ok=True);(d/'run').mkdir(exist_ok=True)
+f=A/'c32-rest-20261026/f20-row-pairs/candidate.comp';s=f.read_text(encoding='utf-8-sig')
+s=s.replace('buffer ImageOut { float16_t imgout[]; }','buffer ImageOut { float residual_out[]; }')
+helper='''// Ordered tail projection: one lane per (pixel,output), all SG lanes participate.
+float boundary_project(uint row,uint channel) {
+    precise float residual=0.0;
+    for(uint c=0u;c<32u;c+=2u) {
+        f16vec2 input_pair=f16vec2(shX[row*32u+c],shX[row*32u+c+1u]);
+        f16vec2 weight_pair=f16vec2(wb[17024u+channel*32u+c],wb[17024u+channel*32u+c+1u]);
+        float value=float(input_pair.x);
+        residual=residual+value*float(weight_pair.x);
+        value=float(input_pair.y);
+        residual=residual+value*float(weight_pair.y);
+    }
+    return residual;
+}
+'''
+pos=s.index('void main(');s=s[:pos]+helper+s[pos:]
+s=s.replace('if (debug) coopMatStore(half0, shX, m0 * 32u, 32u, LROW);','coopMatStore(half0, shX, m0 * 32u, 32u, LROW);')
+s=s.replace('if (debug) coopMatStore(half1, shX, m0 * 32u + 16u, 32u, LROW);','coopMatStore(half1, shX, m0 * 32u + 16u, 32u, LROW);')
+for h in (0,1):
+ s=s.replace(f'        if (!oob{h}) coopMatStore(half{h}, imgout, base{h}, 16u, LROW);','')
+anchor='    // Only debug O uses shared shX; normal output has no within-WG reader.'
+assert s.count(anchor)==1
+s=s.replace(anchor,'''    subgroupMemoryBarrierShared();subgroupBarrier();
+    {
+        uint t=sg*8u+lane/4u,channel=lane%4u,q=t/16u,r=t%16u;
+        int px=(2*int(wx)+shift+int(q&1u))*4+int(r%4u);
+        int py=(2*int(wy)+pc.p3.w+int(q>>1u))*4+int(r/4u);
+        if(px>=0 && px<1280 && py>=0 && py<720)
+            residual_out[(uint(py)*1280u+uint(px))*4u+channel]=boundary_project(t,channel);
+    }
+    // Debug O continues to read the same rounded half values from shX.''')
+spv,info=build(d,'candidate',s,f.with_suffix('.spv'),'boundary_project')
+# F27: only replace scalar projection with residual read; keep full image tail.
+tail=B/'candidates/amd-map-20261015/s3-io-tail-transport/f27-surfaces'
+for name in ['ioport_common.glsl','ioport_images.glsl']:shutil.copyfile(tail/name,d/name)
+s=(tail/'paired_reads_surface.comp').read_text();s=s.replace('readonly buffer FeaturePairs { f16vec2 xp[]; }','readonly buffer FeaturePairs { float residual_in[]; }')
+a=s.index('    precise vec4 residual=vec4(0);');b=s.index('    vec4 base=',a)
+s=s[:a]+'    vec4 residual=vec4(residual_in[i*4u],residual_in[i*4u+1u],residual_in[i*4u+2u],residual_in[i*4u+3u]);\n'+s[b:]
+tspv,_=build(d,'tail',s,None)
+pt=(P/'plan.txt').read_text();pt=pt.replace(f.with_suffix('.spv').as_posix(),spv.as_posix())
+oldtail=B/'candidates/amd-map-20261015/round4-integrated/candidate/spv/io-f27-surfaces.spv';assert pt.count(oldtail.as_posix())==1;pt=pt.replace(oldtail.as_posix(),tspv.as_posix())
+assert pt.count('BUFFER "ioport_70_ioport_body" 66060288')==1;pt=pt.replace('BUFFER "ioport_70_ioport_body" 66060288','BUFFER "ioport_70_ioport_body" 14745600')
+for slot in (2,3):assert pt.count(f'BIND {slot} 480 0 66060288')==1;pt=pt.replace(f'BIND {slot} 480 0 66060288',f'BIND {slot} 480 0 14745600')
+plan=d/'plan.txt';plan.write_text(pt,encoding='utf-8');tickets(d,plan,[spv,tspv])
+save(d/'PROOF.json',dict(baseline=ident(P/'plan.txt'),source=ident(d/'candidate.comp'),spv=ident(spv),tail=ident(tspv),NC=info,pipeline_indices=[38,39],pass_indices=[230,231],cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check'])))
+print('BOTH_CANDIDATES_CPU_READY')

@@ -1,0 +1,94 @@
+"""n22-f15-den-pv: classify the parent ISA's mov population and message stream.
+
+CPU only, read-only inputs:
+  queue/n13-vit-attn/native/captures/native-native-base/ISA/*.asm   (parent capture)
+Output: cards/n22-f15-den-pv/build/ISA-CLASSES.json
+"""
+import json, re, sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+BASE = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(BASE))
+import ISA  # noqa: E402
+
+ASM = BASE / 'queue/n13-vit-attn/native/captures/native-native-base/ISA/CS_asm059648fd95fa9a9d_simd32_000000000000001a_25_orig.asm'
+OUT = BASE / 'cards/n22-f15-den-pv/build/ISA-CLASSES.json'
+
+
+def mov_class(i):
+    """Coarse shape class for a mov, from the raw operand text."""
+    raw = i['raw']
+    body = raw.split('*/', 1)[1] if '*/' in raw else raw
+    m = re.search(r'mov\s+\((\d+)\|(M\d+)\)', body)
+    exec_ = int(m.group(1)) if m else -1
+    dst = i['ops'][0] if i['ops'] else ''
+    src = i['ops'][1] if len(i['ops']) > 1 else ''
+    dt = dst.split(':')[-1] if ':' in dst else '?'
+    dst_stride = re.search(r'<(\d+);', dst)
+    src_stride = re.search(r'<(\d+);', src)
+    indirect = 'r[a0' in src
+    if indirect:
+        return 'indirect-grf-read r[a0]'
+    # VNNI/half interleave: write with stride 2 while reading a packed region
+    if dst_stride and int(dst_stride.group(1)) == 2:
+        return 'interleave (dst stride 2)'
+    if src_stride and int(src_stride.group(1)) == 2 and exec_ <= 16:
+        return 'de-interleave (src stride 2)'
+    if dt == 'hf' and ':f' in src:
+        return 'f32->f16 narrow'
+    if dt == 'f' and ':hf' in src:
+        return 'f16->f32 widen'
+    if exec_ == 8:
+        return '8-wide payload build'
+    if exec_ == 32:
+        return '32-wide 1:1 copy'
+    if exec_ == 16:
+        return '16-wide copy'
+    if exec_ == 1:
+        return 'scalar (uniform)'
+    return 'other (exec %d)' % exec_
+
+
+def main():
+    isa = ISA.parse(ASM)
+    movs = [i for i in isa if i['op'].startswith('mov')]
+    cls = Counter(mov_class(i) for i in movs)
+    wat = defaultdict(list)
+    for i in movs:
+        c = mov_class(i)
+        if len(wat[c]) < 3:
+            wat[c].append(i['raw'].strip())
+
+    # per-256B-region instruction density, to show where the static bulk sits
+    regions = Counter(i['addr'] >> 8 for i in isa)
+    movregions = Counter(i['addr'] >> 8 for i in movs)
+
+    # sync / barrier / branch census
+    sync_hist = Counter(i['op'] for i in isa if i['op'].startswith('sync'))
+    br_hist = Counter(i['op'] for i in isa if i['op'] in ('goto', 'join', 'jmpi'))
+
+    res = dict(isa=str(ASM), instructions=len(isa), mov_total=len(movs),
+               mov_classes=dict(cls.most_common()),
+               mov_examples={k: v for k, v in wat.items()},
+               sync=sync_hist, branches=br_hist,
+               region_histogram={hex(k << 8): [regions[k], movregions.get(k, 0)]
+                                 for k in sorted(regions)},
+               exec_size_hist={})
+    # exec-size histogram over the whole kernel
+    ex = Counter()
+    for i in isa:
+        m = re.search(r'\((\d+)\|M\d+\)', i['raw'].split('*/', 1)[1] if '*/' in i['raw'] else i['raw'])
+        ex[int(m.group(1)) if m else -1] += 1
+    res['exec_size_hist'] = {str(k): v for k, v in sorted(ex.items())}
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(json.dumps(res, indent=2), encoding='utf-8')
+    print(json.dumps({k: v for k, v in res.items() if k not in ('mov_examples', 'region_histogram')}, indent=2)[:4000])
+    print('--- examples ---')
+    for k, v in res['mov_examples'].items():
+        print(k, '::', v[0][:130])
+    print('wrote', OUT)
+
+
+if __name__ == '__main__':
+    main()

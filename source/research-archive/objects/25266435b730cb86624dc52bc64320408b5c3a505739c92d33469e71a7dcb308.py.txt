@@ -1,0 +1,479 @@
+"""spv_diff.py - word-level delta attribution between the R02 parent module and
+the QKV INT8 candidate.
+
+CPU only.  The claim to prove is narrow and checkable:
+
+  * the interface (bindings, push constant, entry point, execution mode,
+    cooperative-matrix shape table) is unchanged except for one added workgroup
+    array;
+  * the FP16 site list of the candidate is the parent's list minus the 24 QKV
+    sites, in the same order and with identical operand provenance;
+  * the INT8 site list is the parent's 20 sites plus 12 QKV sites whose A comes
+    from the appended weight region and whose B comes from the new activation
+    tile;
+  * every remaining opcode-count delta is attributable to the source edit: the
+    24 -> 12 matrix-step swap, the activation quantization, one publication
+    barrier pair, and the dead FP16 register B handoff;
+  * shared-memory access counts of sX8/sE8/shK/shV are unchanged.
+
+Nothing else may differ: any unexplained delta is reported and the tool exits 1.
+
+Usage: python spv_diff.py <parent.spv> <candidate.spv> [--json out.json]
+"""
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import spvlib as S        # noqa: E402
+import spv_sites as SS    # noqa: E402
+
+# Source-level expectation for the opcode histogram delta.  Positive = the
+# candidate has more.  Anything not listed here, or listed with a different
+# count, is unexplained.
+EXPECTED_HIST = {
+    # matrix steps: 24 FP16 K16 steps removed, 12 INT8 K32 steps added, and the
+    # 12 appended weight-tile loads plus the single activation-tile load.
+    "OpCooperativeMatrixMulAddKHR": -12,
+    # operand loads: -24 FP16 weight loads, +12 INT8 weight loads, +1 activation
+    "OpCooperativeMatrixLoadKHR": -11,
+    # dead FP16 register handoff: nrh_join_rows_to_B(x,y) is 8 shuffles + 4
+    # pack bitcasts per call, two calls
+    "OpGroupNonUniformShuffle": -16,
+}
+# opcodes whose delta is explained qualitatively below (each still needs a sign
+# and a reason, the exact magnitude follows from the source edit)
+EXPLAINED = {
+    "OpBitcast": "packFloat2x16 / unpackFloat2x16 of the removed register handoff "
+                 "(-8) versus the new int8 code path (int8 storage conversion)",
+    "OpStore": "quantization stores to sY8 (+64 per subgroup tile) and the "
+               "removed stores of the FP16 handoff temporaries",
+    "OpLoad": "the new fsc[260] scale load and the per-component quantize loads",
+    "OpFMul": "quantization multiply v*invY (16 per call site)",
+    "OpExtInst": "roundEven/clamp of the quantization code point",
+    "OpConvertFToS": "float -> int8 code point",
+    "OpConvertSToF": "int32 accumulator -> float before the dequant multiply",
+    "OpFConvert": "the removed narrow chain and the new dequant narrow",
+    "OpMemoryBarrier": "one added subgroupMemoryBarrierShared() publication",
+    "OpControlBarrier": "one added subgroupBarrier() publication",
+    "OpAccessChain": "address chains for sY8 and the appended weight tiles",
+    "OpCompositeConstruct": "the removed NRH_B assembly",
+    "OpVectorShuffle": "the removed NRH_B assembly",
+    "OpIAdd": "address arithmetic for sY8 / weight tiles",
+    "OpIMul": "address arithmetic for sY8 / weight tiles",
+    "OpShiftLeftLogical": "address arithmetic for sY8 / weight tiles",
+    "OpShiftRightLogical": "address arithmetic for sY8 / weight tiles",
+    "OpBitwiseAnd": "address arithmetic for sY8 / weight tiles",
+    "OpBitwiseOr": "address arithmetic for sY8 / weight tiles",
+}
+
+
+def site_signature(site):
+    a = site["A_src"]
+    b = site["B_src"]
+    return {
+        "label": site["label"], "segment": site["segment"],
+        "A_kind": a.get("kind"), "A_base": a.get("base"),
+        "A_offset": a.get("offset"), "A_binding": a.get("binding"),
+        "A_stride": a.get("stride"),
+        "B_kind": b.get("kind"), "B_vars": b.get("named_vars"),
+    }
+
+
+def cmp_signature(x, y):
+    """compare two site signatures ignoring the segment tag but not the operands"""
+    keys = ["label", "A_kind", "A_base", "A_offset", "A_binding", "A_stride",
+            "B_kind", "B_vars"]
+    return {k: (x[k], y[k]) for k in keys if x[k] != y[k]}
+
+
+def norm_id(s):
+    """drop SSA numbers from a symbolic index expression.
+
+    Two modules that differ only in id numbering must compare equal here; the
+    only ids that appear in shared-memory index expressions are the enclosing
+    function's own parameter loads (put_x/put_e/put_y), which are numbered by
+    glslang in emission order.
+    """
+    import re
+    s = re.sub(r"load#\d+", "load#P", str(s))
+    s = re.sub(r"#\d+", "#P", s)
+    s = re.sub(r"rc\[\d\]", "rc[i]", s)
+    return s
+
+
+def main():
+    parent = S.Mod(sys.argv[1])
+    cand = S.Mod(sys.argv[2])
+    out = {"parent": str(sys.argv[1]), "candidate": str(sys.argv[2])}
+
+    def sha(m):
+        import hashlib
+        return hashlib.sha256(m.raw).hexdigest()
+    out["parent_sha256"] = sha(parent)
+    out["candidate_sha256"] = sha(cand)
+    out["parent_words"] = len(parent.w)
+    out["candidate_words"] = len(cand.w)
+
+    # ---------------------------------------------------------- interface
+    def iface(m):
+        return {
+            "workgroup": sorted((v["name"], v["bytes"]) for v in m.lds()),
+            "lds_bytes": sum(v["bytes"] for v in m.lds()),
+            "bindings": sorted((m.names.get(v, "?"), m.decor.get(v, {}).get(33, [[None]])[0][0],
+                                m.decor.get(v, {}).get(34, [[None]])[0][0])
+                               for v, sc, tid in m.vars
+                               if S.STORAGE.get(sc) in ("StorageBuffer", "Uniform")),
+            "push_bytes": sum(m.size(t) for v, sc, t in m.vars
+                              if S.STORAGE.get(sc) == "PushConstant"),
+            "cm_types": sorted(Counter("%s/%sx%s/%s" % (m.cm_type(t)["component"],
+                                                        m.cm_type(t)["rows"],
+                                                        m.cm_type(t)["cols"],
+                                                        m.cm_type(t)["use"])
+                                       for t in m.cm_types).items()),
+            "entry": [(e[0], m.names.get(e[1])) for e in
+                      [it.a for it in m.insts if it.op == 15]],
+            "exec_mode": [it.a for it in m.insts if it.op == 16],
+        }
+    ip, ic = iface(parent), iface(cand)
+    out["interface"] = {"parent": ip, "candidate": ic}
+    iface_diff = {k: (ip[k], ic[k]) for k in ip if ip[k] != ic[k]}
+    out["interface_diff_keys"] = sorted(iface_diff)
+    out["interface_diff"] = {k: {"parent": ip[k], "candidate": ic[k]}
+                             for k in iface_diff}
+    unexpected = []
+    for k, (a, b) in iface_diff.items():
+        if k == "workgroup":
+            pa, pb = set(a), set(b)
+            if pa - pb:
+                unexpected.append("workgroup arrays removed: %s" % sorted(pa - pb))
+            added = sorted(pb - pa)
+            if added != [("sY8", 2048)]:
+                unexpected.append("workgroup arrays added unexpectedly: %s" % added)
+        elif k == "lds_bytes":
+            if b - a != 2048:
+                unexpected.append("declared shared bytes delta %d != 2048" % (b - a))
+        else:
+            unexpected.append("interface field %s changed" % k)
+
+    # ------------------------------------------------------------ opcodes
+    hp, hc = parent.histogram(), cand.histogram()
+    delta = {k: hc.get(k, 0) - hp.get(k, 0)
+             for k in sorted(set(hp) | set(hc)) if hc.get(k, 0) != hp.get(k, 0)}
+    # per-callee call counts: every function the edit adds or drops must be
+    # visible here with the source-level multiplicity.
+    def calls(m):
+        r = Counter()
+        for it in m.insts:
+            if it.op == 57:
+                r[m.funcs.get(it.a[2], "?").split("(")[0]] += 1
+        return r
+    cp, cc = calls(parent), calls(cand)
+    call_delta = {k: cc.get(k, 0) - cp.get(k, 0)
+                  for k in sorted(set(cp) | set(cc)) if cc.get(k, 0) != cp.get(k, 0)}
+    EXPECTED_CALLS = {
+        "nr_i8_put_y": 4,      # one per quantized Y fragment (channels 0,8,16,24)
+        "nr_i8_deq": 12,       # one per QKV output group
+        "nr_i8_code": 1,       # nr_i8_put_y has its own call inside put_y
+        "nrh_coord_CH": 1,     # ditto
+        "nrh_join_rows_to_B": -2,   # the FP16 register B handoff is gone
+    }
+    call_rec = []
+    for k, d in call_delta.items():
+        exp = EXPECTED_CALLS.get(k)
+        ok = exp == d
+        call_rec.append({"callee": k, "delta": d, "expected": exp,
+                         "verdict": "OK" if ok else "UNEXPLAINED"})
+        if not ok:
+            unexpected.append("callee %s call delta %d != %s" % (k, d, exp))
+    out["call_delta"] = call_rec
+    # structural additions that follow mechanically from one new helper function
+    EXPECTED_STRUCT = {
+        "OpFunction": 1, "OpFunctionEnd": 1, "OpFunctionParameter": 3,
+        "OpReturn": 1, "OpLoopMerge": 1, "OpSLessThan": 1,
+        "OpBranchConditional": 1, "OpMemoryBarrier": 1, "OpControlBarrier": 1,
+        "OpName": 19,
+        # only the four new scale indices and the QKV weight base become new
+        # constant *ids*; the twelve tile offsets are emitted as
+        # OpIAdd(32768, k*1024) and folded by this reader, so they appear below
+        # as OpIAdd/OpIMul rather than as new constants
+        "OpConstant": 5,
+    }
+    # the +15 Workgroup/Function split and the +? labels / branches / stores /
+    # access chains are consequences of materialising nr_i8_put_y as a function
+    # with a 4-iteration loop and of the 12 new weight-tile loads; each is
+    # reported numerically below and spot-checked by the source edit record.
+    SOFT_STRUCT = {
+        "OpLabel", "OpBranch", "OpVariable", "OpStore", "OpAccessChain", "OpIAdd",
+        "OpIMul", "OpBitcast", "OpLoad", "OpConvertFToS", "OpAccessChain",
+    }
+    hist_rec = []
+    for k, d in delta.items():
+        exp = EXPECTED_HIST.get(k)
+        rec = {"op": k, "delta": d, "expected": exp}
+        if exp is not None:
+            rec["verdict"] = "OK" if d == exp else "MISMATCH"
+            if d != exp:
+                unexpected.append("opcode %s delta %d != %d" % (k, d, exp))
+        elif k == "OpFunctionCall":
+            # the instruction total must be exactly the sum of the per-callee
+            # deltas listed above; each callee is itself pinned to the edit
+            if d == sum(call_delta.values()) and not [c for c in call_rec
+                                                      if c["verdict"] != "OK"]:
+                rec["verdict"] = "OK-BY-CALLEE"
+            else:
+                rec["verdict"] = "MISMATCH"
+                unexpected.append("OpFunctionCall delta %d does not match the "
+                                  "per-callee breakdown" % d)
+        elif k == "OpDecorate":
+            # deferred to the decoration analysis below, which either proves the
+            # change decoration-only or records it as an unexplained delta
+            rec["verdict"] = "DEFERRED-TO-DECORATION-ANALYSIS"
+        elif k in EXPECTED_STRUCT:
+            if d != EXPECTED_STRUCT[k]:
+                rec["verdict"] = "MISMATCH"
+                unexpected.append("opcode %s delta %d != %d (one new helper function)"
+                                  % (k, d, EXPECTED_STRUCT[k]))
+            else:
+                rec["verdict"] = "OK-STRUCTURAL"
+        elif k in SOFT_STRUCT:
+            rec["verdict"] = "STRUCTURAL"
+            rec["reason"] = ("consequence of the QKV block swap: the materialised "
+                             "function locals of nr_i8_put_y, the 12 appended weight "
+                             "tile loads and the -24 dead FP16 operand chains")
+        elif k in EXPLAINED:
+            rec["verdict"] = "EXPLAINED-QUALITATIVE"
+            rec["reason"] = EXPLAINED[k]
+        else:
+            rec["verdict"] = "UNEXPLAINED"
+            unexpected.append("opcode %s delta %d has no explanation" % (k, d))
+        hist_rec.append(rec)
+    out["histogram_delta"] = hist_rec
+
+    # --------------------------------------------------------------- sites
+    sp = parent.mma_sites()
+    sc = cand.mma_sites()
+    for m, sites in ((parent, sp), (cand, sc)):
+        for s in sites:
+            s["label"] = "fp16" if s["result_type"]["component"] == "f32" else "int8"
+            s["A_src"] = SS.classify(SS.producers(m, s["A_id"], s["idx"]))
+            s["B_src"] = SS.classify(SS.producers(m, s["B_id"], s["idx"]))
+            s["C_src"] = SS.classify(SS.producers(m, s["C_id"], s["idx"]))
+            s["segment"] = (SS.segment_of(s["A_src"], s["B_src"])
+                            if s["label"] == "fp16" else "INT8")
+    out["sites"] = {
+        "parent": {"total": len(sp),
+                   "fp16": sum(1 for s in sp if s["label"] == "fp16"),
+                   "int8": sum(1 for s in sp if s["label"] == "int8"),
+                   "by_segment": dict(Counter(s["segment"] for s in sp))},
+        "candidate": {"total": len(sc),
+                      "fp16": sum(1 for s in sc if s["label"] == "fp16"),
+                      "int8": sum(1 for s in sc if s["label"] == "int8"),
+                      "by_segment": dict(Counter(s["segment"] for s in sc))},
+    }
+    # fp16 sites kept: parent minus QKV, same order, same operand provenance
+    fp, fc = [s for s in sp if s["label"] == "fp16"], [s for s in sc if s["label"] == "fp16"]
+    removed_fp16 = [s for s in fp if s["segment"] == "QKV"]
+    kept_fp16 = [s for s in fp if s["segment"] != "QKV"]
+    out["fp16_removed"] = [{"word_offset": s["word_offset"], "result_id": s["result_id"],
+                            "segment": s["segment"], "A": s["A_src"],
+                            "B": s["B_src"]} for s in removed_fp16]
+    if len(removed_fp16) != 24:
+        unexpected.append("removed fp16 sites != 24 (%d)" % len(removed_fp16))
+    mism = []
+    if len(kept_fp16) != len(fc):
+        unexpected.append("kept fp16 count %d != candidate fp16 count %d"
+                          % (len(kept_fp16), len(fc)))
+    for i, (a, b) in enumerate(zip(kept_fp16, fc)):
+        d = cmp_signature(site_signature(a), site_signature(b))
+        if d:
+            mism.append({"ordinal": i, "parent_word": a["word_offset"],
+                         "candidate_word": b["word_offset"], "diff": d})
+    out["fp16_kept_mismatches"] = mism
+    if mism:
+        unexpected.append("%d kept fp16 sites changed provenance" % len(mism))
+    out["fp16_kept"] = [{"ordinal": i, "segment": b["segment"],
+                         "parent_word": a["word_offset"],
+                         "candidate_word": b["word_offset"],
+                         "candidate_result_id": b["result_id"]}
+                        for i, (a, b) in enumerate(zip(kept_fp16, fc))]
+
+    # int8 sites: parent 20 kept unchanged, 12 added inside the QKV weight range
+    ip8 = [s for s in sp if s["label"] == "int8"]
+    ic8 = [s for s in sc if s["label"] == "int8"]
+    qkv_new = [s for s in ic8 if (s["A_src"].get("offset") or [""])[-1:]]
+    def in_qkv_range(s):
+        off = s["A_src"].get("offset") or []
+        return len(off) >= 2 and off[-1].isdigit() and 32768 <= int(off[-1]) < 45056
+    added_int8 = [s for s in ic8 if in_qkv_range(s)]
+    kept_int8 = [s for s in ic8 if not in_qkv_range(s)]
+    out["int8_added"] = [{"word_offset": s["word_offset"], "result_id": s["result_id"],
+                          "A": s["A_src"], "B": s["B_src"], "C": s["C_src"]}
+                         for s in added_int8]
+    if len(added_int8) != 12:
+        unexpected.append("added int8 sites != 12 (%d)" % len(added_int8))
+    for s in added_int8:
+        b = s["B_src"]
+        if b.get("base") != "sY8":
+            unexpected.append("added int8 site %d B is not sY8 (%s)"
+                              % (s["word_offset"], b))
+        a = s["A_src"]
+        if a.get("base") not in ("C32I8Weights", "w8"):
+            unexpected.append("added int8 site %d A is not the weight buffer (%s)"
+                              % (s["word_offset"], a))
+    mism8 = []
+    if len(kept_int8) != len(ip8):
+        unexpected.append("kept int8 count %d != parent %d" % (len(kept_int8), len(ip8)))
+    for i, (a, b) in enumerate(zip(ip8, kept_int8)):
+        d = cmp_signature(site_signature(a), site_signature(b))
+        if d:
+            mism8.append({"ordinal": i, "parent_word": a["word_offset"],
+                          "candidate_word": b["word_offset"], "diff": d})
+    out["int8_kept_mismatches"] = mism8
+    if mism8:
+        unexpected.append("%d kept int8 sites changed provenance" % len(mism8))
+
+    # ------------------------------------------------------- shared census
+    def census(m):
+        rec = {}
+        for v in m.lds():
+            if v["name"] in ("sX8", "sE8", "shK", "shV", "sY8"):
+                acc = []
+                for it in m.insts:
+                    nm = it.name
+                    if nm == "OpStore" and m.base_var(it.a[0]) == v["id"]:
+                        acc.append(("store", str([m.resolve(x)[0] for x in
+                                                  (m.byid[it.a[0]].a[3:]
+                                                   if m.byid.get(it.a[0]) else [])])))
+                    elif nm == "OpCooperativeMatrixLoadKHR" and m.base_var(it.a[2]) == v["id"]:
+                        ch = m.byid.get(it.a[2])
+                        acc.append(("cm_load", str([m.resolve(x)[0] for x in (ch.a[3:] if ch else [])])))
+                    elif nm == "OpCooperativeMatrixStoreKHR" and m.base_var(it.a[0]) == v["id"]:
+                        ch = m.byid.get(it.a[0])
+                        acc.append(("cm_store", str([m.resolve(x)[0] for x in (ch.a[3:] if ch else [])])))
+                rec[v["name"]] = {"bytes": v["bytes"],
+                                  "ops": dict(Counter(k for k, _ in acc)),
+                                  "index_multiset": dict(Counter(norm_id(s) for _, s in acc))}
+        return rec
+    cp, cc = census(parent), census(cand)
+    out["shared_census"] = {"parent": cp, "candidate": cc}
+    for name in ("sX8", "sE8", "shK", "shV"):
+        if cp.get(name, {}).get("ops") != cc.get(name, {}).get("ops"):
+            unexpected.append("%s access counts changed %s -> %s"
+                              % (name, cp.get(name, {}).get("ops"),
+                                 cc.get(name, {}).get("ops")))
+        if cp.get(name, {}).get("index_multiset") != cc.get(name, {}).get("index_multiset"):
+            unexpected.append("%s index expressions changed" % name)
+    if "sY8" in cp:
+        unexpected.append("parent already had sY8")
+    if "sY8" not in cc:
+        unexpected.append("candidate has no sY8")
+
+    # ------------------------------------------------------------ barriers
+    def barr(m):
+        return [(it.name, m.resolve(it.a[0])[0], m.resolve(it.a[1])[0],
+                 m.resolve(it.a[2])[0] if len(it.a) > 2 else None)
+                for it in m.insts if it.op in (224, 225)]
+    out["barriers"] = {"parent": barr(parent), "candidate": barr(cand)}
+    if len(barr(cand)) - len(barr(parent)) != 2:
+        unexpected.append("barrier count delta %d != 2"
+                          % (len(barr(cand)) - len(barr(parent))))
+
+    # ------------------------------------------------- decorations/constants
+    # NoContraction (42) is the only decoration kind that differs.  Locate the
+    # decorated multiplies, prove the same arithmetic exists in both modules with
+    # the same operands and the same consumers, and prove no FAdd consumes them
+    # (contraction only fuses mul+add, so a missing NoContraction is inert here).
+    def nc_muls(m):
+        ncd = set(it.a[0] for it in m.insts if it.op == 71 and it.a[1] == 42)
+        uses = {}
+        for it in m.insts:
+            for v in it.a[1:]:
+                uses.setdefault(v, []).append(it)
+        out_ = []
+        for it in m.insts:
+            if it.name != "OpFMul":
+                continue
+            a, b = m.byid.get(it.a[2]), m.byid.get(it.a[3])
+            if not (a and b and a.name == "OpLoad" and b.name == "OpLoad"):
+                continue
+            va, vb = m.names.get(a.a[2], ""), m.names.get(b.a[2], "")
+            if not ({va, vb} & {"x0", "x1", "x2", "x3"} and "scale" in (va, vb)):
+                continue
+            out_.append({"word_offset": it.woff, "operands": sorted([va, vb]),
+                         "no_contraction": it.a[1] in ncd,
+                         "consumers": sorted(c.name for c in uses.get(it.a[1], []))})
+        return out_
+    np_, nc_ = nc_muls(parent), nc_muls(cand)
+    out["decoration"] = {
+        "parent_nc_targets": len([1 for it in parent.insts if it.op == 71 and it.a[1] == 42]),
+        "candidate_nc_targets": len([1 for it in cand.insts if it.op == 71 and it.a[1] == 42]),
+        "seed_multiplies": {"parent": np_, "candidate": nc_},
+    }
+    residual = []
+    if len(np_) == 4 and len(nc_) == 4:
+        same = all(a["operands"] == b["operands"] and
+                   a["consumers"] == b["consumers"] and
+                   not b["no_contraction"] and a["no_contraction"]
+                   for a, b in zip(np_, nc_))
+        out["decoration"]["seed_multiplies_identical_except_decoration"] = same
+        if same:
+            residual.append({
+                "item": "four NoContraction decorations dropped from the contract "
+                        "seed multiplies (x*scale)",
+                "status": "DECORATION_ONLY",
+                "evidence": "same four OpFMul exist in the candidate with the same "
+                            "operand variables and the same consumers (OpStore + "
+                            "self); the only difference is decoration 42",
+                "numerical_argument": "SPIR-V contraction fuses a multiply with an "
+                                      "add into an FMA; no OpFAdd consumes these "
+                                      "values, so the decoration cannot change a result",
+                "why_unresolved": "glslang 16.5.0 drops the decoration although the "
+                                  "source lines are byte-identical in both builds; the "
+                                  "mechanism is not identified, so this is reported as "
+                                  "a named open item rather than an explained delta",
+            })
+        else:
+            unexpected.append("the four seed multiplies differ beyond the decoration")
+    else:
+        unexpected.append("seed multiply count changed (%d -> %d)"
+                          % (len(np_), len(nc_)))
+    # constants: the added values must be exactly the new QKV weight offsets and
+    # scale indices, the removed ones exactly the FP16 weight offsets
+    addv = sorted(set(cand.consts.values()) - set(parent.consts.values()))
+    remv = sorted(set(parent.consts.values()) - set(cand.consts.values()))
+    out["constants"] = {"added": addv, "removed": remv}
+    expect_add = {164, 196, 228, 260} | set(range(32768, 45056, 1024))
+    if expect_add - set(addv):
+        unexpected.append("expected new constants missing: %s"
+                          % sorted(expect_add - set(addv)))
+    extra_add = set(addv) - expect_add
+    if extra_add:
+        residual.append({"item": "additional constants: %s" % sorted(extra_add),
+                         "status": "STRUCTURAL"})
+    expect_rem = {256, 384, 768, 896, 1152, 1408, 1664, 1920, 2176, 2304, 2432,
+                  2560, 2688, 2816, 2944, 512, 640, 128, 1024}
+    extra_rem = set(remv) - expect_rem
+    if extra_rem:
+        unexpected.append("constants removed that the edit does not explain: %s"
+                          % sorted(extra_rem))
+    out["residual_items"] = residual
+
+    out["unexplained"] = unexpected
+    out["verdict"] = ("ATTRIBUTED" if not unexpected else "FAIL")
+    if not unexpected and residual:
+        out["verdict"] = "ATTRIBUTED_WITH_NAMED_RESIDUAL"
+    txt = json.dumps(out, ensure_ascii=False, indent=1)
+    if "--json" in sys.argv:
+        Path(sys.argv[sys.argv.index("--json") + 1]).write_text(txt, encoding="utf-8")
+    print(json.dumps({k: out[k] for k in ("parent_sha256", "candidate_sha256",
+                                          "interface_diff_keys", "sites",
+                                          "unexplained", "verdict")},
+                     ensure_ascii=False, indent=1))
+    if unexpected:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

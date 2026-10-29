@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Word-level SPIR-V delta attribution for the A1 gM-mirror drop.
+
+For each width it answers one question: *is the candidate module the parent module
+minus exactly the four unused `gM` mirror stores (and the address arithmetic that
+becomes dead), and nothing else?*
+
+Method
+------
+1. Parse both modules into (opcode, operands, word_count) triples.
+2. Globals (before the first OpFunction) are compared ID-agnostically: per-variable
+   storage class / byte size / (set, binding) / debug name, plus opcode histograms.
+3. In the parent body, locate every `OpStore` whose pointer chain terminates at the
+   `gM` variable, then close the set under "result used only by removed
+   instructions" so dead address arithmetic is included.
+4. Compare the parent body minus that closure against the child body: the opcode
+   histogram must be identical, the word count must drop by exactly the closure's
+   words, and the closure must contain no floating-point, cooperative-matrix,
+   barrier or control-flow opcode.
+
+Output: JSON with per-width verdicts; exit code 1 when a verdict is False.
+"""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, r"@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts")
+import spv_tools_local as S  # noqa: E402
+
+W = Path(r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024")
+CARD = W / "candidates/a1-d034-gm-drop"
+BUILD = W / "build/a1-d034-gm-drop"
+
+OPNAME = {
+    5: "OpName", 6: "OpMemberName", 11: "OpExtInstImport", 12: "OpExtInst", 14: "OpMemoryModel",
+    15: "OpEntryPoint", 16: "OpExecutionMode", 17: "OpCapability", 19: "OpTypeVoid",
+    20: "OpTypeBool", 21: "OpTypeInt", 22: "OpTypeFloat", 23: "OpTypeVector", 24: "OpTypeMatrix",
+    25: "OpTypeImage", 26: "OpTypeSampler", 27: "OpTypeSampledImage", 28: "OpTypeArray",
+    29: "OpTypeRuntimeArray", 30: "OpTypeStruct", 31: "OpTypeOpaque", 32: "OpTypePointer",
+    33: "OpTypeFunction", 40: "OpConstantTrue", 41: "OpConstantFalse", 42: "OpConstantSampler",
+    43: "OpConstant", 44: "OpConstantComposite", 46: "OpConstantNull", 48: "OpSpecConstantOp",
+    54: "OpFunction", 55: "OpFunctionParameter", 56: "OpFunctionEnd", 57: "OpFunctionCall",
+    59: "OpVariable", 61: "OpLoad", 62: "OpStore", 65: "OpAccessChain", 66: "OpInBoundsAccessChain",
+    67: "OpPtrAccessChain", 71: "OpDecorate", 72: "OpMemberDecorate", 73: "OpDecorationGroup",
+    74: "OpGroupDecorate", 75: "OpGroupMemberDecorate", 77: "OpVectorExtractDynamic",
+    79: "OpVectorInsertDynamic", 80: "OpVectorShuffle", 81: "OpCompositeConstruct",
+    82: "OpCompositeExtract", 83: "OpCompositeInsert", 84: "OpCopyObject", 86: "OpTranspose",
+    87: "OpSampledImage", 95: "OpImageSampleImplicitLod", 99: "OpImageWrite",
+    109: "OpConvertFToU", 110: "OpConvertFToS", 111: "OpConvertSToF", 112: "OpConvertUToF",
+    113: "OpUConvert", 114: "OpSConvert", 115: "OpFConvert", 116: "OpQuantizeToF16",
+    117: "OpBitcast", 119: "OpSNegate", 120: "OpFNegate", 124: "OpIAdd", 126: "OpFAdd",
+    128: "OpISub", 129: "OpFSub", 130: "OpIMul", 133: "OpFMul", 134: "OpUDiv", 135: "OpSDiv",
+    137: "OpFDiv", 141: "OpShiftRightLogical", 142: "OpShiftRightArithmetic",
+    143: "OpShiftLeftLogical", 146: "OpBitwiseOr", 147: "OpBitwiseXor", 148: "OpBitwiseAnd",
+    152: "OpSelect", 154: "OpIEqual", 155: "OpINotEqual", 156: "OpUGreaterThan",
+    157: "OpSGreaterThan", 158: "OpUGreaterThanEqual", 159: "OpSGreaterThanEqual",
+    164: "OpLogicalOr", 165: "OpLogicalAnd", 166: "OpLogicalNot", 167: "OpSelect",
+    169: "OpIAddCarry", 170: "OpISubBorrow", 171: "OpUMulExtended", 172: "OpSMulExtended",
+    177: "OpAny", 178: "OpAll", 179: "OpIsNan", 180: "OpIsInf", 191: "OpDPdx",
+    194: "OpFwidth", 224: "OpImage", 225: "OpImageQuerySizeLod", 246: "OpControlBarrier",
+    247: "OpMemoryBarrier", 248: "OpAtomicLoad", 249: "OpAtomicStore",
+    250: "OpAtomicExchange", 251: "OpAtomicCompareExchange", 252: "OpAtomicIIncrement",
+    253: "OpAtomicIDecrement", 254: "OpAtomicIAdd", 255: "OpAtomicISub",
+    4456: "OpCooperativeMatrixLoadKHR", 4457: "OpCooperativeMatrixStoreKHR",
+    4458: "OpCooperativeMatrixMulAddKHR", 4459: "OpCooperativeMatrixLengthKHR",
+    5358: "OpCooperativeMatrixConvertKHR",
+}
+# opcodes that must never appear in the removed closure
+FORBIDDEN_IN_CLOSURE = set(range(126, 200)) | {12, 4456, 4457, 4458, 4459, 5358,
+                                               246, 247, 248, 249, 250, 251, 252, 253, 254,
+                                               255, 54, 55, 56, 57}
+def rid_of(op, ops):
+    """Result id with the cooperative-matrix KHR opcodes corrected.
+
+    spv_tools_local's table predates them: 4457 stores carry no result id, and the
+    4456/4459/5358 results sit at operand 1."""
+    if op == 4457:
+        return None
+    if op in (4456, 4459, 5358):
+        return ops[1]
+    return S.result_id_of(op, ops)
+
+
+CACHE_CTRL_OPS = (54, 55, 56)
+ALLOW_IN_CLOSURE = {62, 65, 66, 67, 82, 79, 80, 81, 83, 84, 117, 124, 130, 134, 135,
+                    141, 143, 146, 148, 23, 22, 21, 30, 32, 43, 44, 28, 59}
+
+
+def hist(ops):
+    out = {}
+    for op in ops:
+        out[op] = out.get(op, 0) + 1
+    return out
+
+
+def split(mod):
+    """(global instruction list, code instruction list) with word counts."""
+    gi = next(i for i, (op, _, _, _) in enumerate(mod.instructions) if op == 54)
+    return mod.instructions[:gi], mod.instructions[gi:]
+
+
+def globals_view(mod, gl):
+    """ID-agnostic view of the global section: descriptors, shared bytes, decorations."""
+    by_id = {}
+    for op, ops, _, _ in gl:
+        rid = S.result_id_of(op, ops)
+        if rid is not None:
+            by_id.setdefault(rid, (op, ops))
+    names, binds = {}, {}
+    for op, ops, _, _ in gl:
+        if op == 5:
+            names.setdefault(ops[0], ops[1].to_bytes(4, "little").split(b"\0")[0].decode())
+        if op == 71 and len(ops) >= 3 and ops[1] == 33:
+            binds.setdefault(ops[0], {})["binding"] = ops[2]
+        if op == 71 and len(ops) >= 3 and ops[1] == 34:
+            binds.setdefault(ops[0], {})["set"] = ops[2]
+    vars_, wgsize = [], 0
+    for op, ops, _, _ in gl:
+        if op != 59:
+            continue
+        vars_.append((ops[2], binds.get(ops[1], {}).get("set"),
+                      binds.get(ops[1], {}).get("binding"), names.get(ops[1]) or ""))
+        if ops[2] == 4:
+            try:
+                wgsize += mod.type_size_bytes(by_id[ops[0]][1][2])
+            except Exception:
+                wgsize = None
+    return {"opcode_hist": {OPNAME.get(k, str(k)): v for k, v in sorted(hist([i[0] for i in gl]).items())},
+            "variables_sorted": sorted((str(a), str(b), str(c), d) for a, b, c, d in vars_),
+            "workgroup_bytes": wgsize,
+            "binding_list": sorted(v[2] for v in vars_ if v[2] is not None)}
+
+
+def closure_of_gm_store(mod, gm_binding=5):
+    """Indices (into mod.instructions) removed when the gM mirror stores go away."""
+    # 1. the variable id: StorageBuffer variable carrying Binding 5
+    bind = {}
+    for op, ops, _, _ in mod.instructions:
+        if op == 71 and len(ops) >= 3 and ops[1] == 33:
+            bind[ops[0]] = ops[2]
+    gm_id = None
+    for op, ops, _, _ in mod.instructions:
+        if op == 59 and ops[2] == 12 and bind.get(ops[1]) == gm_binding:
+            gm_id = ops[1]
+            break
+    if gm_id is None:
+        raise SystemExit(f"gM variable (binding {gm_binding}) not found")
+    by_id = {}
+    for idx, (op, ops, _, _) in enumerate(mod.instructions):
+        rid = rid_of(op, ops)
+        if rid is not None:
+            by_id.setdefault(rid, idx)
+
+    # 2. cooperative-matrix stores whose pointer chain ends at gm_id
+    def chain_from_pointer(ptr_id, depth=0):
+        if depth > 12:
+            return False
+        d = by_id.get(ptr_id)
+        if d is None:
+            return False
+        op, ops = mod.instructions[d][0], mod.instructions[d][1]
+        if op == 59:
+            return ops[1] == gm_id
+        if op in (65, 66, 67):
+            return chain_from_pointer(ops[2], depth + 1)
+        return False
+
+    stores = [idx for idx, (op, ops, _, _) in enumerate(mod.instructions)
+              if op == 4457 and ops and chain_from_pointer(ops[0])]
+    if not stores:
+        raise SystemExit("no gM store found")
+
+    # 3. use map for closure
+    uses = {}
+    for idx, (op, ops, _, _) in enumerate(mod.instructions):
+        for pos, w in enumerate(ops):
+            if (op in S.RESULT_AT_ZERO_OPS and pos == 0) or (op in (4456, 4459, 5358) and pos == 1):
+                continue
+            if op in (54, 55) and pos == 1:
+                continue
+            uses.setdefault(w, []).append(idx)
+
+    removed = set(stores)
+    changed = True
+    while changed:
+        changed = False
+        for idx, (op, ops, _, _) in enumerate(mod.instructions):
+            if idx in removed or idx < gi:
+                continue
+            rid = rid_of(op, ops)
+            if rid is None:
+                continue
+            u = [x for x in uses.get(rid, []) if x != idx]
+            if u and all(x in removed for x in u) and op not in CACHE_CTRL_OPS:
+                removed.add(idx)
+                changed = True
+    return gm_id, sorted(removed)
+
+
+def compare(width, parent_path, child_path):
+    P = S.Module(Path(parent_path))
+    C = S.Module(Path(child_path))
+    gi = next(i for i, (op, _, _, _) in enumerate(P.instructions) if op == 54)
+    pgl, cgl = P.instructions[:gi], C.instructions[:next(
+        i for i, (op, _, _, _) in enumerate(C.instructions) if op == 54)]
+    pcode = P.instructions[gi:]
+    ccode = C.instructions[gi:]
+    gm_id, removed = closure_of_gm_store(P)
+    removed_ops = [P.instructions[i][0] for i in removed]
+    keep = [i for i in range(len(P.instructions)) if i not in set(removed)]
+    pcode_keep_ops = [P.instructions[i][0] for i in keep if P.instructions[i][0] not in (54, 56)]
+    ccode_ops = [op for op, _, _, _ in ccode if op not in (54, 56)]
+    hp, hc = hist(pcode_keep_ops), hist(ccode_ops)
+    removed_words = sum(P.instructions[i][3] for i in removed)
+    forbidden = sorted({OPNAME.get(o, o) for o in removed_ops if o in FORBIDDEN_IN_CLOSURE})
+    allowed_ok = all(o in ALLOW_IN_CLOSURE for o in removed_ops)
+    pgl_view, cgl_view = globals_view(P, pgl), globals_view(C, cgl)
+    return {
+        "width": width,
+        "parent_sha256": __import__("hashlib").sha256(Path(parent_path).read_bytes()).hexdigest(),
+        "child_sha256": __import__("hashlib").sha256(Path(child_path).read_bytes()).hexdigest(),
+        "parent_words": len(P.words), "child_words": len(C.words),
+        "removed_words": removed_words,
+        "words_consistent": len(P.words) - len(C.words) == removed_words,
+        "gM_variable_id_parent": gm_id,
+        "gM_binding5_declared_in_child": 5 in cgl_view["binding_list"],
+        "removed_instruction_count": len(removed),
+        "removed_opcode_hist": {OPNAME.get(k, str(k)): v for k, v in sorted(hist(removed_ops).items())},
+        "removed_ops_all_in_allowed_set": allowed_ok,
+        "removed_forbidden_ops": forbidden,
+        "code_hist_equal_after_removal": hp == hc,
+        "code_hist_parent_after_removal": {OPNAME.get(k, str(k)): v for k, v in sorted(hp.items())},
+        "code_hist_child": {OPNAME.get(k, str(k)): v for k, v in sorted(hc.items())},
+        "global_opcode_hist_equal": pgl_view["opcode_hist"] == cgl_view["opcode_hist"],
+        "global_variables_equal": pgl_view["variables_sorted"] == cgl_view["variables_sorted"],
+        "global_bindings_parent": pgl_view["binding_list"],
+        "global_bindings_child": cgl_view["binding_list"],
+        "workgroup_bytes_parent": pgl_view["workgroup_bytes"],
+        "workgroup_bytes_child": cgl_view["workgroup_bytes"],
+    }
+
+
+def main():
+    out = {}
+    ok = True
+    for w_ in ("c64", "c128", "c256"):
+        r = compare(w_, CARD / "spv" / f"parent_{w_}.spv", BUILD / f"a1_{w_}.spv")
+        r["verdict"] = bool(r["words_consistent"] and r["code_hist_equal_after_removal"]
+                            and r["removed_ops_all_in_allowed_set"] and not r["removed_forbidden_ops"]
+                            and r["global_opcode_hist_equal"] and r["global_variables_equal"])
+        ok = ok and r["verdict"]
+        out[w_] = r
+    (CARD / "evidence" / "SPV-DELTA.json").parent.mkdir(parents=True, exist_ok=True)
+    (CARD / "evidence" / "SPV-DELTA.json").write_text(
+        json.dumps({"card": "a1-d034-gm-drop", "widths": out,
+                    "all_verdicts_true": ok}, indent=1) + "\n", encoding="utf-8", newline="\n")
+    for w_, r in out.items():
+        print(w_, "verdict=", r["verdict"], "removed_instr=", r["removed_instruction_count"],
+              "words_consistent=", r["words_consistent"], "hist_equal=", r["code_hist_equal_after_removal"],
+              "globals_equal=", r["global_variables_equal"], "gM_still_declared=",
+              r["gM_variable_still_declared_in_child"], "forbidden=", r["removed_forbidden_ops"])
+    print("ALL", ok)
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

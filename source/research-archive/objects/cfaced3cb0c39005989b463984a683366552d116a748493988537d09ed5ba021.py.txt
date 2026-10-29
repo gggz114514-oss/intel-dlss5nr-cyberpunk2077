@@ -1,0 +1,184 @@
+"""R09 candidate build: compile the INT8-WO module, validate it, cut the pack.
+
+CPU only.  Writes only under work/dsh-xmx-handoff-validation-20261024/.
+
+  * candidate source -> spv/r09_f3c64_body_ds_wo_i8.spv  (glslang 16.5.0, -DNATIVE=1)
+  * spv_validate_cpu.exe -> evidence expects result=0
+  * packs: block-8 WO (swin_8_weights.fp16.bin first 8192 B) -> 4096 int8 codes
+    in the measured I8B K32 layout + 64 f32 per-output-channel scales
+  * build-receipt.json: full argv, input/output sha256, rc, time
+
+usage: python tools/build_r09.py
+"""
+import hashlib
+import json
+import shutil
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+CARD = HERE.parent
+R = Path("@NR_WORKSPACE@")
+W = R / "work/dsh-xmx-handoff-validation-20261024"
+BUILD = W / "build/r09-r11-f3ds"
+GLSLANG = R / "src/project/tools/glslang-16.5.0/bin/glslang.exe"
+VALIDATOR = (R / "candidates/amd-map-20261015/s4-final-output-fusion-fix/"
+                 "production-repair/spv_validate_cpu.exe")
+PACK8 = R / "candidates/amd-map-20261015/round4-integrated/candidate/packs/swin_8_weights.fp16.bin"
+WO_HALF = 0          # p4.x of G3 PASS 8
+ARS_HALF = 12288     # p4.z of G3 PASS 8
+N = K = 64
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def ident(p):
+    p = Path(p)
+    return {"path": p.as_posix(), "bytes": p.stat().st_size, "sha256": sha(p)}
+
+
+def f16_index(n, k):
+    """the deployed FP16 WO tile order: (n/16)*1024 + (k/16)*256 + (n%16)*16 + (k%16)"""
+    return (n // 16) * 1024 + (k // 16) * 256 + (n % 16) * 16 + (k % 16)
+
+
+def i8_index(n, k):
+    """measured I8B K32 order: (n/16)*(K/32)*512 + (k/32)*512 + (n%16)*32 + (k%32)"""
+    return (n // 16) * (K // 32) * 512 + (k // 32) * 512 + (n % 16) * 32 + (k % 32)
+
+
+def build_pack():
+    raw = PACK8.read_bytes()
+    halves = struct.unpack("<%de" % (len(raw) // 2), raw[:len(raw) // 2 * 2])
+    assert len(raw) == 107024
+    w = [[0.0] * K for _ in range(N)]
+    for n in range(N):
+        for k in range(K):
+            w[n][k] = halves[WO_HALF + f16_index(n, k)]
+    codes = bytearray(N * K)
+    scales = [0.0] * N
+    amax = [0.0] * N
+    for n in range(N):
+        a = max(abs(w[n][k]) for k in range(K))
+        amax[n] = a
+        s = (a / 127.0) if a > 0.0 else 0.0
+        scales[n] = s
+        inv = (127.0 / a) if a > 0.0 else 0.0
+        for k in range(K):
+            v = w[n][k] * inv
+            # roundEven, clamp exactly as the CUDA/GLSL contract of this family
+            i = int(round(v))
+            i = max(-127, min(127, i))
+            codes[i8_index(n, k)] = i & 0xFF
+    (CARD / "packs").mkdir(parents=True, exist_ok=True)
+    p8 = CARD / "packs/r09_c64_b8_wo.i8.bin"
+    ps = CARD / "packs/r09_c64_b8_wosc.f32.bin"
+    p8.write_bytes(bytes(codes))
+    ps.write_bytes(struct.pack("<%df" % N, *scales))
+    # round-trip statistics of the pack itself (no frame needed)
+    se = 0.0
+    ref = 0.0
+    mx = 0.0
+    for n in range(N):
+        for k in range(K):
+            dq = codes[i8_index(n, k)]
+            dq = dq - 256 if dq > 127 else dq
+            e = (dq * scales[n] - w[n][k])
+            se += e * e
+            ref += w[n][k] * w[n][k]
+            mx = max(mx, abs(e))
+    meta = {
+        "source_pack": ident(PACK8),
+        "wo_half_base": WO_HALF,
+        "wo_region_bytes": N * K * 2,
+        "fp16_layout_index": "(n/16)*1024 + (k/16)*256 + (n%16)*16 + (k%16)",
+        "int8_layout_index": "(n/16)*(K/32)*512 + (k/32)*512 + (n%16)*32 + (k%32)",
+        "int8_pack": ident(p8),
+        "scale_table": ident(ps),
+        "n_scale_entries": N,
+        "amax_per_channel": {"min": min(amax), "max": max(amax),
+                             "mean": sum(amax) / N},
+        "scale_per_channel": {"min": min(scales), "max": max(scales),
+                              "mean": sum(scales) / N},
+        "code_range": {"min": min(min(x - 256 if x > 127 else x for x in codes[i * 64:(i + 1) * 64])
+                                  for i in range(N)),
+                       "max": max(max(x - 256 if x > 127 else x for x in codes[i * 64:(i + 1) * 64])
+                                  for i in range(N))},
+        "round_trip": {"rel_l2": (se / ref) ** 0.5, "max_abs_err": mx,
+                       "rms": (se / (N * K)) ** 0.5},
+        "saturation_codes": sum(1 for b in codes if b in (0x7F, 0x81)),
+        "note": "pack cut from the block-8 pack the plan binds at BIND 0 for PASS 8 "
+                "(resource 39 swin_8_weights, wo=0, ars=12288); no capture is used "
+                "or needed for the pack itself",
+    }
+    (CARD / "packs/PACK-META.json").write_text(
+        json.dumps(meta, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    return meta
+
+
+def main():
+    BUILD.mkdir(parents=True, exist_ok=True)
+    (CARD / "spv").mkdir(parents=True, exist_ok=True)
+    src_dir = CARD / "source/candidate"
+    # the shared header is a verbatim copy of the parent's
+    hdr = src_dir / "c64_ffn_opt_common.glsl"
+    shutil.copyfile(CARD / "source/parent/r09/c64_ffn_opt_common.glsl", hdr)
+    src = src_dir / "r09_f3c64_body_ds_wo_i8.comp"
+    out = CARD / "spv/r09_f3c64_body_ds_wo_i8.spv"
+    argv = [str(GLSLANG), "-V", "--target-env", "vulkan1.3", "-DNATIVE=1",
+            "-I" + str(src_dir), "-o", str(out), str(src)]
+    t0 = time.time()
+    r = subprocess.run(argv, cwd=str(R), capture_output=True)
+    log = BUILD / "r09-candidate-compile.log"
+    log.write_bytes(r.stdout + r.stderr)
+    if r.returncode != 0:
+        print((r.stdout + r.stderr).decode(errors="replace"))
+        raise SystemExit("candidate compile failed")
+    v = subprocess.run([str(VALIDATOR), str(out)], capture_output=True)
+    vlog = BUILD / "r09-candidate-validate.log"
+    vlog.write_bytes(v.stdout + v.stderr)
+    vtxt = (v.stdout + v.stderr).decode(errors="replace").strip()
+    # NATIVE=0 compile is not deployed but must still build (shared ABI sanity)
+    nat0 = BUILD / "r09-candidate-NATIVE0.spv"
+    argv0 = [str(GLSLANG), "-V", "--target-env", "vulkan1.3", "-DNATIVE=0",
+             "-I" + str(src_dir), "-o", str(nat0), str(src)]
+    r0 = subprocess.run(argv0, cwd=str(R), capture_output=True)
+    (BUILD / "r09-candidate-compile-NATIVE0.log").write_bytes(r0.stdout + r0.stderr)
+    pack = build_pack()
+    rec = {
+        "status": "CPU_COMPILE_VALIDATOR_PACK_CPU_ONLY_GPU_NOT_RUN",
+        "card": "r09-r11-f3ds / R09 (F3-C64 f3c64_body_ds)",
+        "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "toolchain": {"compiler": ident(GLSLANG), "validator": ident(VALIDATOR)},
+        "parent_spv": ident(CARD / "spv/parent_repro-f3c64_body_ds.spv"),
+        "source": ident(src),
+        "header": ident(hdr),
+        "compile": {"argv": argv, "cwd": str(R), "rc": r.returncode,
+                    "log": ident(log), "elapsed_s": round(time.time() - t0, 2),
+                    "output": ident(out)},
+        "compile_NATIVE0": {"argv": argv0, "rc": r0.returncode,
+                            "output": ident(nat0),
+                            "note": "not deployed; proves the source still builds in "
+                                    "the non-native arm"},
+        "validate": {"rc": v.returncode, "out": vtxt,
+                     "result_zero": "result=0" in vtxt, "log": ident(vlog)},
+        "pack": pack,
+    }
+    (CARD / "build-receipt.json").write_text(
+        json.dumps(rec, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(json.dumps({"spv": rec["compile"]["output"], "validate": vtxt,
+                      "NATIVE0_rc": r0.returncode,
+                      "pack_rel_l2": pack["round_trip"]["rel_l2"],
+                      "scale_range": [pack["scale_per_channel"]["min"],
+                                      pack["scale_per_channel"]["max"]]}, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

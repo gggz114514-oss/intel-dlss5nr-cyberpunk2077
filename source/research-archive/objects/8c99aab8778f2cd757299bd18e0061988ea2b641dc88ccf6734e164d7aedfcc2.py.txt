@@ -1,0 +1,144 @@
+"""Task 3: CPU reference of the C64 block65 INT8 FFN (passes qx -> d1 -> d2).
+
+Reproduces exactly the shader math of
+  c64-b6-equal-x-alpha1/candidate.comp        (qX producer, uses sc[464+c])
+  int8-coverage-v2-20261020/B/source/c64_d1.comp
+  c64-b6-reconstruction/original-half.comp
+with the deployed packs b65-weights.bin / b65-scales.bin.
+
+Same-input oracle: X = teacher dump_block64_out.bin (canonical C64 image layout)
+and Y_teacher = dump_swin_65_Y.bin (window-major w*64+m)*64+c.
+Both come from the FP16 network, so the only difference is the INT8 quantisation
+of the C64 FFN -> this is a *common FP16 input* local error, not a chain error.
+"""
+import json
+import numpy as np
+from pathlib import Path
+
+B = Path("@NR_WORKSPACE@")
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+W = B / "work/dsh-fullnet-static-20261029"
+TEACH = Q / "real-int8-24/dump-fp16"
+SC = Q / "real-int8-24/c64-family-static/b65-scales.bin"
+W8 = Q / "real-int8-24/c64-family-static/b65-weights.bin"
+
+TILES_X, TILES_Y = 84, 48
+GRID_X, GRID_Y = 42, 25
+SHIFT_X, SHIFT_Y = 0, -1
+NT = 16          # slots per tile
+CH = 64
+
+
+def f16(a):
+    return np.asarray(a, dtype=np.float16)
+
+
+def rne_clamp(x, inv):
+    """clamp(roundEven(x*inv), -127, 127) as in rounded_code()"""
+    v = np.rint(np.asarray(x, dtype=np.float32) * np.float32(inv))
+    return np.clip(v, -127.0, 127.0).astype(np.int8)
+
+
+def act_h(x):
+    """float16 MpCubicSilu from c64_int8_common.glsl"""
+    x = f16(x)
+    t = np.clip(x, f16(-4.0), f16(4.0))
+    u = f16(f16(-0.055908203125) * np.abs(t) + f16(0.447265625))
+    inner = f16(t * u + f16(0.89453125))
+    return f16(x * inner)
+
+
+def main():
+    sc = np.fromfile(SC, dtype="<f4")
+    w8 = np.fromfile(W8, dtype="i1").astype(np.int32)
+    X_can = np.fromfile(TEACH / "dump_block64_out.bin", dtype="<f2").astype(np.float16)
+    assert X_can.size == TILES_X * TILES_Y * 1024, X_can.size
+    # canonical [tile][g][slot][k] -> [tile][slot][c]
+    Xc = X_can.reshape(TILES_X * TILES_Y, 4, NT, 16).transpose(0, 2, 1, 3).reshape(-1, CH)
+    ntok = Xc.shape[0]
+    inv_qx = sc[464:528].astype(np.float32)
+
+    # ---- qX producer -------------------------------------------------------
+    qx = rne_clamp(Xc.astype(np.float32), inv_qx[None, :])
+    xdq = qx.astype(np.float32) / inv_qx[None, :]
+    res = {"n_tokens": int(ntok)}
+    res["input_quant_floor"] = {
+        "relL2_qx_dequant_vs_X": float(np.linalg.norm(xdq - Xc.astype(np.float32)) / np.linalg.norm(Xc.astype(np.float32))),
+        "code_saturation_frac": float(np.mean(np.abs(qx) == 127)),
+        "code_rms": float(np.sqrt(np.mean(qx.astype(np.float64) ** 2))),
+    }
+
+    we = w8[:16384].reshape(256, 64)          # [N][K]
+    wm = w8[16384:24576].reshape(64, 128)     # [N][K]
+    wc = w8[24576:28672].reshape(64, 64)      # [N][K]
+
+    # ---- d1: expand (K=64,N=256) -> act -> mid (K=128,N=64) ----------------
+    CHUNK = 8192
+    M = np.empty((ntok, 64), np.int8)
+    e_all_absmax = 0.0
+    for s in range(0, ntok, CHUNK):
+        e = s + CHUNK
+        q = qx[s:e].astype(np.int32)
+        acc = q @ we.T                                    # int32 [t,256]
+        e_f = f16(acc.astype(np.float32) * sc[16:272].astype(np.float32)[None, :])
+        a = act_h(e_f)
+        qa = rne_clamp(a, sc[2])
+        # mid: group 0 uses expand cols 0..127, group 1 cols 128..255
+        m0 = qa[:, 0:128].astype(np.int32) @ wm[0:32].T   # [t,32]
+        m1 = qa[:, 128:256].astype(np.int32) @ wm[32:64].T
+        mm = np.concatenate([m0, m1], axis=1).astype(np.float32)
+        mm = mm * sc[272:336].astype(np.float32)[None, :]
+        M[s:e] = rne_clamp(mm, sc[3])
+        e_all_absmax = max(e_all_absmax, float(np.abs(e_f.astype(np.float32)).max()))
+
+    # ---- d2: contract (K=64,N=64) + half residual seed ---------------------
+    rs = f16(sc[528:592])
+    Y = np.empty((ntok, 64), np.float16)
+    for s in range(0, ntok, CHUNK):
+        e = s + CHUNK
+        acc = M[s:e].astype(np.int32) @ wc.T
+        realv = acc.astype(np.float32) * sc[336:400].astype(np.float32)[None, :]
+        seed = f16(Xc[s:e])
+        seed = f16(seed * rs[None, :])                     # half multiply
+        Y[s:e] = f16(realv + seed.astype(np.float32))
+
+    # ---- map window-major Y_teacher to (tile, slot) ------------------------
+    Yt = np.fromfile(TEACH / "dump_swin_65_Y.bin", dtype="<f2").astype(np.float16)
+    assert Yt.size == GRID_X * GRID_Y * 64 * 64, Yt.size
+    Yt = Yt.reshape(GRID_X * GRID_Y, 64, 64)
+    wmap = np.full((GRID_X * GRID_Y, 64), -1, np.int64)
+    for wy in range(GRID_Y):
+        for wx in range(GRID_X):
+            w = wy * GRID_X + wx
+            for m in range(64):
+                q, sl = m >> 4, m & 15
+                tx = 2 * wx + SHIFT_X + (q & 1)
+                ty = 2 * wy + SHIFT_Y + (q >> 1)
+                if 0 <= tx < TILES_X and 0 <= ty < TILES_Y:
+                    wmap[w, m] = (ty * TILES_X + tx) * NT + sl
+    valid = wmap >= 0
+    idx = wmap[valid]                                      # token ids
+    A = Y[idx].astype(np.float64)
+    Bv = Yt[valid].astype(np.float64)
+    res["y_stage"] = {
+        "n_valid_tokens": int(idx.size),
+        "rms_cpu": float(np.sqrt((A * A).mean())), "rms_teacher": float(np.sqrt((Bv * Bv).mean())),
+        "ratio": float(np.sqrt((A * A).mean() / (Bv * Bv).mean())),
+        "relL2": float(np.linalg.norm(A - Bv) / np.linalg.norm(Bv)),
+        "corr": float(np.corrcoef(A.ravel(), Bv.ravel())[0, 1]),
+        "slope": float((A * Bv).sum() / (Bv * Bv).sum()),
+    }
+    ch_r = np.sqrt((A * A).mean(0)) / np.maximum(np.sqrt((Bv * Bv).mean(0)), 1e-30)
+    res["y_stage"]["ch_ratio_64"] = [round(float(x), 4) for x in ch_r]
+    res["y_stage"]["ch_ratio_min"] = float(ch_r.min()); res["y_stage"]["ch_ratio_max"] = float(ch_r.max())
+    res["y_stage"]["ch_ratio_std"] = float(ch_r.std())
+
+    # ---- also: pure FP16-weight reference on the same input? not available.
+    np.save(W / "C00-c64-b65/evidence/Y_cpu_block65.npy", Y)
+    np.save(W / "C00-c64-b65/evidence/qx_block65.npy", qx)
+    np.save(W / "C00-c64-b65/evidence/M_block65.npy", M)
+    print(json.dumps(res, indent=1))
+
+
+if __name__ == "__main__":
+    main()

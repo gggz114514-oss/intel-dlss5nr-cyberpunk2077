@@ -1,0 +1,123 @@
+"""S07 final search: coordinate descent over the four scalar steps on the shipped
+structure (per-input-channel X inverse pack).  Extended ranges are used because
+the earlier scan pushed sR to its search boundary.
+
+Fold rules (exact, no effective matrix moves):
+    sX * f  -> invX /= f, wsc1 *= f
+    sR * f  -> sR   *= f, wsc2 *= f
+    sA * f  -> sA   *= f, wsc3 *= f
+    sF * f  -> sF   *= f, wscL *= f
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029"
+S = W / "S07-split16"
+sys.path.insert(0, str(W / "tools"))
+sys.path.insert(0, str(S / "tools"))
+from verify_candidate import Arm  # noqa: E402
+import model as M  # noqa: E402
+
+TEACHERS = [("34189", B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24/dump-fp16"),
+            ("41444", B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24/teacher-diagnostics/teacher-41444"),
+            ("43654", B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24/teacher-diagnostics/teacher-43654")]
+
+
+def main():
+    arm = Arm(S / "candidate-34189.txt")
+    frames = []
+    for tag, td in TEACHERS:
+        X = M.load_half(td / "dump_block22_out.bin")
+        frames.append((tag, X, M.load_half(td / "dump_split16_b23_F.bin"),
+                       M.load_half(td / "dump_split16_b23_Y.bin"), M.f16(X * arm.pk.rs)))
+    state = {"invX": arm.invX.astype(np.float32), "wsc1": arm.pk.wsc1.astype(np.float32),
+             "wsc2": arm.pk.wsc2.copy(), "wsc3": arm.pk.wsc3.copy(), "wscL": arm.pk.wscL.copy(),
+             "sR": np.float32(arm.sR), "sA": np.float32(arm.sA), "sF": np.float32(arm.sF),
+             "sX": np.float32(arm.sX)}
+
+    def apply(st) -> None:
+        arm.pk.wsc1 = st["wsc1"]
+        arm.pk.wsc2 = st["wsc2"]
+        arm.pk.wsc3 = st["wsc3"]
+        arm.pk.wscL = st["wscL"]
+        arm.invX = st["invX"]
+        arm.sR = float(st["sR"])
+        arm.sA = float(st["sA"])
+        arm.sF = float(st["sF"])
+
+    def fold(dim, f):
+        st = {k: (v.copy() if hasattr(v, "copy") else v) for k, v in state.items()}
+        if dim == "sX":
+            st["invX"] = (state["invX"] / f).astype(np.float32)
+            st["wsc1"] = (state["wsc1"] * f).astype(np.float32)
+            st["sX"] = np.float32(state["sX"] * f)
+        elif dim == "sR":
+            st["sR"] = np.float32(state["sR"] * f); st["wsc2"] = (state["wsc2"] * f).astype(np.float32)
+        elif dim == "sA":
+            st["sA"] = np.float32(state["sA"] * f); st["wsc3"] = (state["wsc3"] * f).astype(np.float32)
+        elif dim == "sF":
+            st["sF"] = np.float32(state["sF"] * f); st["wscL"] = (state["wscL"] * f).astype(np.float32)
+        return st
+
+    def score(st, detail=False):
+        apply(st)
+        ys, fs, clip = [], [], 0
+        per = []
+        for tag, X, Ft, Yt, seed in frames:
+            r = arm.forward(X, seed)
+            y = M.rel_l2(r["Y"], Yt)
+            f = M.rel_l2(r["F"], Ft)
+            ys.append(y); fs.append(f)
+            clip += int(np.sum(np.abs(r["qr"]) >= 127))
+            per.append({"frame": tag, "Y_rel_l2": y, "F_rel_l2": f,
+                        "qr_clipped": int(np.sum(np.abs(r["qr"]) >= 127)),
+                        "qa_used": float(np.abs(r["qa"]).max()), "qf_used": float(np.abs(r["qf"]).max())})
+        res = {"mse": float(np.mean(np.square(ys))), "mean_Y": float(np.mean(ys)),
+               "mean_F": float(np.mean(fs)), "qr_clipped": clip}
+        if detail:
+            res["per_frame"] = per
+            res["scales"] = {"sR": float(st["sR"]), "sA": float(st["sA"]),
+                             "sF": float(st["sF"]), "sX": float(st["sX"])}
+        return res
+
+    hist = []
+    base = score(state, detail=True)
+    print("start", json.dumps(base), flush=True)
+    grid = [0.5, 0.65, 0.8, 1.0, 1.25, 1.55, 1.9]
+    for sweep in range(2):
+        for dim in ["sR", "sA", "sF", "sX"]:
+            opts = []
+            for f in grid:
+                st = fold(dim, f)
+                r = score(st)
+                hist.append({"sweep": sweep, "dim": dim, "factor": f, **{k: r[k] for k in
+                                                                         ("mse", "mean_Y", "mean_F", "qr_clipped")},
+                             "value": float(st[dim if dim != "sX" else "sX"])})
+                opts.append((r["mse"], st, r))
+            m, st, r = min(opts, key=lambda z: z[0])
+            state = st
+            apply(state)
+            print(f"sweep{sweep} {dim} -> {r['mean_Y']:.6e} F={r['mean_F']:.6e} clip={r['qr_clipped']} "
+                  f"s={float(state[dim]):.6f}", flush=True)
+    final = score(state, detail=True)
+    print("final", json.dumps(final, indent=1), flush=True)
+    out = {"start": base, "final": final, "history": hist,
+           "grid": grid,
+           "note": "objective = pooled teacher-Y relL2 over 1056 valid tokens x 3 frames; "
+                   "the sR optimum sits on a clipping plateau because the half activation maps "
+                   "every raw value below -4 to exactly 0 and the qA step bounds the positive side"}
+    (S / "FINAL-SEARCH.json").write_text(json.dumps(out, indent=1))
+    np.save(S / "PACK/_state_invX.npy", state["invX"])
+    np.save(S / "PACK/_state_wsc1.npy", state["wsc1"])
+    np.save(S / "PACK/_state_wsc2.npy", state["wsc2"])
+    np.save(S / "PACK/_state_wsc3.npy", state["wsc3"])
+    np.save(S / "PACK/_state_wscL.npy", state["wscL"])
+    print("state saved")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,190 @@
+"""N02 SPIR-V structural check: parent vs candidate.
+
+Canonicalises every result-producing instruction into an id-free expression tree
+and compares multisets. Also isolates the floating-point / GLSL.std.450 value set
+so the card can state "the FP expressions are unchanged; only the record stores
+and their integer address arithmetic differ".
+"""
+import sys, pathlib, collections, json
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import spv_tools_local as ST
+
+CARD = pathlib.Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/cards/n02-f20-f21-tail')
+
+OPNAME = {
+    12: 'OpExtInst', 42: 'OpConstantNull', 43: 'OpConstant',
+    61: 'OpLoad', 62: 'OpStore', 65: 'OpAccessChain',
+    79: 'OpVectorShuffle', 80: 'OpCompositeConstruct', 81: 'OpCompositeExtract',
+    126: 'OpSNegate', 127: 'OpFNegate', 128: 'OpIAdd', 129: 'OpFAdd',
+    130: 'OpISub', 131: 'OpFSub', 132: 'OpIMul', 133: 'OpFMul',
+    134: 'OpUDiv', 135: 'OpFDiv', 136: 'OpUMod', 137: 'OpRem',
+    138: 'OpSRem', 139: 'OpSMod', 140: 'OpFRem', 141: 'OpFMod',
+    142: 'OpVectorTimesScalar', 143: 'OpMatrixTimesScalar',
+    144: 'OpVectorTimesMatrix', 145: 'OpMatrixTimesVector', 146: 'OpMatrixTimesMatrix',
+    147: 'OpOuterProduct', 148: 'OpDot',
+    194: 'OpShiftRightLogical', 195: 'OpShiftRightArithmetic', 196: 'OpShiftLeftLogical',
+    197: 'OpBitwiseOr', 198: 'OpBitwiseXor', 199: 'OpBitwiseAnd', 200: 'OpNot',
+    124: 'OpBitcast', 109: 'OpConvertFToU', 110: 'OpConvertFToS', 111: 'OpConvertSToF',
+    112: 'OpConvertUToF', 113: 'OpUConvert', 114: 'OpSConvert', 115: 'OpFConvert',
+    117: 'OpSatConvertSToU', 118: 'OpSatConvertUToS',
+    177: 'OpSelect', 82: 'OpCompositeInsert', 83: 'OpCopyObject',
+}
+# SPIR-V floating-point arithmetic / transcendental opcodes in use here.
+FP_OPS = {127, 129, 131, 133, 135, 140, 141, 142, 143, 144, 145, 146, 147, 148}
+# GLSL.std.450 instructions used by this kernel: Fma=50, Exp=27, Log=28, Pow=26,
+# InverseSqrt=32, Sqrt=31, FAbs=4, FClamp=43, FMin=37, FMax=40, Floor=8, Fract=10.
+FP_EXT = {4, 8, 10, 26, 27, 28, 31, 32, 37, 40, 43, 46, 50}
+
+
+class Canon:
+    def __init__(self, module):
+        self.m = module
+        self.cache = {}
+        self.depth_guard = 0
+
+    def c(self, cid):
+        if cid in self.cache:
+            return self.cache[cid]
+        self.depth_guard += 1
+        assert self.depth_guard < 4000, 'canon recursion'
+        op, ops = self.m.defining_instruction(cid)
+        self.depth_guard -= 1
+        if op is None:
+            val = ('undef',)
+        elif op == 43:
+            # OpConstant operands are [result type, result id, value]; drop the type id
+            to, tops = self.m.defining_instruction(ops[0])
+            val = ('const', to, tuple(tops[1:]), ops[2])
+        elif op == 42:
+            to, tops = self.m.defining_instruction(ops[0])
+            val = ('nullconst', to, tuple(tops[1:]))
+        elif op == 12:
+            val = ('ext', ops[2], ops[3], tuple(self.c(x) for x in ops[4:]))
+        elif op == 61:
+            val = ('load', self.c(ops[2]))
+        elif op == 65:
+            val = ('ac', self.c(ops[2]), tuple(self.c(x) for x in ops[3:]))
+        elif op == 81:
+            val = ('extract', self.c(ops[2]), tuple(ops[3:]))
+        elif op == 80:
+            val = ('construct', tuple(self.c(x) for x in ops[2:]))
+        elif op == 79:
+            val = ('shuffle', self.c(ops[2]), self.c(ops[3]), tuple(ops[4:]))
+        elif op in (82,):
+            val = ('insert', self.c(ops[2]), self.c(ops[3]), tuple(ops[4:]))
+        elif op in (124, 109, 110, 111, 112, 113, 114, 115, 117, 118):
+            val = ('conv', op, self.c(ops[2]))
+        elif op in (126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137,
+                    138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148,
+                    194, 195, 196, 197, 198, 199, 200) or 170 <= op <= 191:
+            # 170..191 are the comparison opcodes (OpIEqual .. OpFUnordGreaterThanEqual).
+            val = ('op', op, tuple(self.c(x) for x in ops[2:]))
+        else:
+            val = ('id', op)
+        self.cache[cid] = val
+        return val
+
+
+def result_instructions(m):
+    """(opcode, result_id) for every result-producing instruction."""
+    out = []
+    for op, ops, _, _ in m.instructions:
+        rid = ST.result_id_of(op, ops)
+        if rid is not None:
+            out.append((op, rid))
+    return out
+
+
+def fp_multiset(m):
+    can = Canon(m)
+    bag = collections.Counter()
+    for op, rid in result_instructions(m):
+        if op in FP_OPS:
+            bag[can.c(rid)] += 1
+        elif op == 12:
+            _, ops = m.defining_instruction(rid)
+            if ops[3] in FP_EXT:
+                bag[can.c(rid)] += 1
+    return bag
+
+
+def value_multiset(m):
+    can = Canon(m)
+    bag = collections.Counter()
+    for op, rid in result_instructions(m):
+        bag[can.c(rid)] += 1
+    return bag, can
+
+
+def store_list(m):
+    """Describe every OpStore: pointer chain + stored expression + target."""
+    can = Canon(m)
+    out = []
+    for op, ops, _, _ in m.instructions:
+        if op != 62:
+            continue
+        ptr, val = ops[0], ops[1]
+        out.append((ptr, val, can.c(ptr), can.c(val)))
+    return out, can
+
+
+def main():
+    par = ST.Module(CARD / 'build/parent-raw.spv')
+    cand = ST.Module(CARD / 'candidate.spv')
+    res = {}
+    res['words'] = {'parent': len(par.words), 'candidate': len(cand.words)}
+    res['instructions'] = {'parent': len(par.instructions), 'candidate': len(cand.instructions)}
+    res['bound'] = {'parent': par.bound, 'candidate': cand.bound}
+
+    # 1) opcode histogram of both modules
+    hp = collections.Counter(op for op, _, _, _ in par.instructions)
+    hc = collections.Counter(op for op, _, _, _ in cand.instructions)
+    res['opcode_delta'] = {OPNAME.get(k, 'op%d' % k): [hp.get(k, 0), hc.get(k, 0)]
+                           for k in sorted(set(hp) | set(hc)) if hp.get(k, 0) != hc.get(k, 0)}
+
+    # 2) floating-point value multiset must be identical
+    fp_p = fp_multiset(par)
+    fp_c = fp_multiset(cand)
+    res['fp_multiset'] = {
+        'parent_sites': sum(fp_p.values()),
+        'candidate_sites': sum(fp_c.values()),
+        'identical': fp_p == fp_c,
+        'parent_only': [str(k) for k in (fp_p - fp_c)],
+        'candidate_only': [str(k) for k in (fp_c - fp_p)],
+    }
+
+    # 3) full value multiset difference (everything except stores)
+    vp, cp = value_multiset(par)
+    vc, cc = value_multiset(cand)
+    only_p = vp - vc
+    only_c = vc - vp
+    res['value_multiset'] = {
+        'parent_values': sum(vp.values()), 'candidate_values': sum(vc.values()),
+        'parent_only': [str(k) for k in only_p],
+        'candidate_only': [str(k) for k in only_c],
+    }
+
+    # 4) stores: parent 8 scalar float stores, candidate 2 vec4 stores
+    sp, _ = store_list(par)
+    sc, _ = store_list(cand)
+    res['stores'] = {'parent': len(sp), 'candidate': len(sc)}
+    res['store_parent_targets'] = [str(x[2]) for x in sp][:16]
+    res['store_candidate_values'] = [str(x[3]) for x in sc][:4]
+
+    # compact summary for the card documents (UTF-8, no huge lists)
+    summary = dict(res)
+    summary['value_multiset'] = {
+        'parent_values': sum(vp.values()),
+        'candidate_values': sum(vc.values()),
+        'parent_only_entries': len(list(only_p)),
+        'candidate_only_entries': len(list(only_c)),
+        'parent_only_head': [str(k) for k in list(only_p)[:6]],
+        'candidate_only_head': [str(k) for k in list(only_c)[:6]],
+    }
+    (CARD / 'build/spv-check.json').write_text(json.dumps(summary, indent=1), encoding='utf-8')
+    print(json.dumps(summary, indent=1)[:12000])
+
+
+if __name__ == '__main__':
+    main()

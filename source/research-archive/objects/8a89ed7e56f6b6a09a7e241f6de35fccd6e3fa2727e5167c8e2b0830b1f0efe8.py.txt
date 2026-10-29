@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""B3 seed-flow extractor: every read/write point of the contract seed, the widen
+site and the copy evidence, straight from the SPIR-V module.
+
+Copies are *not* hidden: glslang emits every GLSL local as a Private OpVariable
+and every assignment as OpStore, so `NRH_C seedN = ycN;` shows up as an explicit
+OpLoad(OpStore) pair.  The extractor walks value -> variable -> value hops with a
+depth cap and prints the whole chain with instruction indices and word offsets.
+
+Works for the parent and the candidate (no hard-coded ids: cooperative matrix
+types come from OpTypeCooperativeMatrixKHR, functions from OpName).
+"""
+import hashlib
+import json
+import sys
+
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024/candidates/b3-c32-seed/tools")
+from b3_spv import Module  # noqa: E402
+
+FMUL, FCONV, LOAD, STORE, CALL, VAR, LABEL, LOOPMERGE = 133, 115, 61, 62, 57, 59, 248, 246
+MULADD, CM_TYPE, CM_LOAD, CM_STORE = 4459, 4456, 4457, 4458
+MAX_DEPTH = 6
+
+
+def cstr(ops):
+    return b"".join(x.to_bytes(4, "little") for x in ops).split(b"\0")[0].decode("utf-8", "replace")
+
+
+class Analysis:
+    def __init__(self, path):
+        self.path = path
+        self.M = M = Module(path)
+        self.sha = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        self.names = {}
+        for ins in M.insts:
+            if ins.op == 5:
+                self.names.setdefault(ins.ops[0], cstr(ins.ops[1:]))
+        self.cm = {}
+        for ins in M.insts:
+            if ins.op == CM_TYPE:
+                self.cm[ins.ops[0]] = dict(comp=ins.ops[1], rows=self.konst(ins.ops[3]),
+                                           cols=self.konst(ins.ops[4]), use=self.konst(ins.ops[5]))
+        pick = lambda c, r, k, u: [t for t, d in self.cm.items()
+                                   if (d["comp"], d["rows"], d["cols"], d["use"]) == (c, r, k, u)]
+        self.T_CH = pick(6, 8, 16, 2)[0]
+        self.T_C = pick(28, 8, 16, 2)[0]
+        self.fn = {}
+        for ins in M.insts:
+            if ins.op == 54:
+                self.fn.setdefault(self.names.get(ins.ops[1], "").split("(")[0], []).append(ins.ops[1])
+        self.entry = next(i.ops[1] for i in M.insts if i.op == 15)
+        self.func_of, self.block_of = [], []
+        fn, blk = None, None
+        for k, ins in enumerate(M.insts):
+            if ins.op == 54:
+                fn, blk = ins.ops[1], None
+            elif ins.op == LABEL:
+                blk = ins.ops[0]
+            self.func_of.append(fn)
+            self.block_of.append(blk)
+        self.var_type = {}
+        for ins in M.insts:
+            if ins.op == VAR:
+                p = M.by_id.get(ins.ops[0])
+                self.var_type[ins.ops[1]] = p.ops[2] if p is not None and p.op == 32 else None
+        self.stores_of, self.loads_of = {}, {}
+        for ins in M.insts:
+            if ins.op == STORE:
+                self.stores_of.setdefault(ins.ops[0], []).append(ins)
+            elif ins.op == LOAD:
+                self.loads_of.setdefault(ins.ops[2], []).append(ins)
+
+    # -------------------------------------------------------------- helpers
+    def konst(self, cid):
+        ins = self.M.by_id.get(cid)
+        return ins.ops[2] if ins is not None and ins.op == 43 else None
+
+    def at(self, ins):
+        return {"inst": ins.idx, "word": ins.pos, "op": ins.name,
+                "block": self.block_of[ins.idx]}
+
+    def vd(self, vid):
+        return {"id": vid, "name": self.names.get(vid, ""),
+                "cm_type": self.var_type.get(vid)}
+
+    def consumers(self, ident):
+        return [u for u in self.M.uses.get(ident, []) if u.rid != ident]
+
+    # ------------------------------------------------------- chain walker
+    def value_origin(self, vid, depth=0):
+        """Describe where a value comes from (one hop, then recurse)."""
+        d = self.M.by_id.get(vid)
+        if d is None or depth > MAX_DEPTH:
+            return {"kind": "unknown", "id": vid}
+        if d.op == LOAD:
+            return {"kind": "load", "at": self.at(d), "from_var": self.vd(d.ops[2]),
+                    "var_writes": [self.store_site(s, depth + 1)
+                                   for s in self.stores_of.get(d.ops[2], [])]}
+        if d.op == CALL:
+            return {"kind": "call", "at": self.at(d), "callee": self.names.get(d.ops[2], ""),
+                    "result": d.rid,
+                    "args": [self.arg_origin(a, depth + 1) for a in d.ops[3:]]}
+        if d.op == FMUL:
+            return {"kind": "fmul", "at": self.at(d),
+                    "type_is_NRH_CH": d.rtype == self.T_CH,
+                    "operands": [self.value_origin(o, depth + 1) for o in d.ops[2:]]}
+        if d.op == FCONV:
+            return {"kind": "fconvert", "at": self.at(d), "from": d.ops[2],
+                    "src": self.value_origin(d.ops[2], depth + 1)}
+        if d.op == CM_LOAD:
+            return {"kind": "coopmat_load", "at": self.at(d), "ptr": d.ops[1]}
+        if d.op == 43:
+            return {"kind": "constant", "at": self.at(d), "value": d.ops[2]}
+        return {"kind": d.name, "at": self.at(d), "id": vid}
+
+    def store_origin(self, val_id, depth=0):
+        return {"value_id": val_id, "origin": self.value_origin(val_id, depth)}
+
+    def store_site(self, st, depth=0):
+        return {"at": self.at(st), "value_id": st.ops[1],
+                "origin": self.value_origin(st.ops[1], depth)}
+
+    def arg_origin(self, aid, depth=0):
+        """Function arguments are temp variable ids for cooperative matrices."""
+        d = self.M.by_id.get(aid)
+        if d is not None and d.op == VAR:
+            return {"arg_var": self.vd(aid),
+                    "stores": [self.store_site(s, depth) for s in self.stores_of.get(aid, [])]}
+        return {"arg_value": aid, "origin": self.value_origin(aid, depth)}
+
+    def reads_after(self, varid, word):
+        """Loads of a variable that occur after a given word offset (program order)."""
+        return [l for l in self.loads_of.get(varid, []) if l.pos > word]
+
+    def read_use(self, ld):
+        out = []
+        for u in self.consumers(ld.rid):
+            item = {"at": self.at(u)}
+            if u.op == STORE:
+                item["stores_into"] = self.vd(u.ops[0])
+                item["stores_into_cm_type"] = self.var_type.get(u.ops[0])
+            elif u.op == CALL:
+                item["callee"] = self.names.get(u.ops[2], "")
+                item["args"] = [self.names.get(a, str(a)) for a in u.ops[3:]]
+            out.append(item)
+        return out
+
+    # ------------------------------------------------------------- reports
+    def seed_report(self):
+        wid = self.fn["nrh_widen_exact"][0]
+        nw = self.fn["nrh_narrow"][0]
+        da = self.fn["nr_i8_deq_add"][0]
+        deq = self.fn["nr_i8_deq"][0]
+        muls = [i for i in self.M.insts if i.op == FMUL and i.rtype == self.T_CH
+                and self.func_of[i.idx] == self.entry]
+        deqadd_calls = [i for i in self.M.insts if i.op == CALL and i.ops[2] == da
+                        and self.func_of[i.idx] == self.entry]
+
+        records = []
+        for k, mul in enumerate(muls):
+            half_var = None
+            for u in self.consumers(mul.rid):
+                if u.op == STORE:
+                    half_var = u.ops[0]
+            rec = {"index": k, "mul": self.at(mul), "half_var": self.vd(half_var),
+                   "half_var_cm_type": self.var_type.get(half_var),
+                   "half_var_reads": [self.at(l) for l in self.loads_of.get(half_var, [])],
+                   "reach_widen": [], "reach_deq_add": []}
+            # loads of the half seed -> (arg store) -> widen call
+            for ld in self.loads_of.get(half_var, []):
+                for u in self.consumers(ld.rid):
+                    if u.op == STORE:
+                        for u2 in self.consumers(u.ops[0]):
+                            if u2.op == CALL and u2.ops[2] == wid:
+                                entry = {"load": self.at(ld), "arg_store": self.at(u),
+                                         "call": self.at(u2)}
+                                # the wide result -> its variable -> every read
+                                wvars = []
+                                for u3 in self.consumers(u2.rid):
+                                    if u3.op == STORE:
+                                        wvars.append(u3.ops[0])
+                                        entry["result_store"] = self.at(u3)
+                                        entry["wide_var"] = self.vd(u3.ops[0])
+                                entry["wide_var_reads"] = []
+                                for wv in wvars:
+                                    for l2 in self.loads_of.get(wv, []):
+                                        use = {"load": self.at(l2), "consumers": []}
+                                        for u3 in self.consumers(l2.rid):
+                                            sub = {"op": u3.name, **self.at(u3)}
+                                            if u3.op == STORE:
+                                                sub["dst"] = self.vd(u3.ops[0])
+                                                sub["dst_cm_type"] = self.var_type.get(u3.ops[0])
+                                            if u3.op == CALL:
+                                                sub["callee"] = self.names.get(u3.ops[2], "")
+                                            use["consumers"].append(sub)
+                                        entry["wide_var_reads"].append(use)
+                                rec["reach_widen"].append(entry)
+            records.append(rec)
+
+        # deq_add calls: resolve the 4th argument (the seed) back to a widen call
+        for c in deqadd_calls:
+            arg = c.ops[6] if len(c.ops) > 6 else None
+            chain = self.arg_origin(arg) if arg is not None else None
+            # find which mul it belongs to: walk the chain text for the half var id
+            txt = json.dumps(chain)
+            owner = None
+            for rec in records:
+                if '"id": %d' % rec["half_var"]["id"] in txt:
+                    owner = rec
+                    break
+            if owner is None:
+                continue
+            item = {"call": self.at(c), "result": c.rid, "seed_arg_var": self.vd(arg),
+                    "seed_arg_chain": chain}
+            outs = [u for u in self.consumers(c.rid) if u.op == STORE]
+            if outs:
+                item["result_store"] = self.at(outs[0])
+                item["result_var"] = self.vd(outs[0].ops[0])
+                item["narrow"] = []
+                for l in self.loads_of.get(outs[0].ops[0], []):
+                    for u in self.consumers(l.rid):
+                        for u2 in self.consumers(u.ops[0] if u.op == STORE else u.rid):
+                            if u2.op == CALL and u2.ops[2] == nw:
+                                item["narrow"].append({"load": self.at(l),
+                                                       "arg_store": self.at(u),
+                                                       "call": self.at(u2)})
+            owner["reach_deq_add"].append(item)
+
+        for rec in records:
+            rec["class"] = "contract_seed" if rec["reach_deq_add"] else "other_half_mul"
+            # context: does this seed's half value reach the widen before the first
+            # cooperative-matrix mul-add after the mul?
+            w = [x["call"]["word"] for x in rec["reach_widen"]]
+            rec["widen_words"] = w
+            rec["half_seed_live_words"] = (min(w) - rec["mul"]["word"]) if w else None
+            rec["half_seed_live_instructions"] = (
+                min(x["call"]["inst"] for x in rec["reach_widen"]) - rec["mul"]["inst"]
+                if rec["reach_widen"] else None)
+            dw = [x["call"]["word"] for x in rec["reach_deq_add"]]
+            rec["deq_add_words"] = dw
+            rec["wide_seed_live_words"] = (max(dw) - min(w) + 1) if (dw and w) else None
+        return {"widen_fn": wid, "narrow_fn": nw, "deq_add_fn": da, "deq_fn": deq,
+                "seed_mul_count": len(muls), "deq_add_call_count": len(deqadd_calls),
+                "seeds": records}
+
+    def order(self):
+        kinds = {self.fn["nrh_widen_exact"][0]: "widen", self.fn["nr_i8_deq_add"][0]: "deq_add",
+                 self.fn["nr_i8_deq"][0]: "deq", self.fn["nrh_narrow"][0]: "narrow"}
+        out = []
+        for ins in self.M.insts:
+            if self.func_of[ins.idx] != self.entry:
+                continue
+            k = None
+            if ins.op == CALL and ins.ops[2] in kinds:
+                k = kinds[ins.ops[2]]
+            elif ins.op == FMUL and ins.rtype == self.T_CH:
+                k = "seed_mul_h16"
+            elif ins.op == MULADD:
+                k = "muladd"
+            elif ins.op == LOOPMERGE:
+                k = "loop_header"
+            if k:
+                out.append({"kind": k, "inst": ins.idx, "word": ins.pos})
+        return out
+
+    def loops(self):
+        return [{"merge": self.at(i), "merge_block": i.ops[0], "continue_block": i.ops[1]}
+                for i in self.M.insts if i.op == LOOPMERGE and self.func_of[i.idx] == self.entry]
+
+    def census(self):
+        h, words = {}, 0
+        for ins in self.M.insts:
+            key = "%d:%d" % (ins.op, ins.n)
+            h[key] = h.get(key, 0) + 1
+            words += ins.n
+        return {"instructions": len(self.M.insts), "words": words,
+                "sha256": self.sha, "bytes": self.M.nbytes, "histogram": h}
+
+
+def main():
+    path = sys.argv[1]
+    out = sys.argv[2] if len(sys.argv) > 2 else None
+    A = Analysis(path)
+    doc = {"module": {"path": path, "sha256": A.sha, "bytes": A.M.nbytes,
+                      "words": len(A.M.words), "entry_point": A.entry,
+                      "NRH_CH_type": A.T_CH, "NRH_C_type": A.T_C,
+                      "functions": {k: v for k, v in sorted(A.fn.items())},
+                      "census": A.census()},
+           "seed_flow": A.seed_report(),
+           "loops": A.loops(),
+           "order": A.order()}
+    txt = json.dumps(doc, indent=1)
+    if out:
+        open(out, "w", encoding="utf-8", newline="\n").write(txt + "\n")
+    else:
+        print(txt)
+
+
+if __name__ == "__main__":
+    main()

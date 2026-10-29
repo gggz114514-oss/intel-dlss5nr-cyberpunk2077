@@ -1,0 +1,87 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys,shlex,shutil
+D=Path(__file__).resolve().parent;A=D.parent;B=A.parent.parent;P=A/'f20-coarse-owner-20261026';S=D/'ups-coarse-owner';S.mkdir(exist_ok=True)
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+def save(p,x):p.write_text(json.dumps(x,indent=2,ensure_ascii=False),encoding='utf-8')
+def ident(p):return dict(path=str(p),sha256=sha(p))
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+rows=[];cur=-1
+for l in (P/'plan.txt').read_text().splitlines():
+ t=shlex.split(l)
+ if t and t[0]=='PASS':rows.append(dict(pass_tokens=t))
+ elif t and t[0]=='PUSH':rows[-1]['push']=list(map(int,t[1:]))
+proof=[];sources=[];repls={}
+for C,idx in [(64,212),(128,192),(256,166)]:
+ row=rows[idx];p=row['push'];z=row['pass_tokens'];parent=Path(z[3]);src=parent.parent/'source'/f'c3x_pre_c{C}.comp';d=S/f'c{C}';d.mkdir(exist_ok=True)
+ assert p[20]==2*C and p[21]==C and p[23]==0
+ shift=p[2] if p[2]<2**31 else p[2]-2**32;shifty=p[3] if p[3]<2**31 else p[3]-2**32
+ nrow=8 if C==256 else 16;pixels=0;coarse=0
+ for wy in range(int(z[-2])):
+  for wx in range(int(z[-3])):
+   for half in range(int(z[-1])):
+    old={};new={}
+    for t in range(nrow*4):
+     tg=t+32*half;q,s=tg//16,tg%16;tx=2*wx+shift+q%2;ty=2*wy+shifty+q//2
+     if not(0<=tx<p[0] and 0<=ty<p[1]):continue
+     px,py=4*tx+s%4,4*ty+s//4
+     ps=(py//2-(4*wy+2*half))*4+(px//2-4*wx)+(2 if C==128 else 0)
+     assert 0<=ps<nrow;old[(px,py)]=ps
+    for r in range(nrow):
+     px0=8*wx+4*shift+2*(r%4);py0=8*wy+4*shifty+4*half+2*(r//4)
+     if not(0<=px0<p[0]*4 and 0<=py0<p[1]*4):continue
+     coarse+=1
+     for k in range(4):
+      px,py=px0+(k&1),py0+(k>>1);assert (px,py) not in new;new[(px,py)]=r
+    assert old==new,(C,wx,wy,half);pixels+=len(new)
+ assert pixels==p[0]*4*p[1]*4
+ # Lane mapping distributes consecutive channel pairs, all256 lanes participate.
+ owners={(tid+256*j) for tid in range(256) for j in range((nrow*(C//2))//256)};assert owners==set(range(nrow*(C//2)))
+ proof.append(dict(width=C,ordinal=idx,grid=list(map(int,z[-3:])),pixels=pixels,coarse_positions=coarse,coarse_pairs=coarse*C//2,old_logical_projection_SLM_bytes=pixels*C*2,new_logical_projection_SLM_bytes=coarse*C*2,SLM_bytes_saved=(pixels-coarse)*C*2,weight_MMA_change=0,new_barriers=0,new_shared=0,new_shuffle=0,all8SG=True,mapping='Exhaustive actual grid including shifted left/cropped right boundaries: old(pixel,projectionRow)==new(pixel,projectionRow); channel-pair ownership covers all pairs once.',lifetime='One retained main halfpair and skip-gain halfpair across four sequential consumers; one skip/result pair at a time. Projection accumulators and gather retire before unchanged final barrier. GRF allocation/spill requires GPU native.'))
+ s=src.read_text(encoding='utf-8-sig');inc=src.parent
+ def compile(name,text):
+  f=d/(name+'.comp');out=d/(name+'.spv');f.write_text(text,encoding='utf-8');run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3','-I'+str(inc),f,'-o',out]);return out
+ raw=compile('parent-rebuild',s);pm,rm=ST.Module(parent),ST.Module(raw)
+ keep,info=ST.transfer_decoration_pattern_aligned(pm,rm,set());ST.set_no_contraction(rm,keep,raw);assert sha(raw)==sha(parent),(C,'parent not reproduced')
+ start=s.index('    // ---- blend:');shared='nr3_proj' if C==64 else 'nr3_gbuf';halfexpr='half3' if C==256 else '0u'
+ tail=f'''    // One projection/channel-pair owner consumes once and emits its 2x2 pixels.
+    for(uint j=tid;j<{nrow*(C//2)}u;j+=256u) {{
+        uint pr=j/{C//2}u,c3=(j%{C//2}u)*2u;
+        int px0=8*int(wx)+4*pc.p0.z+2*int(pr%4u);
+        int py0=8*int(wy)+4*pc.p0.w+4*int({halfexpr})+2*int(pr/4u);
+        if(px0<0 || py0<0 || px0>=int(pc.p0.x*4u) || py0>=int(pc.p0.y*4u)) continue;
+        precise f16vec2 main_scaled=f16vec2({shared}[pr*{C}u+c3],{shared}[pr*{C}u+c3+1u]);
+        if(pc.p5.w==1u) main_scaled=main_scaled*f16vec2(pw[pc.p5.z+pc.p5.y+c3],pw[pc.p5.z+pc.p5.y+c3+1u]);
+        const f16vec2 skip_gain=f16vec2(pw[pc.p5.z+c3],pw[pc.p5.z+c3+1u]);
+        for(uint k=0u;k<4u;++k) {{
+            uint px3=uint(px0)+(k&1u),py3=uint(py0)+(k>>1u);
+            uint sa3=pc.p4.z+nr3_io_at0(px3,py3,c3,pc.p6.x,pc.p5.y);
+            f16vec2 skip_input=f16vec2(sk[sa3],sk[sa3+1u]);
+            precise f16vec2 skip_v=skip_input*skip_gain;
+            precise f16vec2 value=main_scaled+skip_v;
+            uint ba3=nr3_io_at0(px3,py3,c3,pc.p0.x*4u,pc.p5.y);
+            blout[ba3]=value.x;blout[ba3+1u]=value.y;
+        }}
+    }}
+}}
+'''
+ cand=compile('candidate',s[:start]+tail);cm=ST.Module(cand)
+ # Only three blend FP ops carry NoContraction. Projection prefix unchanged.
+ assert len(ST.no_contraction_ids(pm))==len(ST.no_contraction_ids(cm))==3,(C,ST.no_contraction_ids(pm),ST.no_contraction_ids(cm))
+ run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',cand])
+ sources.append(dict(width=C,parent=ident(parent),parent_rebuild=ident(raw),candidate=ident(cand),NC_count=3));repls[parent.as_posix()]=cand.as_posix()
+plantext=(P/'plan.txt').read_text()
+for a,b in repls.items():assert plantext.count(a)==1;plantext=plantext.replace(a,b)
+plan=S/'plan.txt';plan.write_text(plantext,encoding='utf-8');cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check'])
+save(S/'PROOF.json',dict(parent=ident(P/'plan.txt'),rows=proof,rounding='Original projection MMA order/half narrowing unchanged. Each main halfpair multiplied at most once then reused as exact half bits; skip half mul then half add unchanged. All3 retained FP arithmetic decorations are NoContraction. No weight duplication, SG reduction, extra synchronization or shared allocation. Logical requests not DRAM bytes.'))
+save(S/'BUILD.json',dict(plan=ident(plan),sources=sources,cpu=cpu))
+(S/'run').mkdir(exist_ok=True)
+for kind in ['GATES','NATIVE','RESOURCES','ORDINARY']:
+ t=json.loads((P/f'LUNA-{kind}.json').read_text());ex=S/(kind.lower()+'-execution');ex.mkdir(exist_ok=True);t['output_root']=str(ex);t['identities']=[i for i in t['identities'] if not i['path'].endswith('.spv')]+[x['candidate'] for x in sources]+[x['parent'] for x in sources]
+ for j in t['jobs']:
+  jp=P/'plan.txt' if kind=='ORDINARY' and j['candidate']=='parent' else plan
+  j['plan']=ident(jp);j['runner_output']=str(S/'run'/j['id']);ar=j['argv'];ar[ar.index('--plan')+1]=str(jp);ar[ar.index('--out')+1]=j['runner_output']
+  if kind=='NATIVE':ar[ar.index('--output_dir')+1]=str(S/'captures');ar[ar.index('--msg_file')+1]=str(S/'native.log');j['capture_output']=str(S/'captures'/ar[ar.index('--profile_dir')+1])
+ save(S/f'LUNA-{kind}.json',t)
+shutil.copyfile(P/'execute.ps1',S/'execute.ps1');print(cpu);print('projectionSLMlogical saved',sum(x['SLM_bytes_saved'] for x in proof))

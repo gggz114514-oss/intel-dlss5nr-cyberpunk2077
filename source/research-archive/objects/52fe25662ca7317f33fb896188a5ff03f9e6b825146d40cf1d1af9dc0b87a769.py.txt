@@ -1,0 +1,139 @@
+"""Declared static Workgroup (shared) memory of a SPIR-V module, per array.
+
+Everything reported here is *declared SPIR-V bytes*: OpVariable with storage
+class Workgroup, resolved through its pointer/array/struct type, summed.  This is
+NOT native SLM, not occupancy, not bank behaviour -- none of which can be
+measured without a device.
+
+usage: python tools/shared_bytes.py [--json out.json] <spv> [<spv> ...]
+"""
+import hashlib
+import json
+import struct
+import sys
+from pathlib import Path
+
+OP_NAME = 5
+OP_TYPE_INT = 21
+OP_TYPE_FLOAT = 22
+OP_TYPE_VECTOR = 23
+OP_TYPE_ARRAY = 28
+OP_TYPE_RUNTIME_ARRAY = 29
+OP_TYPE_STRUCT = 30
+OP_TYPE_POINTER = 32
+OP_CONSTANT = 43
+OP_VARIABLE = 59
+WORKGROUP = 4
+
+FLOAT_BYTES = {16: 2, 32: 4, 64: 8}
+
+
+def parse(path):
+    raw = Path(path).read_bytes()
+    words = list(struct.unpack("<%dI" % (len(raw) // 4), raw))
+    assert words[0] == 0x07230203, "not a SPIR-V module"
+    ins = []
+    i = 5
+    while i < len(words):
+        w = words[i]
+        op = w & 0xFFFF
+        n = w >> 16
+        ins.append((op, words[i + 1:i + n]))
+        i += n
+    return {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+            "words": len(words), "instructions": ins,
+            "version": (words[1], words[2], words[3], words[4])}
+
+
+def sizes(mod):
+    ints, floats, vecs, arrs, structs, ptrs, consts = {}, {}, {}, {}, {}, {}, {}
+    names = {}
+    for op, ops in mod["instructions"]:
+        if op == OP_NAME and len(ops) >= 2:
+            raw = b"".join(struct.pack("<I", w) for w in ops[1:])
+            names[ops[0]] = raw.split(b"\x00")[0].decode("utf-8", "replace")
+        elif op == OP_TYPE_INT:
+            ints[ops[0]] = (ops[1], ops[2])          # width, signedness
+        elif op == OP_TYPE_FLOAT:
+            floats[ops[0]] = ops[1]
+        elif op == OP_TYPE_VECTOR:
+            vecs[ops[0]] = (ops[1], ops[2])
+        elif op == OP_TYPE_ARRAY:
+            arrs[ops[0]] = (ops[1], ops[2])
+        elif op == OP_TYPE_STRUCT:
+            structs[ops[0]] = list(ops[1:])
+        elif op == OP_TYPE_POINTER:
+            ptrs[ops[0]] = (ops[1], ops[2])
+        elif op == OP_CONSTANT and ops:
+            consts[ops[1]] = ops[2:] if len(ops) > 2 else [0]
+
+    def size(t, depth=0):
+        if depth > 16:
+            return 0, "?"
+        if t in ints:
+            return max(1, ints[t][0] // 8), "i%d" % ints[t][0]
+        if t in floats:
+            return FLOAT_BYTES.get(floats[t], floats[t] // 8), "f%d" % floats[t]
+        if t in vecs:
+            c, n = vecs[t]
+            s, nm = size(c, depth + 1)
+            return s * n, "vec%d<%s>" % (n, nm)
+        if t in arrs:
+            e, ln = arrs[t]
+            s, nm = size(e, depth + 1)
+            n = consts.get(ln, [0])[0]
+            return s * n, "[%d x %s]" % (n, nm)
+        if t in structs:
+            tot, parts = 0, []
+            for m in structs[t]:
+                s, nm = size(m, depth + 1)
+                tot += s
+                parts.append(nm)
+            return tot, "{" + ",".join(parts) + "}"
+        if t in ptrs:
+            return size(ptrs[t][1], depth + 1)
+        return 0, "?"
+
+    out = []
+    for op, ops in mod["instructions"]:
+        if op != OP_VARIABLE:
+            continue
+        vt, rid, sc = ops[0], ops[1], ops[2]
+        if sc != WORKGROUP:
+            continue
+        if vt not in ptrs:
+            continue
+        b, nm = size(ptrs[vt][1])
+        out.append({"name": names.get(rid, "id%d" % rid), "bytes": b, "type": nm})
+    return out
+
+
+def main(argv):
+    js = None
+    args = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--json":
+            js = argv[i + 1]
+            i += 2
+        else:
+            args.append(argv[i])
+            i += 1
+    doc = {"note": "declared SPIR-V Workgroup-storage bytes only; not native SLM, "
+                   "not occupancy", "modules": []}
+    for p in args:
+        mod = parse(p)
+        arrs = sizes(mod)
+        total = sum(a["bytes"] for a in arrs)
+        doc["modules"].append({"path": str(Path(p).as_posix()), "bytes": mod["bytes"],
+                               "sha256": mod["sha256"], "words": mod["words"],
+                               "declared_workgroup_bytes": total, "arrays": arrs})
+        print("%-58s %6d B  %s" % (Path(p).name, total,
+                                   " ".join("%s=%d" % (a["name"], a["bytes"]) for a in arrs)))
+    if js:
+        Path(js).write_text(json.dumps(doc, indent=1) + "\n", encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

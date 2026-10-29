@@ -1,0 +1,87 @@
+"""Whole-frame redundancy test on the four criteria (the n33/n35 method, applied everywhere).
+
+For every expensive op (math.inv / math.rsqt) build a bounded backward slice of length <= 4 and
+take its leaf signature: the set of (register, subregister) read from outside the slice. Two ops
+are candidates for sharing only if their leaf signatures are identical AND no write to those
+leaves separates them. This is the test that refuted the earlier text-matching census.
+"""
+import json, re, sys
+from collections import Counter, defaultdict
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+import ISA
+
+REG = re.compile(r'\br(\d+)(?:\.(\d+))?')
+SLICE = 4
+
+def reg_of(o):
+    m = REG.match(o or '')
+    return (int(m.group(1)), m.group(2)) if m else None
+
+def dst_src(ops):
+    regs = [reg_of(o) for o in ops]
+    regs = [r for r in regs if r]
+    if not regs:
+        return None, []
+    return regs[0], regs[1:]
+
+def leaf_signature(isa, idx, depth=SLICE):
+    """Backward slice from instruction idx; return the set of external leaves read."""
+    reads = set()
+    frontier = [idx]
+    seen = set()
+    for _ in range(depth):
+        nxt = []
+        for j in frontier:
+            if j in seen:
+                continue
+            seen.add(j)
+            ops = [o for o in isa[j]['ops'] if o]
+            regs = [reg_of(o) for o in ops if reg_of(o)]
+            srcs = regs[1:] if len(regs) > 1 else []
+            for s in srcs:
+                # find the nearest previous writer of s
+                w = None
+                for k in range(j - 1, max(-1, j - 40), -1):
+                    d, _ = dst_src([o for o in isa[k]['ops'] if o])
+                    if d == s:
+                        w = k
+                        break
+                if w is None:
+                    reads.add(s)
+                else:
+                    nxt.append(w)
+        frontier = nxt
+        if not frontier:
+            break
+    return frozenset(reads)
+
+cap = K.C / 'queue' / 'n32-run' / 'run' / 'captures-base'
+found = []
+for p in sorted(cap.rglob('*.asm')):
+    isa = ISA.parse(p)
+    sites = []
+    for i, ins in enumerate(isa):
+        if ins['op'] not in ('math.inv', 'math.rsqt'):
+            continue
+        sig = leaf_signature(isa, i)
+        if not sig:
+            continue
+        sites.append((i, ins['op'], sig))
+    if len(sites) < 2:
+        continue
+    groups = defaultdict(list)
+    for i, op, sig in sites:
+        groups[(op, sig)].append(i)
+    for (op, sig), idxs in groups.items():
+        if len(idxs) > 1:
+            found.append(dict(kernel=p.name, op=op, sites=len(idxs), indices=idxs[:8],
+                              leaves=sorted('%d.%s' % (a, b) for a, b in sig)))
+found.sort(key=lambda r: -r['sites'])
+print('candidate sharing groups (identical leaf signature, same op):')
+for r in found:
+    print('  %-46s %-9s x%d  leaves %s  idx %s' % (r['kernel'][:46], r['op'], r['sites'],
+                                                   r['leaves'][:3], r['indices'][:5]))
+print('\ngroups:', len(found), ' total duplicated ops:', sum(r['sites'] - 1 for r in found))
+K.write_json(K.C / 'evidence' / 'SHARED-DEFINITION-CANDIDATES.json', dict(rows=found, slice=SLICE))

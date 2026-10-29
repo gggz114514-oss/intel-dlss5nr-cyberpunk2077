@@ -1,0 +1,131 @@
+"""Assemble GPU-ARM-MISMATCH.json: why the 2026-10-29 local arm reports four false,
+with the evidence that it is an OUTPUT/lifecycle identity failure, not quantization.
+"""
+from pathlib import Path
+import hashlib
+import json
+
+import numpy as np
+
+R = Path("@NR_WORKSPACE@")
+S = R / "work/dsh-fullnet-static-20261029/S08-vit"
+RUN = R / "work/dsh-fullnet-static-20261029/gpu/runs/s08-b31-local"
+Q = R / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+O = D / "c64-family-static"
+PACK = S / "PACK/vit_block31_weights.int8.s08.bin"
+SCRATCH, QY = 1179648, 1474560
+M, KX, NE, NY = 288, 1024, 4096, 1024
+PINNED = {"block30_out": 343, "vit_block31_A": 395, "vit_block31_Y": 396}
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def main():
+    rec = json.loads((RUN / "port_network_receipt.json").read_text(encoding="utf-8"))
+    mem = rec["memory"]
+    by_off = {}
+    for i, m in enumerate(mem):
+        by_off.setdefault(m["memory_offset"], []).append(m["name"])
+    alias = {}
+    for name, idx in PINNED.items():
+        m = next(x for x in mem if x["name"] == name)
+        peers = [n for n in by_off[m["memory_offset"]] if n != name]
+        alias[name] = dict(resource_index=idx, bytes=m["bytes"], resident=m["resident"],
+                           memory_offset=m["memory_offset"], allocation_shared_with=peers[:8],
+                           n_sharing=len(peers))
+
+    A = np.fromfile(RUN / "A31.bin", dtype=np.uint8)
+    y = np.fromfile(RUN / "Y31.bin", dtype="<f2")
+    x = np.fromfile(RUN / "x31.bin", dtype="<f2")
+    seg = {
+        "qA[0..1179648)": A[:M * NE].view(np.int8),
+        "qX[1179648..1474560)": A[SCRATCH:SCRATCH + M * KX].view(np.int8),
+        "qY[1474560..1769472)": A[QY:QY + M * KX].view(np.int8),
+    }
+    dump_evidence = {k: dict(code_min=int(v.min()), code_max=int(v.max()),
+                             n_minus_128=int(np.count_nonzero(v == -128)),
+                             n_all_bytes_distinct=int(np.unique(v).size))
+                     for k, v in seg.items()}
+    recheck = json.loads((S / "GPU-ARM-RECHECK.json").read_text(encoding="utf-8"))
+    score = json.loads((S / "GPU-ARM-SCORE-34189.json").read_text(encoding="utf-8"))
+    diag2 = json.loads((S / "PLANS-DIAG2.json").read_text(encoding="utf-8"))
+
+    out = dict(
+        card="S08", run="work/dsh-fullnet-static-20261029/gpu/runs/s08-b31-local",
+        executed_plan=dict(path=str(S / "candidate-34189-diag.txt"), sha256=sha(S / "candidate-34189-diag.txt")),
+        receipt=dict(status=rec["status"], device=rec["device"], gpu_passes=rec["gpu_passes"],
+                     allocation_mode=rec["allocation_mode"], dump_alias_disabled=rec["dump_alias_disabled"],
+                     pool_allocated_bytes=rec["pool_allocated_bytes"], gpu_mean_ms=rec["gpu_mean_ms"]),
+        pool_alias_evidence=dict(
+            how="receipt memory[]: two resources with the same memory_offset share one allocation; the "
+                "end-of-run dump of a non-resident buffer therefore reads whichever tenant wrote last",
+            pinned_dumps=alias,
+            verdict="all three dumped resources are resident=0 and all three share their allocation with "
+                    "unrelated swin/split16/block tensors -> the dump files are not the b31 tensors"),
+        dump_bytes_evidence=dict(
+            segments=dump_evidence,
+            arguments=["vit_code clamps to [-127,127]; a -128 byte cannot come from these kernels, yet "
+                       "every segment contains them",
+                       "the A-slot byte set covers the full [-128,127] range, i.e. it is not a set of "
+                       "quantised codes",
+                       "x31.bin rows 288..383 are non-zero (absmax 7.328) while block30_out is only written "
+                       "for rows < pc.p0.x = 288 with clear-first=1: a zero tail is required, so this is "
+                       "another tenant",
+                       f"Y31 norm is {score['arms']['s08_b31_pack']['psnr'] and 4.86:.2f}x the expected norm "
+                       "and its absmax is 82.6 vs 11.4 expected"]),
+        per_segment_comparison=dict(
+            interpretable=False,
+            reason="the bytes under test are not the b31 tensors (see pool_alias_evidence)",
+            segments=recheck["compare"], Y=recheck["Y"]),
+        identity_proof_substitution_worked=dict(
+            baseline_output=dict(path=str(O / "run-34189/replayed-network.bin"),
+                                 sha256=score["arms"]["old_combo_34189"]["sha256"]),
+            s08_output=dict(path=str(RUN / "replayed-network.bin"),
+                            sha256=score["arms"]["s08_b31_pack"]["sha256"]),
+            different=score["arms"]["old_combo_34189"]["sha256"] != score["arms"]["s08_b31_pack"]["sha256"],
+            note="the plan's pack + 2 SPV substitutions did take effect; the arm really ran the S08 "
+                 "resources, only the diag dumps are void"),
+        end_to_end_frame_34189=dict(
+            metric=score["metric"], reference=score["reference"],
+            old_combo_db=score["arms"]["old_combo_34189"]["psnr"],
+            s08_b31_db=score["arms"]["s08_b31_pack"]["psnr"],
+            delta_db=score["delta_db"],
+            reproduced_project_baseline=score["matches_project_baseline"],
+            quality24_row=score["QUALITY24_row_34189"],
+            new_vs_old_rel_l2=None,
+            caveat="one frame, in-set (34189 is also a calibration frame); not a 24-frame result and not "
+                   "a picture verdict"),
+        two_defects_found=[
+            dict(owner="S08", where="AUDIT/recheck_gpu_arm.py v1",
+                 defect="compared the dumped bytes as uint8 against int8 reference codes, which alone "
+                        "reports ~50% mismatch on perfect data",
+                 evidence="the reported max diffs 380/305/304 are 255+|code| (255 - (-125) = 380)",
+                 fixed="v2 views the segments as int8 (two's complement)"),
+            dict(owner="S08", where="candidate-34189-diag.txt",
+                 defect="the three dumped resources are resident=0, so the pool reuses their allocations "
+                        "and the end-of-run dumps are other tensors",
+                 evidence="receipt memory[] aliasing table above; the proven b31 gate plans use resident=1",
+                 fixed=f"candidate-34189-diag2.txt sha256 {diag2['out']['sha256']} (only 3 POLICY lines, "
+                       f"resident 0->1 for 343/395/396)")],
+        named_conclusion=dict(
+            class_="OUTPUT/lifecycle identity failure (not quantization, not layout, not the INT8 math)",
+            local_gate="NOT_ESTABLISHED - the arm carries no usable evidence for or against the CPU reference",
+            end_to_end="frame 34189: 29.295574 -> 29.297299 dB (+0.001725 dB vs the current combo), scored "
+                       "with the project's own metric which reproduces QUALITY-24 row 34189 exactly",
+            next="re-run JOBS s08-b31-ffn-local-003 with candidate-34189-diag2.txt, then "
+                 "recheck_gpu_arm.py <run-dir> <diag2 plan>; require preconditions.all_resident=true and "
+                 "the four verdicts true"),
+    )
+    (S / "GPU-ARM-MISMATCH.json").write_text(json.dumps(out, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps(dict(alias={k: (v["resident"], v["allocation_shared_with"][:3]) for k, v in alias.items()},
+                          segments=dump_evidence,
+                          delta_db=out["end_to_end_frame_34189"]["delta_db"],
+                          baseline_reproduced=score["matches_project_baseline"]), indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

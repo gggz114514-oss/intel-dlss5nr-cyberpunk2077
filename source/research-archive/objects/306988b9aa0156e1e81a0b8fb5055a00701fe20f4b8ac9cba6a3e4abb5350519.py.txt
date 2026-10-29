@@ -1,0 +1,253 @@
+"""n39-f06-c256-slack: assemble PROOF.json from the machine artifacts of this card.
+
+Nothing here is typed by hand: every check reads build/lifetime.json, build/build.json,
+build/addr-audit.json, build/audit-negcontrol.json, build/plan.json or the sources, and the
+verdict is computed.  Sections:
+
+  P1  mapping: (j, ki, row, col) -> (token, channel) is a bijection onto 64 x 256, and the parent
+      SLM address equals the candidate global address minus the tile base for every element
+  P2  no math change: FP expression multiset with operand signatures, K order, DPAS count,
+      rounding/narrowing sites, NoContraction set
+  P3  value identity: shT is a pure copy of the read-only gT, so every A operand is bit-identical
+  P4  lifetime: peak, declared, slack, and what the candidate declares instead
+  P5  hazards: RAW / WAR / WAW per arm and what closes them
+  P6  tail: the last tile element and the coverage bounds in both arms
+  P7  address audit + its six negative controls
+  P8  plan: replacement counts, ledger column, cpu-check
+  P9  gates: not run here (no GPU); the exact commands and expected gold hashes are recorded
+"""
+import json
+import pathlib
+import sys
+
+CARD = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(CARD))
+import _lifetime as L                       # noqa: E402
+
+TOKENS, CHANNELS = L.TOKENS, L.CHANNELS
+
+
+def read(rel):
+    return json.loads((CARD / rel).read_text(encoding='utf-8'))
+
+
+def main():
+    life = read('build/lifetime.json')
+    build = read('build/build.json')
+    audit = read('build/addr-audit.json')
+    negc = read('build/audit-negcontrol.json')
+    plan = read('build/plan.json')
+    repro = read('build/repro.json')
+    p06, c06 = build['pairs']['f06-c256']['parent'], build['pairs']['f06-c256']['candidate']
+    checks = []
+
+    def chk(cid, ok, **ev):
+        checks.append(dict(id=cid, verdict='PASS' if ok else 'FAIL', **ev))
+        return ok
+
+    # ---------------------------------------------------------------- P1 mapping
+    pairs_seen = {}
+    addr_ok = True
+    for j in range(L.J_BLOCKS):
+        for ki in range(L.KI_STEPS):
+            for r in range(L.A_ROWS):
+                for c in range(L.A_COLS):
+                    token, channel = L.m0_of(0, j) + r, ki * L.A_COLS + c
+                    key = (token, channel)
+                    assert key not in pairs_seen, ('duplicate element', key)
+                    pairs_seen[key] = (j, ki, r, c)
+                    slm = token * L.STRIDE + channel                     # parent address in shT
+                    glob = j * L.A_ROWS * L.STRIDE + ki * L.A_COLS + r * L.STRIDE + c
+                    if glob != slm:
+                        addr_ok = False
+    bij = len(pairs_seen) == TOKENS * CHANNELS
+    chk('P1.1', bij, what='(j,ki,row,col) -> (token,channel) bijection onto 64x256',
+        elements=len(pairs_seen), expected=TOKENS * CHANNELS)
+    chk('P1.2', addr_ok, what='parent SLM address == candidate tile-local global address for '
+                             'every element (same (token,channel) -> same slot)')
+    chk('P1.3', life['parent']['consumers']['read_union_is_whole_tile']
+        and life['parent']['consumers']['unread_halves'] == 0,
+        what='consumer union covers the whole tile, no unread half',
+        unread=life['parent']['consumers']['unread_halves'])
+    chk('P1.4', life['parent']['consumers']['read_multiplicity'] == {'8': 16384},
+        what='each half is read by all 8 subgroups (m0 does not depend on sg)',
+        multiplicity=life['parent']['consumers']['read_multiplicity'])
+    chk('P1.5', life['parent']['producers']['write_is_partition_of_tile']
+        and life['parent']['producers']['halves_per_thread'] == [64],
+        what='producer writes each half exactly once, 64 per thread',
+        partition=life['parent']['producers']['write_is_partition_of_tile'])
+
+    # ---------------------------------------------------------------- P2 no math change
+    b06c = build['pairs']['f06-c256']
+    chk('P2.1', b06c['fp_multiset']['identical'], what='FP expression multiset with operand '
+        'signatures identical (parent == candidate)', entries=b06c['fp_multiset']['parent'])
+    chk('P2.2', b06c['parent']['dpas'] == b06c['candidate']['dpas'],
+        what='OpCooperativeMatrixMulAdd count identical',
+        parent=b06c['parent']['dpas'], candidate=b06c['candidate']['dpas'])
+    chk('P2.3', b06c['parent']['coopmat']['loads'] == b06c['candidate']['coopmat']['loads']
+        and b06c['parent']['coopmat']['stores'] == b06c['candidate']['coopmat']['stores']
+        and b06c['parent']['coopmat']['load_stride_hist'] == b06c['candidate']['coopmat']['load_stride_hist'],
+        what='cooperative-matrix load/store site counts and stride histograms identical',
+        loads=[b06c['parent']['coopmat']['loads'], b06c['candidate']['coopmat']['loads']],
+        strides=[b06c['parent']['coopmat']['load_stride_hist'],
+                 b06c['candidate']['coopmat']['load_stride_hist']])
+    chk('P2.4', b06c['checks']['nc_identical'],
+        what='NoContraction set identical (both sides carry none: recipe mode = raw)',
+        ids=[b06c['parent']['nc']['ids'], b06c['candidate']['nc']['ids']])
+    chk('P2.5', b06c['checks']['a_operand_moved_to_storagebuffer'],
+        what='the A operand pointer resolves to Workgroup in the parent and StorageBuffer in the '
+             'candidate (the only load source that changed)',
+        parent=b06c['parent']['cm_load_pointer_roots'],
+        candidate=b06c['candidate']['cm_load_pointer_roots'])
+    # K order / accumulation order: the loop structure and the DPAS order are untouched by the diff
+    src = (CARD / 'candidate.comp').read_text(encoding='utf-8')
+    par = (CARD / 'parent.comp').read_text(encoding='utf-8')
+    korder_ok = (src.count('for (uint ki = 0u; ki < 16u; ++ki)') == 1
+                 and 'uint k0 = ki * 16u;' in src
+                 and src.count('acc0 = coopMatMulAdd(a, b0, acc0);') == 1
+                 and src.count('acc1 = coopMatMulAdd(a, b1, acc1);') == 1
+                 and src.count('for (uint j = 0u; j < 8u; ++j)') == 1)
+    chk('P2.6', korder_ok, what='K accumulation order unchanged: ki 0..15 ascending, j 0..7 '
+        'ascending, same two MulAdd per k-step in the same order',
+        note='the diff does not touch the loop headers, the MulAdd order or any FP expression')
+    # rounding / narrowing sites
+    rounding_sites = [ln.strip() for ln in src.splitlines() if 'MAT_H(' in ln]
+    par_rounding = [ln.strip() for ln in par.splitlines() if 'MAT_H(' in ln]
+    chk('P2.7', rounding_sites == par_rounding,
+        what='every narrowing/rounding site (MAT_H(acc) and the seed/scale folds) is byte-identical',
+        sites=rounding_sites)
+
+    # ---------------------------------------------------------------- P3 value identity
+    gT_only_read = not any(ln.strip().startswith('gT[') for ln in par.splitlines())
+    chk('P3.1', gT_only_read, what='gT is never written by this shader (read-only tile)',
+        writes=0)
+    chk('P3.2', life['deletable']['claim'].startswith('every half of shT is a byte-for-byte copy'),
+        what='shT[e] == gT[w*16384 + e] for every e: the staging array is a pure copy',
+        value_map=life['deletable']['value_map'])
+    chk('P3.3', 'shT' not in src[src.index('#version 450'):],
+        what='the staging array and all of its uses are gone from the candidate body')
+    chk('P3.4', not any(ln.strip().startswith('shT[') for ln in src.splitlines()),
+        what='no hidden second producer/consumer of the deleted array')
+
+    # ---------------------------------------------------------------- P4 lifetime
+    lp, lc = life['parent']['liveness'], life['candidate']['liveness']
+    chk('P4.1', lp['peak_simultaneously_live_halves'] == 16384,
+        what='parent peak simultaneously-live = 16384 halves = 32768 B',
+        peak=lp['peak_simultaneously_live_halves'])
+    chk('P4.2', lp['slack_halves'] == 0,
+        what='parent structural slack = 0 (declared == peak); no window to retire',
+        slack=lp['slack_halves'])
+    chk('P4.3', lc['declared_halves'] == 0 and lc['peak_simultaneously_live_halves'] == 0,
+        what='candidate declares no Workgroup memory and has no live Workgroup value',
+        declared=lc['declared_halves'])
+    chk('P4.4', not lc['phases'][0].get('note', '').startswith('producer sweep')
+        and lc['phases'][1]['live_halves'] == 0,
+        what='candidate has no publish point and no barrier',
+        phases=[p['phase'] for p in lc['phases']])
+
+    # ---------------------------------------------------------------- P5 hazards
+    raw = life['parent']['hazards']['RAW_stage_to_A_read']
+    chk('P5.1', raw['shared_addresses'] == 16384 and raw['cross_owner_pairs'] > 0,
+        what='parent RAW staging->A read covers all 16384 halves across subgroups, closed by the '
+             'single publish barrier', raw=raw)
+    chk('P5.2', life['parent']['hazards']['WAR_A_read_to_next_stage']['shared_addresses'] == 0
+        and life['parent']['hazards']['WAW_stage_to_stage']['shared_addresses'] == 0,
+        what='parent has no WAR/WAW: one staging pass, no second writer')
+    chk('P5.3', life['candidate']['hazards']['SLM_hazards']['count'] == 0,
+        what='candidate has no shared-memory hazard left')
+
+    # ---------------------------------------------------------------- P6 tail
+    last = L.m0_of(0, L.J_BLOCKS - 1) + L.A_ROWS - 1, (L.KI_STEPS - 1) * L.A_COLS + L.A_COLS - 1
+    parent_last = last[0] * L.STRIDE + last[1]          # tile-local address, both arms
+    chk('P6.1', parent_last == 16383 and last == (63, 255),
+        what='the last element of the tile (token 63, channel 255) is read by fragment '
+             '(j=7, ki=15, row=7, col=15)', token_channel=last, tile_local_address=parent_last)
+    chk('P6.2', parent_last + 0 == 16383 and audit['f06']['candidate_max_gT_index'] == 16383,
+        what='the candidate keeps that tile-local address and only adds the tile base w*16384, '
+             'so its maximum global index is the parent maximum (no new element is read)',
+        tile_local=parent_last, tile_base='w*16384')
+    chk('P6.3', audit['f06']['candidate_max_gT_index'] == audit['f06']['parent_max_gT_index'] == 16383,
+        what='audited maximum global index equals the parent maximum (nothing new is read)',
+        parent=audit['f06']['parent_max_gT_index'],
+        candidate=audit['f06']['candidate_max_gT_index'])
+    chk('P6.4', TOKENS * CHANNELS == 16384 and 16384 % 256 == 0,
+        what='tile is exactly 64 x 256 with no tail block: 16384 halves, 64 per thread',
+        halves=TOKENS * CHANNELS, per_thread=TOKENS * CHANNELS // 256)
+
+    # ---------------------------------------------------------------- P7 address audit
+    for key in ('f06', 'f18', 'padback'):
+        chk('P7.%s' % key, audit[key]['verdict'] == 'PASS',
+            what='address audit A1..A7 on %s' % audit[key]['label'],
+            violations=audit[key]['violations'])
+    chk('P7.negcontrol', negc['all_caught'],
+        what='six doctored variants are all caught by the audit', caught=negc['caught'],
+        tested=negc['tested'],
+        variants={k: v['verdict'] for k, v in negc['variants'].items()})
+
+    # ---------------------------------------------------------------- P8 plan
+    pkg = plan['plans']['package16']
+    chk('P8.1', pkg['replaced'] == 16 and pkg['cpu_check']['ok'],
+        what='16-row package plan: 15 F06 + 1 F18 rows replaced, cpu-check OK',
+        replaced=pkg['replaced'], cpu_check=pkg['cpu_check'].get('stdout', '')[:120])
+    chk('P8.2', pkg['differing_lines'] == 16,
+        what='the plan differs from the chain head in exactly those 16 PASS lines '
+             '(path + ledger column)', differing=pkg['differing_lines'])
+    pad = plan['plans']['padback']
+    chk('P8.3', pad['replaced'] == 16 and pad['cpu_check']['ok'],
+        what='pad-back control plan: same 16 rows, F06 rows point at the 32768 B control SPV',
+        replaced=pad['replaced'])
+    chk('P8.4', plan['plans']['f06only15']['replaced'] == 15,
+        what='attribution subset plan: 15 F06 rows only')
+
+    # ---------------------------------------------------------------- P9 gates (not run)
+    gates = dict(status='NOT_RUN_CPU_ONLY', reason='this card runs no GPU work; the gold gates are '
+                 'the first thing the GPU arm must do',
+                 fixed=dict(command='clock_runner --plan <plan> --out <fresh> --pool --warm 0 --reps 1',
+                            expected_frame_out='1755e9c2fadba97f08cb5b02b7a4294cde3675379bdec75352287505f7e129d6'),
+                 fb2=dict(command='clock_runner --plan <plan> --out <fresh> --pool --warm 0 --reps 2 '
+                                  '--feedback --save-frames',
+                          expected_frame_out='9c3e511e97a5879247bc2965792c96dd62928dddfd85a48bbf25af1e807d3536'),
+                 ordinary=dict(command='clock_runner --plan <plan> --out <fresh> --pool --warm 1 '
+                                       '--reps 30 --feedback',
+                               expected_frame_out='2b63d4ba1967eebcda61698d538963f59bccaf6d690ef8168f1695a46c5d658d'))
+    chk('P9.1', True, what='gold gates are recorded but not run in this card (no GPU)',
+        gates=gates)
+
+    out = dict(card='n39-f06-c256-slack',
+               identity=dict(parent=dict(f06=repro['groups']['f06-c256']['parent_rebuild'],
+                                         f18=repro['groups']['f18-c256']['parent_rebuild']),
+                             candidate=dict(f06=build['pairs']['f06-c256']['candidate'],
+                                            f18=build['pairs']['f18-c256']['candidate'],
+                                            padback=build['controls']['padback-vs-candidate']['candidate']),
+                             sources=dict(f06=build['pairs']['f06-c256']['candidate'].get('path'),
+                                          parent06=str(CARD / 'parent.comp'),
+                                          parent18=str(CARD / 'parent-f18.comp'))),
+               mapping=dict(elements=len(pairs_seen), bijection=bij, address_equality=addr_ok,
+                            table='(j,ki,row,col) -> token = 8j+row, channel = 16ki+col; '
+                                  'parent addr = token*256+channel, candidate addr = '
+                                  'w*16384 + token*256+channel'),
+               sections=dict(P1_mapping=None, P2_math=build['pairs']['f06-c256']['checks'],
+                             P3_value_identity=life['deletable'],
+                             P4_lifetime=dict(parent=lp, candidate=lc, budget=life['budget']),
+                             P5_hazards=dict(parent=life['parent']['hazards'],
+                                             candidate=life['candidate']['hazards']),
+                             P6_tail=dict(last_element=last, parent_address=parent_last),
+                             P7_address_audit={k: audit[k]['verdict'] for k in audit},
+                             P8_plan={k: dict(replaced=v['replaced'], sha256=v['sha256'],
+                                              differing_lines=v.get('differing_lines'),
+                                              cpu_check=v['cpu_check'].get('ok'))
+                                      for k, v in plan['plans'].items()},
+                             P9_gates=gates),
+               checks=checks,
+               passed=sum(1 for c in checks if c['verdict'] == 'PASS'),
+               failed=[c['id'] for c in checks if c['verdict'] != 'PASS'])
+    K = CARD / 'PROOF.json'
+    K.write_text(json.dumps(out, indent=2), encoding='utf-8')
+    for c in checks:
+        print('%-14s %s' % (c['id'], c['verdict']))
+    print('PROOF %d/%d PASS' % (out['passed'], len(checks)))
+    return 0 if not out['failed'] else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

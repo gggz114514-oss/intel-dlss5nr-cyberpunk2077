@@ -1,0 +1,107 @@
+"""build_receipt.py -- recompile both modules and stamp build-receipt.json.
+
+Re-runs the frozen toolchain so the recorded return codes and validator lines
+come from this run, not from memory.  Idempotent: the same sources must give
+the same bytes.
+"""
+import datetime
+import hashlib
+import json
+import subprocess
+from pathlib import Path
+
+ROOT = Path(r"@NR_WORKSPACE@")
+CARD = ROOT / "work/dsh-xmx-handoff-validation-20261024/candidates/c2-c32-regk32"
+BUILD = ROOT / "work/dsh-xmx-handoff-validation-20261024/build/c2-c32-regk32"
+GLSLANG = ROOT / "src/project/tools/glslang-16.5.0/bin/glslang.exe"
+VALIDATE = ROOT / ("candidates/amd-map-20261015/s4-final-output-fusion-fix/"
+                   "production-repair/spv_validate_cpu.exe")
+DEPLOYED_PARENT_SPV = (ROOT / "candidates/int8-coverage-v2-20261020/C/"
+                       "c32-i8-debug-eact-v1/spv/c32_body1_i8.spv")
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def build(name, srcdir, entry, out):
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    argv = [str(GLSLANG), "-V", "--target-env", "vulkan1.3", "-I" + str(srcdir),
+            "-o", str(out), str(entry)]
+    t0 = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    p = subprocess.run(argv, cwd=str(srcdir), capture_output=True, text=True)
+    rc = p.returncode
+    sh = sha(out) if out.exists() else None
+    v = subprocess.run([str(VALIDATE), str(out)], capture_output=True, text=True) \
+        if out.exists() else None
+    vline = (v.stdout or "").strip().splitlines()[0] if v and v.stdout else None
+    return {
+        "label": name,
+        "argv": argv,
+        "cwd": str(srcdir),
+        "entries_sha256": {"source_file": sha(entry),
+                           "include_c32_i8_common.glsl": sha(srcdir / "c32_i8_common.glsl"),
+                           "include_register_handoff.glsl": sha(srcdir / "register_handoff.glsl"),
+                           **({"include_c2_i8_regk32.glsl": sha(srcdir / "c2_i8_regk32.glsl")}
+                              if (srcdir / "c2_i8_regk32.glsl").exists() else {})},
+        "started_utc": t0,
+        "rc": rc,
+        "stdout": (p.stdout or "").strip().splitlines(),
+        "stderr": (p.stderr or "").strip().splitlines(),
+        "spv": str(out),
+        "spv_sha256": sh,
+        "spv_bytes": out.stat().st_size if out.exists() else None,
+        "validate_argv": [str(VALIDATE), str(out)] if out.exists() else None,
+        "validate_rc": v.returncode if v else None,
+        "validate_line": vline,
+        "validate_result_zero": bool(vline and "result=0" in vline),
+    }
+
+
+def main():
+    BUILD.mkdir(parents=True, exist_ok=True)
+    parent = build("parent-repro",
+                   CARD / "source/parent", CARD / "source/parent/c32_body1_i8.comp",
+                   BUILD / "parent_repro.spv")
+    parent["must_equal_deployed_parent"] = {
+        "path": str(DEPLOYED_PARENT_SPV), "sha256": sha(DEPLOYED_PARENT_SPV),
+        "identical": parent["spv_sha256"] == sha(DEPLOYED_PARENT_SPV)}
+    cand = build("candidate",
+                 CARD / "source/candidate", CARD / "source/candidate/c32_body1_i8.comp",
+                 BUILD / "c2_body1_regk32.spv")
+    shipped = CARD / "spv/c2_body1_regk32.spv"
+    cand["shipped_copy"] = {"path": str(shipped), "sha256": sha(shipped),
+                            "identical": cand["spv_sha256"] == sha(shipped)}
+
+    rec = {
+        "label": "C2-BUILD-RECEIPT",
+        "card": "c2-c32-regk32",
+        "generated_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "toolchain": {"glslang": str(GLSLANG), "glslang_sha256": sha(GLSLANG),
+                      "validator": str(VALIDATE), "validator_sha256": sha(VALIDATE)},
+        "qualification": ["OFFLINE_COMPILE", "SPV_IDENTITY"],
+        "builds": [parent, cand],
+        "source_tree": {str(p.relative_to(CARD)).replace("\\", "/"): sha(p)
+                        for p in sorted(CARD.rglob("*"))
+                        if p.is_file() and p.suffix in (".comp", ".glsl", ".py", ".json",
+                                                        ".md", ".txt")},
+    }
+    ok = (parent["rc"] == 0 and parent["validate_result_zero"]
+          and parent["must_equal_deployed_parent"]["identical"]
+          and cand["rc"] == 0 and cand["validate_result_zero"]
+          and cand["shipped_copy"]["identical"])
+    rec["verdict"] = "OK" if ok else "FAIL"
+    out = CARD / "build-receipt.json"
+    out.write_text(json.dumps(rec, indent=1) + "\n", encoding="utf-8")
+    print("parent rc=%d validate=%s identical_to_deployed=%s"
+          % (parent["rc"], parent["validate_result_zero"],
+             parent["must_equal_deployed_parent"]["identical"]))
+    print("cand   rc=%d validate=%s identical_to_shipped=%s"
+          % (cand["rc"], cand["validate_result_zero"], cand["shipped_copy"]["identical"]))
+    print("verdict", rec["verdict"], "->", out)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

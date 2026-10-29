@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Regenerate the R03 int8 weight pack and scale table from frozen inputs.
+
+Inputs (read-only):
+  candidates/amd-map-20261015/s2-ds-complete/weights/ioport_4_ioport_pack.fp16.bin
+      region [16768, 18816) = the DS_WB block, canonical [N=64][K=32] fp16
+  run/int8-coverage-v2-20261020/v2-g3-diag-002/dump_skip4.bin
+      the accepted-frame skip4 buffer of the arm whose PASS 4 is c32_body1_i8.spv
+  run/int8-coverage-v2-20261020/v2-g1chain-l2diag-001/dump_block4_out.bin
+      only used to validate the parent emulation (layout proof), not for the steps
+
+Scheme (identical to the validated C32/C64 INT8 template):
+  weight  : per-output-channel absmax/127, RNE, symmetric clamp [-127,127], zero point 0
+  code    : roundEven(real * inv), inv = 127/absmax
+  pooling : the parent's own four-point half tree, then one code point
+  output  : f32(int32 acc) * f32(sV*sW[n]), one half narrow  (half arm)
+            and  roundEven(that f32 * 127/amax_out[n]) clamped  (qx arm)
+
+usage: python gen_r03_packs.py [--check]
+  --check  recompute and compare with the shipped files instead of writing
+"""
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+R = Path("@NR_WORKSPACE@")
+CARD = R / "work/dsh-xmx-handoff-validation-20261024/candidates/r03-ioport4"
+PACKS = CARD / "packs"
+
+IW, IH, OW, OH = 672, 384, 336, 192
+K, N = 32, 64
+WB_HALF = 16768
+FP16_PACK = R / "candidates/amd-map-20261015/s2-ds-complete/weights/ioport_4_ioport_pack.fp16.bin"
+CAP_IN = R / "run/int8-coverage-v2-20261020/v2-g3-diag-002/dump_skip4.bin"
+CAP_PAIR_OUT = R / "run/int8-coverage-v2-20261020/v2-g1chain-l2diag-001/dump_block4_out.bin"
+CAP_PAIR_IN = R / "run/int8-coverage-v2-20261020/v2-g1chain-l2diag-001/dump_skip4.bin"
+NPIX = OW * OH
+
+
+def f32(x):
+    return np.float32(x)
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def io_at(px, py, c, W, H, C, layout):
+    px = np.asarray(px, np.int64); py = np.asarray(py, np.int64); c = np.asarray(c, np.int64)
+    if layout == 2:
+        return (py * W + px) * C + c
+    t = (py * W + px) if layout == 1 else (((py // 4) * (W // 4) + px // 4) * 16 + 4 * (py % 4) + px % 4)
+    return ((t // 16) * (C // 16) + c // 16) * 256 + (t % 16) * 16 + c % 16
+
+
+def ds_pixel(u):
+    u = np.asarray(u, np.int64)
+    tile, slot = u // 16, u % 16
+    tiles_x = OW // 4
+    return 4 * (tile % tiles_x) + slot % 4, 4 * (tile // tiles_x) + slot // 4
+
+
+def pooled(flat16):
+    u = np.arange(NPIX, dtype=np.int64)
+    px, py = ds_pixel(u)
+    c = np.arange(K, dtype=np.int64)
+    idx = np.empty((NPIX, K, 4), np.int64)
+    for j, (dx, dy) in enumerate(((0, 0), (1, 0), (0, 1), (1, 1))):
+        idx[:, :, j] = io_at((2 * px + dx)[:, None], (2 * py + dy)[:, None], c[None, :], IW, IH, K, 0)
+    g = flat16[idx]
+    return (((g[:, :, 0] + g[:, :, 1]) + (g[:, :, 2] + g[:, :, 3])) * np.float16(0.25)).astype(np.float16)
+
+
+def w_canonical():
+    w = np.fromfile(FP16_PACK, dtype="<f2")[WB_HALF:WB_HALF + N * K]
+    out = np.empty((N, K), np.float16)
+    for n in range(N):
+        for k in range(K):
+            out[n, k] = w[((n // 16) * (K // 16) + k // 16) * 256 + (n % 16) * 16 + (k % 16)]
+    return out
+
+
+def build():
+    w = w_canonical()
+    amax = np.abs(w.astype(np.float32)).max(axis=1)
+    sW = np.array([f32(f32(a) / f32(127.0)) if a > 0 else f32(1.0) for a in amax], np.float32)
+    qw = np.empty((N, K), np.int32)
+    for n in range(N):
+        qw[n] = np.clip(np.rint(w[n].astype(np.float32) / sW[n]), -127.0, 127.0).astype(np.int32)
+    i8 = np.zeros(N * K, np.uint8)
+    for n in range(N):
+        for k in range(K):
+            off = (n // 16) * (K // 32) * 512 + (k // 32) * 512 + (n % 16) * 32 + (k % 32)
+            i8[off] = np.uint8(qw[n, k] & 0xFF)
+
+    v = pooled(np.fromfile(CAP_IN, dtype="<f2"))
+    vmax = float(np.abs(v.astype(np.float32)).max())
+    sV = f32(f32(vmax) / f32(127.0))
+    invV = f32(f32(127.0) / f32(vmax))
+    qv = np.clip(np.rint(v.astype(np.float32) * invV), -127.0, 127.0).astype(np.int32)
+    esc = np.array([f32(f32(sV) * sW[n]) for n in range(N)], np.float32)
+    acc = qv.astype(np.int64) @ qw.T.astype(np.int64)
+    parent_out = (v.astype(np.float32) @ w.T.astype(np.float32)).astype(np.float16)
+    oamax = np.abs(parent_out.astype(np.float32)).max(axis=0)
+    inv_out = np.array([f32(f32(127.0) / f32(a)) if a > 0 else f32(1.0) for a in oamax], np.float32)
+
+    sc = np.zeros(1280, np.float32)
+    sc[0] = sV; sc[1] = invV; sc[2] = f32(sW.max()); sc[3] = f32(f32(1.0) / f32(sW.max()))
+    sc[4:68] = esc
+    sc[68:132] = inv_out
+    for blk in range(4):
+        for c in range(16):
+            n = blk * 16 + c
+            for r in range(8):
+                sc[256 + blk * 128 + c * 8 + r] = esc[n]
+                sc[768 + blk * 128 + c * 8 + r] = inv_out[n]
+    meta = {
+        "scheme": "static_symmetric_int8_per_output_channel",
+        "source_pack": FP16_PACK.as_posix(), "source_pack_sha256": sha(FP16_PACK),
+        "wb_element_range": [WB_HALF, WB_HALF + N * K],
+        "capture": CAP_IN.as_posix(), "capture_sha256": sha(CAP_IN),
+        "sV": float(sV), "invV": float(invV),
+        "weight_amax_max": float(amax.max()), "sW_max": float(sW.max()),
+        "output_amax_max": float(oamax.max()), "inv_out_max": float(inv_out.max()),
+        "pooled_absmax": vmax,
+        "int32_acc_max_abs": int(np.abs(acc).max()),
+        "quantization_saturation": int(np.count_nonzero(np.abs(qv) >= 127)),
+        "code_points": int(qv.size),
+    }
+    return i8.tobytes(), sc.tobytes(), meta
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check", action="store_true")
+    a = ap.parse_args()
+    wb, sb, meta = build()
+    wpath = PACKS / "r03_ioport4_ds_w.i8.bin"
+    spath = PACKS / "r03_ioport4_ds_scales.f32.bin"
+    if a.check:
+        ok = (wpath.read_bytes() == wb) and (spath.read_bytes() == sb)
+        print(json.dumps({"check": "IDENTICAL" if ok else "MISMATCH",
+                          "weights_sha256": hashlib.sha256(wb).hexdigest(),
+                          "shipped_weights_sha256": sha(wpath),
+                          "scales_sha256": hashlib.sha256(sb).hexdigest(),
+                          "shipped_scales_sha256": sha(spath)}, indent=1))
+        return 0 if ok else 1
+    wpath.write_bytes(wb)
+    spath.write_bytes(sb)
+    meta["weights_sha256"] = hashlib.sha256(wb).hexdigest()
+    meta["scales_sha256"] = hashlib.sha256(sb).hexdigest()
+    meta["weights_bytes"] = len(wb)
+    meta["scales_bytes"] = len(sb)
+    (PACKS / "PACK-META.json").write_text(json.dumps(meta, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps(meta, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

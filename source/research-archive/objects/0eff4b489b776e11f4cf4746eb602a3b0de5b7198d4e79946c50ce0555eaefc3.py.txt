@@ -1,0 +1,474 @@
+"""n34-f19-latency, task A: exposure audit of the 24 expensive ops (16 math.rsqt +
+8 math.inv) of F19 / ordinal 226 (`f2c32_block66_fused`).
+
+CPU only, read-only on the campaign evidence.  Method is the n32-f05-aluwr one
+(`cards/n32-f05-aluwr/_a_audit.py` + `_regions.py`) applied to a single kernel,
+plus the n19-f19-root uniform-guard liveness rule (`cards/n19-f19-root/isa_breakdown.py`).
+
+Definitions
+-----------
+live    every instruction that executes when pc.p1.w == 0 (debug off).  The
+        debug echo blocks are entered only through a predicated uniform jmpi
+        (`(W&fN) jmpi Ljoin` with a *forward* target); everything strictly
+        between such a jmpi and its label is guarded (n19's rule, 56 spans,
+        1203 instr = 22.3 %).
+edge    use -> reaching definition of the same (file,register,dword)
+sink    live send that writes memory / signals a barrier / ends the thread
+chain   union of live backward slices from the sinks; side = live minus chain
+depth   longest dependent path (one edge = 1); weighted depth uses the n32 LAT table
+N(p)    per-lane independent chains = greedy def-use path cover of the chain set,
+        then the maximum number of disjoint chain extents [min_addr,max_addr]
+        that cover the same program point (n32's metric, "每 lane 独立链数")
+island  one math.rsqt / math.inv: distance to its first live consumer, counted in
+        live instructions strictly between the two (n32's first_use_gap), plus
+        the raw index gap (every instruction), plus the opcode census of the gap.
+
+Output: A-AUDIT.json + a console summary.  No GPU, no plan, no deployment.
+"""
+import hashlib
+import json
+import re
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+HERE = Path(__file__).parent
+CAMP = HERE.parent.parent
+sys.path.insert(0, str(CAMP))
+import ISA  # noqa: E402
+
+ASM = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+           'fullnet-continuous-20261027/queue/n29-f01-alu-chain/native/captures/'
+           'native-native-base/ISA/'
+           'CS_asmf3942341c6275bc3_simd32_0000000000000026_37_orig.asm')
+OUT = HERE / 'A-AUDIT.json'
+
+# n32 LAT / weight tables (L24), unchanged so the two cards are comparable
+TYPE_W = {"ud": 1, "d": 1, "w": 1, "uw": 1, "f": 1, "v": 1, "hf": 0.5,
+          "q": 2, "uq": 2, "df": 2, "b": 0.25, "ub": 0.25, "bf": 0.25}
+LAT = {"mul": 5, "mad": 5, "macl": 5, "mach": 5, "fma": 5, "dpas.8x8": 8,
+       "math.inv": 12, "math.rsqt": 12, "math.sqrt": 12, "math.log": 12,
+       "math.exp": 12, "rndd": 6, "rndu": 6, "rnde": 6, "rndz": 6, "frc": 6,
+       "add": 4, "add3": 4, "sub": 4, "shl": 4, "shr": 4, "asr": 4, "and": 4,
+       "or": 4, "xor": 4, "not": 4, "bfn.0xFE": 4, "bfn.0xF8": 4, "cmp": 4,
+       "sel": 4, "min": 4, "max": 4, "mov": 1, "movf": 1, "sync.nop": 0,
+       "send.ugm": 20, "send.slm": 20, "send.gtwy": 20, "illegal": 0,
+       "jmpi": 0, "goto": 0, "join": 1, "sync.allrd": 4, "sync.allwr": 4,
+       "sync.bar": 4}
+WEIGHT = {"math.inv": 30, "math.rsqt": 30, "math.log": 30, "math.exp": 30,
+          "dpas.8x8": 6, "send.slm": 12, "send.ugm": 12, "sync.bar": 12,
+          "sync.allwr": 8, "sync.allrd": 6, "fma": 2, "mad": 2, "mul": 2,
+          "add": 1, "add3": 1, "sel": 1, "cmp": 1, "mov": 0.3, "and": 1,
+          "or": 1, "shl": 1, "shr": 1, "bfn.0xFE": 1, "bfn.0xF8": 1,
+          "sync.nop": 0.1, "illegal": 1}
+DPAS_DST, DPAS_AB = 4, 8
+LL_OPS = ('math.rsqt', 'math.inv')
+
+
+# ------------------------------------------------------------------ parsing
+def load():
+    rows = []
+    label = None
+    for raw in ASM.read_text(encoding='utf-8-sig', errors='replace').splitlines():
+        m = re.match(r'^(L\d+):', raw)
+        if m:
+            label = m.group(1)
+            continue
+        mm = ISA.LINE.match(raw)
+        if not mm:
+            continue
+        rows.append(dict(raw=raw.rstrip(), label=label, addr=int(mm.group('addr'), 16)))
+        label = None
+    parsed = ISA.parse(ASM)
+    assert len(parsed) == len(rows), (len(parsed), len(rows))
+    for k, (r, p) in enumerate(zip(rows, parsed)):
+        p['idx'] = k
+        r['i'] = p
+    return rows
+
+
+def guarded_spans(rows):
+    """n19's rule: predicated uniform jmpi with a forward target guards its body."""
+    starts = {r['label']: k for k, r in enumerate(rows) if r['label'] is not None}
+    spans = []
+    for k, r in enumerate(rows):
+        i = r['i']
+        if i['op'] != 'jmpi':
+            continue
+        if not re.search(r'f\d+\.\d+', i['flags'] or ''):
+            continue
+        tg = re.findall(r'\bL(\d+)\b', r['raw'])
+        if len(tg) != 1:
+            continue
+        t = 'L' + tg[0]
+        if t not in starts:
+            continue
+        tgt = starts[t]
+        if tgt > k + 1:
+            spans.append((k + 1, tgt - 1))
+    guarded = set()
+    for a, b in spans:
+        guarded.update(range(a, b + 1))
+    return guarded, spans
+
+
+# ------------------------------------------------------- operand classification
+def exec_size(flags, default=32):
+    m = re.search(r'\((\d+)\|M\d+\)', flags or '')
+    return int(m.group(1)) if m else default
+
+
+def grf_suffix(op):
+    m = re.search(r'^[ra]?\d+(?:\.\d+)?:(\d+)$', op.strip())
+    return int(m.group(1)) if m else None
+
+
+def reg_base(op):
+    o = op.lstrip('-').replace('(abs)', '').strip()
+    m = re.match(r'^r(\d+)\.(\d+)', o)
+    if m:
+        return ('r', int(m.group(1)), int(m.group(2)))
+    m = re.match(r'^r(\d+)(?![\d.])', o)
+    if m:
+        return ('r', int(m.group(1)), 0)
+    m = re.match(r'^acc(\d+)\.(\d+)', o)
+    if m:
+        return ('acc', int(m.group(1)), int(m.group(2)))
+    return None
+
+
+def span_of(op, flags, opcode):
+    g = grf_suffix(op)
+    if g is not None:
+        return max(1, g * 8)
+    if opcode.startswith('dpas'):
+        return DPAS_DST
+    return 1
+
+
+def classify(ins):
+    """(writes, reads) as [(file, number, dword, count)] - n32's rules."""
+    op, ops, com = ins['op'], ins['ops'], ins['comment'] or ''
+    w, r = [], []
+    if op.startswith('send'):
+        store = 'store.' in com or 'fence' in com
+        if store:
+            if len(ops) > 2:
+                b = reg_base(ops[2])
+                if b:
+                    r.append((b[0], b[1], b[2], span_of(ops[2], ins['flags'], op)))
+        else:
+            if ops:
+                b = reg_base(ops[0])
+                if b:
+                    g = grf_suffix(ops[0])
+                    n = max(1, g * 8) if g is not None else span_of(ops[0], ins['flags'], op)
+                    w.append((b[0], b[1], b[2], n))
+        for o in ops:
+            if re.match(r'^a0\.\d+', o):
+                r.append(('a0', 0, 0, 2))
+        return w, r
+    if op.startswith('dpas'):
+        if ops:
+            b = reg_base(ops[0])
+            if b:
+                w.append((b[0], b[1], b[2], 4))
+        for o in ops[2:4]:
+            b = reg_base(o)
+            if b:
+                r.append((b[0], b[1], b[2], DPAS_AB))
+        return w, r
+    if not ops:
+        return w, r
+    if ops[0] != 'null':
+        b = reg_base(ops[0])
+        if b:
+            w.append((b[0], b[1], b[2], span_of(ops[0], ins['flags'], op)))
+        else:
+            m = re.match(r'^f(\d)\.(\d)<', ops[0])
+            if m:
+                w.append(('f', int(m.group(1)), int(m.group(2)), 1))
+    for o in ops[1:]:
+        if o.startswith('null'):
+            continue
+        b = reg_base(o)
+        if b:
+            r.append(('a0', 0, 0, 2) if b[0] == 'a0' else (b[0], b[1], b[2],
+                                                           span_of(o, ins['flags'], op)))
+    for o in ops:
+        if re.match(r'^a0\.\d+', o) and not any(x[0] == 'a0' for x in r):
+            r.append(('a0', 0, 0, 2))
+    return w, r
+
+
+def is_send(ins):
+    return ins['op'].startswith('send')
+
+
+# ---------------------------------------------------------------- analysis
+def main():
+    rows = load()
+    guarded, spans = guarded_spans(rows)
+    ins = [r['i'] for r in rows]
+    for k, it in enumerate(ins):
+        it['live'] = k not in guarded
+        it['w'], it['r'] = classify(it)
+
+    live = [i for i in ins if i['live']]
+    live_idx = {i['idx'] for i in live}
+    by_dw = defaultdict(list)
+    for it in ins:
+        for f, no, dw, n in it['w']:
+            for d in range(dw, dw + n):
+                by_dw[(f, no, d)].append(it['idx'])
+    for v in by_dw.values():
+        v.sort()
+
+    def reaching(key, idx):
+        lst = by_dw.get(key)
+        hit = None
+        for widx in lst or ():
+            if widx < idx:
+                hit = widx
+            else:
+                break
+        return hit
+
+    def par(k):
+        out = set()
+        for f, no, dw, cnt in ins[k]['r']:
+            for d in range(dw, dw + cnt):
+                p = reaching((f, no, d), k)
+                if p is not None and p in live_idx:
+                    out.add(p)
+        return out
+
+    # ---- live graph
+    parents = {k: par(k) for k in live_idx}
+    children = defaultdict(set)
+    for k, ps in parents.items():
+        for p in ps:
+            children[p].add(k)
+
+    sinks = [k for k in live_idx if is_send(ins[k]) and
+             ('store.' in (ins[k]['comment'] or '') or
+              'signal barrier' in (ins[k]['comment'] or '') or
+              'end of thread' in (ins[k]['comment'] or ''))]
+    chain, stack = set(), list(sinks)
+    while stack:
+        k = stack.pop()
+        if k in chain or k not in live_idx:
+            continue
+        chain.add(k)
+        stack.extend(parents[k])
+    side = live_idx - chain
+
+    memo, wmemo = {}, {}
+    for k in sorted(live_idx, key=lambda q: ins[q]['addr']):
+        ps = parents[k]
+        memo[k] = 1 + max((memo.get(p, 0) for p in ps), default=0)
+        wmemo[k] = LAT.get(ins[k]['op'], 4) + max((wmemo.get(p, 0) for p in ps), default=0)
+
+    order = sorted(chain, key=lambda q: ins[q]['addr'])
+    owner, chains = {}, []
+    for k in order:
+        cand = None
+        for p in sorted(parents[k], reverse=True):
+            if p in owner:
+                cand = owner[p]
+                break
+        if cand is None:
+            cand = len(chains)
+            chains.append(dict(id=cand, lo=ins[k]['addr'], hi=ins[k]['addr'], n=0,
+                               ops=Counter()))
+        owner[k] = cand
+        c = chains[cand]
+        c['n'] += 1
+        c['lo'] = min(c['lo'], ins[k]['addr'])
+        c['hi'] = max(c['hi'], ins[k]['addr'])
+        c['ops'][ins[k]['op']] += 1
+    ev = []
+    for c in chains:
+        ev.append((c['lo'], 1))
+        ev.append((c['hi'] + 1, -1))
+    ev.sort()
+    cur = best = 0
+    best_at = 0
+    for a, d in ev:
+        cur += d
+        if cur > best:
+            best, best_at = cur, a
+
+    def tab(s):
+        return Counter(ins[k]['op'] for k in s)
+
+    # ---- L24 price over live ALU ops (sends / syncs are SENDWR / barrier,
+    #      not ALUWR; measured ALUWR of this PASS = 0.082632749 ms,
+    #      evidence/STALL-BY-FAMILY.json F19)
+    ALUWR_PASS = 0.08263274964452873
+    alu = [k for k in live_idx if not is_send(ins[k]) and not ins[k]['op'].startswith('sync')]
+    price = defaultdict(lambda: [0, 0.0, 0, 0.0])
+    for k in alu:
+        op = ins[k]['op']
+        w = WEIGHT.get(op, 1.0)
+        price[op][0] += 1
+        price[op][1] += w
+        if k in chain:
+            price[op][2] += 1
+            price[op][3] += w
+    w_alu = sum(v[1] for v in price.values())
+    w_chain = sum(v[3] for v in price.values())
+    price_rows = []
+    for op, (n, w, cn, cw) in sorted(price.items(), key=lambda kv: -kv[1][1]):
+        price_rows.append(dict(
+            op=op, live=n, weight=round(w, 2), chain_n=cn, chain_weight=round(cw, 2),
+            ms_all=round(ALUWR_PASS * w / w_alu, 6),
+            ms_one=round(ALUWR_PASS * WEIGHT.get(op, 1.0) / w_alu, 6),
+            on_chain_pct=round(100.0 * cw / w, 1) if w else 0.0))
+
+    # ---- long-latency islands
+    ll = sorted([k for k in live_idx if ins[k]['op'] in LL_OPS],
+                key=lambda q: ins[q]['addr'])
+    live_sorted = sorted(live_idx)
+    islands = []
+    for k in ll:
+        users = sorted(j for j in children.get(k, ()) if j in live_idx)
+        nxt = users[0] if users else None
+        gap_live = [j for j in live_sorted if k < j < (nxt if nxt is not None else k + 1)]
+        gap_raw = list(range(k + 1, nxt)) if nxt is not None else []
+        # who else is independent inside the gap (candidate hoist material):
+        # a gap instruction is independent of `k` when it is not a transitive
+        # descendant of k.  Compute descendants lazily via children walk.
+        indep = set()
+        seen = set()
+        st = [k]
+        while st:
+            x = st.pop()
+            for ch in children.get(x, ()):
+                if ch not in seen:
+                    seen.add(ch)
+                    st.append(ch)
+        indep = [j for j in gap_live if j not in seen]
+        islands.append(dict(
+            idx=k, addr=hex(ins[k]['addr']), op=ins[k]['op'],
+            dst=['%s%d.%d' % (ins[k]['w'][0][0], ins[k]['w'][0][1], ins[k]['w'][0][2])]
+            if ins[k]['w'] else [],
+            first_use_idx=nxt,
+            first_use=hex(ins[nxt]['addr']) if nxt is not None else None,
+            first_use_op=ins[nxt]['op'] if nxt is not None else None,
+            gap_live=len(gap_live), gap_raw=len(gap_raw),
+            gap_ops=dict(Counter(ins[j]['op'] for j in gap_live).most_common()),
+            gap_independent_live=len(indep),
+            gap_independent_ops=dict(Counter(ins[j]['op'] for j in indep).most_common()),
+            in_chain=k in chain,
+        ))
+
+    def hist_bucket(d):
+        if d <= 2:
+            return '<=2'
+        if d <= 10:
+            return '3-10'
+        if d <= 19:
+            return '11-19'
+        return '>=20'
+
+    for it in islands:
+        it['bucket'] = hist_bucket(it['gap_live'])
+
+    # ---- segmentation of the norm / softmax regions (for the reorder design)
+    def region_span(lo_op_idx, hi_op_idx):
+        return [j for j in live_sorted if lo_op_idx <= j <= hi_op_idx]
+
+    # ---- straight-line windows between consecutive long-latency producers
+    windows = []
+    for a, b in zip(ll, ll[1:]):
+        seg = [j for j in live_sorted if a < j < b]
+        windows.append(dict(a=hex(ins[a]['addr']), b=hex(ins[b]['addr']), n=len(seg),
+                            ops=dict(Counter(ins[j]['op'] for j in seg).most_common(6))))
+
+    out = dict(
+        kernel='CS_asmf3942341c6275bc3_simd32_0000000000000026_37_orig.asm',
+        kernel_hash='f3942341c6275bc3', ordinal=226, pass_name='f2c32_block66_fused',
+        isa=str(ASM), isa_sha256=hashlib.sha256(ASM.read_bytes()).hexdigest(),
+        isa_bytes=ASM.stat().st_size,
+        spv_sha256='7f1ad115cb46d710336c536dd8009b8f3af93206202f96cb8b262617b42796a2',
+        source_sha256='d82eb7dd23e4a38a9547a4f23f82cf1e990a57036c148953d115560bdbe299e3',
+        instructions=len(ins), live=len(live), guarded=len(guarded),
+        guarded_pct=round(100.0 * len(guarded) / len(ins), 2),
+        guarded_spans=[[hex(rows[a]['addr']), hex(rows[b]['addr']), b - a + 1]
+                       for a, b in spans],
+        sinks=len(sinks), chain=len(chain), side=len(side),
+        chain_pct=round(100.0 * len(chain) / len(live), 2),
+        depth=int(max(memo[k] for k in chain)) if chain else 0,
+        depth_weighted=int(max(wmemo[k] for k in chain)) if chain else 0,
+        chains=len(chains), max_concurrent=best, max_concurrent_at=hex(best_at),
+        op_live=dict(tab(live_idx).most_common()),
+        op_chain=dict(tab(chain).most_common()),
+        op_side=dict(tab(side).most_common()),
+        invariants=dict(dpas=tab(live_idx).get('dpas.8x8', 0),
+                        send_ugm=sum(1 for i in ins if i['op'] == 'send.ugm'),
+                        send_slm=sum(1 for i in ins if i['op'] == 'send.slm'),
+                        send_gtwy=sum(1 for i in ins if i['op'] == 'send.gtwy'),
+                        eot=sum(1 for i in ins if 'end of thread' in (i['comment'] or '')),
+                        scratch=sum(1 for i in ins if 'scratch' in i['raw']),
+                        max_r=max(int(m.group(1)) for r in rows
+                                  for m in re.finditer(r'\br(\d+)\.', r['raw'])),
+                        distinct_r=len({int(m.group(1)) for r in rows
+                                        for m in re.finditer(r'\br(\d+)\.', r['raw'])})),
+        islands=islands,
+        island_hist=dict(Counter(i['bucket'] for i in islands)),
+        windows=windows,
+        wdeepest=[[wmemo[k], hex(ins[k]['addr']), ins[k]['op']]
+                  for k in sorted(chain, key=lambda q: -wmemo[q])[:10]],
+        aluwr_pass=ALUWR_PASS,
+        w_alu=round(w_alu, 2), w_chain=round(w_chain, 2),
+        price=price_rows,
+        expensive=dict(
+            ops=dict(math_rsqt=tab(live_idx).get('math.rsqt', 0),
+                     math_inv=tab(live_idx).get('math.inv', 0)),
+            ll_weight_units=round(30.0 * (tab(live_idx).get('math.rsqt', 0) +
+                                          tab(live_idx).get('math.inv', 0)), 1),
+            ll_ms_all=round(ALUWR_PASS * 30.0 * (tab(live_idx).get('math.rsqt', 0) +
+                                                 tab(live_idx).get('math.inv', 0)) / w_alu, 6),
+            exposed_ms_upper=round(ALUWR_PASS * 30.0 * sum(
+                1 for i in islands if i['bucket'] == '<=2') / w_alu, 6),
+            note='ALUWR is measured; the ms split is L24 weighting, not a counter'),
+    )
+    OUT.write_text(json.dumps(out, indent=1), encoding='utf-8')
+
+    # ------------------------------------------------------------ console
+    print('kernel %s (ord 226)  instr %d  live %d  guarded %d (%.1f%%)'
+          % (out['kernel_hash'], out['instructions'], out['live'],
+             out['guarded'], out['guarded_pct']))
+    print('sinks %d  chain %d (%.1f%%)  side %d  depth %d / weighted %d  chains %d'
+          % (out['sinks'], out['chain'], out['chain_pct'], out['side'],
+             out['depth'], out['depth_weighted'], out['chains']))
+    print('per-lane independent chains: %d @ %s' % (out['max_concurrent'], out['max_concurrent_at']))
+    print('invariants:', out['invariants'])
+    print('op_live:', out['op_live'])
+    print()
+    print('%-6s %-10s %-8s %5s %5s %5s %-5s  gap_ops' %
+          ('idx', 'addr', 'op', 'gapL', 'gapR', 'indep', 'bucket'))
+    for it in islands:
+        print('%-6d %-10s %-8s %5d %5d %5d %-5s  %s'
+              % (it['idx'], it['addr'], it['op'][5:], it['gap_live'], it['gap_raw'],
+                 it['gap_independent_live'], it['bucket'], it['gap_ops']))
+    print()
+    print('island histogram:', out['island_hist'])
+    print('W(ALU)=%.1f W(chain)=%.1f ALUWR/PASS=%.6f ms  expensive=%s'
+          % (out['w_alu'], out['w_chain'], out['aluwr_pass'], out['expensive']))
+    print('price (L24 weight over live ALU):')
+    for p in out['price'][:12]:
+        print('  %-10s live %5d w %7.1f chainW %7.1f  ms_all %.6f  ms_one %.6f'
+              % (p['op'], p['live'], p['weight'], p['chain_weight'],
+                 p['ms_all'], p['ms_one']))
+    print()
+    print()
+    print('windows between consecutive long-latency ops:')
+    for w in windows:
+        print('  %s..%s n=%-3d %s' % (w['a'], w['b'], w['n'], w['ops']))
+    print('\nwrote', OUT)
+
+
+if __name__ == '__main__':
+    main()

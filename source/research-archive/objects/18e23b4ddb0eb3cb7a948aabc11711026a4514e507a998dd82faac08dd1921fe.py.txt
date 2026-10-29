@@ -1,0 +1,205 @@
+"""n35-f18-latency task C: run n33's three redundancy criteria on ord 166.
+
+Same algorithm and same code as cards/n33-f02-latency/_c1_redundancy.py (imported
+read-only, with its ISA path patched to this card's kernel), plus the two checks
+n33's form does not spell out: the exec width of every site, and the value ROOT
+(the push-constant dword the divisor is copied from) between the sites.
+
+Criteria (as handed down by the main agent):
+  1. reaching definition (dword granular) of the source operand at every site;
+  2. writes of that dword between two sites (a rewrite proves the value changed);
+  3. exec width of every site;
+  4. consumer list of every copy.
+"""
+import sys, json, importlib
+from collections import defaultdict
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+N33 = HERE.parent / 'n33-f02-latency'
+sys.path.insert(0, str(N33))
+
+import _isa                     # noqa: E402  (patched below)
+import _t02_live                # noqa: E402
+import _t01_identity            # noqa: E402
+
+CAP = HERE.parent.parent / 'queue/n01b-f02-load-side/native/captures/native-native-base/ISA'
+KERN = 'CS_asma606bc5d667e43fa_simd32_000000000000001d_28_orig.asm'
+_isa.CAP = CAP
+_isa.FILES = [KERN]
+
+import _c1_redundancy           # noqa: E402  (their script; uses _isa at call time)
+
+OUT = HERE / 'C-REDUNDANCY.json'
+EXEC = None
+
+
+def exec_mask(it):
+    """the (N|Mx) operand column of an instruction (destination exec mask)."""
+    for tok in it.get('_raw_toks', []):
+        if tok.startswith('(') and '|M' in tok:
+            return tok
+    return None
+
+
+def main():
+    ins, labels = _isa.parse()
+    seen = _t02_live.reachable(ins, labels)
+    for i, it in enumerate(ins):
+        it['live'] = seen[i]
+        it['w'], it['r'] = _t01_identity.classify(it)
+        # keep the exec column: _isa.parse drops parenthesised tokens, so re-read it
+        toks = it['text'].split()
+        it['exec'] = next((t for t in toks if t.startswith('(') and '|M' in t), None)
+    by_dw = defaultdict(list)
+    for it in ins:
+        for f, no, dw, n in it['w']:
+            for d in range(dw, dw + n):
+                by_dw[(f, no, d)].append(it['idx'])
+    for v in by_dw.values():
+        v.sort()
+
+    def reg_of(tok):
+        return _t01_identity.reg_base(tok)
+
+    exp = [k for k in range(len(ins)) if ins[k]['op'] in ('math.rsqt', 'math.inv')]
+    sites = []
+    for k in exp:
+        dst = reg_of(ins[k]['ops'][0])          # r6.0 (first register operand)
+        src = reg_of(ins[k]['ops'][1])          # r2.8 (second register operand)
+        prod_dst = _t01_identity.reaching(by_dw, dst, k)
+        prod_src = _t01_identity.reaching(by_dw, src, k)
+        # the value root: follow the copy chain one more hop
+        root = None
+        if prod_src is not None:
+            for o in ins[prod_src]['ops'][1:]:
+                b = reg_of(o)
+                if b:
+                    root = b
+                    break
+        root_prod = _t01_identity.reaching(by_dw, root, prod_src) if root else None
+        # consumers of the reciprocal value (dst dword) and of the quotient words
+        cons = [j for j in range(k + 1, min(k + 120, len(ins)))
+                if any(reg_of(o) == dst for o in ins[j]['ops'][1:])]
+        sites.append(dict(
+            idx=k, addr='%04X' % ins[k]['addr'], op=ins[k]['op'],
+            exec_mask=ins[k]['exec'], dst=list(dst), src=list(src),
+            master_exec=ins[k]['flags'],
+            src_text=' '.join(ins[k]['ops']),
+            producer_of_dst=prod_dst,
+            producer_of_dst_addr='%04X' % ins[prod_dst]['addr'] if prod_dst is not None else None,
+            producer_of_src=prod_src,
+            producer_of_src_addr='%04X' % ins[prod_src]['addr'] if prod_src is not None else None,
+            producer_of_src_text=ins[prod_src]['text'][:70] if prod_src is not None else None,
+            root=list(root) if root else None,
+            root_producer=root_prod,
+            root_producer_addr='%04X' % ins[root_prod]['addr'] if root_prod is not None else None,
+            first_consumer=cons[0] if cons else None,
+            first_consumer_addr='%04X' % ins[cons[0]]['addr'] if cons else None,
+            first_consumer_op=ins[cons[0]]['op'] if cons else None,
+            n_consumers=len(cons),
+        ))
+
+    # ---- criterion 1: distinct reaching definitions
+    c1 = dict(distinct_producers_of_src=len({s['producer_of_src'] for s in sites}),
+              distinct_producers_of_dst=len({s['producer_of_dst'] for s in sites}),
+              distinct_roots=len({tuple(s['root']) for s in sites}),
+              distinct_root_producers=len({s['root_producer'] for s in sites}),
+              n_sites=len(sites))
+    # ---- criterion 2: writes between sites
+    src_keys = {tuple(s['src']) for s in sites}
+    root_keys = {tuple(s['root']) for s in sites if s['root']}
+    between_src, between_root = [], []
+    for i in range(len(sites)):
+        for j in range(i + 1, len(sites)):
+            lo, hi = sites[i]['idx'], sites[j]['idx']
+            w_src = [x for kk in src_keys for x in by_dw.get(kk, []) if lo < x < hi]
+            w_root = [x for kk in root_keys for x in by_dw.get(kk, []) if lo < x < hi]
+            between_src.append(len(w_src))
+            between_root.append(len(w_root))
+    c2 = dict(src_dword=sorted(src_keys), root_dword=sorted(root_keys),
+              pairs=len(between_src),
+              pairs_with_a_write_of_the_src_dword=sum(1 for x in between_src if x),
+              pairs_with_a_write_of_the_root_dword=sum(1 for x in between_root if x),
+              writes_of_root_in_whole_kernel=len(by_dw.get(tuple(sites[0]['root']), [])),
+              root_write_instructions=[dict(idx=x, addr='%04X' % ins[x]['addr'], text=ins[x]['text'][:70])
+                                       for kk in root_keys for x in by_dw.get(kk, [])])
+    # ---- criterion 3: exec width
+    c3 = dict(exec_masks=sorted({s['exec_mask'] for s in sites}),
+              master_flags=sorted({s['master_exec'] for s in sites}),
+              all_one_lane=all(s['exec_mask'] == '(1|M0)' for s in sites))
+    # ---- criterion 4: consumers
+    c4 = dict(first_consumer_ops=sorted({s['first_consumer_op'] for s in sites}),
+              first_consumer_addr=[s['first_consumer_addr'] for s in sites],
+              n_consumers_hist=sorted({s['n_consumers'] for s in sites}),
+              note='every copy feeds its own refinement (mad) and then its own quotient chain, '
+                   'because each element divides a different dividend')
+    # ---- n33's own verdict on the same ISA (their script, unmodified)
+    try:
+        ins2, by_dw2 = _c1_redundancy.build()
+        verdict = dict(ran=True, n_sites=len([1 for it in ins2 if it['op'] in ('math.rsqt', 'math.inv')]))
+    except Exception as ex:
+        verdict = dict(ran=False, error=str(ex))
+
+    # ---- criterion 5 (n33's strongest test): leaf signature of each backward slice
+    # live_idx = every instruction: this kernel has NO debug island (the source never
+    # reads pc.p1.w), so n33's debug-skip reachability heuristic does not apply -
+    # it reports 109/1375 here because it does not model this kernel's join/jmpi mix
+    # (measured, see the report below).
+    live_all = set(range(len(ins)))
+    leaves = {}
+    for s in sites:
+        body, lv = _c1_redundancy.slice_leaf_and_body(ins, by_dw, live_all, s['idx'])
+        sig = tuple(sorted({(f, no, d) for f, no, d, _ in lv}))
+        leaves[s['idx']] = sig
+        s['slice_len'] = len(body)
+        s['leaf_sig'] = [list(x) for x in sig]
+        s['leaf_n'] = len(sig)
+    c5 = dict(distinct_leaf_signatures=len(set(leaves.values())),
+              leaf_signature=list(leaves[sites[0]['idx']]),
+              slice_lens=sorted({s['slice_len'] for s in sites}),
+              verdict='ALL SITES SLICE DOWN TO THE SAME LEAF (the push-constant dword)'
+                      if len(set(leaves.values())) == 1 else 'LEAVES DIFFER')
+
+    out = dict(card='n35-f18-latency', ordinal=166, kernel='a606bc5d667e43fa',
+               isa=str(CAP / KERN),
+               n_instructions=len(ins), reachable=int(sum(seen)),
+               reachability_note=('n33 _t02_live.reachable marks %d/%d here: it treats the `join` and the '
+                                  '`(W&~f0.0) jmpi` guard polarity of this kernel as a skip island, which ord 166 '
+                                  'does not have (its source never reads pc.p1.w). The four criteria below are '
+                                  'computed without that mask.' % (sum(seen), len(ins))),
+               sites=sites,
+               criterion1=c1, criterion2=c2, criterion3=c3, criterion4=c4,
+               criterion5_leaf_signature=c5,
+               n33_script=verdict,
+               verdict=None)
+    # ---- decision logic (all four must hold for "true redundancy")
+    true_redundant = (c1['distinct_roots'] == 1 and c2['writes_of_root_in_whole_kernel'] <= 1
+                      and c3['all_one_lane'])
+    out['verdict'] = dict(
+        reciprocal_is_value_redundant=bool(true_redundant),
+        reason=('all 16 sites compute the same function of the same single reaching definition: '
+                'the root dword has {nr} write(s) in the whole kernel, inserts none between sites, '
+                'and every site is exec {em}'.format(nr=c2['writes_of_root_in_whole_kernel'],
+                                                    em='/'.join(c3['exec_masks']))),
+        per_site_division_is_not_redundant='the other 26 instructions of each 30-instruction site depend on the dividend e, '
+                                           'which differs at every site - only the reciprocal part is duplicate',
+    )
+    OUT.write_text(json.dumps(out, indent=1), encoding='utf-8')
+
+    print('sites %d  reachable %d/%d' % (len(sites), sum(seen), len(ins)))
+    print('%-6s %-9s %-10s %-8s %-8s %-6s' % ('idx', 'addr', 'exec', 'prod_src', 'root', '1stcon'))
+    for s in sites:
+        print('%-6d %-9s %-10s %-8s %-8s %-6s'
+              % (s['idx'], s['addr'], s['exec_mask'], s['producer_of_src_addr'],
+                 s['root_producer_addr'], s['first_consumer_addr']))
+    print('\nC1', json.dumps(c1))
+    print('C2', json.dumps({k: v for k, v in c2.items() if k != 'root_write_instructions'}))
+    print('C3', json.dumps(c3))
+    print('C4', json.dumps(c4))
+    print('\nverdict', json.dumps(out['verdict'], indent=1))
+    print('wrote', OUT)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,205 @@
+// c3x_pre_c256_i8mma.comp -- R17 card candidate: the C256 block48 "pre"
+// dispatch (projection -> up-sample/skip-gain/blend -> qX) with the STATIC
+// PROJECTION WEIGHT MATRIX converted from FP16 K16 to INT8 K32, and the
+// activation quantised on the fly from the FP16 producer.
+//
+// Parent (unchanged elsewhere): candidates/codex-sol-int8-long-008-20261019/
+// c256-int8-v1/source/c3x_pre_c256_int8_qx.comp, deployed as
+// .../spv/c3x_pre_c256_int8_qx.spv sha256
+// e0a86136b60c9fce28d3219996d3ce96ac2c7570329708940042fc3f343d6d4b
+// (plan-g3-production.txt PASS 129 "c3x_pre_c256"; reproduced byte-identically
+// from the parent source by this card, see spv/parent_repro.spv).
+//
+// WHAT CHANGES (enumerated; everything else is the parent's statement)
+//   1. the two FP16 K16 cooperative MMAs  -> two INT8 K32 cooperative MMAs
+//      (int32 accumulator; the K16 FP16 loop is paired into K32 per GUIDE
+//      line 101 / B580 M8N16K32);
+//   2. the FP16 A gather tile (shared float16_t, 4096 half) -> an INT8 A tile
+//      (shared int8_t, 4096 B) plus a per-row absmax reduction in shared
+//      float[256] and 8 published per-row inverse steps in shared float[8];
+//   3. the projection weights come from the NEW binding 13 offline pack
+//      (r07-style INT8 tile + per-output-channel scale) instead of the FP16
+//      half matrix at binding 8.  Binding 8 stays bound for the two gain
+//      records only (pw[p5.z + c] and the untaken main-gain record).
+//   4. the epilogue dequantises INT32 -> f32 with ONE product of the row scale
+//      and the per-channel weight scale, then narrows to half exactly where the
+//      parent narrowed its f32 accumulator.
+//
+// WHAT DOES NOT CHANGE (numeric boundaries kept byte for byte)
+//   * the skip path is read as half from binding 9 and multiplied by the half
+//     skip gain -- NOT replaced by any dequantised approximation;
+//   * `precise f16vec2 skip_v = skip_input * skip_gain;` and
+//     `precise f16vec2 value = main_scaled + skip_v;` are the parent's lines;
+//   * the canonical half blend store (binding 10) and its addressing;
+//   * the qX production: one code per element, `roundEven(float(value) * invX)`
+//     clamped to +-127, written in the same blend loop with the same index.  It
+//     is produced AFTER the blend, never from the pre-blend projection.
+//   * the push-constant ABI: all 32 words keep their meaning; no new push word.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256) in;
+#include "c256_common.glsl"
+
+layout(set = 0, binding = 8) buffer Nr3Pack { float16_t pw[]; };
+layout(set = 0, binding = 9) buffer Nr3Skip { float16_t sk[]; };
+layout(set = 0, binding = 10) buffer Nr3BlendOut { float16_t blout[]; };
+layout(set = 0, binding = 11) buffer Nr3ProjIn { float16_t x47[]; };
+// block48 native-INT8 buffer (int8 view; weights/scales first, qX tail)
+layout(set = 0, binding = 12) buffer C3XQ {
+    int8_t d_pad0[372736];      //  0        weights + per-channel factors (unchanged)
+    float  d_sc[32];            //  372,736  scal[]: [0]=127/absmaxX, [1]=127/absmaxA, [2]=127/absmaxM
+    int8_t d_pad1[3968];        //  372,864  rs[256] and padding
+    int8_t d_qx[];              //  376,832  canonical 32-channel-group qX
+};
+// NEW binding 13: this projection's offline INT8 weight pack (this card).
+//   0        int8  W[N=256][K=512] in the r07 tile convention
+//            idx = (n/16)*(K/32)*512 + (k/32)*512 + (n%16)*32 + (k%32)
+//   131,072  f32   sW[n] = amax_k|W[n][k]| / 127   (0 for an all-zero channel)
+layout(set = 0, binding = 13) buffer Nr3PreW8 {
+    int8_t wq[131072];
+    float  wsc[256];
+};
+
+shared float16_t nr3_gbuf[4096u];   // parent: A gather tile, reused as the
+                                    // projection/blend tile.  Here the output
+                                    // tile only (8 rows x 256 channels = 2048).
+shared int8_t nr3_a[4096u];         // candidate: quantised A tile [8][K], K=512
+shared float nr3_abs[256u];         // candidate: per-row |A| partials [row*32+lane]
+shared float nr3_srow[8u];          // candidate: per-row inverse step 127/absmax
+
+#define MAT_H coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define I8_A  coopmat<int8_t, gl_ScopeSubgroup, 8, 32, gl_MatrixUseA>
+#define I8_B  coopmat<int8_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB>
+#define I32_C coopmat<int, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define F32_C coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+
+// ioport_common.glsl io_at, layout 0 (spatial 4x4 tiles, 16 channels).
+uint nr3_io_at0(uint px, uint py, uint c, uint W, uint C) {
+    uint t = ((py / 4u) * (W / 4u) + px / 4u) * 16u + 4u * (py % 4u) + px % 4u;
+    return ((t / 16u) * (C / 16u) + c / 16u) * 256u + (t % 16u) * 16u + c % 16u;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = tid / 32u;
+    const uint wx = (pc.p1.z != 0) ? uint(pc.p2.x) : gl_WorkGroupID.x;
+    const uint wy = (pc.p1.z != 0) ? uint(pc.p2.y) : gl_WorkGroupID.y;
+    // z is the 32-token half only; the head index is gone because this dispatch
+    // always produces all 256 projection channels.
+    const uint half3 = gl_WorkGroupID.z % 2u;
+    const uint t0 = half3 * 32u;
+    const float invX = d_sc[0];
+    const uint K3 = uint(pc.p5.x);          // 512
+
+    // ---- gather 8 rows x K as INT8 codes + per-row absmax, then the same
+    //      projection, now M8 x N16 x K32 with an int32 accumulator ----
+    {
+        // one subgroup per projected row: 32 lanes x 16 contiguous channels
+        const uint r3 = tid / 32u;              // 0..7  projected row
+        const uint kb = (tid % 32u) * 16u;      // 0..496 channel base (16-aligned)
+        const int px3 = 4 * int(wx) + int(r3 % 4u);
+        const int py3 = 4 * int(wy) + 2 * int(half3) + int(r3 / 4u);
+        const uint sb3 = nr3_io_at0(uint(px3), uint(py3), kb,
+                                    uint(pc.p6.z), K3);
+        float16_t hv[16];
+        float amax = 0.0;
+        for (uint i = 0u; i < 16u; ++i) {
+            hv[i] = x47[sb3 + i];
+            amax = max(amax, abs(float(hv[i])));
+        }
+        nr3_abs[r3 * 32u + (tid % 32u)] = amax;
+        barrier();
+        // all 32 partials of this row are contiguous; every lane recomputes the
+        // row max so that no second barrier is needed before the code store.
+        float m3 = 0.0;
+        for (uint j = 0u; j < 32u; ++j) m3 = max(m3, nr3_abs[r3 * 32u + j]);
+        const float inv3 = (m3 > 0.0) ? 127.0 / m3 : 0.0;
+        for (uint i = 0u; i < 16u; ++i) {
+            precise float c3v = float(hv[i]) * inv3;
+            nr3_a[r3 * K3 + kb + i] =
+                int8_t(clamp(roundEven(c3v), -127.0, 127.0));
+        }
+        // R17-FIX-A: the codes are roundEven(x * 127/amax), so the epilogue must
+        // multiply by amax/127 = 1/inv3, not by inv3 (that was a ~127x over-scale).
+        if ((tid % 32u) == 0u) nr3_srow[r3] = (inv3 > 0.0) ? (1.0 / inv3) : 0.0;
+        barrier();
+
+        const uint n0 = sg * 32u;
+        const uint kst = K3 / 32u;              // 16 K32 steps
+        const uint n16s = kst * 512u;           // n16 tile stride, = 8192 at K=512
+        const uint w16 = (n0 / 16u) * n16s;
+        I32_C acc0 = I32_C(0), acc1 = I32_C(0);
+        for (uint ki = 0u; ki < kst; ++ki) {
+            I8_A a; I8_B b0, b1;
+            coopMatLoad(a, nr3_a, ki * 32u, K3, LROW);
+            coopMatLoad(b0, wq, w16 + ki * 512u, 32u, LCOL);
+            coopMatLoad(b1, wq, w16 + n16s + ki * 512u, 32u, LCOL);
+            acc0 = coopMatMulAdd(a, b0, acc0);
+            acc1 = coopMatMulAdd(a, b1, acc1);
+        }
+        // Kept from the parent: still a real retirement point for any reader of
+        // nr3_gbuf, although the A fragment no longer aliases that tile.
+        barrier();
+        F32_C rowF;
+        coopMatLoad(rowF, nr3_srow, 0u, 0u, LCOL);      // per-row, stride 0
+        {
+            F32_C colF;
+            coopMatLoad(colF, wsc, n0, 0u, LROW);       // per-column, stride 0
+            F32_C f = F32_C(acc0);
+            for (uint c = 0u; c < f.length(); ++c)
+                f[c] = f[c] * (rowF[c] * colF[c]);
+            MAT_H h = MAT_H(f);
+            coopMatStore(h, nr3_gbuf, sg * 32u, 256u, LROW);
+        }
+        {
+            F32_C colF;
+            coopMatLoad(colF, wsc, n0 + 16u, 0u, LROW);
+            F32_C f = F32_C(acc1);
+            for (uint c = 0u; c < f.length(); ++c)
+                f[c] = f[c] * (rowF[c] * colF[c]);
+            MAT_H h = MAT_H(f);
+            coopMatStore(h, nr3_gbuf, sg * 32u + 16u, 256u, LROW);
+        }
+    }
+    barrier();
+
+    // ---- blend: one value per token/channel, published once (canonical only) ----
+    // Unchanged from the parent, including the two `precise` statements.
+    for (uint i = tid; i < 4096u; i += 256u) {
+        const uint t3 = i / 128u, cp3 = i % 128u, c3 = cp3 * 2u;
+        const uint tg3 = t0 + t3, q3 = tg3 >> 4u, s3 = tg3 & 15u;
+        const int tx3 = 2 * int(wx) + pc.p0.z + int(q3 & 1u);
+        const int ty3 = 2 * int(wy) + pc.p0.w + int(q3 >> 1u);
+        const bool oob3 = (tx3 < 0 || ty3 < 0 || tx3 >= int(pc.p0.x) || ty3 >= int(pc.p0.y));
+        if (oob3) continue;   // canonical copy holds no out-of-bounds tiles
+        const uint px3 = uint(4 * tx3 + int(s3 % 4u)), py3 = uint(4 * ty3 + int(s3 / 4u));
+        const uint cx3 = px3 >> 1u, cy3 = py3 >> 1u;
+        const uint ps3 = (cy3 - (4u * wy + 2u * half3)) * 4u + (cx3 - 4u * wx);
+        precise f16vec2 main_scaled = f16vec2(nr3_gbuf[ps3 * 256u + c3], nr3_gbuf[ps3 * 256u + c3 + 1u]);
+        if (pc.p5.w == 1u) main_scaled = main_scaled * f16vec2(pw[pc.p5.z + pc.p5.y + c3], pw[pc.p5.z + pc.p5.y + c3 + 1u]);
+        const f16vec2 skip_gain = f16vec2(pw[pc.p5.z + c3], pw[pc.p5.z + c3 + 1u]);
+        const uint sa3 = pc.p4.z + nr3_io_at0(px3, py3, c3, pc.p6.x, pc.p5.y);
+        const f16vec2 skip_input = f16vec2(sk[sa3], sk[sa3 + 1u]);
+        precise f16vec2 skip_v = skip_input * skip_gain;
+        precise f16vec2 value = main_scaled + skip_v;
+        // The canonical store is the parent's statement, byte for byte: the
+        // contract seed reader's input is unchanged.
+        const uint ba3 = nr3_io_at0(px3, py3, c3, pc.p0.x * 4u, pc.p5.y);
+        blout[ba3] = value.x; blout[ba3 + 1u] = value.y;
+        // qX for block48's expand: same value, one code per element, written
+        // once in this loop. c3 is even, so c3 and c3+1 never cross a 32-group.
+        const uint tile3 = uint(ty3) * uint(pc.p0.x) + uint(tx3);
+        const uint qb3 = ((tile3 * 8u + (c3 / 32u)) * 16u + s3) * 32u + (c3 % 32u);
+        precise float q0 = float(value.x) * invX;
+        precise float q1 = float(value.y) * invX;
+        d_qx[qb3] = int8_t(clamp(roundEven(q0), -127.0, 127.0));
+        d_qx[qb3 + 1u] = int8_t(clamp(roundEven(q1), -127.0, 127.0));
+    }
+}

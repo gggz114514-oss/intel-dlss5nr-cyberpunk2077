@@ -1,0 +1,118 @@
+"""n36-f05-arena-shrink: build both delivery tiers on the current chain head.
+
+  tier 1  plan-c256.txt   16 PASS rows, the C256 group only   (zero extra UGM messages)
+  tier 2  plan.txt        36 PASS rows, all three groups      (C64/C128 pay +50% UGM)
+
+Both replace the SPV path and sync the ledger `shared` field (plan token 5) 24576 -> 16384
+for exactly the rows they replace.  CPU only; clock_runner --cpu-check is the gate.
+"""
+import hashlib
+import json
+import pathlib
+import subprocess
+import sys
+
+W = pathlib.Path('@NR_WORKSPACE@')
+A = W / 'work/codex-astra-fp16-int8-audit-20261024'
+C = A / 'fullnet-continuous-20261027'
+CARD = C / 'cards/n36-f05-arena-shrink'
+RUNNER = A / 'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe'
+D = A / 'fullnet-mechanism-transfer-20261026'
+
+GROUPS = {
+    'c64': dict(parent=D / 'f05-kv-consumer-layout/family/c64/candidate.spv',
+                candidate=CARD / 'candidate-c64.spv', expect=8),
+    'c128': dict(parent=D / 'f05-kv-consumer-layout/family/c128/candidate.spv',
+                 candidate=CARD / 'candidate-c128.spv', expect=12),
+    'c256': dict(parent=C / 'cards/n05a-f05-c256-mreuse/candidate.spv',
+                 candidate=CARD / 'candidate-c256.spv', expect=16),
+}
+SHARED_OLD, SHARED_NEW = '24576', '16384'
+TIERS = {
+    'tier1-c256': dict(groups=['c256'], path=CARD / 'plan-c256.txt', expect=16),
+    'tier2-36': dict(groups=['c64', 'c128', 'c256'], path=CARD / 'plan.txt', expect=36),
+}
+
+
+def sha(p):
+    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+
+
+def current_best():
+    d = json.loads((C / 'CURRENT.json').read_text(encoding='utf-8-sig'))
+    return pathlib.Path(d['best_plan']['path']), d['best_plan']['sha256']
+
+
+def cpu_check(plan):
+    r = subprocess.run([str(RUNNER), '--plan', str(plan), '--cpu-check'],
+                       capture_output=True, text=True, encoding='utf-8', errors='replace')
+    return r.returncode, (r.stdout or '') + (r.stderr or '')
+
+
+def build_tier(base_text, group_names):
+    by_path = {GROUPS[g]['parent'].as_posix(): g for g in group_names}
+    per_group = {g: 0 for g in group_names}
+    out, replaced_lines = [], []
+    for line in base_text.splitlines():
+        if not line.startswith('PASS '):
+            out.append(line)
+            continue
+        toks = line.split()
+        g = by_path.get(toks[3].strip('"'))
+        if not g:
+            out.append(line)
+            continue
+        toks[3] = '"%s"' % GROUPS[g]['candidate'].as_posix()
+        assert toks[5] == SHARED_OLD, (g, 'ledger shared field', toks[5])
+        toks[5] = SHARED_NEW
+        per_group[g] += 1
+        replaced_lines.append(line)
+        out.append(' '.join(toks))
+    return out, per_group
+
+
+def main():
+    base, base_sha = current_best()
+    text = base.read_text(encoding='utf-8-sig')
+    res = dict(baseline=dict(path=str(base), sha256=base_sha, verified=sha(base) == base_sha),
+               groups={g: dict(parent_spv=str(v['parent']), parent_sha=sha(v['parent']),
+                               candidate_spv=str(v['candidate']),
+                               candidate_sha=sha(v['candidate']), expect=v['expect'])
+                       for g, v in GROUPS.items()},
+               tiers={})
+    for name, spec in TIERS.items():
+        lines, per_group = build_tier(text, spec['groups'])
+        plan = spec['path']
+        plan.write_text('\n'.join(lines) + ('\n' if text.endswith('\n') else ''),
+                        encoding='utf-8')
+        total = sum(per_group.values())
+        assert total == spec['expect'], (name, total, spec['expect'])
+        differing = sum(1 for a, b in zip(text.splitlines(), lines) if a != b)
+        rc, log = cpu_check(plan)
+        res['tiers'][name] = dict(plan=dict(path=str(plan), sha256=sha(plan),
+                                            bytes=plan.stat().st_size),
+                                  groups=list(spec['groups']), per_group=per_group,
+                                  replaced_total=total, differing_lines=differing,
+                                  cpu_check=dict(exit=rc, stdout=log.strip()))
+        print('%-11s rows=%2d differing=%2d sha=%s cpu_check=%d %s'
+              % (name, total, differing, sha(plan)[:16], rc, log.strip()))
+
+    # control arms: the same plans with the ledger field left at 24576 (is it validated?)
+    for name, spec in TIERS.items():
+        lines = TIERS[name]['path'].read_text(encoding='utf-8-sig').splitlines()
+        ctrl = CARD / 'build' / ('plan-%s-shared-unsynced.txt' % name)
+        ctrl.write_text('\n'.join(
+            l.replace(' %s 8 32 ' % SHARED_NEW, ' %s 8 32 ' % SHARED_OLD)
+            if (l.startswith('PASS ') and 'n36-f05-arena-shrink' in l) else l
+            for l in lines) + '\n', encoding='utf-8')
+        rc, log = cpu_check(ctrl)
+        res['tiers'][name]['cpu_check_shared_unsynced'] = dict(plan=str(ctrl), exit=rc,
+                                                              stdout=log.strip())
+    rc, log = cpu_check(base)
+    res['cpu_check_baseline'] = dict(exit=rc, stdout=log.strip())
+    (CARD / 'build/plan.json').write_text(json.dumps(res, indent=2), encoding='utf-8')
+    return 0 if all(v['cpu_check']['exit'] == 0 for v in res['tiers'].values()) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

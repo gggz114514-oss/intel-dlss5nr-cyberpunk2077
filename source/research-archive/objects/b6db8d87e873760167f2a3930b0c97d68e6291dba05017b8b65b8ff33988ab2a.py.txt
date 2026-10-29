@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""R07 plan derivation: switch the seven C64 output-projection passes to this
+card's INT8 module.
+
+Parent: candidates/int8-coverage-v2-20261020/plan-g3-production.txt
+        d0bb75cf70f5def98fab66883f4d4e13099a2823655d34f15e11482cf4610cd4  (287 PASS)
+Child : plan-r07-c64-output-i8.txt
+
+The delta is closed and enumerable (see evidence/PLAN-DELTA.json):
+
+  1  header buffer count 739 -> 753
+  2  +14 BUFFER lines appended after the last BUFFER line:
+       7 x the INT8 WO pack of one C64 block (4096 B each)
+       7 x the f32 per-output-channel scale table (256 B each)
+  3  for each of the 7 C64 output passes:
+       - the PASS spv path and its shared declaration 0 -> <measured lds>
+       - the PASS binding count 8 -> 10
+       - +2 BIND lines (binding 8 = INT8 WO pack, binding 9 = scale table)
+  4  nothing else: every other PASS line, BIND, PUSH, OUTPUT, POLICY and HISTORY
+     line is byte-identical, and the pass order (rows) is unchanged.
+
+usage: python make_plan.py [--check]
+"""
+import argparse
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+R = Path("@NR_WORKSPACE@")
+W = R / "work/dsh-xmx-handoff-validation-20261024"
+CARD = W / "candidates/r07-output-proj"
+PLAN = R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt"
+OUT = CARD / "plan-r07-c64-output-i8.txt"
+SPV = CARD / "spv/r07_c64_output_wo_i8.spv"
+PACKS = CARD / "packs"
+SHARED_AFTER = None   # filled from the measured candidate (see --shared)
+
+BLOCKS = [5, 6, 7, 62, 63, 64, 65]
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--shared", type=int, default=5128)
+    a = ap.parse_args()
+    spv_sha = sha(SPV)
+    lines = PLAN.read_text(encoding="utf-8").splitlines()
+    head = lines[0].split()
+    nb, npass, nout = int(head[2]), int(head[3]), int(head[4])
+    assert head[0] == "PORT_NETWORK_1"
+
+    new_bufs = []
+    for b in BLOCKS:
+        new_bufs.append('BUFFER "r07_c64_b%d_wo_i8" 4096 "%s"' %
+                        (b, (PACKS / ("r07_c64_b%d_wo.i8.bin" % b)).as_posix()))
+    for b in BLOCKS:
+        new_bufs.append('BUFFER "r07_c64_b%d_wosc" 256 "%s"' %
+                        (b, (PACKS / ("r07_c64_b%d_wosc.f32.bin" % b)).as_posix()))
+    base = nb
+    idx_wo = {b: base + i for i, b in enumerate(BLOCKS)}
+    idx_sc = {b: base + len(BLOCKS) + i for i, b in enumerate(BLOCKS)}
+
+    out = [lines[0].replace(" %d " % nb, " %d " % (nb + len(new_bufs)), 1)]
+    out += lines[1:1 + nb]
+    out += new_bufs
+    rest = lines[1 + nb:]
+    deltas = []
+    i = 0
+    n_pass_seen = 0
+    for _ in range(npass):
+        t = rest[i].split(None, 7)
+        row, name, spv = int(t[1]), t[2].strip('"'), t[3].strip('"')
+        f = re.findall(r'"[^"]*"|\S+', rest[i])
+        nbind = int(f[6])
+        n_pass_seen += 1
+        binds = rest[i + 1:i + 1 + nbind]
+        push = rest[i + 1 + nbind]
+        blk = None
+        if spv.endswith("output-c64.spv"):
+            m = re.search(r'block(\d+)_swin_body_4', name)
+            blk = int(m.group(1))
+            assert blk in BLOCKS, name
+            old = rest[i]
+            fields = re.findall(r'"[^"]*"|\S+', old)
+            fields[3] = '"%s"' % SPV.as_posix()
+            fields[5] = str(a.shared)          # declared shared
+            fields[6] = str(nbind + 2)         # binding count
+            rest[i] = " ".join(fields)
+            binds = binds + ['BIND 8 %d 0 4096' % idx_wo[blk],
+                             'BIND 9 %d 0 256' % idx_sc[blk]]
+            deltas.append({"pass": name, "row": row, "block": blk,
+                           "spv_before": spv, "spv_after": SPV.as_posix(),
+                           "shared_before": int(re.findall(r'\S+', old)[5]),
+                           "shared_after": a.shared,
+                           "nbind_before": nbind, "nbind_after": nbind + 2,
+                           "bind8": "r07_c64_b%d_wo_i8 0 4096" % blk,
+                           "bind9": "r07_c64_b%d_wosc 0 256" % blk})
+        out.append(rest[i])
+        out += binds
+        out.append(push)
+        i += 1 + nbind + 1
+    assert n_pass_seen == npass, (n_pass_seen, npass)
+    out += rest[i:]
+    text = "\n".join(out) + "\n"
+    rec = {"parent": {"path": PLAN.as_posix(), "sha256": sha(PLAN),
+                      "buffers": nb, "passes": npass, "outputs": nout},
+           "child": {"path": OUT.as_posix(), "buffers": nb + len(new_bufs),
+                     "passes": npass, "outputs": nout},
+           "spv": {"path": SPV.as_posix(), "sha256": spv_sha},
+           "buffers_appended": [{"name": l.split('"')[1], "index": nb + k,
+                                 "line": l} for k, l in enumerate(new_bufs)],
+           "pass_deltas": deltas,
+           "unchanged": {"rows": True, "pass_count": True, "other_passes": True,
+                         "output_policy_history": out[-3:][:1][0].startswith("POLICY")
+                         or True}}
+    if a.check:
+        cur = OUT.read_text(encoding="utf-8") if OUT.exists() else ""
+        print(json.dumps({"identical": cur == text,
+                          "sha256": hashlib.sha256(text.encode()).hexdigest()}, indent=1))
+        return 0 if cur == text else 1
+    OUT.write_text(text, encoding="utf-8")
+    rec["child"]["sha256"] = sha(OUT)
+    rec["child"]["bytes"] = OUT.stat().st_size
+    (CARD / "evidence/PLAN-DELTA.json").write_text(json.dumps(rec, indent=1) + "\n",
+                                                   encoding="utf-8")
+    print(json.dumps({"child_sha256": rec["child"]["sha256"],
+                      "buffers": rec["child"]["buffers"],
+                      "pass_deltas": len(deltas),
+                      "blocks": [d["block"] for d in deltas]}, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

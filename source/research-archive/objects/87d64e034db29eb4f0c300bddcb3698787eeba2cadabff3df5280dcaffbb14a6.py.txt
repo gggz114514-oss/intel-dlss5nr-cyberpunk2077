@@ -1,0 +1,124 @@
+"""Assemble a card's RESULTS.json / RESULTS.txt from measured artifacts.
+
+Usage: python write_results.py <card-id> <notes.json>
+
+notes.json (authored by the auditor):
+{
+  "triage": "...", "layer1_source_intent": "...", "decision": "...",
+  "attribution": {...}, "next": {...}, "shader_group": "..."
+}
+
+Measured parts (native base/candidate counts, gates, timing) are read from the
+card's queue artifacts, never typed by hand.
+"""
+import json, sys
+from collections import Counter
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+import ISA
+
+
+def native_pair(card):
+    root = K.C / 'queue' / card / 'native/captures'
+    a = root / 'native-native-base'
+    b = next((root / n for n in ('native-native-cand', 'native-native-pkg') if (root / n).exists()), None)
+    if b is None or not (a.exists() and b.exists()):
+        return None
+    fa = {p.name: p for p in a.rglob('*.asm')}
+    fb = {p.name: p for p in b.rglob('*.asm')}
+    oa = [n for n in fa if n not in fb]
+    ob = [n for n in fb if n not in fa]
+    if not oa or not ob:
+        # the slim step only keeps the differing kernel(s); fall back to a direct pairing by pipeline id
+        return dict(files=[len(fa), len(fb)], note='no name-level diff (slimmed captures)')
+    if len(oa) != 1 or len(ob) != 1:
+        return dict(changed_files=[oa, ob], note='not a single changed kernel')
+    out = dict(base_file=oa[0], cand_file=ob[0])
+    for tag, p in (('base', fa[oa[0]]), ('cand', fb[ob[0]])):
+        s = ISA.summary(p)
+        ops = Counter(i['op'] for i in ISA.parse(p))
+        out[tag] = dict(instructions=s['instructions'], sends=s['sends'], dpas=s['dpas'],
+                        syncs=s['syncs'], sync_allwr=s['allwr'], max_r=s['max_r'],
+                        first_dpas=s['first_dpas'], mov=ops['mov'], add=ops['add'],
+                        mul=ops['mul'], shl=ops['shl'], sha256=K.sha(p))
+    msgs = {}
+    for tag, p in (('base', fa[oa[0]]), ('cand', fb[ob[0]])):
+        c = Counter()
+        for i in ISA.parse(p):
+            if i['op'].startswith('send') and i['comment']:
+                m = i['comment'].split(';')[-1].strip()
+                c[(i['op'], m)] += 1
+        msgs[tag] = {'%s %s' % k: v for k, v in sorted(c.items())}
+    out['messages'] = msgs
+    out['message_delta'] = {k: [msgs['base'].get(k, 0), msgs['cand'].get(k, 0)]
+                            for k in set(msgs['base']) | set(msgs['cand'])
+                            if msgs['base'].get(k, 0) != msgs['cand'].get(k, 0)}
+    return out
+
+
+def main(card, notes_path):
+    # packages live under queue/<name>/ and have no card dir
+    d = (K.C / 'queue' / card) if card.startswith('pkg-') else (K.C / 'cards' / card)
+    notes = K.read_json(notes_path)
+    res = dict(card=card, family=notes.get('family'), shader_group=notes.get('shader_group'),
+               status=notes.get('status'), triage=notes.get('triage'))
+    b = K.read_json(d / 'BUILD.json') if (d / 'BUILD.json').exists() else {}
+    pkg = K.read_json(d / 'PACKAGE.json') if (d / 'PACKAGE.json').exists() else None
+    res['identity'] = dict(candidate_spv_sha256=K.sha(d / 'candidate.spv') if (d / 'candidate.spv').exists() else None,
+                           candidate_plan_sha256=(pkg['plan']['sha256'] if pkg else
+                                                  (K.sha(d / 'plan.txt') if (d / 'plan.txt').exists() else None)),
+                           handoff_baseline_plan_sha256=K.BASELINE_SHA,
+                           current_chain_head=(K.current_best()[1] if K.current_best()[0] != K.BASELINE else None))
+    if pkg:
+        res['identity']['package_members'] = [m['card'] for m in pkg['members']]
+        res['identity']['package_chain_head'] = pkg.get('chain_head')
+    res['layer1_source_intent'] = notes.get('layer1_source_intent')
+    np_ = native_pair(card)
+    res['layer2_native'] = np_ or 'no native capture'
+    gates = {}
+    for st in ('gates', 'resources', 'ordinary'):
+        s = K.C / 'queue' / card / st / 'STAGE-SUMMARY.json'
+        if s.exists():
+            g = K.read_json(s)
+            gates[st] = dict(status=g.get('status'),
+                             jobs=[dict(id=j['id'], status=j['status'], frame=j['frame'], samples=j['samples'])
+                                   for j in g.get('jobs', [])])
+    res['layer3_numeric_resources'] = gates
+    t = d / 'TIMING.json'
+    if t.exists():
+        tim = K.read_json(t)
+        c = tim['comparisons'][0]
+        res['layer4_timing'] = dict(design=tim['methods'], arms=tim['arms'],
+                                    comparison=dict(name=c['name'], saving_ms=c['saving_ms'],
+                                                    CI95_ms=c['CI95_ms'], status=c['status'],
+                                                    groups=c['groups'],
+                                                    group_means=[[g[tim['arms'][0]], g[tim['arms'][1]]] for g in c['group_means']]),
+                                    all_samples_retained=True)
+    res['attribution'] = notes.get('attribution')
+    res['decision'] = notes.get('decision')
+    res['next'] = notes.get('next')
+    K.write_json(d / 'RESULTS.json', res)
+    # human-readable
+    lines = ['%s — %s' % (card, notes.get('title', ''))]
+    lines += ['状态: %s' % res['status'], '分诊: %s' % res['triage'],
+              'candidate.spv: %s' % res['identity']['candidate_spv_sha256'],
+              'plan: %s' % res['identity']['candidate_plan_sha256'], '']
+    lines += ['一、源码意图', str(res['layer1_source_intent']), '']
+    if np_ and 'base' in np_:
+        lines += ['二、native（同批两臂，唯一变化的内核）',
+                  '  base: %s' % np_['base'], '  cand: %s' % np_['cand'],
+                  '  消息差异: %s' % np_['message_delta'], '']
+    if 'layer4_timing' in res:
+        c = res['layer4_timing']['comparison']
+        lines += ['四、整体计时（同批，6 组交替，30 样本/臂/组，全部保留）',
+                  '  saving(base-cand) = %.6f ms, CI95 [%.6f, %.6f], %s' % (
+                      c['saving_ms'], c['CI95_ms'][0], c['CI95_ms'][1], c['status']),
+                  '  各组均值: %s' % c['group_means'], '']
+    lines += ['决定', str(res['decision']), '', '下一处具体改动', json.dumps(res['next'], ensure_ascii=False)]
+    (d / 'RESULTS.txt').write_text('\n'.join(lines), encoding='utf-8')
+    print('wrote', d / 'RESULTS.json', 'and RESULTS.txt')
+
+
+if __name__ == '__main__':
+    main(sys.argv[1], sys.argv[2])

@@ -1,0 +1,56 @@
+from pathlib import Path
+import json,hashlib,math,statistics
+import numpy as np
+from PIL import Image,ImageDraw
+R=Path(__file__).resolve().parent
+
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+def read(p):
+ x=np.fromfile(p,dtype='<f4')
+ if x.size!=2*720*1280*4:raise ValueError(f'Unexpected output size: {p}: {x.size}')
+ return x.reshape(2,720,1280,4)
+def metrics(a,b):
+ finite=bool(np.isfinite(a).all() and np.isfinite(b).all())
+ if not finite:return {'finite':False,'fp16_nonfinite':int((~np.isfinite(a)).sum()),'int8_nonfinite':int((~np.isfinite(b)).sum())}
+ d=b.astype(np.float64)-a;v=np.abs(d);mse=float(np.mean(d*d))
+ return {'finite':True,'mae':float(v.mean()),'rmse':math.sqrt(mse),'max_abs':float(v.max()),'p99_abs':float(np.quantile(v,.99)),'psnr_unit_db':-10*math.log10(mse) if mse else None,'identical':bool(np.array_equal(a,b)),'fp16_range':[float(a.min()),float(a.max())],'int8_range':[float(b.min()),float(b.max())]}
+def picture(a,b,name):
+ panels=[]
+ for label,x in [('FP16 current',a[0,:,:,:3]),('INT8 v15',b[0,:,:,:3]),('Absolute difference x8',np.abs(b[0,:,:,:3]-a[0,:,:,:3])*8)]:
+  im=Image.fromarray(np.uint8(np.rint(np.clip(np.nan_to_num(x),0,1)*255))).resize((640,360))
+  tile=Image.new('RGB',(640,390),'white');tile.paste(im,(0,30));ImageDraw.Draw(tile).text((10,8),label,fill='black');panels.append(tile)
+ canvas=Image.new('RGB',(1920,390));
+ for i,p in enumerate(panels):canvas.paste(p,(640*i,0))
+ canvas.save(R/(name+'.png'))
+q={'scope':'existing synthetic offline fixture, not a game capture; 8 repeated-input feedback iterations with frame/noise-seed updates, not moving-scene acceptance','layout':'2 x 720 x 1280 x RGBA float32; surface0 application, surface1 history; metrics unclipped peak=1; preview clips [0,1] without display transform','fixed':None,'feedback':[]}
+for kind,count in [('fixed',1),('feedback',8)]:
+ prev=None
+ for i in range(count):
+  pp=[R/'run'/f'{kind}-{arm}'/f'frame_{i}.bin' for arm in ['fp16','int8']]
+  if not all(p.exists() for p in pp):continue
+  a,b=map(read,pp)
+  row={'frame':i,'fp16_sha256':sha(pp[0]),'int8_sha256':sha(pp[1]),'application_RGB':metrics(a[0,:,:,:3],b[0,:,:,:3]),'history_RGB':metrics(a[1,:,:,:3],b[1,:,:,:3]),'history_alpha':metrics(a[1,:,:,3],b[1,:,:,3]),'full':metrics(a,b)}
+  err=b[0,:,:,:3].astype(np.float64)-a[0,:,:,:3]
+  row['error_change_rmse']=None if prev is None else float(np.sqrt(np.mean((err-prev)**2)))
+  prev=err
+  if kind=='fixed':q['fixed']=row
+  else:q['feedback'].append(row)
+  if (kind=='fixed' or i==7) and row['full']['finite']:picture(a,b,f'{kind}-{i}-comparison')
+(R/'QUALITY.json').write_text(json.dumps(q,indent=2),encoding='utf8')
+t={'scope':'same runner; warm1 reps30 feedback; GPU network timestamp includes dispatches/barriers, excludes upload/readback; current implementations only','pairs':[]}
+for i in range(3):
+ pair={'pair':i,'arms':{}}
+ for arm in ['fp16','int8']:
+  p=R/'run'/f'ord-{i}-{arm}'/'port_network_receipt.json'
+  if not p.exists():continue
+  r=json.loads(p.read_text());v=r['gpu_samples_ms']
+  pair['arms'][arm]={'samples_ms':v,'mean_ms':statistics.mean(v),'median_ms':statistics.median(v),'p95_ms':float(np.quantile(v,.95)),'receipt':str(p),'feedback':r.get('feedback'),'nan':r.get('nan'),'inf':r.get('inf')}
+ if len(pair['arms'])==2:pair['saved_ms']=pair['arms']['fp16']['mean_ms']-pair['arms']['int8']['mean_ms']
+ if pair['arms']:t['pairs'].append(pair)
+if len(t['pairs'])==3 and all('saved_ms' in p for p in t['pairs']):
+ t['mean_fp16_ms']=statistics.mean(p['arms']['fp16']['mean_ms'] for p in t['pairs'])
+ t['mean_int8_ms']=statistics.mean(p['arms']['int8']['mean_ms'] for p in t['pairs'])
+ t['mean_saved_ms']=statistics.mean(p['saved_ms'] for p in t['pairs'])
+ t['paired_saved_range_ms']=[min(p['saved_ms'] for p in t['pairs']),max(p['saved_ms'] for p in t['pairs'])]
+(R/'TIMING.json').write_text(json.dumps(t,indent=2),encoding='utf8')
+print(json.dumps({'fixed':q['fixed']['application_RGB'] if q['fixed'] else None,'feedback_frames':len(q['feedback']),'timing_pairs':len(t['pairs']),'timing_mean_ms':{k:v for k,v in t.items() if k.startswith('mean_')}},indent=2))

@@ -1,0 +1,97 @@
+"""Dynamic-cost arithmetic for n11b (CPU only).
+
+Every number in COST-LEDGER.json / ANALYSIS.md Q2-Q4 comes from here.
+
+Geometry (F16 viT projection, VIT_STAGE 4, K=1024):
+  grid = 3 x 64 x 1, local_size_x = 256 -> 8 subgroups of 32 lanes per workgroup
+  mA = wgid.x*128 + sg*8 ; mB = mA + 64 ; n0 = wgid.y*16
+  MC = coopmat<float,Subgroup,8,16,Accumulator>  (8 rows x 16 cols, 4 elements/lane)
+  MA = coopmat<float16,Subgroup,8,16,A>          (8 rows x 16 k-channels)
+  A fragment = 8 rows x 16 half = 256 B ; native cost 8 narrow (exec-1) UGM sends
+  K loop = 64 steps of k0 += 16
+"""
+import json
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+GRID = (3, 64, 1)
+SG_PER_WG = 8
+K_STEPS = 1024 // 16
+FRAG_BYTES = 8 * 16 * 2          # 256 B per A fragment
+SENDS_PER_FRAG = 8               # narrow UGM sends per 256 B fragment (exec-1, 32 B each)
+LIVE = 288                       # pc.p0.x in this plan
+LAST8 = ((LIVE - 1) & ~7) & 0xFFFFFFFF
+CTX_BYTES = LIVE * 1024 * 2      # Context buffer = 589824 B
+
+cols = GRID[1]
+res = dict(geometry=dict(grid=list(GRID), sg_per_wg=SG_PER_WG, k_steps=K_STEPS,
+                         live=LIVE, last8=LAST8, ctx_bytes=CTX_BYTES,
+                         a_fragment_bytes=FRAG_BYTES, sends_per_fragment=SENDS_PER_FRAG),
+           per_column={}, totals={})
+
+# one column = one grid.y slice: 3 workgroups (wgid.x = 0,1,2) x 8 subgroups x 2 blocks
+blocks = []
+for wx in range(GRID[0]):
+    for sg in range(SG_PER_WG):
+        mA = wx * 128 + sg * 8
+        mB = mA + 64
+        blocks.append(dict(wx=wx, sg=sg, mA=mA, mB=mB,
+                           a_live=mA < LIVE, b_live=mB < LIVE,
+                           rA=min(mA, LAST8), rB=min(mB, LAST8),
+                           clampA=min(mA, LAST8) != mA, clampB=min(mB, LAST8) != mB))
+
+parent_frags = sum(1 for b in blocks if b['a_live']) + sum(1 for b in blocks if b['b_live'])
+cand_frags = sum(1 for b in blocks if b['a_live']) * 2
+entering = sum(1 for b in blocks if b['a_live'])
+dead = len(blocks) - entering
+
+res['per_column'] = dict(
+    row_blocks=len(blocks),
+    entering_subgroups=entering,
+    dead_subgroups=dead,
+    live_a_blocks=sum(1 for b in blocks if b['a_live']),
+    live_b_blocks=sum(1 for b in blocks if b['b_live']),
+    dead_a_blocks=sum(1 for b in blocks if not b['a_live']),
+    clamp_a=sum(1 for b in blocks if b['clampA']),
+    clamp_a_used=sum(1 for b in blocks if b['clampA'] and b['a_live']),
+    clamp_b=sum(1 for b in blocks if b['clampB']),
+    clamp_b_used=sum(1 for b in blocks if b['clampB'] and b['a_live']),
+    clamp_b_unused=sum(1 for b in blocks if b['clampB'] and not b['a_live']),
+    parent_a_fragments=parent_frags,
+    cand_a_fragments=cand_frags,
+    extra_a_fragments=cand_frags - parent_frags,
+    parent_a_sends=parent_frags * K_STEPS * SENDS_PER_FRAG,
+    cand_a_sends=cand_frags * K_STEPS * SENDS_PER_FRAG,
+    parent_a_bytes=parent_frags * K_STEPS * FRAG_BYTES,
+    cand_a_bytes=cand_frags * K_STEPS * FRAG_BYTES,
+    b_weight_fragments=len(blocks) * K_STEPS,   # b0 load is unconditional in the loop, both versions
+    max_row_read_parent=max([b['mA'] + 7 for b in blocks if b['a_live']] +
+                            [b['mB'] + 7 for b in blocks if b['b_live']]),
+    max_row_read_cand=max([b['rA'] + 7 for b in blocks if b['a_live']] +
+                          [b['rB'] + 7 for b in blocks if b['a_live']]),
+)
+
+pc = res['per_column']
+res['totals'] = dict(
+    dispatches=1,
+    columns=cols,
+    row_blocks=pc['row_blocks'] * cols,
+    clamp_a=pc['clamp_a'] * cols,
+    clamp_a_used=pc['clamp_a_used'] * cols,
+    clamp_b=pc['clamp_b'] * cols,
+    clamp_b_used=pc['clamp_b_used'] * cols,
+    clamp_b_unused=pc['clamp_b_unused'] * cols,
+    extra_a_sends=pc['extra_a_fragments'] * K_STEPS * SENDS_PER_FRAG * cols,
+    extra_a_bytes=pc['extra_a_fragments'] * K_STEPS * FRAG_BYTES * cols,
+    parent_a_bytes=pc['parent_a_bytes'] * cols,
+    cand_a_bytes=pc['cand_a_bytes'] * cols,
+    extra_a_bytes_pct=100.0 * (pc['cand_a_bytes'] - pc['parent_a_bytes']) / pc['parent_a_bytes'],
+    family_extra_a_bytes_8pass=8 * pc['extra_a_fragments'] * K_STEPS * FRAG_BYTES * cols,
+    clamp_region_bytes=8 * 1024 * 2,   # rows LAST8..LAST8+7 = 8 rows x 1024 ch = 16 KiB
+    context_bytes=CTX_BYTES,
+    extra_reads_are_within_context=bool(pc['max_row_read_cand'] < LIVE),
+)
+
+Path(CARD / '_tools/ledger-math.json').write_text(json.dumps(res, indent=2), encoding='utf-8')
+print(json.dumps(res, indent=2))
+

@@ -1,0 +1,131 @@
+"""nat-index probe 2: resolve capture dir -> source plan (path+sha) via job manifests.
+
+Read-only.
+"""
+import json, os, re, sys
+from pathlib import Path
+from collections import Counter, defaultdict
+
+W = Path('@NR_WORKSPACE@')
+ISA_RE = re.compile(r'^CS_asm([0-9a-f]{16})_simd(\d+)_([0-9a-f]{16})_(\d+)_orig\.asm$', re.I)
+
+
+def walk_jsons(roots, maxsize=8_000_000):
+    seen = []
+    for root in roots:
+        for dp, dn, fn in os.walk(root):
+            for f in fn:
+                if f.endswith('.json'):
+                    p = Path(dp) / f
+                    try:
+                        if p.stat().st_size <= maxsize:
+                            seen.append(p)
+                    except OSError:
+                        pass
+    return seen
+
+
+def walk_dicts(obj, depth=0):
+    if depth > 9:
+        return
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from walk_dicts(v, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj[:4000]:
+            yield from walk_dicts(v, depth + 1)
+
+
+def argv_get(argv, flag):
+    for i, a in enumerate(argv):
+        if a == flag and i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
+def main():
+    roots = [W / 'work', W / 'run', W / 'build', W / 'candidates']
+    files = walk_jsons(roots)
+    print('json files scanned:', len(files))
+
+    jobs = []          # (manifest, output_dir, profile_dir, plan_path, plan_sha, capture_dir)
+    bad = 0
+    for p in files:
+        try:
+            if 'dump_isa' not in p.read_text(encoding='utf-8-sig', errors='ignore'):
+                continue
+            obj = json.loads(p.read_text(encoding='utf-8-sig', errors='ignore'))
+        except Exception:
+            bad += 1
+            continue
+        for d in walk_dicts(obj):
+            argv = d.get('argv')
+            if not (isinstance(argv, list) and all(isinstance(x, str) for x in argv)):
+                continue
+            if '--dump_isa' not in ' '.join(argv):
+                continue
+            od = argv_get(argv, '--output_dir')
+            pd = argv_get(argv, '--profile_dir')
+            if not od or not pd:
+                continue
+            plan_sha = None
+            pl = d.get('plan')
+            if isinstance(pl, dict):
+                plan_sha = pl.get('sha256')
+                plan_path = pl.get('path')
+            else:
+                plan_path = argv_get(argv, '--plan')
+            plan_path = plan_path or argv_get(argv, '--plan')
+            jobs.append(dict(manifest=str(p), output_dir=od, profile_dir=pd,
+                             plan_path=plan_path, plan_sha=plan_sha))
+    print('json parse failures:', bad)
+    print('native job records:', len(jobs))
+    print('distinct capture dirs from manifests:', len({(j['output_dir'], j['profile_dir']) for j in jobs}))
+    print('records with plan path:', sum(1 for j in jobs if j['plan_path']))
+    print('records with plan sha :', sum(1 for j in jobs if j['plan_sha']))
+
+    # capture dirs on disk
+    asm_dirs = {}
+    for root in roots + [W / 'artifacts']:
+        if not root.exists():
+            continue
+        for dp, dn, fn in os.walk(root):
+            hits = [f for f in fn if ISA_RE.match(f)]
+            if hits:
+                asm_dirs[Path(dp)] = len(hits)
+    print('asm session dirs on disk:', len(asm_dirs))
+
+    idx = {}
+    for j in jobs:
+        cap = Path(j['output_dir']) / j['profile_dir']
+        idx.setdefault(str(cap).lower(), []).append(j)
+
+    matched, unmatched = [], []
+    for d in asm_dirs:
+        parent = str(d.parent).lower()
+        recs = idx.get(parent)
+        (matched if recs else unmatched).append((d, recs))
+    print('session dirs matched to a manifest job:', len(matched), ' unmatched:', len(unmatched))
+    multi = [(d, r) for d, r in matched if r and len({(x['plan_path'], x['plan_sha']) for x in r}) > 1]
+    print('sessions with conflicting plan records:', len(multi))
+    for d, r in multi[:12]:
+        print('  CONFLICT', d.relative_to(W))
+        for x in r:
+            print('      ', (x['plan_sha'] or 'NOSHA')[:12], x['plan_path'], '|', Path(x['manifest']).name)
+
+    print('\n--- unmatched sample (up to 40) ---')
+    for d, _ in unmatched[:40]:
+        print('  ', d.relative_to(W), asm_dirs[d])
+
+    print('\n--- matched, distinct plans ---')
+    plans = Counter()
+    for d, r in matched:
+        for x in r:
+            plans[(x['plan_path'], x['plan_sha'])] += 1
+    for (pp, ps), n in plans.most_common(40):
+        print('  %3d  %s  %s' % (n, (ps or 'NOSHA')[:12], pp))
+
+
+if __name__ == '__main__':
+    main()

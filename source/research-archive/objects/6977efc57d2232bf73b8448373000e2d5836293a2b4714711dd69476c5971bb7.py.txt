@@ -1,0 +1,186 @@
+"""S05 step 10: work in the REAL qX domain.
+
+The main executor captured block8_out (int8, resident=True, own allocation offset) as
+gpu/runs/input-capture/xq-c128-b9.bin - that is block9's true FFN input domain in this plan.
+
+Checks
+  A  decode the real qX (m8col) and correlate with the FP16 teacher X: layout + domain sanity
+  B  CPU forward from the REAL qX with the bound pack -> the real "old" local error vs teacher Y
+  C  CPU forward from the REAL qX with the v1 pack -> the 1/38.5 attenuation seen on GPU
+  D  rebuild the pack in the fixed-qX domain (touch only 0..3 / 16..783 / 784..911) and re-search
+     (sA, sM); no producer slot change at all
+  E  teacher-domain vs real-domain comparison: is the 5.7249% -> 3.1393% claim transferable?
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import s05_common as C
+
+CAP = C.B / 'work/dsh-fullnet-static-20261029/gpu/runs/input-capture/xq-c128-b9.bin'
+G = C.CARD / 'GPU/gate-34189'
+V1S = C.CARD / 'PACK/c128_b9_scales.f32.bin'
+V1W = C.CARD / 'PACK/c128_b9_weights.i8.bin'
+V2S = C.CARD / 'PACK/c128_b9_scales_v2.f32.bin'
+
+data = C.rows()
+buf = data['buffers']
+r1 = C.row_by_name('block9_swin_body_1', data)
+b1 = {int(k): v for k, v in r1['bindings'].items()}
+push = [int(x) for x in r1['push']]
+OLD_W, OLD_S = buf[b1[0][0]]['file'], buf[b1[1][0]]['file']
+
+idx_m8 = ((np.arange(C.WIN_X * C.WIN_Y)[:, None, None] * 8192
+           + (np.arange(64)[None, :, None] >> 3) * 1024
+           + np.arange(128)[None, None, :] * 8
+           + (np.arange(64)[None, :, None] & 7)).reshape(-1))
+
+
+def decode_qx(path):
+    raw = C.i8(path)
+    assert raw.size == C.TOK * 128, raw.size
+    return raw[idx_m8].reshape(C.TOK, 128)
+
+
+qx_real = decode_qx(CAP).astype(np.float32)          # (16128,128) codes of LAYER 34189
+X = C.load_x(C.D / 'dump-fp16/dump_block8_out.bin')
+Y = C.load_y(C.D / 'dump-fp16/dump_swin_9_Y.bin')
+
+out = dict(card='S05-c128', step='real qX domain',
+           capture=dict(path=str(CAP), bytes=CAP.stat().st_size, sha256=C.sha256(CAP)),
+           gate_qx=dict(path=str(G / 'block9_qx.bin'), sha256=C.sha256(G / 'block9_qx.bin')))
+
+# ---------------- A: domain sanity
+rho = float(np.corrcoef(qx_real.ravel(), X.ravel())[0, 1])
+per_ch = [float(np.corrcoef(qx_real[:, c], X[:, c])[0, 1]) for c in range(0, 128, 16)]
+slope = float((qx_real * X).sum() / (X * X).sum())
+out['A_domain'] = dict(
+    corr_flat=rho, corr_per_channel_stride16=per_ch,
+    global_slope=slope, implied_step=float(1.0 / slope) if slope else None,
+    codes=dict(absmax=float(np.abs(qx_real).max()), std=float(qx_real.std()),
+               at_127=int((np.abs(qx_real) == 127).sum()), zero=int((qx_real == 0).sum())),
+    bound_sc0=float(C.f32(OLD_S)[0]),
+    verdict='global slope ~ 1/bound sc[0] means the capture is the BOUND (untouched) producer domain',
+)
+
+# ---------------- B/C: same codes, three packs
+w_old = C.i8(OLD_W).astype(np.int32)
+w1 = C.i8(V1W).astype(np.int32)
+sc_old = C.f32(OLD_S)
+sc_v1 = C.f32(V1S)
+sc_v2 = C.f32(V2S)
+
+
+def ffn_from_codes(qx, we8, wm8, wc8, sc, rscale=None):
+    invA, invM = np.float32(sc[2]), np.float32(sc[3])
+    de = np.rint(qx @ we8.astype(np.float32).T)
+    a = C.act(C.half(de * sc[16:528][None, :]))
+    qa = C.code(a * invA)
+    mo = np.empty((qx.shape[0], 128), np.float32)
+    for g in range(4):
+        mo[:, g * 32:(g + 1) * 32] = qa[:, g * 128:(g + 1) * 128] @ wm8[g * 32:(g + 1) * 32].astype(np.float32).T
+    qm = C.code(np.rint(mo) * np.float32(sc[528:656])[None, :] * invM)
+    dc = np.rint(qm @ wc8.astype(np.float32).T)
+    rs = sc[784:912] if rscale is None else rscale
+    return C.half(dc.astype(np.float32) * np.float32(sc[656:784])[None, :] + qx * np.float32(rs)[None, :]), qa, qm
+
+
+def split(w):
+    return w[0:65536].reshape(512, 128), w[65536:81920].reshape(128, 128), w[81920:98304].reshape(128, 128)
+
+
+y_old, _, _ = ffn_from_codes(qx_real, *split(w_old), sc_old)
+y_v1, _, _ = ffn_from_codes(qx_real, *split(w1), sc_v1)
+y_v2, _, _ = ffn_from_codes(qx_real, *split(w1), sc_v2)
+out['B_old_real'] = dict(rel_l2=C.rel(y_old, Y), rmse=float(np.sqrt(((y_old - Y) ** 2).mean())),
+                         teacher_rms=float(np.sqrt((Y.astype(np.float64) ** 2).mean())))
+out['C_v1_real'] = dict(rel_l2=C.rel(y_v1, Y), rms_ratio=float(np.sqrt((y_v1.astype(np.float64) ** 2).mean())
+                                                                  / np.sqrt((Y.astype(np.float64) ** 2).mean())))
+out['C_v2_real'] = dict(rel_l2=C.rel(y_v2, Y))
+
+# gate dumps vs CPU in the real domain (the dumps are pooled/stale, so expect no match)
+y_gpu_dump = C.f16(G / 'block9_Y.bin').reshape(C.TOK, 128)
+out['gate_dump_vs_real_domain_cpu'] = dict(
+    dump_vs_old=dict(rel_l2=C.rel(y_gpu_dump, y_old)),
+    dump_vs_v1=dict(rel_l2=C.rel(y_gpu_dump, y_v1)),
+    note='if these are ~1.4 the dump is not block9 at all (consistent with the pooled-slot evidence)',
+)
+
+# ---------------- D: rebuild in the fixed-qX domain (no producer slot change)
+# Only 0..3, 16..783, 784..911 may move.  sWe/sWm/sWc are already at the row-amax optimum, so the
+# only free coordinates are the activation scale sA and the mid scale sM; the residual table must
+# stay sX_anchor*rs (it dequantises the SAME codes).
+sX_anchor = np.float32(sc_old[0])
+rs_pack = sc_old[784:912] / sX_anchor
+sWe = sc_old[16:528] / sX_anchor
+sWm = sc_old[528:656] * np.float32(sc_old[2])
+sWc = sc_old[656:784] * np.float32(sc_old[3])
+
+
+def build(sa_factor, sm_factor):
+    s = sc_old.copy()
+    invA = np.float32(sc_old[2]) / np.float32(sa_factor)
+    invM = np.float32(sc_old[3]) / np.float32(sm_factor)
+    s[2] = invA
+    s[3] = invM
+    s[16:528] = sX_anchor * sWe
+    s[528:656] = sWm / invA
+    s[656:784] = sWc / invM
+    s[784:912] = sX_anchor * rs_pack
+    s[912:1040] = sc_old[912:1040]          # producer untouched
+    return s
+
+
+FACT = [0.3, 0.4, 0.5, 0.65, 0.8, 1.0, 1.2, 1.5]
+hist = []
+best = (C.rel(y_old, Y), 1.0, 1.0)
+for fa in FACT:
+    for fm in FACT:
+        s = build(fa, fm)
+        y, _, _ = ffn_from_codes(qx_real, *split(w_old), s)
+        r = C.rel(y, Y)
+        hist.append(dict(sa_factor=fa, sm_factor=fm, rel_l2=r))
+        if r < best[0]:
+            best = (r, fa, fm)
+# one refinement pass around the winner
+fa0, fm0 = best[1], best[2]
+for fa in [fa0 * k for k in (0.7, 0.85, 1.0, 1.15, 1.3)]:
+    for fm in [fm0 * k for k in (0.7, 0.85, 1.0, 1.15, 1.3)]:
+        s = build(fa, fm)
+        y, _, _ = ffn_from_codes(qx_real, *split(w_old), s)
+        r = C.rel(y, Y)
+        hist.append(dict(sa_factor=fa, sm_factor=fm, rel_l2=r, refined=True))
+        if r < best[0]:
+            best = (r, fa, fm)
+out['D_search'] = dict(best=dict(rel_l2=best[0], sa_factor=best[1], sm_factor=best[2]),
+                       evaluations=len(hist), history=sorted(hist, key=lambda h: h['rel_l2'])[:12])
+sc_v3 = build(best[1], best[2])
+y_v3, _, _ = ffn_from_codes(qx_real, *split(w_old), sc_v3)
+(C.CARD / 'PACK/c128_b9_scales_v3.f32.bin').write_bytes(sc_v3.astype('<f4').tobytes())
+out['D_pack'] = dict(path=str(C.CARD / 'PACK/c128_b9_scales_v3.f32.bin'),
+                     sha256=C.sha256(C.CARD / 'PACK/c128_b9_scales_v3.f32.bin'),
+                     bytes=4160, rel_l2=C.rel(y_v3, Y),
+                     changed_slots='0,2,3 (bookkeeping), 528..655 (mid), 656..783 (contract); '
+                                   '16..527 and 784..911 are the bound values recomputed identically; '
+                                   '912..1039 byte-identical to the bound table',
+                     producer_untouched=bool(np.array_equal(sc_v3[912:1040], sc_old[912:1040])),
+                     weights='bound weight pack unchanged')
+
+# ---------------- E: teacher-domain vs real-domain
+e = np.rint(np.log2(np.abs(np.concatenate([X]).max(axis=0)))).astype(np.int64)
+D = np.exp2(e.astype(np.float64)).astype(np.float32)
+qx_teacher = C.code(X * np.float32(sc_old[1]))
+out['E_domains'] = dict(
+    teacher_domain_old_rel_l2=None,
+    real_domain_old_rel_l2=C.rel(y_old, Y),
+    code_disagreement_teacher_vs_real=dict(equal_frac=float((qx_teacher == qx_real).mean()),
+                                           mean_abs_diff=float(np.abs(qx_teacher - qx_real).mean()),
+                                           max_abs_diff=float(np.abs(qx_teacher - qx_real).max())),
+    note='the teacher-domain proxy qX=round(X*sc[1]) is what the calibration used; compare its code field '
+         'with the real one to judge transferability',
+)
+(C.CARD / 'evidence/REAL-QX-DOMAIN.json').write_text(json.dumps(out, indent=2))
+print(json.dumps(out, indent=2)[:5000])

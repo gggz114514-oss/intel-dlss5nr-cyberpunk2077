@@ -1,0 +1,270 @@
+"""EXIT-CPU-REF.py — CPU reference for the F20 exit kernel (S03).
+
+Two variants are implemented, because the INT8 and the FP16 plans do not run the same
+exit program (see TAIL-CONTRACT.json / TAIL-RISKS.json R1-R2):
+
+  int8  : feature surface = 1344x768x32 halfs (layout 0), 32->4 projection is a scalar
+          fp16 x fp16 -> fp32 dot (paired_reads_surface.comp L16-33), then the shared tail.
+  fp16  : feature surface = 1280x720x4 fp32 (already projected, tail.comp L15).
+
+The shared tail (identical in both sources):
+  base  = post.bin RGBA at byte-float offset 0
+  rgb   = clamp(base.rgb + residual.rgb * 0.25, 0, 1)
+  if ctl(8)!=0:
+      hist  = history5((uv + motion_uv(uv)) * (ctl(9), ctl(10)))
+      blend = clamp(sigmoid(residual.w) * clamp(ctl(19) * tmp[p7.w], 0, 1), 0, 1)
+      rgb   = mix(rgb, hist, blend)
+  surface[hist_off + 4i .. +3] = (rgb, blend)
+  rgb   = clamp(fma(min(ctl(7),1), rgb - base.rgb, base.rgb), 0, 1)
+  surface[4i .. +3] = (rgb, base.a if (p5.w & 1) else 1.0)
+
+Usage
+  py EXIT-CPU-REF.py --self-test
+  py EXIT-CPU-REF.py --post <post.bin> --body <body.bin> [--weights <ioport_70_ioport_pack.fp16.bin>]
+                     [--ref <replayed-network.bin>]
+
+The second form is the J1 job's CPU half: it recomputes the exit from the dumped body and
+reports the difference against the runner's own output.  Nothing here writes outside the
+S03-tail directory.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+W_OUT, H_OUT = 1280, 720
+COARSE_W, COARSE_H = 672, 384
+FEAT_W, FEAT_H, FEAT_C = 1344, 768, 32
+OUT_PLANE = 4
+HIST_FLOAT_OFF = 3_686_400       # frame_out plane 1
+CTL_FLOAT_OFF = 3_686_400        # controls inside post.bin
+HIST_IN_FLOAT_OFF = 3_686_420    # history inside post.bin
+MOTION_FLOAT_OFF = 7_372_820
+DEPTH_FLOAT_OFF = 9_216_020
+
+
+def io_at(px, py, c, W, H, C, layout_id):
+    """iO layout 0 = 4x4 spatial tiles + 16 channel planes (ioport_common.glsl L24-31)."""
+    if layout_id == 2:
+        return (py * W + px) * C + c
+    if layout_id == 3:
+        sub = (c & 1) | (((c >> 3) & 1) << 1) | (((c >> 1) & 1) << 2) | (((c >> 2) & 1) << 3)
+        return (c // 16) * (W * H * 16) + (py * W + px) * 16 + sub
+    t = (py * W + px) if layout_id == 1 else ((py // 4) * (W // 4) + px // 4) * 16 + 4 * (py % 4) + px % 4
+    return ((t // 16) * (C // 16) + c // 16) * 256 + (t % 16) * 16 + c % 16
+
+
+def _mirror(i, size):
+    period = 2 * size
+    j = np.mod(np.asarray(i, dtype=np.int64), period)
+    return np.where(j < size, j, period - 1 - j)
+
+
+def _rgba(f, base, W, H, xs, ys):
+    a = base + _mirror(ys, H) * W * 4 + _mirror(xs, W) * 4
+    return f[a], f[a + 1], f[a + 2], f[a + 3]
+
+
+def _hist_linear(f, base, W, H, xs, ys):
+    """Four-tap bilinear over the history block, texel-centre convention
+    (ioport_images.glsl L14-24).  xs/ys are in pixel units."""
+    qx = np.asarray(xs, dtype=np.float64) - 0.5
+    qy = np.asarray(ys, dtype=np.float64) - 0.5
+    fx = np.mod(qx, 1.0)
+    fy = np.mod(qy, 1.0)
+    ix = np.floor(qx).astype(np.int64)
+    iy = np.floor(qy).astype(np.int64)
+    hx, hy = W - 1, H - 1
+    out = [np.zeros_like(fx) for _ in range(3)]
+    for (dx, dy, wgt) in ((0, 0, (1 - fx) * (1 - fy)), (1, 0, fx * (1 - fy)),
+                          (0, 1, (1 - fx) * fy), (1, 1, fx * fy)):
+        cx = np.clip(ix + dx, 0, hx)
+        cy = np.clip(iy + dy, 0, hy)
+        for k in range(3):
+            out[k] = out[k] + wgt * f[base + cy * W * 4 + cx * 4 + k]
+    return out
+
+
+def _history5(f, base, W, H, px, py):
+    """Five-tap cubic '+' stencil (ioport_images.glsl L25-36).  px/py in pixel units."""
+    lo_x, lo_y = 0.5, 0.5
+    hi_x, hi_y = W - 0.5, H - 0.5
+    cx = np.floor(px - 0.5) + 0.5
+    cy = np.floor(py - 0.5) + 0.5
+    tx = np.clip(px - cx, 0, 1)
+    ty = np.clip(py - cy, 0, 1)
+    t2x, t3x = tx * tx, tx * tx * tx
+    t2y, t3y = ty * ty, ty * ty * ty
+    w0x = (tx + t3x) * -0.5 + t2x
+    w1x = 1.5 * t3x - 2.5 * t2x + 1.0
+    w3x = 0.5 * (t3x - t2x)
+    w2x = 1.0 - w0x - w1x - w3x
+    wcx = w1x + w2x
+    w0y = (ty + t3y) * -0.5 + t2y
+    w1y = 1.5 * t3y - 2.5 * t2y + 1.0
+    w3y = 0.5 * (t3y - t2y)
+    w2y = 1.0 - w0y - w1y - w3y
+    wcy = w1y + w2y
+    p0x = np.clip(cx - 1.0, lo_x, hi_x)
+    pmx = np.clip(cx + w2x / wcx, lo_x, hi_x)
+    p2x = np.clip(cx + 2.0, lo_x, hi_x)
+    p0y = np.clip(cy - 1.0, lo_y, hi_y)
+    pmy = np.clip(cy + w2y / wcy, lo_y, hi_y)
+    p2y = np.clip(cy + 2.0, lo_y, hi_y)
+    kl = w0x * wcy
+    ku = w0y * wcx
+    kc = wcx * wcy
+    kd = w3y * wcx
+    kr = w3x * wcy
+    samples = [
+        (kl, _hist_linear(f, base, W, H, p0x, pmy)),
+        (ku, _hist_linear(f, base, W, H, pmx, p0y)),
+        (kc, _hist_linear(f, base, W, H, pmx, pmy)),
+        (kd, _hist_linear(f, base, W, H, pmx, p2y)),
+        (kr, _hist_linear(f, base, W, H, p2x, pmy)),
+    ]
+    denom = kl + ku + kc + kd + kr
+    out = []
+    for k in range(3):
+        acc = np.zeros_like(px)
+        for kg, comp in samples:
+            acc = acc + kg * comp[k]
+        out.append(acc / denom)
+    return out
+
+
+def _motion_uv(f, base, W, H, uv, ctl):
+    qx = (uv[0] * ctl[15] + ctl[17]) * W
+    qy = (uv[1] * ctl[16] + ctl[18]) * H
+    ix = np.floor(qx).astype(np.int64)
+    iy = np.floor(qy).astype(np.int64)
+    a = base + (_mirror(iy, H) * W + _mirror(ix, W)) * 2
+    return f[a] * ctl[13], f[a + 1] * ctl[14]
+
+
+def project_32_to_4(feat, weights, p1z=17024):
+    """int8 variant: feat[1344,768,32] half, weights 4x32 half at half-offset p1z."""
+    w = np.asarray(weights[p1z:p1z + 128], dtype=np.float32).reshape(4, 32)
+    acc = np.zeros((H_OUT, W_OUT, 4), dtype=np.float32)
+    ys, xs = np.mgrid[0:H_OUT, 0:W_OUT]
+    for c in range(0, FEAT_C, 2):
+        i0 = io_at(xs, ys, c, FEAT_W, FEAT_H, FEAT_C, 0)
+        i1 = io_at(xs, ys, c + 1, FEAT_W, FEAT_H, FEAT_C, 0)
+        v0 = feat[i0].astype(np.float32)
+        v1 = feat[i1].astype(np.float32)
+        for r in range(4):
+            acc[:, :, r] += v0 * w[r, c] + v1 * w[r, c + 1]
+    return acc
+
+
+def exit_math(post, residual, hist_scale=(W_OUT, H_OUT), history_param=1.0, ctl7=1.0,
+              alpha_from_base=False):
+    """residual: (720,1280,4) fp32. post: flat float32 view of post.bin. Returns (display, history)."""
+    ctl = post[CTL_FLOAT_OFF:CTL_FLOAT_OFF + 20].astype(np.float64)
+    ctl[7] = ctl7
+    ctl[9] = hist_scale[0]
+    ctl[10] = hist_scale[1]
+    ctl[19] = history_param
+    ys, xs = np.mgrid[0:H_OUT, 0:W_OUT]
+    bx, by, bz, ba = _rgba(post, 0, W_OUT, H_OUT, xs, ys)
+    base = np.stack([bx, by, bz], axis=-1)
+    rgb = np.clip(base + residual[:, :, :3] * 0.25, 0, 1)
+    blend = np.zeros((H_OUT, W_OUT), dtype=np.float64)
+    if ctl[8] != 0.0:
+        uvx = (xs + 0.5) / W_OUT
+        uvy = (ys + 0.5) / H_OUT
+        mx, my = _motion_uv(post, MOTION_FLOAT_OFF, W_OUT, H_OUT, (uvx, uvy), ctl)
+        hx = (uvx + mx) * ctl[9]
+        hy = (uvy + my) * ctl[10]
+        h0, h1, h2 = _history5(post, HIST_IN_FLOAT_OFF, W_OUT, H_OUT, hx, hy)
+        hist = np.stack([h0, h1, h2], axis=-1)
+        sig = 1.0 / (1.0 + np.exp(-residual[:, :, 3].astype(np.float64)))
+        blend = np.clip(sig * np.clip(history_param, 0, 1), 0, 1)
+        rgb = rgb * (1 - blend[:, :, None]) + hist * blend[:, :, None]
+    history = np.concatenate([rgb, blend[:, :, None]], axis=-1)
+    rgb2 = np.clip(np.minimum(ctl7, 1.0) * (rgb - base) + base, 0, 1)
+    alpha = ba if alpha_from_base else np.ones_like(ba)
+    display = np.concatenate([rgb2, alpha[:, :, None]], axis=-1)
+    return display.astype(np.float32), history.astype(np.float32)
+
+
+def _self_test() -> int:
+    rng = np.random.default_rng(20261029)
+    post = np.zeros(10_137_620, dtype=np.float32)
+    W, H = W_OUT, H_OUT
+    # stay below 0.9 so that no clamp order can mask an arithmetic error
+    img = (rng.random((H, W, 4), dtype=np.float32) * 0.9).astype(np.float32)
+    post[0:H * W * 4] = img.reshape(-1)
+    post[CTL_FLOAT_OFF:CTL_FLOAT_OFF + 20] = 0.0
+    post[CTL_FLOAT_OFF + 7] = 1.0
+    post[CTL_FLOAT_OFF + 8] = 0.0          # history disabled -> pure base+residual path
+    resid = np.zeros((H, W, 4), dtype=np.float32)
+    resid[:, :, :3] = 0.2
+    disp, hist = exit_math(post, resid)
+    ok = True
+    expect = np.clip(img[:, :, :3] + 0.05, 0, 1)
+    err = float(np.abs(disp[:, :, :3] - expect).max())
+    ok &= err < 1e-6
+    ok &= float(np.abs(disp[:, :, 3] - 1.0).max()) == 0.0
+    ok &= float(np.abs(hist[:, :, 3]).max()) == 0.0
+    # alpha-from-base branch
+    disp2, _ = exit_math(post, resid, alpha_from_base=True)
+    ok &= float(np.abs(disp2[:, :, 3] - img[:, :, 3]).max()) < 1e-7
+    # blend branch: history == base image and residual.w == 0 -> blend == 0.5, so the mixed
+    # value must be exactly base + 0.5*0.05 (a constant-field resample is exact)
+    post[CTL_FLOAT_OFF + 8] = 1.0
+    post[HIST_IN_FLOAT_OFF:HIST_IN_FLOAT_OFF + H * W * 4] = img.reshape(-1)
+    disp3, hist3 = exit_math(post, resid)
+    expect3 = np.clip(img[:, :, :3] + 0.025, 0, 1)
+    err3 = float(np.abs(disp3[:, :, :3] - expect3).max())
+    ok &= err3 < 2e-3
+    ok &= bool((hist3[:, :, 3] >= 0).all() and (hist3[:, :, 3] <= 1).all())
+    ok &= abs(float(hist3[:, :, 3].mean()) - 0.5) < 1e-6
+    print(json.dumps({
+        "self_test": "PASS" if ok else "FAIL",
+        "residual_gain_0p25_max_err": err,
+        "alpha_constant": float(np.abs(disp[:, :, 3] - 1.0).max()),
+        "alpha_from_base_max_err": float(np.abs(disp2[:, :, 3] - img[:, :, 3]).max()),
+        "history_mix_halfweight_max_err": err3,
+        "blend_range": [float(hist3[:, :, 3].min()), float(hist3[:, :, 3].max())],
+    }, indent=1))
+    return 0 if ok else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--post")
+    ap.add_argument("--body")
+    ap.add_argument("--weights")
+    ap.add_argument("--ref")
+    a = ap.parse_args()
+    if a.self_test or not a.post:
+        return _self_test()
+    post = np.fromfile(a.post, dtype="<f4")
+    if a.body:
+        feat = np.fromfile(a.body, dtype="<f2")
+        if a.weights:
+            w = np.fromfile(a.weights, dtype="<f2")
+            resid = project_32_to_4(feat, w)
+        else:
+            resid = feat.reshape(-1, 4).reshape(H_OUT, W_OUT, 4).astype(np.float32)
+        disp, hist = exit_math(post, resid)
+        out = {"body_elements": int(feat.size), "residual_abs_mean": float(np.abs(resid).mean())}
+        if a.ref:
+            ref = np.fromfile(a.ref, dtype="<f4").reshape(2, H_OUT, W_OUT, 4)
+            out["display_rgb_relL2"] = float(np.linalg.norm(disp[:, :, :3] - ref[0, :, :, :3]) /
+                                             (np.linalg.norm(ref[0, :, :, :3]) + 1e-30))
+            out["history_rgb_relL2"] = float(np.linalg.norm(hist[:, :, :3] - ref[1, :, :, :3]) /
+                                             (np.linalg.norm(ref[1, :, :, :3]) + 1e-30))
+            out["blend_mae"] = float(np.abs(hist[:, :, 3] - ref[1, :, :, 3]).mean())
+        print(json.dumps(out, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

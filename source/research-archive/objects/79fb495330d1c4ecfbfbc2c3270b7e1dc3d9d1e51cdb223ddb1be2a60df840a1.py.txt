@@ -1,0 +1,241 @@
+"""n06b-f06-c64 proof: exhaustive ownership / store / seed / scale / K-order proof (CPU only).
+
+Enumerates all 64x64 = 4096 output elements of one workgroup for the parent (2x2 blocking)
+and the candidate (1x4 blocking), checks the per-element store address decomposition, the
+seed/scale index arithmetic, the K order, and the reuse/load accounting (including the
+weight-halving impossibility count).
+"""
+import json
+from pathlib import Path
+
+CARD = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027/cards/n06b-f06-c64')
+TOK, CH, MB, NB = 64, 64, 8, 16
+NBLK = CH // NB          # 4
+NM = TOK // MB           # 8
+SG = 8
+ARS = 777                # arbitrary push-constant scale base (index arithmetic is linear)
+
+
+def tiles_parent(sg):
+    ma = (sg // 2) * 8
+    mb = ma + 32
+    n0 = (sg % 2) * 32
+    return [(ma, n0), (ma, n0 + 16), (mb, n0), (mb, n0 + 16)]
+
+
+def tiles_cand(sg):
+    m = sg * 8
+    return [(m, 0), (m, 16), (m, 32), (m, 48)]
+
+
+def elems(tile):
+    m, c0 = tile
+    return [(m + i, c0 + j, i, j) for i in range(MB) for j in range(NB)]
+
+
+def img_half_index(t, c, wx, wy, sx, sy, tiles_x, tiles_y):
+    """Verbatim port of c64_img_half_index (pinned header 39e573768c89)."""
+    q, s = t >> 4, t & 15
+    tx = 2 * wx + sx + (q & 1)
+    ty = 2 * wy + sy + (q >> 1)
+    oob = tx < 0 or ty < 0 or tx >= tiles_x or ty >= tiles_y
+    stx = min(max(tx, 0), tiles_x - 1)
+    sty = min(max(ty, 0), tiles_y - 1)
+    return (((sty * tiles_x + stx) * 4 + c // 16) * 256 + s * 16 + c % 16), oob
+
+
+def owner_map(tiles_fn):
+    own, dup = {}, 0
+    for sg in range(SG):
+        for tile in tiles_fn(sg):
+            for (t, c, i, j) in elems(tile):
+                if (t, c) in own:
+                    dup += 1
+                own[(t, c)] = (sg, tile, i, j)
+    return own, dup
+
+
+def main():
+    par, dup_p = owner_map(tiles_parent)
+    cand, dup_c = owner_map(tiles_cand)
+    all_e = [(t, c) for t in range(TOK) for c in range(CH)]
+    missing = [e for e in all_e if e not in par or e not in cand]
+
+    tiles_p = sorted({t for sg in range(SG) for t in tiles_parent(sg)})
+    tiles_c = sorted({t for sg in range(SG) for t in tiles_cand(sg)})
+
+    # ---- store address / seed / scale / K order, per element, over several window placements
+    addr_mismatch = oob_mismatch = tile_oob_mismatch = 0
+    seed_mismatch = scale_mismatch = k_mismatch = 0
+    windows = []
+    for (wx, wy, sx, sy, tx_, ty_) in [(0, 0, 0, 0, 42, 24), (1, 0, 0, 0, 43, 25),
+                                       (5, 7, 1, 0, 43, 24), (41, 23, 0, 1, 42, 25),
+                                       (0, 0, -1, -1, 42, 24)]:
+        bad = dict(addr=0, oob=0, tile_oob=0, seed=0, scale=0, k=0)
+        for (t, c) in all_e:
+            direct, d_oob = img_half_index(t, c, wx, wy, sx, sy, tx_, ty_)
+            for own in (par, cand):
+                sg, (m0, c0), i, j = own[(t, c)]
+                base, t_oob = img_half_index(m0, c0, wx, wy, sx, sy, tx_, ty_)
+                elem_addr = base + i * 16 + j          # coopMatStore writes s*16 + c%16 rows
+                if elem_addr != direct:
+                    bad['addr'] += 1
+                if t_oob != d_oob:
+                    bad['oob'] += 1
+                # oob must be constant inside a tile (q = t>>4 and the s range stay in one tile)
+                if (m0 >> 4) != (t >> 4):
+                    bad['tile_oob'] += 1
+                seed_base = (0 * 64 + m0) * 64 + c0
+                if seed_base + i * 64 + j != (0 * 64 + t) * 64 + c:
+                    bad['seed'] += 1
+                if (ARS + c0) + j != ARS + c:
+                    bad['scale'] += 1
+                k_seq = [ki * 16 for ki in range(4)]
+                if k_seq != [0, 16, 32, 48]:
+                    bad['k'] += 1
+        addr_mismatch += bad['addr']; oob_mismatch += bad['oob']
+        tile_oob_mismatch += bad['tile_oob']; seed_mismatch += bad['seed']
+        scale_mismatch += bad['scale']; k_mismatch += bad['k']
+        windows.append(dict(wx=wx, wy=wy, shift=[sx, sy], tiles=[tx_, ty_], bad=bad))
+
+    # ---- per-SG store tile disjointness (parent and candidate)
+    def overlap(tiles_fn):
+        bad = 0
+        for sg in range(SG):
+            seen = set()
+            for tile in tiles_fn(sg):
+                for e in elems(tile):
+                    if (e[0], e[1]) in seen:
+                        bad += 1
+                    seen.add((e[0], e[1]))
+        return bad
+
+    # ---- per-SG / per-WG load accounting (tiles, not bytes)
+    def acct(tiles_fn):
+        per = []
+        for sg in range(SG):
+            tl = tiles_fn(sg)
+            m_blocks = sorted({t[0] for t in tl})
+            n_blocks = sorted({t[1] for t in tl})
+            per.append(dict(sg=sg, m_blocks=m_blocks, n_blocks=n_blocks,
+                            a_tiles=len(m_blocks) * 4,
+                            seed_tiles=len(tl),
+                            b_tiles=len(n_blocks) * 4,
+                            store_tiles=len(tl),
+                            dpas=len(tl) * 4))
+        return per
+
+    ap, ac = acct(tiles_parent), acct(tiles_cand)
+
+    def total(per):
+        return dict(a_tiles=sum(x['a_tiles'] for x in per),
+                    seed_tiles=sum(x['seed_tiles'] for x in per),
+                    b_tiles=sum(x['b_tiles'] for x in per),
+                    store_tiles=sum(x['store_tiles'] for x in per),
+                    dpas=sum(x['dpas'] for x in per))
+
+    tp, tc = total(ap), total(ac)
+
+    A_BYTES, B_BYTES, S_BYTES, ST_BYTES = 256, 512, 256, 256
+    MSG_A, MSG_B, MSG_ST = 8, 1, 8          # native messages per tile (d32x8t / d32x8 / d32x8t)
+
+    def ledger(t):
+        load_bytes = t['a_tiles'] * A_BYTES + t['seed_tiles'] * S_BYTES + t['b_tiles'] * B_BYTES
+        sends = (t['a_tiles'] + t['seed_tiles'] + t['store_tiles']) * MSG_A + t['b_tiles'] * MSG_B
+        # every 32 B transposed message is one L1 sector; a 512 B weight message is four
+        sectors = (t['a_tiles'] + t['seed_tiles'] + t['store_tiles']) * MSG_A + t['b_tiles'] * 4
+        return dict(load_bytes=load_bytes, send_messages=sends, sectors=sectors)
+
+    alt = dict(name='1 n-block x 4 M blocks per SG (weight-halving shape)',
+               a_tiles=SG * 4 * 4, seed_tiles=SG * 4, b_tiles=SG * 1 * 4,
+               store_tiles=SG * 4, dpas=SG * 16)
+    alt_ledger = ledger(alt)
+
+    out = dict(
+        card='n06b-f06-c64',
+        geometry=dict(tokens_per_wg=TOK, channels_per_wg=CH, subgroups=SG, lanes=32,
+                      m_block=MB, n_block=NB, k_steps=4, k0=[0, 16, 32, 48],
+                      tiles_per_wg=len(tiles_p),
+                      wg_per_pass_note='grid 42/43 x 24/25 from the chain-head plan'),
+        mapping=dict(
+            output_elements=TOK * CH,
+            tile_owners_parent=len(tiles_p), tile_owners_candidate=len(tiles_c),
+            owners_per_output_parent=1, owners_per_output_candidate=1,
+            duplicate_parent=dup_p, duplicate_candidate=dup_c,
+            missing=len(missing),
+            store_address_mismatches=addr_mismatch,
+            oob_mismatches=oob_mismatch,
+            tile_q_mismatches=tile_oob_mismatch,
+            seed_tile_mismatches=seed_mismatch,
+            scale_index_mismatches=scale_mismatch,
+            k_sequence_mismatches=k_mismatch,
+            tile_set_mismatch=dict(parent_only=sorted(set(tiles_p) - set(tiles_c)),
+                                   candidate_only=sorted(set(tiles_c) - set(tiles_p))),
+            per_sg_disjoint_conflicts=dict(parent=overlap(tiles_parent),
+                                           candidate=overlap(tiles_cand)),
+            windows=windows,
+            owner_permutation_note='the candidate permutes which subgroup owns which (m,n) tile; '
+                                   'the union of stores, the per-element address, seed index, '
+                                   'scale index and K order are unchanged',
+            equal=(dup_p == 0 and dup_c == 0 and not missing and addr_mismatch == 0
+                   and oob_mismatch == 0 and tile_oob_mismatch == 0 and seed_mismatch == 0
+                   and scale_mismatch == 0 and k_mismatch == 0 and tiles_p == tiles_c),
+        ),
+        k_order=dict(
+            rule='each output accumulator is seeded before K, then accumulates exactly 4 '
+                 'coopMatMulAdd steps with k0 = 0,16,32,48 in that order; the candidate changes '
+                 'only which accumulator is issued, never the k index order',
+            steps=4, k0=[0, 16, 32, 48], mismatch=k_mismatch),
+        rounding=dict(
+            seed='coopMatLoad(MAT_H) from gY at (w*64+m)*64+n, then seed = seed * scale in half',
+            scale='pack[ars + n + (lane & 15)] splatted into MAT_H; identical expression per '
+                  'column, only the n values owned per SG change',
+            accumulate='MAT_C(float) += half A * half B, 4 steps',
+            narrow='MAT_H(acc) once per output tile at the end',
+            exp_recip_clamp='not present in this kernel'),
+        reuse=dict(
+            parent=dict(a_tiles_per_sg=8, seed_tiles_per_sg=4, b_tiles_per_sg=8,
+                        store_tiles_per_sg=4, dpas_per_sg=16,
+                        uses_per_a_load=2, uses_per_b_load=2),
+            candidate=dict(a_tiles_per_sg=4, seed_tiles_per_sg=4, b_tiles_per_sg=16,
+                           store_tiles_per_sg=4, dpas_per_sg=16,
+                           uses_per_a_load=4, uses_per_b_load=1),
+            per_wg_parent=tp, per_wg_candidate=tc,
+            per_sg_parent=ap, per_sg_candidate=ac),
+        ledger=dict(
+            tile_bytes=dict(a=A_BYTES, b=B_BYTES, seed=S_BYTES, store=ST_BYTES),
+            messages_per_tile=dict(a=MSG_A, b=MSG_B, store=MSG_ST, seed=MSG_A),
+            parent=ledger(tp), candidate=ledger(tc),
+            weight_halving_shape=dict(counts=alt, ledger=alt_ledger),
+            delta=dict(load_bytes=ledger(tc)['load_bytes'] - ledger(tp)['load_bytes'],
+                       send_messages=ledger(tc)['send_messages'] - ledger(tp)['send_messages'],
+                       sectors=ledger(tc)['sectors'] - ledger(tp)['sectors'])),
+        weight_halving_impossible=dict(
+            distinct_weight_tiles_per_wg=NBLK * 4,
+            parent_weight_loads_per_wg=tp['b_tiles'],
+            duplicate_factor=tp['b_tiles'] // (NBLK * 4),
+            reason='each weight tile is already loaded once per subgroup and consumed by two '
+                   'DPAS (the two M blocks of that subgroup); reaching four DPAS per weight '
+                   'tile needs four M blocks per subgroup, but a subgroup that owns four M '
+                   'blocks x two n-blocks would cover eight tiles and eight subgroups would '
+                   'cover 64 tiles while the workgroup only has 32. The only four-M-block '
+                   'shape (4 M x 1 n) halves the weight loads but doubles the A loads and '
+                   'raises messages from 136 to 196 per subgroup (ledger.weight_halving_shape).',
+            weight_loads_if_halved=tp['b_tiles'] // 2,
+            weight_loads_per_sg_if_one_n_block=4,
+            current_weight_loads_per_sg=tp['b_tiles'] // SG,
+        ),
+        tail=dict(
+            token_tail=TOK % MB, channel_tail=CH % NB,
+            note='64 tokens = 8 x 8 and 64 channels = 4 x 16, so there is no tail block; the '
+                 'out-of-bounds window (shift_x/shift_y) is handled per tile by the unchanged '
+                 'c64_img_half_index oob+clamp, and the per-element oob flag is identical in '
+                 'both arms (oob_mismatches = 0)'),
+    )
+    (CARD / 'PROOF.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print(json.dumps({k: out[k] for k in ('mapping', 'reuse', 'ledger', 'weight_halving_impossible')},
+                     indent=1)[:7000])
+
+
+if __name__ == '__main__':
+    main()

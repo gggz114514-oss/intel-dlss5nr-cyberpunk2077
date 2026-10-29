@@ -1,0 +1,201 @@
+"""n02d proof generator: enumerable coverage / rounding / lifetime / tail evidence.
+
+CPU only.  Writes PROOF.json inside the card directory.
+
+Everything here is either (a) an enumeration over the 1024 elements of the 16x64
+f32 bias tile, or (b) a read of the two SPIR-V modules this card built.  Nothing is
+assumed about the implementation's register layout beyond the one hypothesis the
+probe is designed to test, and that hypothesis is stated as a hypothesis.
+"""
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+CARD = Path(__file__).parent
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(CARD.parent.parent))
+sys.path.insert(0, str(CARD))
+import COMMON as K   # noqa: E402
+
+PARENT_SPV = CARD / 'parent-rebuild.spv'
+CAND_SPV = CARD / 'candidate.spv'
+WIDE, TALL = 64, 8          # f32 elements per row of the bias tile / rows per band
+SG_TILE_ROWS = 16
+ORDINALS = [1, 2, 3, 4, 227, 228, 229]
+MESSAGE_512 = 512           # d64x64t
+MESSAGE_256 = 256           # d32x64t
+
+
+def site_element(row_half, col_block, comp, lane):
+    return (row_half * TALL + 2 * comp + (lane >> 4), col_block * 16 + (lane & 15))
+
+
+def tile_index(row, col):
+    return row * WIDE + col
+
+
+def main():
+    proof = {'card': 'n02d-f02-bias-wide', 'family': 'F02',
+             'subject': 'fb bias read as 8x64 f32 accumulator bands instead of 8 row '
+                        'gathers per 8x16 site',
+             'shader_group': {'ordinals': ORDINALS,
+                              'parent_spv_sha256': K.sha(PARENT_SPV),
+                              'candidate_spv_sha256': K.sha(CAND_SPV)},
+             'hypothesis': {
+                 'H1_block_major': 'band component k of lane L holds tile element '
+                                   '(row = 2c + (L>>4), col = 16b + (L&15)) with k = 4b + c',
+                 'status': 'NOT MEASURED on this card.  probe.comp / probe-plan.txt / '
+                           'probe_read.py measure it on the GPU arm; every numeric claim '
+                           'below is conditional on H1 (or on the measured permutation, '
+                           'which is the same statement with a different index map).',
+                 'why_it_is_enough': 'any lane-local permutation of the same 16 elements is '
+                                     'a register rename: the f32 add, its order and the '
+                                     'following nrh_narrow() rounding point are untouched'}}
+
+    # ---- P1 coordinate law (sealed header, reused verbatim) ---------------
+    law = []
+    for comp in range(4):
+        for lane in range(32):
+            x = (lane << 2) | comp
+            z = (((x & 3) << 5) ^ ((x & 124) >> 2))
+            law.append({'lane': lane, 'component': comp, 'row': z // 16, 'col': z % 16,
+                        'closed_form': [2 * comp + (lane >> 4), lane & 15],
+                        'equal': [z // 16, z % 16] == [2 * comp + (lane >> 4), lane & 15]})
+    proof['P1_coord_law_8x16_accumulator'] = {
+        'derived_from': 'register_handoff.glsl 1c4c7489 nrh_coord_C',
+        'law': 'row = 2*component + (lane>>4), col = lane & 15',
+        'pairs_checked': len(law), 'all_equal': all(e['equal'] for e in law),
+        'note': 'this is the measured 8x16 law; the 8x64 law is the probe question'}
+
+    # ---- P2 parent path: 8 sites x 4 components x 32 lanes = tile once ----
+    parent_elements = []
+    for half in range(2):
+        for b in range(4):
+            for comp in range(4):
+                for lane in range(32):
+                    r, c = site_element(half, b, comp, lane)
+                    parent_elements.append((half, b, comp, lane, tile_index(r, c)))
+    cnt_p = Counter(e[4] for e in parent_elements)
+    proof['P2_parent_exact_cover'] = {
+        'entries': len(parent_elements),
+        'distinct_tile_elements': len(cnt_p),
+        'max_multiplicity': max(cnt_p.values()),
+        'exact_cover': len(cnt_p) == 1024 and max(cnt_p.values()) == 1,
+        'sites': 8, 'components_per_site': 4, 'lanes': 32,
+        'product_check': 8 * 4 * 32 == 1024}
+
+    # ---- P3 candidate path under H1: 2 bands x 16 comps x 32 lanes --------
+    cand_elements = []
+    for half in range(2):
+        for k in range(16):
+            b, comp = k // 4, k % 4
+            for lane in range(32):
+                r, c = site_element(half, b, comp, lane)
+                cand_elements.append((half, k, lane, tile_index(r, c)))
+    cnt_c = Counter(e[3] for e in cand_elements)
+    proof['P3_candidate_exact_cover_under_H1'] = {
+        'entries': len(cand_elements), 'distinct_tile_elements': len(cnt_c),
+        'max_multiplicity': max(cnt_c.values()),
+        'exact_cover': len(cnt_c) == 1024 and max(cnt_c.values()) == 1,
+        'bands': 2, 'components_per_band': 16, 'lanes': 32,
+        'product_check': 2 * 16 * 32 == 1024,
+        'identity_with_parent_element_set': {e[3] for e in cand_elements}
+        == {e[4] for e in parent_elements},
+        'note': 'the band path reads exactly the same 1024 elements as the 8 sites; the only '
+                'difference is which register holds each element for a given lane'}
+
+    # ---- P4 byte footprint / message accounting --------------------------
+    parent_msg = 8 * 8              # 8 sites x 8 row messages
+    parent_bytes = parent_msg * 64
+    wide_512 = (2 * 2048) // MESSAGE_512
+    wide_256 = (2 * 2048) // MESSAGE_256
+    executed_ugm = 182              # n02c census, executed path
+    proof['P4_bytes_and_messages'] = {
+        'tile_bytes_per_subgroup': 16 * 64 * 4,
+        'parent': {'form': 'load.ugm.d32x16t', 'count': parent_msg, 'bytes_each': 64,
+                   'total_bytes': parent_bytes,
+                   'runs': '8 rows per site x 8 sites = 64 maximal contiguous 64 B runs'},
+        'candidate_512B': {'form': 'load.ugm.d64x64t', 'count': wide_512, 'bytes_each': 512,
+                           'total_bytes': wide_512 * 512,
+                           'runs': '2 bands, each one contiguous 2048 B run = 4 runs of 512 B'},
+        'candidate_256B': {'form': 'load.ugm.d32x64t', 'count': wide_256, 'bytes_each': 256,
+                           'total_bytes': wide_256 * 256,
+                           'runs': 'same two runs, if igc caps the block read at 256 B'},
+        'bytes_conserved': wide_512 * 512 == parent_bytes == 4096,
+        'message_delta_per_subgroup': {'best': wide_512 - parent_msg,
+                                       'worst': wide_256 - parent_msg},
+        'executed_ugm_reads': {'before': executed_ugm,
+                               'after_best': executed_ugm - (parent_msg - wide_512),
+                               'after_worst': executed_ugm - (parent_msg - wide_256),
+                               'share_best': -(parent_msg - wide_512) / executed_ugm,
+                               'share_worst': -(parent_msg - wide_256) / executed_ugm},
+        'note': 'every count is per subgroup; a uniform message is issued once per subgroup, '
+                'so a workgroup of 4 subgroups issues 4x the static count'}
+
+    # ---- P5 invariants from the two modules ------------------------------
+    pm = K.ST.Module(PARENT_SPV)
+    cm = K.ST.Module(CAND_SPV)
+
+    def lite(m):
+        return dict(module_instructions=len(m.instructions),
+                    spv_bytes=Path(m.path).stat().st_size,
+                    muladd=sum(1 for op, _, _, _ in m.instructions if op == 4459),
+                    loads=sum(1 for op, _, _, _ in m.instructions if op == 4457),
+                    stores=sum(1 for op, _, _, _ in m.instructions if op == 4458),
+                    barriers=sum(1 for op, _, _, _ in m.instructions if op == 224),
+                    fadd=sum(1 for op, _, _, _ in m.instructions if op == 129),
+                    fconvert=sum(1 for op, _, _, _ in m.instructions if op == 115),
+                    nc_sites=len(K.ST.no_contraction_ids(m)))
+    proof['P5_invariants'] = {
+        'parent': lite(pm), 'candidate': lite(cm),
+        'dpas_128_expected': '128 static dpas in the ISA; the module level counterpart is '
+                             'OpCooperativeMatrixMulAddKHR, unchanged at 128',
+        'muladd_unchanged': lite(pm)['muladd'] == lite(cm)['muladd'] == 128,
+        'barriers_unchanged': lite(pm)['barriers'] == lite(cm)['barriers'],
+        'f32_add_unchanged': lite(pm)['fadd'] == lite(cm)['fadd'],
+        'fconvert_unchanged': lite(pm)['fconvert'] == lite(cm)['fconvert'],
+        'no_contraction_one_to_one': lite(pm)['nc_sites'] == lite(cm)['nc_sites'] == 185,
+        'code_bytes_delta': lite(cm)['spv_bytes'] - lite(pm)['spv_bytes'],
+        'load_sites_delta': lite(cm)['loads'] - lite(pm)['loads'],
+        'b_lane_packing_untouched': 'the 64 OpCooperativeMatrixLoadKHR of a 16x16 B fragment '
+                                    '(the source of the 528 interleaved zip movs) are '
+                                    'unchanged in count and shape'}
+
+    # ---- P6 lifetime / retirement ----------------------------------------
+    proof['P6_lifetime'] = {
+        'bias_band_value': 'live from its coopMatLoad to the last component read (block 3 of '
+                           'its row half); after that it is dead before the den reduction tree',
+        'accumulator': 'each sc0/sc1 is created and consumed inside one column block, exactly '
+                       'as in the parent, so the bias add cannot extend an accumulator lifetime',
+        'no_new_barrier': 'the single OpControlBarrier (the shK/shV handoff) is untouched; the '
+                          'bias table is read-only and dispatch invariant (n02c P4)',
+        'no_slm': 'the candidate declares no shared array beyond the parent shK/shV'}
+    # ---- P7 tail blocks ---------------------------------------------------
+    proof['P7_tail'] = {
+        'bias_base_dependencies': ['push constant pc.p2.w', 'sg uniform t0 = 16*sg'],
+        'wgid_dependent': False,
+        'token_dependent': False,
+        'oob_guard_in_parent': 'none: the 8 sites are unconditional, unlike imgin/imgout '
+                               '(8 x if(!tok_oob_u) unchanged)',
+        'tile_size': '16 rows x 64 columns f32 = 4096 B per subgroup, exactly the 4096 B the '
+                     '8 sites read, so there is no partial band at any edge of the dispatch'}
+    # ---- P8 what would falsify the candidate -----------------------------
+    proof['P8_falsifiers'] = {
+        'lane_map_not_lane_local': 'probe verdict CROSS-LANE -> the extraction would need '
+                                   'subgroup shuffles, the mechanism is net negative',
+        'lane_map_other_permutation': 'probe verdict PERM -> one-line NRH_C64_AT() change, '
+                                     'numeric claim then exact',
+        'igc_does_not_emit_block_reads': 'native shows the two sites expand to per-lane '
+                                        'd32x1t or 64 B gathers -> A class (not landed)',
+        'register_spill': 'native/resource shows scratch > 0 or max_r > 127 -> B class, the '
+                          'priced fallback (16 GRF, one band at a time) is in BUDGET.md'}
+    K.write_json(CARD / 'PROOF.json', proof)
+    print(json.dumps({k: proof[k] for k in ('P2_parent_exact_cover',
+                                            'P3_candidate_exact_cover_under_H1',
+                                            'P4_bytes_and_messages', 'P5_invariants')},
+                     indent=1)[:3500])
+
+
+if __name__ == '__main__':
+    main()

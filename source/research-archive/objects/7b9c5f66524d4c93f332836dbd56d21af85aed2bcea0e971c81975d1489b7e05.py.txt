@@ -1,0 +1,379 @@
+"""n29-f01-alu-chain: dependency-chain audit of the F01 entry region (ordinal 0).
+
+Read-only over the captured ISA of the current chain-head F01 SPV
+(kernel hash 54249010bf7e593b).  CPU only: parse -> def/use -> backward slice ->
+split into the integer address tail (shortenable without touching numerics) and
+the float position preparation (must not change).  Nothing here touches the GPU.
+
+Register model
+--------------
+* dword-granular: a register is (rN, dword M).  Vector writes expand over the
+  exec size and the element width, so `mov (16|M0) r3.0<1>:hf` writes dwords
+  r3.0..r3.7 (16 halfs) and `mov (16|M0) r67.0<1>:ud` writes r67.0..r67.15.
+* a broadcast source (`<0;1,0>`) reads one dword; a contiguous source
+  (`<1;1,0>`) reads exec_size elements.
+* a0.0 is its own 64-bit address register (both dwords tracked).
+* The last preceding writer in address order is taken as the reaching
+  definition.  The region is straight-line except the uniform-branch skips
+  (ctl(8)/ctl(11) gates); every slice that spans one is reported under
+  `crosses_branch`, so the approximation is visible.
+"""
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+CAMP = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(CAMP))
+import ISA  # noqa: E402  (read-only reuse of the campaign parser)
+
+ISA_PATH = CAMP / 'queue/n27-f07/native/captures/native-native-base/ISA/CS_asm54249010bf7e593b_simd32_0000000000000001_0_orig.asm'
+
+# entry region of nrf_prepare_A: entered by (~f0.0) goto L19088 after
+# cmp (lt)f0.0 lane,16 (n18b isa-mask-proof), left at byte offset 19088 = 0x4A90
+REGION = (0x0390, 0x4A90)
+
+TYPE_DWORDS = {'ud': 1, 'd': 1, 'w': 1, 'uw': 1, 'f': 1, 'v': 1, 'hf': 0.5,
+               'q': 2, 'uq': 2, 'df': 2, 'b': 0.25, 'ub': 0.25, 'bf': 0.25}
+FLOAT_TYPES = {'f', 'hf', 'df'}
+
+# issue-to-result latency (cycles) by opcode family; used only for the
+# secondary "latency-weighted depth" column.  Values are the usual GEN/Battlemage
+# ALU latencies; the unweighted depth (each edge = 1) is the primary metric.
+LAT = {
+    'mul': 5, 'mad': 5, 'macl': 5, 'mach': 5, 'dpas': 8, 'math.inv': 8,
+    'math.rsqt': 8, 'math.sqrt': 8, 'math.sqt': 8, 'math.log': 8, 'math.exp': 8,
+    'rndd': 6, 'rndu': 6, 'rnde': 6, 'rndz': 6, 'frc': 6,
+    'add': 4, 'add3': 4, 'addc': 4, 'sub': 4, 'shl': 4, 'shr': 4, 'asr': 4,
+    'and': 4, 'or': 4, 'xor': 4, 'not': 4, 'bfn': 4, 'cmp': 4, 'sel': 4,
+    'min': 4, 'max': 4, 'mov': 1, 'movf': 1, 'sync.nop': 0, 'illegal': 0,
+    'send.ugm': 20, 'send.slm': 20,
+}
+MEM_OPS = ('send.ugm', 'send.slm', 'send.gtwy')
+
+
+def reg_dwords(operand):
+    """(regfile, regno, first_dword) for a plain register operand, else None."""
+    o = operand.lstrip('-').replace('(abs)', '')
+    m = re.match(r'^r(\d+)\.(\d+)<', o)
+    if m:
+        return ('r', int(m.group(1)), int(m.group(2)))
+    m = re.match(r'^r(\d+)<', o)
+    if m:
+        return ('r', int(m.group(1)), 0)
+    m = re.match(r'^(?:acc|r)(\d+)\.(\d+)<', o)
+    if m:
+        return ('acc', int(m.group(1)), int(m.group(2)))
+    m = re.match(r'^a0\.(\d+)<', o)
+    if m:
+        return ('a0', 0, int(m.group(1)))
+    return None
+
+
+def elem_width(operand):
+    m = re.search(r':([a-z0-9]+)', operand)
+    return m.group(1) if m else 'ud'
+
+
+def exec_size(flags, default=1):
+    m = re.search(r'\((\d+)\|M\d+\)', flags or '')
+    return int(m.group(1)) if m else default
+
+
+def region_spec(op):
+    """(width, hstride, vstride) of the `<W;H,V>` region spec, or None."""
+    m = re.search(r'<(\d+);(\d+),(\d+)>', op)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def span(op, flags):
+    """Dwords touched by an operand."""
+    w = TYPE_DWORDS.get(elem_width(op), 1)
+    rs = region_spec(op)
+    if rs is not None and rs[0] == 0:
+        return max(1, int(round(w)))
+    return max(1, int(round(w * exec_size(flags))))
+
+
+def writes(instr):
+    if not instr['ops']:
+        return []
+    op0 = instr['ops'][0]
+    r = reg_dwords(op0)
+    if r:
+        regfile, no, dw = r
+        if regfile == 'a0':
+            return [('a0', 0, 0, 2)]
+        if instr['op'].startswith('send'):
+            return [('r', no, dw, span(op0, instr['flags']))]
+        return [('r', no, dw, span(op0, instr['flags']))]
+    m = re.match(r'^acc(\d+)\.(\d+)<', op0)
+    if m:
+        return [('acc', int(m.group(1)), int(m.group(2)), span(op0, instr['flags']))]
+    m = re.match(r'^(f[0-9])\.(\d)<', op0)
+    if m:
+        return [('f', int(m.group(1)[1]), int(m.group(2)), 1)]
+    return []
+
+
+def reads(instr):
+    out = []
+    op = instr['op']
+    ops = instr['ops']
+    if op.startswith('send'):
+        if len(ops) > 1:
+            r = re.match(r'^r(\d+)$', ops[1])
+            if r:
+                out.append(('r', int(r.group(1)), 0, 1))
+            else:
+                rr = reg_dwords(ops[1])
+                if rr:
+                    out.append(('r', rr[1], rr[2], 1))
+        for o in ops[3:]:
+            if re.search(r'a0\.(\d+)', o):
+                out.append(('a0', 0, 0, 2))
+        return out
+    for o in ops[1:]:
+        if re.match(r'^(null|0[xX][0-9A-Fa-f]+$|[-+]?[0-9.]+($|:))', o.lstrip('-')):
+            continue
+        rr = reg_dwords(o)
+        if not rr:
+            continue
+        regfile, no, dw = rr
+        if regfile == 'a0':
+            out.append(('a0', 0, 0, 2))
+        elif regfile == 'acc':
+            out.append(('acc', no, dw, 1))
+        else:
+            out.append(('r', no, dw, span(o, instr['flags'])))
+    return out
+
+
+def build(isa):
+    for k, ins in enumerate(isa):
+        ins['idx'] = k
+        ins['w'] = writes(ins)
+        ins['r'] = reads(ins)
+        ins['ty'] = elem_width(ins['ops'][0]) if ins['ops'] else 'ud'
+    by_dw = {}
+    for ins in isa:
+        for regfile, no, dw, n in ins['w']:
+            for d in range(dw, dw + n):
+                by_dw.setdefault((regfile, no, d), []).append(ins['idx'])
+    for v in by_dw.values():
+        v.sort()
+    return by_dw
+
+
+def reaching(by_dw, key, idx):
+    lst = by_dw.get(key)
+    if not lst:
+        return None
+    hit = None
+    for w in lst:
+        if w < idx:
+            hit = w
+        else:
+            break
+    return hit
+
+
+def slice_of(isa, by_dw, root_idx):
+    nodes = {}
+    stack = [root_idx]
+    while stack:
+        k = stack.pop()
+        if k in nodes:
+            continue
+        ins = isa[k]
+        parents = set()
+        for regfile, no, dw, n in ins['r']:
+            for d in range(dw, dw + n):
+                w = reaching(by_dw, (regfile, no, d), k)
+                if w is not None:
+                    parents.add(w)
+        nodes[k] = sorted(parents)
+        stack.extend(nodes[k])
+    return nodes
+
+
+def depth_of(isa, nodes, weight=False):
+    memo = {}
+
+    def d(k):
+        if k in memo:
+            return memo[k]
+        best = 0
+        for p in nodes.get(k, []):
+            if p in nodes:
+                best = max(best, d(p) + (1 if not weight else LAT.get(isa[p]['op'], 4)))
+        memo[k] = best
+        return best
+
+    for k in nodes:
+        d(k)
+    return (max(memo.values()) if memo else 0), memo
+
+
+def is_mem(ins):
+    return any(ins['op'].startswith(m) for m in MEM_OPS)
+
+
+def int_tail(isa, nodes, root_idx):
+    """Nodes reachable from the root through integer-typed ALU ops only.
+
+    Stops at float/half destinations and at memory sends: those are the
+    upstream producers (position math, uniform loads) that this card must not
+    change.  What is left is the integer address tail, i.e. exactly the part a
+    chain-shortening candidate may rewrite.
+    """
+    keep = {}
+    boundary = set()
+    stack = [root_idx]
+    while stack:
+        k = stack.pop()
+        if k in keep:
+            continue
+        ins = isa[k]
+        if k != root_idx and (ins['ty'] in FLOAT_TYPES or is_mem(ins)):
+            boundary.add(k)
+            continue
+        keep[k] = [p for p in nodes.get(k, [])]
+        for p in keep[k]:
+            if p in nodes:
+                stack.append(p)
+    return keep, sorted(boundary)
+
+
+def region_of(addr):
+    return REGION[0] <= addr < REGION[1]
+
+
+def gathers(isa, region_only=True):
+    out = []
+    for ins in isa:
+        if (ins['op'].startswith('send') and ins['comment']
+                and 'load.ugm.d32.' in ins['comment']
+                and (not region_only or region_of(ins['addr']))):
+            out.append(ins)
+    return out
+
+
+def load():
+    isa = ISA.parse(ISA_PATH)
+    by_dw = build(isa)
+    return isa, by_dw
+
+
+def describe(isa, k, level):
+    ins = isa[k]
+    return dict(addr=hex(ins['addr']), op=ins['op'], ty=ins['ty'],
+                dst=(ins['ops'][0] if ins['ops'] else ''),
+                deps=len(ins['r']), level=level, raw=ins['raw'].strip())
+
+
+def cmd_summary():
+    isa, by_dw = load()
+    reg = [i for i in isa if region_of(i['addr'])]
+    gs = gathers(isa)
+    c = Counter(i['op'] for i in reg)
+    print('kernel instructions      :', len(isa))
+    print('entry region instructions:', len(reg), 'range 0x%04X..0x%04X' % (REGION[0], reg[-1]['addr']))
+    print('scalar gathers in region :', len(gs))
+    print('region opcode histogram  :', dict(c.most_common()))
+    rows = []
+    onchain = set()
+    for g in gs:
+        nodes = slice_of(isa, by_dw, g['idx'])
+        d, memo = depth_of(isa, nodes)
+        gl, _ = depth_of(isa, nodes, weight=True)
+        tail, boundary = int_tail(isa, nodes, g['idx'])
+        td, _ = depth_of(isa, tail)
+        tw, _ = depth_of(isa, tail, weight=True)
+        rows.append(dict(addr=g['addr'], n=len(nodes), depth=d, wdepth=gl,
+                         tail=len(tail), tail_depth=td, tail_wdepth=tw,
+                         boundary=[hex(isa[b]['addr']) for b in boundary],
+                         offreg=g['ops'][1] if len(g['ops']) > 1 else '?',
+                         msg=g['comment'].split(';')[-1].strip()))
+        for k in nodes:
+            if region_of(isa[k]['addr']):
+                onchain.add(isa[k]['addr'])
+    print('\n%-8s %5s %5s %6s %5s %5s %6s  %-5s %s' % ('gather', 'nodes', 'depth', 'wdepth',
+                                                      'tail', 'tdep', 'twdep', 'off', 'message'))
+    for r in rows:
+        print('%-8s %5d %5d %6d %5d %5d %6d  %-5s %s' % (
+            hex(r['addr']), r['n'], r['depth'], r['wdepth'], r['tail'],
+            r['tail_depth'], r['tail_wdepth'], r['offreg'], r['msg']))
+    side = [i for i in reg if i['addr'] not in onchain]
+    print('\nchain-union (region)     :', len(onchain), 'of', len(reg))
+    print('side-branch (region)     :', len(side), dict(Counter(i['op'] for i in side).most_common(12)))
+    tail_union = {}
+    for g in gs:
+        nodes = slice_of(isa, by_dw, g['idx'])
+        tail, _ = int_tail(isa, nodes, g['idx'])
+        for k in tail:
+            tail_union[isa[k]['addr']] = tail_union.get(isa[k]['addr'], 0) + 1
+    tail_only = [a for a in tail_union if a in onchain]
+    print('int-tail union (region)  :', len(tail_only), 'instructions')
+    print('int-tail opcode hist     :', dict(Counter(
+        i['op'] for i in reg if i['addr'] in tail_union).most_common(20)))
+    out = dict(isa_path=str(ISA_PATH), isa_sha256=None,
+               region=[hex(REGION[0]), hex(REGION[1])],
+               kernel_instructions=len(isa), region_instructions=len(reg),
+               gathers=len(gs), opcode_histogram=dict(c.most_common()),
+               chain_union_region=len(onchain), side_branch_region=len(side),
+               side_opcodes=dict(Counter(i['op'] for i in side).most_common()),
+               int_tail_union=len(tail_only),
+               int_tail_opcodes=dict(Counter(i['op'] for i in reg if i['addr'] in tail_union).most_common()),
+               per_gather=[dict(addr=hex(r['addr']), nodes=r['n'], depth=r['depth'],
+                                wdepth=r['wdepth'], tail=r['tail'], tail_depth=r['tail_depth'],
+                                tail_wdepth=r['tail_wdepth'], boundary=r['boundary'],
+                                offreg=r['offreg'], message=r['msg']) for r in rows])
+    (CAMP / 'cards/n29-f01-alu-chain/tools/chain-raw.json').write_text(
+        json.dumps(out, indent=1), encoding='utf-8')
+
+
+def cmd_list(addr):
+    isa, by_dw = load()
+    target = None
+    for g in gathers(isa):
+        if g['addr'] == int(addr, 16):
+            target = g
+    if target is None:
+        raise SystemExit('no gather at ' + addr)
+    nodes = slice_of(isa, by_dw, target['idx'])
+    _, memo = depth_of(isa, nodes)
+    tail, boundary = int_tail(isa, nodes, target['idx'])
+    for k in sorted(nodes):
+        mark = 'TAIL' if k in tail else ('BOUND' if k in boundary else 'fp')
+        print('L%-4d %s %s' % (memo[k], mark.ljust(5), isa[k]['raw'].strip()))
+
+
+def cmd_tails():
+    """One line per gather: the integer address tail in address order."""
+    isa, by_dw = load()
+    for g in gathers(isa):
+        nodes = slice_of(isa, by_dw, g['idx'])
+        tail, boundary = int_tail(isa, nodes, g['idx'])
+        seq = sorted(tail, reverse=True)
+        parts = []
+        for k in seq:
+            if isa[k]['op'].startswith('send'):
+                continue
+            parts.append('%04X:%s' % (isa[k]['addr'], isa[k]['op'].split('.')[0]))
+        print('%04X %-6s n=%2d d=%2d | %s' % (
+            g['addr'], g['ops'][1] if len(g['ops']) > 1 else '?', len(tail),
+            depth_of(isa, tail)[0], ' '.join(parts)))
+
+
+if __name__ == '__main__':
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'summary'
+    if cmd == 'summary':
+        cmd_summary()
+    elif cmd == 'list':
+        cmd_list(sys.argv[2])
+    elif cmd == 'tails':
+        cmd_tails()

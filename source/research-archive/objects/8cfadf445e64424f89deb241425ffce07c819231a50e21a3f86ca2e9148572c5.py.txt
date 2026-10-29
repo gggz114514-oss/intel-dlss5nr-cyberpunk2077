@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Build the B3 candidate source from the frozen parent, mechanically.
+
+Change set (parent line numbers):
+  A. line 231 comment: "widened BEFORE K0" -> half-kept + widened at the epilogue.
+  B. lines 232/239/246/253: add `NRH_CH seedH0..3;` next to the `NRH_C ycN;`
+     declarations.
+  C. lines 236-237/243-244/250-251/257-258: `NRH_CH seed = xN * scale;` +
+     `ycN = nrh_widen_exact(seed);`  ->  `seedHN = xN * scale;`
+     (the half seed survives; the widening is deferred).
+  D. lines 261-264: drop the four `NRH_C seedN = ycN;` copies (the seed is no
+     longer an NRH_C value at that point).
+  E. lines 493-496: `..., seedN)` -> `..., nrh_widen_exact(seedHN))` so the widen
+     happens immediately before nr_i8_deq_add.
+Nothing else changes; every replacement asserts a single exact anchor.
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+CARD = Path(r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024/candidates/b3-c32-seed")
+PARENT_SRC = CARD / "source/parent"
+CAND_SRC = CARD / "source/candidate"
+OUT = CAND_SRC / "c32_body1_i8.comp"
+EVID = CARD / "evidence"
+
+HEADER = """// B3 INT8-C32 half seed, widen deferred. Contract seed H(X*rs) is kept in half
+// (NRH_CH seedH0..3, declared lines {decl}) and widened by nrh_widen_exact only
+// at the dequant epilogue (lines {epi}); the parent's `NRH_C seedN = ycN` copies
+// (parent lines 261-264) are gone. No other line differs from the parent source.
+"""
+
+
+def main():
+    src = (PARENT_SRC / "c32_body1_i8.comp").read_text(encoding="utf-8")
+    orig_sha = hashlib.sha256((PARENT_SRC / "c32_body1_i8.comp").read_bytes()).hexdigest()
+    changes = []
+
+    def rep(old, new, tag, count=1):
+        nonlocal src
+        n = src.count(old)
+        assert n == count, "%s: expected %d occurrences, found %d" % (tag, count, n)
+        src = src.replace(old, new)
+        changes.append({"tag": tag, "old": old, "new": new})
+
+    # A. the "widened BEFORE K0" comment
+    rep("        // Contract seed H(X*rs[8+feature]) is widened BEFORE K0.\n",
+        "        // B3: contract seed H(X*rs[8+feature]) is kept in half here and widened\n"
+        "        // only at the dequant epilogue, not before K0.\n",
+        "A-comment")
+
+    # B. half seed variables next to the NRH_C result variables
+    for i in range(4):
+        rep("        NRH_C yc%d;\n" % i,
+            "        NRH_C yc%d;\n        NRH_CH seedH%d;\n" % (i, i),
+            "B-decl-%d" % i)
+
+    # C. half multiply without the widen; the block-local `seed` temp is gone
+    for i in range(4):
+        rep("            NRH_CH seed = x%d * scale;\n"
+            "            yc%d = nrh_widen_exact(seed);\n" % (i, i),
+            "            seedH%d = x%d * scale;\n" % (i, i),
+            "C-halfmul-%d" % i)
+
+    # D. the four copies of the widened seed
+    rep("        NRH_C seed0 = yc0;\n"
+        "        NRH_C seed1 = yc1;\n"
+        "        NRH_C seed2 = yc2;\n"
+        "        NRH_C seed3 = yc3;\n",
+        "", "D-drop-copies")
+
+    # E. widen at the dequant epilogue
+    for i, mbase in enumerate((0, 8, 16, 24)):
+        rep("            yc%d = nr_i8_deq_add(ca%d, %du, C32_I8_MULT_C, seed%d);\n"
+            % (i, i, mbase, i),
+            "            yc%d = nr_i8_deq_add(ca%d, %du, C32_I8_MULT_C, "
+            "nrh_widen_exact(seedH%d));\n" % (i, i, mbase, i),
+            "E-epilogue-%d" % i)
+
+    # locate the changed regions in the *final* text (header included), then write it.
+    # Two passes with a same-line-count placeholder keep the numbering exact.
+    provisional = HEADER.format(decl="?", epi="?") + src
+    lines = provisional.split("\n")
+    decl = [i + 1 for i, l in enumerate(lines) if l.strip().startswith("NRH_CH seedH")]
+    epi = [i + 1 for i, l in enumerate(lines) if "nr_i8_deq_add(ca" in l]
+    halfmul = [i + 1 for i, l in enumerate(lines) if "seedH" in l and "* scale;" in l]
+    assert len(decl) == 4 and len(epi) == 4 and len(halfmul) == 4, (decl, epi, halfmul)
+
+    header = HEADER.format(decl="/".join(str(x) for x in decl),
+                           epi="%d-%d" % (epi[0], epi[-1]))
+    final = header + src
+    assert len(final.split("\n")) == len(lines), "header line count changed"
+    OUT.write_text(final, encoding="utf-8", newline="\n")
+
+    # the candidate's own copies of the unchanged includes (self-contained build)
+    for inc in ("c32_i8_common.glsl", "register_handoff.glsl"):
+        (CAND_SRC / inc).write_bytes((PARENT_SRC / inc).read_bytes())
+
+    fl = final.split("\n")
+    def find(sub, start=0):
+        return [i + 1 for i, l in enumerate(fl) if sub in l]
+
+    doc = {
+        "card": "b3-c32-seed",
+        "parent_source": {"path": str(PARENT_SRC / "c32_body1_i8.comp"), "sha256": orig_sha,
+                          "lines": len((PARENT_SRC / "c32_body1_i8.comp").read_text(encoding="utf-8").split("\n"))},
+        "candidate_source": {"path": str(OUT),
+                             "sha256": hashlib.sha256(OUT.read_bytes()).hexdigest(),
+                             "lines": len(fl)},
+        "includes": {inc: hashlib.sha256((CAND_SRC / inc).read_bytes()).hexdigest()
+                     for inc in ("c32_i8_common.glsl", "register_handoff.glsl")},
+        "semantics": "seed H(X*rs) still computed as a half cooperative-matrix multiply; "
+                     "the half value is kept in NRH_CH seedH0..3 and widened by "
+                     "nrh_widen_exact immediately before nr_i8_deq_add; dequant product, "
+                     "seed add order and the final narrow order are unchanged.",
+        "candidate_line_map": {
+            "header_note": "1-4",
+            "comment": find("B3: contract seed")[0],
+            "seedH_decls": decl,
+            "half_multiplies": halfmul,
+            "epilogue_widen_calls": epi,
+            "seedN_copies_in_body": src.count("NRH_C seed"),
+        },
+        "replacements": changes,
+    }
+    (EVID / "SOURCE-CHANGE.json").write_text(json.dumps(doc, indent=1) + "\n",
+                                             encoding="utf-8", newline="\n")
+    print(json.dumps(doc["candidate_line_map"], indent=1))
+    print("parent sha", orig_sha)
+    print("candidate sha", doc["candidate_source"]["sha256"])
+    print("lines parent->candidate", doc["parent_source"]["lines"], "->", doc["candidate_source"]["lines"])
+
+
+if __name__ == "__main__":
+    main()

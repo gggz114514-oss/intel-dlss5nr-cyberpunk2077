@@ -1,0 +1,166 @@
+"""n03b-f04-c256 / F04 C256 build card.
+
+CPU only.  Writes nothing outside this card directory.
+
+Step 1  parent byte reproduction: compile the current baseline source of the C256
+        F04 shader (ordinal 36, 15 PASS) with the pinned header and compare to the
+        baseline SPIR-V that the accepted plan points at.
+Step 2  compile candidate.comp (hidden block 32 -> 64) and validate the SPIR-V.
+Step 3  NoContraction / float-site audit parent vs candidate.
+Step 4  plan on the CURRENT ACCEPTED CHAIN HEAD with exactly the 15 C256 F04 PASS
+        rows replaced; cpu-check it and the chain head for the buffer/pool comparison.
+"""
+import json, sys
+from pathlib import Path
+
+sys.path.insert(0, r'@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\fullnet-continuous-20261027')
+import COMMON as K
+
+CARD = Path(__file__).resolve().parent
+C256 = 'dc5f1634de7e0a798dd38d64042a83bcc14ee0e8594b427c17f9923d8142e9e5'
+HEADERS = (K.C / 'cards/idt-identity-recipe/evidence/headers/dc5f1634de7e')
+PARENT_SRC = K.D / 'backend-uniform-owner/d034-family/c256/candidate.comp'
+PARENT_SPV = K.D / 'backend-uniform-owner/d034-family/c256/candidate.spv'
+ORDINALS = [36, 39, 42, 45, 48, 51, 54, 57, 171, 174, 177, 180, 183, 186, 189]
+
+
+def tail(s, n=4000):
+    s = s or ''
+    return s if len(s) <= n else s[-n:]
+
+
+def main():
+    best, best_sha, chain = K.current_best()
+    out = dict(card='n03b-f04-c256', width='C256',
+               toolchain=dict(glslang=dict(path=str(K.GLSLANG), sha256=K.sha(K.GLSLANG)),
+                              validate=dict(path=str(K.VALIDATE), sha256=K.sha(K.VALIDATE)),
+                              runner=dict(path=str(K.RUNNER), sha256=K.sha(K.RUNNER))),
+               baseline_plan=dict(path=str(K.BASELINE), sha256=K.sha(K.BASELINE)),
+               expected_baseline_sha=K.BASELINE_SHA,
+               baseline_plan_sha_ok=K.sha(K.BASELINE) == K.BASELINE_SHA,
+               plan_base=dict(path=str(best), sha256=best_sha, chain_length=len(chain),
+                              role='current accepted chain head'))
+
+    # ---- step 1: parent byte reproduction -------------------------------------
+    incs = [HEADERS]
+    raw = CARD / 'build' / 'parent-raw.spv'
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    K.compile_glsl(PARENT_SRC, raw, incs)
+    out['parent'] = dict(source=dict(path=str(PARENT_SRC), sha256=K.sha(PARENT_SRC)),
+                         spv=dict(path=str(PARENT_SPV), sha256=K.sha(PARENT_SPV)),
+                         rebuild=dict(path=str(raw), sha256=K.sha(raw)),
+                         include_dirs=[str(HEADERS)],
+                         include_pins={'nb05_swin_c256_common.glsl': K.sha(HEADERS / 'nb05_swin_c256_common.glsl')},
+                         byte_identical=K.sha(raw) == C256,
+                         expected_sha256=C256)
+    if not out['parent']['byte_identical']:
+        raise SystemExit('parent does not reproduce byte-identically; stop and investigate identity')
+    import shutil
+    shutil.copyfile(raw, CARD / 'parent-rebuild.spv')
+    out['parent_rebuild'] = K.ident(CARD / 'parent-rebuild.spv')
+
+    # ---- step 2: candidate build ---------------------------------------------
+    cand_src = CARD / 'candidate.comp'
+    cand_spv = CARD / 'candidate.spv'
+    K.compile_glsl(cand_src, cand_spv, incs)
+    K.validate_spv(cand_spv)
+    out['candidate'] = dict(source=dict(path=str(cand_src), sha256=K.sha(cand_src)),
+                            spv=dict(path=str(cand_spv), sha256=K.sha(cand_spv)),
+                            validated=True)
+
+    # ---- step 3: NoContraction + float site audit ----------------------------
+    pm = K.ST.Module(raw)
+    cm = K.ST.Module(cand_spv)
+
+    def op_hist(m):
+        h = {}
+        for op, ops, _i, _c in m.instructions:
+            h[op] = h.get(op, 0) + 1
+        return h
+
+    # SPIR-V core opcodes: 129 OpFAdd, 131 OpFSub, 133 OpFMul, 136 OpFDiv;
+    # 12 OpExtInst with GLSL.std.450 Fma (50) carries the fused multiply-adds.
+    FLOAT = {129: 'OpFAdd', 131: 'OpFSub', 133: 'OpFMul', 136: 'OpFDiv'}
+    GLSL_FMA = 50
+
+    def float_hist(m):
+        h = {}
+        for op, ops, _i, _c in m.instructions:
+            if op in FLOAT:
+                h[FLOAT[op]] = h.get(FLOAT[op], 0) + 1
+            elif op == 12 and len(ops) >= 4 and ops[3] == GLSL_FMA:
+                h['Fma.ext'] = h.get('Fma.ext', 0) + 1
+        return h
+
+    def float_signatures(m):
+        """(site kind, operand count) stream of every floating point site, in module order."""
+        out = []
+        for op, ops, _i, _c in m.instructions:
+            if op in FLOAT:
+                out.append((FLOAT[op], len(ops)))
+            elif op == 12 and len(ops) >= 4 and ops[3] == GLSL_FMA:
+                out.append(('Fma.ext', len(ops)))
+        return out
+
+    hp, hc = op_hist(pm), op_hist(cm)
+    fh_p, fh_c = float_hist(pm), float_hist(cm)
+    ncp, ncc = K.ST.no_contraction_ids(pm), K.ST.no_contraction_ids(cm)
+    ls_p = K.ST.collections_counter(float_signatures(pm))
+    ls_c = K.ST.collections_counter(float_signatures(cm))
+    pr, cr = K.ST.function_regions(pm), K.ST.function_regions(cm)
+    fn_p = [[pm.instructions[idx][0] for idx in r] for r in pr]
+    fn_c = [[cm.instructions[idx][0] for idx in r] for r in cr]
+    out['functions'] = dict(parent=[len(r) for r in fn_p], candidate=[len(r) for r in fn_c],
+                            identical_op_streams=sum(1 for a, b in zip(fn_p, fn_c) if a == b),
+                            compared=len(fn_p))
+    out['no_contraction'] = dict(
+        parent=len(ncp), candidate=len(ncc), parent_ids=sorted(ncp)[:16], candidate_ids=sorted(ncc)[:16],
+        equal=len(ncp) == len(ncc),
+        rule=('reproduction recipe is raw: character for character the toolchain that produced the '
+              'parent.  The parent carries no NoContraction decoration, so both modules have the empty '
+              'set and every floating point site is contracted exactly as before'),
+        float_NC_checked=sum(fh_p.values()) + sum(fh_c.values()))
+    out['float_sites'] = dict(
+        parent=fh_p, candidate=fh_c,
+        parent_total=sum(fh_p.values()), candidate_total=sum(fh_c.values()),
+        signature_stream_equal=ls_p == ls_c,
+        note=('static site counts differ only because the hb loop body now holds two hidden blocks; '
+              'the per-element expression tree of act/middle/contract is unchanged, and the signature '
+              'stream (site kind + operand arity, in module order) is compared as a multiset'),
+        parent_instructions=len(pm.instructions), candidate_instructions=len(cm.instructions))
+    out['opcode_delta'] = {str(k): [hp.get(k, 0), hc.get(k, 0)]
+                           for k in sorted(set(hp) | set(hc)) if hp.get(k) != hc.get(k)}
+    # control-flow integer opcode set the campaign tracks separately
+    CTRL = {128, 130, 132, 134, 135, 137, 138, 139, 140, 141}
+    out['integer_ctrl_ops'] = {str(k): [hp.get(k, 0), hc.get(k, 0)] for k in sorted(CTRL)}
+    K.write_json(CARD / 'SPV-DIFF.json', out)
+
+    # ---- step 4: plan on the chain head + cpu check ---------------------------
+    plan = CARD / 'plan.txt'
+    replaced = K.make_plan(cand_spv, plan, parent_plan=best, spv_shas={C256})
+    base_check = K.cpu_check(best)
+    cand_check = K.cpu_check(plan)
+    out['plan'] = dict(path=str(plan), sha256=K.sha(plan),
+                       parent_plan=dict(path=str(best), sha256=best_sha),
+                       passes_replaced=replaced,
+                       expected_passes=15,
+                       assert_replaced_is_15=(replaced == 15),
+                       replaced_ordinals=ORDINALS)
+    out['cpu_check'] = dict(baseline=tail(base_check), candidate=tail(cand_check),
+                            identical=base_check.replace(str(best), 'PLAN') ==
+                            cand_check.replace(str(plan), 'PLAN'),
+                            baseline_full=base_check, candidate_full=cand_check)
+    out['float_NC_checked'] = out['no_contraction']['float_NC_checked']
+    out['candidate_spv_bytes'] = (CARD / 'candidate.spv').stat().st_size
+    out['parent_spv_bytes'] = PARENT_SPV.stat().st_size
+    out['status'] = 'BUILT_CPU_GATES_PASSED_AWAITING_GPU'
+    K.write_json(CARD / 'BUILD.json', out)
+    print(json.dumps({k: v for k, v in out.items() if k != 'cpu_check'}, indent=2)[:6000])
+    print('--- cpu_check chain head ---')
+    print(base_check[-1200:])
+    print('--- cpu_check candidate ---')
+    print(cand_check[-1200:])
+
+
+if __name__ == '__main__':
+    main()

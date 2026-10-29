@@ -1,0 +1,114 @@
+"""Estimate the frame-wide matrix-pipe (XMX) utilisation from ISA + plan geometry.
+
+Measured inputs:
+  * dpas instructions per thread, from each PASS's own shader ISA capture
+  * workgroups per dispatch, from the plan's PASS line (gx gy gz)
+  * local workgroup size, from the SPIR-V LocalSize execution mode (opcode 16, mode 17)
+
+One dpas instruction is executed once per SUBGROUP (its lanes are the SIMD32 media lanes),
+so instances = dpas_static * (local_size / 32) * workgroups.
+
+Assumptions stated in the output: one dpas.8x8.f16 retires 8x8x8 = 512 MACs, 1 MAC = 2 flop,
+frame time = the measured ordinary mean. The profiler invocation in this campaign collects
+only GpuTime, so this is an arithmetic occupancy, not a hardware counter.
+"""
+import json, struct, sys
+from collections import defaultdict
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+import ISA
+from audit_card import pass_lines
+
+cur = K.read_json(K.C / 'CURRENT.json')
+head = Path(cur['best_plan']['path'])
+recs = pass_lines(head)
+rows = K.rows()
+
+
+def local_size(spv_path):
+    d = Path(spv_path).read_bytes()
+    w = struct.unpack('<%dI' % (len(d) // 4), d[:len(d) // 4 * 4])
+    i = 5
+    while i < len(w):
+        wc = w[i] >> 16
+        op = w[i] & 0xFFFF
+        if wc == 0:
+            break
+        if op == 16 and w[i + 2] == 17:          # OpExecutionMode, LocalSize
+            return (w[i + 3], w[i + 4], w[i + 5])
+        i += wc
+    return None
+
+
+idx = K.read_json(K.C / 'evidence' / 'NATIVE-INDEX.json')
+by_ord = {}
+def walk(node):
+    if isinstance(node, dict):
+        if 'ordinal' in node and 'baseline_kernel_hash' in node:
+            by_ord.setdefault(int(node['ordinal']), node['baseline_kernel_hash'])
+        for v in node.values():
+            walk(v)
+    elif isinstance(node, list):
+        for v in node:
+            walk(v)
+walk(idx)
+
+want = set(str(v)[:16] for v in by_ord.values())
+found = {}
+for p in (K.C / 'queue').rglob('*.asm'):
+    for wnt in want:
+        if wnt and wnt in p.name:
+            found.setdefault(wnt, p)
+        if len(found) == len(want):
+            break
+
+total_dpas = 0
+total_macs = 0
+local_sizes = defaultdict(int)
+per_pass = []
+DPAS_MACS = 512
+for r in rows:
+    o = r['ordinal']
+    kh = str(by_ord.get(o, ''))[:16]
+    p = found.get(kh)
+    ls = local_size(recs[o]['spv'])
+    assert ls, ('no LocalSize', o)
+    local_sizes[ls] += 1
+    if p is None:
+        continue
+    dpas = ISA.summary(p)['dpas']
+    toks = recs[o]['line'].split()
+    gx, gy, gz = int(toks[-3]), int(toks[-2]), int(toks[-1])
+    threads = ls[0] * ls[1] * ls[2]
+    subgroups = max(1, threads // 32)
+    wgs = gx * gy * gz
+    inst = dpas * subgroups * wgs
+    total_dpas += inst
+    total_macs += inst * DPAS_MACS
+    per_pass.append((o, r['name'], dpas, threads, wgs, inst))
+
+frame_ms = 17.80
+macs_per_s = total_macs / (frame_ms * 1e-3)
+flops = macs_per_s * 2
+print('passes counted: %d / 232' % len(per_pass))
+print('local sizes:', dict(local_sizes))
+print('total dpas executions per frame: %.3e' % total_dpas)
+print('total MACs per frame:           %.3e' % total_macs)
+print('achieved: %.1f GMAC/s  =  %.2f TFLOPS (fp16, 1 MAC = 2 flop)' % (macs_per_s / 1e9, flops / 1e12))
+print('frame assumed %.2f ms' % frame_ms)
+print('')
+print('matrix-pipe utilisation, for a range of plausible FP16 peaks:')
+for peak in (24e12, 48e12, 96e12, 116e12, 233e12):
+    print('  peak %6.0f TFLOPS  ->  %5.1f%%' % (peak / 1e12, 100 * flops / peak))
+per_pass.sort(key=lambda x: -x[5])
+print('\ntop 6 dispatches by dpas executions/frame:')
+for o, name, dpas, th, wgs, inst in per_pass[:6]:
+    print('  ord %3d %-28s dpas %3d x %3d thr x %6d wg = %.3e' % (o, name, dpas, th, wgs, inst))
+K.write_json(K.C / 'evidence' / 'XMX-UTILISATION.json',
+             dict(assumptions=dict(macs_per_dpas=DPAS_MACS, frame_ms=frame_ms, flop_per_mac=2,
+                                   instances_per_dpas='one per subgroup'),
+                  passes_counted=len(per_pass), local_sizes={str(k): v for k, v in local_sizes.items()},
+                  total_dpas_per_frame=total_dpas, total_macs_per_frame=total_macs,
+                  achieved_tflops=flops / 1e12,
+                  note='arithmetic occupancy from ISA dpas counts x plan grid x SPIR-V LocalSize; the profiler here collects only GpuTime'))

@@ -1,0 +1,221 @@
+"""S08: re-score the b31 FFN in the ACTUAL quantised-upstream domain.
+
+Input (from the main executor's resident capture, unique allocation offset):
+  work/dsh-fullnet-static-20261029/gpu/runs/input-capture/xq-vit-b31.bin
+  = block30_out (the ViT-block31 expand A operand) as the INT8 chain really produces it.
+
+Two different questions, kept apart on purpose:
+  Q1 (domain shift)  how far is the actual input from the FP16 teacher input?
+  Q2 (does the pack still win?)  conditional on the ACTUAL input, how close is the INT8 FFN to
+     the FP16 FFN fed the SAME input?  The reference is therefore an FP16 forward on the
+     actual X, not the recorded teacher dump (which belongs to a different X and would
+     dominate any comparison with a 64% input difference).
+
+Also reports, as a diagnostic only, what a single-frame refit in the actual domain would buy
+(upper bound; fitting a frame on itself is exactly the SINGLE_FRAME_DIAGNOSTIC defect).
+"""
+from pathlib import Path
+import hashlib
+import json
+
+import numpy as np
+
+R = Path("@NR_WORKSPACE@")
+S = R / "work/dsh-fullnet-static-20261029/S08-vit"
+Q = R / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+ACTUAL = R / "work/dsh-fullnet-static-20261029/gpu/runs/input-capture/xq-vit-b31.bin"
+FP16W = R / "src/project/artifacts/parallel-port-20261013/vit/block31/vit_weights.fp16.bin"
+OLDPACK = R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-v1/pack/vit_block31_weights.int8.bin"
+NEWPACK = S / "PACK/vit_block31_weights.int8.s08.bin"
+W_HALF = dict(WE=(0, 4096, 1024), WC=(4194304, 1024, 4096))
+GAIN_HALF = 12582912
+WS_OFF, EW_OFF, AC_OFF = 9437184, 9437248, 9453632
+WG_OFF, NEW_X, NEW_A = 9461824, 12623936, 12628032
+WC8 = 4194304
+M, KX, NE, NY = 288, 1024, 4096, 1024
+TEACH = [D / "dump-fp16", D / "teacher-diagnostics/teacher-41444", D / "teacher-diagnostics/teacher-43654"]
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def idx_half(n, k, N, K):
+    return (n // 32) * (K // 16) * 512 + (k // 16) * 512 + (n % 32) * 16 + (k % 16)
+
+
+def idx_int8(n, k, N, K):
+    return (n // 32) * (K // 32) * 1024 + (k // 32) * 1024 + (n % 32) * 32 + (k % 32)
+
+
+def unpack_half(flat, off, N, K):
+    n = np.arange(N)[:, None]
+    k = np.arange(K)[None, :]
+    return flat[off + idx_half(n, k, N, K)]
+
+
+def half(v):
+    return np.asarray(v, np.float32).astype(np.float16).astype(np.float32)
+
+
+def cubic(z):
+    z = np.float16(z)
+    t = np.clip(z, np.float16(-4.0), np.float16(4.0)).astype(np.float32)
+    u = half(np.float32(-0.055908203125) * np.abs(t) + np.float32(0.447265625))
+    v = half(t * u + np.float32(0.89453125))
+    return half(z.astype(np.float32) * v)
+
+
+def code(v, inv):
+    c = np.asarray(v, np.float32) * np.asarray(inv, np.float32)
+    return np.clip(np.rint(c), -127, 127).astype(np.int16)
+
+
+def rowscale(W):
+    ch = np.abs(W).max(axis=1)
+    return np.where(ch > 0, ch / 127.0, 1.0).astype(np.float32)
+
+
+def rowq(W, s):
+    return np.clip(np.rint(W / s.astype(np.float64)[:, None]), -127, 127).astype(np.int8)
+
+
+def load_pack(path):
+    b = Path(path).read_bytes()
+    p8 = np.frombuffer(b, np.int8)
+    return dict(
+        b=b, cE=p8[idx_int8(np.arange(4096)[:, None], np.arange(1024)[None, :], 4096, 1024)],
+        cC=p8[WC8 + idx_int8(np.arange(1024)[:, None], np.arange(4096)[None, :], 1024, 4096)],
+        ws=np.frombuffer(b[WS_OFF:WS_OFF + 64], dtype="<f4"),
+        ew=np.frombuffer(b[EW_OFF:EW_OFF + 16384], dtype="<f4"),
+        ac=np.frombuffer(b[AC_OFF:AC_OFF + 4096], dtype="<f4"),
+        wg=np.frombuffer(b[WG_OFF:WG_OFF + 2048], dtype="<f2").astype(np.float32),
+        invx=np.frombuffer(b[NEW_X:NEW_X + 4096], dtype="<f4") if Path(path) == NEWPACK else None,
+        inva=np.frombuffer(b[NEW_A:NEW_A + 16384], dtype="<f4") if Path(path) == NEWPACK else None)
+
+
+def fwd(pk, X):
+    """INT8 FFN. Old pack has no per-channel tables -> single ws[8]/ws[9]."""
+    invx = pk["invx"] if pk["invx"] is not None else np.float32(pk["ws"][8])
+    inva = pk["inva"] if pk["inva"] is not None else np.float32(pk["ws"][9])
+    qX = code(X, invx)
+    E = half((qX.astype(np.float64) @ pk["cE"].astype(np.float64).T).astype(np.float32) * pk["ew"][None, :])
+    A = cubic(E)
+    qA = code(A, inva)
+    lin = (qA.astype(np.float64) @ pk["cC"].astype(np.float64).T).astype(np.float32) * pk["ac"][None, :]
+    Y = half(pk["wg"].astype(np.float64)[None, :] * X + lin.astype(np.float64)).astype(np.float32)
+    return dict(Y=Y, A=A, qX_sat=int(np.count_nonzero(np.abs(X * np.atleast_1d(invx)[None, :]) > 127.0)),
+                qA_sat=int(np.count_nonzero(np.abs(A * np.atleast_1d(inva)[None, :]) > 127.0)),
+                A_absmax=float(np.abs(A).max()))
+
+
+def main():
+    out = {"inputs": {}}
+    flat16 = np.frombuffer(FP16W.read_bytes(), dtype="<f2")
+    WE = unpack_half(flat16, *W_HALF["WE"]).astype(np.float64)
+    WC = unpack_half(flat16, *W_HALF["WC"]).astype(np.float64)
+    gain = flat16[GAIN_HALF:GAIN_HALF + 1024].astype(np.float32).astype(np.float64)
+
+    def fp16_ref(X):
+        return half(gain[None, :] * X.astype(np.float64)
+                    + (cubic(half(X @ (rowq(WE, rowscale(WE)).astype(np.float64)
+                                        * rowscale(WE).astype(np.float64)[:, None]).T))
+                       @ (rowq(WC, rowscale(WC)).astype(np.float64)
+                          * rowscale(WC).astype(np.float64)[:, None]).T).astype(np.float64)).astype(np.float32)
+
+    raw = np.fromfile(ACTUAL, dtype="<f2")
+    Xa = raw[:M * KX].reshape(M, KX).astype(np.float32)
+    out["inputs"]["actual"] = dict(path=str(ACTUAL), sha256=sha(ACTUAL), bytes=ACTUAL.stat().st_size,
+                                   halves=int(raw.size), live_rows=M,
+                                   tail_absmax=float(np.abs(raw[M * KX:]).max()) if raw.size > M * KX else None,
+                                   absmax=float(np.abs(Xa).max()), rms=float(np.sqrt(np.mean(Xa.astype(np.float64) ** 2))))
+    t0 = np.fromfile(TEACH[0] / "dump_block30_out.bin", dtype="<f2")[:M * KX].reshape(M, KX).astype(np.float32)
+    out["inputs"]["teacher_34189"] = dict(absmax=float(np.abs(t0).max()),
+                                          rms=float(np.sqrt(np.mean(t0.astype(np.float64) ** 2))))
+    d = Xa.astype(np.float64) - t0.astype(np.float64)
+    out["inputs"]["domain_shift"] = dict(rel_l2=float(np.linalg.norm(d) / np.linalg.norm(t0.astype(np.float64))),
+                                         corr=float(np.corrcoef(Xa.ravel().astype(np.float64),
+                                                                t0.ravel().astype(np.float64))[0, 1]))
+    for t in TEACH[1:]:
+        tt = np.fromfile(t / "dump_block30_out.bin", dtype="<f2")[:M * KX].reshape(M, KX).astype(np.float32)
+        dd = Xa.astype(np.float64) - tt.astype(np.float64)
+        out["inputs"].setdefault("actual_vs_other_teachers", {})[t.name] = float(
+            np.linalg.norm(dd) / np.linalg.norm(tt.astype(np.float64)))
+
+    old, new = load_pack(OLDPACK), load_pack(NEWPACK)
+    Yref_a = fp16_ref(Xa)
+    out["actual_domain"] = {}
+    for name, pk in (("old_v1_pack", old), ("new_s08_pack", new)):
+        r = fwd(pk, Xa)
+        e = r["Y"].astype(np.float64) - Yref_a.astype(np.float64)
+        out["actual_domain"][name] = dict(
+            rel_l2=float(np.linalg.norm(e) / np.linalg.norm(Yref_a.astype(np.float64))),
+            mse=float(np.mean(e ** 2)), A_absmax=r["A_absmax"],
+            qX_sat=r["qX_sat"], qA_sat=r["qA_sat"],
+            pack_sha256=sha(OLDPACK if name.startswith("old") else NEWPACK))
+
+    # teacher domain, same code, for the side-by-side
+    Yref_t = fp16_ref(t0)
+    out["teacher_domain_34189"] = {}
+    for name, pk in (("old_v1_pack", old), ("new_s08_pack", new)):
+        r = fwd(pk, t0)
+        e = r["Y"].astype(np.float64) - Yref_t.astype(np.float64)
+        out["teacher_domain_34189"][name] = dict(
+            rel_l2=float(np.linalg.norm(e) / np.linalg.norm(Yref_t.astype(np.float64))),
+            qX_sat=r["qX_sat"], qA_sat=r["qA_sat"])
+
+    # how far is the actual domain from the per-channel basis the new pack was fitted on?
+    Da = np.frombuffer(new["b"][NEW_A:NEW_A + 16384], dtype="<f4")       # inva
+    Dx = np.frombuffer(new["b"][NEW_X:NEW_X + 4096], dtype="<f4")
+    Aa = fwd(new, Xa)["A"]
+    fitted_a_absmax = (np.float32(127.0) / Da).astype(np.float64)        # implied per-channel amax
+    actual_a_absmax = np.abs(Aa).astype(np.float64).max(axis=0)
+    fitted_x_absmax = (np.float32(127.0) / Dx).astype(np.float64)
+    actual_x_absmax = np.abs(Xa).astype(np.float64).max(axis=0)
+    out["domain_basis_check"] = dict(
+        x_channel_ratio=dict(median=float(np.median(actual_x_absmax / fitted_x_absmax)),
+                             p05=float(np.percentile(actual_x_absmax / fitted_x_absmax, 5)),
+                             p95=float(np.percentile(actual_x_absmax / fitted_x_absmax, 95)),
+                             max=float(np.max(actual_x_absmax / fitted_x_absmax))),
+        a_channel_ratio=dict(median=float(np.median(actual_a_absmax / fitted_a_absmax)),
+                             p05=float(np.percentile(actual_a_absmax / fitted_a_absmax, 5)),
+                             p95=float(np.percentile(actual_a_absmax / fitted_a_absmax, 95)),
+                             max=float(np.max(actual_a_absmax / fitted_a_absmax))),
+        reading="ratio > 1 means the actual frame exceeds the fitted per-channel absmax for that channel "
+                "(headroom consumed); the median tells whether the fitted basis still lines up")
+
+    # diagnostic-only: refit on this single frame (upper bound, NOT a candidate)
+    AXa = np.abs(Xa).max(axis=0)
+    AAa = np.abs(Aa).max(axis=0)
+    g = 0.8
+    Dxa = np.exp2(np.rint(g * np.log2(np.maximum(AXa, 1e-8)))).astype(np.float32)
+    Daa = np.exp2(np.rint(g * np.log2(np.maximum(AAa, 1e-8)))).astype(np.float32)
+    bx = np.float32(np.max(AXa / Dxa) / 127.0) * np.float32(1.02)
+    ba = np.float32(np.max(AAa / Daa) / 127.0) * np.float32(1.02)
+    WEx, WCx = WE * Dxa.astype(np.float64)[None, :], WC * Daa.astype(np.float64)[None, :]
+    sE, sC = rowscale(WEx), rowscale(WCx)
+    refit = dict(cE=rowq(WEx, sE), cC=rowq(WCx, sC), ew=(bx * sE).astype(np.float32),
+                 ac=(ba * sC).astype(np.float32), ws=np.zeros(16, np.float32),
+                 wg=new["wg"], invx=(np.float32(1.0) / (bx * Dxa)).astype(np.float32),
+                 inva=(np.float32(1.0) / (ba * Daa)).astype(np.float32), b=b"")
+    r = fwd(refit, Xa)
+    e = r["Y"].astype(np.float64) - Yref_a.astype(np.float64)
+    out["single_frame_refit_diagnostic"] = dict(
+        rel_l2=float(np.linalg.norm(e) / np.linalg.norm(Yref_a.astype(np.float64))),
+        qX_sat=r["qX_sat"], qA_sat=r["qA_sat"],
+        label="SINGLE_FRAME_DIAGNOSTIC_NOT_CALIBRATION - fitted on the very frame it is scored on")
+
+    o = out["actual_domain"]["old_v1_pack"]["rel_l2"]
+    n = out["actual_domain"]["new_s08_pack"]["rel_l2"]
+    out["verdict"] = dict(
+        actual_domain_old=o, actual_domain_new=n, improvement=float(1.0 - n / o),
+        ordering_holds=bool(n < o),
+        note="actual domain = INT8 chain's own block30_out; reference = FP16 FFN on the same X")
+    (S / "CALIBRATION-ACTUAL.json").write_text(json.dumps(out, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps(out, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

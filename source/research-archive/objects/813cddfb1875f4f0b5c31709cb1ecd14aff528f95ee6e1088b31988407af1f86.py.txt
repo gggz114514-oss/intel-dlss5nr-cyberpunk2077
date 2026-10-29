@@ -1,0 +1,114 @@
+"""Decode-variant sweep: rank layout hypotheses by the free-fit residual.
+
+For each variant we compute E codes from the variant decode, then solve
+    min_A || (Y_gpu - seed) - A @ eq ||
+The residual is invariant to any permutation of the 128 E channels and to any K
+permutation of the contract tiles, so a small residual means the *values* are right.
+"""
+import sys, json, itertools
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+BLOCK = int(sys.argv[1]) if len(sys.argv) > 1 else 4
+ARMS = {1: ("c32-minmax/local-b1.txt", "c32-minmax/local-b1/replayed-network.bin"),
+        2: ("c32-minmax/local-b2.txt", "c32-minmax/local-b2/replayed-network.bin"),
+        3: ("c32-minmax/local-b3.txt", "c32-minmax/local-b3/replayed-network.bin"),
+        4: ("c32-minmax/local-b4.txt", "c32-minmax/local-b4/replayed-network.bin")}
+info = L.block_bindings(L.D / ARMS[BLOCK][0], ordinal=BLOCK)
+x_flat = np.fromfile(info["input"], dtype="<f2")
+gpu = np.fromfile(L.D / ARMS[BLOCK][1], dtype="<f2")
+wb = np.fromfile(info["wb"], dtype="<f2")
+w8raw = np.fromfile(info["w8"], dtype=np.int8)
+fsc = L.load_fsc(info["fsc"])
+
+rng = np.random.default_rng(5)
+tiles = np.sort(rng.choice(168 * 96, size=800, replace=False))
+TT, CC = np.meshgrid(tiles, np.arange(16), indexing="ij")
+TT = TT.ravel(); CC = CC.ravel()
+base = TT * 512 + CC * 16
+
+
+def take(flat):
+    out = np.empty((32, TT.size), np.float16)
+    for c in range(32):
+        off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+        out[c] = flat[base + off]
+    return out
+
+
+ref = take(gpu).astype(np.float64)
+
+
+def expand_weights(mode):
+    if mode == "k32m":            # A[m][k] = tile[k*32+m]         (current)
+        return w8raw[0:16384].reshape(16, 32, 32)[:, :, :8].transpose(0, 2, 1).reshape(128, 32).astype(np.int16)
+    if mode == "k8m":             # A[m][k] = tile[k*8+m]          (packed 8-wide rows)
+        t = w8raw[0:16384].reshape(16, 32, 32)
+        return np.stack([t[g, :, m] for g in range(16) for m in range(8)]).astype(np.int16)
+    if mode == "m32k":            # A[m][k] = tile[m*32+k]
+        t = w8raw[0:16384].reshape(16, 32, 32)
+        return np.stack([t[g, m, :] for g in range(16) for m in range(8)]).astype(np.int16)
+    raise ValueError(mode)
+
+
+def contract_weights(mode):
+    ct = w8raw[16384:32768].reshape(16, 32, 32)
+    wc = np.zeros((32, 128), np.int16)
+    for step in range(4):
+        for g in range(4):
+            idx = g * 4 + step if mode == "g4s" else step * 4 + g
+            t = ct[idx][:, :8]
+            for m in range(8):
+                wc[g * 8 + m, step * 32:step * 32 + 32] = t[:, m]
+    return wc
+
+
+def rs_variants():
+    return {"zero": np.zeros(32, np.float16),
+            "p2x+0": wb[info["rs_base"]:info["rs_base"] + 32].astype(np.float16),
+            "p2x+8": wb[info["rs_base"] + 8:info["rs_base"] + 40].astype(np.float16),
+            "p2x+40": wb[info["rs_base"] + 40:info["rs_base"] + 72].astype(np.float16)}
+
+
+x_cur = L.gather(x_flat, TT, CC)
+# transposed gather: element (c,t) at base + c*16 + t
+xT = np.empty_like(x_cur)
+for c in range(32):
+    off = (c // 16) * 256 + ((c // 8) % 2) * 8 + (c % 8)
+    xT[c] = x_flat[base + (c % 16) * 16 + (c // 16) * 2 + (c // 8) % 2]
+
+results = []
+for wemode, wcmode, xmode, actmode, rsmode, invmode in itertools.product(
+        ["k32m", "k8m", "m32k"], ["g4s", "s4g"], ["current"], ["x", "t"], list(rs_variants()), ["scalar", "perchan"]):
+    we = expand_weights(wemode)
+    wc = contract_weights(wcmode)
+    x = x_cur
+    invx = (fsc[L.FSC_INVX:L.FSC_INVX + 32] if invmode == "perchan" and fsc.size >= L.FSC_INVX + 32
+            else np.full(32, fsc[L.FSC_INV_X], np.float32))
+    invE = np.float32(fsc[L.FSC_INV_E])
+    xq = L.code8_ch(x, invx)
+    acc_e = np.rint(we.astype(np.float64) @ xq.astype(np.float64)).astype(np.int32)
+    e_f32 = acc_e.astype(np.float32) * fsc[4:132][:, None]
+    e_h = L.to_half(e_f32)
+    if actmode == "x":
+        a_h = L.act_h(e_h)
+    else:  # act on the clamped value
+        t = np.clip(e_h, np.float16(-4), np.float16(4))
+        u = L.to_half(np.float32(-0.055908203125) * np.abs(t).astype(np.float32) + np.float32(0.447265625))
+        inner = L.to_half(t.astype(np.float32) * u.astype(np.float32) + np.float32(0.89453125))
+        a_h = L.to_half(t.astype(np.float32) * inner.astype(np.float32))
+    eq = L.code8_ch(a_h, np.full(128, invE))
+    seed = L.widen(L.to_half(x * rs_variants()[rsmode][:, None]))
+    target = ref - seed
+    A, *_ = np.linalg.lstsq(eq.astype(np.float64).T, target.T, rcond=None)
+    resid = target.T - eq.astype(np.float64).T @ A
+    rel = float(np.linalg.norm(resid) / np.linalg.norm(target))
+    results.append(dict(we=wemode, wc=wcmode, act=actmode, rs=rsmode, inv=invmode, fit_resid=rel))
+results.sort(key=lambda r: r["fit_resid"])
+for r in results[:12]:
+    print(r)
+(Path(__file__).resolve().parent / f"sweep_b{BLOCK}.json").write_text(json.dumps(results, indent=2))
+print("worst:", results[-1])

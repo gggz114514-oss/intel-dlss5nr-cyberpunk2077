@@ -67,7 +67,7 @@ struct History { size_t source,destination; VkDeviceSize sourceOffset,destinatio
 struct Plan { std::vector<Buffer> buffers; std::vector<Pass> passes; std::vector<Output> outputs; std::vector<History> history; };
 struct Pipeline { VkPipeline handle; VkPipelineLayout layout; VkDescriptorSetLayout descriptors; };
 
-static constexpr size_t kPlanRows = 76;
+#include "port_network_bridge_backend_model_identity.inc"
 static std::string read_quoted_path(std::istream& in) {
     char ch=0; in>>std::ws; if(!(in>>ch)||ch!='"') throw std::runtime_error("expected quoted path");
     std::string value; while(in.get(ch)){ if(ch=='"') return value; value.push_back(ch);}
@@ -81,14 +81,20 @@ static Plan read_plan(const std::string& path) {
     size_t rows, nb, np, no;
     file >> word >> rows >> nb >> np >> no;
     if (word != "PORT_NETWORK_1" || rows != kPlanRows || !nb || !np || !no)
-        throw std::runtime_error("network requires a complete Small prepared plan");
+        throw std::runtime_error("network requires a complete plan matching the built model");
     Plan plan;
+    const auto planDir = std::filesystem::absolute(path).parent_path();
+    auto assetPath = [&](const std::string& value) {
+        if (value == "-") return value;
+        auto p = std::filesystem::path(value);
+        return (p.is_absolute() ? p : planDir / p).lexically_normal().string();
+    };
     for (size_t i = 0; i < nb; ++i) {
         Buffer buffer;
         file >> word;
         buffer.name = read_quoted_path(file);
         file >> buffer.bytes;
-        buffer.path = read_quoted_path(file);
+        buffer.path = assetPath(read_quoted_path(file));
         if (word != "BUFFER" || !buffer.bytes) throw std::runtime_error("invalid BUFFER");
         plan.buffers.push_back(buffer);
     }
@@ -99,7 +105,7 @@ static Plan read_plan(const std::string& path) {
         size_t nbind, npush;
         file >> word >> pass.row;
         pass.name = read_quoted_path(file);
-        pass.spv = read_quoted_path(file);
+        pass.spv = assetPath(read_quoted_path(file));
         file >> pass.subgroup >> pass.shared >> nbind >> npush >> pass.gx >> pass.gy >> pass.gz;
         if (word != "PASS" || pass.row >= kPlanRows || int(pass.row) < previous ||
             pass.shared > 49152 || pass.subgroup != 32 || npush > 32 || !pass.gx || !pass.gy || !pass.gz)
@@ -543,7 +549,7 @@ static int execute(Plan& plan, const std::string& out, int warm, int reps, bool 
     for(double value:gpu_times) sum+=value;
     std::ofstream receipt(std::filesystem::path(out)/"port_network_receipt.json");
     receipt<<std::setprecision(9)<<"{\n  \"status\": \""<<((n_nan||n_inf)?"NONFINITE":"GPU_EXECUTED_NUMERIC_PENDING")
-           <<"\",\n  \"normal_close\": true,\n  \"original_plan_rows\": 76,\n  \"gpu_passes\": "<<plan.passes.size()
+           <<"\",\n  \"normal_close\": true,\n  \"original_plan_rows\": "<<kPlanRows<<",\n  \"gpu_passes\": "<<plan.passes.size()
            <<",\n  \"device\": \""<<properties.deviceName<<"\",\n  \"driver_version_raw\": "<<properties.driverVersion
            <<",\n  \"vulkan_memory_model_enabled\": true, \"vulkan_memory_model_device_scope_enabled\": false, \"vulkan_memory_model_availability_visibility_chains_enabled\": false"
            <<",\n  \"warm\": "<<warm<<", \"reps\": "<<reps<<",\n  \"nan\": "<<n_nan<<", \"inf\": "<<n_inf
@@ -613,7 +619,10 @@ int main(int argc,char** argv) {
     try {
         if(path.empty() || (!cpu && out.empty()) || warm<0 || reps<1) throw std::runtime_error("invalid runner arguments; see --help");
         auto plan=read_plan(path);
-        if(cpu) { std::cout<<"CPU_PLAN_OK 76 rows, "<<plan.passes.size()<<" passes, "<<plan.buffers.size()<<" buffers; no Vulkan loaded\n"; return 0; }
+        if(cpu) {
+            for(const auto& b:plan.buffers) if(b.path!="-" && !std::filesystem::is_regular_file(b.path)) throw std::runtime_error("missing input asset "+b.path);
+            for(const auto& p:plan.passes) if(!std::filesystem::is_regular_file(p.spv)) throw std::runtime_error("missing shader asset "+p.spv);
+            std::cout<<"CPU_PLAN_OK "<<kPlanRows<<" rows, "<<plan.passes.size()<<" passes, "<<plan.buffers.size()<<" buffers; no Vulkan loaded\n"; return 0; }
         return execute(plan,out,warm,reps,pooled,feedback,dump,saveFrames,perPassTiming);
     } catch(const std::exception& error) { std::cerr<<"PORT_NETWORK_FAIL: "<<error.what()<<std::endl; return 1; }
 }

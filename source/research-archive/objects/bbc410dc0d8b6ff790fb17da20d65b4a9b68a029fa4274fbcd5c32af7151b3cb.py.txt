@@ -1,0 +1,207 @@
+# -*- coding: utf-8 -*-
+"""C00 part A: fixed comparison identity for the three frames.
+
+Writes evidence/identity.json.  Read-only outside C00-color-baseline.
+"""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/tools")
+import planlib  # noqa: E402
+
+B = Path(r"@NR_WORKSPACE@")
+Q = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+A = B / "work/codex-astra-fp16-int8-audit-20261024"
+W = B / "work/dsh-fullnet-static-20261029"
+D = Q / "real-int8-24"
+XE = W / "S02-f01/candidate-xe-{frame}.txt"
+C64 = D / "c64-family-static/combo-{frame}.txt"
+FP16_PLAN = A / "fullnet-continuous-20261027/backend-merged/plan.txt"
+OUT = Path(__file__).resolve().parent.parent / "evidence"
+
+FRAMES = [(34189, "day-street-static-formal-01"),
+          (41444, "day-street-motion-formal-01"),
+          (43654, "day-street-motion-formal-02")]
+
+_spv_cache = {}
+
+
+def spv_sha(p):
+    if p not in _spv_cache:
+        _spv_cache[p] = planlib.sha256_file(p) if Path(p).is_file() else None
+    return _spv_cache[p]
+
+
+TOL_BUFFER = __import__("re").compile(r'^BUFFER\s+"?([^"\s]+)"?\s+(\d+)\s+"?([^"\s]*)"?\s*$')
+TOL_PASS = __import__("re").compile(r'^PASS\s+(\d+)\s+"?([^"\s]+)"?\s+"?([^"\s]+)"?')
+TOL_BIND = __import__("re").compile(r'^BIND\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$')
+TOL_OUT = __import__("re").compile(r'^OUTPUT\s+(\d+)\s+(\S+)\s+"?([^"\s]+)"?\s*$')
+
+
+def tolerant_summary(plan_path: Path, why: str) -> dict:
+    """Fallback for plans planlib rejects (e.g. unquoted SPV paths)."""
+    import hashlib
+    import re
+    lines = plan_path.read_text(encoding="utf-8").splitlines()
+    buffers, passes, outputs, history = [], [], [], []
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        m = TOL_BUFFER.match(line)
+        if m:
+            buffers.append({"idx": len(buffers), "name": m.group(1), "bytes": int(m.group(2)),
+                            "file": m.group(3)})
+            continue
+        m = TOL_PASS.match(line)
+        if m:
+            passes.append({"ordinal": len(passes), "group": int(m.group(1)),
+                           "name": m.group(2), "spv": m.group(3), "push": None})
+            continue
+        if line.startswith("PUSH ") and passes:
+            passes[-1]["push"] = line.split()[1:]
+            continue
+        m = TOL_OUT.match(line)
+        if m:
+            outputs.append({"buffer": int(m.group(1)), "format": m.group(2), "file": m.group(3)})
+            continue
+        if line.startswith("HISTORY "):
+            history.append(line.split()[1:])
+    spvs = sorted({p["spv"] for p in passes})
+    spv_rows = [{"path": s.replace("\\", "/"), "sha256": spv_sha(s)} for s in spvs]
+    file_rows = [{"name": b["name"], "bytes": b["bytes"], "file": b["file"].replace("\\", "/"),
+                  "sha256": planlib.sha256_file(b["file"]) if Path(b["file"]).is_file() else None}
+                 for b in buffers if b["file"] != "-"]
+    h = hashlib.sha256()
+    for r in spv_rows:
+        h.update((r["sha256"] or "MISSING").encode())
+    for r in sorted(file_rows, key=lambda r: r["name"]):
+        h.update((r["sha256"] or "MISSING").encode())
+    name_by_idx = {b["idx"]: b for b in buffers}
+    return {
+        "plan": str(plan_path).replace("\\", "/"),
+        "plan_sha256_raw": planlib.sha256_file(plan_path),
+        "plan_sha256_text": None,
+        "parser": "tolerant-regex",
+        "parser_note": why,
+        "header": None,
+        "buffers": len(buffers),
+        "dispatches": len(passes),
+        "outputs": [{"buffer": o["buffer"], "name": name_by_idx[o["buffer"]]["name"],
+                     "bytes": name_by_idx[o["buffer"]]["bytes"], "format": o["format"],
+                     "file": o["file"]} for o in outputs],
+        "dispatch0_push": passes[0]["push"] if passes else None,
+        "history_lines": [" ".join(hh) for hh in history],
+        "distinct_spv": len(spv_rows),
+        "spv_set": spv_rows,
+        "file_buffers": file_rows,
+        "spv_pack_identity_sha256": h.hexdigest(),
+        "validation_problems": [],
+        "capture_bindings": {b["name"]: b["file"].replace("\\", "/") for b in buffers
+                             if b["file"].replace("\\", "/").lower().endswith(("pre.bin", "post.bin"))},
+    }
+
+
+def arm_summary(plan_path: Path) -> dict:
+    try:
+        pl = planlib.Plan(plan_path)
+    except planlib.PlanError as exc:
+        return tolerant_summary(plan_path, f"planlib rejected: {exc}")
+    problems = pl.validate()
+    spvs = sorted({p.spv for p in pl.passes})
+    spv_rows = [{"path": s.replace("\\", "/"), "sha256": spv_sha(s)} for s in spvs]
+    files = [b for b in pl.buffers if b.file != "-"]
+    file_rows = [{"name": b.name, "bytes": b.bytes, "file": b.file.replace("\\", "/"),
+                  "sha256": planlib.sha256_file(b.file) if Path(b.file).is_file() else None}
+                 for b in files]
+    # hash the whole SPV/pack identity as one digest
+    import hashlib
+    h = hashlib.sha256()
+    for r in spv_rows:
+        h.update((r["sha256"] or "MISSING").encode())
+    for r in sorted(file_rows, key=lambda r: r["name"]):
+        h.update((r["sha256"] or "MISSING").encode())
+    return {
+        "plan": str(plan_path).replace("\\", "/"),
+        "plan_sha256_raw": planlib.sha256_file(plan_path),
+        "plan_sha256_text": pl.sha256(),
+        "parser": "planlib",
+        "parser_note": None,
+        "header": list(pl.header),
+        "buffers": len(pl.buffers),
+        "dispatches": len(pl.passes),
+        "outputs": [{"buffer": o[0], "name": pl.buffers[o[0]].name, "bytes": pl.buffers[o[0]].bytes,
+                     "format": o[1], "file": o[2]} for o in pl.outputs],
+        "dispatch0_push": pl.passes[0].push if pl.passes else None,
+        "history_lines": [" ".join(h[0]) for h in pl.history],
+        "distinct_spv": len(spv_rows),
+        "spv_set": spv_rows,
+        "file_buffers": file_rows,
+        "spv_pack_identity_sha256": h.hexdigest(),
+        "validation_problems": problems,
+        "capture_bindings": {
+            b.name: b.file.replace("\\", "/") for b in pl.buffers
+            if b.file.replace("\\", "/").lower().endswith(("pre.bin", "post.bin"))
+        },
+    }
+
+
+ident = {"note": "C00 fixed comparison identity; both INT8 arms replay the same captured pre/post/history/seed.",
+         "fp16_reference_plan": arm_summary(FP16_PLAN), "frames": []}
+
+for frame, seq in FRAMES:
+    fdir = Q / f"dataset/{seq}/0-{frame}"
+    cap = json.loads((fdir / "capture.json").read_text())
+    row = {
+        "frame": frame, "sequence": seq,
+        "capture": {
+            "source_plan_sha256": cap["source_plan_sha256"],
+            "control_epoch": cap["control_epoch"],
+            "history_active": cap["history_active"],
+            "noise_seed": cap["noise_seed"],
+            "first_push": cap["first_push"],
+            "resolution": {"width": cap["first_push"][20], "height": cap["first_push"][21]},
+            "pre": {"bytes": cap["buffers"][0]["bytes"], "sha256": cap["buffers"][0]["sha256"]},
+            "post": {"bytes": cap["buffers"][1]["bytes"], "sha256": cap["buffers"][1]["sha256"]},
+            "output": {"bytes": cap["output"]["bytes"], "sha256": cap["output"]["sha256"]},
+        },
+        "reference_file": str(fdir / "network-output.bin").replace("\\", "/"),
+        "arms": {
+            "xe": arm_summary(Path(str(XE).format(frame=frame))),
+            "c64": arm_summary(Path(str(C64).format(frame=frame))),
+        },
+        "replayed": {
+            "xe": {"path": str(W / f"S02-f01/runs24/run-{frame}/replayed-network.bin").replace("\\", "/"),
+                   "sha256": planlib.sha256_file(W / f"S02-f01/runs24/run-{frame}/replayed-network.bin")},
+            "c64": {"path": str(D / f"c64-family-static/run-{frame}/replayed-network.bin").replace("\\", "/"),
+                    "sha256": planlib.sha256_file(D / f"c64-family-static/run-{frame}/replayed-network.bin")},
+        },
+    }
+    # structural arm-to-arm diff (XE vs c64) for this frame
+    xa = planlib.Plan(Path(str(XE).format(frame=frame)))
+    ca = planlib.Plan(Path(str(C64).format(frame=frame)))
+    d = planlib.diff_plans(ca, xa)
+    row["arm_diff_c64_to_xe"] = {
+        "buffers_added": d["buffers_added"], "buffers_removed": d["buffers_removed"],
+        "buffers_changed": d["buffers_changed"],
+        "dispatches_added": d["dispatches_added"], "dispatches_removed": d["dispatches_removed"],
+        "dispatch_change_count": len(d["dispatch_changes"]),
+        "dispatch_change_kinds": sorted({c["kind"] for c in d["dispatch_changes"]}),
+        "first_changes": d["dispatch_changes"][:6],
+    }
+    ident["frames"].append(row)
+    print(f"frame {frame}: xe plan {row['arms']['xe']['plan_sha256_raw'][:16]} "
+          f"c64 plan {row['arms']['c64']['plan_sha256_raw'][:16]} "
+          f"dispatch_changes={len(d['dispatch_changes'])} "
+          f"buffers_changed={len(d['buffers_changed'])} added={d['buffers_added']}")
+
+OUT.mkdir(parents=True, exist_ok=True)
+(OUT / "identity.json").write_text(json.dumps(ident, indent=1))
+print("wrote", OUT / "identity.json")
+print("fp16 plan raw sha", ident["fp16_reference_plan"]["plan_sha256_raw"])
+for row in ident["frames"]:
+    for k, v in row["arms"].items():
+        print(f"  {row['frame']} {k}: spv={v['distinct_spv']} files={len(v['file_buffers'])} "
+              f"push0words={len(v['dispatch0_push'])} history={v['history_lines']} "
+              f"problems={v['validation_problems']}")
+        print(f"    capture bindings: {v['capture_bindings']}")

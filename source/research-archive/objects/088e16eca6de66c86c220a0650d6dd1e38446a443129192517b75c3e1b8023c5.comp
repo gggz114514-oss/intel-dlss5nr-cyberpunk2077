@@ -1,0 +1,1455 @@
+// Complete transpose/register C32 handoff, CPU-generated literal fragments.
+// AMD purpose: fswin_t.comp167-205: feature rows are the next contraction K.
+// Intel coordinates come ONLY from the independently sealed measured helper.
+// K/V cross-SG shared is required and explicitly retained; all other intermediates stay registers.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#include "register_handoff.glsl"
+
+// ---- T3 transport variant: identity shuffle round-trips removed ----------
+// nrh_unpack2(p) was:
+//   uint moved = subgroupShuffle(p, lane ^ 1);
+//   uint back  = subgroupShuffle(moved, lane ^ 1);
+//   return unpackFloat2x16(back);
+// The two shuffles are exact inverses for every lane (id is lane^1 both
+// times), so back == p and the helper is unpackFloat2x16(p).  The value is
+// unchanged for every input; only the lane-transport instructions disappear.
+
+layout(local_size_x=128, local_size_y=1, local_size_z=1) in;
+layout(set=0,binding=0) buffer HalfBuf { float16_t wb[]; };
+layout(set=0,binding=1) buffer FloatBuf { float fb[]; };
+layout(set=0,binding=2) buffer ImageIn { float16_t imgin[]; };
+layout(set=0,binding=3) buffer ImageOut { float16_t imgout[]; };
+layout(set=0,binding=4) buffer DebugBuf { float16_t dbg[]; };
+layout(push_constant) uniform PC {
+    ivec4 p0; ivec4 p1; ivec4 p2; ivec4 p3;
+} pc;
+
+// ---- C32-I8 v1 declarations (generated) ----------------------------------
+layout(set=0,binding=5) readonly buffer C32I8Weights { int8_t w8[]; };
+layout(set=0,binding=6) readonly buffer C32I8Scales { float fsc[]; };
+// ---- unified INT8 tiles (this card) --------------------------------------
+// One 2048 B int8 tile per subgroup serves three disjoint lifetimes:
+//   X    : written by nr_i8_put_x, read once by the expand A/B step, then dead;
+//   Y    : written by nr_i8_put_y, read once by the twelve QKV steps, then dead;
+//   Ctx  : written after PV, read once by the four output-projection steps.
+// The three sets are separated in program order by at least one barrier, and
+// every one of them is partitioned identically (subgroup slot sg*512).
+shared int8_t sT8[2048];
+// Attention tiles.  K and V are read by every subgroup (attention spans the
+// whole 64-key tile), so both are workgroup-wide; Q, P and the context tile are
+// consumed by the owning subgroup only.
+shared int8_t sK8[2048];   // K codes   [key 64][dim 32], workgroup tile
+shared int8_t sV8[2048];   // V codes   [key 64][dim 32], workgroup tile
+shared int8_t sQ8[2048];   // Q codes   [token 16][dim 32] per subgroup slot
+shared int8_t sP8[4096];   // P codes   [query 16][key 64] per subgroup slot
+shared float sKsc[64];     // per-key K dequant scale, workgroup tile
+shared float sVpm[128];    // |V| partial maximum per (subgroup, dimension)
+// C2: shared E staging deleted -- E code words never leave registers.
+#include "c32_i8_common.glsl"
+#include "c2_i8_regk32.glsl"
+// --------------------------------------------------------------------------
+#define LROW gl_CooperativeMatrixLayoutRowMajor
+#define LCOL gl_CooperativeMatrixLayoutColumnMajor
+// half MpCubicSilu (guide §2.1): one rounding per half op
+float16_t nr_act_h(float16_t x) {
+    float16_t t = clamp(x, float16_t(-4.0), float16_t(4.0));
+    float16_t u = fma(float16_t(-0.055908203125), abs(t), float16_t(0.447265625));
+    return x * fma(t, u, float16_t(0.89453125));
+}
+
+// half swin exp (guide §2.3). M05 paired form: the former scalar
+// packHalf2x16/unpackHalf2x16 transform runs on two packed halves at once.
+// Bit-identical proof (CHANGES.md): the mantissa is bits 0..9, so
+// (h & 0x03ff03ff) << 5 sets only bits 5..14 of each 16-bit lane and can never
+// cross into the other half, for any input; the clamp keeps exactly the scalar
+// form's value domain, so fma/clamp/exception behaviour is unchanged.
+f16vec2 nr_exp_h2(f16vec2 xy) {
+    f16vec2 y = clamp(fma(xy, f16vec2(float16_t(0.044921875)), f16vec2(float16_t(1.30078125))),
+                      f16vec2(float16_t(1.03125)), f16vec2(float16_t(1.5693359375)));
+    uint h = packFloat2x16(y);
+    return unpackFloat2x16((h & 0x03ff03ffu) << 5u);
+}
+
+// M01: every call site uses t = t0 = sg*16 (so q = sg, s = 0) and c in
+// {0,8,16,24}; the tile base and oob are SG/WG-uniform and the four addresses
+// differ only by (c/16)*256 + c%16 in {0,8,256,264}. The base is formed once
+// per SG and broadcast — the AMD NR_WAVE_UNIFORM analog, applied only to
+// genuinely SG-uniform values, not a global macro.
+uint nr_tok_base(uint q, uint wx, uint wy, int shift, uint tiles_x, out bool oob) {
+    int tx = 2 * int(wx) + shift + int(q & 1u);
+    int ty = 2 * int(wy) + pc.p3.w + int(q >> 1u);
+    oob = (tx < 0 || ty < 0 || tx >= int(tiles_x) || ty >= pc.p3.z);
+    uint safe_tx = uint(clamp(tx, 0, int(tiles_x) - 1));
+    uint safe_ty = uint(clamp(ty, 0, pc.p3.z-1));
+    return (safe_ty * tiles_x + safe_tx) * 512u;   // s = 0, c = 0
+}
+
+// Measured CH ownership proved in CPU-local-reduction-proof.json.
+// Each lane owns one parity of16 features for its query column.
+f16vec2 nr_norm32_pair(NRH_CH q0,NRH_CH q1,NRH_CH q2,NRH_CH q3,
+                       NRH_CH k0,NRH_CH k1,NRH_CH k2,NRH_CH k3) {
+    float16_t qsq0_0=q0[0]*q0[0];
+    float16_t qsq0_1=q0[1]*q0[1];
+    float16_t qsq0_2=q0[2]*q0[2];
+    float16_t qsq0_3=q0[3]*q0[3];
+    float16_t qsq1_0=q1[0]*q1[0];
+    float16_t qsq1_1=q1[1]*q1[1];
+    float16_t qsq1_2=q1[2]*q1[2];
+    float16_t qsq1_3=q1[3]*q1[3];
+    float16_t qsq2_0=q2[0]*q2[0];
+    float16_t qsq2_1=q2[1]*q2[1];
+    float16_t qsq2_2=q2[2]*q2[2];
+    float16_t qsq2_3=q2[3]*q2[3];
+    float16_t qsq3_0=q3[0]*q3[0];
+    float16_t qsq3_1=q3[1]*q3[1];
+    float16_t qsq3_2=q3[2]*q3[2];
+    float16_t qa0=qsq0_0+qsq2_0;
+    float16_t qb0=qsq1_0+qsq3_0;
+    float16_t qs0=qa0+qb0;
+    float16_t qa1=qsq0_1+qsq2_1;
+    float16_t qb1=qsq1_1+qsq3_1;
+    float16_t qs1=qa1+qb1;
+    float16_t qa2=qsq0_2+qsq2_2;
+    float16_t qb2=qsq1_2+qsq3_2;
+    float16_t qs2=qa2+qb2;
+    float16_t qa3=qsq0_3+qsq2_3;
+    float16_t qb3;
+    // Measured map: lastcomponent is feature30 on evenparity and31 on oddparity.
+    // No subgroup helper appears inside this scalar parity branch.
+    if ((gl_SubgroupInvocationID&16u)==0u) {
+        float16_t qsq30_material=q3[3]*q3[3];
+        qb3=qsq1_3+qsq30_material;
+    } else {
+        qb3=fma(q3[3],q3[3],qsq1_3);
+    }
+    float16_t qs3=qa3+qb3;
+    float16_t qt4lo=qs0+qs2;
+    float16_t qt4hi=qs1+qs3;
+    float16_t qpartial=qt4lo+qt4hi;
+    float16_t ksq0_0=k0[0]*k0[0];
+    float16_t ksq0_1=k0[1]*k0[1];
+    float16_t ksq0_2=k0[2]*k0[2];
+    float16_t ksq0_3=k0[3]*k0[3];
+    float16_t ksq1_0=k1[0]*k1[0];
+    float16_t ksq1_1=k1[1]*k1[1];
+    float16_t ksq1_2=k1[2]*k1[2];
+    float16_t ksq1_3=k1[3]*k1[3];
+    float16_t ksq2_0=k2[0]*k2[0];
+    float16_t ksq2_1=k2[1]*k2[1];
+    float16_t ksq2_2=k2[2]*k2[2];
+    float16_t ksq2_3=k2[3]*k2[3];
+    float16_t ksq3_0=k3[0]*k3[0];
+    float16_t ksq3_1=k3[1]*k3[1];
+    float16_t ksq3_2=k3[2]*k3[2];
+    float16_t ka0=ksq0_0+ksq2_0;
+    float16_t kb0=ksq1_0+ksq3_0;
+    float16_t ks0=ka0+kb0;
+    float16_t ka1=ksq0_1+ksq2_1;
+    float16_t kb1=ksq1_1+ksq3_1;
+    float16_t ks1=ka1+kb1;
+    float16_t ka2=ksq0_2+ksq2_2;
+    float16_t kb2=ksq1_2+ksq3_2;
+    float16_t ks2=ka2+kb2;
+    float16_t ka3=ksq0_3+ksq2_3;
+    float16_t kb3;
+    // Measured map: lastcomponent is feature30 on evenparity and31 on oddparity.
+    // No subgroup helper appears inside this scalar parity branch.
+    if ((gl_SubgroupInvocationID&16u)==0u) {
+        float16_t ksq30_material=k3[3]*k3[3];
+        kb3=ksq1_3+ksq30_material;
+    } else {
+        kb3=fma(k3[3],k3[3],ksq1_3);
+    }
+    float16_t ks3=ka3+kb3;
+    float16_t kt4lo=ks0+ks2;
+    float16_t kt4hi=ks1+ks3;
+    float16_t kpartial=kt4lo+kt4hi;
+    uint partial_bits=nrh_pack2(qpartial,kpartial);
+    f16vec2 peer=nrh_unpack2(subgroupShuffleXor(partial_bits,16u));
+    bool even=(gl_SubgroupInvocationID&16u)==0u;
+    float16_t qeven=even?qpartial:peer.x, qodd=even?peer.x:qpartial;
+    float16_t keven=even?kpartial:peer.y, kodd=even?peer.y:kpartial;
+    float16_t qsum=qeven+qodd, ksum=keven+kodd;
+    float qmx=max(float(qsum),float(float16_t(0.000062)));
+    float kmx=max(float(ksum),float(float16_t(0.000062)));
+    float16_t nq=float16_t(inversesqrt(qmx)), nk=float16_t(inversesqrt(kmx));
+return f16vec2(nq,nk);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = tid / 32u;
+    const uint lane = tid % 32u;
+    const uint t0 = sg * 16u;
+    const uint wx = (pc.p3.y != 0) ? uint(pc.p0.w) : gl_WorkGroupID.x;
+    const uint wy = (pc.p3.y != 0) ? uint(pc.p3.x) : gl_WorkGroupID.y;
+    const int shift = pc.p0.y;
+    const uint tiles_x = uint(pc.p0.x);
+    const bool debug = pc.p0.z != 0;
+    // M01: one SG-uniform tile base serves the four input and four output
+    // token addresses (differences {0,8,256,264}); oob is the same for all of
+    // them. Broadcast only genuinely SG-uniform values.
+    bool tok_oob;
+    uint tok_base_wg = nr_tok_base(t0 >> 4u, wx, wy, shift, tiles_x, tok_oob);
+    uint tok_base = subgroupBroadcastFirst(tok_base_wg);
+    const bool tok_oob_u = subgroupBroadcastFirst(tok_oob ? 1u : 0u) != 0u;
+    NRH_CH y0 = NRH_CH(float16_t(0.0));
+    NRH_CH y1 = NRH_CH(float16_t(0.0));
+    NRH_CH y2 = NRH_CH(float16_t(0.0));
+    NRH_CH y3 = NRH_CH(float16_t(0.0));
+    NRH_CH q0 = NRH_CH(float16_t(0.0));
+    NRH_CH q1 = NRH_CH(float16_t(0.0));
+    NRH_CH q2 = NRH_CH(float16_t(0.0));
+    NRH_CH q3 = NRH_CH(float16_t(0.0));
+    // ---- unified INT8 tail state ------------------------------------------
+    // v0..v3 are produced by the QKV segment and consumed again after the first
+    // cross-subgroup barrier, because their per-dimension scale is the maximum
+    // over all four subgroups' keys.  qsy is the per-token Q dequant scale: it is
+    // computed with the norm and read by the QK segment after that barrier.
+    NRH_CH v0 = NRH_CH(float16_t(0.0));
+    NRH_CH v1 = NRH_CH(float16_t(0.0));
+    NRH_CH v2 = NRH_CH(float16_t(0.0));
+    NRH_CH v3 = NRH_CH(float16_t(0.0));
+    float qsy = 0.0;
+    if (sg < 4u) {
+        // Each active subgroup owns16 tokens and all32 channels.
+        // X^T is loaded directly from the original tiled input as COL16.
+        NRH_CH x0 = NRH_CH(float16_t(0.0));
+        uint x_base0 = tok_base + 0u;
+        if (!tok_oob_u) coopMatLoad(x0, imgin, x_base0, 16u, LCOL);
+        if (debug) coopMatStore(x0, dbg, 22528u+t0*32u+0u, 32u, LCOL);
+        NRH_CH x1 = NRH_CH(float16_t(0.0));
+        uint x_base1 = tok_base + 8u;
+        if (!tok_oob_u) coopMatLoad(x1, imgin, x_base1, 16u, LCOL);
+        if (debug) coopMatStore(x1, dbg, 22528u+t0*32u+8u, 32u, LCOL);
+        NRH_CH x2 = NRH_CH(float16_t(0.0));
+        uint x_base2 = tok_base + 256u;
+        if (!tok_oob_u) coopMatLoad(x2, imgin, x_base2, 16u, LCOL);
+        if (debug) coopMatStore(x2, dbg, 22528u+t0*32u+16u, 32u, LCOL);
+        NRH_CH x3 = NRH_CH(float16_t(0.0));
+        uint x_base3 = tok_base + 264u;
+        if (!tok_oob_u) coopMatLoad(x3, imgin, x_base3, 16u, LCOL);
+        if (debug) coopMatStore(x3, dbg, 22528u+t0*32u+24u, 32u, LCOL);
+        if (debug && tid == 0u) {
+            dbg[24576u]=float16_t(float(wx)); dbg[24577u]=float16_t(float(wy));
+            dbg[24578u]=float16_t(float(pc.p3.y)); dbg[24579u]=float16_t(float(pc.p0.w));
+            dbg[24580u]=float16_t(float(pc.p3.x));
+        }
+        // ---- C32-I8: one int8 copy of the body input per subgroup.
+        // The seed blocks below still consume the original FP16 x0..x3.
+        nr_i8_put_x(x0, 0u, sg * 512u);
+        nr_i8_put_x(x1, 8u, sg * 512u);
+        nr_i8_put_x(x2, 16u, sg * 512u);
+        nr_i8_put_x(x3, 24u, sg * 512u);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        // Contract seed H(X*rs[8+feature]) is widened BEFORE K0.
+        NRH_C yc0;
+        {
+            NRH_CH scale;
+            coopMatLoad(scale, wb, uint(pc.p2.x)+8u, 0u, LCOL);
+            NRH_CH seed = x0 * scale;
+            yc0 = nrh_widen_exact(seed);
+        }
+        NRH_C yc1;
+        {
+            NRH_CH scale;
+            coopMatLoad(scale, wb, uint(pc.p2.x)+16u, 0u, LCOL);
+            NRH_CH seed = x1 * scale;
+            yc1 = nrh_widen_exact(seed);
+        }
+        NRH_C yc2;
+        {
+            NRH_CH scale;
+            coopMatLoad(scale, wb, uint(pc.p2.x)+24u, 0u, LCOL);
+            NRH_CH seed = x2 * scale;
+            yc2 = nrh_widen_exact(seed);
+        }
+        NRH_C yc3;
+        {
+            NRH_CH scale;
+            coopMatLoad(scale, wb, uint(pc.p2.x)+32u, 0u, LCOL);
+            NRH_CH seed = x3 * scale;
+            yc3 = nrh_widen_exact(seed);
+        }
+        // ---- C2: expand with register K32; no shared E staging -----------
+        NRH_C seed0 = yc0;
+        NRH_C seed1 = yc1;
+        NRH_C seed2 = yc2;
+        NRH_C seed3 = yc3;
+        // one invE fetch for all 16 code words (the parent reloaded it per call)
+        const float c2_inv_e = fsc[3];
+        I8C ca0 = I8C(0);
+        I8C ca1 = I8C(0);
+        I8C ca2 = I8C(0);
+        I8C ca3 = I8C(0);
+        {
+            I8B xb8;
+            coopMatLoad(xb8, sT8, sg * 512u, 32u, LCOL);
+            I8C a0;
+            I8C a1;
+            // ---- K32 step 0: features 0..31, four CH8x16 fragments -------
+            {
+                NRH_CH e0;
+                NRH_CH e1;
+                NRH_CH e2;
+                NRH_CH e3;
+                {
+                    I8A wa;
+                    a0 = I8C(0);
+                    a1 = I8C(0);
+                    coopMatLoad(wa, w8, 0u, 32u, LCOL);
+                    a0 = coopMatMulAdd(wa, xb8, a0);
+                    coopMatLoad(wa, w8, 1024u, 32u, LCOL);
+                    a1 = coopMatMulAdd(wa, xb8, a1);
+                }
+                {
+                    NRH_C ec0 = nr_i8_deq(a0, 0u, C32_I8_MULT_E);
+                    e0 = nrh_narrow(ec0);
+                    e0[0] = nr_act_h(e0[0]);
+                    e0[1] = nr_act_h(e0[1]);
+                    e0[2] = nr_act_h(e0[2]);
+                    e0[3] = nr_act_h(e0[3]);
+                    if (debug) coopMatStore(e0, dbg, t0*128u+0u, 128u, LCOL);
+                }
+                {
+                    NRH_C ec1 = nr_i8_deq(a1, 8u, C32_I8_MULT_E);
+                    e1 = nrh_narrow(ec1);
+                    e1[0] = nr_act_h(e1[0]);
+                    e1[1] = nr_act_h(e1[1]);
+                    e1[2] = nr_act_h(e1[2]);
+                    e1[3] = nr_act_h(e1[3]);
+                    if (debug) coopMatStore(e1, dbg, t0*128u+8u, 128u, LCOL);
+                }
+                {
+                    I8A wa;
+                    a0 = I8C(0);
+                    a1 = I8C(0);
+                    coopMatLoad(wa, w8, 2048u, 32u, LCOL);
+                    a0 = coopMatMulAdd(wa, xb8, a0);
+                    coopMatLoad(wa, w8, 3072u, 32u, LCOL);
+                    a1 = coopMatMulAdd(wa, xb8, a1);
+                }
+                {
+                    NRH_C ec0 = nr_i8_deq(a0, 16u, C32_I8_MULT_E);
+                    e2 = nrh_narrow(ec0);
+                    e2[0] = nr_act_h(e2[0]);
+                    e2[1] = nr_act_h(e2[1]);
+                    e2[2] = nr_act_h(e2[2]);
+                    e2[3] = nr_act_h(e2[3]);
+                    if (debug) coopMatStore(e2, dbg, t0*128u+16u, 128u, LCOL);
+                }
+                {
+                    NRH_C ec1 = nr_i8_deq(a1, 24u, C32_I8_MULT_E);
+                    e3 = nrh_narrow(ec1);
+                    e3[0] = nr_act_h(e3[0]);
+                    e3[1] = nr_act_h(e3[1]);
+                    e3[2] = nr_act_h(e3[2]);
+                    e3[3] = nr_act_h(e3[3]);
+                    if (debug) coopMatStore(e3, dbg, t0*128u+24u, 128u, LCOL);
+                }
+                // consume this K32 now, then release the fragments
+                I8B eb8 = c2_i8_join_B(c2_i8_pack(e0, c2_inv_e), c2_i8_pack(e1, c2_inv_e),
+                                       c2_i8_pack(e2, c2_inv_e), c2_i8_pack(e3, c2_inv_e));
+                {
+                    I8A wa;
+                    coopMatLoad(wa, w8, 16384u + (0u*4u+0u)*1024u, 32u, LCOL);
+                    ca0 = coopMatMulAdd(wa, eb8, ca0);
+                    coopMatLoad(wa, w8, 16384u + (1u*4u+0u)*1024u, 32u, LCOL);
+                    ca1 = coopMatMulAdd(wa, eb8, ca1);
+                    coopMatLoad(wa, w8, 16384u + (2u*4u+0u)*1024u, 32u, LCOL);
+                    ca2 = coopMatMulAdd(wa, eb8, ca2);
+                    coopMatLoad(wa, w8, 16384u + (3u*4u+0u)*1024u, 32u, LCOL);
+                    ca3 = coopMatMulAdd(wa, eb8, ca3);
+                }
+            }
+            // ---- K32 step 1: features 32..63, four CH8x16 fragments -------
+            {
+                NRH_CH e0;
+                NRH_CH e1;
+                NRH_CH e2;
+                NRH_CH e3;
+                {
+                    I8A wa;
+                    a0 = I8C(0);
+                    a1 = I8C(0);
+                    coopMatLoad(wa, w8, 4096u, 32u, LCOL);
+                    a0 = coopMatMulAdd(wa, xb8, a0);
+                    coopMatLoad(wa, w8, 5120u, 32u, LCOL);
+                    a1 = coopMatMulAdd(wa, xb8, a1);
+                }
+                {
+                    NRH_C ec0 = nr_i8_deq(a0, 32u, C32_I8_MULT_E);
+                    e0 = nrh_narrow(ec0);
+                    e0[0] = nr_act_h(e0[0]);
+                    e0[1] = nr_act_h(e0[1]);
+                    e0[2] = nr_act_h(e0[2]);
+                    e0[3] = nr_act_h(e0[3]);
+                    if (debug) coopMatStore(e0, dbg, t0*128u+32u, 128u, LCOL);
+                }
+                {
+                    NRH_C ec1 = nr_i8_deq(a1, 40u, C32_I8_MULT_E);
+                    e1 = nrh_narrow(ec1);
+                    e1[0] = nr_act_h(e1[0]);
+                    e1[1] = nr_act_h(e1[1]);
+                    e1[2] = nr_act_h(e1[2]);
+                    e1[3] = nr_act_h(e1[3]);
+                    if (debug) coopMatStore(e1, dbg, t0*128u+40u, 128u, LCOL);
+                }
+                {
+                    I8A wa;
+                    a0 = I8C(0);
+                    a1 = I8C(0);
+                    coopMatLoad(wa, w8, 6144u, 32u, LCOL);
+                    a0 = coopMatMulAdd(wa, xb8, a0);
+                    coopMatLoad(wa, w8, 7168u, 32u, LCOL);
+                    a1 = coopMatMulAdd(wa, xb8, a1);
+                }
+                {
+                    NRH_C ec0 = nr_i8_deq(a0, 48u, C32_I8_MULT_E);
+                    e2 = nrh_narrow(ec0);
+                    e2[0] = nr_act_h(e2[0]);
+                    e2[1] = nr_act_h(e2[1]);
+                    e2[2] = nr_act_h(e2[2]);
+                    e2[3] = nr_act_h(e2[3]);
+                    if (debug) coopMatStore(e2, dbg, t0*128u+48u, 128u, LCOL);
+                }
+                {
+                    NRH_C ec1 = nr_i8_deq(a1, 56u, C32_I8_MULT_E);
+                    e3 = nrh_narrow(ec1);
+                    e3[0] = nr_act_h(e3[0]);
+                    e3[1] = nr_act_h(e3[1]);
+                    e3[2] = nr_act_h(e3[2]);
+                    e3[3] = nr_act_h(e3[3]);
+                    if (debug) coopMatStore(e3, dbg, t0*128u+56u, 128u, LCOL);
+                }
+                // consume this K32 now, then release the fragments
+                I8B eb8 = c2_i8_join_B(c2_i8_pack(e0, c2_inv_e), c2_i8_pack(e1, c2_inv_e),
+                                       c2_i8_pack(e2, c2_inv_e), c2_i8_pack(e3, c2_inv_e));
+                {
+                    I8A wa;
+                    coopMatLoad(wa, w8, 16384u + (0u*4u+1u)*1024u, 32u, LCOL);
+                    ca0 = coopMatMulAdd(wa, eb8, ca0);
+                    coopMatLoad(wa, w8, 16384u + (1u*4u+1u)*1024u, 32u, LCOL);
+                    ca1 = coopMatMulAdd(wa, eb8, ca1);
+                    coopMatLoad(wa, w8, 16384u + (2u*4u+1u)*1024u, 32u, LCOL);
+                    ca2 = coopMatMulAdd(wa, eb8, ca2);
+                    coopMatLoad(wa, w8, 16384u + (3u*4u+1u)*1024u, 32u, LCOL);
+                    ca3 = coopMatMulAdd(wa, eb8, ca3);
+                }
+            }
+            // ---- K32 step 2: features 64..95, four CH8x16 fragments -------
+            {
+                NRH_CH e0;
+                NRH_CH e1;
+                NRH_CH e2;
+                NRH_CH e3;
+                {
+                    I8A wa;
+                    a0 = I8C(0);
+                    a1 = I8C(0);
+                    coopMatLoad(wa, w8, 8192u, 32u, LCOL);
+                    a0 = coopMatMulAdd(wa, xb8, a0);
+                    coopMatLoad(wa, w8, 9216u, 32u, LCOL);
+                    a1 = coopMatMulAdd(wa, xb8, a1);
+                }
+                {
+                    NRH_C ec0 = nr_i8_deq(a0, 64u, C32_I8_MULT_E);
+                    e0 = nrh_narrow(ec0);
+                    e0[0] = nr_act_h(e0[0]);
+                    e0[1] = nr_act_h(e0[1]);
+                    e0[2] = nr_act_h(e0[2]);
+                    e0[3] = nr_act_h(e0[3]);
+                    if (debug) coopMatStore(e0, dbg, t0*128u+64u, 128u, LCOL);
+                }
+                {
+                    NRH_C ec1 = nr_i8_deq(a1, 72u, C32_I8_MULT_E);
+                    e1 = nrh_narrow(ec1);
+                    e1[0] = nr_act_h(e1[0]);
+                    e1[1] = nr_act_h(e1[1]);
+                    e1[2] = nr_act_h(e1[2]);
+                    e1[3] = nr_act_h(e1[3]);
+                    if (debug) coopMatStore(e1, dbg, t0*128u+72u, 128u, LCOL);
+                }
+                {
+                    I8A wa;
+                    a0 = I8C(0);
+                    a1 = I8C(0);
+                    coopMatLoad(wa, w8, 10240u, 32u, LCOL);
+                    a0 = coopMatMulAdd(wa, xb8, a0);
+                    coopMatLoad(wa, w8, 11264u, 32u, LCOL);
+                    a1 = coopMatMulAdd(wa, xb8, a1);
+                }
+                {
+                    NRH_C ec0 = nr_i8_deq(a0, 80u, C32_I8_MULT_E);
+                    e2 = nrh_narrow(ec0);
+                    e2[0] = nr_act_h(e2[0]);
+                    e2[1] = nr_act_h(e2[1]);
+                    e2[2] = nr_act_h(e2[2]);
+                    e2[3] = nr_act_h(e2[3]);
+                    if (debug) coopMatStore(e2, dbg, t0*128u+80u, 128u, LCOL);
+                }
+                {
+                    NRH_C ec1 = nr_i8_deq(a1, 88u, C32_I8_MULT_E);
+                    e3 = nrh_narrow(ec1);
+                    e3[0] = nr_act_h(e3[0]);
+                    e3[1] = nr_act_h(e3[1]);
+                    e3[2] = nr_act_h(e3[2]);
+                    e3[3] = nr_act_h(e3[3]);
+                    if (debug) coopMatStore(e3, dbg, t0*128u+88u, 128u, LCOL);
+                }
+                // consume this K32 now, then release the fragments
+                I8B eb8 = c2_i8_join_B(c2_i8_pack(e0, c2_inv_e), c2_i8_pack(e1, c2_inv_e),
+                                       c2_i8_pack(e2, c2_inv_e), c2_i8_pack(e3, c2_inv_e));
+                {
+                    I8A wa;
+                    coopMatLoad(wa, w8, 16384u + (0u*4u+2u)*1024u, 32u, LCOL);
+                    ca0 = coopMatMulAdd(wa, eb8, ca0);
+                    coopMatLoad(wa, w8, 16384u + (1u*4u+2u)*1024u, 32u, LCOL);
+                    ca1 = coopMatMulAdd(wa, eb8, ca1);
+                    coopMatLoad(wa, w8, 16384u + (2u*4u+2u)*1024u, 32u, LCOL);
+                    ca2 = coopMatMulAdd(wa, eb8, ca2);
+                    coopMatLoad(wa, w8, 16384u + (3u*4u+2u)*1024u, 32u, LCOL);
+                    ca3 = coopMatMulAdd(wa, eb8, ca3);
+                }
+            }
+            // ---- K32 step 3: features 96..127, four CH8x16 fragments -------
+            {
+                NRH_CH e0;
+                NRH_CH e1;
+                NRH_CH e2;
+                NRH_CH e3;
+                {
+                    I8A wa;
+                    a0 = I8C(0);
+                    a1 = I8C(0);
+                    coopMatLoad(wa, w8, 12288u, 32u, LCOL);
+                    a0 = coopMatMulAdd(wa, xb8, a0);
+                    coopMatLoad(wa, w8, 13312u, 32u, LCOL);
+                    a1 = coopMatMulAdd(wa, xb8, a1);
+                }
+                {
+                    NRH_C ec0 = nr_i8_deq(a0, 96u, C32_I8_MULT_E);
+                    e0 = nrh_narrow(ec0);
+                    e0[0] = nr_act_h(e0[0]);
+                    e0[1] = nr_act_h(e0[1]);
+                    e0[2] = nr_act_h(e0[2]);
+                    e0[3] = nr_act_h(e0[3]);
+                    if (debug) coopMatStore(e0, dbg, t0*128u+96u, 128u, LCOL);
+                }
+                {
+                    NRH_C ec1 = nr_i8_deq(a1, 104u, C32_I8_MULT_E);
+                    e1 = nrh_narrow(ec1);
+                    e1[0] = nr_act_h(e1[0]);
+                    e1[1] = nr_act_h(e1[1]);
+                    e1[2] = nr_act_h(e1[2]);
+                    e1[3] = nr_act_h(e1[3]);
+                    if (debug) coopMatStore(e1, dbg, t0*128u+104u, 128u, LCOL);
+                }
+                {
+                    I8A wa;
+                    a0 = I8C(0);
+                    a1 = I8C(0);
+                    coopMatLoad(wa, w8, 14336u, 32u, LCOL);
+                    a0 = coopMatMulAdd(wa, xb8, a0);
+                    coopMatLoad(wa, w8, 15360u, 32u, LCOL);
+                    a1 = coopMatMulAdd(wa, xb8, a1);
+                }
+                {
+                    NRH_C ec0 = nr_i8_deq(a0, 112u, C32_I8_MULT_E);
+                    e2 = nrh_narrow(ec0);
+                    e2[0] = nr_act_h(e2[0]);
+                    e2[1] = nr_act_h(e2[1]);
+                    e2[2] = nr_act_h(e2[2]);
+                    e2[3] = nr_act_h(e2[3]);
+                    if (debug) coopMatStore(e2, dbg, t0*128u+112u, 128u, LCOL);
+                }
+                {
+                    NRH_C ec1 = nr_i8_deq(a1, 120u, C32_I8_MULT_E);
+                    e3 = nrh_narrow(ec1);
+                    e3[0] = nr_act_h(e3[0]);
+                    e3[1] = nr_act_h(e3[1]);
+                    e3[2] = nr_act_h(e3[2]);
+                    e3[3] = nr_act_h(e3[3]);
+                    if (debug) coopMatStore(e3, dbg, t0*128u+120u, 128u, LCOL);
+                }
+                // consume this K32 now, then release the fragments
+                I8B eb8 = c2_i8_join_B(c2_i8_pack(e0, c2_inv_e), c2_i8_pack(e1, c2_inv_e),
+                                       c2_i8_pack(e2, c2_inv_e), c2_i8_pack(e3, c2_inv_e));
+                {
+                    I8A wa;
+                    coopMatLoad(wa, w8, 16384u + (0u*4u+3u)*1024u, 32u, LCOL);
+                    ca0 = coopMatMulAdd(wa, eb8, ca0);
+                    coopMatLoad(wa, w8, 16384u + (1u*4u+3u)*1024u, 32u, LCOL);
+                    ca1 = coopMatMulAdd(wa, eb8, ca1);
+                    coopMatLoad(wa, w8, 16384u + (2u*4u+3u)*1024u, 32u, LCOL);
+                    ca2 = coopMatMulAdd(wa, eb8, ca2);
+                    coopMatLoad(wa, w8, 16384u + (3u*4u+3u)*1024u, 32u, LCOL);
+                    ca3 = coopMatMulAdd(wa, eb8, ca3);
+                }
+            }
+        }
+        yc0 = nr_i8_deq_add(ca0, 0u, C32_I8_MULT_C, seed0);
+        yc1 = nr_i8_deq_add(ca1, 8u, C32_I8_MULT_C, seed1);
+        yc2 = nr_i8_deq_add(ca2, 16u, C32_I8_MULT_C, seed2);
+        yc3 = nr_i8_deq_add(ca3, 24u, C32_I8_MULT_C, seed3);
+        y0 = nrh_narrow(yc0);
+        if (debug) coopMatStore(y0, dbg, 8192u+t0*32u+0u, 32u, LCOL);
+        y1 = nrh_narrow(yc1);
+        if (debug) coopMatStore(y1, dbg, 8192u+t0*32u+8u, 32u, LCOL);
+        y2 = nrh_narrow(yc2);
+        if (debug) coopMatStore(y2, dbg, 8192u+t0*32u+16u, 32u, LCOL);
+        y3 = nrh_narrow(yc3);
+        if (debug) coopMatStore(y3, dbg, 8192u+t0*32u+24u, 32u, LCOL);
+        // ==================== C32 body_1 unified INT8 tail ==================
+        // This card's change.  Everything below the contract row Y is the
+        // R02 segment contracts (QKV, QK, PV, output) implemented on C2's
+        // register-staged K32 data path: 64 static FP16 matrix multiplies become
+        // 12 + 8 + 8 + 4 = 32 static INT8 matrix multiplies.
+        //   QKV 24 -> 12, QK 16 -> 8, PV 16 -> 8, output 8 -> 4.
+        // Operands are signed int8 (A 8x32, B 32x16), accumulators int32, one
+        // rank-1 f32 dequant per output element, one narrow per output fragment.
+        NRH_CH k0;
+        NRH_CH k1;
+        NRH_CH k2;
+        NRH_CH k3;
+        {
+            // ---- QKV: 12 int8 K32 steps (was 24 FP16 K16 steps) ------------
+            // Y is the A-side activation of all three projections, so it is
+            // quantised once per token from the rounded halves themselves; the
+            // largest code of a token is therefore exactly 127 and the clamp
+            // never removes information.
+            const float ymx = nr_col_max32(y0, y1, y2, y3);
+            const float sy = (ymx > 0.0) ? (ymx * (1.0 / 127.0)) : 0.0;
+            const float iy = (ymx > 0.0) ? (127.0 / ymx) : 0.0;
+            nr_i8_put_y(y0, 0u, sg * 512u, iy);
+            nr_i8_put_y(y1, 8u, sg * 512u, iy);
+            nr_i8_put_y(y2, 16u, sg * 512u, iy);
+            nr_i8_put_y(y3, 24u, sg * 512u, iy);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            I8B yb8;
+            coopMatLoad(yb8, sT8, sg * 512u, 32u, LCOL);
+            I8A wa;
+            I8C za;
+            // Q: output channels 0..31 over the 32 contract channels, K=32 once.
+            za = I8C(0);
+            coopMatLoad(wa, w8, C32_I8_WQ + 0u*1024u, 32u, LCOL);
+            za = coopMatMulAdd(wa, yb8, za);
+            q0 = nrh_narrow(nr_i8_deq_w(za, 0u, C32_I8_DQ_Q, sy));
+            za = I8C(0);
+            coopMatLoad(wa, w8, C32_I8_WQ + 1u*1024u, 32u, LCOL);
+            za = coopMatMulAdd(wa, yb8, za);
+            q1 = nrh_narrow(nr_i8_deq_w(za, 8u, C32_I8_DQ_Q, sy));
+            za = I8C(0);
+            coopMatLoad(wa, w8, C32_I8_WQ + 2u*1024u, 32u, LCOL);
+            za = coopMatMulAdd(wa, yb8, za);
+            q2 = nrh_narrow(nr_i8_deq_w(za, 16u, C32_I8_DQ_Q, sy));
+            za = I8C(0);
+            coopMatLoad(wa, w8, C32_I8_WQ + 3u*1024u, 32u, LCOL);
+            za = coopMatMulAdd(wa, yb8, za);
+            q3 = nrh_narrow(nr_i8_deq_w(za, 24u, C32_I8_DQ_Q, sy));
+            // K: identical shape, its own weight tiles and channel scales.
+            za = I8C(0);
+            coopMatLoad(wa, w8, C32_I8_WK + 0u*1024u, 32u, LCOL);
+            za = coopMatMulAdd(wa, yb8, za);
+            k0 = nrh_narrow(nr_i8_deq_w(za, 0u, C32_I8_DQ_K, sy));
+            za = I8C(0);
+            coopMatLoad(wa, w8, C32_I8_WK + 1u*1024u, 32u, LCOL);
+            za = coopMatMulAdd(wa, yb8, za);
+            k1 = nrh_narrow(nr_i8_deq_w(za, 8u, C32_I8_DQ_K, sy));
+            za = I8C(0);
+            coopMatLoad(wa, w8, C32_I8_WK + 2u*1024u, 32u, LCOL);
+            za = coopMatMulAdd(wa, yb8, za);
+            k2 = nrh_narrow(nr_i8_deq_w(za, 16u, C32_I8_DQ_K, sy));
+            za = I8C(0);
+            coopMatLoad(wa, w8, C32_I8_WK + 3u*1024u, 32u, LCOL);
+            za = coopMatMulAdd(wa, yb8, za);
+            k3 = nrh_narrow(nr_i8_deq_w(za, 24u, C32_I8_DQ_K, sy));
+            // V: identical shape; V never passes through the norm below.
+            za = I8C(0);
+            coopMatLoad(wa, w8, C32_I8_WV + 0u*1024u, 32u, LCOL);
+            za = coopMatMulAdd(wa, yb8, za);
+            v0 = nrh_narrow(nr_i8_deq_w(za, 0u, C32_I8_DQ_V, sy));
+            za = I8C(0);
+            coopMatLoad(wa, w8, C32_I8_WV + 1u*1024u, 32u, LCOL);
+            za = coopMatMulAdd(wa, yb8, za);
+            v1 = nrh_narrow(nr_i8_deq_w(za, 8u, C32_I8_DQ_V, sy));
+            za = I8C(0);
+            coopMatLoad(wa, w8, C32_I8_WV + 2u*1024u, 32u, LCOL);
+            za = coopMatMulAdd(wa, yb8, za);
+            v2 = nrh_narrow(nr_i8_deq_w(za, 16u, C32_I8_DQ_V, sy));
+            za = I8C(0);
+            coopMatLoad(wa, w8, C32_I8_WV + 3u*1024u, 32u, LCOL);
+            za = coopMatMulAdd(wa, yb8, za);
+            v3 = nrh_narrow(nr_i8_deq_w(za, 24u, C32_I8_DQ_V, sy));
+        }
+        // Norm and reciprocal are per token; no subgroupAdd or alternate tree.
+        f16vec2 norm_pair=nr_norm32_pair(q0,q1,q2,q3,k0,k1,k2,k3);
+        float16_t scalar0 = float16_t(fb[uint(pc.p2.z)]);
+        // Per-token |Q| and |K| maxima and the per-dimension |V| maxima are
+        // accumulated as the four fragments pass through the parent's norm
+        // scaling, so no second pass over the values is needed.
+        float qmx = 0.0;
+        float kmx = 0.0;
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q0[0] * qn;
+            qr = qr * scalar0;
+            q0[0] = qr;
+            k0[0] = k0[0] * kn;
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q0[1] * qn;
+            qr = qr * scalar0;
+            q0[1] = qr;
+            k0[1] = k0[1] * kn;
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q0[2] * qn;
+            qr = qr * scalar0;
+            q0[2] = qr;
+            k0[2] = k0[2] * kn;
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q0[3] * qn;
+            qr = qr * scalar0;
+            q0[3] = qr;
+            k0[3] = k0[3] * kn;
+        }
+// T3 transport: identity materialize removed: q0 = nrh_materialize(q0);
+// T3 transport: identity materialize removed: k0 = nrh_materialize(k0);
+        if (debug) coopMatStore(q0, dbg, 10240u+t0*32u+0u, 32u, LCOL);
+        if (debug) coopMatStore(k0, dbg, 12288u+t0*32u+0u, 32u, LCOL);
+        qmx = nr_abs4(q0);
+        kmx = nr_abs4(k0);
+        {
+            vec4 mv = nr_dim_max16(v0);
+            if ((lane & 15u) == 0u) {
+                for (int i = 0; i < 4; ++i) {
+                    uvec2 rc = nrh_coord_CH(uint(i));
+                    sVpm[sg * 32u + 0u + rc.x] = mv[i];
+                }
+            }
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q1[0] * qn;
+            qr = qr * scalar0;
+            q1[0] = qr;
+            k1[0] = k1[0] * kn;
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q1[1] * qn;
+            qr = qr * scalar0;
+            q1[1] = qr;
+            k1[1] = k1[1] * kn;
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q1[2] * qn;
+            qr = qr * scalar0;
+            q1[2] = qr;
+            k1[2] = k1[2] * kn;
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q1[3] * qn;
+            qr = qr * scalar0;
+            q1[3] = qr;
+            k1[3] = k1[3] * kn;
+        }
+// T3 transport: identity materialize removed: q1 = nrh_materialize(q1);
+// T3 transport: identity materialize removed: k1 = nrh_materialize(k1);
+        if (debug) coopMatStore(q1, dbg, 10240u+t0*32u+8u, 32u, LCOL);
+        if (debug) coopMatStore(k1, dbg, 12288u+t0*32u+8u, 32u, LCOL);
+        qmx = max(qmx, nr_abs4(q1));
+        kmx = max(kmx, nr_abs4(k1));
+        {
+            vec4 mv = nr_dim_max16(v1);
+            if ((lane & 15u) == 0u) {
+                for (int i = 0; i < 4; ++i) {
+                    uvec2 rc = nrh_coord_CH(uint(i));
+                    sVpm[sg * 32u + 8u + rc.x] = mv[i];
+                }
+            }
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q2[0] * qn;
+            qr = qr * scalar0;
+            q2[0] = qr;
+            k2[0] = k2[0] * kn;
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q2[1] * qn;
+            qr = qr * scalar0;
+            q2[1] = qr;
+            k2[1] = k2[1] * kn;
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q2[2] * qn;
+            qr = qr * scalar0;
+            q2[2] = qr;
+            k2[2] = k2[2] * kn;
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q2[3] * qn;
+            qr = qr * scalar0;
+            q2[3] = qr;
+            k2[3] = k2[3] * kn;
+        }
+// T3 transport: identity materialize removed: q2 = nrh_materialize(q2);
+// T3 transport: identity materialize removed: k2 = nrh_materialize(k2);
+        if (debug) coopMatStore(q2, dbg, 10240u+t0*32u+16u, 32u, LCOL);
+        if (debug) coopMatStore(k2, dbg, 12288u+t0*32u+16u, 32u, LCOL);
+        qmx = max(qmx, nr_abs4(q2));
+        kmx = max(kmx, nr_abs4(k2));
+        {
+            vec4 mv = nr_dim_max16(v2);
+            if ((lane & 15u) == 0u) {
+                for (int i = 0; i < 4; ++i) {
+                    uvec2 rc = nrh_coord_CH(uint(i));
+                    sVpm[sg * 32u + 16u + rc.x] = mv[i];
+                }
+            }
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q3[0] * qn;
+            qr = qr * scalar0;
+            q3[0] = qr;
+            k3[0] = k3[0] * kn;
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q3[1] * qn;
+            qr = qr * scalar0;
+            q3[1] = qr;
+            k3[1] = k3[1] * kn;
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q3[2] * qn;
+            qr = qr * scalar0;
+            q3[2] = qr;
+            k3[2] = k3[2] * kn;
+        }
+        {
+            float16_t qn=norm_pair.x, kn=norm_pair.y;
+            float16_t qr = q3[3] * qn;
+            qr = qr * scalar0;
+            q3[3] = qr;
+            k3[3] = k3[3] * kn;
+        }
+// T3 transport: identity materialize removed: q3 = nrh_materialize(q3);
+// T3 transport: identity materialize removed: k3 = nrh_materialize(k3);
+        if (debug) coopMatStore(q3, dbg, 10240u+t0*32u+24u, 32u, LCOL);
+        if (debug) coopMatStore(k3, dbg, 12288u+t0*32u+24u, 32u, LCOL);
+        qmx = max(qmx, nr_abs4(q3));
+        kmx = max(kmx, nr_abs4(k3));
+        {
+            vec4 mv = nr_dim_max16(v3);
+            if ((lane & 15u) == 0u) {
+                for (int i = 0; i < 4; ++i) {
+                    uvec2 rc = nrh_coord_CH(uint(i));
+                    sVpm[sg * 32u + 24u + rc.x] = mv[i];
+                }
+            }
+        }
+        // ---- int8 publication of K (workgroup tile) and Q (subgroup tile) ---
+        // K and V are read by every subgroup (attention spans the whole 64-key
+        // tile), so their codes and the per-key K scale are published by the
+        // existing cross-subgroup barrier below.  Q, P and Ctx are consumed by
+        // the owning subgroup only and use a subgroup publication.
+        qmx = max(qmx, float(unpackFloat2x16(
+                  subgroupShuffleXor(packFloat2x16(f16vec2(float16_t(qmx), float16_t(qmx))),
+                                     16u)).x));
+        kmx = max(kmx, float(unpackFloat2x16(
+                  subgroupShuffleXor(packFloat2x16(f16vec2(float16_t(kmx), float16_t(kmx))),
+                                     16u)).x));
+        const float qsy_tok = (qmx > 0.0) ? (qmx * (1.0 / 127.0)) : 0.0;  // dequant
+        qsy = qsy_tok;
+        const float iqy = (qmx > 0.0) ? (127.0 / qmx) : 0.0;              // quantise
+        const float ksy = (kmx > 0.0) ? (kmx * (1.0 / 127.0)) : 0.0;
+        const float iky = (kmx > 0.0) ? (127.0 / kmx) : 0.0;
+        nr_i8_put_q(q0, 0u, sg * 512u, iqy);
+        nr_i8_put_q(q1, 8u, sg * 512u, iqy);
+        nr_i8_put_q(q2, 16u, sg * 512u, iqy);
+        nr_i8_put_q(q3, 24u, sg * 512u, iqy);
+        nr_i8_put_k(k0, 0u, t0 * 32u, iky);
+        nr_i8_put_k(k1, 8u, t0 * 32u, iky);
+        nr_i8_put_k(k2, 16u, t0 * 32u, iky);
+        nr_i8_put_k(k3, 24u, t0 * 32u, iky);
+        if ((lane & 16u) == 0u) sKsc[t0 + (lane & 15u)] = ksy;
+        // V is quantised after the barrier: its per-dimension scale is the
+        // maximum over all 64 keys, i.e. over all four subgroups' partial
+        // maxima in sVpm, so the codes cannot be written before it is known.
+    }
+    // Required cross-SG publication: every invocation, including idle SG4..7.
+    barrier();
+    if (sg < 4u) {
+        // ---- V: per-dimension scale from the four subgroups' maxima ---------
+        {
+            vec4 vs0 = nr_v_scale(0u);
+            vec4 vs1 = nr_v_scale(1u);
+            vec4 vs2 = nr_v_scale(2u);
+            vec4 vs3 = nr_v_scale(3u);
+            nr_i8_put_v(v0, 0u, t0 * 32u, nr_inv4(vs0));
+            nr_i8_put_v(v1, 8u, t0 * 32u, nr_inv4(vs1));
+            nr_i8_put_v(v2, 16u, t0 * 32u, nr_inv4(vs2));
+            nr_i8_put_v(v3, 24u, t0 * 32u, nr_inv4(vs3));
+        }
+        // v0..v3 are dead after this point; the PV dequant recomputes the same
+        // per-dimension scales from sVpm rather than extending their live range.
+    }
+    // V's int8 tile is workgroup-wide (every subgroup reads all 64 keys), so its
+    // publication needs the second cross-subgroup barrier.  This is the only
+    // barrier this card adds; a static V scale would avoid it but would need a
+    // per-block V calibration that does not exist.
+    barrier();
+    if (sg < 4u) {
+        // ---- QK: 8 int8 K32 steps (was 16 FP16 K16 steps) ------------------
+        // S^T[key,query] = K[key,dim] * Q^T[dim,query]; the A operand is the
+        // workgroup K tile, the B operand is this subgroup's Q tile.  The
+        // dequant factor is sK[key] * sQ[query], a rank-1 product.
+        NRH_CH p0;
+        {
+            I8C s8 = I8C(0);
+            I8A a;
+            I8B b;
+            coopMatLoad(a, sK8, 0u, 32u, LROW);
+            coopMatLoad(b, sQ8, sg * 512u, 32u, LCOL);
+            s8 = coopMatMulAdd(a, b, s8);
+            NRH_C sc = nr_i8_deq_k(s8, 0u, qsy);
+            NRH_C bias;
+            coopMatLoad(bias, fb, uint(pc.p2.w)+t0*64u+0u, 64u, LCOL);
+            precise float nr_score_biased_0_0 = sc[0] + bias[0];
+            sc[0] = nr_score_biased_0_0;
+            precise float nr_score_biased_0_1 = sc[1] + bias[1];
+            sc[1] = nr_score_biased_0_1;
+            precise float nr_score_biased_0_2 = sc[2] + bias[2];
+            sc[2] = nr_score_biased_0_2;
+            precise float nr_score_biased_0_3 = sc[3] + bias[3];
+            sc[3] = nr_score_biased_0_3;
+            p0 = nrh_narrow(sc);
+            {f16vec2 e01=nr_exp_h2(f16vec2(p0[0],p0[1]));p0[0]=e01.x;p0[1]=e01.y;
+             f16vec2 e23=nr_exp_h2(f16vec2(p0[2],p0[3]));p0[2]=e23.x;p0[3]=e23.y;}
+// T3 transport: identity materialize removed: p0 = nrh_materialize(p0);
+        }
+        NRH_CH p1;
+        {
+            I8C s8 = I8C(0);
+            I8A a;
+            I8B b;
+            coopMatLoad(a, sK8, 256u, 32u, LROW);
+            coopMatLoad(b, sQ8, sg * 512u, 32u, LCOL);
+            s8 = coopMatMulAdd(a, b, s8);
+            NRH_C sc = nr_i8_deq_k(s8, 8u, qsy);
+            NRH_C bias;
+            coopMatLoad(bias, fb, uint(pc.p2.w)+t0*64u+8u, 64u, LCOL);
+            precise float nr_score_biased_1_0 = sc[0] + bias[0];
+            sc[0] = nr_score_biased_1_0;
+            precise float nr_score_biased_1_1 = sc[1] + bias[1];
+            sc[1] = nr_score_biased_1_1;
+            precise float nr_score_biased_1_2 = sc[2] + bias[2];
+            sc[2] = nr_score_biased_1_2;
+            precise float nr_score_biased_1_3 = sc[3] + bias[3];
+            sc[3] = nr_score_biased_1_3;
+            p1 = nrh_narrow(sc);
+            {f16vec2 e01=nr_exp_h2(f16vec2(p1[0],p1[1]));p1[0]=e01.x;p1[1]=e01.y;
+             f16vec2 e23=nr_exp_h2(f16vec2(p1[2],p1[3]));p1[2]=e23.x;p1[3]=e23.y;}
+// T3 transport: identity materialize removed: p1 = nrh_materialize(p1);
+        }
+        NRH_CH p2;
+        {
+            I8C s8 = I8C(0);
+            I8A a;
+            I8B b;
+            coopMatLoad(a, sK8, 512u, 32u, LROW);
+            coopMatLoad(b, sQ8, sg * 512u, 32u, LCOL);
+            s8 = coopMatMulAdd(a, b, s8);
+            NRH_C sc = nr_i8_deq_k(s8, 16u, qsy);
+            NRH_C bias;
+            coopMatLoad(bias, fb, uint(pc.p2.w)+t0*64u+16u, 64u, LCOL);
+            precise float nr_score_biased_2_0 = sc[0] + bias[0];
+            sc[0] = nr_score_biased_2_0;
+            precise float nr_score_biased_2_1 = sc[1] + bias[1];
+            sc[1] = nr_score_biased_2_1;
+            precise float nr_score_biased_2_2 = sc[2] + bias[2];
+            sc[2] = nr_score_biased_2_2;
+            precise float nr_score_biased_2_3 = sc[3] + bias[3];
+            sc[3] = nr_score_biased_2_3;
+            p2 = nrh_narrow(sc);
+            {f16vec2 e01=nr_exp_h2(f16vec2(p2[0],p2[1]));p2[0]=e01.x;p2[1]=e01.y;
+             f16vec2 e23=nr_exp_h2(f16vec2(p2[2],p2[3]));p2[2]=e23.x;p2[3]=e23.y;}
+// T3 transport: identity materialize removed: p2 = nrh_materialize(p2);
+        }
+        NRH_CH p3;
+        {
+            I8C s8 = I8C(0);
+            I8A a;
+            I8B b;
+            coopMatLoad(a, sK8, 768u, 32u, LROW);
+            coopMatLoad(b, sQ8, sg * 512u, 32u, LCOL);
+            s8 = coopMatMulAdd(a, b, s8);
+            NRH_C sc = nr_i8_deq_k(s8, 24u, qsy);
+            NRH_C bias;
+            coopMatLoad(bias, fb, uint(pc.p2.w)+t0*64u+24u, 64u, LCOL);
+            precise float nr_score_biased_3_0 = sc[0] + bias[0];
+            sc[0] = nr_score_biased_3_0;
+            precise float nr_score_biased_3_1 = sc[1] + bias[1];
+            sc[1] = nr_score_biased_3_1;
+            precise float nr_score_biased_3_2 = sc[2] + bias[2];
+            sc[2] = nr_score_biased_3_2;
+            precise float nr_score_biased_3_3 = sc[3] + bias[3];
+            sc[3] = nr_score_biased_3_3;
+            p3 = nrh_narrow(sc);
+            {f16vec2 e01=nr_exp_h2(f16vec2(p3[0],p3[1]));p3[0]=e01.x;p3[1]=e01.y;
+             f16vec2 e23=nr_exp_h2(f16vec2(p3[2],p3[3]));p3[2]=e23.x;p3[3]=e23.y;}
+// T3 transport: identity materialize removed: p3 = nrh_materialize(p3);
+        }
+        NRH_CH p4;
+        {
+            I8C s8 = I8C(0);
+            I8A a;
+            I8B b;
+            coopMatLoad(a, sK8, 1024u, 32u, LROW);
+            coopMatLoad(b, sQ8, sg * 512u, 32u, LCOL);
+            s8 = coopMatMulAdd(a, b, s8);
+            NRH_C sc = nr_i8_deq_k(s8, 32u, qsy);
+            NRH_C bias;
+            coopMatLoad(bias, fb, uint(pc.p2.w)+t0*64u+32u, 64u, LCOL);
+            precise float nr_score_biased_4_0 = sc[0] + bias[0];
+            sc[0] = nr_score_biased_4_0;
+            precise float nr_score_biased_4_1 = sc[1] + bias[1];
+            sc[1] = nr_score_biased_4_1;
+            precise float nr_score_biased_4_2 = sc[2] + bias[2];
+            sc[2] = nr_score_biased_4_2;
+            precise float nr_score_biased_4_3 = sc[3] + bias[3];
+            sc[3] = nr_score_biased_4_3;
+            p4 = nrh_narrow(sc);
+            {f16vec2 e01=nr_exp_h2(f16vec2(p4[0],p4[1]));p4[0]=e01.x;p4[1]=e01.y;
+             f16vec2 e23=nr_exp_h2(f16vec2(p4[2],p4[3]));p4[2]=e23.x;p4[3]=e23.y;}
+// T3 transport: identity materialize removed: p4 = nrh_materialize(p4);
+        }
+        NRH_CH p5;
+        {
+            I8C s8 = I8C(0);
+            I8A a;
+            I8B b;
+            coopMatLoad(a, sK8, 1280u, 32u, LROW);
+            coopMatLoad(b, sQ8, sg * 512u, 32u, LCOL);
+            s8 = coopMatMulAdd(a, b, s8);
+            NRH_C sc = nr_i8_deq_k(s8, 40u, qsy);
+            NRH_C bias;
+            coopMatLoad(bias, fb, uint(pc.p2.w)+t0*64u+40u, 64u, LCOL);
+            precise float nr_score_biased_5_0 = sc[0] + bias[0];
+            sc[0] = nr_score_biased_5_0;
+            precise float nr_score_biased_5_1 = sc[1] + bias[1];
+            sc[1] = nr_score_biased_5_1;
+            precise float nr_score_biased_5_2 = sc[2] + bias[2];
+            sc[2] = nr_score_biased_5_2;
+            precise float nr_score_biased_5_3 = sc[3] + bias[3];
+            sc[3] = nr_score_biased_5_3;
+            p5 = nrh_narrow(sc);
+            {f16vec2 e01=nr_exp_h2(f16vec2(p5[0],p5[1]));p5[0]=e01.x;p5[1]=e01.y;
+             f16vec2 e23=nr_exp_h2(f16vec2(p5[2],p5[3]));p5[2]=e23.x;p5[3]=e23.y;}
+// T3 transport: identity materialize removed: p5 = nrh_materialize(p5);
+        }
+        NRH_CH p6;
+        {
+            I8C s8 = I8C(0);
+            I8A a;
+            I8B b;
+            coopMatLoad(a, sK8, 1536u, 32u, LROW);
+            coopMatLoad(b, sQ8, sg * 512u, 32u, LCOL);
+            s8 = coopMatMulAdd(a, b, s8);
+            NRH_C sc = nr_i8_deq_k(s8, 48u, qsy);
+            NRH_C bias;
+            coopMatLoad(bias, fb, uint(pc.p2.w)+t0*64u+48u, 64u, LCOL);
+            precise float nr_score_biased_6_0 = sc[0] + bias[0];
+            sc[0] = nr_score_biased_6_0;
+            precise float nr_score_biased_6_1 = sc[1] + bias[1];
+            sc[1] = nr_score_biased_6_1;
+            precise float nr_score_biased_6_2 = sc[2] + bias[2];
+            sc[2] = nr_score_biased_6_2;
+            precise float nr_score_biased_6_3 = sc[3] + bias[3];
+            sc[3] = nr_score_biased_6_3;
+            p6 = nrh_narrow(sc);
+            {f16vec2 e01=nr_exp_h2(f16vec2(p6[0],p6[1]));p6[0]=e01.x;p6[1]=e01.y;
+             f16vec2 e23=nr_exp_h2(f16vec2(p6[2],p6[3]));p6[2]=e23.x;p6[3]=e23.y;}
+// T3 transport: identity materialize removed: p6 = nrh_materialize(p6);
+        }
+        NRH_CH p7;
+        {
+            I8C s8 = I8C(0);
+            I8A a;
+            I8B b;
+            coopMatLoad(a, sK8, 1792u, 32u, LROW);
+            coopMatLoad(b, sQ8, sg * 512u, 32u, LCOL);
+            s8 = coopMatMulAdd(a, b, s8);
+            NRH_C sc = nr_i8_deq_k(s8, 56u, qsy);
+            NRH_C bias;
+            coopMatLoad(bias, fb, uint(pc.p2.w)+t0*64u+56u, 64u, LCOL);
+            precise float nr_score_biased_7_0 = sc[0] + bias[0];
+            sc[0] = nr_score_biased_7_0;
+            precise float nr_score_biased_7_1 = sc[1] + bias[1];
+            sc[1] = nr_score_biased_7_1;
+            precise float nr_score_biased_7_2 = sc[2] + bias[2];
+            sc[2] = nr_score_biased_7_2;
+            precise float nr_score_biased_7_3 = sc[3] + bias[3];
+            sc[3] = nr_score_biased_7_3;
+            p7 = nrh_narrow(sc);
+            {f16vec2 e01=nr_exp_h2(f16vec2(p7[0],p7[1]));p7[0]=e01.x;p7[1]=e01.y;
+             f16vec2 e23=nr_exp_h2(f16vec2(p7[2],p7[3]));p7[2]=e23.x;p7[3]=e23.y;}
+// T3 transport: identity materialize removed: p7 = nrh_materialize(p7);
+        }
+        // Original64-key half denominator. Every operation/node is literal.
+        float16_t den0=float16_t(0.0);
+        float16_t den_pair_0_0=p0[0]+p1[0];
+        den0=den0+den_pair_0_0;
+        float16_t den_pair_0_1=p2[0]+p3[0];
+        den0=den0+den_pair_0_1;
+        float16_t den_pair_0_2=p4[0]+p5[0];
+        den0=den0+den_pair_0_2;
+        float16_t den_pair_0_3=p6[0]+p7[0];
+        den0=den0+den_pair_0_3;
+        float16_t den1=float16_t(0.0);
+        float16_t den_pair_1_0=p0[1]+p1[1];
+        den1=den1+den_pair_1_0;
+        float16_t den_pair_1_1=p2[1]+p3[1];
+        den1=den1+den_pair_1_1;
+        float16_t den_pair_1_2=p4[1]+p5[1];
+        den1=den1+den_pair_1_2;
+        float16_t den_pair_1_3=p6[1]+p7[1];
+        den1=den1+den_pair_1_3;
+        float16_t den2=float16_t(0.0);
+        float16_t den_pair_2_0=p0[2]+p1[2];
+        den2=den2+den_pair_2_0;
+        float16_t den_pair_2_1=p2[2]+p3[2];
+        den2=den2+den_pair_2_1;
+        float16_t den_pair_2_2=p4[2]+p5[2];
+        den2=den2+den_pair_2_2;
+        float16_t den_pair_2_3=p6[2]+p7[2];
+        den2=den2+den_pair_2_3;
+        float16_t den3=float16_t(0.0);
+        float16_t den_pair_3_0=p0[3]+p1[3];
+        den3=den3+den_pair_3_0;
+        float16_t den_pair_3_1=p2[3]+p3[3];
+        den3=den3+den_pair_3_1;
+        float16_t den_pair_3_2=p4[3]+p5[3];
+        den3=den3+den_pair_3_2;
+        float16_t den_pair_3_3=p6[3]+p7[3];
+        den3=den3+den_pair_3_3;
+        float16_t denpartial=(den0+den1)+(den2+den3);
+        uint den_bits=nrh_pack2(denpartial,denpartial);
+        float16_t denpeer=nrh_unpack2(subgroupShuffleXor(den_bits,16u)).x;
+        bool iseven=(lane&16u)==0u;
+        float16_t even=iseven?denpartial:denpeer, odd=iseven?denpeer:denpartial;
+        float16_t sum = even+odd;
+        float16_t inv = float16_t(1.0/max(float(sum),6.103515625e-05));
+// T3 transport: identity unpack2(pack2(inv,inv)) removed
+        {
+            float16_t r=inv;
+            p0[0] = p0[0] * r;
+        }
+        {
+            float16_t r=inv;
+            p0[1] = p0[1] * r;
+        }
+        {
+            float16_t r=inv;
+            p0[2] = p0[2] * r;
+        }
+        {
+            float16_t r=inv;
+            p0[3] = p0[3] * r;
+        }
+// T3 transport: identity materialize removed: p0 = nrh_materialize(p0);
+        if (debug) coopMatStore(p0, dbg, 14336u+t0*64u+0u, 64u, LCOL);
+        {
+            float16_t r=inv;
+            p1[0] = p1[0] * r;
+        }
+        {
+            float16_t r=inv;
+            p1[1] = p1[1] * r;
+        }
+        {
+            float16_t r=inv;
+            p1[2] = p1[2] * r;
+        }
+        {
+            float16_t r=inv;
+            p1[3] = p1[3] * r;
+        }
+// T3 transport: identity materialize removed: p1 = nrh_materialize(p1);
+        if (debug) coopMatStore(p1, dbg, 14336u+t0*64u+8u, 64u, LCOL);
+        {
+            float16_t r=inv;
+            p2[0] = p2[0] * r;
+        }
+        {
+            float16_t r=inv;
+            p2[1] = p2[1] * r;
+        }
+        {
+            float16_t r=inv;
+            p2[2] = p2[2] * r;
+        }
+        {
+            float16_t r=inv;
+            p2[3] = p2[3] * r;
+        }
+// T3 transport: identity materialize removed: p2 = nrh_materialize(p2);
+        if (debug) coopMatStore(p2, dbg, 14336u+t0*64u+16u, 64u, LCOL);
+        {
+            float16_t r=inv;
+            p3[0] = p3[0] * r;
+        }
+        {
+            float16_t r=inv;
+            p3[1] = p3[1] * r;
+        }
+        {
+            float16_t r=inv;
+            p3[2] = p3[2] * r;
+        }
+        {
+            float16_t r=inv;
+            p3[3] = p3[3] * r;
+        }
+// T3 transport: identity materialize removed: p3 = nrh_materialize(p3);
+        if (debug) coopMatStore(p3, dbg, 14336u+t0*64u+24u, 64u, LCOL);
+        {
+            float16_t r=inv;
+            p4[0] = p4[0] * r;
+        }
+        {
+            float16_t r=inv;
+            p4[1] = p4[1] * r;
+        }
+        {
+            float16_t r=inv;
+            p4[2] = p4[2] * r;
+        }
+        {
+            float16_t r=inv;
+            p4[3] = p4[3] * r;
+        }
+// T3 transport: identity materialize removed: p4 = nrh_materialize(p4);
+        if (debug) coopMatStore(p4, dbg, 14336u+t0*64u+32u, 64u, LCOL);
+        {
+            float16_t r=inv;
+            p5[0] = p5[0] * r;
+        }
+        {
+            float16_t r=inv;
+            p5[1] = p5[1] * r;
+        }
+        {
+            float16_t r=inv;
+            p5[2] = p5[2] * r;
+        }
+        {
+            float16_t r=inv;
+            p5[3] = p5[3] * r;
+        }
+// T3 transport: identity materialize removed: p5 = nrh_materialize(p5);
+        if (debug) coopMatStore(p5, dbg, 14336u+t0*64u+40u, 64u, LCOL);
+        {
+            float16_t r=inv;
+            p6[0] = p6[0] * r;
+        }
+        {
+            float16_t r=inv;
+            p6[1] = p6[1] * r;
+        }
+        {
+            float16_t r=inv;
+            p6[2] = p6[2] * r;
+        }
+        {
+            float16_t r=inv;
+            p6[3] = p6[3] * r;
+        }
+// T3 transport: identity materialize removed: p6 = nrh_materialize(p6);
+        if (debug) coopMatStore(p6, dbg, 14336u+t0*64u+48u, 64u, LCOL);
+        {
+            float16_t r=inv;
+            p7[0] = p7[0] * r;
+        }
+        {
+            float16_t r=inv;
+            p7[1] = p7[1] * r;
+        }
+        {
+            float16_t r=inv;
+            p7[2] = p7[2] * r;
+        }
+        {
+            float16_t r=inv;
+            p7[3] = p7[3] * r;
+        }
+// T3 transport: identity materialize removed: p7 = nrh_materialize(p7);
+        if (debug) coopMatStore(p7, dbg, 14336u+t0*64u+56u, 64u, LCOL);
+        // ---- P quantised per query row --------------------------------------
+        // The scale is the row maximum of the *rounded* half P (half() is
+        // monotone, so the largest code of a row is exactly 127 and the clamp
+        // never removes a bit).  P is the B side of PV and index [query][key].
+        const float pmx = nr_row_max64(p0,p1,p2,p3,p4,p5,p6,p7);
+        const float psy = (pmx > 0.0) ? (pmx * (1.0 / 127.0)) : 0.0;
+        const float ipy = (pmx > 0.0) ? (127.0 / pmx) : 0.0;
+        nr_i8_put_p(p0, 0u,  sg * 1024u, ipy);
+        nr_i8_put_p(p1, 8u,  sg * 1024u, ipy);
+        nr_i8_put_p(p2, 16u, sg * 1024u, ipy);
+        nr_i8_put_p(p3, 24u, sg * 1024u, ipy);
+        nr_i8_put_p(p4, 32u, sg * 1024u, ipy);
+        nr_i8_put_p(p5, 40u, sg * 1024u, ipy);
+        nr_i8_put_p(p6, 48u, sg * 1024u, ipy);
+        nr_i8_put_p(p7, 56u, sg * 1024u, ipy);
+        // P is consumed by the owning subgroup only (its own 16 queries).
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        // ---- PV: 8 int8 K32 steps (was 16 FP16 K16 steps) -------------------
+        // Ctx^T[dim,query] = V^T[dim,key] * P^T[key,query]; the two 32-key slices
+        // accumulate into the SAME int32 fragments, so this is one exact K64 dot
+        // product and the dequant is a single rank-1 multiply per component:
+        // sV[dim] * sP[query].
+        NRH_C tc0 = NRH_C(0.0);
+        NRH_C tc1 = NRH_C(0.0);
+        NRH_C tc2 = NRH_C(0.0);
+        NRH_C tc3 = NRH_C(0.0);
+        {
+            I8C i0 = I8C(0);
+            I8C i1 = I8C(0);
+            I8C i2 = I8C(0);
+            I8C i3 = I8C(0);
+            I8A va;
+            I8B pb8;
+            // key slice 0: keys 0..31 (parent K16 blocks 0 and 1)
+            coopMatLoad(pb8, sP8, sg * 1024u + 0u, 64u, LCOL);
+            coopMatLoad(va, sV8, 0u, 32u, LCOL);
+            i0 = coopMatMulAdd(va, pb8, i0);
+            coopMatLoad(va, sV8, 8u, 32u, LCOL);
+            i1 = coopMatMulAdd(va, pb8, i1);
+            coopMatLoad(va, sV8, 16u, 32u, LCOL);
+            i2 = coopMatMulAdd(va, pb8, i2);
+            coopMatLoad(va, sV8, 24u, 32u, LCOL);
+            i3 = coopMatMulAdd(va, pb8, i3);
+            // key slice 1: keys 32..63 (parent K16 blocks 2 and 3)
+            coopMatLoad(pb8, sP8, sg * 1024u + 32u, 64u, LCOL);
+            coopMatLoad(va, sV8, 1024u, 32u, LCOL);
+            i0 = coopMatMulAdd(va, pb8, i0);
+            coopMatLoad(va, sV8, 1032u, 32u, LCOL);
+            i1 = coopMatMulAdd(va, pb8, i1);
+            coopMatLoad(va, sV8, 1040u, 32u, LCOL);
+            i2 = coopMatMulAdd(va, pb8, i2);
+            coopMatLoad(va, sV8, 1048u, 32u, LCOL);
+            i3 = coopMatMulAdd(va, pb8, i3);
+            tc0 = nr_i8_deq_v(i0, nr_v_scale(0u), psy);
+            tc1 = nr_i8_deq_v(i1, nr_v_scale(1u), psy);
+            tc2 = nr_i8_deq_v(i2, nr_v_scale(2u), psy);
+            tc3 = nr_i8_deq_v(i3, nr_v_scale(3u), psy);
+        }
+        NRH_CH ctx0 = nrh_narrow(tc0);
+        if (debug) coopMatStore(ctx0, dbg, 18432u+t0*32u+0u, 32u, LCOL);
+        NRH_CH ctx1 = nrh_narrow(tc1);
+        if (debug) coopMatStore(ctx1, dbg, 18432u+t0*32u+8u, 32u, LCOL);
+        NRH_CH ctx2 = nrh_narrow(tc2);
+        if (debug) coopMatStore(ctx2, dbg, 18432u+t0*32u+16u, 32u, LCOL);
+        NRH_CH ctx3 = nrh_narrow(tc3);
+        if (debug) coopMatStore(ctx3, dbg, 18432u+t0*32u+24u, 32u, LCOL);
+        // ---- Ctx quantised per query ---------------------------------------
+        const float cmx = nr_col_max32(ctx0, ctx1, ctx2, ctx3);
+        const float csy = (cmx > 0.0) ? (cmx * (1.0 / 127.0)) : 0.0;
+        const float icy = (cmx > 0.0) ? (127.0 / cmx) : 0.0;
+        nr_i8_put_y(ctx0, 0u, sg * 512u, icy);
+        nr_i8_put_y(ctx1, 8u, sg * 512u, icy);
+        nr_i8_put_y(ctx2, 16u, sg * 512u, icy);
+        nr_i8_put_y(ctx3, 24u, sg * 512u, icy);
+        // ---- output projection: 4 int8 K32 steps (was 8 FP16 K16 steps) ----
+        // O^T[ch,query] = WO[ch,dim] * Ctx^T[dim,query]; the residual seed
+        // H(Y*ars) is the parent's, added once in f32 after the integer dot.
+        NRH_C oc0;
+        {
+            NRH_CH scale;
+            coopMatLoad(scale,wb,uint(pc.p2.y)+0u,0u,LCOL);
+            NRH_CH seed = y0 * scale;
+            oc0 = nrh_widen_exact(seed);
+        }
+        NRH_C oc1;
+        {
+            NRH_CH scale;
+            coopMatLoad(scale,wb,uint(pc.p2.y)+8u,0u,LCOL);
+            NRH_CH seed = y1 * scale;
+            oc1 = nrh_widen_exact(seed);
+        }
+        NRH_C oc2;
+        {
+            NRH_CH scale;
+            coopMatLoad(scale,wb,uint(pc.p2.y)+16u,0u,LCOL);
+            NRH_CH seed = y2 * scale;
+            oc2 = nrh_widen_exact(seed);
+        }
+        NRH_C oc3;
+        {
+            NRH_CH scale;
+            coopMatLoad(scale,wb,uint(pc.p2.y)+24u,0u,LCOL);
+            NRH_CH seed = y3 * scale;
+            oc3 = nrh_widen_exact(seed);
+        }
+        {
+            I8B cb8;
+            coopMatLoad(cb8, sT8, sg * 512u, 32u, LCOL);
+            I8A wo;
+            I8C oa;
+            oa = I8C(0);
+            coopMatLoad(wo, w8, C32_I8_WO + 0u*1024u, 32u, LCOL);
+            oa = coopMatMulAdd(wo, cb8, oa);
+            // M12: narrow o0 immediately; the accumulator dies here.
+            NRH_CH o0 = nrh_narrow(nr_i8_deq_add_w(oa, 0u, C32_I8_DQ_O, csy, oc0));
+            if (debug) coopMatStore(o0,dbg,20480u+t0*32u+0u,32u,LCOL);
+            oa = I8C(0);
+            coopMatLoad(wo, w8, C32_I8_WO + 1u*1024u, 32u, LCOL);
+            oa = coopMatMulAdd(wo, cb8, oa);
+            NRH_CH o1 = nrh_narrow(nr_i8_deq_add_w(oa, 8u, C32_I8_DQ_O, csy, oc1));
+            if (debug) coopMatStore(o1,dbg,20480u+t0*32u+8u,32u,LCOL);
+            oa = I8C(0);
+            coopMatLoad(wo, w8, C32_I8_WO + 2u*1024u, 32u, LCOL);
+            oa = coopMatMulAdd(wo, cb8, oa);
+            NRH_CH o2 = nrh_narrow(nr_i8_deq_add_w(oa, 16u, C32_I8_DQ_O, csy, oc2));
+            if (debug) coopMatStore(o2,dbg,20480u+t0*32u+16u,32u,LCOL);
+            oa = I8C(0);
+            coopMatLoad(wo, w8, C32_I8_WO + 3u*1024u, 32u, LCOL);
+            oa = coopMatMulAdd(wo, cb8, oa);
+            NRH_CH o3 = nrh_narrow(nr_i8_deq_add_w(oa, 24u, C32_I8_DQ_O, csy, oc3));
+            if (debug) coopMatStore(o3,dbg,20480u+t0*32u+24u,32u,LCOL);
+            uint o_base0=tok_base+0u;
+            if (!tok_oob_u) coopMatStore(o0,imgout,o_base0,16u,LCOL);
+            uint o_base1=tok_base+8u;
+            if (!tok_oob_u) coopMatStore(o1,imgout,o_base1,16u,LCOL);
+            uint o_base2=tok_base+256u;
+            if (!tok_oob_u) coopMatStore(o2,imgout,o_base2,16u,LCOL);
+            uint o_base3=tok_base+264u;
+            if (!tok_oob_u) coopMatStore(o3,imgout,o_base3,16u,LCOL);
+        }
+    }
+}

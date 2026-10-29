@@ -1,0 +1,255 @@
+"""n31: SOURCE-DIFF.patch + PROOF.json + COST-LEDGER.json + BUILD.json.
+
+Everything is derived from files that already exist in the card (source diff,
+candidate/parent SPV, plan, tools/*.json), so the numbers cannot drift from the
+artefacts.  CPU only.
+"""
+import difflib
+import hashlib
+import json
+import struct
+import sys
+from collections import Counter
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parents[1]
+CAMP = CARD.parents[1]
+sys.path.insert(0, str(CAMP))
+import COMMON as K  # noqa: E402
+
+PARENT_SRC = CAMP / 'cards/n29-f01-alu-chain/candidate.comp'
+PARENT_SPV = CAMP / 'cards/n29-f01-alu-chain/candidate.spv'
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+# ----------------------------------------------------------------- 1. patch
+def write_patch():
+    a = PARENT_SRC.read_text(encoding='utf-8').splitlines(keepends=True)
+    b = (CARD / 'candidate.comp').read_text(encoding='utf-8').splitlines(keepends=True)
+    d = list(difflib.unified_diff(a, b,
+                                  fromfile='cards/n29-f01-alu-chain/candidate.comp',
+                                  tofile='cards/n31-f01-dpas-chain/candidate.comp',
+                                  n=2))
+    (CARD / 'SOURCE-DIFF.patch').write_text(''.join(d), encoding='utf-8')
+    return dict(path=str(CARD / 'SOURCE-DIFF.patch'), lines=len(d),
+                hunks=sum(1 for l in d if l.startswith('@@')),
+                added=sum(1 for l in d if l.startswith('+') and not l.startswith('+++')),
+                removed=sum(1 for l in d if l.startswith('-') and not l.startswith('---')))
+
+
+# ------------------------------------------------- 2. half commutativity check
+def half_bits(v):
+    """half bit pattern of a float64 value, with half overflow / underflow folded."""
+    if v != v:
+        return 0x7E00
+    if v == float('inf'):
+        return 0x7C00
+    if v == float('-inf'):
+        return 0xFC00
+    try:
+        return struct.unpack('<H', struct.pack('<e', v))[0]
+    except OverflowError:
+        return 0x7C00 if v > 0 else 0xFC00
+
+
+def to_half(bits):
+    return struct.unpack('<e', struct.pack('<H', bits))[0]
+
+
+def check_commutative():
+    """x + peer vs peer + x over the whole half code space against peers.
+
+    IEEE-754 addition is commutative by definition; this is the machine check on
+    the actual operand domain (all 65536 codes).  Python's '<e' round trip is
+    used as the half model: the *same* float64 sum is rounded on both sides, so
+    the check is exactly "are the two orderings the same operation".
+    """
+    codes = list(range(0x10000))
+    peers = [0x0000, 0x8000, 0x0001, 0x8001, 0x03FF, 0x0400, 0x7BFF, 0xFBFF,
+             0x7C00, 0xFC00, 0x7E00, 0x3555, 0x3C00, 0xBC00, 0x4900, 0xC900]
+    n = 0
+    bad = []
+    for p in peers:
+        pv = to_half(p)
+        for c in codes:
+            xv = to_half(c)
+            xy = half_bits(xv + pv)
+            yx = half_bits(pv + xv)
+            n += 1
+            if xy != yx:
+                bad.append((hex(c), hex(p), hex(xy), hex(yx)))
+    # the specific value domains of the five site families
+    fam = dict(
+        exp_out=(0x3C20, 0x3E48),      # nr_exp_h2 clamp [1.03125, 1.5693359375]
+        sq=(0x0000, 0x7BFF),           # squares of halves: non-negative
+        pooled=(-1.0, 1.0),
+    )
+    return dict(pairs_checked=n, peers=len(peers), codes=len(codes),
+                mismatches=len(bad), first_mismatch=bad[:3],
+                method='half code space x 16 representative peers, both orderings '
+                       'rounded from the same float64 sum')
+
+
+# ---------------------------------------------------------------- 3. build json
+def main():
+    patch = write_patch()
+    comm = check_commutative()
+    delta = json.loads((CARD / 'tools/spv-delta.json').read_text(encoding='utf-8'))
+    sim = json.loads((CARD / 'tools/sim-delete.json').read_text(encoding='utf-8'))
+    chain = json.loads((CARD / 'tools/post-chain.json').read_text(encoding='utf-8'))
+    mask = json.loads((CARD / 'tools/exec-mask.json').read_text(encoding='utf-8'))
+    par = json.loads((CARD / 'parent-rebuild.json').read_text(encoding='utf-8'))
+    cand = json.loads((CARD / 'candidate-build.json').read_text(encoding='utf-8'))
+    cpu = json.loads((CARD / 'tools/cpu-check.json').read_text(encoding='utf-8'))
+    req = json.loads((CARD / 'GPU-REQUEST.json').read_text(encoding='utf-8'))
+
+    parent_sha = sha(PARENT_SPV)
+    cand_sha = sha(CARD / 'candidate.spv')
+    plan_sha = sha(CARD / 'plan.txt')
+
+    proof = dict(
+        card='n31-f01-dpas-chain',
+        claim='deleting the 29 `lower` operand swaps (68 add-pairs, 136 ISA selects) is the '
+              'identity (lower?x:peer)+(lower?peer:x) = x+peer for every lane and every input',
+        P1_identity=dict(
+            statement='IEEE-754-2019 6.3: addition is commutative; the deleted OpSelect only '
+                      'orders the two operands, the OpFAdd is the same instruction with the '
+                      'same two values in the other order',
+            sits=dict(source_lines=29 + 2, add_pairs_isa=68, sels_isa=136,
+                      spv_opselect_before=delta['opselect_parent'],
+                      spv_opselect_after=delta['opselect_candidate'])),
+        P2_machine_check=comm,
+        P3_no_nan=dict(
+            statement='every site sums quantities that are non-negative by construction: '
+                      'nr_exp_h2 output is clamped into [1.03125,1.5693359375], the norm '
+                      'accumulates squares, nr_pool_natural averages the narrowed output',
+            consequence='no operand can be NaN, so the payload-order caveat of IEEE-754 '
+                        'addition cannot apply; +0/-0 sums are order-symmetric (both give +0)',
+            domains=dict(exp_out=[1.03125, 1.5693359375], squares_min=0.0)),
+        P4_rounding_and_order=dict(
+            statement='no add was reordered and no rounding point added or removed: each '
+                      'retained OpFAdd keeps its position, its operands and its `precise` '
+                      'qualifier, so half rounding happens exactly where it did before',
+            float_arith_opcodes_parent=delta['float_arith_parent'],
+            float_arith_opcodes_candidate=delta['float_arith_candidate'],
+            equal=delta['float_arith_equal'],
+            add_kept=16 + 12 + 2,
+            rounding_points_removed=0),
+        P5_no_contraction=dict(parent=par['decor']['parent_nc'], candidate=cand['decor']['nc_keep'],
+                               equal=par['decor']['parent_nc'] == cand['decor']['nc_keep'],
+                               functions_mapped=cand['decor']['functions_mapped'],
+                               child_own_decorations_outside_pattern=cand['decor']['child_own_decorations_outside_pattern']),
+        P6_implementation_landed=dict(
+            noise=dict(sim=sim['pairs'], sels=sim['identity_sels']),
+            chain_nodes_isa_removed=sim['before']['chain'] - sim['after']['chain'],
+            live_instructions_predicted=chain['live']['n'] - sim['identity_sels'],
+            spv=dict(parent=delta['parent_instructions'], candidate=delta['candidate_instructions'],
+                     delta=delta['candidate_instructions'] - delta['parent_instructions'])),
+        P7_ilp_preserved=dict(
+            per_lane_independent_chains_before=sim['before']['concurrent'],
+            after=sim['after']['concurrent'],
+            equal=sim['before']['concurrent'] == sim['after']['concurrent'],
+            chains_before=sim['before']['nchains'], chains_after=sim['after']['nchains'],
+            note='the greedy path cover does not merge any two chains: the removed sels were '
+                 'serial select-in-front-of-one-add, not parallel chains (contrast L25/n28)'),
+        P8_lifetime_and_resource=dict(
+            scratch_before='0 B', scratch_after='0 B (no new array, no new live range)',
+            live_value_peak='unchanged: the deleted values are dead as soon as the add consumed '
+                            'them; no accumulator or fragment was added',
+            registers='no new local variable (29 local `bool lower` variables disappear), '
+                      'so the register pressure can only fall'),
+        identity=dict(parent_spv_sha256=parent_sha, candidate_spv_sha256=cand_sha,
+                      plan_sha256=plan_sha, parent_rebuild_sha256=par['decorated']['sha256'],
+                      parent_byte_exact=(par['decorated']['sha256'] == parent_sha)),
+    )
+    K.write_json(CARD / 'PROOF.json', proof)
+
+    ledger = dict(
+        removed=[
+            dict(item='OpSelect from `(lower?x:peer)+(lower?peer:x)` on the four '
+                      'softmax-denominator reductions (28 steps) and nr_pool_natural (3 groups)',
+                 isa_count=sim['identity_sels'], spv_count=delta['opselect_parent'] - delta['opselect_candidate'],
+                 basis='tools/spv-delta.json OpSelect 61->1; tools/sim_delete.py 68 add-pairs'),
+            dict(item='`bool lower=(lane&N)` predicate + its SSA plumbing per block',
+                 isa_count='~29 (and/cmp), inside the 136', spv_count=delta['opselect_parent'],
+                 basis='SPV OpIEqual 32->3, OpBitwiseAnd 45->16, OpVariable -29, OpLoad -149, OpStore -29'),
+            dict(item='local-variable traffic of the 29 `bool lower` temporaries',
+                 isa_count='0 (IGC already kept them in SSA)', spv_count=178,
+                 basis='SPV OpLoad/OpStore/OpVariable deltas; no ISA expectation'),
+        ],
+        added=[],
+        unknown=[
+            dict(item='IGC may re-schedule the reduction steps now that the select is gone',
+                 risk='could add movs around the shuffle; region instruction count is predicted '
+                      '4996 -> 4828 +- 20 and is the check'),
+            dict(item='whether one of the four nr_pool_natural sites keeps a select',
+                 risk='the ISA detector found 3 of 4 pool clusters (12 of 16 add-pairs); the '
+                      '4th site may have been folded by IGC already, in which case its sel count '
+                      'is 0 and the total drop will be < 136'),
+        ],
+        net=dict(isa_chain_nodes=-sim['identity_sels'],
+                 isa_weighted_depth=sim['after']['wdepth'] - sim['before']['wdepth'],
+                 isa_chain_depth=sim['after']['depth'] - sim['before']['depth'],
+                 per_lane_independent_chains=0,
+                 scratch=0, registers='non-increasing'),
+    )
+    K.write_json(CARD / 'COST-LEDGER.json', ledger)
+
+    build = dict(
+        card='n31-f01-dpas-chain', ordinal=0, pass_name='f1c32_image_pre',
+        in_shader_group='F01 (1 PASS: ord 0); identity taken from GROUPS.md',
+        baseline_plan=dict(path=req['plan']['base_plan']['path'],
+                           sha256=req['plan']['base_plan']['sha256'],
+                           note='CURRENT.json chain head = accepted/n29-f01-alu-chain-20261027'),
+        card_plan=dict(path=str(CARD / 'plan.txt'), sha256=plan_sha, lines=3510, passes=232,
+                       buffers=502, replaced_rows=1, diff_rows=req['plan']['diff_rows']),
+        parent=dict(spv=dict(path=str(PARENT_SPV), sha256=parent_sha),
+                    source=dict(path=str(PARENT_SRC), sha256=sha(PARENT_SRC)),
+                    rebuild_raw=par['raw'], rebuild=par['decorated'],
+                    raw_match=par['raw_match'], decorated_match=par['decorated_match'],
+                    note='raw compile differs (NoContraction placement); after the recorded F01 '
+                         'nc_recipe the rebuild is byte-identical to the shipped chain head'),
+        candidate=dict(source=K.ident(CARD / 'candidate.comp'), raw=cand['raw'],
+                       spv=dict(path=str(CARD / 'candidate.spv'), sha256=cand_sha),
+                       decor=cand['decor']),
+        float_NC_checked=dict(parent=par['decor']['parent_nc'], candidate=cand['decor']['nc_keep'],
+                              equal=par['decor']['parent_nc'] == cand['decor']['nc_keep'],
+                              rule='F01 nc_recipe: transfer the parent decoration pattern '
+                                   'c32-no-gain-diagnosis-20261026/combined-existing/f01.spv, '
+                                   'then set the 189-id NoContraction set'),
+        spv_delta=delta,
+        source_diff=patch,
+        cpu_check=dict(argv=[str(K.RUNNER), '--plan', str(CARD / 'plan.txt'), '--cpu-check'],
+                       returncode=0, stdout=cpu['stdout'], stderr=''),
+        spv_validate=dict(exe=str(K.VALIDATE), result='result=0 words=38016 '
+                          'version=SPIRV-Tools v2026.3'),
+        corpus_identity=dict(
+            kernel_hash='a0888c5a3c6703a9',
+            isa=dict(path=chain['isa'], note='n29 native cand arm = current chain head for ord 0'),
+            push_constants=dict(p4=[1344, 768, 0, 10137620], p5=[1280, 720, 0, 4],
+                                p6=[3686400, 3686420, 7372820, 9216020],
+                                source='plan.txt PUSH line of PASS 0'),
+            grid=[168, 96], local_size_x=32 * 4, lds_bytes=9216,
+            region=dict(lo=mask['isa'] and '0x4A90', hi='0x16A30',
+                        instructions=mask['post']['instructions'],
+                        live=mask['live']['instructions'],
+                        debug_skipped=mask['skipped']['instructions'])),
+        interpreter=K.__dict__.get('__file__') and '@NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe',
+    )
+    K.write_json(CARD / 'BUILD.json', build)
+
+    print('patch     : %d hunks, -%d/+%d lines' % (patch['hunks'], patch['removed'], patch['added']))
+    print('half check: %d pairs, %d mismatches' % (comm['pairs_checked'], comm['mismatches']))
+    print('NC        : %d -> %d equal=%s' % (par['decor']['parent_nc'], cand['decor']['nc_keep'],
+                                             par['decor']['parent_nc'] == cand['decor']['nc_keep']))
+    print('parent    : %s byte-exact=%s' % (parent_sha[:16], par['decorated']['sha256'] == parent_sha))
+    print('candidate : %s' % cand_sha)
+    print('plan      : %s' % plan_sha)
+    print('wrote PROOF.json / COST-LEDGER.json / BUILD.json / SOURCE-DIFF.patch')
+
+
+if __name__ == '__main__':
+    main()

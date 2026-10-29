@@ -1,0 +1,129 @@
+"""Turn a card's GPU-REQUEST.json into a locked, serial GPU stage spec (and optionally run it).
+
+Usage:
+  python submit_card.py <card-id> <gates|native|resources|ordinary> [--run] [--only-arm cand]
+
+Design rules (contract):
+  gates     : every arm -> fixed + fb2
+  native    : every arm (parent first) unless the parent ISA already exists for
+              the current identity (then pass --only-arm <arm>)
+  resources : every arm
+  ordinary  : 2 arms -> 6 alternating pairs; 3 arms -> 6 ABC permutations;
+              30 samples/arm; single batch; no reruns
+"""
+import json, sys, itertools
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+
+PERM3 = [('A', 'B', 'C'), ('A', 'C', 'B'), ('B', 'A', 'C'), ('B', 'C', 'A'), ('C', 'A', 'B'), ('C', 'B', 'A')]
+
+
+def load_request(card_id):
+    d = K.C / 'cards' / card_id
+    req = K.read_json(d / 'GPU-REQUEST.json')
+    card_plan = req.get('plan') or {}
+    best, best_sha, chain = K.current_best()
+    rebased = False
+    rebase_info = None
+    arms = []
+    for a in req['arms']:
+        p = a['plan']
+        if isinstance(p, dict):
+            p, sha = p.get('path'), p.get('sha256')
+        else:
+            sha = a.get('sha256')
+        if p == 'baseline':
+            arms.append(dict(id=a['id'], role='baseline', path=best, sha=best_sha))
+        elif p == 'candidate':
+            if chain:
+                # a newer accepted baseline exists -> rebuild this card's plan on it.
+                # Prefer the ordinal-based rebase: follow-up cards bind to an adopted
+                # candidate (not a handoff row), so the sha table cannot locate them.
+                if not rebased:
+                    try:
+                        rp, rsha, n, info = K.rebase_by_ordinals(card_id)
+                        how = 'ordinals'
+                    except Exception as e:
+                        rp, rsha, n, info = K.rebase_candidate_plan(card_id)
+                        how = 'sha-table (%s)' % str(e)[:80]
+                    rebase_info = dict(plan=str(rp), sha256=rsha, replaced_passes=n, how=how, **info)
+                    rebased = True
+                arms.append(dict(id=a['id'], role='candidate', path=rp, sha=rsha))
+            else:
+                path = Path(card_plan['path'])
+                arms.append(dict(id=a['id'], role='candidate', path=path,
+                                 sha=sha or card_plan.get('sha256') or K.sha(path)))
+        else:
+            path = Path(p)
+            arms.append(dict(id=a['id'], role=a.get('role', a['id']), path=path,
+                             sha=sha or K.sha(path)))
+    return d, req, arms, rebase_info
+
+
+def build(card_id, stage, only_arm=None):
+    d, req, arms, rebase_info = load_request(card_id)
+    out = K.C / 'queue' / card_id / stage
+    out.mkdir(parents=True, exist_ok=True)
+    run = out / 'run'
+    jobs = []
+    use = [a for a in arms if only_arm is None or a['id'] == only_arm]
+    if stage == 'gates':
+        for a in use:
+            for mode in ('fixed', 'fb2'):
+                jobs.append(K.gate_job('%s-%s-%s' % (stage, a['id'], mode), a['path'], a['sha'],
+                                       run / ('%s-%s-%s' % (stage, a['id'], mode)), mode, a['id']))
+    elif stage == 'native':
+        for a in use:
+            jobs.append(K.native_job('%s-%s' % (stage, a['id']), a['path'], a['sha'],
+                                     run / ('%s-%s' % (stage, a['id'])), out / 'captures',
+                                     out / ('native-%s.log' % a['id']), a['id']))
+    elif stage == 'resources':
+        for a in use:
+            jobs.append(K.resources_job('%s-%s' % (stage, a['id']), a['path'], a['sha'],
+                                        run / ('%s-%s' % (stage, a['id'])), a['id']))
+    elif stage == 'ordinary':
+        ids = [a['id'] for a in arms]
+        if len(ids) == 2:
+            orders = [(ids[0], ids[1]) if i % 2 == 0 else (ids[1], ids[0]) for i in range(6)]
+        elif len(ids) == 3:
+            orders = PERM3
+        else:
+            raise SystemExit('ordinary supports 2 or 3 arms, got %d' % len(ids))
+        by = {a['id']: a for a in arms}
+        for pi, order in enumerate(orders):
+            for arm in order:
+                a = by[arm]
+                jobs.append(K.ordinary_job('ord-%d-%s' % (pi, arm), a['path'], a['sha'],
+                                           run / ('ord-%d-%s' % (pi, arm)), a['id'], pi))
+    else:
+        raise SystemExit('bad stage ' + stage)
+    spec = dict(stage=stage,
+                owner='LUNA-CONTINUOUS-' + card_id.upper(),
+                authorization='Main (this session) authorized card %s stage %s only: the jobs in this manifest, gold required.' % (card_id, stage),
+                output_root=str(out),
+                identities=[str(a['path']) for a in use] + [str(K.RUNNER)],
+                jobs=jobs,
+                rules=(req.get('ordinary') or {}).get('design', '') + '; all samples retained, no rerun after nongold.')
+    if rebase_info:
+        spec['rebase'] = rebase_info
+    spec_path = out / ('spec-%s.json' % stage)
+    K.write_json(spec_path, spec)
+    return spec_path, spec
+
+
+if __name__ == '__main__':
+    card_id, stage = sys.argv[1], sys.argv[2]
+    only = None
+    if '--only-arm' in sys.argv:
+        only = sys.argv[sys.argv.index('--only-arm') + 1]
+    spec_path, spec = build(card_id, stage, only)
+    print(spec_path, 'jobs:', len(spec['jobs']))
+    if '--run' in sys.argv:
+        import subprocess
+        r = subprocess.run([K_PY := '@NR_USER_HOME@/AppData/Local/Programs/Python/Python312/python.exe',
+                            str(Path(__file__).parent / 'STAGE.py'), str(spec_path)],
+                           capture_output=True, text=True, encoding='utf-8', errors='replace')
+        print(r.stdout[-6000:])
+        if r.returncode:
+            print(r.stderr[-4000:])

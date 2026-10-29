@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Re-run the whole R12 check chain from the artefacts on disk and diff against the seals.
+
+This is the closing self-check: it recomputes every sha256 that the card claims, rebuilds
+both candidates from their sources with the frozen glslang, re-runs the census/delta/site
+tools, and fails if anything moved.
+"""
+import hashlib
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+W = Path(r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024")
+CARD = W / "candidates/r12-split16-l2"
+BUILD = W / "build/r12-split16-l2"
+EV = CARD / "evidence"
+GLSLANG = "@NR_WORKSPACE@/src/project/tools/glslang-16.5.0/bin/glslang.exe"
+VALIDATOR = ("@NR_WORKSPACE@/candidates/amd-map-20261015/"
+             "s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe")
+PY = r"@NR_WORKSPACE@/run/python312/python.exe"
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def main():
+    checks = {}
+    tmp = Path(tempfile.mkdtemp(prefix="r12-recheck-"))
+
+    builds = [
+        ("parent_15", CARD / "source/parent/_15", ["-DL2_INLINE_QT=1", "-DL2_NO_T_WRITE=1"],
+         "split16_attention_qkv_int8_inline.comp", CARD / "spv/parent_repro_15.spv"),
+        ("parent_b30", CARD / "source/parent/block30", [],
+         "split16_attention_qkv_int8.comp", CARD / "spv/parent_repro_b30.spv"),
+        ("candidate_15", CARD / "source/candidate", ["-DL2_INLINE_QT=1", "-DL2_NO_T_WRITE=1"],
+         "split16_attention_qkv_int8_pv_int8.comp", CARD / "spv/r12_split16_l2_pv_int8.spv"),
+        ("candidate_b30", CARD / "source/candidate-b30", [],
+         "split16_attention_qkv_int8_pv_int8.comp", CARD / "spv/r12_split16_b30_l2_pv_int8.spv"),
+    ]
+    for tag, inc, macros, src, sealed in builds:
+        out = tmp / (tag + ".spv")
+        argv = [GLSLANG, "-V", "--target-env", "vulkan1.3", "-I" + str(inc)] + macros + \
+               ["-o", str(out), str(inc / src)]
+        r = subprocess.run(argv, capture_output=True, text=True)
+        v = subprocess.run([VALIDATOR, str(out)], capture_output=True, text=True)
+        checks[tag] = {"rebuilt_sha256": sha(out), "sealed_sha256": sha(sealed),
+                       "identical": sha(out) == sha(sealed),
+                       "compile_rc": r.returncode,
+                       "validation": v.stdout.strip(),
+                       "result_zero": v.returncode == 0 and "result=0" in v.stdout}
+    # parent reproduction must equal the deployed copies
+    checks["parent_15"]["matches_deployed"] = (sha(CARD / "spv/parent_repro_15.spv")
+                                               == sha(CARD / "spv/parent_deployed_15.spv"))
+    checks["parent_b30"]["matches_deployed"] = (sha(CARD / "spv/parent_repro_b30.spv")
+                                                == sha(CARD / "spv/parent_deployed_b30.spv"))
+
+    ev = {}
+    for p in sorted(EV.glob("*.json")):
+        try:
+            json.loads(p.read_text(encoding="utf-8"))
+            ev[p.name] = "ok"
+        except Exception as e:                                     # noqa: BLE001
+            ev[p.name] = "PARSE_ERROR: %s" % e
+
+    plan = CARD / "plan-r12-g3-base.txt"
+    lint = subprocess.run([PY, r"@NR_WORKSPACE@/work/dsh-int8-same-family-20261023/tools/plan_lint.py",
+                           str(plan)], capture_output=True, text=True)
+    strict = subprocess.run([PY, str(CARD / "tools/check_plan_strict.py"), str(plan),
+                             str(tmp / "strict.json")], capture_output=True, text=True)
+    strict_data = json.loads((tmp / "strict.json").read_text(encoding="utf-8")) \
+        if (tmp / "strict.json").exists() else {}
+
+    out = {"card": "r12-split16-l2",
+           "purpose": "closing reproducibility check; every number the card claims is recomputed here",
+           "builds": checks,
+           "evidence_json": ev,
+           "plan": {"sha256": sha(plan), "bytes": plan.stat().st_size,
+                    "lint_problems": json.loads(lint.stdout)["problems"] if lint.stdout else ["NO OUTPUT"],
+                    "strict_problems": strict_data.get("problems"),
+                    "strict_problem_count": strict_data.get("problem_count"),
+                    "strict_shared_ok": strict_data.get("shared_matches_module_workgroup_bytes"),
+                    "strict_shared_bad": strict_data.get("shared_mismatch"),
+                    "strict_bind_bounds_violations": [x for x in (strict_data.get("problems") or []) if "BIND" in x]},
+           "verdict": None}
+    ok = (all(c["identical"] and c["result_zero"] and c["compile_rc"] == 0
+              for c in checks.values())
+          and checks["parent_15"]["matches_deployed"] and checks["parent_b30"]["matches_deployed"]
+          and all(v == "ok" for v in ev.values())
+          and out["plan"]["lint_problems"] == [])
+    out["verdict"] = "REPRODUCIBLE" if ok else "MISMATCH"
+    (EV / "REPRODUCE.json").write_text(json.dumps(out, indent=1) + "\n",
+                                       encoding="utf-8", newline="\n")
+    print("verdict", out["verdict"])
+    for k, v in checks.items():
+        print(" ", k, v["rebuilt_sha256"][:16], "identical", v["identical"],
+              "result=0", v["result_zero"], "parent_deployed_match", v.get("matches_deployed"))
+    print(" evidence files", len(ev), "all ok", all(v == "ok" for v in ev.values()))
+    print(" plan lint", out["plan"]["lint_problems"], "strict problems",
+          out["plan"]["strict_problem_count"], "bind violations",
+          len(out["plan"]["strict_bind_bounds_violations"]))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

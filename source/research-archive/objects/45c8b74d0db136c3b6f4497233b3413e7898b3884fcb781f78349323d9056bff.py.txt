@@ -1,0 +1,293 @@
+"""Register / shape budget evidence for n05e-f05-atile (CPU only, read-only input).
+
+Reads the *existing* native ISA capture of the F05 C128 QKV kernel (the base arm
+of card n04b-f05-c128-feed, pipeline 9, SPV 20f4074f...) and reports:
+
+  1. every send message kind with its per-subgroup dynamic count (the ki loop and
+     both row_phases are fully unrolled, so static == dynamic per subgroup);
+  2. every DPAS with its destination base -> the accumulator footprint and the
+     GRF stride between accumulator bases;
+  3. a per-definition live-range model (live range = a write .. the last read
+     before the next write) -> the peak number of simultaneously live GRF inside
+     the QKV window, with the live set split by role;
+  4. the projection to the candidate's 12-accumulator form, two ways:
+       delta   : parent peak + 6 extra accumulators
+       absolute: 12*8 + the measured non-accumulator set at the parent's peak
+     plus the scalar floor as the optimistic bound.
+
+Writes only _build/budget-isa.json.  No GPU, no Vulkan, no plan, no baseline file.
+"""
+import json
+import re
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+Q = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+         'fullnet-continuous-20261027/queue')
+PARENT = (Q / 'n04b-f05-c128-feed/native/captures/native-native-base/ISA/'
+               'CS_asmf98d5ab4e239dd54_simd32_000000000000000a_9_orig.asm')
+
+LINE = re.compile(r'/\* \[([0-9A-Fa-f]+)\]\s*\*/\s*(\([^)]*\))?\s*([a-zA-Z0-9_.]+)\s*(.*)$')
+REG = re.compile(r'\br(\d+)(?:\.(\d+))?')
+NGRF = 128
+BPE = {'ud': 4, 'd': 4, 'f': 4, 'w': 2, 'uw': 2, 'hf': 2, 'bf': 2,
+       'ub': 1, 'b': 1, 'q': 8, 'uq': 8, 'df': 8, 'v': 2, 'uv': 2, 'vf': 2}
+
+
+def parse(path):
+    out = []
+    for raw in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+        m = LINE.match(raw.strip())
+        if not m:
+            continue
+        pc, pred, op, rest = int(m.group(1), 16), m.group(2) or '', m.group(3), m.group(4)
+        ex = 1
+        me = re.match(r'\s*\((\d+)\|[^)]*\)\s*', rest)
+        if me:
+            ex = int(me.group(1))
+            rest = rest[me.end():]
+        code, _, comment = rest.partition('//')
+        out.append(dict(pc=pc, op=op, pred=pred, execsize=ex,
+                        text=code.strip(), comment=comment.strip()))
+    return out
+
+
+def typ_of(tok):
+    m = re.search(r':([a-z]+)', tok)
+    return m.group(1) if m else 'd'
+
+
+def region_span(execsize, typ):
+    n = execsize * BPE.get((typ or 'd').lower(), 4)
+    return max(1, (n + 31) // 32)
+
+
+def operands(text):
+    return [t for t in re.split(r'(?<=\S)\s+', text.strip()) if t]
+
+
+def main():
+    ins = parse(PARENT)
+    assert ins, 'parent ISA did not parse'
+
+    # ---- messages (static == dynamic per subgroup: everything is unrolled)
+    messages = {}
+    for d in ins:
+        if d['op'].startswith('send') and d['comment']:
+            msg = d['comment'].split(';')[-1].strip()
+            messages[msg] = messages.get(msg, 0) + 1
+
+    # ---- DPAS map
+    dpas = []
+    for i, d in enumerate(ins):
+        if not d['op'].startswith('dpas'):
+            continue
+        ops = operands(d['text'])
+        m = REG.search(ops[0]) if ops else None
+        if not m:
+            continue
+        dpas.append(dict(pc=d['pc'], shape=d['op'], execsize=d['execsize'], acc=int(m.group(1))))
+    acc_bases = sorted({x['acc'] for x in dpas})
+    gaps = sorted({b - a for a, b in zip(acc_bases, acc_bases[1:])})
+    # the six QKV accumulators are the first six distinct bases in the QKV window
+    weight_sends = [d['pc'] for d in ins
+                    if d['op'].startswith('send') and 'load.ugm.d32x8.' in d['comment']]
+    slm_stores = [d['pc'] for d in ins
+                  if d['op'].startswith('send') and 'store.slm' in d['comment']]
+    lo = min(weight_sends)
+    hi = min([p for p in slm_stores if p > lo])
+    qkv_dpas = [x for x in dpas if lo <= x['pc'] <= hi]
+    qkv_bases = sorted({x['acc'] for x in qkv_dpas})
+    qkv_gaps = sorted({b - a for a, b in zip(qkv_bases, qkv_bases[1:])})
+
+    # ---- writes / reads per GRF, per definition
+    writes, reads = {}, {}
+
+    def add(d, grfs, is_write, role):
+        tgt = writes if is_write else reads
+        for g in grfs:
+            tgt.setdefault(g, []).append((d['pc'], role))
+
+    for d in ins:
+        ops = operands(d['text'])
+        if not ops:
+            continue
+        if d['op'].startswith('dpas'):
+            m = REG.search(ops[0])
+            if m:
+                add(d, range(int(m.group(1)), min(int(m.group(1)) + 8, NGRF)), True, 'acc')
+            for tok in ops[3:5]:
+                mm = REG.search(tok)
+                if mm:
+                    base = int(mm.group(1))
+                    add(d, range(base, min(base + 8, NGRF)), False, 'dpas_operand')
+            continue
+        if d['op'].startswith('send'):
+            rd = re.search(r'rd:(\d+)', d['comment'])
+            span = int(rd.group(1)) if rd else 1
+            msg = d['comment'].split(';')[-1].strip()
+            m = REG.search(ops[0])
+            if m:
+                base = int(m.group(1))
+                if 'store.' in msg:
+                    add(d, range(base, min(base + span, NGRF)), False, 'send_src')
+                elif 'load.ugm.d32x8.' in msg:
+                    add(d, range(base, min(base + span, NGRF)), True, 'weight_return')
+                elif 'load.ugm.d32x8t' in msg:
+                    add(d, range(base, min(base + span, NGRF)), True, 'a_return')
+                elif 'load.' in msg:
+                    add(d, range(base, min(base + span, NGRF)), True, 'other_return')
+                else:
+                    add(d, range(base, min(base + span, NGRF)), True, 'send_dst')
+            for tok in ops[1:2]:
+                mm = REG.search(tok)
+                if mm:
+                    add(d, [int(mm.group(1))], False, 'send_hdr')
+            continue
+        if ops and not ops[0].startswith('null'):
+            m = REG.search(ops[0])
+            if m:
+                span = region_span(d['execsize'], typ_of(ops[0]))
+                add(d, range(int(m.group(1)), min(int(m.group(1)) + span, NGRF)), True, 'alu')
+        for tok in ops[1:]:
+            if re.match(r'^[a-z0-9.]+:', tok):
+                continue
+            for mm in REG.finditer(tok):
+                base = int(mm.group(1))
+                span = region_span(d['execsize'], typ_of(tok))
+                add(d, range(base, min(base + span, NGRF)), False, 'alu')
+
+    # ---- live ranges and sweep
+    events = []
+    for grf, ws in writes.items():
+        ws = sorted(ws)
+        rs = sorted(reads.get(grf, []))
+        for k, (wpc, role) in enumerate(ws):
+            nxt = ws[k + 1][0] if k + 1 < len(ws) else None
+            end = None
+            for (rpc, _rrole) in rs:
+                if rpc < wpc:
+                    continue
+                if nxt is not None and rpc >= nxt:
+                    break
+                end = rpc
+            if end is not None:
+                events.append((wpc, end, grf, role))
+    for grf, rs in reads.items():
+        if grf in writes:
+            continue
+        events.append((ins[0]['pc'], max(p for p, _ in rs), grf, 'param'))
+
+    def sweep(lo_, hi_):
+        best = (0, None, [])
+        pcs = sorted({e[0] for e in events if lo_ <= e[0] <= hi_} |
+                     {e[1] for e in events if lo_ <= e[1] <= hi_})
+        for p in pcs:
+            live = [e for e in events if e[0] <= p <= e[1]]
+            if len(live) > best[0]:
+                best = (len(live), p, live)
+        return best
+
+    def compose(live):
+        by = {}
+        for (_s, _e, g, role) in live:
+            by.setdefault(role, []).append(g)
+        return {k: dict(n=len(v), grf=sorted(set(v))) for k, v in by.items()}
+
+    peak_n, peak_pc, peak_live = sweep(lo, hi)
+    comp = compose(peak_live)
+    acc_grf = comp.get('acc', {}).get('n', 0)
+    scalar_floor = sum(v['n'] for k, v in comp.items() if k in ('alu', 'param', 'send_hdr'))
+
+    # every QKV phase window = between two shared publications (the loop body
+    # publishes at the end of each row_phase, so the ISA has two such windows)
+    pubs = [d['pc'] for d in ins
+            if d['op'].startswith('send') and 'store.slm' in d['comment'] and d['pc'] > lo]
+    bounds = [lo] + pubs[:2] + [max(weight_sends)]
+    windows = []
+    for a, b in zip(bounds, bounds[1:]):
+        if b <= a:
+            continue
+        n, p, live = sweep(a, b)
+        c = compose(live)
+        windows.append(dict(window=[hex(a), hex(b)], n=n, pc=hex(p) if p is not None else None,
+                            acc=c.get('acc', {}).get('n', 0),
+                            non_acc=n - c.get('acc', {}).get('n', 0),
+                            scalar_floor=sum(v['n'] for k, v in c.items()
+                                             if k in ('alu', 'param', 'send_hdr')),
+                            comp={k: v['n'] for k, v in c.items()}))
+    body = sweep(lo, pubs[0] if pubs else hi)
+    epi = sweep(pubs[0] if pubs else lo, pubs[1] if len(pubs) > 1 else hi)
+
+    ACC = 8
+    proj = {}
+    for name, nacc in (('D0_parent_6acc', 6), ('n05e_12acc_one_A_fragment', 12)):
+        acc = nacc * ACC
+        proj[name] = dict(
+            acc=nacc, acc_grf=acc,
+            peak_if_non_acc_unchanged=acc + (peak_n - acc_grf),
+            peak_if_scalar_floor=acc + scalar_floor,
+            peak_delta_reading=peak_n + (nacc - 6) * ACC,
+            delta_acc_grf_vs_6acc=(nacc - 6) * ACC,
+            fits_120=bool(acc + (peak_n - acc_grf) <= 120),
+            fits_128=bool(acc + (peak_n - acc_grf) <= 128),
+        )
+
+    res = dict(
+        source=dict(path=str(PARENT), spv='20f4074fc70c32c0e74f0ad000053492e5f5c420259da6044e7a00cfc3ee3f4f',
+                    pipeline=9),
+        instructions=len(ins),
+        dpas=len(dpas),
+        dpas_shapes=sorted({x['shape'] for x in dpas}),
+        dpas_execsizes=sorted({x['execsize'] for x in dpas}),
+        acc_bases_all=acc_bases,
+        acc_base_gaps_all=gaps,
+        qkv_window=[hex(lo), hex(hi)],
+        qkv_acc_bases=qkv_bases,
+        qkv_acc_gaps=qkv_gaps,
+        qkv_acc_block_GRF=ACC,
+        qkv_dpas=len(qkv_dpas),
+        max_reg_index=max((int(m.group(1)) for d in ins for m in REG.finditer(d['text'])),
+                          default=None),
+        messages=messages,
+        peak_qkv=dict(n=peak_n, pc=hex(peak_pc), comp=comp,
+                      acc_grf=acc_grf, non_acc=peak_n - acc_grf, scalar_floor=scalar_floor),
+        peak_qkv_body=dict(n=body[0], pc=hex(body[1]) if body[1] else None,
+                           comp={k: v['n'] for k, v in compose(body[2]).items()}),
+        peak_qkv_epilogue=dict(n=epi[0], pc=hex(epi[1]) if epi[1] else None,
+                               comp={k: v['n'] for k, v in compose(epi[2]).items()}),
+        phase_windows=windows,
+        projection=proj,
+        per_sg_dynamic=dict(
+            weight_messages=messages.get('load.ugm.d32x8.a32.bss[a0.2]', 0),
+            a_row_messages=messages.get('load.ugm.d32x8t.a32.bss[a0.0]', 0),
+            qkv_dpas=len(qkv_dpas),
+            store_slm_d32x8t=messages.get('store.slm.d32x8t.a32', 0),
+            store_ugm_d32x8t=messages.get('store.ugm.d32x8t.a32.bss[a0.0]', 0),
+            note='ki loop and both row_phases are fully unrolled, so the static count of the '
+                 'kernel equals the dynamic count of one subgroup run',
+        ),
+    )
+    (CARD / '_build' / 'budget-isa.json').write_text(json.dumps(res, indent=2), encoding='utf-8')
+
+    print('instructions %d  dpas %d  shapes %s exec %s' %
+          (res['instructions'], res['dpas'], res['dpas_shapes'], res['dpas_execsizes']))
+    print('all acc bases %s  gaps %s' % (acc_bases, gaps))
+    print('QKV acc bases %s  gaps %s  (%d DPAS in window %s)' %
+          (qkv_bases, qkv_gaps, len(qkv_dpas), res['qkv_window']))
+    print('peak QKV n=%d @%s  acc=%d non_acc=%d scalar_floor=%d' %
+          (peak_n, hex(peak_pc), acc_grf, peak_n - acc_grf, scalar_floor))
+    for k, v in sorted(comp.items()):
+        print('   %-14s %3d %s' % (k, v['n'], v['grf']))
+    print('body peak %s  epilogue peak %s' % (res['peak_qkv_body'], res['peak_qkv_epilogue']))
+    for w in windows:
+        print('phase window %s n=%d @%s %s' % (w['window'], w['n'], w['pc'], w['comp']))
+    for k, v in proj.items():
+        print('%-26s acc_grf=%3d peak(abs)=%3d (scalar floor %3d) peak(delta)=%3d fits120=%s fits128=%s' %
+              (k, v['acc_grf'], v['peak_if_non_acc_unchanged'], v['peak_if_scalar_floor'],
+               v['peak_delta_reading'], v['fits_120'], v['fits_128']))
+    print('per-SG dynamic:', res['per_sg_dynamic'])
+
+
+if __name__ == '__main__':
+    main()

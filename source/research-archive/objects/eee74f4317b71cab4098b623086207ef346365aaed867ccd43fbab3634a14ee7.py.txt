@@ -1,0 +1,245 @@
+"""R09 deliverables: CANDIDATE.json + evidence/CONNECT-COST.json (CPU only).
+
+Every number here is derived, not typed in from memory: the instruction-level
+multiplicities come from the two modules' own counts (tools/spvlib.py), the
+workgroup geometry from the G3 PASS line, and the per-element work from the
+source's loop bounds.  All values are source-level effective counts -- not DRAM
+bytes, not LDS bank conflicts, not occupancy, not time.
+
+usage: python tools/deliverables.py
+"""
+import hashlib
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+CARD = HERE.parent
+sys.path.insert(0, str(HERE))
+import spvlib  # noqa: E402
+
+for _op, _name in ((3, "OpSource"), (4, "OpSourceExtension"),
+                   (185, "OpFOrdLessThan"), (186, "OpFOrdGreaterThan"),
+                   (42, "OpConstantFalse")):
+    spvlib.OP.setdefault(_op, _name)
+
+R = Path("@NR_WORKSPACE@")
+BUILD = R / "work/dsh-xmx-handoff-validation-20261024/build/r09-r11-f3ds"
+PARENT = CARD / "spv/parent_repro-f3c64_body_ds.spv"
+CAND = CARD / "spv/r09_f3c64_body_ds_wo_i8.spv"
+PLAN = CARD / "plan-r09-f3ds.txt"
+GRID = (42, 25, 1)
+WG = 256
+SG = 8
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def ident(p):
+    p = Path(p)
+    return {"path": p.as_posix(), "bytes": p.stat().st_size, "sha256": sha(p)}
+
+
+def counts(m):
+    c = Counter(it.name for it in m.insts)
+    return c
+
+
+def connect_cost():
+    p, c = spvlib.Mod(PARENT), spvlib.Mod(CAND)
+    hp, hc = counts(p), counts(c)
+    nwg = GRID[0] * GRID[1] * GRID[2]
+    # per-workgroup multiplicities, read off the source loops
+    par = {
+        "mma_static": 4, "ki_steps": 4,
+        "cm_loads_static": 10,          # 2 pack scale + 4 gY + 2 B + 2 A in the ki body
+        "cm_loads_dynamic": 2 + 4 + 4 * 4,   # scale 2 + gY 4 + (2 B + 2 A) x 4 ki
+        "wo_b_bytes": SG * 2 * 4 * 512,      # 8 sg x 2 n-tiles x 4 ki x 512 B
+        "a_global_bytes": SG * 2 * 4 * 256,  # 8 sg x 2 row blocks x 4 ki x 256 B of gT
+        "a_shared_bytes": 0,
+        "shared_declared": 9216,
+        "barriers": hp.get("OpControlBarrier", 0),
+    }
+    cand = {
+        "mma_static": 4, "ki_steps": 2,
+        "cm_loads_static": 14,          # 2 scale + 4 gY + 4 fsc + (2 B + 2 A) in the body
+        "cm_loads_dynamic": 2 + 4 + 4 + 4 * 2,
+        "wo_b_bytes": SG * 2 * 2 * 512,
+        "a_global_bytes": 2 * 4096 * 2,      # amax pass + staging pass over the tile
+        "a_shared_bytes": SG * 2 * 2 * 256,  # int8 A tiles: 8 sg x 2 x 2 ki x 256 B
+        "shared_declared": 14344,
+        "barriers": hc.get("OpControlBarrier", 0),
+        "staged_bytes_written": 4096,
+        "code_points": 4096,
+        "amax_reads": 4096,
+        "reduction_shared": 256 + 256,
+    }
+    rec = {
+        "scope": "source-level effective counts, not DRAM traffic, not LDS conflicts, "
+                 "not occupancy, not time",
+        "geometry": {"grid": list(GRID), "workgroups_per_frame": nwg, "workgroup_size": WG,
+                     "subgroups": SG, "owner": "unchanged: subgroup-local 8x16 "
+                     "fragments; the staging tile and the two scale slots are "
+                     "workgroup-private, so no cross-SG or cross-WG contract is added"},
+        "per_workgroup": {
+            "matrix_steps": {"before": par["mma_static"] * par["ki_steps"],
+                             "after": cand["mma_static"] * cand["ki_steps"]},
+            "cooperative_matrix_loads": {"before": par["cm_loads_dynamic"],
+                                         "after": cand["cm_loads_dynamic"]},
+            "wo_weight_bytes": {"before": par["wo_b_bytes"], "after": cand["wo_b_bytes"]},
+            "a_operand_bytes": {"before": par["a_global_bytes"],
+                                "after_global": cand["a_global_bytes"],
+                                "after_shared": cand["a_shared_bytes"],
+                                "note": "the parent reads gT once (16 KiB of 8x16 f16 "
+                                        "tiles); the candidate reads gT twice (amax "
+                                        "pass + staging pass, 8 KiB each) and then "
+                                        "reads 8 KiB of int8 from the shared tile, so "
+                                        "the global A volume is exactly replaced"},
+            "declared_shared_bytes": {"before": par["shared_declared"],
+                                      "after": cand["shared_declared"]},
+            "workgroup_barriers": {"before": par["barriers"], "after": cand["barriers"]},
+            "code_points_staged": {"before": 0, "after": cand["code_points"]},
+            "shared_tile_writes_B": {"before": 0, "after": cand["staged_bytes_written"]},
+            "reduction_shared_ops": {"before": 0, "after": cand["reduction_shared"]},
+        },
+        "per_frame": {},
+        "added_elementwise": {
+            "quantiser": "per staged element: 1 f32 multiply + 1 roundEven + 1 clamp + "
+                         "1 f32->int8 convert + 1 int8 shared store",
+            "amax_pass": "per element: 1 f16->f32 widen + 1 abs + 1 max; then 256 "
+                         "shared stores, 256 shared loads and 2 publications per WG",
+            "epilogue_per_fragment_element": "1 f32 multiply (fsc = sWo * sC) + 1 f32 "
+                                             "multiply (acc * fsc) + 1 f32 add "
+                                             "(+ seed) + 1 int32->f32 convert + 1 "
+                                             "f32->f16 narrow",
+            "epilogue_elements_per_wg": 4 * 128,
+        },
+        "removed": {
+            "fp16_matrix_steps_per_wg": par["mma_static"] * par["ki_steps"],
+            "fp16_wo_tile_loads_per_wg": SG * 2 * 4,
+            "fp16_a_tile_loads_per_wg": SG * 2 * 4,
+            "bytes_of_fp16_wo_tiles_per_wg": par["wo_b_bytes"],
+        },
+        "not_counted_here": ["DRAM bytes", "LDS bank conflicts", "GRF pressure",
+                             "scratch", "occupancy", "milliseconds"],
+    }
+    pf = rec["per_frame"]
+    for k, v in (("matrix_steps", (par["mma_static"] * par["ki_steps"],
+                                    cand["mma_static"] * cand["ki_steps"])),
+                 ("wo_weight_bytes", (par["wo_b_bytes"], cand["wo_b_bytes"])),
+                 ("code_points", (0, cand["code_points"])),
+                 ("shared_tile_writes_B", (0, cand["staged_bytes_written"])),
+                 ("barriers", (par["barriers"], cand["barriers"]))):
+        pf[k] = {"before": v[0] * nwg, "after": v[1] * nwg,
+                 "delta": (v[1] - v[0]) * nwg}
+    pf["derivation"] = "per-workgroup value x %d workgroups per frame" % nwg
+    return rec
+
+
+def main():
+    files = []
+    for p in sorted(CARD.rglob("*")):
+        if p.is_file() and p.name != "CANDIDATE.json":
+            files.append(ident(p))
+    pack_meta = json.loads((CARD / "packs/PACK-META.json").read_text(encoding="utf-8"))
+    spv_id = json.loads((CARD / "evidence/SPV-IDENTITY-R09.json").read_text(encoding="utf-8"))
+    plan_id = json.loads((CARD / "evidence/PLAN-DELTA.json").read_text(encoding="utf-8"))
+    oracle = json.loads((CARD / "evidence/ORACLE-R09.json").read_text(encoding="utf-8"))
+    resid = json.loads((CARD / "evidence/RESIDUAL-MMA-AFTER.json").read_text(encoding="utf-8"))
+    sites = json.loads((CARD / "evidence/SITE-REGISTRY.json").read_text(encoding="utf-8"))
+    ident_ = json.loads((CARD / "evidence/MODULE-IDENTITY.json").read_text(encoding="utf-8"))
+    receipt = json.loads((CARD / "build-receipt.json").read_text(encoding="utf-8"))
+    cc = connect_cost()
+    (CARD / "evidence/CONNECT-COST.json").write_text(
+        json.dumps(cc, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    files = [f for f in files if not f["path"].endswith("evidence/CONNECT-COST.json")]
+    files.append(ident(CARD / "evidence/CONNECT-COST.json"))
+
+    cand = {
+        "card": "R09 (+R10/R11 identity & enumeration)",
+        "label": "r09-r11-f3ds",
+        "pass_family": "F3 down-sample family: f3c64_body_ds / f3c128_body_ds / "
+                       "f3c256_body_ds",
+        "implemented": "R09 f3c64_body_ds (WO -> INT8); R10/R11 enumerated only",
+        "candidate_plan": ident(PLAN),
+        "parent_plan": {"path": "@NR_WORKSPACE@/candidates/"
+                                "int8-coverage-v2-20261020/plan-g3-production.txt",
+                        "bytes": 216393,
+                        "sha256": "d0bb75cf70f5def98fab66883f4d4e13099a2823655d34f15e11482cf4610cd4"},
+        "module_identity": ident_["summary"],
+        "parent_spv": ident(PARENT),
+        "candidate_spv": ident(CAND),
+        "candidate_spv_native0": ident(BUILD / "r09-candidate-NATIVE0.spv"),
+        "nocontraction_transfer_probe": ident(CARD / "spv/r09_f3c64_body_ds_wo_i8.transfer.spv"),
+        "toolchain": receipt["toolchain"],
+        "replay_argv": {
+            "parent_raw": ["glslang.exe", "-V", "--target-env", "vulkan1.3", "-DNATIVE=1",
+                           "-I<candidate source/parent/r09>", "-o", "<build>/r09.parent.raw.spv",
+                           "<source/parent/r09>/fused_body_int8_ds.comp"],
+            "parent_deployed": ["spv_tools.py transfer_decoration_pattern_aligned("
+                                "fused_c64_body_ds.spv -> r09.parent.raw.spv) then "
+                                "set_no_contraction -> spv/parent_repro-f3c64_body_ds.spv"],
+            "candidate": ["glslang.exe", "-V", "--target-env", "vulkan1.3", "-DNATIVE=1",
+                          "-I<candidate source/candidate>", "-o", "spv/r09_f3c64_body_ds_wo_i8.spv",
+                          "<source/candidate>/r09_f3c64_body_ds_wo_i8.comp"],
+            "validate": ["spv_validate_cpu.exe", "spv/r09_f3c64_body_ds_wo_i8.spv"],
+            "plan": ["python tools/make_plan.py"],
+        },
+        "packs": [ident(CARD / "packs/r09_c64_b8_wo.i8.bin"),
+                  ident(CARD / "packs/r09_c64_b8_wosc.f32.bin")],
+        "pack_meta": pack_meta,
+        "sites": {p: {"fp16": v["fp16_static_mma"], "int8": v["int8_static_mma"],
+                      "WO_fp16": v["WO_fp16"], "DS_fp16": v["DS_fp16"],
+                      "DS_int8": v["DS_int8"], "by_function": v["by_function"]}
+                  for p, v in sites["modules"].items()},
+        "identity_summary": ident_["summary"],
+        "spv_identity_verdict": spv_id["verdict"],
+        "plan_identity_verdict": plan_id["verdict"],
+        "residual_after": resid["summary"],
+        "oracle": {k: oracle[k] for k in ("A_provenance", "B_int8_exactness",
+                                          "C_wo_arm_int8_vs_fp16", "D_pool_and_mean",
+                                          "E_ds_consumer")},
+        "qualification": {
+            "CPU_STRUCT": "yes -- 16 sites across the three modules enumerated and "
+                          "classified (WO vs post-pool DS) from raw SPIR-V, cross-checked "
+                          "1:1 against the audit registry (word offset, result id, function)",
+            "OFFLINE_COMPILE": "yes -- parent raw 769926c7... + NoContraction transfer = "
+                               "c2feb5dc... byte-identical to the deployed C-producer.spv; "
+                               "candidate result=0 words=9227; NATIVE=0 arm also builds",
+            "SPV_IDENTITY": "yes -- " + spv_id["verdict"] + ", unexplained: [], 16 "
+                            "must-be-zero invariants at zero, 2 must-be-kept invariants "
+                            "unchanged, residual loads and the whole store stream identical",
+            "PLAN_IDENTITY": "yes -- 1 PASS changed / 286 unchanged, tail identical, "
+                             "plan_lint 0 problems (16 notes = parent's own D1 artefact), "
+                             "strict 2629-BIND check 0 problems, pool upload PASS",
+            "NATIVE": "unknown (no pipeline created)",
+            "GATE": "not run (no GPU slot)",
+            "ORDINARY": "not run (no GPU slot)",
+            "QUALITY": "not run (no GPU slot)",
+            "claims_not_made": ["numeric gate", "milliseconds", "speedup",
+                                "native SLM/GRF/scratch", "PSNR",
+                                "whole-network INT8 coverage",
+                                "that R10/R11 are implemented",
+                                "that the 232 FP16 arm's f3c64_body_ds is closed"],
+        },
+        "files": files,
+    }
+    (CARD / "CANDIDATE.json").write_text(
+        json.dumps(cand, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(json.dumps({"candidate_plan": cand["candidate_plan"]["sha256"],
+                      "candidate_spv": cand["candidate_spv"],
+                      "files": len(files),
+                      "connect_cost_per_wg": cc["per_workgroup"]["matrix_steps"],
+                      "connect_cost_per_frame": {
+                          k: cc["per_frame"][k] for k in
+                          ("matrix_steps", "wo_weight_bytes", "code_points", "barriers")}},
+                     indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,107 @@
+"""Compute each PASS's TRUE workgroup memory from its SPIR-V and compare with the plan field.
+
+n38 found the F20 plan field says 29184 while the module declares 24576 (the field was stale
+after the P publish region was deleted). My occupancy ranking used the plan field, so it may be
+misattributing groups. This recomputes the declaration from the module itself.
+"""
+import json, struct, sys
+from collections import defaultdict
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+from audit_card import pass_lines
+
+WG = 4  # StorageClass Workgroup
+SIZES = {  # scalar type -> bytes
+    6: 4,   # OpTypeFloat 32
+    7: 4,   # OpTypeFloat 64? (rare) - refined below via width
+    9: 4,   # OpTypeInt (width read from operand)
+    10: 4,
+}
+
+
+def scan(spv):
+    d = Path(spv).read_bytes()
+    w = struct.unpack('<%dI' % (len(d) // 4), d[:len(d) // 4 * 4])
+    i = 5
+    consts = {}
+    types = {}
+    arrays = {}
+    ptr_target = {}
+    wg_vars = []
+    while i < len(w):
+        wc = w[i] >> 16
+        op = w[i] & 0xFFFF
+        if wc == 0:
+            break
+        a = list(w[i + 1:i + wc])
+        if op == 43 and len(a) >= 3:            # OpConstant
+            consts[a[1]] = a[2]
+        elif op == 21:                          # OpTypeInt
+            types[a[0]] = ('int', a[1] // 8)
+        elif op == 22:                          # OpTypeFloat
+            types[a[0]] = ('float', a[1] // 8)
+        elif op == 23:                          # OpTypeVector
+            types[a[0]] = ('vector', a[1], a[2])
+        elif op == 28:                          # OpTypeArray
+            arrays[a[0]] = (a[1], a[2])
+        elif op == 32 and len(a) >= 3:          # OpTypePointer
+            ptr_target[a[0]] = (a[1], a[2])
+        elif op == 59:                          # OpVariable
+            if a[0] in ptr_target and ptr_target[a[0]][0] == WG:
+                wg_vars.append((a[1], ptr_target[a[0]][1]))
+        i += wc
+
+    def size_of(tid, depth=0):
+        if depth > 8 or tid not in types and tid not in arrays:
+            return 0
+        if tid in arrays:
+            elem, ln = arrays[tid]
+            n = consts.get(ln, 0)
+            return n * size_of(elem, depth + 1)
+        t = types[tid]
+        if t[0] in ('int', 'float'):
+            return t[1]
+        if t[0] == 'vector':
+            return t[1] * size_of(t[2], depth + 1) if False else t[1] * (size_of(t[2], depth + 1))
+        return 0
+
+    total = 0
+    detail = []
+    for _res, tid in wg_vars:
+        s = size_of(tid)
+        total += s
+        detail.append(s)
+    return total, detail
+
+
+cur = K.read_json(K.C / 'CURRENT.json')
+recs = pass_lines(Path(cur['best_plan']['path']))
+seen = {}
+rows = []
+for r in K.rows():
+    spv = recs[r['ordinal']]['spv']
+    if spv not in seen:
+        try:
+            seen[spv] = scan(spv)
+        except Exception as e:
+            seen[spv] = (None, str(e))
+    true_slm, detail = seen[spv]
+    plan_slm = int(recs[r['ordinal']]['line'].split()[-6])
+    rows.append(dict(ordinal=r['ordinal'], name=r['name'], family=r['family'],
+                     plan=plan_slm, true=true_slm, detail=detail if isinstance(detail, list) else detail))
+mismatch = [x for x in rows if x['true'] != x['plan']]
+print('rows:', len(rows), ' mismatches (plan field vs SPIR-V declaration):', len(mismatch))
+for x in mismatch[:20]:
+    print('  ord %3d %-28s plan %6d  true %s' % (x['ordinal'], x['name'][:28], x['plan'], x['true']))
+by_true = defaultdict(list)
+for x in rows:
+    by_true[x['true']].append(x)
+print('\nby TRUE workgroup memory:')
+for t in sorted(k for k in by_true if isinstance(k, int)):
+    sel = by_true[t]
+    fam = defaultdict(int)
+    for x in sel:
+        fam[x['family']] += 1
+    print('  %6d B  %3d PASS  %s' % (t, len(sel), ', '.join('%s×%d' % (f, c) for f, c in sorted(fam.items()))))
+K.write_json(K.C / 'evidence' / 'TRUE-SLM.json', dict(rows=rows, mismatches=len(mismatch)))

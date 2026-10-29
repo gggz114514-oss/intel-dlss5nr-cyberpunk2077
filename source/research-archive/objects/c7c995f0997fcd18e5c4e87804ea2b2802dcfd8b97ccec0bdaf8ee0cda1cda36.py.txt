@@ -1,0 +1,203 @@
+"""Emit CANDIDATE.json and MERGE-RECIPE.json from the artefacts on disk.
+
+Every hash, size and line vector in the two deliverables is read from the file
+that will actually be merged, so the card cannot drift from the plan.
+
+usage: python tools/deliverables.py
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+CARD = HERE.parent
+R = Path("@NR_WORKSPACE@")
+BUILD = R / "work/dsh-int8-fullnet-impl-20261024/build/r10-r11-ds"
+G3 = R / "candidates/int8-coverage-v2-20261020/plan-g3-production.txt"
+G3_SHA = "d0bb75cf70f5def98fab66883f4d4e13099a2823655d34f15e11482cf4610cd4"
+PLAN = CARD / "plan-r10-r11-ds.txt"
+TARGETS = [("f3c128_body_ds", 14, "R10"), ("f3c256_body_ds", 22, "R11")]
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def info(p):
+    p = Path(p)
+    return {"path": p.as_posix(), "bytes": p.stat().st_size, "sha256": sha(p)}
+
+
+def parse_plan(path):
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    h = lines[0].split()
+    nb, npass = int(h[2]), int(h[3])
+    bufs = lines[1:1 + nb]
+    passes = {}
+    i = 1 + nb
+    for _ in range(npass):
+        t = lines[i].split()
+        nbind = int(t[6])
+        order = int(t[1])
+        passes[order] = {"line": lines[i], "name": t[2].strip('"'),
+                         "binds": lines[i + 1:i + 1 + nbind],
+                         "push": lines[i + nbind + 1]}
+        i += nbind + 2
+    tail = lines[i:]
+    return {"header": lines[0], "buffers": bufs, "passes": passes, "tail": tail,
+            "nb": nb, "npass": npass}
+
+
+def main():
+    assert sha(G3) == G3_SHA
+    plan = parse_plan(PLAN)
+    parent = parse_plan(G3)
+    pols = [ln for ln in plan["tail"] if ln.startswith("POLICY")]
+    parent_pols = [ln for ln in parent["tail"] if ln.startswith("POLICY")]
+    new_pols = pols[len(parent_pols):]
+    new_bufs = plan["buffers"][parent["nb"]:]
+    oracle = json.loads((CARD / "evidence/ORACLE-R10-R11.json").read_text(encoding="utf-8"))
+    delta = json.loads((CARD / "evidence/PLAN-DELTA.json").read_text(encoding="utf-8"))
+    packmeta = json.loads((CARD / "packs/PACK-META.json").read_text(encoding="utf-8"))
+    shared = json.loads((BUILD / "shared-bytes.json").read_text(encoding="utf-8"))
+    ident = {t: json.loads((CARD / ("evidence/SPV-IDENTITY-%s.json" % t))
+                           .read_text(encoding="utf-8")) for t in ("R10", "R11")}
+
+    mods = {}
+    for tag, order in (("R10", 14), ("R11", 22)):
+        name = dict((o, n) for n, o, _ in TARGETS)[order]
+        p = plan["passes"][order]
+        base = p["line"].split('"')[1]
+        parent_binds = parent["passes"][order]["binds"]
+        mods[tag] = {
+            "pass_name": name, "pass_order": order,
+            "candidate_spv": info(CARD / "spv" / (tag.lower() + {
+                "R10": "_f3c128_body_ds_wo_ds_i8.spv",
+                "R11": "_f3c256_body_ds_wo_ds_i8.spv"}[tag])),
+            "source": info(CARD / "source/candidate" / {
+                "R10": "r10_f3c128_body_ds_wo_ds_i8.comp",
+                "R11": "r11_f3c256_body_ds_wo_ds_i8.comp"}[tag]),
+            "parent_source": info(CARD / "source/parent" / (
+                "r10/fused_c128_body_ds.comp" if tag == "R10" else "r11/fused_c256_body_ds.comp")),
+            "parent_replay_spv": info(BUILD / (tag.lower() + ".parent.replay.spv")),
+            "sites": {"parent_fp16": ident[tag]["sites"]["parent"]["fp16"],
+                      "parent_int8": ident[tag]["sites"]["parent"]["int8"],
+                      "candidate_fp16": ident[tag]["sites"]["candidate"]["fp16"],
+                      "candidate_int8": ident[tag]["sites"]["candidate"]["int8"]},
+            "declared_shared_bytes": {
+                "parent": [m for m in shared["modules"]
+                           if m["path"].endswith(tag.lower() + ".parent.replay.spv")][0]
+                          ["declared_workgroup_bytes"],
+                "candidate": [m for m in shared["modules"]
+                              if "r10-r11-ds/spv/" in m["path"].replace("\\", "/")
+                              and tag.lower() in Path(m["path"]).name][0]
+                             ["declared_workgroup_bytes"],
+                "arrays_candidate": [m for m in shared["modules"]
+                                     if "r10-r11-ds/spv/" in m["path"].replace("\\", "/")
+                                     and tag.lower() in Path(m["path"]).name][0]["arrays"],
+            },
+            "binds": [{"line": ln, "kept_from_parent": ln in parent_binds}
+                      for ln in p["binds"]],
+            "push": p["push"], "pushed_words": len(p["push"].split()) - 1,
+            "plan_pass_line": p["line"], "plan_pass_line_before":
+                parent["passes"][order]["line"],
+        }
+
+    cand = {
+        "card": "r10-r11-ds",
+        "label": "r10-r11-ds",
+        "title": "R10 f3c128_body_ds + R11 f3c256_body_ds: WO and post-pool DS both INT8",
+        "implemented": {
+            "R10": "f3c128_body_ds  -- 2 WO + 4 DS FP16 MulAdd -> 6 INT8 MulAdd",
+            "R11": "f3c256_body_ds  -- 2 WO + 4 DS FP16 MulAdd -> 6 INT8 MulAdd",
+        },
+        "gpu_used": False,
+        "parent_plan": {"path": G3.as_posix(), "bytes": G3.stat().st_size, "sha256": G3_SHA,
+                        "header": parent["header"], "buffers": parent["nb"],
+                        "passes": parent["npass"]},
+        "candidate_plan": {"path": PLAN.as_posix(), "bytes": PLAN.stat().st_size,
+                           "sha256": sha(PLAN), "header": plan["header"],
+                           "buffers": plan["nb"], "passes": plan["npass"],
+                           "policies": len(pols)},
+        "plan_identity": delta["verdict"],
+        "modules": mods,
+        "packs": packmeta["packs"],
+        "oracle": {t: {"capture": oracle["passes"][t]["capture"],
+                       "A_provenance": oracle["passes"][t]["A_provenance_fp16_wo_vs_capture"],
+                       "B_exactness": oracle["passes"][t]["B_integer_exactness"],
+                       "C_wo_int8_vs_fp16": oracle["passes"][t]["C_wo_int8_vs_fp16"],
+                       "D_pooling": oracle["passes"][t]["D_pooling_and_post_pool"]
+                       ["pooled_half_diff_i8_wo_vs_fp16_wo"],
+                       "E_ds": oracle["passes"][t]["E_ds"]["vs_parent_fp16_ds"],
+                       "E_ds_weight": oracle["passes"][t]["E_ds"]["ds_weight"]}
+                  for t in ("R10", "R11")},
+        "qualification": {
+            "CPU_STRUCT": "yes -- both parents replayed byte-identical to the deployed SPV; "
+                          "6 MulAdd sites each, classified WO vs post-pool DS from operand "
+                          "provenance (A = gT/shT context tile vs nrf_mean pooled tile)",
+            "OFFLINE_COMPILE": "yes -- both candidates compile with the frozen glslang and "
+                               "validate result=0 (words 10096 / 10110)",
+            "WIRING": "yes at plan level -- 2 PASS changed, 285 unchanged, ordinals/grids/"
+                      "32-word PUSH identical, 8 BUFFERs appended, 8 POLICY lines appended, "
+                      "plan_lint 0 problems, strict 2635-BIND check 0 problems, pool upload PASS",
+            "STATIC_ZERO_RESIDUAL": "yes -- 12 FP16 MulAdd across the two passes -> 0 FP16 / "
+                                    "12 INT8 (operand-level audit, signedness included)",
+            "SEGMENT_REPLACEMENT": "yes -- the WO and the post-pool DS are both replaced inside "
+                                   "the same module identities; no FP16 matrix path is kept",
+            "NUMERIC_PASS": "NOT RUN (no GPU slot)",
+            "QUALITY_PASS": "NOT RUN (no GPU slot)",
+            "claims_not_made": ["numeric gate", "PSNR", "milliseconds", "speedup",
+                                "native SLM/occupancy/GRF", "quality acceptance",
+                                "whole-network INT8 coverage",
+                                "that PASS 14/22 have a capture of their own frame"],
+        },
+        "files": [],
+    }
+    for p in sorted(CARD.rglob("*")):
+        if p.is_file() and p.name not in ("CANDIDATE.json",):
+            cand["files"].append({**info(p),
+                                  "rel": p.relative_to(CARD).as_posix()})
+    (CARD / "CANDIDATE.json").write_text(
+        json.dumps(cand, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    recipe = {
+        "card": "r10-r11-ds",
+        "note": "Exact merge instructions into a cumulative plan. Ordinals, grids and PUSH "
+                "are untouched, so only these lines change.",
+        "parent_plan_sha256": G3_SHA,
+        "candidate_plan": {"path": PLAN.as_posix(), "bytes": PLAN.stat().st_size,
+                           "sha256": sha(PLAN), "header": plan["header"]},
+        "buffer_declarations": [{"resource": parent["nb"] + i, "line": ln}
+                                for i, ln in enumerate(new_bufs)],
+        "policy_lines": new_pols,
+        "passes": [],
+    }
+    for tag, order in (("R10", 14), ("R11", 22)):
+        m = mods[tag]
+        recipe["passes"].append({
+            "tag": tag, "pass_name": m["pass_name"], "order": order,
+            "replace_pass_line": {"before": m["plan_pass_line_before"],
+                                  "after": m["plan_pass_line"]},
+            "replace_spv": {"before": m["plan_pass_line_before"].split('"')[3],
+                            "after": m["candidate_spv"]["path"]},
+            "shared_bytes": {"before": m["declared_shared_bytes"]["parent"],
+                             "after": m["declared_shared_bytes"]["candidate"]},
+            "binds": m["binds"],
+            "push_unchanged": m["push"],
+            "binds_kept_count": sum(1 for b in m["binds"] if b["kept_from_parent"]),
+        })
+    (CARD / "MERGE-RECIPE.json").write_text(
+        json.dumps(recipe, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(json.dumps({"candidate_plan": cand["candidate_plan"],
+                      "modules": {t: {"spv": mods[t]["candidate_spv"]["sha256"][:16],
+                                      "shared": mods[t]["declared_shared_bytes"],
+                                      "sites": mods[t]["sites"]} for t in mods},
+                      "buffers_appended": len(new_bufs),
+                      "policies_appended": len(new_pols)}, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

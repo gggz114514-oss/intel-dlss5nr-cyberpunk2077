@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""R12 local INT8 reference for the PV segment (CPU only, no device, stdlib only).
+
+Emulates exactly the arithmetic the candidate shader performs for one workgroup
+(= one head, one window: 64 queries x 64 keys x 32 dims) and compares it with the parent
+FP16 PV path:
+
+  parent : T = half( sum_k float16(P[q,k]) * float16(V[k,d]) )        (FP32 accumulate)
+  R12    : P8  = clamp(roundEven(float(P)*127/pmx_q), -127, 127)
+           V8  = clamp(roundEven(float(V)*127/absmax_V), -127, 127)
+           acc = sum_k P8*V8                                          (exact int32)
+           T   = half(float(acc) * (pmx_q*(1/127)) * sV)               (FP32 dequant, 1 narrow)
+
+`P` is the parent's normalised probability half matrix and `V` its half value slab, so the
+only difference under test is the int8 activation quantisation. float16 is emulated with
+struct 'e' (round-to-nearest-even); roundEven() uses Python's round(), which is
+round-half-to-even for the finite range used here. The parent reference accumulates in
+float64 because the parent's FP32 sum order is not reproducible without the device; that
+difference is O(1e-7) relative, two orders below the int8 error reported below.
+
+The error bound is analytic, not fitted:
+  |dT| <= (sP/2)*sum_k|V[k,d]| + (sV/2)*sum_k|P[q,k]| + sP*sV/2
+with sP = pmx_q/127 and sV = absmax_V/127.
+
+usage: oracle_pv.py <out.json> [seed]
+"""
+import json
+import math
+import random
+import struct
+import sys
+
+
+def h(x):
+    """Round a real to IEEE binary16 (RNE), returned as a Python float."""
+    try:
+        return struct.unpack("<e", struct.pack("<e", float(x)))[0]
+    except OverflowError:
+        return math.copysign(float("inf"), x)
+
+
+def f16_exp_mantissa(x):
+    """The shader's exponential(): clamp(fma(x,a,b)) then (bits & 0x3ff) << 5."""
+    z = h(min(max(h(x) * h(0.044921875) + h(1.30078125), h(1.03125)), h(1.5693359375)))
+    bits = struct.unpack("<H", struct.pack("<e", z))[0]
+    return struct.unpack("<e", struct.pack("<H", (bits & 0x3FF) << 5))[0]
+
+
+def main(argv):
+    out = argv[0]
+    seed = int(argv[1]) if len(argv) > 1 else 20261024
+    QN, KN, DN = 64, 64, 32
+    rnd = random.Random(seed)
+
+    # ---- parent P (normalised probability half matrix) and V half slab ----
+    P = []
+    for q in range(QN):
+        row = [f16_exp_mantissa(rnd.gauss(0.0, 0.35)) for _ in range(KN)]
+        total = h(sum(row)) if False else None
+        # sealed half tree: pairwise adds in the shader's order (16 sums of 4 terms)
+        parts = []
+        for c in range(8):
+            a = h(0.0)
+            for j in range(4):
+                pair = h(row[j * 16 + c] + row[j * 16 + c + 8])
+                a = h(a + pair)
+            parts.append(a)
+        e0 = h(parts[0] + parts[2]); e1 = h(parts[4] + parts[6])
+        o0 = h(parts[1] + parts[3]); o1 = h(parts[5] + parts[7])
+        total = h(h(e0 + e1) + h(o0 + o1))
+        inv = h(1.0 / max(float(total), 6.103515625e-05))
+        P.append([h(v * inv) for v in row])
+    V = [[h(rnd.gauss(0.0, 1.0)) for _ in range(DN)] for _ in range(KN)]
+
+    # ---- parent FP16 path: rows of P against columns of V ----
+    T_parent = [[h(sum(P[q][k] * V[k][d] for k in range(KN))) for d in range(DN)]
+                for q in range(QN)]
+
+    # ---- R12 int8 path ----
+    pmx = [max(P[q]) for q in range(QN)]
+    pscale = [float(v) * (1.0 / 127.0) if v > 0 else 0.0 for v in pmx]
+    pinv = [127.0 / float(v) if v > 0 else 0.0 for v in pmx]
+    p8 = []
+    for q in range(QN):
+        p8.append([int(min(max(round(P[q][k] * pinv[q]), -127), 127)) for k in range(KN)])
+    vmax = max(abs(v) for row in V for v in row)
+    sv = float(vmax) * (1.0 / 127.0) if vmax else 1.0
+    svinv = 1.0 / sv
+    v8 = [[int(min(max(round(v * svinv), -127), 127)) for v in row] for row in V]
+
+    acc_max = 0
+    dmax = 0.0
+    dsum = 0.0
+    dsq = 0.0
+    bound_max = 0.0
+    all_within = True
+    ref_sq = 0.0
+    for q in range(QN):
+        for d in range(DN):
+            acc = sum(p8[q][k] * v8[k][d] for k in range(KN))
+            acc_max = max(acc_max, abs(acc))
+            t = h(acc * (pscale[q] * sv))
+            ref = T_parent[q][d]
+            diff = abs(t - ref)
+            dmax = max(dmax, diff)
+            dsum += diff
+            dsq += diff * diff
+            ref_sq += ref * ref
+            bound = (pscale[q] / 2.0) * sum(abs(V[k][d]) for k in range(KN)) \
+                + (sv / 2.0) * sum(abs(P[q][k]) for k in range(KN)) \
+                + pscale[q] * sv / 2.0
+            bound_max = max(bound_max, bound)
+            if diff > bound + 1e-9:
+                all_within = False
+
+    n = QN * DN
+    rms = math.sqrt(dsq / n)
+    ref_rms = math.sqrt(ref_sq / n)
+    nz_p = sum(1 for q in range(QN) for k in range(KN) if P[q][k] != 0)
+    nz_p8 = sum(1 for q in range(QN) for k in range(KN) if p8[q][k] != 0)
+    nz_v8 = sum(1 for row in v8 for v in row if v != 0)
+    res = {
+        "card": "r12-split16-l2",
+        "kind": "LOCAL_INT8_REFERENCE_CPU_ONLY_NOT_A_DEVICE_GATE",
+        "tool": "candidates/r12-split16-l2/tools/oracle_pv.py",
+        "language": "python stdlib only (no numpy available in run/python312)",
+        "seed": seed,
+        "domain": {"queries": QN, "keys": KN, "dims": DN,
+                   "P": "parent H(P*inv) half matrix, normalised before PV",
+                   "V": "parent raw V half slab qkv[4096..6144)",
+                   "K_order": "keys 0..31 then 32..63 (parent j=0,1,2,3)"},
+        "nonzero": {"P_nonzero_fraction": nz_p / float(QN * KN),
+                    "P8_nonzero_fraction": nz_p8 / float(QN * KN),
+                    "V8_nonzero_fraction": nz_v8 / float(KN * DN),
+                    "all_three_nonzero": bool(nz_p and nz_p8 and nz_v8)},
+        "saturation": {"P_le_1": bool(max(max(r) for r in P) <= 1.0),
+                       "P8_max_abs": max(abs(v) for row in p8 for v in row),
+                       "V8_max_abs": max(abs(v) for row in v8 for v in row),
+                       "int32_acc_max_abs": acc_max,
+                       "int32_overflow_impossible_below": 64 * 127 * 127,
+                       "int32_headroom_x": float(2 ** 31) / max(1, acc_max)},
+        "error_vs_parent": {"max_abs": dmax, "mean_abs": dsum / n, "rms": rms,
+                            "relative_rms_percent": 100.0 * rms / ref_rms,
+                            "analytic_bound_max": bound_max,
+                            "within_analytic_bound": all_within,
+                            "unit": "half (the single narrow after dequant)"},
+        "scale_ranges_seen": {"pmx_min": min(pmx), "pmx_max": max(pmx),
+                              "sP_min": min(pscale), "sP_max": max(pscale),
+                              "absmax_V": vmax, "sV": sv},
+        "not_run": ["GATE (fixed/fb2)", "ORDINARY", "QUALITY", "NATIVE"],
+        "claim": "the INT8 PV segment reproduces the parent FP16 PV within the analytic "
+                 "quantisation bound on this local reference; NOT a device gate",
+    }
+    with open(out, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(res, f, indent=1)
+        f.write("\n")
+    print(json.dumps(res["error_vs_parent"], indent=1))
+    print("within bound:", all_within, "P8_max", res["saturation"]["P8_max_abs"],
+          "int32_max", acc_max, "nonzero P/P8/V8:", res["nonzero"]["all_three_nonzero"])
+    return 0 if all_within else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

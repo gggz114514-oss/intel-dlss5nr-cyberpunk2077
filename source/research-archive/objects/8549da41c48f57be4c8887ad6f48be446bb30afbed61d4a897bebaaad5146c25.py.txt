@@ -1,0 +1,165 @@
+"""S07 static calibration for split16 b23 l0/l1.
+
+Scalar static scales only (sX, sR, sA, sF): the shipped SPVs already read every
+one of them from a pack/push scalar, so the arm needs no shader change.
+Objective = pooled teacher-Y relative L2 over the three calibration frames.
+Every quantity is CPU; GPU_VERIFICATION=NOT_RUN.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029"
+sys.path.insert(0, str(W / "tools"))
+sys.path.insert(0, str(W / "S07-split16/tools"))
+from planlib import Plan  # noqa: E402
+import model as M  # noqa: E402
+
+D = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+OUT = W / "S07-split16"
+TEACHERS = [("34189", D / "dump-fp16"),
+            ("41444", D / "teacher-diagnostics/teacher-41444"),
+            ("43654", D / "teacher-diagnostics/teacher-43654")]
+NT = 1056
+
+
+class Chain:
+    def __init__(self):
+        p = Plan(D / "c64-family-static/combo-34189.txt")
+        d0 = p.dispatch_by_name("split16_b23_l0")
+        d1 = p.dispatch_by_name("split16_b23_l1")
+        self.p2 = [int(x) for x in d0.push][8:12]
+        self.p3 = [int(x) for x in d0.push][12:16]
+        self.l0pack = Path(p.buffers[d0.binds[10].buffer].file)
+        self.l1pack = Path(p.buffers[d1.binds[10].buffer].file)
+        self.f16w = Path(p.buffers[d0.binds[0].buffer].file)
+        self.pk = M.Pack(self.l0pack.read_bytes(), self.l1pack.read_bytes(), self.f16w, self.p2, self.p3)
+        self.old = {"sX": 1 / 4.113360404968262, "sR": 1 / float(self.pk.invs[0]),
+                    "sA": 1 / float(self.pk.invs[1]), "sF": 1 / 110.023681640625}
+        self.frames = []
+        for tag, td in TEACHERS:
+            X = M.load_half(td / "dump_block22_out.bin")
+            Ft = M.load_half(td / "dump_split16_b23_F.bin")
+            Yt = M.load_half(td / "dump_split16_b23_Y.bin")
+            seed = M.f16(X * self.pk.rs)
+            self.frames.append({"tag": tag, "X": X, "F": Ft, "Y": Yt, "seed": seed})
+
+    # ---- weight-side rescaling (keeps every effective matrix fixed) ----
+    def wsc(self, s):
+        return (self.pk.wsc1 * (s["sX"] / self.old["sX"]),
+                self.pk.wsc2 * (s["sR"] / self.old["sR"]),
+                self.pk.wsc3 * (s["sA"] / self.old["sA"]),
+                self.pk.wscL * (s["sF"] / self.old["sF"]))
+
+    def forward(self, fr, s, dx=None, w=None, invq=None):
+        """dx: per-input-channel divisors for X (folded in w); invq: per-channel
+        inverse arrays dict(qx=..., qf=...).  w: optional re-quantised weights."""
+        pk = self.pk
+        wsc1, wsc2, wsc3, wscL = self.wsc(s)
+        w = w or {}
+        W1 = w.get("W1", pk.W1q_m)
+        Wc = w.get("Wc", pk.Wcq_m)
+        if "sW1" in w:
+            wsc1 = s["sX"] * w["sW1"]
+        if "sWc" in w:
+            wscL = s["sF"] * w["sWc"]
+        X = fr["X"]
+        if dx is None:
+            qx = M.code(X / s["sX"])
+        else:
+            qx = M.code(X * (invq["qx"] if invq else (1.0 / s["sX"]) / dx))
+        sr = M.f16((qx @ W1.T) * wsc1)
+        qr = M.code(sr / s["sR"])
+        sa = np.empty((X.shape[0], 2048), np.float32)
+        for g in range(8):
+            sa[:, g * 256:(g + 1) * 256] = M.f16((qr[:, g * 64:(g + 1) * 64] @ pk.W2q_m[g * 256:(g + 1) * 256].T)
+                                                * wsc2[g * 256:(g + 1) * 256])
+        act = M.activation(sa)
+        qa = M.code(act / s["sA"])
+        F = np.empty((X.shape[0], 512), np.float32)
+        for g in range(8):
+            F[:, g * 64:(g + 1) * 64] = M.f16((qa[:, g * 256:(g + 1) * 256] @ pk.W3q_m[g * 64:(g + 1) * 64].T)
+                                              * wsc3[g * 64:(g + 1) * 64])
+        if invq and "qf" in invq:
+            qf = M.code(F * invq["qf"])
+        else:
+            qf = M.code(F / s["sF"])
+        A = (qf @ Wc.T) * wscL
+        Y = M.f16(A + fr["seed"])
+        return F, A, Y, qx, qa, qf
+
+    def score(self, s, detail=False, **kw):
+        ys, fs, as_ = [], [], []
+        per = []
+        for fr in self.frames:
+            F, A, Y, *_ = self.forward(fr, s, **kw)
+            y = M.rel_l2(Y, fr["Y"])
+            f = M.rel_l2(F, fr["F"])
+            ys.append(y)
+            fs.append(f)
+            per.append({"frame": fr["tag"], "Y_rel_l2": y, "F_rel_l2": f})
+            as_.append(y)
+        loss = float(np.mean(np.square(ys)))
+        res = {"mse_Y": loss, "mean_Y_rel_l2": float(np.mean(ys)), "mean_F_rel_l2": float(np.mean(fs))}
+        if detail:
+            res["per_frame"] = per
+        return res
+
+
+def main():
+    ch = Chain()
+    old = dict(ch.old)
+    base = ch.score(old, detail=True)
+    print("OLD", json.dumps(base, indent=1), flush=True)
+    factors = [0.35, 0.45, 0.55, 0.7, 0.85, 1.0, 1.2]
+    cur = dict(old)
+    history = []
+    best = base["mse_Y"]
+    for sweep in range(3):
+        for dim in ["sX", "sR", "sA", "sF"]:
+            opts = []
+            for f in factors:
+                trial = dict(cur)
+                trial[dim] = old[dim] * f
+                r = ch.score(trial)
+                history.append({"sweep": sweep, "dim": dim, "factor": f,
+                                "value": trial[dim], "mse_Y": r["mse_Y"],
+                                "mean_Y_rel_l2": r["mean_Y_rel_l2"], "mean_F_rel_l2": r["mean_F_rel_l2"]})
+                opts.append((r["mse_Y"], trial, r))
+            m, cur, r = min(opts, key=lambda z: z[0])
+            print(f"sweep{sweep} {dim} -> {cur[dim]:.6g}  Y={r['mean_Y_rel_l2']:.6e} F={r['mean_F_rel_l2']:.6e}", flush=True)
+    # finer pass around the optimum
+    for dim in ["sX", "sR", "sA", "sF"]:
+        opts = []
+        for f in [0.88, 0.94, 1.0, 1.06, 1.12]:
+            trial = dict(cur)
+            trial[dim] = cur[dim] * f
+            r = ch.score(trial)
+            history.append({"sweep": "fine", "dim": dim, "factor": f, "value": trial[dim],
+                            "mse_Y": r["mse_Y"], "mean_Y_rel_l2": r["mean_Y_rel_l2"]})
+            opts.append((r["mse_Y"], trial, r))
+        m, cur, r = min(opts, key=lambda z: z[0])
+        print(f"fine {dim} -> {cur[dim]:.6g}  Y={r['mean_Y_rel_l2']:.6e}", flush=True)
+    new = ch.score(cur, detail=True)
+    print("NEW", json.dumps(new, indent=1))
+    out = {"method": "coordinate search over four scalar static steps; wsc rescaled so every "
+                     "effective matrix is unchanged (sX fold into wsc1, sR->wsc2, sA->wsc3, sF->wscL); "
+                     "objective = pooled teacher-Y relL2 over 1056 valid tokens x 3 frames; "
+                     "no runtime reduction, no dynamic scale",
+           "old": {"scales": old, **base},
+           "new": {"scales": cur, **new},
+           "history": history,
+           "notes": ["teacher F/Y are FP16 dumps of the same capture; A = contract(F) term only "
+                     "(Y is dominated by the residual seed X*rs, |A|/|Y| ~ 0.4-0.7%)",
+                     "the shipped SPVs read sX from the producer push constant, sR/sA from the l0 "
+                     "pack invs[2], sF from split16_b23_l1qxinv.bin, and per-output-channel factors "
+                     "from wsc1/wsc2/wsc3/wscL -- a scalar-only arm therefore needs pack edits only"]}
+    (OUT / "CALIBRATION.json").write_text(json.dumps(out, indent=1))
+    print("wrote CALIBRATION.json")
+
+
+if __name__ == "__main__":
+    main()

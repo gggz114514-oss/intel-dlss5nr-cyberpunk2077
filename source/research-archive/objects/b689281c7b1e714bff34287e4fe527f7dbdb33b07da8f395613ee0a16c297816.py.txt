@@ -1,0 +1,252 @@
+"""Acceptance gate for a delivered card: verify identities, plan scope, build claims, deliverables.
+
+Schema-tolerant: pulls {path, sha256} ident records out of any nesting the card used.
+Usage: python audit_card.py <card-id>
+Writes cards/<id>/AUDIT-main.json. CPU only; never modifies the card's files.
+"""
+import json, re, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+
+REQUIRED = ['ANALYSIS.md', 'PROOF.json', 'SOURCE-DIFF.patch', 'candidate.comp', 'candidate.spv',
+            'BUILD.json', 'plan.txt', 'COST-LEDGER.json', 'NATIVE-PREDICTION.md', 'GPU-REQUEST.json',
+            'RESUME.txt']
+
+
+def pass_lines(plan):
+    out = []
+    for l in Path(plan).read_text(encoding='utf-8-sig').splitlines():
+        if not l.startswith('PASS '):
+            continue
+        q = re.findall(r'"([^"]*)"', l)
+        name, spv = (q[0], q[1]) if len(q) == 2 else (l.split()[2], l.split()[3])
+        out.append(dict(line=l, index=int(l.split()[1]), name=name, spv=spv))
+    return out
+
+
+def idents(obj, out=None):
+    out = [] if out is None else out
+    if isinstance(obj, dict):
+        if 'path' in obj and 'sha256' in obj and isinstance(obj['path'], str):
+            out.append(obj)
+        for v in obj.values():
+            idents(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            idents(v, out)
+    return out
+
+
+def find_num(obj, needle):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if needle.lower() in k.lower() and isinstance(v, (int, float)):
+                return k, v
+            r = find_num(v, needle)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = find_num(v, needle)
+            if r:
+                return r
+    return None
+
+
+def norm(p):
+    return str(p).replace('/', '\\')
+
+
+def rebuild_candidate(d):
+    """Independently rebuild candidate.spv from candidate.comp and compare bytes.
+
+    Uses the group's parent recipe (include dirs / defines) from evidence/RECIPES.json
+    and, when a raw compile does not match, the parent's NoContraction pattern.
+    """
+    req_p = d / 'GPU-REQUEST.json'
+    if not (d / 'candidate.comp').exists() or not req_p.exists():
+        return dict(ok=False, why='missing candidate.comp or GPU-REQUEST')
+    req = K.read_json(req_p)
+    ords = (req.get('shader_group') or {}).get('pass_ordinals') or []
+    if not ords:
+        return dict(ok=False, why='no pass_ordinals')
+    row = K.row_by_ordinal(ords[0])
+    recs = K.read_json(K.C / 'evidence' / 'RECIPES.json')
+    rec = recs.get(row['spv_sha256'])
+    if not rec:
+        return dict(ok=False, why='no recipe for parent')
+    incs = []
+    if rec['compile'].get('pinned_include_dir'):
+        incs.append(Path(rec['compile']['pinned_include_dir']))
+    incs += [Path(x) for x in rec['compile'].get('include_dirs') or []]
+    out = d / 'repro'
+    out.mkdir(exist_ok=True)
+    raw = out / 'cand-raw.spv'
+    try:
+        K.compile_glsl(d / 'candidate.comp', raw, incs + [d], defines=rec['compile'].get('defines') or ())
+    except Exception as e:
+        return dict(ok=False, why='compile failed: %s' % str(e)[:300])
+    target = K.sha(d / 'candidate.spv')
+    if K.sha(raw) == target:
+        return dict(ok=True, how='raw compile', sha=target)
+    pm = K.ST.Module(Path(row['spv']))
+    rm = K.ST.Module(raw)
+    keep, _ = K.ST.transfer_decoration_pattern_aligned(pm, rm, set())
+    fixed = out / 'cand-decorated.spv'
+    K.ST.set_no_contraction(rm, keep, fixed)
+    return dict(ok=K.sha(fixed) == target, how='decoration transfer + NC', sha=target,
+                nc=len(keep), parent_nc=len(K.ST.no_contraction_ids(pm)))
+
+
+def audit(card_id):
+    d = K.C / 'cards' / card_id
+    res = dict(card=card_id, dir=str(d), checks={}, problems=[], notes=[])
+    C = res['checks']
+    C['baseline_plan_sha'] = K.sha(K.BASELINE)
+    C['baseline_plan_intact'] = C['baseline_plan_sha'] == K.BASELINE_SHA
+    if not C['baseline_plan_intact']:
+        res['problems'].append('BASELINE PLAN MODIFIED')
+    for f in REQUIRED:
+        ok = (d / f).exists()
+        C.setdefault('files', {})[f] = ok
+        if not ok:
+            res['problems'].append('missing ' + f)
+    if not (d / 'BUILD.json').exists():
+        res['verdict'] = 'INCOMPLETE'
+        return res
+    b = K.read_json(d / 'BUILD.json')
+    ids = idents(b)
+    base_spv = {norm(r['spv']) for r in K.rows()}
+    # follow-up cards bind to an adopted candidate rather than a handoff row, so the
+    # chain head's SPV paths are legitimate parents too
+    try:
+        head, _, chain = K.current_best()
+        if chain:
+            base_spv |= {norm(x['spv']) for x in pass_lines(head)}
+    except Exception:
+        pass
+    ids_by_path = {norm(i['path']): i for i in ids}
+    carddir = norm(d).lower()
+
+    def in_card(i):
+        return norm(i['path']).lower().startswith(carddir)
+
+    parent = next((i for i in ids if norm(i['path']) in base_spv), None)
+    rebuilt = next((i for i in ids if in_card(i) and norm(i['path']).lower().endswith('parent-rebuild.spv')), None) \
+        or next((i for i in ids if norm(i['path']).lower().endswith('parent-rebuild.spv')), None)
+    cand_obj = next((i for i in ids if in_card(i) and norm(i['path']).lower().endswith('candidate.spv')), None) \
+        or next((i for i in ids if norm(i['path']).lower().endswith('candidate.spv')), None)
+    C['parent_spv'] = parent and norm(parent['path'])[-70:]
+    C['parent_is_baseline_row_spv'] = bool(parent)
+    C['parent_sha_expected_matches_row'] = None
+    if parent:
+        m = [r for r in K.rows() if norm(r['spv']) == norm(parent['path'])]
+        if m:
+            C['parent_sha_expected_matches_row'] = all(r['spv_sha256'] == parent['sha256'] for r in m)
+            if not C['parent_sha_expected_matches_row']:
+                res['problems'].append('parent sha != baseline row sha')
+        else:
+            # parent is an adopted candidate: check it is the file the chain head binds
+            C['parent_is_chain_spv'] = Path(parent['path']).exists() and K.sha(Path(parent['path'])) == parent['sha256']
+            if not C['parent_is_chain_spv']:
+                res['problems'].append('parent SPV on disk does not match its recorded sha')
+    C['parent_rebuilt_sha'] = rebuilt and rebuilt['sha256']
+    if rebuilt:
+        C['parent_rebuilt_equals_parent'] = bool(parent) and rebuilt['sha256'] == parent['sha256']
+        if not C['parent_rebuilt_equals_parent']:
+            res['problems'].append('parent byte reproduction FAILED (parent-rebuild != parent spv)')
+    else:
+        res['notes'].append('no parent-rebuild ident recorded in BUILD.json')
+    C['candidate_sha_recorded'] = cand_obj and cand_obj['sha256']
+    C['candidate_sha_on_disk'] = K.sha(d / 'candidate.spv') if (d / 'candidate.spv').exists() else None
+    C['candidate_identity_ok'] = C['candidate_sha_recorded'] == C['candidate_sha_on_disk']
+    if not C['candidate_identity_ok']:
+        rb = rebuild_candidate(d)
+        C['candidate_rebuild'] = rb
+        if rb.get('ok'):
+            res['notes'].append('BUILD.json did not record the candidate ident; auditor rebuilt candidate.spv from candidate.comp (%s) and it matches' % rb.get('how'))
+            C['candidate_identity_ok'] = True
+        else:
+            res['problems'].append('candidate.spv sha != BUILD.json and auditor rebuild failed: %s' % rb.get('why'))
+    nc = find_num(b, 'float_NC_checked') or find_num(b, 'NC_checked')
+    C['float_NC_checked'] = nc
+    if not nc or nc[1] <= 0:
+        res['notes'].append('float_NC_checked not reported (acceptable only if shader has no FP NC sites; verify)')
+    # plan scope: the card may have been built on the handoff baseline or on the
+    # accepted chain head; accept whichever yields exactly the declared PASS scope.
+    if (d / 'plan.txt').exists():
+        cand_posix = (d / 'candidate.spv').as_posix()
+        card = pass_lines(d / 'plan.txt')
+        req = K.read_json(d / 'GPU-REQUEST.json') if (d / 'GPU-REQUEST.json').exists() else {}
+        want = (req.get('shader_group') or {}).get('pass_ordinals')
+        parents = [('handoff', K.BASELINE)]
+        try:
+            best, bsha, chain = K.current_best()
+            if chain:
+                parents.append(('chain-head', best))
+        except Exception:
+            pass
+        chosen = None
+        for label, pp in parents:
+            base = pass_lines(pp)
+            if len(base) != len(card):
+                continue
+            diff = [c for b0, c in zip(base, card) if b0['line'] != c['line']]
+            allcand = all(x['spv'] == cand_posix for x in diff)
+            ok = allcand and ((not want) or len(diff) == len(want))
+            info = dict(parent=label, parent_path=str(pp), changed=len(diff),
+                        all_point_at_candidate=allcand, ok=ok,
+                        changed_names=sorted({x['name'] for x in diff}))
+            if ok:
+                chosen = info
+                break
+            if chosen is None:
+                chosen = info
+        C['baseline_pass_count'] = len(pass_lines(K.BASELINE))
+        C['card_pass_count'] = len(card)
+        C['plan_scope'] = chosen
+        C['changed_pass_lines'] = chosen['changed'] if chosen else None
+        C['changed_names'] = chosen['changed_names'] if chosen else None
+        C['all_changes_point_at_candidate'] = chosen['all_point_at_candidate'] if chosen else None
+        C['only_pass_lines_changed'] = C['baseline_pass_count'] == C['card_pass_count']
+        if not chosen or not chosen['ok']:
+            res['problems'].append('plan scope: %s' % (chosen,))
+        if want:
+            C['expected_pass_count'] = len(want)
+            C['plan_scope_ok'] = bool(chosen and chosen['ok'])
+            expect_names = sorted({K.row_by_ordinal(o)['name'] for o in want})
+            C['scope_names_ok'] = expect_names == (C['changed_names'] or [])
+            if C['scope_names_ok'] is False:
+                res['problems'].append('changed PASS names != requested ordinals')
+        C['plan_declared_sha'] = (req.get('plan') or {}).get('sha256') or b.get('plan', {}).get('sha256')
+        C['plan_sha_on_disk'] = K.sha(d / 'plan.txt')
+        C['plan_sha_ok'] = C['plan_declared_sha'] == C['plan_sha_on_disk']
+        if not C['plan_sha_ok']:
+            res['notes'].append('plan sha declared != disk (card may not have re-declared after last edit)')
+    for f in ('ANALYSIS.md', 'PROOF.json', 'COST-LEDGER.json', 'NATIVE-PREDICTION.md', 'RESUME.txt'):
+        p = d / f
+        if p.exists():
+            C.setdefault('sizes', {})[f] = p.stat().st_size
+            if p.stat().st_size < 200:
+                res['notes'].append('%s suspiciously small (%d B)' % (f, p.stat().st_size))
+    if (d / 'COST-LEDGER.json').exists():
+        try:
+            led = K.read_json(d / 'COST-LEDGER.json')
+            C['ledger_keys'] = sorted(led.keys())
+            for k in ('removed', 'added'):
+                if k not in led:
+                    res['notes'].append('COST-LEDGER missing key ' + k)
+                elif isinstance(led[k], list) and not led[k]:
+                    res['notes'].append('COST-LEDGER %s empty' % k)
+        except Exception as e:
+            res['problems'].append('COST-LEDGER.json unreadable: %s' % e)
+    res['verdict'] = 'ACCEPTED' if not res['problems'] else 'NEEDS-WORK'
+    return res
+
+
+if __name__ == '__main__':
+    card = sys.argv[1]
+    r = audit(card)
+    K.write_json(K.C / 'cards' / card / 'AUDIT-main.json', r)
+    print(json.dumps(r, indent=2, default=str)[:7000])

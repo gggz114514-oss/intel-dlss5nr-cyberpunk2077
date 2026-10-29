@@ -1,0 +1,275 @@
+"""n31-f01-dpas-chain: map of the F01 kernel *after* 0x4A90 (chain head identity).
+
+Read-only over the captured ISA of the n29 chain head (kernel hash a0888c5a3c6703a9,
+PASS 0 of the two-arm n29 native run) and over the chain-head SPIR-V.  CPU only:
+parse -> control-flow skeleton -> segment map (barriers, SLM, dpas, message mix) ->
+def/use -> backward slices -> depth / side-branch / per-lane chain census.
+
+Usage:
+    python isa_post.py map        # control-flow + segment skeleton
+    python isa_post.py dpas       # dpas accumulator chains
+    python isa_post.py mix        # message / opcode mix per segment
+    python isa_post.py depth      # depth census of the whole post region
+"""
+import sys
+import re
+from collections import Counter, defaultdict
+from pathlib import Path
+
+CAMP = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(CAMP))
+import ISA  # noqa: E402
+
+ISA_PATH = CAMP / 'queue/n29-f01-alu-chain/native/captures/native-native-cand/ISA/CS_asma0888c5a3c6703a9_simd32_0000000000000001_0_orig.asm'
+ENTRY_END = 0x4A90          # n29: entry body 0x0390..0x4A90 (lane<16 only)
+
+TYPE_DWORDS = {'ud': 1, 'd': 1, 'w': 1, 'uw': 1, 'f': 1, 'v': 1, 'hf': 0.5,
+               'q': 2, 'uq': 2, 'df': 2, 'b': 0.25, 'ub': 0.25, 'bf': 0.25}
+FLOAT_TYPES = {'f', 'hf', 'df'}
+LAT = {'mul': 5, 'mad': 5, 'macl': 5, 'mach': 5, 'dpas.8x8': 8, 'math.inv': 8,
+       'math.rsqt': 8, 'math.sqrt': 8, 'math.sqt': 8, 'math.log': 8, 'math.exp': 8,
+       'math.cos': 8, 'math.sin': 8, 'rndd': 6, 'rndu': 6, 'rnde': 6, 'rndz': 6,
+       'frc': 6, 'add': 4, 'add3': 4, 'sub': 4, 'shl': 4, 'shr': 4, 'asr': 4,
+       'and': 4, 'or': 4, 'xor': 4, 'not': 4, 'bfn.0xFE': 4, 'bfn.0xF8': 4, 'cmp': 4,
+       'sel': 4, 'min': 4, 'max': 4, 'mov': 1, 'movf': 1, 'sync.nop': 0,
+       'send.ugm': 20, 'send.slm': 20, 'send.gtwy': 20, 'illegal': 0, 'jmpi': 0,
+       'goto': 0, 'join': 1, 'sync.allrd': 4, 'sync.allwr': 4, 'sync.bar': 4}
+MEM_OPS = ('send.ugm', 'send.slm', 'send.gtwy')
+
+
+def reg_dwords(operand):
+    o = operand.lstrip('-').replace('(abs)', '')
+    m = re.match(r'^r(\d+)\.(\d+)<', o)
+    if m:
+        return ('r', int(m.group(1)), int(m.group(2)))
+    m = re.match(r'^r(\d+)<', o)
+    if m:
+        return ('r', int(m.group(1)), 0)
+    m = re.match(r'^a0\.(\d+)<', o)
+    if m:
+        return ('a0', 0, int(m.group(1)))
+    return None
+
+
+def elem_width(op):
+    m = re.search(r':([a-z0-9]+)', op)
+    return m.group(1) if m else 'ud'
+
+
+def exec_size(flags, default=32):
+    m = re.search(r'\((\d+)\|M\d+\)', flags or '')
+    return int(m.group(1)) if m else default
+
+
+def region_spec(op):
+    m = re.search(r'<(\d+);(\d+),(\d+)>', op)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def span(op, flags):
+    w = TYPE_DWORDS.get(elem_width(op), 1)
+    rs = region_spec(op)
+    if rs is not None and rs[0] == 0:
+        return max(1, int(round(w)))
+    return max(1, int(round(w * exec_size(flags))))
+
+
+def writes(ins):
+    if not ins['ops']:
+        return []
+    op0 = ins['ops'][0]
+    r = reg_dwords(op0)
+    if r:
+        if r[0] == 'a0':
+            return [('a0', 0, 0, 2)]
+        return [('r', r[1], r[2], span(op0, ins['flags']))]
+    m = re.match(r'^(f[0-9])\.(\d)<', op0)
+    if m:
+        return [('f', int(m.group(1)[1]), int(m.group(2)), 1)]
+    return []
+
+
+def reads(ins):
+    out = []
+    op = ins['op']
+    ops = ins['ops']
+    if op.startswith('send'):
+        if len(ops) > 1:
+            r = reg_dwords(ops[1])
+            if r:
+                out.append(('r', r[1], r[2], 1))
+        for o in ops[3:]:
+            if re.search(r'a0\.(\d+)', o):
+                out.append(('a0', 0, 0, 2))
+        return out
+    for o in ops[1:]:
+        if re.match(r'^(null|0[xX][0-9A-Fa-f]+$|[-+]?[0-9.]+($|:))', o.lstrip('-')):
+            continue
+        rr = reg_dwords(o)
+        if not rr:
+            continue
+        if rr[0] == 'a0':
+            out.append(('a0', 0, 0, 2))
+        else:
+            out.append(('r', rr[1], rr[2], span(o, ins['flags'])))
+    return out
+
+
+def build(isa):
+    for k, ins in enumerate(isa):
+        ins['idx'] = k
+        ins['w'] = writes(ins)
+        ins['r'] = reads(ins)
+        ins['ty'] = elem_width(ins['ops'][0]) if ins['ops'] else 'ud'
+    by_dw = defaultdict(list)
+    for ins in isa:
+        for regfile, no, dw, n in ins['w']:
+            for d in range(dw, dw + n):
+                by_dw[(regfile, no, d)].append(ins['idx'])
+    for v in by_dw.values():
+        v.sort()
+    return by_dw
+
+
+def reaching(by_dw, key, idx):
+    lst = by_dw.get(key)
+    if not lst:
+        return None
+    hit = None
+    for w in lst:
+        if w < idx:
+            hit = w
+        else:
+            break
+    return hit
+
+
+def parents_of(ins, by_dw, k):
+    ps = set()
+    for regfile, no, dw, n in ins['r']:
+        for d in range(dw, dw + n):
+            w = reaching(by_dw, (regfile, no, d), k)
+            if w is not None:
+                ps.add(w)
+    return ps
+
+
+def load():
+    isa = ISA.parse(ISA_PATH)
+    by_dw = build(isa)
+    return isa, by_dw
+
+
+def post(isa):
+    return [i for i in isa if i['addr'] >= ENTRY_END]
+
+
+# ------------------------------------------------------------------ map
+def cmd_map():
+    isa, by_dw = load()
+    ps = post(isa)
+    print('post instructions: %d  (0x%04X..0x%04X)' % (len(ps), ps[0]['addr'], ps[-1]['addr']))
+    print('\n-- control flow --')
+    for ins in ps:
+        if ins['op'] in ('jmpi', 'goto', 'join', 'sync.allwr', 'sync.allrd', 'sync.bar'):
+            print('%04X %-10s %s   %s' % (ins['addr'], ins['op'], ' '.join(ins['ops']),
+                                          (ins['comment'] or '')))
+    print('\n-- SLM messages --')
+    for ins in ps:
+        if ins['op'] == 'send.slm':
+            print('%04X %-10s dst=%-10s  %s' % (ins['addr'], ins['op'],
+                                                ins['ops'][0] if ins['ops'] else '', ins['comment']))
+    print('\n-- dpas --')
+    ad = [i['addr'] for i in ps if i['op'].startswith('dpas')]
+    print('count %d  first %04X last %04X' % (len(ad), ad[0], ad[-1]))
+    # contiguous dpas clusters
+    clusters = []
+    cur = [ad[0]]
+    for a in ad[1:]:
+        if a - cur[-1] <= 0x400:
+            cur.append(a)
+        else:
+            clusters.append(cur)
+            cur = [a]
+    clusters.append(cur)
+    print('clusters (gap>0x400):')
+    for c in clusters:
+        print('  %04X..%04X  n=%d' % (c[0], c[-1], len(c)))
+    print('\n-- uniform (W) instruction runs after 0x4A90 --')
+    w = [i for i in ps if i['flags'].startswith('(W')]
+    print('scalar/uniform instructions:', len(w), 'of', len(ps))
+
+
+# ------------------------------------------------------------------ dpas chains
+def cmd_dpas():
+    isa, by_dw = load()
+    ps = [i for i in isa if i['addr'] >= ENTRY_END]
+    dp = [i for i in ps if i['op'].startswith('dpas')]
+    print('%-6s %-24s %-10s %-12s %s' % ('addr', 'dst(acc)', 'src_ops', 'acc_parent', 'parents'))
+    for ins in dp[:200]:
+        par = parents_of(ins, by_dw, ins['idx'])
+        par_txt = ' '.join('%04X' % isa[p]['addr'] for p in sorted(par))
+        accp = [p for p in par if isa[p]['op'].startswith('dpas')]
+        print('%04X   %-24s %-10s %-12s %s' % (
+            ins['addr'], ins['ops'][0] if ins['ops'] else '', len(ins['ops']),
+            ('%04X' % isa[accp[0]]['addr']) if accp else '-', par_txt))
+
+
+# ------------------------------------------------------------------ mix
+def cmd_mix():
+    isa, by_dw = load()
+    ps = post(isa)
+    segs = []
+    start = 0
+    marks = []
+    for k, ins in enumerate(ps):
+        if ins['op'] in ('sync.allwr', 'sync.bar'):
+            marks.append(k)
+    prev = 0
+    for k in marks:
+        segs.append((prev, k))
+        prev = k + 1
+    segs.append((prev, len(ps) - 1))
+    for a, b in segs:
+        body = ps[a:b + 1]
+        c = Counter(i['op'] for i in body)
+        msg = Counter((i['comment'] or '').split(';')[-1].strip()
+                      for i in body if i['op'].startswith('send') and i['comment'])
+        print('== segment 0x%04X..0x%04X  n=%d' % (body[0]['addr'], body[-1]['addr'], len(body)))
+        print('   ops:', dict(c.most_common(12)))
+        print('   msgs:', dict(msg.most_common(8)))
+        casts = [i for i in body if i['op'] == 'mov' and ':hf' in (i['ops'][0] if i['ops'] else '')
+                 and len(i['ops']) > 1 and ':f<' in i['ops'][1]]
+        print('   mov hf<-f (narrow):', len(casts))
+        print()
+
+
+# ------------------------------------------------------------------ depth census
+def depth_census(isa, by_dw, nodes_mask=None):
+    """longest dependent predecessor path (instruction count) ending at each instr."""
+    memo = {}
+    for ins in isa:
+        k = ins['idx']
+        best = 0
+        for p in parents_of(ins, by_dw, k):
+            if p in memo:
+                best = max(best, memo[p] + 1)
+        memo[k] = best
+    return memo
+
+
+def cmd_depth():
+    isa, by_dw = load()
+    memo = depth_census(isa, by_dw)
+    ps = post(isa)
+    rows = sorted(((memo[i['idx']], i) for i in ps), key=lambda t: -t[0])
+    print('deepest 40 after 0x4A90 (each = longest dependent path length):')
+    for d, i in rows[:40]:
+        print('%3d %04X %-10s %s' % (d, i['addr'], i['op'], ' '.join(i['ops'])[:90]))
+    h = Counter(d for d, _ in rows)
+    print('\ndepth histogram (top of distribution):', sorted(h.items())[-12:])
+
+
+if __name__ == '__main__':
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'map'
+    {'map': cmd_map, 'dpas': cmd_dpas, 'mix': cmd_mix, 'depth': cmd_depth}[cmd]()

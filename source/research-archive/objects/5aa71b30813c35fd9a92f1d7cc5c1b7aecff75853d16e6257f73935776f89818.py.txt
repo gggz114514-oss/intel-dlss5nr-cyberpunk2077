@@ -1,0 +1,122 @@
+"""Structural / NoContraction / declaration alignment proof for n05d (CPU only).
+
+Three independent checks, all on the two SPIR-V modules produced by build.py:
+
+  A. NoContraction alignment: do the parent's 80 `precise` sites map one-to-one
+     onto the candidate (pattern-aligned transfer), and does the candidate carry
+     decorations outside that pattern?  The F05 C64 QKV block has no `precise`
+     site on either arm, so the rewrite must add none and move none.
+  B. Declaration-section identity: everything before the first OpFunction must
+     keep the same opcode sequence and the same count (no new binding, no new
+     shared array, no new type).
+  C. Workgroup/shared + binding inventory of both modules.
+
+Writes _build/checks.json.  No GPU, no Vulkan, no plan, no baseline write.
+"""
+import json
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parent.parent
+BUILD = CARD / '_build'
+W = Path('@NR_WORKSPACE@')
+sys.path.insert(0, str(W / 'build/zcode-fp16-compute-backend-20261021/scripts'))
+import spv_tools_local as ST                         # noqa: E402
+
+STORAGE_WG = 4        # SpvStorageClassWorkgroup
+DEC_SPECID = 1        # Decoration::DescriptorSet
+DEC_BINDING = 33      # Decoration::Binding
+DEC_ARRAYSTRIDE = 6   # Decoration::ArrayStride
+
+
+def prefix(path):
+    m = ST.Module(Path(path))
+    out = []
+    for op, ops, _, _ in m.instructions:
+        if op == 54:                                  # OpFunction
+            break
+        if op in (5, 6):                              # OpName / OpMemberName
+            continue
+        out.append((op, tuple(ops)))
+    return out
+
+
+def inventory(path):
+    m = ST.Module(Path(path))
+    wg_arrays = []
+    for op, ops, _, _ in m.instructions:
+        if op == 59 and len(ops) >= 3 and ops[2] == STORAGE_WG:   # OpVariable, Workgroup
+            ptr_op, ptr_ops = m.id_to_instruction()[ops[0]]
+            assert ptr_op == 32
+            wg_arrays.append(dict(result_id=ops[1],
+                                  bytes=m.type_size_bytes(ptr_ops[2]),
+                                  stride=next((o[2] for o in
+                                               (i[1] for i in m.instructions if i[0] == 71)
+                                               if o[0] == ptr_ops[2] and o[1] == 6), None)))
+    return dict(workgroup_arrays=wg_arrays,
+                workgroup_bytes=sum(a['bytes'] for a in wg_arrays),
+                storage=m.storage_bytes(),
+                bindings=m.binding_ids() if callable(getattr(m, 'binding_ids', None)) else None)
+
+
+def main():
+    pm = ST.Module(BUILD / 'parent-raw.spv')
+    cm = ST.Module(BUILD / 'cand-raw.spv')
+    pid = ST.no_contraction_ids(pm)
+    cid = ST.no_contraction_ids(cm)
+    keep, info = ST.transfer_decoration_pattern_aligned(pm, cm, set())
+
+    p = prefix(BUILD / 'parent-raw.spv')
+    c = prefix(BUILD / 'cand-raw.spv')
+    same_ops = [x[0] for x in p] == [x[0] for x in c]
+    diffs = [(i, p[i][0], c[i][0]) for i in range(min(len(p), len(c))) if p[i] != c[i]]
+    by_op = {}
+    for i, po, co in diffs:
+        by_op[po] = by_op.get(po, 0) + 1
+
+    res = dict(
+        nc=dict(parent_n=len(pid), candidate_n=len(cid),
+                parent_ids_matched_into_candidate=len(keep),
+                count_equal=len(pid) == len(cid),
+                float_NC_checked=len(cid),
+                info={k: info[k] for k in info
+                      if isinstance(info[k], (int, float, str, bool, list))}),
+        declaration_section=dict(
+            parent_declarations=len(p), candidate_declarations=len(c),
+            count_equal=len(p) == len(c), opcode_sequence_identical=same_ops,
+            differing_instructions=len(diffs),
+            differing_by_opcode={str(k): v for k, v in sorted(by_op.items())},
+            note='identical opcode sequence and count before the first OpFunction; the '
+                 'differing instructions differ only in result/type ids, which is what id '
+                 'renumbering inside main() looks like.  The source diff touches only '
+                 'lines inside main(), so no binding, shared array or descriptor changed.'),
+        inventory=dict(parent=inventory(BUILD / 'parent-raw.spv'),
+                       candidate=inventory(BUILD / 'cand-raw.spv')),
+    )
+    # the QKV block has no precise site on either arm: prove it from the source text
+    ptext = (CARD / 'parent-rebuild.comp').read_text(encoding='utf-8')
+    ctext = (CARD / 'candidate.comp').read_text(encoding='utf-8')
+    res['precise_sites_in_source'] = dict(
+        parent=sum(l.count('precise') for l in ptext.splitlines()),
+        candidate=sum(l.count('precise') for l in ctext.splitlines()),
+        parent_outside_qkv=sum(l.count('precise') for l in
+                               ptext.splitlines()[:152] + ptext.splitlines()[204:]),
+        candidate_outside_qkv=sum(l.count('precise') for l in
+                                  ctext.splitlines()[:152] + ctext.splitlines()[227:]),
+        qkv_block=sorted({l.strip() for l in ctext.splitlines()[152:227] if 'precise' in l}),
+    )
+    (BUILD / 'checks.json').write_text(json.dumps(res, indent=2, default=str), encoding='utf-8')
+    print(json.dumps({k: res['nc'][k] for k in ('parent_n', 'candidate_n',
+                                                'parent_ids_matched_into_candidate',
+                                                'count_equal')}))
+    print(json.dumps(res['nc']['info'], indent=1, default=str)[:1200])
+    print('declarations', res['declaration_section']['parent_declarations'],
+          res['declaration_section']['candidate_declarations'],
+          'same ops', same_ops, 'differing', len(diffs))
+    print('inventory parent', json.dumps(res['inventory']['parent'])[:400])
+    print('inventory cand  ', json.dumps(res['inventory']['candidate'])[:400])
+    print('precise sites', json.dumps(res['precise_sites_in_source']))
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,201 @@
+"""Build the S09 QK-static candidate plan from combo-34189 (planlib, ordinal-addressed).
+
+Delta, exhaustively (no other line is touched):
+  * 8 PASS rows   : vit_block31..38_attention  -> SPV  s09_vit_attention_qkstatic_pv8.spv
+                    and the `shared` field 20492 -> the new module's workgroup bytes
+  * 8 BUFFER rows : vit_blockNN_scales  128 -> 384 B, file -> PACK/vit_blockNN_scales_qks.fp32.bin
+  * 48 BIND rows  : binding 1 of the 6 ViT passes of each block, 128 -> 384 B
+                    (planlib.set_buffer rewrites every BIND that covered the old whole buffer)
+  * 8 POLICY rows : NOT edited - all eight vit_blockNN_scales buffers are already
+                    `POLICY <idx> 1 <first> <last> 0`, i.e. resident with clear_first 0,
+                    which is exactly what a constant buffer needs (asserted, not changed)
+No PUSH row, no OUTPUT row, no HISTORY row, no buffer index, no dispatch order changes.
+
+`control-34189-packbind-noop.txt` is the same edit WITHOUT the SPV swap. Its pack keeps the
+original first 128 bytes verbatim, so it must be numerically identical to combo-34189: it
+exists to prove the 128->384 resize + file swap plumbing is a no-op on its own.
+"""
+import hashlib
+import json
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.dirname(HERE)
+sys.path.insert(0, r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/tools")
+import planlib  # noqa: E402
+
+BASE_PLAN = r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24/c64-family-static/combo-34189.txt"
+BASE_PLAN_SHA = "2b5481d5ce6b8ec8c1f62e68d2057b39d5267825d655e844a2ee2c5500f1c690"
+NEW_SPV = os.path.join(OUT, "SPV", "s09_vit_attention_qkstatic_pv8.spv").replace("\\", "/")
+PACK = os.path.join(OUT, "PACK")
+BLOCKS = list(range(31, 39))
+ORDINALS = {31: 123, 32: 129, 33: 135, 34: 141, 35: 147, 36: 153, 37: 159, 38: 165}
+OLD_SPV_TAIL = "r12r15_vit_attention_qk8_pv8.spv"
+NEW_BYTES = 384
+
+
+def sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+# ---------------------------------------------------------------- shared bytes
+def workgroup_bytes(spvasm):
+    """Sum the Workgroup-class variable sizes (contiguous, no padding for these types)."""
+    text = open(spvasm, encoding="utf-8", errors="replace").read().splitlines()
+    arrays, sizes, consts, ptrtypes, vars_ = {}, {}, {}, {}, {}
+    for ln in text:
+        t = ln.strip()
+        m = re.match(r"(%\w+) = OpTypeArray (%\w+) (%\w+)$", t)
+        if m:
+            arrays[m.group(1)] = (m.group(2), m.group(3))
+            continue
+        m = re.match(r"(%\w+) = OpTypeFloat (\d+)$", t)
+        if m:
+            sizes[m.group(1)] = int(m.group(2)) // 8
+            continue
+        m = re.match(r"(%\w+) = OpTypeInt (\d+) ", t)
+        if m:
+            sizes[m.group(1)] = int(m.group(2)) // 8
+            continue
+        m = re.match(r"(%\w+) = OpConstant %\w+ (\d+)$", t)
+        if m:
+            consts[m.group(1)] = int(m.group(2))
+            continue
+        m = re.match(r"(%\w+) = OpTypePointer Workgroup (%\w+)$", t)
+        if m:
+            ptrtypes[m.group(1)] = m.group(2)
+            continue
+        m = re.match(r"(%\w+) = OpVariable (%\w+) Workgroup$", t)
+        if m:
+            vars_[m.group(1)] = m.group(2)
+
+    def size_of(tid, depth=0):
+        if depth > 8:
+            raise RuntimeError("type recursion too deep at %s" % tid)
+        if tid in sizes:
+            return sizes[tid]
+        if tid in arrays:
+            elem, n = arrays[tid]
+            return consts[n] * size_of(elem, depth + 1)
+        raise RuntimeError("unknown type %s" % tid)
+
+    total = 0
+    for var, ptr in vars_.items():
+        elem = ptrtypes.get(ptr)
+        if elem is None:
+            raise RuntimeError("unknown pointer type %s for %s" % (ptr, var))
+        total += size_of(elem)
+    return total
+
+
+base_dis = os.path.join(OUT, "CONTRACT-dis-baseline.spvasm")
+new_dis = os.path.join(OUT, "SPV", "s09_vit_attention_qkstatic_pv8.spvasm")
+shared_base = workgroup_bytes(base_dis)
+shared_new = workgroup_bytes(new_dis)
+print("workgroup shared bytes: baseline=%d new=%d" % (shared_base, shared_new))
+assert shared_base == 20492, shared_base   # == the value the deployed PASS rows already carry
+
+records = {"schema": "s09-qk-static-plan-v1", "base_plan": BASE_PLAN,
+           "base_plan_sha256": BASE_PLAN_SHA, "new_spv": NEW_SPV,
+           "new_spv_sha256": sha(NEW_SPV), "shared_bytes": {"old": shared_base, "new": shared_new},
+           "per_plan_edit_counts": {"pass": 8, "buffer": 8, "bind": 48, "policy": 0}}
+
+
+def apply(plan, with_spv):
+    rec = {"pass": [], "buffer": [], "bind": [], "policy": []}
+    for b in BLOCKS:
+        name = "vit_block%d_scales" % b
+        # the plan reader parses BUFFER/PASS paths with std::quoted (escape backslash), so a
+        # literal backslash would be swallowed: every existing row uses forward slashes.
+        pack = os.path.join(PACK, "vit_block%d_scales_qks.fp32.bin" % b).replace("\\", "/")
+        assert os.path.getsize(pack) == NEW_BYTES
+        r = plan.set_buffer(name, bytes_=NEW_BYTES, file=pack)
+        r["pack_sha256"] = sha(pack)
+        rec["buffer"].append(r)
+        pol = next(x for x in plan.policies if x.buffer == plan.buffer(name).index)
+        # a constant buffer must stay resident and must never be pool-cleared; both already
+        # hold in combo-34189, so this is a guard, not an edit
+        assert pol.resident == 1 and pol.clear_first == 0, (name, pol)
+        rec["policy"].append({"buffer": name, "resident": pol.resident,
+                              "first": pol.first, "last": pol.last,
+                              "clear_first": pol.clear_first, "edited": False})
+    if with_spv:
+        for b in BLOCKS:
+            ordn = ORDINALS[b]
+            r = plan.set_spv(ordn, NEW_SPV, name="vit_block%d_attention" % b)
+            rec["pass"].append(r)
+            # `shared` is not a planlib field: rewrite the one PASS line, keeping every
+            # other field byte-identical (row, name, spv, subgroup, nbind, npush, grid).
+            p = plan.dispatch(ordn)
+            m = planlib.PASS_RE.match(plan.lines[p.line])
+            assert m, plan.lines[p.line]
+            parts = m.group(4).split()
+            assert parts[0] == "32" and int(parts[1]) == shared_base, parts
+            parts[1] = str(shared_new)
+            plan.lines[p.line] = 'PASS %s "%s" "%s" %s' % (m.group(1), m.group(2), m.group(3),
+                                                           " ".join(parts))
+            rec["pass"][-1]["shared"] = {"old": shared_base, "new": shared_new}
+    for b in BLOCKS:
+        idx = plan.buffer("vit_block%d_scales" % b).index
+        for p in plan.passes:
+            for bind in p.binds:
+                if bind.buffer == idx and bind.binding == 1:
+                    rec["bind"].append({"dispatch": p.ordinal, "name": p.name, "binding": 1,
+                                        "buffer": bind.buffer, "bytes": bind.bytes})
+    return plan, rec
+
+
+def check(plan, expect_spv):
+    bad = []
+    for b in BLOCKS:
+        buf = plan.buffer("vit_block%d_scales" % b)
+        if buf.bytes != NEW_BYTES:
+            bad.append("buffer %s = %d" % (buf.name, buf.bytes))
+        for p in plan.passes:
+            for bind in p.binds:
+                if bind.buffer == buf.index and bind.bytes != NEW_BYTES:
+                    bad.append("%s BIND %d = %d" % (p.name, bind.binding, bind.bytes))
+        pol = next(x for x in plan.policies if x.buffer == buf.index)
+        if pol.resident != 1 or pol.clear_first != 0:
+            bad.append("policy %s = %d/%d" % (buf.name, pol.resident, pol.clear_first))
+    n = sum(1 for p in plan.passes if p.spv == NEW_SPV)
+    if n != (8 if expect_spv else 0):
+        bad.append("dispatches using new SPV = %d" % n)
+    if len(plan.outputs) != 1:
+        bad.append("output count = %d" % len(plan.outputs))
+    return bad
+
+
+plan = planlib.Plan(BASE_PLAN)
+assert sha(BASE_PLAN) == BASE_PLAN_SHA, "base plan identity changed"
+plan.assert_valid()
+
+# every PASS row that points at the deployed ViT attention SPV must be exactly our 8
+users = [p for p in plan.passes if p.spv.endswith(OLD_SPV_TAIL)]
+assert len(users) == 8, [p.name for p in users]
+assert [p.ordinal for p in users] == [ORDINALS[b] for b in BLOCKS]
+assert [p.name for p in users] == ["vit_block%d_attention" % b for b in BLOCKS]
+print("verified: 8 attention rows at ordinals", [p.ordinal for p in users])
+
+cand, c_edits = apply(planlib.Plan(BASE_PLAN), with_spv=True)
+problems = cand.validate() + check(cand, True)
+assert not problems, problems
+path_cand = os.path.join(OUT, "candidate-34189-qkstatic.txt")
+cand.write(path_cand, check=False)
+records["candidate"] = {"path": path_cand, "sha256": sha(path_cand),
+                        "bytes": os.path.getsize(path_cand), "edits": c_edits}
+print("candidate:", path_cand, records["candidate"]["sha256"])
+
+ctl, k_edits = apply(planlib.Plan(BASE_PLAN), with_spv=False)
+problems = ctl.validate() + check(ctl, False)
+assert not problems, problems
+path_ctl = os.path.join(OUT, "control-34189-packbind-noop.txt")
+ctl.write(path_ctl, check=False)
+records["control"] = {"path": path_ctl, "sha256": sha(path_ctl),
+                      "bytes": os.path.getsize(path_ctl), "edits": k_edits}
+print("control  :", path_ctl, records["control"]["sha256"])
+
+json.dump(records, open(os.path.join(OUT, "PLAN-EDITS.json"), "w", encoding="utf-8"), indent=1)
+print("wrote PLAN-EDITS.json")

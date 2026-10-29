@@ -1,0 +1,230 @@
+"""Parse the F20 (ord 230) SPIR-V and enumerate every cooperative-matrix access with its
+shared-memory base variable and index expression, plus the plain shared loads/stores.
+
+Purpose (card n28):
+  * Q1 of the contract: an enumerable (site -> shared block -> index expression) map.
+  * BARRIER-AUDIT: exact index ranges of every writer / reader set, so RAW and WAR hazards
+    across workgroup barriers can be decided by interval overlap instead of by prose.
+
+Read-only: the SPIR-V is never modified.
+"""
+import sys, json, struct, collections
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding='utf-8')
+
+SPV = Path(sys.argv[1] if len(sys.argv) > 1 else
+           r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024'
+           r'/f20-coarse-owner-20261026/candidate.spv')
+
+OP = {
+    59: 'OpVariable', 43: 'OpConstant', 65: 'OpAccessChain', 66: 'OpInBoundsAccessChain',
+    61: 'OpLoad', 62: 'OpStore', 81: 'OpCompositeExtract', 80: 'OpCompositeConstruct',
+    79: 'OpVectorShuffle', 83: 'OpCopyObject', 132: 'OpIMul', 128: 'OpIAdd', 126: 'OpIAdd?',
+    130: 'OpISub', 134: 'OpUDiv', 137: 'OpUMod', 194: 'OpShiftRightLogical',
+    195: 'OpShiftRightArithmetic', 196: 'OpShiftLeftLogical', 197: 'OpBitwiseOr',
+    199: 'OpBitwiseAnd', 200: 'OpNot', 124: 'OpConvertUToF', 112: 'OpConvertFToU',
+    4456: 'OpTypeCooperativeMatrixKHR', 4457: 'OpCooperativeMatrixLoadKHR',
+    4458: 'OpCooperativeMatrixStoreKHR', 4459: 'OpCooperativeMatrixMulAddKHR',
+    4460: 'OpCooperativeMatrixLengthKHR', 8: 'OpLine', 248: 'OpExecutionMode',
+    71: 'OpDecorate', 332: 'OpDecorateId',
+}
+STORAGE = {0: 'UniformConstant', 1: 'Input', 2: 'Uniform', 3: 'Output', 4: 'Workgroup',
+           12: 'StorageBuffer', 14: 'PushConstant'}
+
+words = list(struct.unpack('<%dI' % (len(SPV.read_bytes()) // 4), SPV.read_bytes()))
+assert words[0] == 0x07230203, hex(words[0])
+i = 5
+insts = []
+while i < len(words):
+    wc = words[i] >> 16
+    op = words[i] & 0xFFFF
+    operands = words[i + 1:i + wc]
+    insts.append((op, operands))
+    i += wc
+print('instructions:', len(insts))
+
+# pass 1: names / variables / constants
+names, variables, consts, types = {}, {}, {}, {}
+for op, o in insts:
+    if op == 5:            # OpName
+        target = o[0]
+        s = b''.join(struct.pack('<I', w) for w in o[1:]).split(b'\0')[0].decode('utf-8', 'replace')
+        names[target] = s
+    elif op == 59:         # OpVariable  type result storage [init]
+        types[o[1]] = o[0]
+        variables[o[1]] = dict(storage=o[2], type=o[0])
+    elif op == 43:         # OpConstant
+        consts[o[1]] = o[2]
+
+# types: OpTypeArray(28): elem, length-id; OpTypeInt(21): width, signed
+arrayinfo = {}
+intwidth = {}
+fpwidth = {}
+for op, o in insts:
+    if op == 28:
+        arrayinfo[o[0]] = dict(elem=o[1], length_id=o[2])
+    elif op == 21:
+        intwidth[o[0]] = (o[1], o[2])
+    elif op == 22:
+        fpwidth[o[0]] = o[1]
+
+
+def type_size(tid, depth=0):
+    if depth > 6:
+        return None
+    if tid in arrayinfo:
+        a = arrayinfo[tid]
+        n = consts.get(a['length_id'])
+        e = type_size(a['elem'], depth + 1)
+        return None if (n is None or e is None) else n * e
+    if tid in intwidth:
+        return intwidth[tid][0] // 8
+    if tid in fpwidth:
+        return fpwidth[tid] // 8
+    if tid in types and types[tid] in arrayinfo:
+        return type_size(types[tid], depth + 1)
+    return None
+
+
+print('\n=== Workgroup variables ===')
+wg = {}
+for vid, v in variables.items():
+    if v['storage'] == 4:
+        n = names.get(vid, '?')
+        sz = type_size(v['type'])
+        wg[vid] = dict(name=n, size_bytes=sz)
+        print('  %-4d %-14s bytes=%s' % (vid, n, sz))
+
+# pass 2: expressions
+expr = {}          # id -> readable expression
+owner = {}         # id -> base variable id (for pointer chains)
+consts_f = {}
+
+for op, o in insts:
+    if op in (65, 66):                     # OpAccessChain type result base idx...
+        base = o[2]
+        idx = o[3:]
+        parts = []
+        for k, x in enumerate(idx):
+            parts.append(expr_of := None)
+        expr[o[1]] = ('ac', base, list(idx), names.get(base))
+        owner[o[1]] = owner.get(base, base)
+        # keep the index ids for later symbolic rendering
+    elif op == 132:                        # IMul
+        expr[o[1]] = ('*', o[2], o[3])
+    elif op == 128:                        # IAdd
+        expr[o[1]] = ('+', o[2], o[3])
+    elif op == 130:
+        expr[o[1]] = ('-', o[2], o[3])
+    elif op == 196:
+        expr[o[1]] = ('<<', o[2], o[3])
+    elif op == 194:
+        expr[o[1]] = ('>>', o[2], o[3])
+    elif op == 199:
+        expr[o[1]] = ('&', o[2], o[3])
+    elif op == 197:
+        expr[o[1]] = ('|', o[2], o[3])
+    elif op == 81:                         # OpCompositeExtract
+        expr[o[1]] = ('x', o[2], tuple(o[3:]))
+    elif op in (83,):                      # OpCopyObject
+        expr[o[1]] = ('id', o[2])
+    elif op in (80, 79):
+        expr[o[1]] = ('id', o[0])
+
+
+def render(x, depth=0):
+    if depth > 10:
+        return '..%d' % x
+    if x in consts:
+        return str(consts[x])
+    e = expr.get(x)
+    if e is None:
+        return 'v%d' % x
+    if e[0] == 'id':
+        return render(e[1], depth + 1)
+    if e[0] == 'ac':
+        base = e[3] or 'v%d' % e[1]
+        return '%s[%s]' % (base, ', '.join(render(k, depth + 1) for k in e[2]))
+    if e[0] == 'x':
+        return '%s.%s' % (render(e[1], depth + 1), ''.join(str(k) for k in e[2]))
+    return '(%s %s %s)' % (render(e[1], depth + 1), e[0], render(e[2], depth + 1))
+
+
+def const_of(x, depth=0):
+    """Constant-fold an integer expression; None if it depends on anything runtime."""
+    if depth > 12:
+        return None
+    if x in consts:
+        return consts[x]
+    e = expr.get(x)
+    if e is None:
+        return None
+    if e[0] == 'id':
+        return const_of(e[1], depth + 1)
+    if e[0] in ('*', '+', '-', '<<', '>>', '&', '|'):
+        a = const_of(e[1], depth + 1)
+        b = const_of(e[2], depth + 1)
+        if a is None or b is None:
+            return None
+        return {'*': a * b, '+': a + b, '-': a - b,
+                '<<': a << b, '>>': a >> b, '&': a & b, '|': a | b}[e[0]]
+    if e[0] == 'ac':
+        return None
+    return None
+
+
+loads, stores = [], []
+for op, o in insts:
+    if op == 4457:
+        loads.append(dict(type=o[0], id=o[1], ptr=o[2], layout=o[3] if len(o) > 3 else None))
+    elif op == 4458:
+        stores.append(dict(ptr=o[0], obj=o[1], layout=o[2] if len(o) > 2 else None))
+
+print('\ncooperative-matrix loads: %d   stores: %d' % (len(loads), len(stores)))
+
+print('\n=== OpCooperativeMatrixLoadKHR sites ===')
+site_map = []
+for k, s in enumerate(loads):
+    ptr = s['ptr']
+    base = owner.get(ptr, ptr)
+    bname = names.get(base, 'v%d' % base)
+    e = expr.get(ptr)
+    idxs = e[2] if e and e[0] == 'ac' else []
+    c = [const_of(x) for x in idxs]
+    txt = render(ptr)
+    site_map.append(dict(kind='load', k=k, base=bname, text=txt,
+                         const=[x for x in c], idx=[render(x) for x in idxs]))
+    print('  #%02d %-10s %s   const=%s' % (k, bname, txt, c))
+
+print('\n=== OpCooperativeMatrixStoreKHR sites ===')
+for k, s in enumerate(stores):
+    ptr = s['ptr']
+    base = owner.get(ptr, ptr)
+    bname = names.get(base, 'v%d' % base)
+    e = expr.get(ptr)
+    idxs = e[2] if e and e[0] == 'ac' else []
+    c = [const_of(x) for x in idxs]
+    txt = render(ptr)
+    site_map.append(dict(kind='store', k=k, base=bname, text=txt,
+                         const=[x for x in c], idx=[render(x) for x in idxs]))
+    print('  #%02d %-10s %s   const=%s' % (k, bname, txt, c))
+
+Path('cards/n28-f20-barrier-alu/tools/spv-sites.json').write_text(
+    json.dumps(dict(workgroup=wg, sites=site_map), indent=2), encoding='utf-8')
+
+print('\n=== plain shared loads/stores (OpLoad/OpStore on Workgroup pointers) ===')
+cnt = collections.Counter()
+for op, o in insts:
+    if op == 61:            # OpLoad type result ptr ...
+        ptr = o[2]
+        base = owner.get(ptr, ptr)
+        if base in wg:
+            cnt[('load', names.get(base))] += 1
+    elif op == 62:          # OpStore ptr obj ...
+        ptr = o[0]
+        base = owner.get(ptr, ptr)
+        if base in wg:
+            cnt[('store', names.get(base))] += 1
+for k, v in sorted(cnt.items()):
+    print('  %-6s %-8s %d' % (k[0], k[1], v))

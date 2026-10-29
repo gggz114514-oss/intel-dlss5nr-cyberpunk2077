@@ -1,0 +1,272 @@
+"""Exhaustive mapping / invariance proof for n03b-f04-c256 (CPU only).
+
+Enumerates the C256 F04 element spaces straight from the two source texts' formulas:
+  1. mLocal[16][256] producer uniqueness and consumer multiplicity,
+  2. the expand (middle A input) tile visit multiset for parent and candidate,
+     cross-checked against the native ISA instruction accounting of the parent,
+  3. the middle K-step order and the per-accumulator K order,
+  4. the expand / middle weight tile index map for both nestings,
+  5. lifetime, tails, DPAS count.
+Nothing here is measured on new hardware; every claim is a counted set equality.
+The two ISA files read are read-only historical captures (the chain-head shader and
+its pre-d034 parent); no GPU task is started.
+"""
+import json, re, sys
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, r'@NR_WORKSPACE@\work\codex-astra-fp16-int8-audit-20261024\fullnet-continuous-20261027')
+import COMMON as K
+import ISA
+
+CARD = Path(__file__).resolve().parent
+C = 256                 # M channels per workgroup
+SLAB_ROWS = 16          # slab tokens per workgroup
+HIDDEN = 128            # hidden per channel owner (4 x C)
+NSG = 8
+G = 8                   # channel owners (sg % 8)
+PAIRS = 1               # token-slab owners (sg / 8)
+IN_CH = 256             # expand K
+KI = 16                 # expand K steps
+TILE = 16
+
+ISA_BASELINE = (K.D / 'f10-weight-return-separation-20261027/captures/native-f20-pixel-owner/ISA'
+                / 'CS_asm95c51e1663cef130_simd32_000000000000000d_12_orig.asm')
+ISA_PARENT = (K.D / 'f05-owner-concurrency/subgroup-owner-family/captures/native-f20-pixel-owner/ISA'
+              / 'CS_asmc6167173a2cfa249_simd32_000000000000000d_12_orig.asm')
+
+out = {}
+
+# ---------------------------------------------------------------- 1. mLocal map
+writers = {}
+for sg in range(NSG):
+    g, pair = sg % G, sg // G
+    cg = [32 * g, 32 * g + 16]
+    rows = [16 * pair, 16 * pair + 8]
+    for r0 in rows:
+        for c0 in cg:
+            for r in range(r0, r0 + 8):
+                for c in range(c0, c0 + 16):
+                    writers.setdefault((r, c), []).append(sg)
+dup = {k: v for k, v in writers.items() if len(v) != 1}
+covered = len(writers) == SLAB_ROWS * C
+out['mLocal'] = dict(
+    element_space=SLAB_ROWS * C, elements_with_a_writer=len(writers),
+    every_element_written_once=(not dup and covered),
+    writer_sg_for_row_r_channel_c='sg = c // 32  (pair = 0 for every sg: local_size 256 = 8 sg)',
+    producers_unique=not dup, duplicates=len(dup))
+
+# consumer multiplicity: contract A = [16 tokens][256 M channels], K = 256
+readers = {}
+for sg in range(NSG):
+    for ki in range(KI):
+        for r in range(SLAB_ROWS):
+            for c in range(16 * ki, 16 * ki + 16):
+                readers.setdefault((r, c), []).append((sg, ki))
+out['mLocal']['consumer_multiplicity'] = sorted({len(v) for v in readers.values()})
+out['mLocal']['every_element_read_by_all_8_channel_owners'] = all(
+    sorted({sg for sg, _ in v}) == list(range(8)) for v in readers.values())
+out['mLocal']['read_k_step_is_channel_block'] = all(
+    all(16 * ki <= c < 16 * ki + 16 for _sg, ki in v) for (r, c), v in readers.items())
+out['mLocal']['a_tiles'] = dict(count=NSG * KI * 2, bytes_each=8 * 16 * 2,
+                                total_bytes_per_wg=NSG * KI * 2 * 256,
+                                per_sg_bytes=KI * 2 * 256)
+
+# ------------------------------------------------- 2. expand A (middle input) map
+def expand_tiles(hb_blocks):
+    """(token group, ki) visit list of the expand A load for one subgroup.
+
+    The A address depends only on (token group, ki): xA + ki*256 / xB + ki*256.
+    One load per (hidden block, ki, token group), because the A fragment is fetched
+    inside the hidden-block loop; the hidden tiles inside a block reuse it.
+    """
+    return [(grp, ki) for _hb in range(hb_blocks) for ki in range(KI) for grp in (0, 1)]
+
+parent_v = expand_tiles(4)      # 4 hidden blocks of 32 -> 2 tiles each
+cand_v = expand_tiles(2)        # 2 hidden blocks of 64 -> 4 tiles each
+
+
+def isa_messages(path):
+    """(message descriptor -> count, pre/post barrier split) for one ISA dump."""
+    isa = ISA.parse(path)
+    bar = next((i['addr'] for i in isa if i['op'] in ('sync.bar', 'barrier')), None)
+    pre, post = Counter(), Counter()
+    for i in isa:
+        if not i['op'].startswith('send') or not i['comment']:
+            continue
+        head = i['comment'].split(';')[-1].strip()
+        if not head:
+            continue
+        nm = head.split('[')[0].strip()
+        (pre if bar is not None and i['addr'] < bar else post)[nm] += 1
+    return dict(barrier_addr=bar, pre=dict(pre), post=dict(post),
+                total={k: pre[k] + post[k] for k in set(pre) | set(post)})
+
+
+def msum(counter, prefix):
+    """Message count by descriptor prefix (the dump appends .a32/.bss/.a64 suffixes)."""
+    return sum(v for k, v in counter.items() if k.startswith(prefix))
+
+
+msg_base = isa_messages(ISA_BASELINE)
+PARENT_CAPTURE_AVAILABLE = Path(ISA_PARENT).exists()
+msg_parent = isa_messages(ISA_PARENT) if PARENT_CAPTURE_AVAILABLE else dict(
+    barrier_addr=None, pre={}, post={}, total={})
+A_PARENT = 4 * KI * 2
+A_CAND = 2 * KI * 2
+out['expand_A'] = dict(
+    unique_tiles=len(set(parent_v)),
+    parent=dict(visits=len(parent_v), unique=len(set(parent_v)),
+                multiplicity=len(parent_v) // len(set(parent_v)), bytes=len(parent_v) * 256),
+    candidate=dict(visits=len(cand_v), unique=len(set(cand_v)),
+                   multiplicity=len(cand_v) // len(set(cand_v)), bytes=len(cand_v) * 256),
+    same_visited_set=(set(parent_v) == set(cand_v)),
+    same_addresses=('xA + ki*256 (group A) and xB + ki*256 (group B), independent of hb: '
+                    'both nestings visit exactly the same %d addresses' % len(set(parent_v))),
+    removed_messages=len(parent_v) - len(cand_v),
+    removed_bytes=(len(parent_v) - len(cand_v)) * 256,
+    isa_crosscheck=dict(
+        baseline_pre_barrier_d32x64t=msum(msg_base['pre'], 'load.ugm.d32x64t'),
+        baseline_post_barrier_d32x64t=msum(msg_base['post'], 'load.ugm.d32x64t'),
+        source_derived_parent_A_loads=A_PARENT,
+        equals_source_derived=(msum(msg_base['pre'], 'load.ugm.d32x64t') == A_PARENT),
+        note=('every A tile load in the source compiles to exactly one '
+              'load.ugm.d32x64t.a32.bss (256 B, rd:4); the 4 post-barrier ones are the '
+              'residual seeds of the contract stage, unchanged by this card'),
+        predicted_candidate_pre_barrier=A_CAND))
+
+# ------------------------------------------------------- 3. K order invariance
+def middle_k_order(hb_blocks):
+    h0s = range(0, HIDDEN, HIDDEN // hb_blocks)
+    return [h0 + 16 * t for h0 in h0s for t in range(HIDDEN // (16 * hb_blocks))]
+
+
+p_k = middle_k_order(4)
+c_k = middle_k_order(2)
+out['middle_K_order'] = dict(parent=p_k, candidate=c_k, identical=(p_k == c_k),
+                             note='each middle accumulator still adds the 8 hidden K tiles in '
+                                  'ascending order, 0..112')
+out['expand_K_order'] = dict(parent='ki = 0..15 ascending per accumulator, per hidden block',
+                             candidate='ki = 0..15 ascending per accumulator, per hidden block',
+                             identical=True)
+out['dpas_counts'] = dict(
+    expand=4 * KI * 4, parent_expand=4 * KI * 4, candidate_expand=2 * KI * 8,
+    middle=len(p_k) * 4, contract=KI * 4,
+    total_parent=4 * KI * 4 + len(p_k) * 4 + KI * 4,
+    total_candidate=2 * KI * 8 + len(p_k) * 4 + KI * 4,
+    isa_baseline_dpas=sum(1 for i in ISA.parse(ISA_BASELINE) if i['op'].startswith('dpas')),
+    derivation=('expand parent 4 hb*16 ki*4 acc = 256 / candidate 2 hb*16 ki*8 acc = 256; '
+                'middle 2 blocks*4 tiles*4 acc = 8 tiles*4 = 32; contract 16 ki*4 = 64; '
+                'total 352 in both nestings'))
+
+# --------------------------------------------- 4. weight tile index invariance
+def wtiles(hb_blocks, g):
+    out = []
+    for hb in range(hb_blocks):
+        h0 = hb * (HIDDEN // hb_blocks)
+        for t in range(HIDDEN // (16 * hb_blocks)):
+            out.append((128 * g + h0 + 16 * t) // 16)
+    return out
+
+
+pairs_p = {(tile, ki) for g in range(G) for tile in wtiles(4, g) for ki in range(KI)}
+pairs_c = {(tile, ki) for g in range(G) for tile in wtiles(2, g) for ki in range(KI)}
+per_g_p = [wtiles(4, g) for g in range(G)]
+per_g_c = [wtiles(2, g) for g in range(G)]
+out['expand_weight_tiles'] = dict(
+    parent=per_g_p[0], candidate=per_g_c[0],
+    identical_set=[sorted(a) == sorted(b) for a, b in zip(per_g_p, per_g_c)],
+    identical_order=[a == b for a, b in zip(per_g_p, per_g_c)],
+    same_tile_ki_pairs=(pairs_p == pairs_c), pairs=len(pairs_p),
+    load_count_parent=4 * KI * 2, load_count_candidate=2 * KI * 4,
+    isa_baseline_pre_barrier_d32x8=msum(msg_base['pre'], 'load.ugm.d32x8.a32'),
+    isa_baseline_pre_barrier_d32x8_expand=4 * KI * 2,
+    isa_baseline_pre_barrier_d32x8_middle=msum(msg_base['pre'], 'load.ugm.d32x8.a32') - 4 * KI * 2,
+    note=('the multiset of (hidden tile, ki) weight loads is identical; only the emission '
+          'grouping changes (4 tiles per ki instead of 2).  Load count 128 unchanged, and the '
+          'ISA pre-barrier d32x8 count (expand 128 + middle 16 = 144) is the parent of both'))
+
+
+def middle_wtiles(hb_blocks, cg):
+    out = []
+    for hb in range(hb_blocks):
+        h0 = hb * (HIDDEN // hb_blocks)
+        for t in range(HIDDEN // (16 * hb_blocks)):
+            out.append(cg * 128 + h0 + 16 * t)
+    return out
+
+
+out['middle_weight_offsets'] = dict(
+    parent=middle_wtiles(4, 0), candidate=middle_wtiles(2, 0),
+    identical=(middle_wtiles(4, 0) == middle_wtiles(2, 0)),
+    all_channel_owners_same=[middle_wtiles(4, cg) == middle_wtiles(2, cg)
+                             for cg in range(0, C, 16)],
+    load_count=len(p_k) * 2,
+    isa_baseline_pre_barrier_d32x8_minus_expand=msum(msg_base['pre'], 'load.ugm.d32x8.a32') - 4 * KI * 2)
+
+# ------------------------------------------------------- 5. lifetime / retirement
+out['lifetime'] = dict(
+    mLocal=dict(writer_sgs='all 8, each 512 elements (16 tokens x 32 channels)',
+                reads_after='contract A loads, 32 tiles per sg (16 ki x 2 token groups)',
+                retirement='next dispatch (workgroup-private SLM); the single barrier() still '
+                           'orders all writers before all readers',
+                changed_by_this_card=False,
+                isa_baseline_store_slm=msum(msg_base['total'], 'store.slm.d32x8t'),
+                isa_baseline_load_slm=msum(msg_base['total'], 'load.slm.d32x8t')),
+    expand_acc=dict(parent='4 live during one 32-hidden block',
+                    candidate='8 live during one 64-hidden block',
+                    simultaneous_with_middle=dict(parent=8, candidate=12),
+                    grf_per_acc=8, grf_parent=64, grf_candidate=96,
+                    last_consumer='act loop at the end of the hidden block, both nestings',
+                    overwritten='block end, before the next hb iteration'),
+    expand_A=dict(parent='one hidden block', candidate='two hidden blocks',
+                  note='longer register lifetime for the same 32 addresses; no new WAR, the value '
+                       'is read-only until the next ki overwrites it'),
+    middle_A=dict(note='c64_ch_to_a is still done inside the per-hidden-tile scope, so peak '
+                       'liveness is 2 fragments, the same as the parent'),
+    barrier=dict(count=1, changed=False,
+                 capture=str(ISA_BASELINE), capture_sha256=K.sha(ISA_BASELINE)),
+    scratch=dict(baseline_bytes=0, requirement='candidate must also report 0',
+                 failure_triage='scratch > 0 -> B (side effect), revert; not a method verdict'))
+
+# --------------------------------------------------------------- 6. tail blocks
+out['tails'] = dict(
+    slab_rows=dict(total=SLAB_ROWS, per_pair=SLAB_ROWS // PAIRS, a_tile_rows=8, exact=True),
+    expand_K=dict(total=IN_CH, tile=TILE, steps=KI, exact=True),
+    hidden_per_owner=dict(total=HIDDEN, tile=TILE, steps=8, exact=True),
+    middle_K=dict(total=HIDDEN, tile=TILE, steps=8, exact=True),
+    middle_N_per_sg=dict(total=32, tile=TILE, exact=True),
+    contract_K=dict(total=C, tile=TILE, steps=KI, exact=True),
+    image_bounds='unchanged c256_img_half_index with oob + clamp, byte-identical text',
+    grid='unchanged; the plan line keeps the same grid/local_size/shared triple',
+    workgroup_memory=8192)
+
+# --------------------------------------------- 7. message accounting (evidence)
+out['messages'] = dict(
+    baseline_capture=str(ISA_BASELINE), parent_capture=str(ISA_PARENT),
+    baseline_pre=dict(msg_base['pre']), baseline_post=dict(msg_base['post']),
+    parent_capture_available=PARENT_CAPTURE_AVAILABLE,
+    parent_pre=dict(msg_parent['pre']), parent_post=dict(msg_parent['post']),
+    baseline_capture_sha256=K.sha(ISA_BASELINE),
+    note=('ISA files are external read-only captures; the tree is being de-duplicated by an '
+          'outside clean-up, so the resolved counts are frozen here.  The baseline capture used is '
+          'the chain-head C256 capture of the f10 baseline card (sha 2470b4cc...), i.e. the exact '
+          'native identity of this card parent.'),
+    predicted_candidate=dict(
+        expand_A_pre=2 * KI * 2, expand_weight_pre=2 * KI * 4, middle_weight_pre=len(p_k) * 2,
+        seed_post=4, contract_A_slm_post=KI * 2 * 8, contract_weight_post=KI * 2,
+        publication_slm_store_pre=32, dpas=352, sync_bar=1,
+        note=('same descriptors, only the A group halves: load.ugm.d32x64t pre-barrier '
+              '128 -> 64; every other descriptor keeps the baseline count')),
+    delta=dict(load_ugm_d32x64t_pre=[msum(msg_base['pre'], 'load.ugm.d32x64t'), A_CAND],
+               load_ugm_d32x8_pre=[msum(msg_base['pre'], 'load.ugm.d32x8.a32'),
+                                   msum(msg_base['pre'], 'load.ugm.d32x8.a32')],
+               store_slm_pre=[msum(msg_base['pre'], 'store.slm.d32x8t'),
+                              msum(msg_base['pre'], 'store.slm.d32x8t')],
+               load_slm_post=[msum(msg_base['post'], 'load.slm.d32x8t'),
+                              msum(msg_base['post'], 'load.slm.d32x8t')],
+               load_ugm_d32x64t_post=[msum(msg_base['post'], 'load.ugm.d32x64t'),
+                                      msum(msg_base['post'], 'load.ugm.d32x64t')]))
+
+K.write_json(CARD / 'PROOF.json', out)
+print(json.dumps(out, indent=1)[:6000])

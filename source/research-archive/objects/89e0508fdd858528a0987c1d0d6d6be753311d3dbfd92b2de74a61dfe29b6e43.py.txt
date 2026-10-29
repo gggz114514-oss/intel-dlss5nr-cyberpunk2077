@@ -1,0 +1,49 @@
+from pathlib import Path
+import json,re,hashlib,collections
+B=Path('@NR_WORKSPACE@');A=B/'work/codex-astra-fp16-int8-audit-20261024';D=A/'fullnet-mechanism-transfer-20261026';S=D/'f05-four-weight-window-20261027';O=S/'wait-diagnosis';O.mkdir(exist_ok=True);(O/'run').mkdir(exist_ok=True);(O/'captures').mkdir(exist_ok=True)
+read=lambda p:json.loads(p.read_text(encoding='utf-8-sig'));ident=lambda p:dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+plans={'parent':D/'f10-weight-return-separation-20261027/plan.txt','candidate':S/'c128-isolated/plan.txt'}
+nr=next(r for r in read(S/'NATIVE-REVIEW.json') if r['width']=='c128');regions={};audit={}
+for arm in plans:
+ p=Path(nr[arm]['native']);ls=[(int(m[1],16),l) for l in p.read_text().splitlines() if (m:=re.search(r'\[([0-9A-F]+)\]',l))];dp=[(pc,l) for pc,l in ls if 'dpas.8x8' in l][:48];assert len(dp)==48
+ last=dp[-1][0];nxt=next(pc for pc,l in ls if pc>last);start=next(pc for pc,l in ls if 'load.ugm.d32x8t.a32' in l)
+ # Seed assembly windows are exactly four row-join moves plus their destination waits.
+ regions[arm]={'qkv_issue_span':(start,nxt),'seed_A_join':(0x910,0x970) if arm=='parent' else (0x950,0x9b0)}
+ pure=[l for pc,l in ls if regions[arm]['seed_A_join'][0]<=pc<regions[arm]['seed_A_join'][1]];assert len(pure)==8 and sum('mov ' in l for l in pure)==4 and sum('sync.nop' in l for l in pure)==4
+ q=[l for pc,l in ls if start<=pc<nxt];chains=[]
+ for pc,l in dp:
+  m=re.search(r'\s(r\d+):f\s+(r\d+|null):f',l);assert m,l;chains.append((hex(pc),m[1],m[2]))
+ assert all(x[2]=='null' for x in chains[:6]);assert all(x[1]==x[2] for x in chains[6:])
+ assert len({x[1] for x in chains})==6
+ audit[arm]={'native':ident(p),'native_hash':re.search(r'asm([0-9a-f]+)_',p.name)[1],'regions':regions[arm],'seed_A_join':pure,'QKV_static_counts':dict(instructions=len(q),DPAS=48,A_row_reads=sum('load.ugm.d32x8t.a32' in l for l in q),weights=sum('load.ugm.d32x8.a32' in l for l in q),mov=sum(bool(re.search(r'\bmov\s',l)) for l in q),sync_nop=sum('sync.nop' in l for l in q),sync_allwr=sum('sync.allwr' in l for l in q),sync_allrd=sum('sync.allrd' in l for l in q),barrier=sum('sync.bar' in l for l in q)), 'acc_chains':chains}
+ (O/f'{arm}-QKV.asm').write_text('\n'.join(q),encoding='utf-8')
+(O/'NATIVE-AUDIT.json').write_text(json.dumps(audit,indent=2),encoding='utf-8')
+t=read(S/'LUNA-NATIVE.json');base=t['jobs'][0];gtpin=Path(base['argv'][0]);runner=Path(base['argv'][base['argv'].index('--')+1]);tool=A/'phase-diagnosis-20261025/build/Release/phaseclock.dll';gold='1755e9c2fadba97f08cb5b02b7a4294cde3675379bdec75352287505f7e129d6'
+def save(name,jobs,ids):
+ (O/f'{name}.json').write_text(json.dumps(dict(working_directory=str(B),output_root=str(O/(name+'-execution')),identities=[ident(p) for p in ids],jobs=jobs,rules=['Serial unique lock, fresh outputs, stop on nongold/error; no automatic retry. Diagnosis only, do not change shaders.','phaseclock is Before-PC arrival interval, NOT instruction latency, NOT asynchronous completion. Whole QKV endpoint is last DPAS issue, not completion; subsequent norm excluded. Seed join only firstK, do not extrapolate to allK.','One narrow window per capture, exit report. Same-PC null measures timestamp overhead; instrumentation itself can perturb supply and register allocation. No additive time decomposition. Counters must hardware_passes1.']),indent=2),encoding='utf-8')
+jobs=[]
+for rep in range(3):
+ for stage in ['qkv_issue_span','seed_A_join']:
+  for arm in (['parent','candidate'] if rep%2==0 else ['candidate','parent']):
+   start,end=regions[arm][stage];name=f'{stage}-{arm}-{rep}';out=O/'run'/name
+   ar=[str(gtpin),'-t',str(tool),'--filter','I:hash:'+audit[arm]['native_hash'],'--start_pc',str(start),'--end_pc',str(end),'--num_thread_buckets','0','--profile_dir',name,'--output_dir',str(O/'captures'),'--msg_file',str(O/(name+'.log')),'--msgon','all','--',str(runner),'--plan',str(plans[arm]),'--out',str(out),'--pool','--warm','0','--reps','1']
+   jobs.append(dict(id=name,plan=ident(plans[arm]),argv=ar,runner_output=str(out),expected_fixed_frame_out=gold))
+save('CLOCK-PILOT',jobs[:4],[gtpin,runner,tool]);save('CLOCK-REPEATS',jobs[4:],[gtpin,runner,tool])
+null=[]
+for j in jobs[2:4]:
+ j=json.loads(json.dumps(j));name='null-'+j['id'];j['id']=name;j['runner_output']=str(O/'run'/name);ar=j['argv'];ar[ar.index('--end_pc')+1]=ar[ar.index('--start_pc')+1];ar[ar.index('--profile_dir')+1]=name;ar[ar.index('--msg_file')+1]=str(O/(name+'.log'));ar[ar.index('--out')+1]=j['runner_output'];null.append(j)
+save('CLOCK-NULL',null,[gtpin,runner,tool])
+prof=B/'work/zcode-combo1-profile-20261025/build/port_network_driver_profile_zprof.exe';cj=[]
+for rep in range(3):
+ for arm in (['parent','candidate'] if rep%2==0 else ['candidate','parent']):
+  name=f'occupancy-{arm}-{rep}';out=O/'run'/name
+  cj.append(dict(id=name,plan=ident(plans[arm]),runner_output=str(out),expected_fixed_frame_out=gold,argv=[str(prof),'--plan',str(plans[arm]),'--out',str(out),'--pool','--warm','0','--reps','1','--metrics','XVE_THREADS_OCCUPANCY_ALL']))
+save('COUNTERS',cj,[prof])
+(O/'execute.ps1').write_text((S/'execute.ps1').read_text(encoding='utf-8-sig').replace('LUNA-F05-FOUR-WEIGHT-WINDOW','LUNA-F05-WAIT-DIAGNOSIS'),encoding='utf-8')
+(O/'DESIGN.txt').write_text('''Question: limited-window effect is indistinct; NOT proof of wait transfer. Separate structural facts, instrumented observations and causal claims.
+Native two arms have six independent accumulator chains: first6 null seed, subsequent42 self-accumulate. No new cross-acc RAW dependency. Same 48 QKV weights,64 A row reads. Seed A assembly both8 instructions=four moves+four waits; native counts do not measure duration. Allwr count may rise while nop falls: combined waits are not automatically extra work.
+CLOCK windows: complete unrolledQKV supply-to-last-DPAS ISSUE, and exact seedA assembly join. Each3 repeats alternatearms; no barrier in those intervals. NULL samePC at Ajoin bounds timer floor once each, no inferential claims from null alone. All thread cycles nonadditive, no time decomposition. If short window near null or unstable, classify measurement limit, not zero wait. qkv_issue span cannot distinguish B arrival vs A vs scheduling alone.
+COUNTERS three alternating pairs one metric occupancy; same runner reports per-pass timing if available. Only twelveC128 dispatches; separate rest-of-network noise. Occupancy change supports residency response, not GRF allocation proof. If hardwarepasses>1 reject entire capture.
+Discrimination: Ajoin increase with QKV increase supports a local A-return/join exposure at seed only; flat/decreased Ajoin argues against seed being the regression but not laterK. Same chains exclude added mathematical cross-acc dependency, not dependence stall duration. QKV improved but kernelnot improved locates offset outside capturedspan; QKV unchanged and occupancydown supports changed residency. Mixed/noisy result remains unresolved. Never claim instrumentation observes async completions.
+No new optimization code. Baseline F10 and bothF05 candidates preserved. Full validGPU workload budget20 jobs:4pilot+8repeat+2null+6counter. Stop stage on failure; repeats only after primarychecks pilotgold and output frequency.\n''',encoding='utf-8')
+print(json.dumps({a:r['QKV_static_counts'] for a,r in audit.items()},indent=2))

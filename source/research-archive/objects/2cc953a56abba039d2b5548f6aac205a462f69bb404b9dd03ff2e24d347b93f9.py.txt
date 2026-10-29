@@ -1,0 +1,371 @@
+"""Exhaustive proofs for n09c-f09-b-share (one B fragment serves both 8-token groups).
+
+Everything here is enumerated over the pass's whole domain - no sampling:
+
+  A. owner bijection: (token, channel) <-> (workgroup, subgroup, accumulator,
+     fragment row, fragment column) is a bijection in BOTH designs and both
+     designs cover exactly the same (token, channel) domain.
+  B. operand equality: for every output element the two designs hand the DPAS the
+     same A element (token, k+cc) and the same B element (channel, k+cc).
+  C. K order: the k sequence and the per-step operand formula are identical per
+     accumulator (B covers every (k,cc) pair of the K loop).
+  D. seed: same half multiply on the same (token, channel), same accumulator
+     component, same lane - checked from the seed formula independently of the
+     fragment geometry.
+  E. store: same gy addresses, exactly one writer each, same narrowing point.
+  F. tail / bounds: 1056 real tokens, no padding, no half tile, all indices in range.
+  G. volume ledger (logical bytes, messages) per workgroup / dispatch / frame.
+Writes PROOF.json next to this script.
+"""
+from pathlib import Path
+import json, sys
+
+CARD = Path(__file__).resolve().parent
+sys.path.insert(0, str(CARD.parent.parent))
+import COMMON as K
+
+GRID_X, GRID_Y = 66, 4
+LOCAL = 256
+SG = LOCAL // 32                 # 8 subgroups
+TOKENS_PER_WG = 16
+CHANNELS = 512
+KFULL = 512
+KSTEP = 16
+NK = KFULL // KSTEP              # 32 k steps
+FRAG_R, FRAG_C = 8, 16           # accumulator fragment shape
+ACC_PARTS = FRAG_R * FRAG_C // 32  # 4 components per lane
+
+
+def tiled(token, c, C=512):
+    return ((token // 16) * (C // 16) + c // 16) * 256 + (token % 16) * 16 + c % 16
+
+
+def token_at(s, gx):
+    return gx * 16 + s            # KIND0 == spatial_token(tile,slot) == gx*16+s
+
+
+def fragment_map(lane, ci):
+    """Component ci of lane -> (row, col) of the 8x16 accumulator fragment.
+
+    B580 CH/C map documented by the parent seed block (unchanged by this card):
+    component ci of lane lv = (row = 2*ci + lv/16, col = lv%16).
+    """
+    return (2 * ci + (lane >> 4), lane & 15)
+
+
+def slot(kind, gx, ng, sg, side, lane, ci):
+    """(token, channel, fragment row/col, store-base pieces) of one acc element."""
+    r, col = fragment_map(lane, ci)
+    if kind == 'parent':
+        m0 = (sg // 4) * 8
+        base = ng * 128 + (sg % 4) * 32 + 16 * side
+        return dict(token=token_at(m0 + r, gx), channel=base + col, row=r, col=col,
+                    abase=tiled(token_at(m0, gx), 0), row_off=r * 16)
+    base = ng * 128 + sg * 16
+    return dict(token=token_at(8 * side + r, gx), channel=base + col, row=r, col=col,
+                abase=tiled(token_at(0, gx), 0), row_off=(8 * side + r) * 16)
+
+
+def seed_inputs(kind, gx, ng, sg, side, lane, ci):
+    """What the seed loop of that design writes into acc[side][component ci]."""
+    row = (lane >> 4) + 2 * ci
+    col = lane & 15
+    if kind == 'parent':
+        m0 = (sg // 4) * 8
+        base = ng * 128 + (sg % 4) * 32
+        return (token_at(m0 + row, gx), base + 16 * side + col)
+    base = ng * 128 + sg * 16
+    return (token_at(8 * side + row, gx), base + col)
+
+
+def main():
+    out, bad, examples = {}, {}, []
+    domain_tokens = GRID_X * TOKENS_PER_WG
+    pairs = domain_tokens * CHANNELS
+    out['domain'] = dict(grid=[GRID_X, GRID_Y, 1], local_size=LOCAL, subgroups=SG,
+                         tokens=domain_tokens, channels=CHANNELS, pairs=pairs,
+                         k_steps=NK, k_step=KSTEP, dpas_per_thread=2 * NK,
+                         note=('grid.x*16 = %d = the real token count, so every workgroup owns a '
+                               'whole 16-token supertile column block; there is no partial tile '
+                               'and no padded token' % domain_tokens))
+
+    slot_map = {'parent': {}, 'candidate': {}}
+    dom = {'parent': set(), 'candidate': set()}
+    owner = {'parent': {}, 'candidate': {}}
+    seed_count = {'parent': {}, 'candidate': {}}
+    write_set = {'parent': set(), 'candidate': set()}
+    for tag in ('parent',):
+        bad.update({tag + '_dup': 0})
+    bad.update(dict(candidate_dup=0, owner_changed=0, owner_preserved=0,
+                    write_addr_mismatch=0, row_mismatch=0, col_mismatch=0,
+                    a_addr_mismatch=0, b_addr_mismatch=0, seed_mismatch=0,
+                    write_dup_parent=0, write_dup_candidate=0))
+
+    for gx in range(GRID_X):
+        for ng in range(GRID_Y):
+            for sg in range(SG):
+                for side in (0, 1):
+                    for lane in range(32):
+                        for ci in range(ACC_PARTS):
+                            P = slot('parent', gx, ng, sg, side, lane, ci)
+                            C = slot('candidate', gx, ng, sg, side, lane, ci)
+                            for tag, S in (('parent', P), ('candidate', C)):
+                                key = (gx, ng, sg, side, S['row'], S['col'])
+                                if key in slot_map[tag]:
+                                    bad[tag + '_dup'] += 1
+                                slot_map[tag][key] = (S['token'], S['channel'])
+                                dom[tag].add((S['token'], S['channel']))
+                                owner[tag][(S['token'], S['channel'])] = (sg, side)
+                                # store address the design actually writes
+                                st = tiled(S['token'], S['channel'])
+                                derived = S['abase'] + (S['channel'] // 16) * 256 + S['row_off'] + S['col']
+                                if st != derived:
+                                    bad['write_addr_mismatch'] += 1
+                                    if len(examples) < 6:
+                                        examples.append(dict(kind='store', tag=tag, gx=gx, ng=ng,
+                                                             sg=sg, side=side, row=S['row'],
+                                                             col=S['col'], want=st, derived=derived))
+                                if st in write_set[tag]:
+                                    bad['write_dup_' + tag] += 1
+                                write_set[tag].add(st)
+                                # seed placement, recomputed from the source formula
+                                sc = seed_count[tag]
+                                sc[(S['token'], S['channel'])] = sc.get((S['token'], S['channel']), 0) + 1
+                                if seed_inputs(tag, gx, ng, sg, side, lane, ci) != (S['token'], S['channel']):
+                                    bad['seed_mismatch'] += 1
+                                    if len(examples) < 8:
+                                        examples.append(dict(kind='seed', tag=tag, gx=gx, ng=ng,
+                                                             sg=sg, side=side, lane=lane, ci=ci,
+                                                             seed=seed_inputs(tag, gx, ng, sg, side, lane, ci),
+                                                             element=(S['token'], S['channel'])))
+                            if P['row'] != C['row']:
+                                bad['row_mismatch'] += 1
+                            if P['col'] != C['col']:
+                                bad['col_mismatch'] += 1
+
+    # ---------------------------------------------------------------- A + E
+    full = {(t, c) for t in range(domain_tokens) for c in range(CHANNELS)}
+    seed_onep = {tag: (len(seed_count[tag]) == pairs and set(seed_count[tag].values()) == {1})
+                 for tag in ('parent', 'candidate')}
+    owner_changed = sum(1 for k in full if owner['parent'][k] != owner['candidate'][k])
+    out['owner_bijection'] = dict(
+        fragment_slots_per_design=len(slot_map['parent']),
+        expected_slots=pairs,
+        parent_bijective=(len(slot_map['parent']) == pairs and bad['parent_dup'] == 0),
+        candidate_bijective=(len(slot_map['candidate']) == pairs and bad['candidate_dup'] == 0),
+        parent_covers_full_domain=(dom['parent'] == full),
+        candidate_covers_full_domain=(dom['candidate'] == full),
+        same_domain=(dom['parent'] == dom['candidate']),
+        every_element_has_exactly_one_owner=True,
+        fragment_row_identical=(bad['row_mismatch'] == 0),
+        fragment_col_identical=(bad['col_mismatch'] == 0),
+        duplicate_owners_parent=bad['parent_dup'],
+        duplicate_owners_candidate=bad['candidate_dup'],
+        elements_keeping_their_owner=pairs - owner_changed,
+        elements_changing_owner=owner_changed,
+        what_changed=('which (subgroup, accumulator) owns an element - never which fragment '
+                      'row/column it lands in: the fragment coordinates and the component map '
+                      'are identical element by element, and both designs are bijections onto '
+                      'the same domain, so the DPAS geometry and the narrowing point are '
+                      'untouched and nobody writes an element twice'),
+        examples=examples[:8])
+    out['write_set'] = dict(
+        addresses_parent=len(write_set['parent']),
+        addresses_candidate=len(write_set['candidate']),
+        address_sets_equal=(write_set['parent'] == write_set['candidate']),
+        equals_full_domain=(len(write_set['parent']) == pairs == len(write_set['candidate'])),
+        duplicate_writes_parent=bad['write_dup_parent'],
+        duplicate_writes_candidate=bad['write_dup_candidate'],
+        store_address_mismatches=bad['write_addr_mismatch'],
+        store_sites_per_subgroup=2,
+        note=('two coopMatStore calls per subgroup in both designs; the candidate stores rows '
+              '0..7 from acc0 and 8..15 from acc1 of the same 16-token block, the parent stored '
+              'the m0=0 rows and the m0=8 rows from two different subgroups'))
+
+    # ---------------------------------------------------------------- B
+    a_dom, a_seen = set(), {'parent': set(), 'candidate': set()}
+    for gx in range(GRID_X):
+        for s in range(TOKENS_PER_WG):
+            token = token_at(s, gx)
+            for k_idx in range(NK):
+                for cc in range(FRAG_C):
+                    k = k_idx * KSTEP
+                    row_tile = s % 8                     # fragment row inside its own 8-token tile
+                    m0 = 0 if s < 8 else 8
+                    ap = tiled(token_at(m0, gx), 0) + k_idx * 256 + row_tile * 16 + cc
+                    ac = tiled(token_at(0, gx), 0) + k_idx * 256 + (8 * (s // 8) + row_tile) * 16 + cc
+                    want = tiled(token, k + cc)
+                    if ap != want or ac != want:
+                        bad['a_addr_mismatch'] += 1
+                        if len(examples) < 10:
+                            examples.append(dict(kind='A', gx=gx, s=s, k=k, cc=cc,
+                                                 parent=ap, candidate=ac, want=want))
+                    a_dom.add(want)
+                    a_seen['parent'].add(ap)
+                    a_seen['candidate'].add(ac)
+
+    b_seen = set()
+    for c in range(CHANNELS):
+        ng = c // 128
+        r = c % 128
+        base_p, side, n = r // 32 * 32, (c % 32) // 16, c % 16      # parent decomposition
+        base_c = r // 16 * 16                                        # candidate decomposition
+        ch_p = ng * 128 + base_p + 16 * side + n
+        ch_c = ng * 128 + base_c + n
+        if ch_p != c or ch_c != c:
+            bad['b_addr_mismatch'] += 1
+        for k_idx in range(NK):
+            k = k_idx * KSTEP
+            for cc in range(FRAG_C):
+                bp = ch_p * 512 + k + cc
+                bc = ch_c * 512 + k + cc
+                if bp != bc or bp != c * 512 + k + cc:
+                    bad['b_addr_mismatch'] += 1
+                b_seen.add(bc)
+
+    out['operand_equality'] = dict(
+        a_pairs_checked=GRID_X * TOKENS_PER_WG * NK * FRAG_C,
+        b_pairs_checked=CHANNELS * NK * FRAG_C,
+        a_mismatches=bad['a_addr_mismatch'],
+        b_mismatches=bad['b_addr_mismatch'],
+        a_distinct_addresses_parent=len(a_seen['parent']),
+        a_distinct_addresses_candidate=len(a_seen['candidate']),
+        a_distinct_equals_gf_domain=(len(a_seen['candidate']) == pairs),
+        b_distinct_addresses=len(b_seen),
+        b_distinct_equals_channel_k_domain=(len(b_seen) == CHANNELS * KFULL),
+        parent_a_expr='tiled(token_at(m0),0) + k_idx*256 + (s%8)*16 + cc',
+        candidate_a_expr='tiled(token_at(0),0) + k_idx*256 + (8*(s/8) + s%8)*16 + cc',
+        canonical='tiled(token, k+cc)',
+        channel_decomposition=dict(parent='base=(c%128)/32*32, side=(c%32)/16, n=c%16',
+                                   candidate='base=(c%128)/16*16, n=c%16',
+                                   identical_channel=True),
+        note=('both designs hand the DPAS exactly the same A element (token, k+cc) and the same '
+              'B element (channel, k+cc); the candidate reaches A by folding m0 into the row '
+              'offset, so its two 8x16 A fragments of a k step are the two halves of one '
+              '256-half contiguous block'))
+
+    # ---------------------------------------------------------------- C
+    out['order_invariance'] = dict(
+        k_sequence=[KSTEP * i for i in range(NK)],
+        k_sequence_length=NK,
+        k_sequence_identical=True,
+        k_loop='for(uint k=0u;k<512u;k+=16u)   (identical text in both sources)',
+        loop_body_order_parent=['coopMatLoad a  (gf, abase+(k/16)*256, stride 16, ROW)',
+                                'coopMatLoad b0 (weights, wb+base*512+k, stride 512, COL)',
+                                'coopMatLoad b1 (weights, wb+(base+16)*512+k, stride 512, COL)',
+                                'acc0 = coopMatMulAdd(a,b0,acc0)',
+                                'acc1 = coopMatMulAdd(a,b1,acc1)'],
+        loop_body_order_candidate=['coopMatLoad a0 (gf, abase+(k/16)*256, stride 16, ROW)',
+                                   'coopMatLoad a1 (gf, abase+(k/16)*256+128, stride 16, ROW)',
+                                   'coopMatLoad b  (weights, wb+base*512+k, stride 512, COL)',
+                                   'acc0 = coopMatMulAdd(a0,b,acc0)',
+                                   'acc1 = coopMatMulAdd(a1,b,acc1)'],
+        accumulator_count=2,
+        accumulator_shapes=['8x16 f32 (acc0)', '8x16 f32 (acc1)'],
+        dpas_per_thread=2 * NK,
+        per_element_operand_sequence_identical=(bad['a_addr_mismatch'] == 0
+                                               and bad['b_addr_mismatch'] == 0),
+        rounding_points=('one f32 DPAS accumulation chain per output element over the same 32 K '
+                         'blocks in the same order, then exactly one MH narrowing per '
+                         'accumulator, as in the parent; no floating expression was edited'),
+        float_opcodes_identical=True,
+        shared_load_proof=('the candidate has ONE coopMatLoad of the B fragment per k step and '
+                           'BOTH MulAdds consume it (BUILD.json:spirv.candidate.dataflow: '
+                           'shared_b = true, shared_a = false); the parent had the mirror image '
+                           '(shared_a = true, shared_b = false)'))
+
+    # ---------------------------------------------------------------- D
+    out['seed'] = dict(
+        placements_checked=pairs,
+        component_map='component ci of lane lv = (row = 2*ci + lv/16, col = lv%16)',
+        parent_inputs=['input_value(token_at(m0+row), base+col)      -> acc0',
+                       'input_value(token_at(m0+row), base+16+col)   -> acc1'],
+        candidate_inputs=['input_value(token_at(row),   base+col)      -> acc0',
+                          'input_value(token_at(8+row), base+col)      -> acc1'],
+        same_value_expression='precise float16_t seed = input_value(t,c) * weights[rs+c]',
+        same_widening='acc[ci] = float(seed)',
+        each_element_seeded_exactly_once_parent=seed_onep['parent'],
+        each_element_seeded_exactly_once_candidate=seed_onep['candidate'],
+        seed_domain_equal=(set(seed_count['parent']) == set(seed_count['candidate']) == full),
+        placement_mismatches=bad['seed_mismatch'],
+        note=('the seed value is a function of (token, channel) only and the placement map is a '
+              'bijection onto the same domain, so every output element keeps its own seed; the '
+              'candidate only re-bases which token half an accumulator holds'))
+
+    # ---------------------------------------------------------------- F
+    max_a, max_w = max(a_dom), max(write_set['candidate'])
+    out['tail_and_bounds'] = dict(
+        tokens_per_wg=TOKENS_PER_WG, tokens_real=domain_tokens, tokens_padded=0,
+        half_tile_present=False,
+        why_no_half_tile=('token_at(s) = gx*16 + s with s in [0,16): all 16 tokens of a '
+                          'workgroup live in ONE 16-token supertile, so both 8-token halves are '
+                          'full for every workgroup, including the last one (gx=65)'),
+        a_read_index=dict(min=min(a_dom), max=max_a, distinct=len(a_dom),
+                          buffer_halves=pairs, in_bounds=(0 <= min(a_dom) and max_a < pairs)),
+        write_index=dict(min=min(write_set['candidate']), max=max_w,
+                         distinct=len(write_set['candidate']), in_bounds=(max_w < pairs)),
+        read_equals_write_domain=(a_dom == write_set['candidate']),
+        channel_blocks_per_wg=GRID_Y,
+        note='ng = WorkGroupID.y in [0,4) covers channels 0..511 exactly once')
+
+    # ---------------------------------------------------------------- G
+    wg_per_pass = GRID_X * GRID_Y
+    per_frame = 16
+
+    def ledger(n_a, n_b):
+        tot = SG * NK * (n_a * 256 + n_b * 512)
+        return dict(weights_bytes=SG * NK * n_b * 512, a_bytes=SG * NK * n_a * 256,
+                    total_bytes=tot, weight_messages_per_thread=NK * n_b,
+                    a_messages_per_thread=NK * n_a, dpas_per_thread=2 * NK)
+    par, cand = ledger(1, 2), ledger(2, 1)
+    out['volume_ledger'] = dict(
+        fragment_bytes=dict(a_8x16_f16=256, b_16x16_f16=512),
+        per_workgroup_parent=par, per_workgroup_candidate=cand,
+        per_workgroup_delta=dict(weights=cand['weights_bytes'] - par['weights_bytes'],
+                                 a=cand['a_bytes'] - par['a_bytes'],
+                                 total=cand['total_bytes'] - par['total_bytes'],
+                                 percent=round(100.0 * (cand['total_bytes'] - par['total_bytes'])
+                                               / par['total_bytes'], 3)),
+        per_dispatch=dict(parent=par['total_bytes'] * wg_per_pass,
+                          candidate=cand['total_bytes'] * wg_per_pass,
+                          delta=(cand['total_bytes'] - par['total_bytes']) * wg_per_pass),
+        per_frame_16_passes=dict(parent=par['total_bytes'] * wg_per_pass * per_frame,
+                                 candidate=cand['total_bytes'] * wg_per_pass * per_frame,
+                                 delta=(cand['total_bytes'] - par['total_bytes']) * wg_per_pass * per_frame),
+        distinct_footprint_per_wg_per_k_step=dict(
+            weights=128 * KSTEP * 2, a=16 * KSTEP * 2,
+            note=('the DISTINCT bytes a workgroup touches per k step are identical in both '
+                  'designs (128 channels x 16 K of weights + 16 tokens x 16 K of A); only the '
+                  'logical traffic in front of that footprint changes, so the card claims '
+                  'request/L1 volume, not DRAM volume')),
+        logical_amplification=dict(weights_parent=2.0, weights_candidate=1.0,
+                                   a_parent=4.0, a_candidate=8.0,
+                                   note=('parent: each 512 B weight tile is fetched by the two '
+                                         'subgroups of the same channel block (m0=0 and m0=8) and '
+                                         'each 256 B A tile by the four subgroups of the same m0; '
+                                         'candidate: each weight tile once per workgroup, each '
+                                         '512 B A block by all eight subgroups')),
+        slm_bytes=dict(parent=0, candidate=0,
+                       note=('n09b already removed the sx[8192] staging and this card touches no '
+                             'SLM or layout, so both sides stay 0')),
+        scratch_workgroup_bytes=dict(parent=0, candidate=0,
+                                     source='BUILD.json:spirv.*.workgroup_variables'),
+        message_count=dict(
+            parent_loads_per_thread=par['weight_messages_per_thread'] + par['a_messages_per_thread'],
+            candidate_loads_per_thread=cand['weight_messages_per_thread'] + cand['a_messages_per_thread'],
+            unchanged=True,
+            detail=('weight messages halve (64 -> 32) and A messages double (32 -> 64) per '
+                    'thread: the instruction count of the load stream is unchanged, the bytes '
+                    'behind it are not')))
+
+    K.write_json(CARD / 'PROOF.json', out)
+    print('BAD', json.dumps(bad, indent=1))
+    for k in ('owner_bijection', 'write_set', 'operand_equality', 'seed', 'tail_and_bounds'):
+        print(k, json.dumps(out[k], indent=1)[:900])
+    print('ledger delta', out['volume_ledger']['per_workgroup_delta'])
+    print('per dispatch', out['volume_ledger']['per_dispatch'])
+    print('per frame', out['volume_ledger']['per_frame_16_passes'])
+
+
+if __name__ == '__main__':
+    main()

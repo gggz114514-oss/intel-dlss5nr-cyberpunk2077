@@ -1,0 +1,386 @@
+"""n08b-f08-order proof: mapping bijections, write sets, tail blocks, per-WG
+footprint, launch-order model, SPIR-V identity, rounding/K order, lifetime.
+
+Writes PROOF.json inside the card directory only.  No GPU.
+"""
+import sys, json
+from pathlib import Path
+
+CAMPAIGN = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(CAMPAIGN))
+import COMMON as K
+
+CARD = CAMPAIGN / 'cards' / 'n08b-f08-order'
+D = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-mechanism-transfer-20261026')
+PARENT_SPV = D / 'f08-register-chain-20261027' / 'candidate.spv'
+N08_SPV = CAMPAIGN / 'cards' / 'n08-f08-wg-map' / 'candidate.spv'
+CAND_SPV = CARD / 'candidate.spv'
+
+T, G, SG = 1056, 8, 8          # tokens, weight groups, subgroups per workgroup
+NT = T // 8                    # token-8 tiles
+# per-WG content: parent 2 tiles x 4 groups; n08 / n08b 4 tiles x 2 groups
+MAPPINGS = {
+    'parent': {'grid': (66, 2, 1),
+               'fn': lambda x, y, sg: (x * 16 + (sg % 2) * 8, y * 4 + sg // 2),
+               'rule': 'token = WGID.x*16 + (sg%2)*8 ; g = WGID.y*4 + sg/2'},
+    'n08': {'grid': (33, 4, 1),
+            'fn': lambda x, y, sg: (x * 32 + (sg % 4) * 8, y * 2 + sg // 4),
+            'rule': 'token = WGID.x*32 + (sg%4)*8 ; g = WGID.y*2 + sg/4'},
+    'n08b': {'grid': (4, 33, 1),
+             'fn': lambda x, y, sg: (y * 32 + (sg % 4) * 8, x * 2 + sg // 4),
+             'rule': 'token = WGID.y*32 + (sg%4)*8 ; g = WGID.x*2 + sg/4'},
+    'control_2x66': {'grid': (2, 66, 1),
+                     'fn': lambda x, y, sg: (y * 16 + (sg % 2) * 8, x * 4 + sg // 2),
+                     'rule': 'token = WGID.y*16 + (sg%2)*8 ; g = WGID.x*4 + sg/2'},
+}
+
+
+def tiled(token, c, C):
+    return ((token // 16) * (C // 16) + c // 16) * 256 + (token % 16) * 16 + c % 16
+
+
+def enumerate_map(fn, grid):
+    gx, gy, gz = grid
+    return {(x, y, sg): fn(x, y, sg) for y in range(gy) for x in range(gx) for sg in range(SG)}
+
+
+def bijection(mapping, grid, label):
+    pairs = list(mapping.values())
+    uniq = set(pairs)
+    expect = {(t, g) for t in range(0, T, 8) for g in range(G)}
+    return {'label': label, 'grid': list(grid),
+            'workgroups': grid[0] * grid[1] * grid[2],
+            'sg_slots': len(pairs),
+            'distinct_token8_group_pairs': len(uniq),
+            'expected_pairs': len(expect),
+            'duplicate_assignments': len(pairs) - len(uniq),
+            'missing_pairs': sorted(map(list, expect - uniq)),
+            'extra_pairs': sorted(map(list, uniq - expect)),
+            'min_token': min(t for t, g in pairs), 'max_token': max(t for t, g in pairs),
+            'groups_seen': sorted({g for t, g in pairs}),
+            'bijection_ok': expect == uniq}
+
+
+def write_sets(mapping):
+    offs, dup, total = set(), 0, 0
+    for (x, y, sg), (token, g) in mapping.items():
+        for t in range(4):
+            base = tiled(token, g * 64 + t * 16, 512)
+            for r in range(8):
+                for c in range(16):
+                    off = base + r * 16 + c
+                    total += 1
+                    if off in offs:
+                        dup += 1
+                    offs.add(off)
+    return offs, dup, total
+
+
+def wg_membership(mapping, grid):
+    gx, gy, _ = grid
+    out = {}
+    for y in range(gy):
+        for x in range(gx):
+            toks = sorted({mapping[(x, y, sg)][0] for sg in range(SG)})
+            out[(x, y)] = {'tiles': [t // 8 for t in toks],
+                           'token_lo': toks[0], 'token_hi': toks[-1] + 7,
+                           'groups': sorted({mapping[(x, y, sg)][1] for sg in range(SG)})}
+    return out
+
+
+def launch_order(mapping, grid, wg):
+    """Linear workgroup id order x + gx*(y + gy*z): what a wavefront sees."""
+    gx, gy, gz = grid
+    seq = []
+    for y in range(gy):
+        for x in range(gx):
+            seq.append((x, y, wg[(x, y)]['groups'], tuple(wg[(x, y)]['tiles'])))
+    return seq
+
+
+def window_stats(seq, sizes):
+    out = {}
+    for w in sizes:
+        if w > len(seq):
+            continue
+        gsets, tsets = [], []
+        for i in range(len(seq) - w + 1):
+            gs, ts = set(), set()
+            for k in range(w):
+                gs.update(seq[i + k][2])
+                ts.update(seq[i + k][3])
+            gsets.append(len(gs))
+            tsets.append(len(ts))
+        out[str(w)] = {'mean_distinct_group_slabs': sum(gsets) / len(gsets),
+                       'max_distinct_group_slabs': max(gsets),
+                       'mean_distinct_token8_tiles': sum(tsets) / len(tsets),
+                       'max_distinct_token8_tiles': max(tsets),
+                       'windows': len(gsets)}
+    return out
+
+
+def runs(seq, key):
+    """Length of consecutive runs sharing the same value of seq[i][key]."""
+    vals = [s[key] for s in seq]
+    lens, cur = [], 1
+    for i in range(1, len(vals)):
+        if vals[i] == vals[i - 1]:
+            cur += 1
+        else:
+            lens.append(cur)
+            cur = 1
+    lens.append(cur)
+    counts = {}
+    for l in lens:
+        counts[l] = counts.get(l, 0) + 1
+    return {'max': max(lens), 'mean': sum(lens) / len(lens),
+            'run_length_counts': {str(k): v for k, v in sorted(counts.items())}}
+
+
+def row_stats(seq, gx):
+    """Per dispatch row (fixed y): distinct group slabs and token tiles in that row."""
+    out = []
+    for i in range(0, len(seq), gx):
+        row = seq[i:i + gx]
+        gs, ts = set(), set()
+        for r in row:
+            gs.update(r[2])
+            ts.update(r[3])
+        out.append({'y': row[0][1], 'workgroups': len(row),
+                    'distinct_group_slabs': len(gs), 'distinct_token8_tiles': len(ts)})
+    return {'rows': len(out), 'groups_per_row': out[0]['distinct_group_slabs'],
+            'tiles_per_row': out[0]['distinct_token8_tiles'],
+            'uniform': all(o['distinct_group_slabs'] == out[0]['distinct_group_slabs'] and
+                           o['distinct_token8_tiles'] == out[0]['distinct_token8_tiles'] for o in out),
+            'first_two_rows': out[:2], 'last_row': out[-1]}
+
+
+def main():
+    maps = {k: enumerate_map(v['fn'], v['grid']) for k, v in MAPPINGS.items()}
+    bij = {k: bijection(maps[k], MAPPINGS[k]['grid'], k) for k in MAPPINGS}
+    ws = {k: write_sets(maps[k]) for k in MAPPINGS}
+    expect_off = {tiled(t, c, 512) for t in range(T) for c in range(512)}
+    wgm = {k: wg_membership(maps[k], MAPPINGS[k]['grid']) for k in MAPPINGS}
+
+    # same per-WG content between n08 and n08b: the multiset of membership sets
+    # must be identical (only which WG hosts which set changes)
+    def membership_multiset(wg):
+        return sorted((tuple(v['tiles']), tuple(v['groups'])) for v in wg.values())
+
+    same_content_n08_n08b = membership_multiset(wgm['n08']) == membership_multiset(wgm['n08b'])
+    axis_bijection = {}
+    for (x, y), v in wgm['n08'].items():
+        # n08 WG (tb, gp) <-> n08b WG (gp, tb): identical tokens and groups
+        axis_bijection['(%d,%d)' % (x, y)] = '(%d,%d)' % (y, x)
+    content_check = all(
+        wgm['n08b'][(y, x)]['tiles'] == wgm['n08'][(x, y)]['tiles'] and
+        wgm['n08b'][(y, x)]['groups'] == wgm['n08'][(x, y)]['groups']
+        for (x, y) in wgm['n08'])
+
+    orders = {k: launch_order(maps[k], MAPPINGS[k]['grid'], wgm[k]) for k in MAPPINGS}
+    wstats = {k: window_stats(orders[k], [2, 4, 8, 16, 32, 33, 66, 132]) for k in MAPPINGS}
+
+    push = (0, 262144, 393216)     # pc.p2 = (A, Q0, Q2) half-element bases, from plan PUSH
+    per_group_bytes = 131072       # 64 KiB stage1 + 32 KiB expand + 32 KiB contract
+
+    def footprint(wg, groups_per_wg, tiles_per_wg):
+        return {'tile8_per_wg': tiles_per_wg, 'tokens_per_wg': tiles_per_wg * 8,
+                'groups_per_wg': groups_per_wg,
+                'sg_per_group_per_wg': SG // groups_per_wg,
+                'input_bytes_per_wg': tiles_per_wg * 8 * 512 * 2,
+                'weight_bytes_per_wg': groups_per_wg * per_group_bytes,
+                'sum_bytes_per_wg': tiles_per_wg * 8 * 512 * 2 + groups_per_wg * per_group_bytes}
+
+    footprint_by_map = {'parent': footprint(None, 4, 2),
+                        'n08': footprint(None, 2, 4),
+                        'n08b': footprint(None, 2, 4),
+                        'control_2x66': footprint(None, 4, 2)}
+
+    def per_group_counts(mapping):
+        c = {g: 0 for g in range(G)}
+        for (token, g) in mapping.values():
+            c[g] += 1
+        return c
+
+    def wgs_per_group(wg):
+        c = {g: 0 for g in range(G)}
+        for v in wg.values():
+            for g in v['groups']:
+                c[g] += 1
+        return c
+
+    proof = {
+        'card': 'n08b-f08-order',
+        'purpose': 'discrimination only: identical per-workgroup content and arithmetic as n08 (4 token8 tiles x 2 groups), only the dispatch axes swapped (grid (4,33,1) instead of (33,4,1))',
+        'identity': {
+            'parent_spv': K.ident(PARENT_SPV),
+            'n08_spv': K.ident(N08_SPV),
+            'candidate_spv': K.ident(CAND_SPV),
+            'candidate_source': K.ident(CARD / 'candidate.comp'),
+            'plan': K.ident(CARD / 'plan.txt'),
+            'chain_head_plan': K.ident(K.current_best()[0]),
+        },
+        'grid_and_shape': {
+            'tokens_total': T, 'token8_tiles': NT, 'groups_total': G, 'subgroups_per_wg': SG,
+            'parent_grid': list(MAPPINGS['parent']['grid']),
+            'n08_grid': list(MAPPINGS['n08']['grid']),
+            'candidate_grid': list(MAPPINGS['n08b']['grid']),
+            'control_grid': list(MAPPINGS['control_2x66']['grid']),
+            'workgroups': {k: MAPPINGS[k]['grid'][0] * MAPPINGS[k]['grid'][1] for k in MAPPINGS},
+            'workgroups_delta_vs_parent': {k: MAPPINGS[k]['grid'][0] * MAPPINGS[k]['grid'][1] - 132
+                                           for k in MAPPINGS},
+            'sg_slots_per_pass': 1056,
+            'tail': {'tokens_divisible_by_16': T % 16 == 0, 'tokens_divisible_by_32': T % 32 == 0,
+                     'groups_divisible_by_4': G % 4 == 0, 'groups_divisible_by_2': G % 2 == 0,
+                     'candidate_requires_guard': T % 32 != 0 or G % 2 != 0,
+                     'control_requires_guard': T % 16 != 0 or G % 4 != 0,
+                     'last_candidate_wg': {'wg': [3, 32], 'tokens': [1024, 1055], 'groups': [6, 7]},
+                     'note': '1056 = 33*32 = 66*16 exactly, 8 = 4*2 exactly: no partial workgroup, no idle subgroup, no guard'},
+        },
+        'mapping_rule': {k: MAPPINGS[k]['rule'] for k in MAPPINGS},
+        'bijection': bij,
+        'output_coverage': {
+            k: {'distinct_output_halfs': len(ws[k][0]), 'duplicate_writes': ws[k][1],
+                'total_writes': ws[k][2], 'equals_full_tiled_set': ws[k][0] == expect_off,
+                'full_set_size': len(expect_off)} for k in MAPPINGS},
+        'write_sets_all_equal': all(ws[k][0] == expect_off for k in MAPPINGS),
+        'same_workgroup_content_as_n08': {
+            'membership_multiset_equal': same_content_n08_n08b,
+            'wg_correspondence': 'n08 WG (token_block u, group_pair v) <-> n08b WG (x=v, y=u)',
+            'correspondence_is_bijection_on_all_132_wgs': content_check,
+            'sample': {k: axis_bijection[k] for k in ['(0,0)', '(1,0)', '(32,3)', '(0,3)']},
+            'meaning': 'each workgroup of the candidate computes exactly the tokens and groups that one workgroup of n08 computes; only the (WGID.x, WGID.y) label of that workgroup changes',
+        },
+        'per_workgroup_footprint': footprint_by_map,
+        'per_group_request_counts': {
+            'sg_per_group': {k: per_group_counts(maps[k]) for k in MAPPINGS},
+            'sg_per_group_equal_across_all_four': len(
+                {json.dumps(per_group_counts(maps[k]), sort_keys=True) for k in MAPPINGS}) == 1,
+            'wg_per_group': {k: wgs_per_group(wgm[k]) for k in MAPPINGS},
+            'wg_per_group_equal_n08_vs_n08b': wgs_per_group(wgm['n08']) == wgs_per_group(wgm['n08b']),
+            'wg_per_group_note': 'a 2-group workgroup is replayed by 33 workgroups per slab, a 4-group workgroup by 66; this follows from the content, not from the axis order',
+            'totals_unchanged': {'weight_request_bytes_per_pass': 132 * 8 * per_group_bytes,
+                                 'input_request_bytes_per_pass': 132 * 8 * 8192,
+                                 'distinct_weight_bytes_per_pass': 8 * per_group_bytes},
+        },
+        'weight_slab_plan': {
+            'push_constants_p2': {'A_base_halves': push[0], 'Q0_base_halves': push[1],
+                                  'Q2_base_halves': push[2]},
+            'halves_per_group': {'stage1': 32768, 'expand': 16384, 'contract': 16384},
+            'bytes_per_group': per_group_bytes, 'bytes_all_groups': 8 * per_group_bytes,
+        },
+        'launch_order_model': {
+            'linear_wg_id': 'x + grid_x * (y + grid_y * z)',
+            'caveat': 'the driver is free to schedule workgroups in any order; this model is the dispatch-order upper bound, not a measurement of what the B580 does',
+            'per_row': {k: row_stats(orders[k], MAPPINGS[k]['grid'][0]) for k in MAPPINGS},
+            'window_stats': wstats,
+            'group_pair_run': {k: runs(orders[k], 2) for k in MAPPINGS},
+            'token_block_run': {k: runs(orders[k], 3) for k in MAPPINGS},
+            'reading': {
+                'n08': 'consecutive workgroups share one weight group pair (2 slabs = 256 KiB) for 33 workgroups and stream 32 fresh tokens each: weight-slab reuse across the dispatch order',
+                'n08b': 'consecutive workgroups share one token block (32 tokens = 32 KiB) for 4 workgroups and stream all 8 slabs (1 MiB) every 4 workgroups: input reuse across the dispatch order',
+                'consequence': 'the two arms have IDENTICAL per-workgroup content (4 tiles x 2 groups) and identical per-pass request totals; they differ only in which of the two shared-trace axes the linear dispatch order walks',
+            },
+        },
+        'workgroup_membership': {
+            k: [{'wg': [x, y], 'tiles': wgm[k][(x, y)]['tiles'],
+                 'tokens': [wgm[k][(x, y)]['token_lo'], wgm[k][(x, y)]['token_hi']],
+                 'groups': wgm[k][(x, y)]['groups']}
+                for y in range(MAPPINGS[k]['grid'][1]) for x in range(MAPPINGS[k]['grid'][0])]
+            for k in ('n08', 'n08b')},
+        'spirv_identity': {
+            'parent': K.ident(PARENT_SPV), 'n08': K.ident(N08_SPV), 'candidate': K.ident(CAND_SPV),
+            'instructions': {'parent': 1375, 'n08': 1375, 'candidate': 1375},
+            'words': {'parent': 5656, 'n08': 5656, 'candidate': 5656},
+            'candidate_vs_parent_differences': 6,
+            'candidate_vs_parent_difference_list': [
+                'OpLoad <builtin WorkGroupID> component 0 -> 1 (the x*32 term now reads WGID.y)',
+                'OpIMul immediate 16 -> 32 (token block stride)',
+                'OpUMod immediate 2 -> 4 (sg % 4)',
+                'OpLoad <builtin WorkGroupID> component 1 -> 0 (the *2 term now reads WGID.x)',
+                'OpIMul immediate 4 -> 2 (group pair stride)',
+                'OpUDiv immediate 2 -> 4 (sg / 4)'],
+            'candidate_vs_n08_differences': 4,
+            'candidate_vs_n08_difference_list': [
+                'two OpConstant declaration slots exchange the values 1 and 4 (declaration order only; constant multiset identical)',
+                'the two WorkGroupID component reads are exchanged (0 <-> 1)'],
+            'note': 'everything else is result-id renumbering; opcode stream is identical at every ordinal (1375/1375), opcode histogram delta empty',
+            'details': 'BUILD.json numerics.vs_parent / numerics.vs_n08_candidate',
+        },
+        'arithmetic_and_rounding': {
+            'k_order': {'stage1': 'k = 0,16,...,496 ascending per acc, 4 accs',
+                        'expand': 'hidden block 0..7 of 32, four K slices a0..a3 in order',
+                        'contract': 'hidden block 0..7, va then vb, 2 steps per block, K = 256 total'},
+            'rounding': {'stage1_acc': 'f32 accumulate -> MH() half narrowing per acc',
+                         'expand_acc': 'f32 accumulate -> MH() narrowing -> activation() in f16 precise',
+                         'contract_acc': 'f32 accumulate over 256 K -> MH() narrowing -> coopMatStore half'},
+            'reductions': 'none across subgroups or workgroups; no atomics; no shared-memory exchange on the normal path',
+            'activation': 'unchanged source lines (clamp(-4,4), two precise fma, x*v)',
+            'exponent_or_reciprocal': 'none in this shader',
+            'invariant': 'the candidate compiles to the same opcode at every ordinal as the parent (1375 instructions), so K order, every half narrowing point and every FP expression are the parent sequence',
+            'float_NC': 'parent/candidate NoContraction sets are both empty; 3 float sites (1 OpFMul, 2 GLSL.std.450 Fma(50)) have identical operand signatures',
+        },
+        'lifetime_and_retirement': {
+            'rule': 'per-subgroup register lifetimes are the parent instruction sequence (identical opcode stream); no value crosses a subgroup or workgroup boundary, so the workgroup remap cannot extend a lifetime',
+            'values': [
+                {'value': 'a (A fragment)', 'producer': 'coopMatLoad (k loop)', 'last_consumer': '4 coopMatMulAdd of that k step', 'killer': 'next k coopMatLoad', 'conflict': 'WAR inside one SG'},
+                {'value': 'b0,b1 (stage1 B)', 'producer': 'coopMatLoad', 'last_consumer': '2 MMA of the segment', 'killer': 'next segment load', 'conflict': 'WAR inside one SG'},
+                {'value': 'r0..r3 (stage1 acc)', 'producer': '32 k steps', 'last_consumer': 'MH() narrowing', 'killer': 'none', 'conflict': 'RAW chain, K order fixed'},
+                {'value': 'h0..h3 / a0..a3', 'producer': 'MH()', 'last_consumer': 'EXPAND_STEP 0..3 of every hidden block', 'killer': 'none', 'conflict': 'longest live value'},
+                {'value': 'e0,e1 (expand acc)', 'producer': '4 EXPAND_STEP', 'last_consumer': 'MH() + activation()', 'killer': 'next hidden block', 'conflict': 'RAW then WAR'},
+                {'value': 'v0,v1 / va,vb', 'producer': 'activation()', 'last_consumer': 'CONTRACT_STEP of that block', 'killer': 'next hidden block', 'conflict': 'RAW'},
+                {'value': 'o0..o3 (contract acc)', 'producer': '8 hidden blocks x 2 steps', 'last_consumer': 'MH() + coopMatStore', 'killer': 'none', 'conflict': 'RAW chain over 256 K'}],
+            'retirement': {
+                'output_writes': 'each gf element written exactly once per pass (540672 writes = 540672 distinct elements)',
+                'pass_level_raw': 'next dispatch reads gf after the runner barrier; no barrier, binding or PUSH byte changes between parent and candidate',
+                'aliasing': 'BIND 0..9 and PUSH are byte-identical to the parent plan lines (only the SPV path and the trailing grid triple change)',
+                'debug_writes': 'PUSH p5 = (0, 0, 589824, 2949120) so pc.p5.x = 0 and debug_half() is dead in every one of the 16 passes'},
+        },
+        'shape_confirmation_from_push_constants': {
+            'pc_layout': 'p0 width/height/padded/flags, p1 grid_x/grid_y/shift_x/shift_y, p2 A/Q0/Q2/ffwd, p5 debug flag + R/E/A float bases (split16_ffwd_exec_opt_common.glsl)',
+            'push_p0': {'width': 44, 'height': 24, 'padded_tokens': 1152},
+            'note': 'this shader reads only pc.p2 and pc.p5; 1056 = 44*24 = 33*32 = 66*16, so the dispatch covers the spatial token domain exactly in both grids',
+            'push_p1_not_used_by_shader': {'grid_x': 6, 'grid_y': 3},
+        },
+        'pass_coverage': [{'ordinal': o, 'plan_row': K.row_by_ordinal(o)['pass_label'],
+                           'name': K.row_by_ordinal(o)['name'],
+                           'spv_parent': K.row_by_ordinal(o)['spv'],
+                           'grid_parent': K.row_by_ordinal(o)['grid'],
+                           'grid_candidate': list(MAPPINGS['n08b']['grid']),
+                           'grid_n08': list(MAPPINGS['n08']['grid'])}
+                          for o in [60, 64, 68, 72, 76, 80, 84, 88, 134, 138, 142, 146, 150, 154, 158, 162]],
+        'comparison_to_n08': {
+            'identical': ['SPV instruction count and word count (1375 / 5656)',
+                          'opcode at every ordinal (histogram delta empty)',
+                          'subgroup tile shape M8 x N64 x K512 and all four stages',
+                          'K accumulation order and half narrowing points',
+                          'activation() source lines and expressions',
+                          'workgroup memory 2048 B (debugTile only)',
+                          'bindings 0..9 and PUSH bytes',
+                          'workgroups per pass (132) and subgroups per pass (1056)',
+                          'per-pass weight request 132 MiB and distinct weight 1 MiB',
+                          'per-workgroup distinct weight 256 KiB and distinct input 32 KiB',
+                          'M/N/K per DPAS, DPAS count, B tile loads per SG, A tile loads per SG'],
+            'different': ['grid (33,4,1) -> (4,33,1)',
+                          'which WGID component feeds the token stride and which feeds the group stride',
+                          'linear dispatch order: weight-slab-major vs token-block-major',
+                          'concurrent weight working set implied by the order (256 KiB vs 1 MiB)'],
+            'same_content_claim': 'proved by same_workgroup_content_as_n08 above: the two grids partition the same 132 (token block, group pair) sets, only the axis labels differ',
+        },
+    }
+    K.write_json(CARD / 'PROOF.json', proof)
+    print(json.dumps({
+        'bijection_ok': {k: bij[k]['bijection_ok'] for k in MAPPINGS},
+        'write_sets_all_equal': proof['write_sets_all_equal'],
+        'same_content': same_content_n08_n08b, 'axis_bijection_ok': content_check,
+        'sg_per_group_equal': proof['per_group_request_counts']['sg_per_group_equal_across_all_four'],
+        'wg_per_group': proof['per_group_request_counts']['wg_per_group'],
+        'footprint': footprint_by_map,
+        'per_row': proof['launch_order_model']['per_row'],
+        'group_pair_run': proof['launch_order_model']['group_pair_run'],
+        'token_block_run': proof['launch_order_model']['token_block_run'],
+    }, indent=1)[:6000])
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,92 @@
+"""Audit the whole network for EXPOSED expensive-operation latency.
+
+Method (pure ISA, CPU only):
+  * find every expensive-latency op in a kernel's ISA: math.rsqt (sqrt), math.inv
+    (reciprocal, i.e. division), math.div, and f32<->f16 converts are NOT included
+    because they are cheap;
+  * take its destination register, then scan forward for the first instruction that
+    READS that register: that distance is how much independent work sits between the
+    producer and its consumer;
+  * distance 0-2 means the latency is fully exposed (in-order issue cannot hide it),
+    distance >10 means it is likely already hidden.
+
+The point: a site is actionable if the op is expensive AND the distance is tiny AND the
+kernel has plenty of other independent chains to move into the gap.
+"""
+import json, re, sys
+from collections import Counter, defaultdict
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+import ISA
+
+EXPENSIVE = {'math.rsqt', 'math.inv', 'math.div', 'math.sqrt'}
+REG = re.compile(r'\br(\d+)(?:\.(\d+))?')
+
+
+def regs(op):
+    m = REG.search(op or '')
+    return (int(m.group(1)), m.group(2)) if m else None
+
+
+def analyse(path):
+    isa = ISA.parse(path)
+    ops = [i['ops'] for i in isa]
+    kinds = [i['op'] for i in isa]
+    exposed = []
+    for i, k in enumerate(kinds):
+        if k not in EXPENSIVE:
+            continue
+        srcs = [regs(o) for o in ops[i]]
+        srcs = [s for s in srcs if s]
+        if not srcs:
+            continue
+        dst = srcs[0]
+        dist = None
+        for j in range(i + 1, min(i + 80, len(kinds))):
+            if any(regs(o) == dst for o in ops[j]):
+                dist = j - i
+                break
+        exposed.append(dict(index=i, op=k, dst=dst, distance=dist))
+    return exposed, kinds
+
+
+# the freshest whole-frame capture set
+cands = [p for p in (K.C / 'queue').rglob('native-native-base') if p.is_dir()]
+cands.sort(key=lambda p: -len(list(p.rglob('*.asm'))))
+base = cands[0]
+files = sorted(base.rglob('*.asm'))
+print('capture set:', base)
+print('kernels:', len(files))
+
+rows = K.rows()
+name2fam = {}
+for r in rows:
+    name2fam.setdefault(r['name'], r['family'])
+
+per_kernel = []
+for p in files:
+    exp, kinds = analyse(p)
+    if not exp:
+        continue
+    d0 = [e for e in exp if e['distance'] is not None and e['distance'] <= 2]
+    d3 = [e for e in exp if e['distance'] is not None and 3 <= e['distance'] <= 10]
+    dh = [e for e in exp if e['distance'] is not None and e['distance'] > 10]
+    dn = [e for e in exp if e['distance'] is None]
+    per_kernel.append(dict(kernel=p.name, total=len(exp), exposed=len(d0), partial=len(d3),
+                           hidden=len(dh), no_consumer=len(dn),
+                           ops=dict(Counter(e['op'] for e in exp)),
+                           exposed_detail=d0[:8]))
+per_kernel.sort(key=lambda x: -x['exposed'])
+print('\n%-46s %5s %5s %5s %5s' % ('kernel', 'tot', '<=2', '3-10', '>10'))
+for k in per_kernel[:16]:
+    print('%-46s %5d %5d %5d %5d  %s' % (k['kernel'][:46], k['total'], k['exposed'], k['partial'],
+                                          k['hidden'], k['ops']))
+tot = sum(k['total'] for k in per_kernel)
+exp = sum(k['exposed'] for k in per_kernel)
+print('\ntotal expensive latency ops: %d, fully exposed (<=2): %d (%.1f%%), hidden (>10): %d'
+      % (tot, exp, 100 * exp / max(tot, 1), sum(k['hidden'] for k in per_kernel)))
+K.write_json(K.C / 'evidence' / 'LATENCY-EXPOSURE.json',
+             dict(capture=str(base), kernels=per_kernel,
+                  totals=dict(expensive=tot, exposed=exp,
+                              hidden=sum(k['hidden'] for k in per_kernel))))

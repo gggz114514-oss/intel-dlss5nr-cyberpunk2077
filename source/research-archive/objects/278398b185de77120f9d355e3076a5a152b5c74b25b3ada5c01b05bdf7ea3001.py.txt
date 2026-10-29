@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""B3 (INT8 C32 half seed defer-widen) SPIR-V reader.
+
+Self-contained word-level SPIR-V parser: no spirv-dis/spirv-tools on this host.
+Answers three questions for the parent module:
+
+  1. where is the contract seed computed, widened and first consumed (program order,
+     with word offsets), i.e. is the widen already sunk to the dequant epilogue?
+  2. is the `NRH_C seedN = ycN` copy still a real instruction (OpCopyObject) or has
+     the front end renamed it away (SSA identity)?
+  3. what is the exact per-opcode multiset, so parent/child can be diffed as
+     (opcode, word count) histograms.
+"""
+import json
+import struct
+import sys
+
+# ---------------------------------------------------------------- opcode names
+OPNAME = {
+    0: "OpNop", 1: "OpUndef", 2: "OpSourceContinued", 3: "OpSource",
+    4: "OpSourceExtension", 5: "OpName", 6: "OpMemberName", 7: "OpString",
+    8: "OpLine", 10: "OpExtension", 11: "OpExtInstImport", 12: "OpExtInst",
+    14: "OpMemoryModel", 15: "OpEntryPoint", 16: "OpExecutionMode",
+    17: "OpCapability", 19: "OpTypeVoid", 20: "OpTypeBool", 21: "OpTypeInt",
+    22: "OpTypeFloat", 23: "OpTypeVector", 24: "OpTypeMatrix",
+    25: "OpTypeImage", 26: "OpTypeSampler", 27: "OpTypeSampledImage",
+    28: "OpTypeArray", 29: "OpTypeRuntimeArray", 30: "OpTypeStruct",
+    31: "OpTypeOpaque", 32: "OpTypePointer", 33: "OpTypeFunction",
+    41: "OpConstantTrue", 42: "OpConstantFalse", 43: "OpConstant",
+    44: "OpConstantComposite", 45: "OpConstantSampler", 46: "OpConstantNull",
+    54: "OpFunction", 55: "OpFunctionParameter", 56: "OpFunctionEnd",
+    57: "OpFunctionCall", 59: "OpVariable", 60: "OpImageTexelPointer",
+    61: "OpLoad", 62: "OpStore", 63: "OpCopyMemory", 65: "OpAccessChain",
+    66: "OpInBoundsAccessChain", 67: "OpPtrAccessChain", 68: "OpArrayLength",
+    71: "OpDecorate", 72: "OpMemberDecorate", 77: "OpVectorExtractDynamic",
+    78: "OpVectorInsertDynamic", 79: "OpVectorShuffle",
+    80: "OpCompositeConstruct", 81: "OpCompositeExtract",
+    82: "OpCompositeInsert", 83: "OpCopyObject", 84: "OpTranspose",
+    109: "OpConvertFToU", 110: "OpConvertFToS", 111: "OpConvertSToF",
+    112: "OpConvertUToF", 113: "OpUConvert", 114: "OpSConvert", 115: "OpFConvert",
+    116: "OpQuantizeToF16", 117: "OpConvertPtrToU", 118: "OpSatConvertSToF",
+    119: "OpSatConvertUToF", 120: "OpConvertUToPtr", 124: "OpBitcast",
+    126: "OpSNegate", 127: "OpFNegate", 128: "OpIAdd", 129: "OpFAdd",
+    130: "OpISub", 131: "OpFSub", 132: "OpIMul", 133: "OpFMul", 134: "OpUDiv",
+    135: "OpSDiv", 136: "OpFDiv", 137: "OpUMod", 138: "OpSRem", 139: "OpSMod",
+    140: "OpFRem", 141: "OpFMod", 142: "OpVectorTimesScalar",
+    143: "OpMatrixTimesScalar", 144: "OpVectorTimesMatrix",
+    145: "OpMatrixTimesVector", 146: "OpMatrixTimesMatrix",
+    147: "OpOuterProduct", 148: "OpDot", 149: "OpIAddCarry",
+    150: "OpISubBorrow", 151: "OpUMulExtended", 152: "OpSMulExtended",
+    154: "OpAny", 155: "OpAll", 156: "OpIsNan", 157: "OpIsInf",
+    158: "OpIsFinite", 159: "OpIsNormal", 160: "OpSignBitSet",
+    164: "OpLogicalEqual", 165: "OpLogicalNotEqual", 166: "OpLogicalOr",
+    167: "OpLogicalAnd", 168: "OpLogicalNot", 169: "OpSelect",
+    170: "OpIEqual", 171: "OpINotEqual", 172: "OpUGreaterThan",
+    173: "OpSGreaterThan", 174: "OpUGreaterThanEqual",
+    175: "OpSGreaterThanEqual", 176: "OpULessThan", 177: "OpSLessThan",
+    178: "OpULessThanEqual", 179: "OpSLessThanEqual", 180: "OpFOrdEqual",
+    181: "OpFUnordEqual", 182: "OpFOrdNotEqual", 183: "OpFUnordNotEqual",
+    184: "OpFOrdLessThan", 185: "OpFUnordLessThan", 186: "OpFOrdGreaterThan",
+    187: "OpFUnordGreaterThan", 188: "OpFOrdLessThanEqual",
+    189: "OpFUnordLessThanEqual", 190: "OpFOrdGreaterThanEqual",
+    191: "OpFUnordGreaterThanEqual", 194: "OpShiftRightLogical",
+    195: "OpShiftRightArithmetic", 196: "OpShiftLeftLogical", 197: "OpBitwiseOr",
+    198: "OpBitwiseXor", 199: "OpBitwiseAnd", 200: "OpNot",
+    207: "OpDPdx", 208: "OpDPdy", 209: "OpFwidth",
+    224: "OpImage", 225: "OpImageQuerySizeLod",
+    245: "OpPhi", 246: "OpLoopMerge", 247: "OpSelectionMerge",
+    248: "OpLabel", 249: "OpBranch", 250: "OpBranchConditional",
+    251: "OpSwitch", 252: "OpKill", 253: "OpReturn", 254: "OpReturnValue",
+    255: "OpUnreachable",
+    338: "OpImageRead", 345: "OpImageSparseSampleImplicitLod",
+    346: "OpImageSparseSampleDrefImplicitLod",
+    4456: "OpCooperativeMatrixLoadKHR", 4457: "OpCooperativeMatrixStoreKHR",
+    4458: "OpCooperativeMatrixMulAddKHR", 4459: "OpCooperativeMatrixLengthKHR",
+    5366: "OpCooperativeMatrixConvertKHR",
+}
+# SPV_KHR_cooperative_matrix: 4456 load, 4457 store, 4458 muladd, 4459 length
+# (NV variants share the low numbers), EXT convert = 4459+? -> resolved at runtime
+# by walking the OpExtInstImport/OpExtension list instead of guessing.
+
+RESULT_AT_ZERO = set(range(19, 34)) | {7, 11, 33, 248, 249, 250, 251, 252,
+                                       253, 254, 255}
+# opcodes with no result id at all
+NO_RESULT = {0, 3, 4, 5, 6, 8, 10, 14, 15, 16, 17, 71, 72, 73, 74, 75,
+             62, 63, 64, 246, 247, 249, 250, 251, 252, 253, 254, 255,
+             5368, 5369}
+# Extension opcodes keep the generic (result type, result id) shape of the core.
+
+
+class Inst:
+    __slots__ = ("op", "ops", "pos", "n", "idx")
+
+    def __init__(self, op, ops, pos, n, idx):
+        self.op, self.ops, self.pos, self.n, self.idx = op, ops, pos, n, idx
+
+    @property
+    def name(self):
+        return OPNAME.get(self.op, "Op%s" % self.op)
+
+    @property
+    def rid(self):
+        if self.op in NO_RESULT or not self.ops:
+            return None
+        if self.op in RESULT_AT_ZERO:
+            return self.ops[0]
+        if len(self.ops) < 2:
+            return None
+        return self.ops[1]
+
+    @property
+    def rtype(self):
+        if self.op in NO_RESULT or not self.ops:
+            return None
+        if self.op in RESULT_AT_ZERO:
+            return None
+        return self.ops[0]
+
+    def text(self):
+        parts = [str(x) for x in self.ops]
+        return "%-30s %s" % (self.name, " ".join(parts))
+
+
+class Module:
+    def __init__(self, path):
+        self.path = path
+        data = open(path, "rb").read()
+        assert len(data) % 4 == 0, path
+        self.nbytes = len(data)
+        self.words = list(struct.unpack("<%dI" % (len(data) // 4), data))
+        assert self.words[0] == 0x07230203, hex(self.words[0])
+        self.version, self.generator, self.bound, self.schema = self.words[1:5]
+        self.insts = []
+        self.blocks = []       # (function index, label inst index)
+        i, idx = 5, 0
+        while i < len(self.words):
+            w = self.words[i]
+            op, n = w & 0xFFFF, w >> 16
+            assert n >= 1 and i + n <= len(self.words), (i, n)
+            self.insts.append(Inst(op, self.words[i + 1:i + n], i, n, idx))
+            i += n
+            idx += 1
+        self.by_id = {}
+        for ins in self.insts:
+            rid = ins.rid
+            if rid is not None and rid != 0:
+                self.by_id.setdefault(rid, ins)
+        self.uses = {}
+        for ins in self.insts:
+            for p, w in enumerate(ins.ops):
+                if rid_is_skipped(ins.op, p):
+                    continue
+                self.uses.setdefault(w, []).append(ins)
+
+    def funcs(self):
+        out, cur = [], None
+        for ins in self.insts:
+            if ins.op == 54:
+                cur = {"fn": ins, "params": [], "insts": []}
+                out.append(cur)
+            elif cur is not None:
+                if ins.op == 55:
+                    cur["params"].append(ins)
+                if ins.op != 56:
+                    cur["insts"].append(ins)
+        return out
+
+    def exts(self):
+        return [(i.ops[1].to_bytes(4, "little").split(b"\0")[0].decode(),
+                 i.ops[0]) for i in self.insts if i.op == 11]
+
+    def hist(self, insts=None):
+        h = {}
+        for ins in (insts if insts is not None else self.insts):
+            h[(ins.op, ins.n)] = h.get((ins.op, ins.n), 0) + 1
+        return h
+
+
+def rid_is_skipped(op, pos):
+    """True for operand positions that are not ID *uses* (result id, literals)."""
+    if op in NO_RESULT:
+        return False
+    if op in RESULT_AT_ZERO:
+        return pos == 0
+    if pos == 1:
+        return True
+    if pos == 0:
+        return True          # result type id - not a value use
+    return False
+
+
+def load(path):
+    return Module(path)

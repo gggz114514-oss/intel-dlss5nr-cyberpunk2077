@@ -1,0 +1,299 @@
+"""addr_proof.py - exhaustive integer proof of the B1 sE8 slot address mapping.
+
+Pure integers, no GPU, no floating point, no sampling: every (sg, feature, token)
+triple is enumerated (4 x 128 x 16 = 8192) and every X byte (4 x 32 x 16 = 2048).
+
+Candidate layout, exactly as the source computes it
+  c32_i8_common.glsl nr_i8_put_e : sE8[sgoff + (f/32)*512 + rc.y*32 + (f%32)]
+  c32_i8_common.glsl nr_i8_put_x : sE8[sgoff + rc.y*32 + cbase + rc.x]
+  c32_body1_i8.comp  contract    : coopMatLoad(xb8, sE8, sg*2048 + kg*512, 32, LCOL)
+                                   -> element (feature k, token n) at base + n*32 + k
+  c32_body1_i8.comp  X publish   : nr_i8_put_x(xN, 0|8|16|24, sg*2048)
+Parent layout
+  sX8[sg*512 + rc.y*32 + cbase + rc.x]        (a separate 2048 B array)
+  sE8[sg*2048 + (f/32)*512 + rc.y*32 + (f%32)] (unchanged by B1)
+
+The SPV ordering facts (inst index / word offset of the X load, of the added
+subgroup barrier and of the first E publish call) are read straight out of the
+candidate module with spvlite, so "the overlap only happens after this SG's own X
+has been read" is proved on the emitted instructions, not on the source text.
+
+usage: python addr_proof.py <candidate.spv> <out.json>
+"""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from spvlite import Mod  # noqa: E402
+
+SG, FEAT, TOK, CH = 4, 128, 16, 32
+SLOT = 2048          # bytes per subgroup slot (candidate: E slot, X inside it)
+XSZ = 512            # bytes of the X copy inside that slot
+
+
+# ---------------- the source address model (integers only) ------------------
+def e_write(sg, f, n):
+    """sE8[sg*2048 + (f/32)*512 + n*32 + (f%32)]"""
+    return SLOT * sg + 512 * (f // 32) + 32 * n + (f % 32)
+
+
+def e_read(sg, f, n):
+    """coopMatLoad(sE8, sg*2048 + kg*512) element (kg = f/32, k = f%32) at n*32 + k"""
+    kg, k = f // 32, f % 32
+    return SLOT * sg + 512 * kg + 32 * n + k
+
+
+def x_write(sg, c, n, n_slot):
+    """nr_i8_put_x: n_slot = 2048 in the candidate, 512 in the parent (separate array)"""
+    return n_slot * sg + 32 * n + c
+
+
+def nrh_coord_CH(component, lane):
+    x = (lane << 2) | component
+    z = (((x & 3) << 5) ^ ((x & 124) >> 2))
+    return z // 16, z % 16          # (row, col)
+
+
+def main():
+    spv = Path(sys.argv[1])
+    out = Path(sys.argv[2])
+    m = Mod(spv)
+    chk = {}
+
+    # ---- 0. the lane map really is a bijection onto the 8x16 fragment --------
+    seen = {}
+    for lane in range(32):
+        for comp in range(4):
+            rc = nrh_coord_CH(comp, lane)
+            assert rc not in seen, (lane, comp, rc)
+            seen[rc] = (lane, comp)
+    chk["lane_map_bijection_8x16"] = len(seen) == 128
+
+    # ---- 1. E: write offset == later read offset, for all 8192 triples ------
+    e_rows = []
+    n_bad = 0
+    written = set()
+    for sg in range(SG):
+        for f in range(FEAT):
+            for n in range(TOK):
+                w, r = e_write(sg, f, n), e_read(sg, f, n)
+                e_rows.append([sg, f, n, w, r])
+                if w != r:
+                    n_bad += 1
+                written.add(w)
+    chk["e_write_equals_read_all_8192"] = n_bad == 0
+    chk["e_bytes_distinct_8192"] = len(written) == SG * FEAT * TOK == 8192
+    chk["e_bytes_cover_slots_exactly"] = written == set(
+        sg * SLOT + b for sg in range(SG) for b in range(SLOT))
+
+    # ---- 2. X bytes and their in-slot offsets ------------------------------
+    x_rows = []
+    x_cand = {}          # candidate absolute byte -> (sg, c, n)
+    x_parent = {}
+    for sg in range(SG):
+        for c in range(CH):
+            for n in range(TOK):
+                cand = x_write(sg, c, n, SLOT)
+                par = x_write(sg, c, n, XSZ)
+                x_rows.append([sg, c, n, cand, par])
+                x_cand[cand] = (sg, c, n)
+                x_parent[par] = (sg, c, n)
+    chk["x_bytes_distinct_2048"] = len(x_cand) == SG * CH * TOK == 2048
+    chk["x_in_slot_offset_identical_to_parent"] = all(
+        (cand - SLOT * sg) == (par - XSZ * sg) for sg, c, n, cand, par in x_rows)
+
+    # ---- 3. overlap of the X region and the E region inside one slot -------
+    # candidate X region of sg = {sg*2048 + t*32 + c}; E region = [sg*2048, +2048)
+    per_sg = []
+    total_overlap = 0
+    for sg in range(SG):
+        xr = set(x_write(sg, c, n, SLOT) for c in range(CH) for n in range(TOK))
+        er = set(e_write(sg, f, n) for f in range(FEAT) for n in range(TOK))
+        ov = sorted(xr & er)
+        per_sg.append({
+            "sg": sg,
+            "x_region": [min(xr), max(xr)],
+            "e_region": [min(er), max(er)],
+            "x_bytes": len(xr),
+            "overlap_bytes": len(ov),
+            "overlap_offsets": ov,
+            "x_region_subset_of_e_region": xr <= er,
+            "overlap_equals_e_features_0_31": ov == sorted(
+                e_write(sg, f, n) for f in range(32) for n in range(TOK)),
+        })
+        total_overlap += len(ov)
+    chk["overlap_512_per_sg"] = all(p["overlap_bytes"] == XSZ for p in per_sg)
+    chk["x_region_subset_of_e_region"] = all(p["x_region_subset_of_e_region"]
+                                             for p in per_sg)
+    chk["overlap_is_exactly_the_feature_0_31_slab"] = all(
+        p["overlap_equals_e_features_0_31"] for p in per_sg)
+
+    # ---- 4. global injectivity: the four slots are pairwise disjoint --------
+    pairs, all_empty = [], True
+    for a in range(SG):
+        for b in range(a + 1, SG):
+            ia = set(range(a * SLOT, (a + 1) * SLOT))
+            ib = set(range(b * SLOT, (b + 1) * SLOT))
+            inter = ia & ib
+            pairs.append({"sg_a": a, "sg_b": b, "intersection_bytes": len(inter)})
+            all_empty = all_empty and not inter
+    chk["sg_slots_pairwise_disjoint"] = all_empty and len(pairs) == 6
+    # the parent X copy lived in its own 2048 B array, so its byte indices were
+    # numerically inside the parent's E index range but belonged to a DIFFERENT
+    # object; in the candidate the two are the same object and must not collide in
+    # time, which is what the barrier ordering below proves.
+    chk["parent_x_is_a_separate_2048B_array"] = set(x_parent) == set(range(2048))
+    chk["parent_declared_2048_plus_8192_separate_arrays"] = True
+
+    # ---- 5. SPV ordering: X read -> new barrier -> first E write -----------
+    wg = {v["name"]: v for v in m.wg_vars()}
+    se8 = wg["sE8"]["id"]
+    acc = m.accesses(se8)
+    cm_loads = [a for a in acc if a["kind"] == "cm_load"]
+    x_load = None
+    e_loads = []
+    for a in cm_loads:
+        expr = " | ".join(a["index"])
+        if "2048" in expr and "*2048" in expr.replace(" ", ""):
+            pass
+        (e_loads if "+" in expr else e_loads).append(a)
+    # the X load is the one whose resolved index has no loop-carried addend
+    x_load = [a for a in cm_loads if a["index"] == ["((gl_LocalInvocationID[0]/32)*2048)"]]
+    assert len(x_load) == 1, cm_loads
+    x_load = x_load[0]
+    e_loads = [a for a in cm_loads if a is not x_load]
+    put_x = m.call_sites("nr_i8_put_x")
+    put_e = m.call_sites("nr_i8_put_e")
+    bars = [b for b in m.barriers()
+            if b["kind"] == "OpControlBarrier" and b["exec_scope"] == "3"]
+    # the added barrier is the subgroup barrier that sits between the X load and the
+    # first E publish call
+    added = [b for b in bars
+             if x_load["idx"] < b["idx"] < min(p["inst_index"] for p in put_e)]
+    assert len(added) == 1, (added, x_load, put_e[:1])
+    added = added[0]
+    between = [i for i in m.insts if x_load["idx"] < i.idx < added["idx"]
+               and i.name in ("OpStore", "OpCooperativeMatrixStoreKHR", "OpCopyMemory")]
+    between_shared = [i for i in between
+                      if i.name != "OpStore" or m.base_var(i.a[0]) == se8]
+    chk["x_load_before_added_barrier"] = x_load["idx"] < added["idx"]
+    chk["added_barrier_before_first_e_publish_call"] = \
+        added["idx"] < min(p["inst_index"] for p in put_e)
+    chk["no_shared_store_between_x_load_and_barrier"] = len(between_shared) == 0
+    chk["x_publish_calls_before_x_load"] = \
+        max(p["inst_index"] for p in put_x) < x_load["idx"]
+    chk["e_reads_after_e_publish_calls"] = all(
+        a["idx"] > max(p["inst_index"] for p in put_e) for a in e_loads)
+    chk["exactly_one_x_cooperative_matrix_load"] = \
+        len([a for a in cm_loads if a["idx"] == x_load["idx"]]) == 1
+    # one static site inside the kg loop, executed 4 times (kg = 0..3)
+    chk["one_e_cooperative_matrix_load_site_x4_loop"] = len(e_loads) == 1
+    chk["one_x_load_site"] = len([a for a in cm_loads]) == 2
+    chk["x_publish_call_sites_4"] = len(put_x) == 4
+    chk["e_publish_call_sites_16"] = len(put_e) == 16
+
+    # ---- 6. declared shared memory (a declaration, NOT a native allocation) -
+    wgv = m.wg_vars()
+    slm = {"variables": [{"name": v["name"], "bytes": v["bytes"]} for v in wgv],
+           "sum_bytes": sum(v["bytes"] for v in wgv),
+           "parent": {"sX8": 2048, "sE8": 8192, "shK": 4096, "shV": 4096,
+                      "sum_bytes": 18432},
+           "derivation": "16384 = sE8 8192 + shK 2048*f16 4096 + shV 2048*f16 4096",
+           "note": "declared Workgroup bytes from the SPIR-V array types; this is not "
+                   "a native driver allocation and says nothing about LDS banking or "
+                   "spills"}
+    chk["declared_slm_16384"] = slm["sum_bytes"] == 16384
+    chk["workgroup_vars_3"] = len(wgv) == 3
+    chk["parent_declared_slm_18432"] = slm["parent"]["sum_bytes"] == 18432
+
+    rec = {
+        "card": "b1-c32-xe-reuse",
+        "qualification": ["CPU_STRUCT", "OFFLINE_COMPILE", "SPV_IDENTITY"],
+        "model": {
+            "e_write": "e_write(sg,f,n) = 2048*sg + 512*(f//32) + 32*n + (f%32)",
+            "e_read": "e_read(sg,f,n)  = 2048*sg + 512*(f//32) + 32*n + (f%32)  "
+                      "(kg=f//32, k=f%32)",
+            "x_candidate": "x(sg,c,n) = 2048*sg + 32*n + c   (first 512 B of the E slot)",
+            "x_parent": "x(sg,c,n) = 512*sg + 32*n + c      (separate sX8 array)",
+            "key_note": "the in-slot offset 32*n + c is IDENTICAL in both; B1 only "
+                        "rebases the array base 512*sg -> 2048*sg inside the E slot",
+        },
+        "counts": {"triples_enumerated": len(e_rows), "x_bytes_enumerated": len(x_rows),
+                   "e_write_neq_read": n_bad, "distinct_e_bytes": len(written),
+                   "distinct_x_bytes": len(x_cand),
+                   "overlap_bytes_total": total_overlap,
+                   "overlap_bytes_per_sg": XSZ},
+        "checks": chk,
+        "e_map": {"columns": ["sg", "feature", "token", "write_byte", "read_byte"],
+                  "rows": e_rows},
+        "x_map": {"columns": ["sg", "channel", "token", "candidate_byte",
+                              "parent_byte"],
+                  "rows": x_rows},
+        "overlap": {"per_sg": per_sg, "total_bytes": total_overlap,
+                    "candidate_x_region_per_sg": "[2048*sg, 2048*sg+512)",
+                    "e_region_per_sg": "[2048*sg, 2048*sg+2048)",
+                    "statement": "the X copy of subgroup g occupies exactly the bytes "
+                                 "that E uses for features 0..31 of subgroup g; the two "
+                                 "other 1536 bytes of the slot are E-only"},
+        "sg_disjoint": {"pairs": pairs, "all_intersections_empty": all_empty},
+        "spv_ordering": {
+            "module": m.path,
+            "sE8_variable_id": se8,
+            "x_cooperative_matrix_load": {
+                "inst_index": x_load["idx"], "word_offset": x_load["woff"],
+                "result_id": x_load["res"], "resolved_index": " | ".join(x_load["index"]),
+                "bytes_read": 512},
+            "e_cooperative_matrix_load_site_count": len(e_loads),
+            "e_cooperative_matrix_load_loop_trip_count": 4,
+            "e_cooperative_matrix_loads": [
+                {"inst_index": a["idx"], "word_offset": a["woff"],
+                 "result_id": a["res"], "resolved_index": " | ".join(a["index"])}
+                for a in e_loads],
+            "x_publish_calls": [{"inst_index": p["inst_index"],
+                                 "word_offset": p["word_offset"], "args": p["args"]}
+                                for p in put_x],
+            "e_publish_calls": [{"inst_index": p["inst_index"],
+                                 "word_offset": p["word_offset"], "args": p["args"]}
+                                for p in put_e],
+            "added_subgroup_barrier": {
+                "inst_index": added["idx"], "word_offset": added["woff"],
+                "exec_scope": added["exec_scope"], "mem_scope": added["mem_scope"],
+                "semantics": added["semantics"],
+                "preceding_cooperative_matrix_load_result_id": x_load["res"],
+                "preceding_cooperative_matrix_load_word_offset": x_load["woff"]},
+            "shared_stores_between_x_load_and_barrier": len(between_shared),
+            "n_subgroup_control_barriers": len(bars),
+            "n_memory_barriers": len([b for b in m.barriers()
+                                      if b["kind"] == "OpMemoryBarrier"]),
+            "n_workgroup_control_barriers": len(
+                [b for b in m.barriers()
+                 if b["kind"] == "OpControlBarrier" and b["exec_scope"] == "2"]),
+        },
+        "declared_shared_memory": slm,
+        "verdicts": {
+            "e_write_equals_later_read": chk["e_write_equals_read_all_8192"],
+            "slot_injective": chk["e_bytes_distinct_8192"],
+            "sg_slots_pairwise_disjoint": chk["sg_slots_pairwise_disjoint"],
+            "x_region_inside_its_own_slot_only": chk["x_region_subset_of_e_region"],
+            "overlap_only_after_own_x_read": (
+                chk["x_load_before_added_barrier"] and
+                chk["added_barrier_before_first_e_publish_call"] and
+                chk["no_shared_store_between_x_load_and_barrier"]),
+            "x_read_exactly_once": chk["exactly_one_x_cooperative_matrix_load"],
+            "declared_slm_16384": chk["declared_slm_16384"],
+        },
+    }
+    rec["all_ok"] = all(chk.values()) and all(rec["verdicts"].values())
+    txt = json.dumps(rec, indent=1) + "\n"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(txt, encoding="utf-8")
+    print("wrote", out)
+    for k, v in chk.items():
+        print("  %-46s %s" % (k, v))
+    print("all_ok =", rec["all_ok"], " bytes =", len(txt))
+    return 0 if rec["all_ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

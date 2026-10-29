@@ -1,0 +1,179 @@
+"""n33 task B1: build candidate.comp from the F02 parent by pure statement reorder.
+
+Two independent, purely-order edits (no expression, no rounding point, no K order
+is touched):
+
+  EDIT 1 - norm section (2 x 4 full_norm calls).
+      parent : { n=full_norm(c0); apply(c0) } x4         (rsqt -> consumer = 1..5)
+      cand   : f16vec2 n0..n3 = full_norm(c0..c3);        (4 trees first)
+               { apply(c0) } { apply(c1) } { apply(c2) } { apply(c3) }
+      -> the 8 rsqt of a group are issued before any of their consumers, and the
+         three later trees of the same group sit between an rsqt and its apply.
+
+  EDIT 2 - softmax denominator (4 groups of 8 muls).
+      parent : { d-tree; inv=1/max(d); 8 muls } x4
+      cand   : d0..d3 = tree0..tree3; inv0..inv3 = 1/max(d_i);
+               tc00/pv_early_b (existing, moved up);
+               {8 muls of i0} {8 muls of i1} [debug] {pv dpas} {i2} {i3}
+      -> all 8 math.inv are issued before their first consumer, and the
+         tc00/pv_early_b block (which does not depend on them) sits in the gap.
+
+Both edits keep every arithmetic operator, operand, clamp and rounding point in
+the same order per value; only independent statements move.  The assert()s below
+pin the parent text so a wrong source cannot silently build.
+"""
+import sys, json, hashlib, difflib
+from pathlib import Path
+
+HERE = Path(__file__).parent
+PARENT = Path("@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/"
+              "c32-rest-20261026/body-pv-den-overlap/candidate.comp")
+OUT = HERE / "candidate.comp"
+PATCH = HERE / "SOURCE-DIFF.patch"
+PARENT_SHA = "75e3474dc2749288261f3824fd0d45f9675e3b8e2fe95c5ba4b56d29d2698749"
+
+
+def sha_text(t):
+    return hashlib.sha256(t.encode("utf-8")).hexdigest()
+
+
+def block(lines, lo, hi):
+    """1-based inclusive slice"""
+    return lines[lo - 1:hi]
+
+
+def norm_edit(lines, base, q, qn, k, kn):
+    """base..base+19 is four blocks of { n=full_norm(...); qr0; qr1; }"""
+    out = ["{"]
+    for i in range(4):
+        n_line = lines[base - 1 + 5 * i + 1]
+        assert n_line.startswith("f16vec2 n=full_norm("), n_line
+        if i == 0:
+            assert q in n_line, n_line
+        assert "%s[%d]" % (qn, i) in n_line, n_line
+        out.append(n_line.replace("f16vec2 n=", "f16vec2 n%d=" % i))
+    for i in range(4):
+        qr0 = lines[base - 1 + 5 * i + 2]
+        qr1 = lines[base - 1 + 5 * i + 3]
+        assert qr0.startswith("precise float16_t qr0="), qr0
+        assert qr1.startswith("precise float16_t qr1="), qr1
+        out.append("{")
+        out.append(qr0.replace("n.x", "n%d.x" % i).replace("n.y", "n%d.y" % i))
+        out.append(qr1.replace("n.x", "n%d.x" % i).replace("n.y", "n%d.y" % i))
+        out.append("}")
+    out.append("}")
+    return out
+
+
+def main():
+    raw_bytes = PARENT.read_bytes()
+    assert hashlib.sha256(raw_bytes).hexdigest() == PARENT_SHA, \
+        "parent source is not the recorded identity: %s" % hashlib.sha256(raw_bytes).hexdigest()
+    raw = raw_bytes.decode("utf-8")
+    assert "\r\n" in raw
+    lines = raw.splitlines()
+
+    # --- pin the parent regions -------------------------------------------
+    assert lines[518] == "{" and "full_norm(q00[0],q01[0],k00[0],k01[0])" in lines[519]
+    assert lines[537] == "}", lines[537]
+    assert lines[546] == "{" and "full_norm(q10[0],q11[0],k10[0],k11[0])" in lines[547]
+    assert lines[565] == "}", lines[565]
+    assert lines[709] == "{" and lines[710].startswith("precise f16vec2 d="), lines[709:711]
+    assert lines[745] == "}", lines[745]
+    assert lines[746] == "{" and lines[747].startswith("precise f16vec2 d="), lines[746:748]
+    assert lines[782] == "}", lines[782]
+    assert lines[787].startswith("NRH_C tc00="), lines[787]
+    assert lines[789].startswith("{NRH_A ready=nrh_to_A(p00)"), lines[789]
+    assert lines[790] == "{" and lines[791].startswith("precise f16vec2 d="), lines[790:792]
+    assert lines[826] == "}", lines[826]
+    assert lines[827] == "{" and lines[828].startswith("precise f16vec2 d="), lines[827:829]
+    assert lines[863] == "}", lines[863]
+
+    GRP = {  # name -> (block_start, tree_first_line, tree_last_line, inv_line, applies, block_end)
+        "g0": (710, 711, 740, 741, (742, 745), 746),
+        "g1": (747, 748, 777, 778, (779, 782), 783),
+        "g2": (791, 792, 821, 822, (823, 826), 827),
+        "g3": (828, 829, 858, 859, (860, 863), 864),
+    }
+    for name, (bs, tf, tl, invl, ap, be) in GRP.items():
+        assert lines[tf - 1].startswith("precise f16vec2 d="), (name, lines[tf - 1])
+        assert lines[invl - 1].startswith("f16vec2 inv=f16vec2(float16_t(1.0/max(float(d.x)"), \
+            (name, lines[invl - 1])
+        assert lines[be - 1] == "}", (name, lines[be - 1])
+        assert lines[aps_first(ap) - 1].startswith("p"), (name, lines[aps_first(ap) - 1])
+
+    # --- EDIT 1 ------------------------------------------------------------
+    newA = norm_edit(lines, 519, "q00[0]", "q00", "k00", "k00")
+    newB = norm_edit(lines, 547, "q10[0]", "q10", "k10", "k10")
+
+    # --- EDIT 2 ------------------------------------------------------------
+    sm = ["precise f16vec2 d0,d1,d2,d3; f16vec2 inv0,inv1,inv2,inv3;"]
+    for name, idx in (("g0", 0), ("g1", 1), ("g2", 2), ("g3", 3)):
+        bs, tf, tl, invl, ap, be = GRP[name]
+        sm.append("{")
+        sm.extend(block(lines, tf, tl))
+        sm.append("d%d=d;" % idx)
+        sm.append("}")
+    for name, idx in (("g0", 0), ("g1", 1), ("g2", 2), ("g3", 3)):
+        bs, tf, tl, invl, ap, be = GRP[name]
+        inv = lines[invl - 1].replace("f16vec2 inv=", "inv%d=" % idx)
+        inv = inv.replace("float(d.x)", "float(d%d.x)" % idx).replace("float(d.y)", "float(d%d.y)" % idx)
+        sm.append("{")
+        sm.append(inv)
+        sm.append("}")
+    sm.append(lines[787])            # NRH_C tc00=NRH_C(0.0);
+    sm.append(lines[788])            # NRH_B pv_early_b;coopMatLoad(pv_early_b,shV,0u,16u,LROW);
+    for name, idx in (("g0", 0), ("g1", 1)):
+        bs, tf, tl, invl, ap, be = GRP[name]
+        sm.append("{")
+        for ln in block(lines, ap[0], ap[1]):
+            sm.append(ln.replace("inv.x", "inv%d.x" % idx).replace("inv.y", "inv%d.y" % idx))
+        sm.append("}")
+    sm.extend(block(lines, 784, 787))    # debug stores of p00..p03 (unchanged, dead at debug==0)
+    sm.append(lines[789])                # {NRH_A ready=nrh_to_A(p00);tc00=...;}
+    for name, idx in (("g2", 2), ("g3", 3)):
+        bs, tf, tl, invl, ap, be = GRP[name]
+        sm.append("{")
+        for ln in block(lines, ap[0], ap[1]):
+            sm.append(ln.replace("inv.x", "inv%d.x" % idx).replace("inv.y", "inv%d.y" % idx))
+        sm.append("}")
+
+    # --- assemble ----------------------------------------------------------
+    pre = lines[:518]                    # 1..518
+    mid = lines[538:546]                 # 539..546 stores of group A
+    mid2 = lines[566:709]                # 567..709 stores of group B .. p13 exp
+    post = lines[864:]                   # 865..end
+    out = pre + newA + mid + newB + mid2 + sm + post
+    text = "\n".join(out) + "\n"
+
+    # --- invariants that can be checked without a compiler -----------------
+    assert text.count("full_norm(") == 8 + 1, text.count("full_norm(")          # 1 def + 8 calls
+    assert text.count("1.0/max(float(") == 8, text.count("1.0/max(float(")      # 4 den x (x,y)
+    assert text.count("coopMatMulAdd") == raw.count("coopMatMulAdd")
+    assert text.count("coopMatLoad") == raw.count("coopMatLoad")
+    assert text.count("coopMatStore") == raw.count("coopMatStore")
+    assert text.count("inversesqrt(") == raw.count("inversesqrt(")
+    assert text.count("packFloat2x16") == raw.count("packFloat2x16")
+    assert text.count("unpackFloat2x16") == raw.count("unpackFloat2x16")
+    assert text.count("fma(") == raw.count("fma(")
+    assert text.count("val =") == 0
+
+    OUT.write_text(text, encoding="utf-8")
+    diff = "".join(difflib.unified_diff(
+        raw.splitlines(True), text.splitlines(True),
+        fromfile="a/candidate.comp", tofile="b/candidate.comp (n33-f02-latency)", n=4))
+    PATCH.write_text(diff, encoding="utf-8")
+    print("parent lines %d -> candidate lines %d" % (len(lines), len(out)))
+    print("parent sha %s" % PARENT_SHA)
+    print("candidate sha %s" % sha_text(text))
+    print("patch lines %d" % len(diff.splitlines()))
+    print("wrote", OUT)
+    print("wrote", PATCH)
+
+
+def aps_first(ap):
+    return ap[0]
+
+
+if __name__ == "__main__":
+    main()

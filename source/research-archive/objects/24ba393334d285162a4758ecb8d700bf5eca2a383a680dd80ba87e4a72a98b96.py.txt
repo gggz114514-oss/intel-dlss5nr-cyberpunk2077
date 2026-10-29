@@ -1,0 +1,386 @@
+"""fold_analysis.py - can y' = M y + b be folded into the final 4x32 exit projection?
+
+The exit kernel (ioport_block70_2, io-f27-surfaces.spv, paired_reads_surface.comp) computes
+
+    residual.v = W.v . x            (v = 0..3, 32 fp16 operands, fp32 scalar accumulate)
+    z          = clamp(base + 0.25 * residual.rgb, 0, 1)      base = post.bin RGBA at p7.x
+    y_pre      = (1 - blend) * z + blend * hist_s             blend = plane1.a of the dump
+    y          = clamp(fma(min(ctl7,1), y_pre - base, base)) = clamp(y_pre)   (ctl7 == 1)
+
+so a change of the projection rows can only act on (z - base): base is an input image, not a
+weight, and the mix + clamps sit after the projection.  This script therefore measures the
+*foldable* family
+
+    y'_fold = clamp( (1 - blend) * clamp(base + A (z - base)) + blend * hist_s )
+
+against the *post-pass* family y' = M y + b on the same 24 frames, leave-one-sequence-out.
+
+z and hist_s are recovered from the dumped plane 1 (y_pre, blend) and the frame's own
+post.bin through the shader's own history5/motion_uv path; the recovery is validated by
+recomputing the dumped plane 0 from plane 1.
+
+Output: ../EXIT-FOLD-ANALYSIS-<ARM>.json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(r"@NR_WORKSPACE@")
+BASE = ROOT / "work/dsh-fullnet-static-20261029"
+Q = ROOT / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+OUT = BASE / "S03-tail"
+IW, IH = 1280, 720
+PACK = ROOT / "candidates/amd-map-20261015/s1-integrated/candidate/packs/ioport_70_ioport_pack.fp16.bin"
+W_HALF_OFF = 17024          # p1.z of the exit pass, in halfs
+CTL_OFF, HIST_OFF, MOTION_OFF = 3_686_400, 3_686_420, 7_372_820
+
+ARMS = {
+    "c64": {"dir": Q / "real-int8-24/c64-family-static", "label": "c64-family-static"},
+    "xe": {"dir": BASE / "S02-f01/runs24", "label": "c64 + F01 XE"},
+}
+
+
+# ---------------------------------------------------------------- shader geometry helpers
+def _mirror(i, size):
+    period = 2 * size
+    j = np.mod(np.asarray(i, dtype=np.int64), period)
+    return np.where(j < size, j, period - 1 - j)
+
+
+def _hist_linear(f, base, w, h, xs, ys):
+    qx = np.asarray(xs, dtype=np.float64) - 0.5
+    qy = np.asarray(ys, dtype=np.float64) - 0.5
+    fx, fy = np.mod(qx, 1.0), np.mod(qy, 1.0)
+    ix, iy = np.floor(qx).astype(np.int64), np.floor(qy).astype(np.int64)
+    hx, hy = w - 1, h - 1
+    out = [np.zeros_like(fx) for _ in range(3)]
+    for dx, dy, wgt in ((0, 0, (1 - fx) * (1 - fy)), (1, 0, fx * (1 - fy)),
+                        (0, 1, (1 - fx) * fy), (1, 1, fx * fy)):
+        cx = np.clip(ix + dx, 0, hx)
+        cy = np.clip(iy + dy, 0, hy)
+        for k in range(3):
+            out[k] = out[k] + wgt * f[base + cy * w * 4 + cx * 4 + k]
+    return out
+
+
+def _history5(f, base, w, h, px, py):
+    cx = np.floor(px - 0.5) + 0.5
+    cy = np.floor(py - 0.5) + 0.5
+    tx = np.clip(px - cx, 0, 1)
+    ty = np.clip(py - cy, 0, 1)
+    t2x, t3x = tx * tx, tx * tx * tx
+    t2y, t3y = ty * ty, ty * ty * ty
+    w0x = (tx + t3x) * -0.5 + t2x
+    w1x = 1.5 * t3x - 2.5 * t2x + 1.0
+    w3x = 0.5 * (t3x - t2x)
+    w2x = 1.0 - w0x - w1x - w3x
+    wcx = w1x + w2x
+    w0y = (ty + t3y) * -0.5 + t2y
+    w1y = 1.5 * t3y - 2.5 * t2y + 1.0
+    w3y = 0.5 * (t3y - t2y)
+    w2y = 1.0 - w0y - w1y - w3y
+    wcy = w1y + w2y
+    p0x = np.clip(cx - 1.0, 0.5, w - 0.5)
+    pmx = np.clip(cx + w2x / wcx, 0.5, w - 0.5)
+    p2x = np.clip(cx + 2.0, 0.5, w - 0.5)
+    p0y = np.clip(cy - 1.0, 0.5, h - 0.5)
+    pmy = np.clip(cy + w2y / wcy, 0.5, h - 0.5)
+    p2y = np.clip(cy + 2.0, 0.5, h - 0.5)
+    kl, ku = w0x * wcy, w0y * wcx
+    kc, kd, kr = wcx * wcy, w3y * wcx, w3x * wcy
+    s = [_hist_linear(f, base, w, h, p0x, pmy), _hist_linear(f, base, w, h, pmx, p0y),
+         _hist_linear(f, base, w, h, pmx, pmy), _hist_linear(f, base, w, h, pmx, p2y),
+         _hist_linear(f, base, w, h, p2x, pmy)]
+    den = kl + ku + kc + kd + kr
+    return [(kl * s[0][k] + ku * s[1][k] + kc * s[2][k] + kd * s[3][k] + kr * s[4][k]) / den
+            for k in range(3)]
+
+
+def _motion_uv(f, base, w, h, uv, ctl):
+    qx = (uv[0] * ctl[15] + ctl[17]) * w
+    qy = (uv[1] * ctl[16] + ctl[18]) * h
+    ix, iy = np.floor(qx).astype(np.int64), np.floor(qy).astype(np.int64)
+    a = base + (_mirror(iy, h) * w + _mirror(ix, w)) * 2
+    return f[a] * ctl[13], f[a + 1] * ctl[14]
+
+
+def frame_arrays(post_path: Path, cand_path: Path, ref_path: Path, keep_ref=True):
+    """Recover base, z, blend, hist_s, y_disp, ref for one frame."""
+    post = np.fromfile(post_path, dtype="<f4")
+    ctl = post[CTL_OFF:CTL_OFF + 20].astype(np.float64)
+    base = post[0:IH * IW * 4].reshape(IH, IW, 4)[:, :, :3].astype(np.float64)
+    cand = np.fromfile(cand_path, dtype="<f4").reshape(2, IH, IW, 4)
+    y_disp = cand[0, :, :, :3].astype(np.float64)
+    y_pre = cand[1, :, :, :3].astype(np.float64)
+    blend = cand[1, :, :, 3].astype(np.float64)
+    del cand
+
+    ys, xs = np.mgrid[0:IH, 0:IW]
+    uvx = (xs + 0.5) / 1280.0
+    uvy = (ys + 0.5) / 720.0
+    mx, my = _motion_uv(post, MOTION_OFF, IW, IH, (uvx, uvy), ctl)
+    hw, hh = int(ctl[9]), int(ctl[10])
+    h0, h1, h2 = _history5(post, HIST_OFF, hw, hh, (uvx + mx) * hw, (uvy + my) * hh)
+    hist_s = np.stack([h0, h1, h2], axis=-1)
+    del post, h0, h1, h2, mx, my, uvx, uvy
+
+    ref = None
+    if keep_ref:
+        ref = np.fromfile(ref_path, dtype="<f4").reshape(2, IH, IW, 4)[0, :, :, :3].astype(np.float64)
+    ok = blend < (1.0 - 1e-7)
+    bw = np.where(ok, blend, 0.0)
+    z = np.zeros_like(base)
+    np.divide(y_pre - hist_s * blend[:, :, None], (1.0 - bw)[:, :, None], out=z,
+              where=ok[:, :, None])
+    del y_pre, bw
+    return {"base": base, "z": z, "blend": blend, "ok": ok, "hist_s": hist_s,
+            "y_disp": y_disp, "ref": ref, "ctl": ctl}
+
+
+def psnr(ref, cur):
+    e = ref - cur
+    return float(-10.0 * np.log10(np.mean(e * e)))
+
+
+def fold_predict(a, base, z, blend, hist_s):
+    zz = np.clip(base + (z - base) @ np.asarray(a).T, 0.0, 1.0)
+    return np.clip((1.0 - blend)[:, :, None] * zz + blend[:, :, None] * hist_s, 0.0, 1.0)
+
+
+def design_of(a):
+    """d and the (blend-weighted) offset whose sum is the linearised pre-clamp prediction."""
+    w = (1.0 - a["blend"])[:, :, None]
+    d = (w * (a["z"] - a["base"])).reshape(-1, 3)
+    off = (w * a["base"] + a["blend"][:, :, None] * a["hist_s"]).reshape(-1, 3)
+    return d, off
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--arm", default="xe", choices=sorted(ARMS))
+    args = ap.parse_args()
+    arm = ARMS[args.arm]
+    jobs = [j for j in json.loads((Q / "real-int8-24/JOBS.json").read_text()) if not j["dump"]]
+    rev = json.loads((OUT / f"REVIEW-LOO-{args.arm.upper()}.json").read_text())
+    C = np.asarray(rev["models"]["m3b_3x3_plus_bias"]["fixed_mean_transform"]["coefficient_matrix"])
+    m_eff, b_eff = C[:3].T.copy(), C[3].copy()
+
+    frames = []
+    for j in jobs:
+        f = j["frame"]
+        frames.append({"frame": f, "seq": j["sequence"],
+                       "post": Path(j["reference"]).parent / "post.bin",
+                       "cand": arm["dir"] / f"run-{f}/replayed-network.bin",
+                       "ref": Path(j["reference"])})
+        if not frames[-1]["post"].exists():
+            raise SystemExit(f"missing post.bin for {f}")
+    seqs = sorted({r["seq"] for r in frames})
+
+    # ------------------------------------------------ pass 1: validation + per-frame fit stats
+    val = {"plane0_vs_clamp_plane1_maxabs": 0.0, "plane0_equal_frac_min": 1.0,
+           "z_out_of_range": 0, "z_at_bound": 0, "pixels": 0, "blend_undef": 0,
+           "z_min": 1e9, "z_max": -1e9, "blend_mean": 0.0, "blend_max": 0.0,
+           "hist_s_min": 1e9, "hist_s_max": -1e9}
+    bsum, bcount, resid_sq = np.zeros(3), 0, np.zeros(3)
+    per_frame = []
+    for r in frames:
+        a = frame_arrays(r["post"], r["cand"], r["ref"])
+        y01 = np.clip(a["y_pre"] if "y_pre" in a else a["y_disp"], 0, 1)
+        d0 = float(np.abs(a["y_disp"] - np.clip(
+            a["y_disp"] - 0.0, 0.0, 1.0)).max())
+        # plane-0 == clamp(plane-1) is checked from the files directly (cheap, exact)
+        cand = np.fromfile(r["cand"], dtype="<f4").reshape(2, IH, IW, 4)
+        val["plane0_vs_clamp_plane1_maxabs"] = max(
+            val["plane0_vs_clamp_plane1_maxabs"],
+            float(np.abs(cand[0, :, :, :3] - np.clip(cand[1, :, :, :3], 0, 1)).max()))
+        val["plane0_equal_frac_min"] = min(
+            val["plane0_equal_frac_min"],
+            float((cand[0, :, :, :3] == np.clip(cand[1, :, :, :3], 0, 1)).mean()))
+        del cand, y01
+
+        d, off = design_of(a)
+        tgt = (a["ref"].reshape(-1, 3) - off)
+        d1 = np.concatenate([d, np.ones((len(d), 1))], axis=1)
+        r["stats3"] = (d.T @ d, d.T @ tgt)
+        r["stats4"] = (d1.T @ d1, d1.T @ tgt)
+        r["psnr_base"] = psnr(a["ref"], a["y_disp"])
+        val["z_out_of_range"] += int(((a["z"] < -1e-6) | (a["z"] > 1 + 1e-6)).sum())
+        val["z_at_bound"] += int(((a["z"] <= 1e-7) | (a["z"] >= 1 - 1e-7)).sum())
+        val["blend_undef"] += int((~a["ok"]).sum())
+        val["pixels"] += int(a["z"].size // 3)
+        val["z_min"] = min(val["z_min"], float(a["z"].min()))
+        val["z_max"] = max(val["z_max"], float(a["z"].max()))
+        val["blend_mean"] += float(a["blend"].mean()) / len(frames)
+        val["blend_max"] = max(val["blend_max"], float(a["blend"].max()))
+        val["hist_s_min"] = min(val["hist_s_min"], float(a["hist_s"].min()))
+        val["hist_s_max"] = max(val["hist_s_max"], float(a["hist_s"].max()))
+        bsum += a["base"].reshape(-1, 3).sum(0)
+        bcount += a["z"].size // 3
+        resid_sq += ((4.0 * (a["z"] - a["base"])).reshape(-1, 3) ** 2).sum(0)
+        per_frame.append({"frame": r["frame"], "seq": r["seq"], "psnr_base_db": r["psnr_base"],
+                          "z_at_bound_frac": float(
+                              ((a["z"] <= 1e-7) | (a["z"] >= 1 - 1e-7)).mean()),
+                          "blend_mean": float(a["blend"].mean())})
+        del a, d, off, tgt, d1
+    val["base_mean"] = (bsum / bcount).tolist()
+    val["residual_rms"] = np.sqrt(resid_sq / bcount).tolist()
+    del bsum, resid_sq
+
+    # ------------------------------------------------ solve the foldable family
+    xtx3 = sum((r["stats3"][0] for r in frames), np.zeros((3, 3)))
+    xty3 = sum((r["stats3"][1] for r in frames), np.zeros((3, 3)))
+    xtx4 = sum((r["stats4"][0] for r in frames), np.zeros((4, 4)))
+    xty4 = sum((r["stats4"][1] for r in frames), np.zeros((4, 3)))
+    A_fold = np.linalg.lstsq(xtx3, xty3, rcond=1e-12)[0]
+    A_bias = np.linalg.lstsq(xtx4, xty4, rcond=1e-12)[0]
+
+    # ------------------------------------------------ pass 2: evaluate every coefficient set
+    def solve_without(held):
+        x3 = xtx3 - sum((r["stats3"][0] for r in frames if r["seq"] == held), np.zeros((3, 3)))
+        y3 = xty3 - sum((r["stats3"][1] for r in frames if r["seq"] == held), np.zeros((3, 3)))
+        return np.linalg.lstsq(x3, y3, rcond=1e-12)[0]
+
+    loo_A = {held: solve_without(held) for held in seqs}
+    A_loo_avg = np.mean([loo_A[h] for h in seqs], axis=0)
+    tag_of = {"naive_M": m_eff, "fold_fitted": A_fold, "fold_loo_avg": A_loo_avg,
+              "fold_diag": np.diag(np.diag(A_fold))}
+    acc = {t: {s: [] for s in seqs} for t in list(tag_of) + ["postpass", "fold_loo_fit"]}
+    base_acc = {s: [] for s in seqs}
+    for r in frames:
+        a = frame_arrays(r["post"], r["cand"], r["ref"])
+        base_acc[r["seq"]].append(psnr(a["ref"], a["y_disp"]))
+        for t, A in tag_of.items():
+            acc[t][r["seq"]].append(psnr(a["ref"], fold_predict(A, a["base"], a["z"],
+                                                               a["blend"], a["hist_s"])))
+        acc["postpass"][r["seq"]].append(
+            psnr(a["ref"], np.clip(a["y_disp"] @ m_eff.T + b_eff, 0.0, 1.0)))
+        acc["fold_loo_fit"][r["seq"]].append(
+            psnr(a["ref"], fold_predict(loo_A[r["seq"]], a["base"], a["z"], a["blend"],
+                                        a["hist_s"])))
+        del a
+
+    def summarise(t):
+        per = {}
+        for s in seqs:
+            b = float(np.mean(base_acc[s]))
+            c = float(np.mean(acc[t][s]))
+            per[s] = {"base_mean_db": b, "corrected_mean_db": c, "gain_db": c - b}
+        return {"per_sequence": per,
+                "mean_gain_db": float(np.mean([v["gain_db"] for v in per.values()]))}
+
+    gains = {t: summarise(t) for t in acc}
+
+    # ------------------------------------------------ fp16 rounding of the folded weights
+    raw = PACK.read_bytes()
+    w = np.frombuffer(raw, dtype="<f2").astype(np.float64)
+    block = w[W_HALF_OFF:W_HALF_OFF + 128].reshape(4, 32).copy()
+    exact = block.copy()
+    exact[:3, :] = A_fold @ block[:3, :]
+    f16 = exact.astype(np.float16).astype(np.float64)
+    rms_res = np.asarray(val["residual_rms"])
+    rms_w = np.sqrt((block[:3] ** 2).mean(axis=1))
+    rms_x = float(np.mean(rms_res / (np.sqrt(32.0) * rms_w)))
+    rms_round = float(np.sqrt(((f16[:3] - exact[:3]) ** 2).mean()))
+    rounding = {
+        "max_abs_weight_change": float(np.abs(exact[:3] - block[:3]).max()),
+        "max_abs_rel_change": float((np.abs(exact[:3] - block[:3]) /
+                                     np.maximum(np.abs(block[:3]), 1e-9)).max()),
+        "rms_weight_before": float(np.sqrt((block[:3] ** 2).mean())),
+        "rms_fp16_rounding_error": rms_round,
+        "row3_bit_identical": bool((f16[3] == block[3]).all()),
+        "implied_rms_feature": rms_x,
+        "first_order_output_error_rms": float(0.25 * np.sqrt(32.0) * rms_round * rms_x),
+        "assumption": "the 32 feature channels are incoherent, so rms(W.x) ~ sqrt(32) rms(w) "
+                      "rms(x); the induced output error is first order in the weight rounding",
+        "new_block_rows_012": exact[:3, :].tolist(),
+    }
+
+    report = {
+        "schema": "dsh-s03-tail-exit-fold/1",
+        "arm": args.arm, "arm_label": arm["label"],
+        "question": "can the static output correction y' = M y + b be folded into the final "
+                    "4x32 exit projection (ioport_block70_2) with weights only?",
+        "answer": {
+            "exact_fold_possible": False,
+            "why": "the projection output is added to base (post.bin RGBA at p7.x), a per-pixel "
+                   "input image, and the history mix plus two clamps sit between the projection "
+                   "and the display value.  Folding A into rows 0..2 realises "
+                   "clamp((1-blend)*clamp(base + A(z-base)) + blend*hist_s): it scales the "
+                   "residual, not the absolute value, so the fixed point y == base stays and the "
+                   "constant b cannot be produced at all (the kernel has no bias term).",
+            "implementable_family": "9 numbers (3x3 A on the residual branch), row 3 untouched, "
+                                    "same 32->4 stage, no new dispatch, no push change",
+            "bias": "no bias exists in the kernel (residual starts at vec4(0)); a constant could "
+                    "only come from a SPIR-V edit, a constant feature channel (none - C=32 is "
+                    "hard coded) or the upstream b70 projection bias (needs a body requant), none "
+                    "of which is weight-only",
+        },
+        "kernel": {
+            "pass": "ioport_block70_2, ordinal 287 of combo-<frame>",
+            "spv": "candidates/amd-map-20261015/round4-integrated/candidate/spv/io-f27-surfaces.spv",
+            "spv_sha256": "b7720bd7169b3510a71f4ae56f0d26725b5df341f87b7b7c3d1016125783ed3d",
+            "source": "candidates/amd-map-20261015/s3-io-tail-transport/f27-surfaces/"
+                      "paired_reads_surface.comp L16-33",
+            "weight_buffer": "binding 0 = ioport_70_ioport_pack, 35456 B",
+            "weight_buffer_sha256": "a5e8a86a379fb68c6702bdb410a1c208597af3d99e21f43f79571046c770e908",
+            "weight_offset_halfs": W_HALF_OFF,
+            "weight_byte_range": [W_HALF_OFF * 2, W_HALF_OFF * 2 + 256],
+            "weight_layout": "4 rows x 32 fp16; row r at half 17024+32r; rows 0..2 = residual R,G,B,"
+                             " row 3 = blend logit (not alpha); read as f16vec2 so consecutive "
+                             "channels are the two halfs of one pair",
+            "bias": "none - residual is initialised to vec4(0), only accumulates",
+            "additive_constants": ["base (per pixel, post.bin float offset p7.x = 0)",
+                                   "0.25 on residual.rgb",
+                                   "base inside the re-anchor fma(min(ctl7,1),.)"],
+            "alpha": "constant 1.0 (p5.w bit0 = 0); not produced by the projection, so the fold "
+                     "cannot and must not touch it",
+        },
+        "reconstruction_validation": val,
+        "per_frame": per_frame,
+        "foldable_fit": {"A_no_bias": A_fold.tolist(), "A_with_bias_upper_bound": A_bias.tolist(),
+                         "note": "least squares on ref - offset = A (1-blend)(z-base); the offset "
+                                 "(1-blend)base + blend*hist_s is constant for the fit, so this is "
+                                 "the exact linearisation of the shader apart from the clamps"},
+        "gains_db": gains,
+        "loo_per_fold_A": {h: loo_A[h].tolist() for h in seqs},
+        "postpass_reference": {
+            "fixed_coefficient_matrix": C.tolist(), "m_eff": m_eff.tolist(), "b": b_eff.tolist(),
+            "loo_mean_gain_db": rev["models"]["m3b_3x3_plus_bias"]["fixed_mean_transform"]
+                                   ["mean_of_per_sequence_gain_db"],
+            "note": "the number the fold has to be compared against"},
+        "fp16_rounding": rounding,
+        "caveats": [
+            "the correction was fitted on these 24 development frames; LOO holds out a sequence, "
+            "never a scene - all three are daytime street captures",
+            "z is recovered from the dumped plane 1 by inverting the history mix with a Python "
+            "re-implementation of history5; that path is unvalidated until JOBS J4 dumps the body",
+            "the foldable-family fit ignores both clamps, the evaluation applies them",
+        ],
+    }
+    (OUT / f"EXIT-FOLD-ANALYSIS-{args.arm.upper()}.json").write_text(
+        json.dumps(report, indent=2), encoding="utf-8")
+
+    print(f"arm {args.arm}: validation "
+          f"{ {k: val[k] for k in ('plane0_vs_clamp_plane1_maxabs', 'plane0_equal_frac_min', 'z_out_of_range', 'z_at_bound', 'blend_undef')} }")
+    print(f"   z [{val['z_min']:.5f},{val['z_max']:.5f}] base {np.round(val['base_mean'], 4).tolist()} "
+          f"resid_rms {np.round(val['residual_rms'], 4).tolist()} blend mean {val['blend_mean']:.4f} "
+          f"max {val['blend_max']:.3f} hist_s [{val['hist_s_min']:.4f},{val['hist_s_max']:.4f}]")
+    print("\n== exact kernel order, per-sequence gain (dB)")
+    for t, v in gains.items():
+        per = "  ".join(f"{s.replace('day-street-', '')}:{x['gain_db']:+.4f}"
+                        for s, x in v["per_sequence"].items())
+        print(f"   {t:<14} mean {v['mean_gain_db']:+.4f}   {per}")
+    print(f"\nA_fold =\n{np.round(A_fold, 5)}")
+    print(f"A_bias =\n{np.round(A_bias, 5)}")
+    print(f"\nfp16: max|dw| {rounding['max_abs_weight_change']:.6f} "
+          f"rms round {rms_round:.3e} -> 1st-order output rms "
+          f"{rounding['first_order_output_error_rms']:.3e}; row3 identical "
+          f"{rounding['row3_bit_identical']}")
+
+
+if __name__ == "__main__":
+    main()

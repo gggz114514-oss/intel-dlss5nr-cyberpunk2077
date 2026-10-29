@@ -1,0 +1,61 @@
+from pathlib import Path
+import json,hashlib,subprocess,sys
+R=Path(__file__).resolve().parent;A=R.parent;B=A.parents[1];P=R/'f20-score-owner';T=R/'f20-q-producer-handoff';N=R/'f20-norm-local-owner';N.mkdir(exist_ok=True)
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr
+ return r.stdout
+s=(T/'candidate.comp').read_text(encoding='utf-8-sig');start=s.index('    // ============ stage 5:');end=s.index('    // ============ stage 5b:')
+block=s[start:end]
+block=block.replace('    if (t_local < 128u) {','    float16_t owner_norm=float16_t(0.0);\n    if (gl_SubgroupInvocationID < 16u) {')
+block=block.replace('bool isQ = t_local < 64u;','bool isQ = gl_SubgroupInvocationID < 8u;').replace('uint t = t_local % 64u;','uint t = sg*8u + gl_SubgroupInvocationID%8u;')
+block=block.replace('        shNorm[t + (isQ ? 0u : 64u)] = n;','        owner_norm = n;')
+block=block.replace('    barrier();','''    // Only this subgroup reads/scales these Q/K rows. Retire its norm reads.
+    subgroupBarrier();
+    uint owner_norm_bits=packFloat2x16(f16vec2(owner_norm,float16_t(0.0)));''')
+candidate=s[:start]+block+s[end:]
+old='''        for (uint e = 2048u+2u*t_local; e < 4096u; e += 512u) {
+            float16_t n = shNorm[e/32u];'''
+new='''        for (uint d = 0u; d < 4u; ++d) {
+            uint row_local=2u*d+(gl_SubgroupInvocationID>>4u);
+            uint e=2048u+(sg*8u+row_local)*32u+2u*(gl_SubgroupInvocationID&15u);
+            float16_t n=unpackFloat2x16(subgroupShuffle(owner_norm_bits,8u+row_local)).x;'''
+assert candidate.count(old)==1;candidate=candidate.replace(old,new)
+old='float16_t n=shNorm[sg*8u+2u*uint(d)+(gl_SubgroupInvocationID>>4u)];'
+new='float16_t n=unpackFloat2x16(subgroupShuffle(owner_norm_bits,2u*uint(d)+(gl_SubgroupInvocationID>>4u))).x;'
+assert candidate.count(old)==1;candidate=candidate.replace(old,new)
+decl='shared float16_t shNorm[256];     // nq[64] nk[64] inv[64]        512 B';assert candidate.count(decl)==1
+candidate=candidate.replace(decl,'// Norm coefficients remain in their row-owning subgroup; no shared slab.')
+assert 'shNorm[' not in candidate
+# Each norm row has exactly one producer; every K pair has exactly one writer.
+owners={(q,8*g+l%8):(g,l) for g in range(8) for l in range(16) for q in [l<8]};assert len(owners)==128
+seen=set()
+for g in range(8):
+ for l in range(32):
+  for d in range(4):
+   row=8*g+2*d+l//16;assert owners[False,row]==(g,8+2*d+l//16);assert owners[True,row]==(g,2*d+l//16)
+   for c in [2*(l%16),2*(l%16)+1]:assert (row,c) not in seen;seen.add((row,c))
+assert len(seen)==2048
+tree=lambda x:x[x.index('        float16_t sq[32];'):x.index('        float16_t n = float16_t(inversesqrt(mx));')]
+assert tree(candidate)==tree(s)
+src=N/'candidate.comp';spv=N/'candidate.spv';src.write_text(candidate,encoding='utf-8')
+run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',src,'-o',spv])
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+pm=ST.Module(P/'candidate.spv');cm=ST.Module(spv);pattern=N/'parent-pattern-only.spv';ST.set_no_contraction(pm,set(ST.no_contraction_ids(pm))-{1436,1444},pattern)
+ids=cm.id_to_instruction();raw_half2=[rid for rid in ST.no_contraction_ids(cm) if ids[rid][0]==133 and ids.get(ids[rid][1][0],(0,[]))[0]==23];assert len(raw_half2)==5
+keep,info=ST.transfer_decoration_pattern_aligned(ST.Module(pattern),cm,raw_half2);assert len(keep)==8
+ST.set_no_contraction(cm,set(keep),spv);run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+plan=N/'plan.txt';plan.write_text((P/'plan.txt').read_text().replace((P/'candidate.spv').as_posix(),spv.as_posix()),encoding='utf-8')
+for kind in ['GATES','NATIVE']:
+ t=json.loads((P/f'LUNA-{kind}.json').read_text().replace('f20-score-owner',N.name));t['identities']=[x for x in t['identities'] if not x['path'].endswith('.spv')]+[ident(spv)]
+ for j in t['jobs']:j['plan']=ident(plan)
+ (N/f'LUNA-{kind}.json').write_text(json.dumps(t,indent=2),encoding='utf-8')
+runner=json.loads((P/'LUNA-GATES.json').read_text())['identities'][0]['path']
+proof=dict(parent=ident(P/'plan.txt'),implementation_parent=ident(T/'candidate.spv'),source=ident(src),spv=ident(spv),plan=ident(plan),cpu=run([runner,'--plan',plan,'--cpu-check']),NC=sorted(keep),alignment=info,shared_bytes=24576,
+ mapping='Each SG owns Q/K rows8*sg..+7. Lane0..7 computes Q norm,8..15 K norm; lanes16..31 norm scalar0. Uniform subgroup shuffle reads only lanes0..15. K scaling every lane owns two adjacent feature values in row2*d+lane/16; exact2048-element coverage. Q retained fragment row mapping unchanged.',
+ arithmetic='Scalar sq/s/t4/t2/sum tree source byte-identical, including inversesqrt and half floor. No scalar norm NoContraction introduced. Thread predicate/row assignment change may change driver FMA contraction; exact GPU gate mandatory.',
+ sync='Original QKV publication WG barrier retained. Norm WG barrier replaced by subgroupBarrier: norm and K scale access only ownSG rows. Q raw data only read. K scale writes disjoint rows across SG. Final K publication WG barrier retained before score crossSG reads.',
+ cost_vs_q_producer=dict(norm_stores_removed_bytes=256,norm_scalar_reads_removed_source_bytes=4096,shared_allocation_removed_bytes=512,WG_barriers_removed=1,subgroup_barriers_added=1,shuffle_calls_per_SG=8,norm_active_threads_before=128,norm_active_threads_after=128,norm_distribution_before='4 full SG',norm_distribution_after='8 half-active SG',weight_read_delta=0),
+ lifetime='Q16B/lane remains across norm as prior trial. New owner_norm_bits uint4B/lane survives K scale through Q scale, retires before score MMA. Norm temporaries unchanged source size but spread across all8 SG. This may reduce perSG active-lane efficiency; no occupancy claim.',
+ stop='If fixed/fb2 not gold, stop without performance or same-identity retry. If new scratch, no performance. One ordinary/resource batch after main native review.')
+(N/'PROOF.json').write_text(json.dumps(proof,indent=2),encoding='utf-8');print(ident(spv))

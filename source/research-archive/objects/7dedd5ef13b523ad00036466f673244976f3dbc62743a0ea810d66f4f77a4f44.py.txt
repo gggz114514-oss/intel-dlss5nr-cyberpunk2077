@@ -1,0 +1,162 @@
+"""Intel ISA (GTPin --dump_isa asm5 format) parsing and structural diff.
+
+Line format:
+/* [0F60]  */ (W)     add (1|M0)   r2.8<1>:d   r1.1<0;1,0>:d   r1.0<0;1,0>:d    {I@2}
+
+Used for native review: counts, send return-register windows, DPAS positions,
+sync/barrier/allwr, and an ID-free structural diff between two dumps.
+CPU only.
+"""
+import re, sys
+from pathlib import Path
+from difflib import SequenceMatcher
+
+LINE = re.compile(r'^/\*\s*\[(?P<addr>[0-9A-Fa-f]+)\]\s*\*/\s*(?P<rest>.*)$')
+DEPS = re.compile(r'\{(?P<deps>[^}]*)\}\s*$')
+COMMENT = re.compile(r'//\s*(?P<c>.*)$')
+
+
+def parse(path):
+    out = []
+    for raw in Path(path).read_text(encoding='utf-8-sig', errors='replace').splitlines():
+        m = LINE.match(raw)
+        if not m:
+            continue
+        rest = m.group('rest')
+        deps = None
+        dm = DEPS.search(rest)
+        if dm:
+            deps = dm.group('deps').strip()
+            rest = rest[:dm.start()]
+        comment = None
+        cm = COMMENT.search(rest)
+        if cm:
+            comment = cm.group('c').strip()
+            rest = rest[:cm.start()]
+        toks = rest.split()
+        if not toks:
+            continue
+        flags = ''
+        if toks and toks[0].startswith('(') and toks[0].endswith(')'):
+            flags = toks[0]
+            toks = toks[1:]
+        if not toks:
+            continue
+        op = toks[0]
+        ops = []
+        for t in toks[1:]:
+            if t.startswith('(') and t.endswith(')'):
+                continue
+            ops.append(t)
+        out.append(dict(addr=int(m.group('addr'), 16), flags=flags, op=op, ops=ops,
+                        deps=deps, comment=comment, raw=raw.rstrip()))
+    return out
+
+
+def norm_ops(ops):
+    """ID-free operand shape: register -> '<reg>', immediate kept, others kept."""
+    out = []
+    for o in ops:
+        o2 = re.sub(r'^r\d+(\.\d+)?', '<r>', o)
+        o2 = re.sub(r'^(acc|a|b|v|nll|null|cr|null|cb)\d+(\.\d+)?', '<x>', o2)
+        out.append(o2)
+    return tuple(out)
+
+
+def sig(i):
+    return (i['op'], norm_ops(i['ops']))
+
+
+def dst_regs(i):
+    """Register numbers written by the instruction (approximation on dst operand)."""
+    regs = []
+    if not i['ops']:
+        return regs
+    m = re.match(r'^r(\d+)(\.(\d+))?', i['ops'][0])
+    if m:
+        base = int(m.group(1))
+        regs.append(base)
+    m = re.match(r'^(acc|a|b)(\d+)', i['ops'][0])
+    if m:
+        regs.append(m.group(1) + m.group(2))
+    return regs
+
+
+def rmw_regs(i):
+    regs = dst_regs(i)
+    for o in i['ops'][1:]:
+        m = re.match(r'^r(\d+)', o)
+        if m:
+            regs.append(int(m.group(1)))
+    return regs
+
+
+def summary(path):
+    isa = parse(path)
+    n = len(isa)
+    sends = [i for i in isa if i['op'].startswith('send')]
+    dpas = [i for i in isa if i['op'].startswith('dpas')]
+    first_dpas = dpas[0]['addr'] if dpas else None
+    syncs = [i for i in isa if i['op'].startswith('sync')]
+    barriers = [i for i in isa if i['op'].startswith('barrier') or i['op'].startswith('fence')]
+    allwr = [i for i in isa if 'allwr' in i['op']]
+    sends_before_dpas = [i for i in sends if first_dpas is not None and i['addr'] < first_dpas]
+    # send destination windows: dst register + width from the (W) mask
+    windows = []
+    for i in sends:
+        w = 1
+        m = re.search(r'(\d+)\|', i['flags'])
+        if m:
+            w = int(m.group(1))
+        regs = [int(x) for x in re.findall(r'^r(\d+)', i['ops'][0])] if i['ops'] else []
+        rd = None
+        if i['comment']:
+            mm = re.search(r'rd:(\d+)', i['comment'])
+            if mm:
+                rd = int(mm.group(1))
+        span = None
+        if regs:
+            span = [regs[0], regs[0] + (rd if rd else w) - 1]
+        windows.append(dict(addr=i['addr'], op=i['op'], comments=i['comment'],
+                            width=w, rd=rd, dst=regs[0] if regs else None, span=span))
+    regs_all = set()
+    for i in isa:
+        for o in i['ops']:
+            for m in re.finditer(r'r(\d+)', o):
+                regs_all.add(int(m.group(1)))
+    return dict(path=str(path), instructions=n, sends=len(sends), dpas=len(dpas),
+                first_dpas=first_dpas, sends_before_first_dpas=[dict(addr=w['addr'], op=w['op'], dst=w['dst'], span=w['span'])
+                                                               for w in windows if first_dpas is not None and w['addr'] < first_dpas],
+                syncs=len(syncs), barrier_like=len(barriers), allwr=len(allwr),
+                max_r=max(regs_all) if regs_all else None, distinct_r=len(regs_all),
+                send_windows=windows,
+                message_comments=sorted({w['comments'] for w in windows if w['comments']}))
+
+
+def diff(a, b, name_a='A', name_b='B'):
+    ia, ib = parse(a), parse(b)
+    sa = [sig(i) for i in ia]
+    sm = SequenceMatcher(None, sa, sb_ := [sig(i) for i in ib], autojunk=False)
+    ops_at = {}
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            continue
+        ops_at.setdefault(tag, []).append(dict(
+            a=[dict(addr=ia[k]['addr'], raw=ia[k]['raw']) for k in range(i1, i2)],
+            b=[dict(addr=ib[k]['addr'], raw=ib[k]['raw']) for k in range(j1, j2)]))
+    da = ia[0]['addr'] if ia else None
+    db = ib[0]['addr'] if ib else None
+    return dict(a=str(a), b=str(b), instructions=[len(ia), len(ib)],
+                delta=len(ib) - len(ia), changes=ops_at,
+                summary_a=summary(a), summary_b=summary(b))
+
+
+if __name__ == '__main__':
+    cmd = sys.argv[1]
+    if cmd == 'summary':
+        print(__import__('json').dumps(summary(sys.argv[2]), indent=2)[:6000])
+    elif cmd == 'diff':
+        d = diff(sys.argv[2], sys.argv[3])
+        print(__import__('json').dumps({k: v for k, v in d.items() if k != 'changes'}, indent=2)[:6000])
+        for tag, items in d['changes'].items():
+            print(tag, len(items))

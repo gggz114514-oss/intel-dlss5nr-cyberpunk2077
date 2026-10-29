@@ -1,0 +1,122 @@
+"""Diagnose the failed S08 GPU local arm from the run's own bytes (read-only)."""
+import json
+from pathlib import Path
+
+import numpy as np
+
+R = Path("@NR_WORKSPACE@")
+RUN = R / "work/dsh-fullnet-static-20261029/gpu/runs/s08-b31-local"
+S = R / "work/dsh-fullnet-static-20261029/S08-vit"
+Q = R / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029"
+D = Q / "real-int8-24"
+TEACH = [D / "dump-fp16", D / "teacher-diagnostics/teacher-41444", D / "teacher-diagnostics/teacher-43654"]
+M, KX, NE, NY = 288, 1024, 4096, 1024
+PACK = S / "PACK/vit_block31_weights.int8.s08.bin"
+OLDPACK = R / "candidates/codex-sol-int8-long-008-20261019/vit21-blocks31-38-v1/pack/vit_block31_weights.int8.bin"
+SCRATCH, QY = 1179648, 1474560
+
+rep = {}
+x = np.fromfile(RUN / "x31.bin", dtype="<f2")
+A = np.fromfile(RUN / "A31.bin", dtype=np.uint8)
+y = np.fromfile(RUN / "Y31.bin", dtype="<f2")
+rep["sizes"] = dict(x=x.size, A=A.size, y=y.size, expect=dict(x=384 * KX, A=2359296, y=M * NY))
+X = x[:M * KX].reshape(M, KX).astype(np.float32)
+rep["x"] = dict(absmax=float(np.abs(X).max()), absmax_gt288=float(np.abs(x[M * KX:]).max()),
+                mean=float(X.mean()), n_nonfinite=int(np.count_nonzero(~np.isfinite(X))))
+# is x31 the same as any teacher block30_out?
+same = []
+for t in TEACH:
+    bt = np.fromfile(t / "dump_block30_out.bin", dtype="<f2")
+    same.append(dict(teacher=t.name,
+                     same_live=bool(np.array_equal(x[:M * KX].view(np.uint16), bt[:M * KX].view(np.uint16))),
+                     rel=np.nan))
+    d = x[:M * KX].astype(np.float64) - bt[:M * KX].astype(np.float64)
+    same[-1]["rel"] = float(np.linalg.norm(d) / max(np.linalg.norm(bt[:M * KX].astype(np.float64)), 1e-30))
+rep["x_vs_teacher"] = same
+
+# --- pack decode ---
+def idx_int8(n, k, N, K):
+    return (n // 32) * (K // 32) * 1024 + (k // 32) * 1024 + (n % 32) * 32 + (k % 32)
+
+
+pack = PACK.read_bytes()
+p8 = np.frombuffer(pack, np.int8)
+ws = np.frombuffer(pack[9437184:9437184 + 64], dtype="<f4")
+ew = np.frombuffer(pack[9437248:9437248 + 16384], dtype="<f4")
+ac = np.frombuffer(pack[9453632:9453632 + 4096], dtype="<f4")
+wg = np.frombuffer(pack[9461824:9461824 + 2048], dtype="<f2").astype(np.float32)
+invx = np.frombuffer(pack[12623936:12623936 + 4096], dtype="<f4")
+inva = np.frombuffer(pack[12628032:12628032 + 16384], dtype="<f4")
+cE = p8[idx_int8(np.arange(4096)[:, None], np.arange(1024)[None, :], 4096, 1024)]
+cC = p8[4194304 + idx_int8(np.arange(1024)[:, None], np.arange(4096)[None, :], 1024, 4096)]
+
+
+def half(v):
+    return np.asarray(v, np.float32).astype(np.float16).astype(np.float32)
+
+
+def cubic(z):
+    z = np.float16(z)
+    t = np.clip(z, np.float16(-4.0), np.float16(4.0)).astype(np.float32)
+    u = half(np.float32(-0.055908203125) * np.abs(t) + np.float32(0.447265625))
+    v = half(t * u + np.float32(0.89453125))
+    return half(z.astype(np.float32) * v)
+
+
+def code(v, inv):
+    c = np.asarray(v, np.float32) * np.asarray(inv, np.float32)
+    return np.clip(np.rint(c), -127, 127).astype(np.int16)
+
+
+qX_ref = code(X, invx).astype(np.int16)
+gqX_u = A[SCRATCH:SCRATCH + M * KX].reshape(M, KX)
+gqX_s = gqX_u.view(np.int8).astype(np.int16)
+gqA_u = A[:M * NE].reshape(M, NE)
+gqA_s = gqA_u.view(np.int8).astype(np.int16)
+gqY_u = A[QY:QY + M * KX].reshape(M, KX)
+gqY_s = gqY_u.view(np.int8).astype(np.int16)
+
+rep["qX"] = dict(
+    unsigned_diff=int(np.count_nonzero(gqX_u.astype(np.int16) != qX_ref)),
+    signed_diff=int(np.count_nonzero(gqX_s != qX_ref)),
+    signed_maxabs=int(np.abs(gqX_s - qX_ref).max()),
+    gpu_code_range=[int(gqX_s.min()), int(gqX_s.max())],
+    ref_code_range=[int(qX_ref.min()), int(qX_ref.max())],
+    n_bytes_255=int(np.count_nonzero(gqX_u == 255)),
+    first_diff_pos=(np.argwhere(gqX_s != qX_ref)[:5].tolist()),
+    first_diff_vals=[(int(r), int(c), int(gqX_s[r, c]), int(qX_ref[r, c]))
+                     for r, c in np.argwhere(gqX_s != qX_ref)[:5]])
+
+E = half((qX_ref.astype(np.float64) @ cE.astype(np.float64).T).astype(np.float32) * ew[None, :])
+Ah = cubic(E)
+qA_ref = code(Ah, inva).astype(np.int16)
+rep["qA"] = dict(
+    unsigned_diff=int(np.count_nonzero(gqA_u.astype(np.int16) != qA_ref)),
+    signed_diff=int(np.count_nonzero(gqA_s != qA_ref)),
+    signed_maxabs=int(np.abs(gqA_s - qA_ref).max()),
+    gpu_code_range=[int(gqA_s.min()), int(gqA_s.max())],
+    ref_code_range=[int(qA_ref.min()), int(qA_ref.max())])
+
+lin = (qA_ref.astype(np.float64) @ cC.astype(np.float64).T).astype(np.float32) * ac[None, :]
+Y_ref = half(wg.astype(np.float64)[None, :] * X + lin.astype(np.float64)).astype(np.float32)
+qY_ref = code(Y_ref, np.float32(ws[12])).astype(np.int16)
+Yg = y[:M * NY].reshape(M, NY).astype(np.float32)
+rep["qY"] = dict(signed_diff=int(np.count_nonzero(gqY_s != qY_ref)),
+                 signed_maxabs=int(np.abs(gqY_s - qY_ref).max()),
+                 gpu_code_range=[int(gqY_s.min()), int(gqY_s.max())],
+                 ref_code_range=[int(qY_ref.min()), int(qY_ref.max())])
+rep["Y"] = dict(gpu_absmax=float(np.abs(Yg).max()), ref_absmax=float(np.abs(Y_ref).max()),
+                gpu_mean=float(Yg.mean()), ref_mean=float(Y_ref.mean()),
+                rel_l2=float(np.linalg.norm(Yg.astype(np.float64) - Y_ref.astype(np.float64))
+                             / np.linalg.norm(Y_ref.astype(np.float64))),
+                ratio_of_norms=float(np.linalg.norm(Yg.astype(np.float64)) / np.linalg.norm(Y_ref.astype(np.float64))),
+                bit_diff=int(np.count_nonzero(Yg.astype(np.float16).view(np.uint16)
+                                              != Y_ref.astype(np.float16).view(np.uint16))))
+# what would Yg be if the residual were missing / doubled?
+lin_g = (gqA_s.astype(np.float64) @ cC.astype(np.float64).T).astype(np.float32) * ac[None, :]
+rep["Y_candidates"] = dict(
+    ref=float(np.linalg.norm(Yg.astype(np.float64) - Y_ref.astype(np.float64)) / np.linalg.norm(Y_ref.astype(np.float64))),
+    no_residual=float(np.linalg.norm(Yg.astype(np.float64) - lin_g.astype(np.float64)) / np.linalg.norm(lin_g.astype(np.float64))),
+    gpu_acc_only_rel=float(np.linalg.norm(Yg.astype(np.float64) - lin.astype(np.float64)) / np.linalg.norm(lin.astype(np.float64))))
+print(json.dumps(rep, indent=1))
+(S / "GPU-ARM-MISMATCH-DIAG1.json").write_text(json.dumps(rep, indent=1) + "\n", encoding="utf-8")

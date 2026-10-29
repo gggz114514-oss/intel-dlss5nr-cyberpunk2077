@@ -1,0 +1,179 @@
+"""n13b-f13-contract: coverage proof + dynamic cost model (CPU only).
+
+Enumerates (wg.x, sg) for the plan's grid (3,32,1), live = pc.p0.x, for both the
+parent mapping and the candidate mapping, classifies each subgroup into
+  fast   : both 8-row blocks fully live   -> unguarded K loop (L6384..)
+  slow   : exactly one block live         -> guarded K loop (L456..)
+  dead   : both blocks above live         -> guarded K loop, no DPAS
+and prices each class with the measured static block sizes of the parent ISA.
+
+All constants below come from the capture
+  run/codex-fp16-continuation-20261021/C/ct01-f17-native-001/gtpin/ISA/
+  CS_asm479f1bb119e3b522_simd32_0000000000000002_1_orig.asm   (sha256 a6d4bc55...)
+and from its SPIR-V statistics (Instruction Count 3458, Basic Block Count 30,
+Workgroup Memory Size 0, Scratch 0, Loop Count 2).
+"""
+import json
+import sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parents[1]
+
+# ---- measured block sizes (instructions) and message counts of the parent ISA ----
+BLK = dict(
+    head=20 + 19,        # L0 (20) + L288 accumulator zero init (19) — both paths
+    fast_pro=81,         # L6384 four B messages + addresses
+    fast_body=2271,      # L7552 15 x 32K steps   (120 dpas, 480 narrow, 60 wide)
+    fast_tail=196,       # L42128 1 x 32K step + back edge (8 dpas, 32 narrow, 4 wide)
+    fast_peel=129,       # L45040 last two 16K steps (8 dpas, 32 narrow, no wide)
+    epi=6 + 133 + 136 + 2 + 6,   # L46864 / L46944 / L48848 / L50752 / L50784
+    slow_step_guard=19,  # 2 wide B messages + addresses, then the mB guard branch
+    slow_step_block=47,  # 8 narrow A messages + 2 dpas + 16 mov(32) + 7 sync
+    slow_skip=1,         # the 1-instruction skip block between the two A blocks
+    dead_exit=4,         # candidate only: cmp/cmp/and/jmpi before the pair split
+)
+# per-subgroup dynamic counts of the parent kernel, from the loop trip counts
+FAST_ITERS, FAST_STEPS_PER_ITER, FAST_TAIL_STEPS = 8, 16, 7
+SLOW_ITERS, SLOW_STEPS_PER_ITER = 64, 4
+K_STEPS16 = 256          # K=4096 / 16
+
+
+def mm(pid):
+    """Lane addressing: PIDs of a 256-thread workgroup, 8 subgroups of 32 lanes."""
+    return pid // 32
+
+
+def classify(live, wg_x, sg, mapping):
+    if mapping == 'parent':
+        mA = wg_x * 128 + sg * 8
+        mB = mA + 64
+    else:
+        mA = wg_x * 128 + sg * 16
+        mB = mA + 8
+    a, b = mA < live, mB < live
+    cls = 'fast' if (a and b) else ('slow' if (a or b) else 'dead')
+    return cls, mA, mB
+
+
+def price(cls, mapping):
+    """(instructions, narrow msgs, wide msgs, dpas) executed by one subgroup."""
+    if cls == 'fast':
+        steps = FAST_ITERS * FAST_STEPS_PER_ITER - 1   # 127 steps of 32K in the loop
+        body = FAST_ITERS * BLK['fast_body'] + FAST_TAIL_STEPS * BLK['fast_tail']
+        ins = BLK['head'] + BLK['fast_pro'] + body + BLK['fast_peel'] + BLK['epi']
+        narrow = steps * 32 + 32                        # 4 tiles x 8 rows per step + peel
+        wide = steps * 4
+        dpas = steps * 8 + 8
+        return dict(instructions=ins, narrow=narrow, wide=wide, dpas=dpas,
+                    steps32k=steps + 1)
+    if cls == 'slow':
+        ins = BLK['head'] + SLOW_ITERS * SLOW_STEPS_PER_ITER * (
+            BLK['slow_step_guard'] + BLK['slow_skip'] + BLK['slow_step_block']) + BLK['epi']
+        narrow = K_STEPS16 * 8
+        wide = K_STEPS16 * 2
+        dpas = K_STEPS16 * 2
+        return dict(instructions=ins, narrow=narrow, wide=wide, dpas=dpas, steps32k=128)
+    # dead
+    if mapping == 'cand':     # candidate: early return, the K loop is not entered
+        return dict(instructions=BLK['head'] + BLK['dead_exit'], narrow=0, wide=0, dpas=0,
+                    steps32k=0)
+    ins = BLK['head'] + SLOW_ITERS * SLOW_STEPS_PER_ITER * (
+        BLK['slow_step_guard'] + BLK['slow_skip']) + BLK['epi']
+    return dict(instructions=ins, narrow=0, wide=K_STEPS16 * 2, dpas=0, steps32k=128)
+
+
+def census(live, grid_x, grid_y, mapping):
+    """All (wg.x, wg.y, sg) of one dispatch = grid_x * grid_y workgroups."""
+    rows = []
+    for wg_y in range(grid_y):
+        for wg_x in range(grid_x):
+            for sg in range(8):
+                cls, mA, mB = classify(live, wg_x, sg, mapping)
+                p = price(cls, mapping)
+                rows.append(dict(wg_x=wg_x, wg_y=wg_y, sg=sg, cls=cls, mA=mA, mB=mB, **p))
+    tot = {k: sum(r[k] for r in rows) for k in ('instructions', 'narrow', 'wide', 'dpas')}
+    per = {c: sum(1 for r in rows if r['cls'] == c) for c in ('fast', 'slow', 'dead')}
+    # per-workgroup wall proxy: the slowest subgroup of the workgroup (all SGs run in parallel)
+    wg = {}
+    for r in rows:
+        k = (r['wg_x'], r['wg_y'])
+        wg[k] = max(wg.get(k, 0), r['instructions'])
+    wg_cls = {}
+    for r in rows:
+        k = (r['wg_x'], r['wg_y'])
+        wg_cls.setdefault(k, set()).add(r['cls'])
+    lat = {}
+    for k, v in wg.items():
+        key = '+'.join(sorted(wg_cls[k]))
+        lat.setdefault(key, []).append(v)
+    return rows, tot, per, {k: dict(wgs=len(v), max_sg_instructions=max(v)) for k, v in lat.items()}
+
+
+def coverage(live, grid_x, mapping):
+    """rows written exactly once, rows written above live, and the block bijection."""
+    seen = {}
+    over = set()
+    for wg_x in range(grid_x):
+        for sg in range(8):
+            cls, mA, mB = classify(live, wg_x, sg, mapping)
+            for base in (mA, mB):
+                if base >= live:
+                    continue        # epilogue skips this block
+                for r in range(base, base + 8):
+                    seen[r] = seen.get(r, 0) + 1
+                    if r >= live:
+                        over.add(r)
+    dup = {r: c for r, c in seen.items() if c != 1}
+    missing = [r for r in range(live) if r not in seen]
+    blocks = {}
+    for wg_x in range(grid_x):
+        for sg in range(8):
+            cls, mA, mB = classify(live, wg_x, sg, mapping)
+            for base in (mA, mB):
+                blocks.setdefault(base, 0)
+                blocks[base] += 1
+    return dict(live=live, rows_covered=len(seen), expected=live, duplicates=dup,
+                missing=missing, over_store=sorted(over),
+                block_bijection=all(v == 1 for v in blocks.values()),
+                blocks=len(blocks))
+
+
+def main():
+    out = dict(tool='n13b-f13-contract/_tools/proof.py', grid=[3, 32, 1], local_size=256,
+               subgroups_per_wg=8, K=4096, N=1024, live_from_plan=288)
+    out['block_sizes'] = BLK
+    out['coverage_parent'] = {str(l): coverage(l, 3, 'parent') for l in (288, 289, 296, 287, 8, 16, 383)}
+    out['coverage_cand'] = {str(l): coverage(l, 3, 'cand') for l in (288, 289, 296, 287, 8, 16, 383)}
+    for tag, key in (('parent', 'parent'), ('candidate', 'cand')):
+        rows, tot, per, lat = census(288, 3, 32, key)
+        out['dynamic_' + tag] = dict(per_class=per, totals=tot, sg_classes=per,
+                                     workgroup_latency=lat,
+                                     per_dispatch=dict(instructions=tot['instructions'],
+                                                       narrow_msgs=tot['narrow'],
+                                                       wide_msgs=tot['wide'],
+                                                       dpas=tot['dpas'],
+                                                       narrow_bytes=tot['narrow'] * 32,
+                                                       wide_bytes=tot['wide'] * 512),
+                                     fastest_sg=max(r['instructions'] for r in rows),
+                                     details=rows)
+    a = out['dynamic_parent']['per_dispatch']
+    b = out['dynamic_candidate']['per_dispatch']
+    out['delta_per_dispatch'] = {k: b[k] - a[k] for k in a}
+    out['delta_pct'] = {k: (100.0 * (b[k] - a[k]) / a[k] if a[k] else None) for k in a}
+    out['frames_per_pass'] = 8
+    out['delta_per_frame'] = {k: 8 * v for k, v in out['delta_per_dispatch'].items()}
+    CARD.joinpath('_tools').mkdir(exist_ok=True)
+    CARD.joinpath('_tools', 'proof-model.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    for tag in ('parent', 'candidate'):
+        d = out['dynamic_' + tag]
+        print(tag, 'classes', d['per_class'], 'totals', d['totals'])
+    print('delta', out['delta_per_dispatch'])
+    print('delta%', {k: (round(v, 2) if v is not None else None) for k, v in out['delta_pct'].items()})
+    print('coverage parent 288', out['coverage_parent']['288'])
+    print('coverage cand   288', out['coverage_cand']['288'])
+    print('sanity parent cov 289', out['coverage_parent']['289']['over_store'],
+          'cand cov 289', out['coverage_cand']['289']['over_store'])
+
+
+if __name__ == '__main__':
+    main()

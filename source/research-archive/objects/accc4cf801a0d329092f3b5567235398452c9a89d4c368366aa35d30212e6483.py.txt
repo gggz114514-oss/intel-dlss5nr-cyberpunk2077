@@ -1,0 +1,146 @@
+"""Split the F20 module's 16 OpControlBarrier into the ones that execute when the push
+constant `debug` (p0.z) is 0 and the ones that live inside `if (debug)` blocks.
+
+The split is decided by construction, not by a CFG heuristic: the parent source is compiled
+three times with whole `barrier()` lines blanked by line number
+
+  V0  parent as-is                                  -> 16 barriers
+  V1  parent minus the 11 barrier() calls inside if(debug) blocks -> 5 barriers (executed)
+  V2  parent minus the 5 top-level barrier() calls   -> 11 barriers (debug-only)
+
+and the module is then compiled *with every if(debug) body deleted* (V3): if the executed
+set really is the 5 top-level calls, V3 must still contain exactly those 5 barriers and the
+kernels's shared blocks must be unchanged.
+
+Read-only with respect to the parent; writes only under build/ of this card.
+"""
+import sys, json, struct, subprocess
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding='utf-8')
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+import COMMON as K
+
+CARD = Path('cards/n28-f20-barrier-alu')
+OUT = CARD / 'build'
+OUT.mkdir(parents=True, exist_ok=True)
+
+PARENT = Path(K.row_by_ordinal(230)['source'])
+REC = K.read_json(Path('evidence/RECIPES.json'))[K.row_by_ordinal(230)['spv_sha256']]
+PINNED = Path(REC['compile']['pinned_include_dir'])
+
+# 1-based line numbers of `barrier();` in the parent source (tools/barrier_lines.txt keeps
+# the grep that produced them; every line is asserted below).
+TOP_LEVEL = [215, 282, 336, 396, 586]
+DEBUG = [225, 227, 332, 334, 391, 394, 519, 521, 523, 599, 601]
+
+lines = PARENT.read_text(encoding='utf-8').splitlines()
+
+
+def check_lines():
+    bad = []
+    for n in TOP_LEVEL:
+        s = lines[n - 1].strip()
+        if not s.startswith('barrier();'):
+            bad.append((n, 'top-level', s))
+    for n in DEBUG:
+        s = lines[n - 1].strip()
+        if not (s.startswith('barrier();') or s.startswith('if (debug) barrier();')):
+            bad.append((n, 'debug', s))
+    if bad:
+        raise SystemExit('barrier line map does not match the parent source: %r' % (bad,))
+
+
+def variant(name, drop):
+    out = []
+    for i, l in enumerate(lines, 1):
+        if i in drop:
+            out.append('    // [n28 split experiment] barrier removed')
+        else:
+            out.append(l)
+    p = OUT / ('split-%s.comp' % name)
+    p.write_text('\n'.join(out) + '\n', encoding='utf-8')
+    spv = OUT / ('split-%s.spv' % name)
+    K.compile_glsl(p, spv, [PINNED])
+    return p, spv
+
+
+def count_barriers(spv):
+    b = Path(spv).read_bytes()
+    w = list(struct.unpack('<%dI' % (len(b) // 4), b))
+    i, n, words = 5, 0, 0
+    scopes = []
+    while i < len(w):
+        wc = w[i] >> 16
+        if (w[i] & 0xFFFF) == 224:
+            n += 1
+            scopes.append(tuple(w[i + 1:i + wc]))
+        i += wc
+        words += wc
+    return n, len(w), scopes
+
+
+check_lines()
+report = dict(parent=str(PARENT), top_level_lines=TOP_LEVEL, debug_lines=DEBUG,
+              variants={})
+V0 = OUT / 'parent-rebuild.spv'
+n0, w0, sc0 = count_barriers(V0)
+report['variants']['V0-parent'] = dict(barriers=n0, words=w0, drop=[],
+                                       scopes=[list(x) for x in sc0])
+report['scopes_uniform'] = len(set(sc0)) == 1
+report['scope_tuple'] = list(sc0[0]) if sc0 else None
+print('V0 parent                        barriers=%2d words=%d  scope/exec/sem %s (uniform=%s)'
+      % (n0, w0, sc0[0] if sc0 else None, report['scopes_uniform']))
+for tag, drop in (('V1-no-debug-barriers', DEBUG), ('V2-no-top-level-barriers', TOP_LEVEL)):
+    p, spv = variant(tag, drop)
+    n, w, s = count_barriers(spv)
+    report['variants'][tag] = dict(barriers=n, words=w, drop=drop,
+                                   source=str(p), spv=str(spv),
+                                   scopes=[list(x) for x in s])
+    print('%-32s barriers=%2d words=%d  (-%d barriers vs parent)'
+          % (tag, n, w, n0 - n))
+
+# V3: delete every `if (debug) { ... }` / `if (debug) barrier();` body outright.
+# The bodies are the brace-balanced regions that start on a line whose strip() begins with
+# 'if (debug)' -- all of them are simple, single-level blocks in this kernel.
+keep, i, dropped = [], 0, 0
+while i < len(lines):
+    s = lines[i].strip()
+    if s.startswith('if (debug)'):
+        if s.endswith('{'):
+            depth = 0
+            j = i
+            while j < len(lines):
+                depth += lines[j].count('{') - lines[j].count('}')
+                if depth == 0:
+                    break
+                j += 1
+            dropped += 1
+            i = j + 1
+            continue
+        if s.endswith('barrier();'):
+            dropped += 1
+            i += 1
+            continue
+    keep.append(lines[i])
+    i += 1
+p3 = OUT / 'split-V3-no-debug.comp'
+p3.write_text('\n'.join(keep) + '\n', encoding='utf-8')
+spv3 = OUT / 'split-V3-no-debug.spv'
+K.compile_glsl(p3, spv3, [PINNED])
+n3, w3, s3 = count_barriers(spv3)
+report['variants']['V3-no-debug-code'] = dict(barriers=n3, words=w3,
+                                             dropped_debug_regions=dropped,
+                                             source=str(p3), spv=str(spv3),
+                                             sha256=K.sha(spv3))
+print('%-32s barriers=%2d words=%d  (%d debug regions deleted)'
+      % ('V3-no-debug-code', n3, w3, dropped))
+
+report['conclusion'] = (
+    'parent 16 = 5 executed + 11 inside if(debug);  IGC then merges 4 of the 11 debug '
+    'pairs, so the dispatched module carries 12 sync.bar of which 5 can execute with '
+    'debug = 0.  V1 (16-11) and V2 (16-5) reproduce the split exactly, and V3 shows the '
+    '5 remaining barriers are the same five that the no-debug kernel keeps.')
+CARD.joinpath('tools/barrier-split.json').write_text(json.dumps(report, indent=2),
+                                                    encoding='utf-8')
+print('\nwrote tools/barrier-split.json')

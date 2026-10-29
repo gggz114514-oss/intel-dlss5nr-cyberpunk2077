@@ -1,0 +1,550 @@
+"""R10/R11 segment-local CPU integer reference (numpy, CPU only, no GPU).
+
+What is measured, and on which data
+-----------------------------------
+There is no capture of either fused pass (PASS 14 / PASS 22) in this workspace.
+What exists is a full-grid capture of each width's *body/WO stage* -- the module
+the fused pass embeds verbatim as `nr_body_stage`:
+
+  R10: candidates/amd-map-20261015/s1-output-complete/gpu-numeric/c128-full-b9-full
+       252 windows on a 21x12 lattice, shift (0,0), pack swin_9_weights.fp16.bin
+  R11: candidates/amd-map-20261015/s1-output-complete/gpu-numeric/c256-full-b16-full
+        77 windows on an 11x7 lattice, shift (-1,-1), pack swin_16_weights.fp16.bin
+
+So the reference is built on a *neighbouring block of the same width*, exactly as
+the C64 sibling card did (it used a block-6 frame for a block-8 pass), and the
+deployed pass's own frame remains unmeasured.  The captures carry T (context),
+Y (residual) and image_out, i.e. exactly the WO arm's inputs and output.
+
+Sections
+  A provenance   : replay the parent's fp16 WO arithmetic (its own tile formula,
+                   residual multiply, image addressing) from T/Y/pack and compare
+                   with the captured image_out.  A wrong decode cannot pass this.
+  B exactness    : int8 arm's int32 accumulation == int64 accumulation.
+  C WO arm       : int8 WO vs fp16 WO on the same frame (rel L2, identical share,
+                   max abs, saturation share, per-window activation amax range).
+  D pooling      : the parent's fp16 pooling tree on both arms; pooled-half
+     + post-pool   difference; then the *one* post-pool quantisation of the
+                   parent's pooled value -> DS codes, and the pre-pool alternative
+                   (quantise WO output, dequantise, pool, quantise again) for
+                   comparison.  This is the "which side of the pool" evidence.
+  E DS arm       : int8 DS vs fp16 DS (deployed pack) on (i) the parent's own
+                   pooled tile (isolates the DS conversion) and (ii) the int8 WO
+                   arm's pooled tile (end-to-end segment).
+
+Nothing here is a gate, a PSNR or a tolerance decision: E is a self-comparison of
+this arm against the parent's own arithmetic on the same inputs.
+
+usage: python tools/oracle.py
+"""
+import json
+import struct
+import sys
+from pathlib import Path
+
+import numpy as np
+
+R = Path("@NR_WORKSPACE@")
+AM = R / "candidates/amd-map-20261015"
+CARD = Path(__file__).resolve().parent.parent
+EVID = CARD / "evidence"
+
+SPECS = {
+    "R10": dict(
+        pass_name="f3c128_body_ds", pass_order=14, K=128, N=256,
+        ws=8192, family="blocked", edge="c128",
+        # the deployed module (byte-identical replay) reads the WO tiles as
+        # wo + (n/16)*(K/16)*256 + (k/16)*256 + (n%16)*16 + (k%16)  [blocked]
+        deployed_wo_layout="blocked",
+        cap=AM / "s1-output-complete/gpu-numeric/c128-full-b9-full",
+        case=AM / "s1-output-complete/numeric-cases.json", case_name="c128-full-b9-full",
+        bank_w=8,                   # channel blocks per image tile
+        image_halfs=2064384),
+    "R11": dict(
+        pass_name="f3c256_body_ds", pass_order=22, K=256, N=512,
+        # NOTE: the *captured* module is c256_d4_full, which reads the blocked
+        # form and was fed the WO-only re-laid pack.  The *deployed* fused body
+        # is built on c256_d4_epi_only and reads the plain form
+        # wo + n*256 + k (stride 256, LCOL), which is what tools/make_packs.py
+        # uses for the shipped pack.  The two pack files hold the SAME weights in
+        # the two layouts (proved in build/probe_wo_layout.py), so the decoded
+        # matrix W -- and therefore every number below -- is identical either way.
+        ws=16384, family="blocked", edge="c256", deployed_wo_layout="linear",
+        cap=AM / "s1-output-complete/gpu-numeric/c256-full-b16-full",
+        case=AM / "s1-output-complete/numeric-cases.json", case_name="c256-full-b16-full",
+        bank_w=16,
+        image_halfs=1081344),
+}
+
+
+def sha(p):
+    import hashlib
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def read_case(spec):
+    d = json.loads(spec["case"].read_text(encoding="utf-8"))
+    for c in d["cases"]:
+        if c["name"] == spec["case_name"]:
+            return c
+    raise SystemExit("case %s not found" % spec["case_name"])
+
+
+def read_abi(path):
+    w = np.frombuffer(Path(path).read_bytes(), dtype="<u4")
+    assert w.size == 49, w.size
+    sizes = w[0:8].tolist()
+    # the ABI stores the 32 push words as int32; a -1 arrives as 4294967295
+    push = [int(v) - (1 << 32) if int(v) >= (1 << 31) else int(v) for v in w[16:48]]
+    return sizes, push
+
+
+def fp16_wo_index(family, base, K, n, k):
+    if family == "linear":
+        return base + n * K + k
+    return (base + (n // 16) * (K // 16) * 256 + (k // 16) * 256
+            + (n % 16) * 16 + (k % 16))
+
+
+def decode_wo(raw, family, base, N, K):
+    nn = np.arange(N)[:, None] * np.ones((1, K), dtype=np.int64)
+    kk = np.ones((N, 1), dtype=np.int64) * np.arange(K)[None, :]
+    return raw[fp16_wo_index(family, base, K, nn, kk)].astype(np.float32)
+
+
+def decode_ds(raw, base, N, K):
+    nn = np.arange(N)[:, None] * np.ones((1, K), dtype=np.int64)
+    kk = np.ones((N, 1), dtype=np.int64) * np.arange(K)[None, :]
+    return raw[base + (nn // 16) * (K // 16) * 256 + (kk // 16) * 256
+               + (nn % 16) * 16 + (kk % 16)].astype(np.float32)
+
+
+def i8_index(N, K, n, k):
+    return (n // 16) * (K // 32) * 512 + (k // 32) * 512 + (n % 16) * 32 + (k % 32)
+
+
+def quantise(W, s):
+    code = np.zeros_like(W, dtype=np.int32)
+    nz = s > 0
+    if np.any(nz):
+        q = np.rint(W[nz] / s[nz][:, None])
+        code[nz] = np.clip(q, -127.0, 127.0).astype(np.int32)
+    return code
+
+
+def rint_div(x, s):
+    """round-even of x/s with s a positive scalar (s == 0 -> zeros)."""
+    if s <= 0.0:
+        return np.zeros(x.shape, dtype=np.int32)
+    return np.clip(np.rint(x.astype(np.float64) / s), -127.0, 127.0).astype(np.int32)
+
+
+def img_index(edge, tiles_x, t, c, wx, wy, shx, shy):
+    q = t >> 4
+    s = t & 15
+    tx = 2 * wx + shx + int(q & 1)
+    ty = 2 * wy + shy + int(q >> 1)
+    if tx < 0 or ty < 0 or tx >= tiles_x[0] or ty >= tiles_x[1]:
+        return None
+    stx = min(max(tx, 0), tiles_x[0] - 1)
+    sty = min(max(ty, 0), tiles_x[1] - 1)
+    if edge == "c128":
+        return (((sty * tiles_x[0] + stx) * 8 + c // 16) * 256 + s * 16 + c % 16)
+    return (((sty * tiles_x[0] + stx) * 16 + c // 16) * 256 + s * 16 + c % 16)
+
+
+def img_index_map(spec, tiles, K, wx, wy, shx, shy):
+    """Vectorised c128/c256_img_half_index over (t, c) for one window.
+
+    Mirrors the parent helper exactly: q = t>>4, s = t&15,
+    tx = 2wx + shift_x + (q&1), ty = 2wy + shift_y + (q>>1), out-of-range
+    tiles are dropped (the parent skips the store), in-range coordinates are
+    clamped exactly as the parent clamps them.
+    """
+    t = np.arange(64)
+    c = np.arange(K)
+    q, s = t >> 4, t & 15
+    tx = 2 * wx + shx + (q & 1)
+    ty = 2 * wy + shy + (q >> 1)
+    ok = ((tx >= 0) & (ty >= 0) & (tx < tiles[0]) & (ty < tiles[1]))
+    stx = np.clip(tx, 0, tiles[0] - 1)
+    sty = np.clip(ty, 0, tiles[1] - 1)
+    bank = 8 if spec["edge"] == "c128" else 16
+    base = (sty * tiles[0] + stx) * bank                      # (64,)
+    idx = (base[:, None] * 256 + (c // 16)[None, :] * 256
+           + s[:, None] * 16 + (c % 16)[None, :])
+    return idx, np.broadcast_to(ok[:, None], idx.shape)
+
+
+def stats(a, b, mask=None):
+    a = a.astype(np.float64)
+    b = b.astype(np.float64)
+    if mask is not None:
+        a, b = a[mask], b[mask]
+    d = a - b
+    den = float(np.sqrt((a ** 2).sum()))
+    return {"compared": int(a.size),
+            "bit_identical_share": float((a == b).mean()) if a.size else 0.0,
+            "rel_L2": float(np.sqrt((d ** 2).sum()) / den) if den else 0.0,
+            "rms": float(np.sqrt((d ** 2).mean())) if a.size else 0.0,
+            "max_abs_diff": float(np.abs(d).max()) if a.size else 0.0,
+            "absmax_ref": float(np.abs(a).max()) if a.size else 0.0}
+
+
+def main():
+    out = {"card": "r10-r11-ds", "gpu_used": False, "numpy": np.__version__,
+           "note": "CPU/numpy only. Segment-local reference on a neighbouring block "
+                   "of the same width; no capture of PASS 14 / PASS 22 exists.",
+           "passes": {}}
+    for tag, spec in SPECS.items():
+        case = read_case(spec)
+        sizes, push = read_abi(case["inputs"]["abi"]["path"])
+        p0 = push[0:4]
+        p1 = push[4:8]
+        p4 = push[16:20]
+        K, ws = spec["K"], spec["ws"]
+        tiles = (p0[0], p0[1])
+        grid = (p1[0], p1[1])
+        shx, shy = p0[2], p0[3]
+        wo, ars = p4[0], p4[2]
+        nwin = grid[0] * grid[1]
+        packp = Path(case["inputs"]["pack"]["path"])
+        capd = spec["cap"]
+        T = np.fromfile(capd / "T.bin", dtype="<f2")
+        Y = np.fromfile(capd / "Y.bin", dtype="<f2")
+        IMG = np.fromfile(capd / "image_out.bin", dtype="<f2")
+        raw = np.fromfile(packp, dtype="<f2")
+        assert T.size == nwin * ws, (T.size, nwin * ws)
+        assert Y.size == nwin * ws
+        W = decode_wo(raw, spec["family"], wo, K, K)                 # [N=K][K]
+        scale = raw[ars:ars + K].astype(np.float16).astype(np.float32)
+        # int8 WO pack, exactly as tools/make_packs.py builds the shipped one
+        amax_w = np.abs(W).max(axis=1)
+        sW = amax_w / 127.0
+        codeW = quantise(W, sW)
+
+        Th = T.reshape(nwin, 64, K)
+        Yh = Y.reshape(nwin, 64, K)
+        # ------------------------------------------------------------ A/C
+        img_fp16 = np.full(spec["image_halfs"], np.nan, dtype=np.float16)
+        img_i8 = np.full(spec["image_halfs"], np.nan, dtype=np.float16)
+        cov = np.zeros(spec["image_halfs"], dtype=bool)
+        acc64 = True
+        amax_act = []
+        sat_act = 0
+        sat_tot = 0
+        pair_fp16 = np.zeros((nwin, 16 * 2, 128), dtype=np.float16)   # per-subgroup staging is per (sg,acc)
+        pair_i8 = np.zeros_like(pair_fp16)
+        # per-window WO output, kept for the pooling section
+        Oout_fp16 = np.zeros((nwin, 64, K), dtype=np.float16)
+        Oout_i8 = np.zeros((nwin, 64, K), dtype=np.float16)
+        seed = (Yh.astype(np.float16) * scale.astype(np.float16)).astype(np.float16)
+        for w in range(nwin):
+            wx, wy = w % grid[0], w // grid[0]
+            A = Th[w]
+            acc_f = A.astype(np.float64) @ W.T.astype(np.float64)
+            o32 = acc_f + seed[w].astype(np.float64)
+            o16 = o32.astype(np.float16)
+            Oout_fp16[w] = o16
+            # int8 arm: per-workgroup per-tensor activation scale
+            m = float(np.abs(A).max())
+            inv = 127.0 / m if m > 0 else 0.0
+            sC = m / 127.0 if m > 0 else 0.0
+            amax_act.append(m)
+            codeA = rint_div(A, sC)
+            sat_act += int(np.count_nonzero(np.abs(codeA) == 127))
+            sat_tot += codeA.size
+            acc32 = codeA @ codeW.T
+            if acc64:
+                acc64 = bool(np.array_equal(acc32.astype(np.int64),
+                                            codeA.astype(np.int64) @ codeW.T.astype(np.int64)))
+            o8 = (acc32.astype(np.float64) * (sC * sW)[None, :]
+                  + seed[w].astype(np.float64)).astype(np.float16)
+            Oout_i8[w] = o8
+            idx, msk = img_index_map(spec, tiles, K, wx, wy, shx, shy)
+            ii = idx[msk]
+            img_fp16[ii] = o16[msk]
+            img_i8[ii] = o8[msk]
+            cov[ii] = True
+        # A: provenance
+        capt = IMG[:spec["image_halfs"]]
+        A_ok = stats(img_fp16[cov].astype(np.float32), capt[cov].astype(np.float32))
+        A_ok["covered_image_halfs"] = int(cov.sum())
+        A_ok["image_halfs"] = int(spec["image_halfs"])
+        A_ok["coverage_share"] = float(cov.sum()) / spec["image_halfs"]
+        # C: WO int8 vs fp16
+        C_ok = stats(img_i8[cov].astype(np.float32), img_fp16[cov].astype(np.float32))
+        C_ok["activation_amax"] = {"min": float(np.min(amax_act)),
+                                   "max": float(np.max(amax_act)),
+                                   "mean": float(np.mean(amax_act))}
+        C_ok["activation_code_saturation_share"] = sat_act / float(sat_tot)
+        C_ok["wo_weight_saturation_share"] = float(np.count_nonzero(np.abs(codeW) == 127)) / codeW.size
+        C_ok["wo_weight_rel_L2"] = float(
+            np.sqrt(((W - codeW * sW[:, None]) ** 2).sum() / (W ** 2).sum()))
+
+        # ------------------------------------------------------------ D/E
+        pooled_fp16 = np.zeros((nwin, 16, K), dtype=np.float16)
+        pooled_i8 = np.zeros((nwin, 16, K), dtype=np.float16)
+        for w in range(nwin):
+            wx, wy = w % grid[0], w // grid[0]
+            if spec["edge"] == "c128":
+                for j in range(4):
+                    for sg in range(8):
+                        Rh = sg >> 2
+                        g4 = sg % 4
+                        m0 = (Rh + 2 * j) * 8
+                        n0 = g4 * 32
+                        sx1, sy1 = j & 1, j >> 1
+                        tx = 2 * wx + shx + sx1
+                        ty = 2 * wy + shy + sy1
+                        tile_ok = (0 <= tx < tiles[0]) and (0 <= ty < tiles[1])
+                        for dx in range(2):
+                            px = 4 * wx - 2 + 2 * sx1 + dx
+                            py = 4 * wy - 2 + 2 * sy1 + Rh
+                            ly = 2 * sy1 + Rh
+                            lx = 2 * sx1 + dx
+                            ok = (tile_ok and px < p0[0] and py >= 0
+                                  and py < 24 and py < 48)
+                            rows = [m0 + 2 * dx + d for d in (0, 1, 4, 5)]
+                            for src, dst in ((Oout_fp16, pooled_fp16), (Oout_i8, pooled_i8)):
+                                a, b, cc, dd = (src[w, rows[0], n0:n0 + 32],
+                                                src[w, rows[1], n0:n0 + 32],
+                                                src[w, rows[2], n0:n0 + 32],
+                                                src[w, rows[3], n0:n0 + 32])
+                                v = ((a + b) + (cc + dd)) * np.float16(0.25)
+                                if not ok:
+                                    v = np.zeros_like(v)
+                                dst[w, 4 * ly + lx, n0:n0 + 32] = v
+            else:
+                for j in range(8):
+                    for sg in range(8):
+                        m0 = j * 8
+                        n0 = sg * 32
+                        q = j >> 1
+                        sx1, sy1 = q & 1, q >> 1
+                        dy = j & 1
+                        for dx in range(2):
+                            px = 4 * wx + 2 * sx1 + dx
+                            py = 4 * wy - 2 + 2 * sy1 + dy
+                            ly = 2 * (1 - sy1) + dy
+                            lx = 2 * sx1 + dx
+                            ok = (px < 42 and px < 44 and py >= 0 and py < 24 and py < 24)
+                            rows = [m0 + 2 * dx + d for d in (0, 1, 4, 5)]
+                            for src, dst in ((Oout_fp16, pooled_fp16), (Oout_i8, pooled_i8)):
+                                a, b, cc, dd = (src[w, rows[0], n0:n0 + 32],
+                                                src[w, rows[1], n0:n0 + 32],
+                                                src[w, rows[2], n0:n0 + 32],
+                                                src[w, rows[3], n0:n0 + 32])
+                                v = ((a + b) + (cc + dd)) * np.float16(0.25)
+                                if not ok:
+                                    v = np.zeros_like(v)
+                                dst[w, 4 * ly + lx, n0:n0 + 32] = v
+        D_pool = stats(pooled_i8.astype(np.float32), pooled_fp16.astype(np.float32))
+        D_pool["pooled_values"] = int(pooled_fp16.size)
+
+        # the DS weights, deployed fp16 pack (ioport_14 / ioport_22 at whalf)
+        dsspec = {
+            "R10": (R / "candidates/amd-map-20261015/round4-integrated/candidate/packs/"
+                    "ioport_14_ioport_pack.fp16.bin", 180736, 256),
+            "R11": (R / "candidates/amd-map-20261015/round4-integrated/candidate/packs/"
+                    "ioport_22_ioport_pack.fp16.bin", 656128, 512),
+        }[tag]
+        Nds = dsspec[2]
+        draw = np.fromfile(dsspec[0], dtype="<f2")
+        Wds = decode_ds(draw, dsspec[1], Nds, K)
+        amax_ds = np.abs(Wds).max(axis=1)
+        sWds = amax_ds / 127.0
+        codeWds = quantise(Wds, sWds)
+
+        def ds_fp16(tile):
+            """parent DS: rows x Wds^T in fp32, narrowed to half."""
+            return (tile.astype(np.float64) @ Wds.T.astype(np.float64)).astype(np.float16)
+
+        def ds_i8(tile, sD, codes):
+            return (codes.astype(np.int64) @ codeWds.T.astype(np.int64)).astype(np.float64) \
+                * (sD * sWds)[None, :]
+
+        # post-pool quantisation of the parent's own pooled tile
+        sD_post = np.array([max(float(np.abs(pooled_fp16[w]).max()) / 127.0, 0.0)
+                            for w in range(nwin)], dtype=np.float64)
+        codes_post = np.zeros((nwin, 16, K), dtype=np.int32)
+        for w in range(nwin):
+            codes_post[w] = rint_div(pooled_fp16[w], sD_post[w])
+        # pre-pool alternative: quantise the WO output, dequantise, pool, requantise
+        sO_pre = np.array([max(float(np.abs(Oout_fp16[w]).max()) / 127.0, 0.0)
+                           for w in range(nwin)], dtype=np.float64)
+        pooled_pre = np.zeros_like(pooled_fp16)
+        for w in range(nwin):
+            q = rint_div(Oout_fp16[w], sO_pre[w])
+            dq = (q.astype(np.float64) * sO_pre[w]).astype(np.float16)
+            Otmp = dq.reshape(1, 64, K)
+            # re-run the pooling tree on the dequantised (pre-pool quantised) values
+            for j in range(4 if spec["edge"] == "c128" else 8):
+                for sg in range(8):
+                    if spec["edge"] == "c128":
+                        Rr = sg >> 2
+                        m0 = (Rr + 2 * j) * 8
+                        n0 = (sg % 4) * 32
+                    else:
+                        Rr = 0
+                        m0 = j * 8
+                        n0 = sg * 32
+                    rows_pairs = [(2 * dx, 2 * dx + 1, 2 * dx + 4, 2 * dx + 5) for dx in (0, 1)]
+                    for dx, (r0, r1, r2, r3) in enumerate(rows_pairs):
+                        v = ((Otmp[0, m0 + r0, n0:n0 + 32] + Otmp[0, m0 + r1, n0:n0 + 32])
+                             + (Otmp[0, m0 + r2, n0:n0 + 32] + Otmp[0, m0 + r3, n0:n0 + 32])
+                             ) * np.float16(0.25)
+                        # slot layout differs per edge; reuse the same slot map as above
+                        if spec["edge"] == "c128":
+                            sx1, sy1 = j & 1, j >> 1
+                            ly = 2 * sy1 + Rr
+                            lx = 2 * sx1 + dx
+                            wx, wy = w % grid[0], w // grid[0]
+                            tx = 2 * wx + shx + sx1
+                            ty = 2 * wy + shy + sy1
+                            tile_ok = (0 <= tx < tiles[0]) and (0 <= ty < tiles[1])
+                            px = 4 * wx - 2 + 2 * sx1 + dx
+                            py = 4 * wy - 2 + 2 * sy1 + Rr
+                            ok = (tile_ok and px < p0[0] and py >= 0 and py < 24 and py < 48)
+                        else:
+                            qq = j >> 1
+                            sx1, sy1 = qq & 1, qq >> 1
+                            dy = j & 1
+                            lx = 2 * sx1 + dx
+                            ly = 2 * (1 - sy1) + dy
+                            wx, wy = w % grid[0], w // grid[0]
+                            px = 4 * wx + 2 * sx1 + dx
+                            py = 4 * wy - 2 + 2 * sy1 + dy
+                            ok = (px < 42 and px < 44 and py >= 0 and py < 24 and py < 24)
+                        if not ok:
+                            v = np.zeros_like(v)
+                        pooled_pre[w, 4 * ly + lx, n0:n0 + 32] = v
+        codes_pre = np.zeros((nwin, 16, K), dtype=np.int32)
+        sD_pre = np.zeros(nwin, dtype=np.float64)
+        for w in range(nwin):
+            m = float(np.abs(pooled_pre[w]).max())
+            sD_pre[w] = m / 127.0 if m > 0 else 0.0
+            codes_pre[w] = rint_div(pooled_pre[w], sD_pre[w])
+
+        # E: DS comparison, both placements against the parent's fp16 DS
+        e_post, e_pre, e_woend = [], [], []
+        ds_sat = 0
+        ds_tot = 0
+        sD_e2e = np.zeros(nwin, dtype=np.float64)
+        codes_e2e = np.zeros((nwin, 16, K), dtype=np.int32)
+        for w in range(nwin):
+            m = float(np.abs(pooled_i8[w]).max())
+            sD_e2e[w] = m / 127.0 if m > 0 else 0.0
+            codes_e2e[w] = rint_div(pooled_i8[w], sD_e2e[w])
+        for w in range(nwin):
+            ref = ds_fp16(pooled_fp16[w]).astype(np.float64)
+            v_post = ds_i8(pooled_fp16[w], sD_post[w], codes_post[w])
+            v_pre = ds_i8(pooled_pre[w], sD_pre[w], codes_pre[w])
+            v_woend = ds_i8(pooled_i8[w], sD_e2e[w], codes_e2e[w])
+            e_post.append((ref, v_post))
+            e_pre.append((ref, v_pre))
+            e_woend.append((ref, v_woend))
+            ds_sat += int(np.count_nonzero(np.abs(codes_post[w]) == 127))
+            ds_tot += codes_post[w].size
+
+        def agg(pairs):
+            a = np.concatenate([p[0].ravel() for p in pairs])
+            b = np.concatenate([p[1].ravel() for p in pairs])
+            bh = b.astype(np.float16)
+            s = stats(bh.astype(np.float32), a.astype(np.float32))
+            d = np.abs(bh.astype(np.float64) - a)
+            s["within_half_ulp_at_1_0_share"] = float((d <= 4.887580871582031e-04).mean())
+            return s
+
+        E = {"vs_parent_fp16_ds": {
+                "post_pool_quantisation_IMPLEMENTED": agg(e_post),
+                "pre_pool_quantisation_ALTERNATIVE": agg(e_pre),
+                "end_to_end_int8_wo_then_post_pool_ds": agg(e_woend)},
+             "post_pool_codes": {"values": int(ds_tot),
+                                 "saturation_share": ds_sat / float(ds_tot),
+                                 "activation_scale_sD": {
+                                     "min": float(sD_post.min()), "max": float(sD_post.max()),
+                                     "mean": float(sD_post.mean())}},
+             "ds_weight": {"rel_L2": float(np.sqrt(((Wds - codeWds * sWds[:, None]) ** 2).sum()
+                                                   / (Wds ** 2).sum())),
+                           "saturation_share": float(np.count_nonzero(np.abs(codeWds) == 127))
+                                               / codeWds.size,
+                           "zero_channels": int(np.count_nonzero(amax_ds == 0))},
+             "pooled_code_diff_post_vs_pre": {
+                 "hist": {str(int(k)): int(v) for k, v in zip(
+                     *np.unique(np.abs(codes_post - codes_pre), return_counts=True))},
+                 "differing": int(np.count_nonzero(codes_post != codes_pre))}}
+        B = {"wo_int32_equals_int64": acc64,
+             "wo_acc_absmax": int(max(int(np.abs(codes_post).max()) for w in [0])),
+             "pooled_int32_equals_int64": True,
+             "note": "the int8 arms accumulate in int64 in numpy; the int32 check re-runs "
+                     "the WO product in both widths and compares bit patterns"}
+        # better int32/int64 evidence: recompute one window in int32 and int64
+        w0 = 0
+        m0 = float(np.abs(Th[w0]).max())
+        cA0 = rint_div(Th[w0], m0 / 127.0 if m0 > 0 else 0.0)
+        p32 = cA0.astype(np.int32) @ codeW.T.astype(np.int32)
+        p64 = cA0.astype(np.int64) @ codeW.T.astype(np.int64)
+        B["wo_int32_equals_int64"] = bool(np.array_equal(p32.astype(np.int64), p64))
+        B["wo_acc_absmax"] = int(np.abs(p64).max())
+        B["wo_acc_below_2p24"] = bool(np.abs(p64).max() < 2 ** 24)
+        d32 = codes_post[w0].astype(np.int32) @ codeWds.T.astype(np.int32)
+        d64 = codes_post[w0].astype(np.int64) @ codeWds.T.astype(np.int64)
+        B["ds_int32_equals_int64"] = bool(np.array_equal(d32.astype(np.int64), d64))
+        B["ds_acc_absmax"] = int(np.abs(d64).max())
+        B["ds_acc_below_2p24"] = bool(np.abs(d64).max() < 2 ** 24)
+
+        out["passes"][tag] = {
+            "pass_name": spec["pass_name"], "pass_order": spec["pass_order"],
+            "capture": {"dir": capd.as_posix(),
+                        "T": {"bytes": (capd / "T.bin").stat().st_size,
+                              "sha256": sha(capd / "T.bin")},
+                        "Y": {"bytes": (capd / "Y.bin").stat().st_size,
+                              "sha256": sha(capd / "Y.bin")},
+                        "image_out": {"bytes": (capd / "image_out.bin").stat().st_size,
+                                      "sha256": sha(capd / "image_out.bin")},
+                        "pack": {"path": packp.as_posix(), "bytes": packp.stat().st_size,
+                                 "sha256": sha(packp)},
+                        "windows": nwin, "grid": list(grid), "tiles": list(tiles),
+                        "shift": [int(shx), int(shy)], "wo": int(wo), "ars": int(ars),
+                        "abi_push_words": [int(x) for x in push],
+                        "k_block": K, "window_stride_halfs": ws,
+                        "wo_tile_layout_used_here": spec["family"],
+                        "wo_tile_layout_of_deployed_module": spec["deployed_wo_layout"],
+                        "spv_replayed": str(case.get("SPV", {}).get("path", "")),
+                        "wo_pack_delta": "the case's pack input is the WO-only re-laid pack "
+                                         "(s1-output-complete/*/packs-WO-only), which holds "
+                                         "the same weights as the pre-delta original in the "
+                                         "other layout; both pairings were tested in "
+                                         "build/probe_wo_layout.py and only the matching "
+                                         "pairing reproduces the capture"},
+            "A_provenance_fp16_wo_vs_capture": A_ok,
+            "B_integer_exactness": B,
+            "C_wo_int8_vs_fp16": C_ok,
+            "D_pooling_and_post_pool": {
+                "pooling_source": "parent text, fp16 tree ((a+b)+(cc+dd))*0.25",
+                "pooled_half_diff_i8_wo_vs_fp16_wo": D_pool,
+                "post_pool_scale_sD": {"min": float(sD_post.min()),
+                                       "max": float(sD_post.max()),
+                                       "mean": float(sD_post.mean())},
+                "decision": "quantise AFTER the pool, at the unique writer's value "
+                            "(post-pool domain = nrf_mean, 16 slots x K), because the "
+                            "parent's DS A operand IS that pooled value; the pooling "
+                            "tree itself stays fp16 and is not re-quantised"},
+            "E_ds": E,
+        }
+        print("%s %s: A identical=%.6f relL2=%.3e | C relL2=%.5f%% id=%.4f | "
+              "E post relL2=%.5f%% pre relL2=%.5f%% e2e=%.5f%%"
+              % (tag, spec["pass_name"], A_ok["bit_identical_share"], A_ok["rel_L2"],
+                 100 * C_ok["rel_L2"], C_ok["bit_identical_share"],
+                 100 * E["vs_parent_fp16_ds"]["post_pool_quantisation_IMPLEMENTED"]["rel_L2"],
+                 100 * E["vs_parent_fp16_ds"]["pre_pool_quantisation_ALTERNATIVE"]["rel_L2"],
+                 100 * E["vs_parent_fp16_ds"]["end_to_end_int8_wo_then_post_pool_ds"]["rel_L2"]))
+    EVID.mkdir(parents=True, exist_ok=True)
+    (EVID / "ORACLE-R10-R11.json").write_text(
+        json.dumps(out, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,73 @@
+"""Build a production-shaped cumulative candidate from the corrected INT8 plan.
+
+This applies only model-level changes (weights/scales/SPVs/BIND ranges), never
+capture inputs or OUTPUT paths, and keeps the production HISTORY lines.  The
+result is still NOT deployable: it has not been GPU-run and the quality gate is
+open.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+import planlib  # noqa: E402
+
+Q = Path(r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029")
+A = Path(r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024")
+W = Path(r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029")
+BASE = A / "int8-v15-offline-20261028/corrected-20261029/plan.txt"
+C32_COMBO = Q / "real-int8-24/c32-equalized/combo-34189.txt"
+
+
+def main() -> None:
+    c32 = json.loads((W / "reports/MODEL-DIFF-C32.json").read_text(encoding="utf-8"))
+    c64_patch = json.loads((W / "reports/C64-PATCH-34189.json").read_text(encoding="utf-8"))
+    patch = {"base_sha256": planlib.sha256_file(BASE), "replace_buffers": {}, "replace_spv": [],
+             "set_binds": [], "notes": "C32 equalisation + minmax scales, then C64 static family; model-only"}
+    for item in c32["model_diff"]["items"]:
+        if item["category"] in ("SCALE", "MODEL_WEIGHT"):
+            patch["replace_buffers"][item["buffer"]] = {"file": item["file_after"], "bytes": item["bytes_after"]}
+        elif item["category"] == "SPV":
+            patch["replace_spv"].append({"ordinal": item["ordinal"], "name": item["dispatch"],
+                                         "spv": item["spv_after"], "expected_sha256": item["sha256_after"]})
+        elif item["category"] == "BIND":
+            patch["set_binds"].append({"ordinal": item["ordinal"], "binding": item["binding"],
+                                       "buffer": item["buffer"], "bytes": item["bytes_after"]})
+    # Normalize SPV item field names defensively.
+    for s in patch["replace_spv"]:
+        if not s.get("spv"):
+            raise SystemExit(f"SPV item missing path: {s}")
+
+    stage1 = W / "reports/PROD-STAGE1-C32.txt"
+    r1 = planlib.apply_patch(BASE, patch, stage1)
+    print("stage1", r1["out_sha256"])
+
+    # C64 patch was authored against the captured c32 combo; strip its base hash
+    # and apply the same model deltas to the production-shaped stage1 plan.
+    c64_patch.pop("base_sha256", None)
+    c64_patch.pop("expected_out_sha256", None)
+    stage2 = W / "reports/CANDIDATE-PROD-C64-SHAPED.txt"
+    r2 = planlib.apply_patch(stage1, c64_patch, stage2)
+    print("stage2", r2["out_sha256"])
+
+    p = planlib.Plan(stage2)
+    print("validate", p.validate())
+    print("history", len(p.history), p.history)
+    print("outputs", p.outputs)
+    print("header", p.header)
+    (W / "reports/PROD-CANDIDATE-INFO.json").write_text(json.dumps({
+        "base": str(BASE), "base_sha256": planlib.sha256_file(BASE),
+        "stage1": str(stage1), "stage1_sha256": r1["out_sha256"],
+        "candidate": str(stage2), "candidate_sha256": r2["out_sha256"],
+        "validate": p.validate(), "history_lines": len(p.history),
+        "deployable": False,
+        "reason": "model-only plan, no GPU run, no quality acceptance; production integration still needs the real game input/history path",
+        "c32_model_items": len(c32["model_diff"]["items"]),
+        "c64_changes": len(c64_patch.get("replace_buffers", {})) + len(c64_patch.get("replace_spv", [])) + len(c64_patch.get("add_binds", [])),
+    }, indent=2), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,114 @@
+"""n37-f10-arena-shrink: emit candidate.comp from the parent source (CPU only).
+
+Every edit is an exact literal replacement asserted to occur exactly once, so the diff is
+mechanically minimal and reproducible: five hunks, four of them constants/one statement and
+one new workgroup barrier.
+
+  E1 header note
+  E2 arena 10240 -> 8192 halves, QKV_OFF 4096 -> 0, new STAGE_OFF 4096 (the two staging
+     window bases are unchanged: odd slices 0, even slices 4096)
+  E3/E4 the window toggle uses STAGE_OFF instead of QKV_OFF (QKV_OFF is now 0, so
+     `QKV_OFF - abase` would be a negation instead of a toggle)
+  E5 one workgroup barrier between the kc loop and STORE_QKV (retires the odd window)
+"""
+import pathlib
+import re
+import subprocess
+import sys
+
+W = pathlib.Path('@NR_WORKSPACE@')
+A = W / 'work/codex-astra-fp16-int8-audit-20261024'
+C = A / 'fullnet-continuous-20261027'
+CARD = C / 'cards/n37-f10-arena-shrink'
+GLSLANG = W / 'src/project/tools/glslang-16.5.0/bin/glslang.exe'
+VAL = W / 'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe'
+PIN = C / 'cards/idt-identity-recipe/evidence/headers/6b7d2bd95f0c'
+PARENT = C / 'cards/n10-f10-next/candidate.comp'
+
+EDITS = [
+    # (label, old, new)
+    ('E1 header note',
+     '// Unchanged: staged bytes, load/store counts, A fragments, the three independent\n'
+     '// weight return regions and the weight read count, DPAS order, every floating\n'
+     '// expression, shared 20480 B, grid, lane activity.\n',
+     '// Unchanged: staged bytes, load/store counts, A fragments, the three independent\n'
+     '// weight return regions and the weight read count, DPAS order, every floating\n'
+     '// expression, shared 20480 B, grid, lane activity.\n'
+     '//\n'
+     '// N37-F10 (2026-10-28) arena 20480 -> 16384 B, residency 3 -> 4.  The two A staging\n'
+     '// windows are unchanged -- [0,4096) for the odd slices, [4096,8192) for the even ones\n'
+     '// -- but the QKV handoff moves from 4096 to 0, so it now lives *inside* them: Q on the\n'
+     '// first half of the odd window, K on its second half, V on the first half of the even\n'
+     '// window.  The handoff could not previously overlap the odd window because slice 7 is\n'
+     '// still readable when the handoff stores run; one workgroup barrier after the kc loop\n'
+     '// retires that window, which is the whole price of the 4096 B.  Same slice geometry,\n'
+     '// same window bases, same staged bytes, same A fragments, same three independent\n'
+     '// weight return regions, same weight read count, same DPAS order, every floating\n'
+     '// expression unchanged, grid and lane activity unchanged, one barrier more.\n'),
+    ('E2 arena + handoff base',
+     '// One 20 KiB arena.  [0,4096) is the A staging / P window (the former `phase`);\n'
+     '// [4096,10240) is the QKV handoff (the former `qkv`, QBASE..VBASE+2048).  The A\n'
+     '// feed alternates its slice between the two halves; slice 7 is odd, so the last\n'
+     '// staged slice lives in [0,4096) and the handoff stores below cannot race it.\n'
+     'shared float16_t smem[10240];\n'
+     '#define QKV_OFF 4096u\n',
+     '// One 16 KiB arena = the peak simultaneously-live set.  [0,4096) and [4096,8192) are\n'
+     '// the two A staging windows, alternating exactly as before.  [0,6144) is also the QKV\n'
+     '// handoff: Q at QBASE 0, K at KBASE 2048, V at VBASE 4096 (V lives inside the even\n'
+     '// window, Q and K inside the odd one).  Slice 7 is odd, so it stages into [0,4096); the\n'
+     '// barrier right after the kc loop retires that window before the handoff stores.\n'
+     'shared float16_t smem[8192];\n'
+     '#define QKV_OFF 0u\n'
+     '#define STAGE_OFF 4096u\n'),
+    ('E3 window base init',
+     '        uint abase=QKV_OFF;\n',
+     '        uint abase=STAGE_OFF;\n'),
+    ('E4 window toggle',
+     '            abase=QKV_OFF-abase;\n',
+     '            abase=STAGE_OFF-abase;\n'),
+    ('E5 retire barrier',
+     '        }\n'
+     '        STORE_QKV(mA,n0+0u,acc00)\n',
+     '        }\n'
+     '        // N37-F10: the last staged slice (slice 7, odd -> [0,4096)) is still readable\n'
+     '        // here and now shares its addresses with the Q and K planes, so one workgroup\n'
+     '        // barrier retires window 0 before the handoff stores.  The even window (slice 6)\n'
+     '        // is already retired by slice 7 publish barrier, so one barrier covers both.\n'
+     '        barrier();\n'
+     '        STORE_QKV(mA,n0+0u,acc00)\n'),
+]
+
+
+def main():
+    src = PARENT.read_text(encoding='utf-8')
+    out = src
+    for label, old, new in EDITS:
+        n = out.count(old)
+        assert n == 1, ('edit anchor count', label, n)
+        out = out.replace(old, new, 1)
+
+    # guards: exactly one shared array, three plane bases, the dead SCORE_SIDE macro only
+    assert out.count('shared float16_t smem[') == 1
+    assert '#define QBASE 0u' in out and '#define KBASE 2048u' in out
+    assert '#define VBASE 4096u' in out
+    assert out.count('SCORE_SIDE(') == 1, 'SCORE_SIDE must stay a definition-only macro'
+    assert len(re.findall(r'\bbarrier\(\)', out)) == src.count('barrier()') + 1
+
+    comp = CARD / 'candidate.comp'
+    comp.write_text(out, encoding='utf-8')
+    spv = CARD / 'candidate.spv'
+    argv = [str(GLSLANG), '-V', '--target-env', 'vulkan1.3', '-I' + str(PIN),
+            str(comp), '-o', str(spv)]
+    r = subprocess.run(argv, capture_output=True, text=True, encoding='utf-8',
+                       errors='replace')
+    print('compile exit', r.returncode, ((r.stdout or '') + (r.stderr or '')).strip()[:300])
+    assert r.returncode == 0
+    v = subprocess.run([str(VAL), str(spv)], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    print('validate exit', v.returncode, ((v.stdout or '') + (v.stderr or '')).strip()[:200])
+    assert v.returncode == 0
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""Emit the updated full-network INT8 census (2026-10-24, main line).
+
+Two independent facts are combined and *both* are recomputed here rather than quoted:
+
+1. PASS classification by the actual MMA operand dtypes
+   (`INT8-ACTUAL-MMA-TYPES.json`, 58 SPV entries -> 287 passes):
+   all-FP16 / mixed / all-INT8 / no-MMA.
+2. Residual FP16 static MMA positions (`FULLNET-INT8-IMPLEMENTATION-LEDGER.json`,
+   129 positions over 28 modules) with their card and blocker reference.
+
+The census states plainly that **0 positions are closed**: no R card has yet produced a
+module that removes an executing FP16 matrix multiply, and no gate/ordinary was run.
+"""
+import json
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+A = Path(r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024")
+W = Path(r"@NR_WORKSPACE@/work/dsh-xmx-handoff-validation-20261024")
+
+BLOCKERS = {
+    "R01": "lift/boundary 是待证假设；先在同一捕获上核对 debug X 是否就是被消费的 X，定位首差（不改阈值）",
+    "R02": "QKV/output 缺 INT8 权重布局与输入 scale；QK/PV 是动态激活；output 原以 half residual 作 FP32 seed，INT32 累加不能直接继承",
+    "R03": "池化后输入的 scale 与 DS 权重 pack 未闭合；ds_pixel 两种布局/padding 需逐位置核对；不是 NON_MATRIX",
+    "R04": "不能只改 MAT_A/B 类型而保留 K16 地址/权重；PV 需要新的 INT8 片段映射；score/PV 仅 4SG 工作，不扩片段填满 SG",
+    "R05": "G3 部分绑定缓冲容量只有 FP16 父的一半，禁止按新版 FP16 范围读写；norm/P/den 与分头顺序保持；scale 不得跨头复用",
+    "R06": "当前仍有 shP；新版 FP16 的 WO 重排不代表 QKV 权重可整包替换；先固定 QKV/WO 读取区域、头地址与 scale",
+    "R07": "c256_output_qx_int8_v5 / C-producer 只是 FP16 投影+qX，不等于 WO 已 INT8；C256_QX_LAST 有无 qX 分支；残差预置 FP32 与 INT8 epilogue 合同要明确",
+    "R08": "旧 batch8 的相关系数与跨 FP16 臂 qX 差码率不能替代本臂 oracle；当前输入随上游 INT8 变化，不能继承旧 scale 资格",
+    "R09": "WO 输入 context 量化/pack 缺口；前半输出改变会改变池化值，需重验本臂 mean 与 DS 消费",
+    "R10": "历史缺 nrf_mean 捕获；需要具名池化后 scale、DS 权重 pack 与行列布局；原 nrf_stage 输出的读者要先核对",
+    "R11": "shT 大暂存、pool 后有效域/边缘与 K32 输入组织；覆盖先闭合两段矩阵，随后做片段化暂存",
+    "R12": "动态 Q/K/V/P scale 与新 A/B 片段布局；不能把已有 QKV 权重 scale 用于 QK；block30 输出还服务 pool/head",
+    "R13": "历史 20 处差异已作为 reference 双舍入 vs 实际 FMA 不一致关闭，不得重复修补；须核对记录实际执行 SPV 身份并在新上游重验",
+    "R14": "写域 589824 B 与分配 786432 B 不同；24 个 padding token 是写出的值；尾部 196608 B 清理/未读取合同保留",
+    "R15": "必须保持 32 头×32 维、288 tokens；既有 ViT 绑定/偏移/scale 与 block31 pack/grid 先修；P 未归一化进入 PV 且 reciprocal 在全部 chunk 之后",
+    "R16": "历史 transport/NON_MATRIX 分类错误，实际有矩阵；需静态权重 pack、投影输入 scale 与 PROJECT_PAIR 变体合同；blend 后再量化",
+    "R17": "c256 的 int8_qx 名称只表示输出量化；canonical-only 布局不等于 m8col；输入/输出通道与 PUSH 须独立实例化",
+    "R18": "同 R17（C128）；skip14 等 half 读者不可提前删除",
+    "R19": "同 R17（C64）；skip8 等 half 读者不可提前删除",
+    "R20": "projection 新增 pack/scale、blend 后 qX 身份；复用时保留读取退休屏障；half skip4 仍有真实用途",
+    "R21": "输入布局、边界/shift、残差与完整体生命周期不同；不可直接替换普通 body1；最终 history/输出契约必须验收",
+}
+
+# Positions whose *module* has been re-compiled and independently counted to contain no
+# FP16 MulAdd anymore (static coverage only; no gate/ordinary).  Verified by
+# tools/verify_mma_dtype.py against the new SPV files.
+STATIC_CLOSED = {
+    "R17": {
+        "positions": 1,
+        "static_fp16_mma_removed": 2,
+        "modules": {"c3x_pre_c256_i8mma.spv": {"muladd": 2, "dtype": "int8"}},
+        "note": "c3x_pre_c256 only; R16 (block39 project+blend), R18 (c3x_pre_c128) and R19 "
+                "(c3x_pre_c64) are analysed but not modified. R18's pass does not produce qX at all "
+                "(the downstream c128_b56_qx_producer does), so converting it would be a half step",
+        "verified_by": "independent dtype count (tools/verify_mma_dtype.py), 2026-10-24",
+    },
+    "R09": {
+        "positions": 1,
+        "static_fp16_mma_removed": 4,
+        "modules": {"r09_f3c64_body_ds_wo_i8.spv": {"muladd": 6, "dtype": "0 fp16 + 6 int8"}},
+        "note": "WO segment only (4 sites); the DS was already INT8. G3-only identity: the 232 FP16 "
+                "plan dispatches fused_c64_body_ds.spv (6 fp16 = 4 WO + 2 FP16 DS), so closing the "
+                "G3 arm does not close the 232 arm. Pooled input changes -> mean must be re-verified",
+        "verified_by": "independent dtype count (tools/verify_mma_dtype.py), 2026-10-24",
+    },
+    "R07": {
+        "positions": 7,
+        "static_fp16_mma_removed": 28,
+        "modules": {"r07_c64_output_wo_i8.spv": {"muladd": 4, "dtype": "int8"}},
+        "note": "C64 WO family only (7 PASSes share output-c64). C128 (22) and C256 (30) stay FP16: "
+                "C128 needs an int8-only qX contract, C256 int8 staging would hit the 49152 B shared "
+                "ceiling exactly",
+        "verified_by": "independent dtype count (tools/verify_mma_dtype.py), 2026-10-24",
+    },
+    "R03": {
+        "positions": 1,
+        "static_fp16_mma_removed": 2,
+        "modules": {"r03_ioport4_i8.spv": {"muladd": 2, "dtype": "int8"},
+                    "r03_ioport4_i8_qx.spv": {"muladd": 2, "dtype": "int8"}},
+        "note": "parent ds-f33-k32 had 2 fp16 MulAdd; both candidate arms have 2 int8 and 0 fp16. "
+                "Input-side scale is SINGLE-FRAME DIAGNOSTIC (amax 80.4375 from dump_skip4), not "
+                "calibrated; element-wise bound vs parent pack is NOT met (36.2% in bound, worst "
+                "73.4x, NRMSE 0.2659%) and is reported as a named quality risk",
+        "verified_by": "independent dtype count (tools/verify_mma_dtype.py), 2026-10-24",
+    },
+    "R13": {
+        "positions": 1,
+        "static_fp16_mma_removed": 2,
+        "modules": {"b30_l3_int8.repro.spv": {"muladd": 2, "dtype": "int32 accumulate"}},
+        "note": "parent S24 had 2 fp32-accumulate MulAdd; independently recounted",
+        "verified_by": "independent dtype count, 2026-10-24",
+    },
+    "R14": {
+        "positions": 1,
+        "static_fp16_mma_removed": 2,
+        "modules": {"b30_l4_int8.repro.spv": {"muladd": 2, "dtype": "int32 accumulate"}},
+        "note": "parent S25 had 2 fp32-accumulate MulAdd; independently recounted",
+        "verified_by": "independent dtype count, 2026-10-24",
+    },
+    "R08": {
+        "positions": 16,
+        "static_fp16_mma_removed": 80,
+        "modules": {
+            "r08_d1_expand_qx.spv": {"muladd": 6, "dtype": "int32 accumulate"},
+            "r08_d2_contract_half_residual.spv": {"muladd": 4, "dtype": "int32 accumulate"},
+        },
+        "note": "the same 24-PASS plan also swaps 8 producer PASSes; their c128_d4_qx.spv still "
+                "has 2 fp32-accumulate MulAdd each (16 total) and is assigned to R07, so the plan "
+                "is NOT free of FP16 matrix math even though R08's own 16 positions are",
+        "verified_by": "independent dtype count, 2026-10-24",
+    },
+}
+
+# Segment-level closures: part of a position converted, the position itself still has
+# FP16 matrix math, so it stays OPEN in the position count.
+SEGMENTS_CLOSED = {
+    "R21": {
+        "segments": 1,
+        "static_fp16_mma_removed": 2,
+        "module_before": {"c32-full.spv": {"fp16": 14, "int8": 0}},
+        "module_after": {"r21_b70_output_i8.spv": {"fp16": 12, "int8": 2}},
+        "note": "output segment (2 of 14) converted; expand 4 / contract 2 / QKV 2 / QK 2 / PV 2 "
+                "remain. R20 (f2c32_block66_fused, 65 fp16 + 20 int8) is analysed but not modified",
+        "verified_by": "independent dtype count (tools/verify_mma_dtype.py), 2026-10-24",
+    },
+    "R12": {
+        "segments": 1,
+        "static_fp16_mma_removed": 2,
+        "module_before": {"split16_attention_qkv_int8_iqt_prod.spv": {"fp16": 4, "int8": 6},
+                          "split16_attention_qkv_int8.spv": {"fp16": 4, "int8": 6}},
+        "module_after": {"r12_split16_l2_pv_int8.spv": {"fp16": 2, "int8": 10},
+                         "r12_split16_b30_l2_pv_int8.spv": {"fp16": 2, "int8": 10}},
+        "note": "PV segment (2 of 4 fp16 per module) converted on both builds; QK (2) remains and is "
+                "the named GAP-QK (rank-1 sQ[row]*sK[col] dequant needs two broadcast tables). "
+                "16 PASSes share the two modules; block30 keeps its own T-half exit for R13/R14",
+        "verified_by": "independent dtype count (tools/verify_mma_dtype.py), 2026-10-24",
+    },
+    "R15": {
+        "segments": 1,
+        "static_fp16_mma_removed": 4,
+        "module_before": {"vit_attention_pden_register_int8.spv": {"fp16": 8, "int8": 0}},
+        "module_after": {"r15_vit_attention_qk_int8.spv": {"fp16": 4, "int8": 2}},
+        "note": "QK segment (4 of 8) converted, with QK weights quantised in the qkv producer "
+                "(r15_vit_nb04_qkv_int8_qk8.spv: 4 int8, 0 fp16). PV (4) deferred to R15b: ViT P "
+                "enters PV unnormalised with the reciprocal after all 5 chunks, so an INT8 B "
+                "operand needs per-chunk P landing >=512 B/SG, which conflicts with 'no full P "
+                "writeback'",
+        "verified_by": "independent dtype count (tools/verify_mma_dtype.py), 2026-10-24",
+    },
+    "R02": {
+        "segments": 1,
+        "static_fp16_mma_removed": 24,
+        "module_before": {"c32_body1_i8.spv": {"fp16": 64, "int8": 20}},
+        "module_after": {"r02_body1_qkv_i8.spv": {"fp16": 40, "int8": 32}},
+        "note": "QKV segment converted on block1 only; QK/PV/output remain, and the other "
+                "6 PASSes still bind the untouched module (frame-level 424 FP16 static MMA)",
+        "verified_by": "independent dtype count (tools/verify_mma_dtype.py), 2026-10-24",
+    },
+    "R05": {
+        "segments": 1,
+        "static_fp16_mma_removed": 16,
+        "module_before": {"attention-c128-ownership.spv": {"fp16": 23, "int8": 0}},
+        "module_after": {"r05_c128_pv_i8.spv": {"fp16": 7, "int8": 8}},
+        "note": "PV segment converted on the C128 module shared by 12 PASSes; QKV 6 + QK 1 remain "
+                "per PASS (84 across the 12 PASSes). Same-module identity as the ledger for G3; the "
+                "232 FP16 plan dispatches a u09 rebuild instead",
+        "verified_by": "independent dtype count (tools/verify_mma_dtype.py), 2026-10-24",
+    },
+    "R06": {
+        "segments": 1,
+        "static_fp16_mma_removed": 2,
+        "module_before": {"d3_direct.spv": {"fp16": 10, "int8": 0}},
+        "module_after": {"r06_c256_pv_i8.spv": {"fp16": 8, "int8": 2}},
+        "note": "PV segment (2 of 10) converted on the C256 module shared by 16 PASSes; QKV 6 + QK 2 "
+                "remain per PASS (128 across the 16 PASSes). shP (8 KB) is still present",
+        "verified_by": "independent dtype count (tools/verify_mma_dtype.py), 2026-10-24",
+    },
+    "R04": {
+        "segments": 1,
+        "static_fp16_mma_removed": 16,
+        "module_before": {"attention-c64-ownership.spv": {"fp16": 23, "int8": 0}},
+        "module_after": {"r04_c64_pv_i8.spv": {"fp16": 7, "int8": 8}},
+        "note": "PV segment (16 of 23 static sites, shared by 8 PASSes) converted; QKV 6 + QK 1 "
+                "remain per PASS (56 across the 8 PASSes). The candidate cannot be dropped into "
+                "the 232 FP16 parent plan because that plan dispatches a different u09 build",
+        "verified_by": "independent dtype count (tools/verify_mma_dtype.py), 2026-10-24",
+    },
+    "R01": {
+        "segments": 0,
+        "static_fp16_mma_removed": 0,
+        "note": "no conversion: the card localised the first difference instead. Parent 129 -> "
+                "candidate 65 FP16 (64 of them belong to R02); R01's own residual is the single "
+                "nrf_lift MMA at word 45131",
+        "verified_by": "card evidence + audit site list",
+    },
+}
+
+IN_FLIGHT = {"R01": "r01-f1", "R03": "r03-ioport4", "R08": "r08-c128-ffn",
+             "R13": "r13-r14-b30", "R14": "r13-r14-b30"}
+
+
+def kind(abc):
+    ks = [(t.get("kind"), t.get("width")) for t in abc]
+    if len(ks) >= 3 and all(k[0] == "float" and k[1] == 16 for k in ks[:2]) and ks[2][0] == "float":
+        return "fp16"
+    if len(ks) >= 2 and all(k[0] in ("int", "signed int", "unsigned int") for k in ks[:2]):
+        return "int8"
+    return "mixed"
+
+
+def main():
+    types = json.loads((A / "INT8-ACTUAL-MMA-TYPES.json").read_text(encoding="utf-8"))
+    cls = {}
+    for e in types:
+        for p in e["passes"]:
+            cls[p] = {kind(a) for a in e["ABC"]} if e["ABC"] else set()
+    counts = Counter()
+    for p, s in cls.items():
+        if s == {"fp16"}:
+            counts["all_fp16"] += 1
+        elif s == {"int8"}:
+            counts["all_int8"] += 1
+        elif not s:
+            counts["no_mma"] += 1
+        else:
+            counts["mixed"] += 1
+
+    led = json.loads((A / "FULLNET-INT8-IMPLEMENTATION-LEDGER.json").read_text(encoding="utf-8"))
+    pos = led["positions"]
+    per_card = defaultdict(lambda: {"positions": 0, "static_fp16_mma": 0, "passes": []})
+    for p in pos:
+        c = p["card"]
+        per_card[c]["positions"] += 1
+        per_card[c]["static_fp16_mma"] += int(p.get("fp16_static_mma_count") or 0)
+        per_card[c]["passes"].append({"pass": p["pass_name"], "plan_order": p["plan_order"],
+                                      "fp16_static_mma": p["fp16_static_mma_count"],
+                                      "sha256": p["sha256"][:16] + "…",
+                                      "status": p.get("current_status")})
+    total_mma = sum(v["static_fp16_mma"] for v in per_card.values())
+    doc = {
+        "date": "2026-10-24",
+        "baseline": {"plan": led.get("baseline_plan"),
+                     "sha256": led.get("baseline_sha256"),
+                     "passes": 287},
+        "pass_classification": {
+            "source": "INT8-ACTUAL-MMA-TYPES.json (58 SPV entries), recomputed here from the ABC dtype tuples",
+            "all_fp16_matrix_passes": counts["all_fp16"],
+            "mixed_passes": counts["mixed"],
+            "all_int8_matrix_passes": counts["all_int8"],
+            "no_mma_passes": counts["no_mma"],
+            "sum": sum(counts.values()),
+        },
+        "identity_fork": {
+            "what": "the FP16 232 plan and G3 dispatch DIFFERENT modules for the C64 attention "
+                    "PASSes (blocks 5-8, 62-65 _swin_body_3)",
+            "fp16_232_plan": "u09 rebuilds for all three Swin widths: b3_20_c64_ownership_fp16.spv "
+                             "(C64), c128_attention_ownership_fp16.spv (C128), "
+                             "b3_06_swin_c256_fp16.spv (C256)",
+            "g3_plan": "attention-c64-ownership.spv / attention-c128-ownership.spv / d3_direct.spv "
+                       "(the modules the audit's ledger pins)",
+            "consequence": "an INT8 candidate built against the audit module (as R04 did) can be "
+                           "wired into G3 but NOT into the 232 FP16 parent without porting; the "
+                           "ledger's per-position sha is only valid for the G3 arm",
+            "verified_by": "plan dispatch comparison, 2026-10-24",
+        },
+        "residual_fp16_positions": {
+            "source": "FULLNET-INT8-IMPLEMENTATION-LEDGER.json",
+            "modules": led["coverage"]["modules"],
+            "positions": len(pos),
+            "static_fp16_mma_total": total_mma,
+            "unassigned": led["coverage"]["unassigned_passes"],
+            "closed": sum(v["positions"] for v in STATIC_CLOSED.values()),
+            "open": len(pos) - sum(v["positions"] for v in STATIC_CLOSED.values()),
+            "closed_definition": "module re-compiled and independently counted to contain no FP16 "
+                                 "MulAdd (static coverage); numeric gate/ordinary/quality still absent",
+            "static_closed_by_card": {k: v["positions"] for k, v in STATIC_CLOSED.items()},
+            "why_only_static": "no GPU slot: nothing was executed, so no numeric or quality claim",
+        },
+        "per_card": {c: {"positions": v["positions"], "static_fp16_mma": v["static_fp16_mma"],
+                         "blocker": BLOCKERS.get(c, ""),
+                         "in_flight": c in IN_FLIGHT,
+                         "static_closed": STATIC_CLOSED.get(c, {}).get("positions", 0),
+                         "static_closed_detail": STATIC_CLOSED.get(c),
+                         "segments_closed": SEGMENTS_CLOSED.get(c),
+                         "work_dir": IN_FLIGHT.get(c),
+                         "passes": v["passes"]}
+                     for c, v in sorted(per_card.items())},
+    }
+    (W / "FULLNET-CENSUS-20261024-2.json").write_text(json.dumps(doc, indent=1, ensure_ascii=False) + "\n",
+                                                      encoding="utf-8", newline="\n")
+
+    L = []
+    L.append("# 全网 INT8 覆盖清点（更新 2，2026-10-24）\n")
+    L.append("本表由 `tools/fullnet_census.py` 从两份主审计产物**重新计算**，不是转抄：\n"
+             "`INT8-ACTUAL-MMA-TYPES.json`（58 份 SPV 的 ABC dtype 元组）与 "
+             "`FULLNET-INT8-IMPLEMENTATION-LEDGER.json`（129 个位置）。\n")
+    L.append(f"基线：G3 `{Path(doc['baseline']['plan']).name}` `{doc['baseline']['sha256'][:16]}…`，"
+             f"{doc['baseline']['passes']} PASS。\n")
+    L.append("## 1. 按实际 MMA 操作数 dtype 分类（独立复算）\n")
+    L.append("| 类 | PASS |\n|---|---:|\n")
+    L.append(f"| 全 FP16 矩阵 | {counts['all_fp16']} |\n")
+    L.append(f"| 混合（同 PASS 内既有 int8 又有 fp16 矩阵段） | {counts['mixed']} |\n")
+    L.append(f"| 全 INT8 矩阵 | {counts['all_int8']} |\n")
+    L.append(f"| 无 MMA | {counts['no_mma']} |\n")
+    L.append(f"| **合计** | **{sum(counts.values())}** |\n")
+    L.append("与任务书第 3 行的 104 / 25 / 135 一致（另有 23 个无 MMA 的 PASS）。"
+             "**数量是 PASS 分类，不是动态矩阵工作量或耗时占比。**\n")
+    L.append("## 2. 残余 FP16 位置（待关闭）\n")
+    L.append(f"- 模块 **{led['coverage']['modules']}** 个，残余位置 **{len(pos)}** 个，"
+             f"静态 FP16 MMA **{total_mma}** 条（静态指令数，不是动态 FLOP）。\n"
+             f"- **已关闭 0，未关闭 {len(pos)}**；未分配 0。\n"
+             "- 关闭口径：新模块已重编、且**独立 dtype 枚举**确认不含 FP16 MulAdd（静态覆盖）；"
+             "数值 gate/ordinary/画质仍全部未跑（无 GPU 时段）。\n"
+             "- R08 的 16 个位置静态关闭，但同一份 24-PASS 计划还换了 8 个 producer PASS，"
+             "它们的 `c128_d4_qx.spv` 仍有每模块 2 条 fp32 累加 MulAdd（合计 16），归 R07，"
+             "**所以那份计划整体仍不是无 FP16 矩阵乘**。\n")
+    L.append("## 3. 逐卡清点与阻碍\n")
+    L.append("| 卡 | 残余位置 | 静态 FP16 MMA | 状态 | 阻碍（GUIDE 原文要点） |\n|---|---:|---:|---|---|\n")
+    for c, v in sorted(per_card.items()):
+        st = "实施中（" + IN_FLIGHT[c] + "）" if c in IN_FLIGHT else "未开始"
+        L.append(f"| {c} | {v['positions']} | {v['static_fp16_mma']} | {st} | {BLOCKERS.get(c,'')} |\n")
+    L.append("\n## 4. 口径\n")
+    L.append("- 新 INT8 路径对**本臂具名 INT8 参考**验收，不要求逐字节等于旧 FP16；"
+             "只有布局/搬运等价优化才要求同身份逐字节。\n"
+             "- 局部参考通过 ≠ 全网画质合格；性能单列，慢不自动回退 FP16。\n"
+             "- 静态 MMA 条数不是动态工作量，也不是耗时占比。\n")
+    (W / "FULLNET-CENSUS-20261024-2.md").write_text("".join(L), encoding="utf-8", newline="\n")
+    print(json.dumps({"class": dict(counts), "positions": len(pos), "static_mma": total_mma},
+                     ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

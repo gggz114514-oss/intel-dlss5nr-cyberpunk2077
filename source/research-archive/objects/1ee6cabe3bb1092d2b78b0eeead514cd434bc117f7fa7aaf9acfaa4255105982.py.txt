@@ -1,0 +1,74 @@
+"""S06 block15 post-GPU diagnosis, part 1: reproduce the frame numbers and localise
+the frame-output change against the exact baseline (combo-<frame>) output.
+
+Reads (read-only):
+  <D>/c64-family-static/run-<frame>/replayed-network.bin    baseline frame output
+  <W>/S06-c256/gpu/a-<frame>/replayed-network.bin           this card's candidate
+  <D>/JOBS.json                                             reference (capture FP16) per frame
+Writes only <W>/S06-c256/evidence/12-*.json.
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+import c256b15 as L
+
+W = L.W
+FRAMES = [34189, 41444, 43654]
+jobs = {j["frame"]: j for j in json.loads((L.D / "JOBS.json").read_text()) if not j.get("dump")}
+ev = {"card": "S06-c256", "part": "frame-diff", "frames": {}}
+
+
+def load(p):
+    x = np.fromfile(p, dtype="<f4").reshape(2, 720, 1280, 4)
+    assert np.isfinite(x).all()
+    return x
+
+
+for f in FRAMES:
+    ref = np.fromfile(jobs[f]["reference"], dtype="<f4").reshape(2, 720, 1280, 4)
+    base_p = L.D / f"c64-family-static/run-{f}/replayed-network.bin"
+    cand_p = W / f"gpu/a-{f}/replayed-network.bin"
+    if not base_p.exists() or not cand_p.exists():
+        ev["frames"][str(f)] = dict(missing=dict(baseline=str(base_p), candidate=str(cand_p),
+                                                 base_exists=base_p.exists(), cand_exists=cand_p.exists()))
+        continue
+    b = load(base_p); c = load(cand_p)
+    r = ref[0, :, :, :3].astype(np.float64)
+    eb = b[0, :, :, :3].astype(np.float64) - r
+    ec = c[0, :, :, :3].astype(np.float64) - r
+    psnr_b = -10 * np.log10(np.mean(eb * eb))
+    psnr_c = -10 * np.log10(np.mean(ec * ec))
+    d = (c - b)[0, :, :, :3].astype(np.float64)
+    # where does the frame change happen, and is it a bias or zero-mean?
+    spatial = np.sqrt((d ** 2).mean(axis=2))          # 720x1280 rms per pixel
+    ev["frames"][str(f)] = dict(
+        baseline_sha=L.sha256(base_p), candidate_sha=L.sha256(cand_p),
+        psnr_baseline=float(psnr_b), psnr_candidate=float(psnr_c),
+        delta_db=float(psnr_c - psnr_b),
+        mse_baseline=float(np.mean(eb * eb)), mse_candidate=float(np.mean(ec * ec)),
+        diff=dict(rms=float(np.sqrt(np.mean(d ** 2))),
+                  mean=float(d.mean()), max_abs=float(np.abs(d).max()),
+                  nonzero_frac=float((d != 0).mean()),
+                  rms_over_ref_rms=float(np.sqrt(np.mean(d ** 2)) / np.sqrt(np.mean(r ** 2)))),
+        diff_vs_error=dict(
+            note="correlation of the arm difference with the baseline error tells whether the change moves toward or away from the reference",
+            corr_d_e_baseline=float(np.corrcoef(d.ravel(), eb.ravel())[0, 1]),
+            energy_toward=float(np.sum(d * eb) / max(np.sum(eb * eb), 1e-30)),
+        ),
+        spatial=dict(p50=float(np.percentile(spatial, 50)), p95=float(np.percentile(spatial, 95)),
+                     p999=float(np.percentile(spatial, 99.9)), max=float(spatial.max()),
+                     frac_pixels_gt_1e_3=float((spatial > 1e-3).mean())),
+        by_channel=dict(
+            mse_baseline=[float(np.mean(eb[:, :, ch] ** 2)) for ch in range(3)],
+            mse_candidate=[float(np.mean(ec[:, :, ch] ** 2)) for ch in range(3)],
+            mean_diff=[float(d[:, :, ch].mean()) for ch in range(3)]),
+    )
+    print(f, "base %.6f cand %.6f delta %+.6f dB  diff_rms %.6f  nonzero %.3f%%"
+          % (psnr_b, psnr_c, psnr_c - psnr_b, np.sqrt(np.mean(d ** 2)), 100 * (d != 0).mean()), flush=True)
+
+(W / "evidence/12-frame-diff.json").write_text(json.dumps(ev, indent=1), encoding="utf-8")
+print("written evidence/12-frame-diff.json")

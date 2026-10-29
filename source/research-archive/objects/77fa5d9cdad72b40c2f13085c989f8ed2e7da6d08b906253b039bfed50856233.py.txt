@@ -1,0 +1,118 @@
+"""S07 stage distribution + per-stage error decomposition for split16 b23 l0/l1."""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+B = Path("@NR_WORKSPACE@")
+W = B / "work/dsh-fullnet-static-20261029"
+sys.path.insert(0, str(W / "tools"))
+sys.path.insert(0, str(W / "S07-split16/tools"))
+from planlib import Plan  # noqa: E402
+import model as M  # noqa: E402
+
+D = B / "work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24"
+TEACHERS = [("34189", D / "dump-fp16"),
+            ("41444", D / "teacher-diagnostics/teacher-41444"),
+            ("43654", D / "teacher-diagnostics/teacher-43654")]
+
+
+def stats(name, a):
+    a = a.reshape(-1)
+    nz = a[a != 0]
+    return {
+        "name": name, "absmax": float(np.abs(a).max()), "rms": float(np.sqrt(np.mean(a ** 2))),
+        "p9999": float(np.percentile(np.abs(a), 99.99)) if nz.size else 0.0,
+        "p999": float(np.percentile(np.abs(a), 99.9)),
+        "p99": float(np.percentile(np.abs(a), 99.0)),
+        "zero_frac": float(np.mean(a == 0)),
+        "absmax_over_rms": float(np.abs(a).max() / max(np.sqrt(np.mean(a ** 2)), 1e-30)),
+    }
+
+
+def main():
+    p = Plan(D / "c64-family-static/combo-34189.txt")
+    d0 = p.dispatch_by_name("split16_b23_l0")
+    d1 = p.dispatch_by_name("split16_b23_l1")
+    push0 = [int(x) for x in d0.push]
+    p2, p3 = push0[8:12], push0[12:16]
+    pk = M.Pack(Path(p.buffers[d0.binds[10].buffer].file).read_bytes(),
+                Path(p.buffers[d1.binds[10].buffer].file).read_bytes(),
+                Path(p.buffers[d0.binds[0].buffer].file), p2, p3)
+    invX = np.float32(4.113360404968262)
+    sX, sR, sA = 1 / float(invX), 1 / float(pk.invs[0]), 1 / float(pk.invs[1])
+    sF = 1 / 110.023681640625
+
+    rep = {"scales_old": {"sX": sX, "sR": sR, "sA": sA, "sF": sF}}
+    per_frame = []
+    for tag, td in TEACHERS:
+        X = M.load_half(td / "dump_block22_out.bin")
+        Ft = M.load_half(td / "dump_split16_b23_F.bin")
+        Yt = M.load_half(td / "dump_split16_b23_Y.bin")
+        # fp16 reference chain
+        sr16 = M.f16(X @ pk.W1.T)
+        sa16 = np.empty((1152, 2048), np.float32)
+        for g in range(8):
+            sa16[:, g * 256:(g + 1) * 256] = M.f16(sr16[:, g * 64:(g + 1) * 64] @ pk.W2[g * 256:(g + 1) * 256].T)
+        act16 = M.activation(sa16)
+        F16 = np.empty((1152, 512), np.float32)
+        for g in range(8):
+            F16[:, g * 64:(g + 1) * 64] = M.f16(act16[:, g * 256:(g + 1) * 256] @ pk.W3[g * 64:(g + 1) * 64].T)
+        A16 = F16 @ pk.Wc.T
+        seed16 = M.f16(X * pk.rs)
+        # int8 chain
+        qx = M.code(X / sX)
+        sr = M.f16((qx @ pk.W1q_m.T) * pk.wsc1)
+        qr = M.code(sr / sR)
+        sai = np.empty((1152, 2048), np.float32)
+        for g in range(8):
+            sai[:, g * 256:(g + 1) * 256] = M.f16((qr[:, g * 64:(g + 1) * 64] @ pk.W2q_m[g * 256:(g + 1) * 256].T) * pk.wsc2[g * 256:(g + 1) * 256])
+        acti = M.activation(sai)
+        qa = M.code(acti / sA)
+        Fi = np.empty((1152, 512), np.float32)
+        for g in range(8):
+            Fi[:, g * 64:(g + 1) * 64] = M.f16((qa[:, g * 256:(g + 1) * 256] @ pk.W3q_m[g * 64:(g + 1) * 64].T) * pk.wsc3[g * 64:(g + 1) * 64])
+        qf = M.code(Fi / sF)
+        Ai = (qf @ pk.Wcq_m.T) * pk.wscL
+        st = [stats("X", X[:1056]), stats("sr16", sr16[:1056]), stats("sa16_raw", sa16[:1056]),
+              stats("act16", act16[:1056]), stats("F16", F16[:1056]), stats("A16", A16[:1056]),
+              stats("seed", seed16[:1056])]
+        # per-channel distribution of X (equalisation headroom)
+        xc = np.abs(X[:1056]).max(0)
+        fr = {
+            "frame": tag, "stats": st,
+            "stage_rel_l2": {
+                "stage1_sr": M.rel_l2(sr, sr16),
+                "stage2_sa": M.rel_l2(sai, sa16),
+                "activation": M.rel_l2(acti, act16),
+                "stage3_F": M.rel_l2(Fi, F16),
+                "contract_A": float(np.linalg.norm(Ai - A16) / np.linalg.norm(A16)),
+                "Y": M.rel_l2(M.f16(Ai + seed16), Yt),
+            },
+            "quant_only_rel_l2": {
+                "X": float(np.linalg.norm(qx * sX - X) / np.linalg.norm(X)),
+                "sr": float(np.linalg.norm(qr * sR - sr16) / np.linalg.norm(sr16)),
+                "act": float(np.linalg.norm(qa * sA - act16) / np.linalg.norm(act16)),
+                "F": float(np.linalg.norm(qf * sF - F16) / np.linalg.norm(F16)),
+            },
+            "X_channel_absmax": {"min": float(xc.min()), "median": float(np.median(xc)),
+                                 "max": float(xc.max()), "geo_mean": float(np.exp(np.log(xc).mean()))},
+            "F_channel_rms_min_median_max": [float(x) for x in
+                                             (np.sqrt((F16[:1056] ** 2).mean(0)).min(),
+                                              np.median(np.sqrt((F16[:1056] ** 2).mean(0))),
+                                              np.sqrt((F16[:1056] ** 2).mean(0)).max())],
+        }
+        per_frame.append(fr)
+        print(tag, json.dumps(fr["stage_rel_l2"], indent=1))
+        print(tag, json.dumps(fr["quant_only_rel_l2"], indent=1))
+        print(tag, "Xch", json.dumps(fr["X_channel_absmax"]))
+        for s in st:
+            print("   ", json.dumps(s))
+    rep["frames"] = per_frame
+    (W / "S07-split16/STAGES.json").write_text(json.dumps(rep, indent=1))
+    print("wrote STAGES.json")
+
+
+if __name__ == "__main__":
+    main()

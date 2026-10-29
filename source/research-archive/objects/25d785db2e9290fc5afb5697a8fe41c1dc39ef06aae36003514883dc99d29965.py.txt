@@ -1,0 +1,139 @@
+"""Adopt a measured card as the new accepted baseline (writes CURRENT.json, copies the plan).
+
+Usage: python adopt.py <card-id> [--note "text"]
+
+Refuses unless: every GPU stage COMPLETED with gold frames, and the same-batch
+ordinary comparison is FASTER_95 (CI lower bound > 0). The handoff pointer and the
+F10 plan stay untouched; the chain lives in fullnet-continuous-20261027/CURRENT.json.
+"""
+import json, shutil, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+import ANALYZE
+
+def stage_summary(card_id, st):
+    p = K.C / 'queue' / card_id / st / 'STAGE-SUMMARY.json'
+    if p.exists():
+        return K.read_json(p)
+    pipe = K.C / 'cards' / card_id / 'PIPELINE.json'
+    if pipe.exists():
+        return (K.read_json(pipe).get('stages') or {}).get(st)
+    return None
+
+
+def adopt_package(name, note=''):
+    """Adopt a measured package (queue/<name>/) as the new chain head."""
+    q = K.C / 'queue' / name
+    info = K.read_json(q / 'PACKAGE.json')
+    bad = []
+    for st in ('gates', 'native', 'resources', 'ordinary'):
+        s = stage_summary(name, st)
+        if not s:
+            bad.append(st + ': not run')
+            continue
+        if s.get('status') != 'COMPLETED':
+            bad.append('%s: %s' % (st, s.get('status')))
+            continue
+        for j in s.get('jobs', []):
+            if j.get('status') != 'COMPLETED' or not j.get('frame'):
+                bad.append('%s/%s: %s gold=%s' % (st, j.get('id'), j.get('status'), j.get('frame')))
+    if bad:
+        print('REFUSED:', bad)
+        return 1
+    tim = K.read_json(q / 'TIMING.json')
+    c = tim['comparisons'][0]
+    if c['status'] != 'FASTER_95' or c['CI95_ms'][0] <= 0:
+        print('REFUSED: timing not FASTER_95:', c['status'], c['CI95_ms'])
+        return 1
+    plan = q / 'plan.txt'
+    acc = K.C / 'accepted' / ('%s-20261027' % name)
+    acc.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(plan, acc / 'plan.txt')
+    assert K.sha(acc / 'plan.txt') == K.sha(plan)
+    entry = dict(card=name, package=True, members=[m['card'] for m in info['members']],
+                 plan=dict(path=str(acc / 'plan.txt'), sha256=K.sha(acc / 'plan.txt')),
+                 saving_ms=c['saving_ms'], CI95_ms=c['CI95_ms'], groups=c['groups'],
+                 note=note, timing=str(q / 'TIMING.json'))
+    K.write_json(acc / 'ADOPT.json', entry)
+    cur_path = K.C / 'CURRENT.json'
+    cur = K.read_json(cur_path) if cur_path.exists() else dict(
+        best_plan=dict(path=str(K.BASELINE), sha256=K.BASELINE_SHA),
+        chain=[dict(path=str(K.BASELINE), sha256=K.BASELINE_SHA, label='handoff F10 baseline (accepted, offline)')],
+        increments_ms=[])
+    cur['chain'].append(dict(path=entry['plan']['path'], sha256=entry['plan']['sha256'],
+                             label=name, saving_ms=c['saving_ms'], CI95_ms=c['CI95_ms']))
+    cur['increments_ms'].append(c['saving_ms'])
+    cur['best_plan'] = entry['plan']
+    cur['cumulative_ms_in_chain'] = sum(x for x in cur['increments_ms'])
+    cur['handoff_plan_preserved'] = dict(path=str(K.BASELINE), sha256=K.BASELINE_SHA)
+    K.write_json(cur_path, cur)
+    print(json.dumps(dict(adopted=name, members=entry['members'], plan=entry['plan'],
+                          saving_ms=c['saving_ms'], chain_len=len(cur['chain'])), indent=2))
+    return 0
+
+
+def main(card_id, note=''):
+    d = K.C / 'cards' / card_id
+    bad = []
+    for st in ('gates', 'native', 'resources', 'ordinary'):
+        s = stage_summary(card_id, st)
+        if not s:
+            bad.append(st + ': not run')
+            continue
+        if s.get('status') != 'COMPLETED':
+            bad.append('%s: %s' % (st, s.get('status')))
+            continue
+        for j in s.get('jobs', []):
+            if j.get('status') != 'COMPLETED' or not j.get('frame'):
+                bad.append('%s/%s: %s gold=%s' % (st, j.get('id'), j.get('status'), j.get('frame')))
+    if bad:
+        print('REFUSED:', bad)
+        return 1
+    tim = K.read_json(d / 'TIMING.json')
+    c = tim['comparisons'][0]
+    if c['status'] != 'FASTER_95' or c['CI95_ms'][0] <= 0:
+        print('REFUSED: timing not FASTER_95:', c['status'], c['CI95_ms'])
+        return 1
+    # adopt the plan that was actually measured: the rebased one on the current chain head
+    rebased = K.C / 'queue' / card_id / 'plan-rebased.txt'
+    plan = rebased if rebased.exists() else (d / 'plan.txt')
+    chain_before = K.current_best()
+    if rebased.exists():
+        # the adopted plan must be the chain head with only this card's group replaced
+        assert K.sha(rebased) != K.sha(K.BASELINE), 'rebased plan equals handoff baseline'
+    stamp = '20261027'
+    acc = K.C / 'accepted' / ('%s-%s' % (card_id, stamp))
+    acc.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(plan, acc / 'plan.txt')
+    entry = dict(card=card_id, plan=dict(path=str(acc / 'plan.txt'), sha256=K.sha(acc / 'plan.txt')),
+                 source_plan=dict(path=str(plan), sha256=K.sha(plan)),
+                 saving_ms=c['saving_ms'], CI95_ms=c['CI95_ms'], groups=c['groups'],
+                 base_mean_ms=tim['comparisons'][0]['group_means'] and
+                 sum(g['base'] for g in c['group_means']) / len(c['group_means']),
+                 cand_mean_ms=sum(g['cand'] for g in c['group_means']) / len(c['group_means']),
+                 note=note, timing=str(d / 'TIMING.json'), results=str(d / 'RESULTS.json'))
+    K.write_json(acc / 'ADOPT.json', entry)
+    cur_path = K.C / 'CURRENT.json'
+    if cur_path.exists():
+        cur = K.read_json(cur_path)
+    else:
+        cur = dict(best_plan=dict(path=str(K.BASELINE), sha256=K.BASELINE_SHA),
+                   chain=[dict(path=str(K.BASELINE), sha256=K.BASELINE_SHA,
+                               label='handoff F10 baseline (accepted, offline)')],
+                   increments_ms=[])
+    cur['chain'].append(dict(path=entry['plan']['path'], sha256=entry['plan']['sha256'],
+                             label=card_id, saving_ms=c['saving_ms'], CI95_ms=c['CI95_ms']))
+    cur['increments_ms'].append(c['saving_ms'])
+    cur['best_plan'] = entry['plan']
+    cur['cumulative_ms_in_chain'] = sum(x for x in cur['increments_ms'])
+    cur['handoff_plan_preserved'] = dict(path=str(K.BASELINE), sha256=K.BASELINE_SHA)
+    K.write_json(cur_path, cur)
+    print(json.dumps(dict(adopted=card_id, plan=entry['plan'], saving_ms=c['saving_ms'],
+                          chain_len=len(cur['chain'])), indent=2))
+    return 0
+
+
+if __name__ == '__main__':
+    note = sys.argv[sys.argv.index('--note') + 1] if '--note' in sys.argv else ''
+    sys.exit(main(sys.argv[1], note))

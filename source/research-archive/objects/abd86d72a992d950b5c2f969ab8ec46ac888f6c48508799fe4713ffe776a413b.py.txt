@@ -1,0 +1,132 @@
+"""Read-only ISA accounting for n20-f18-ups-contract (F18 ord 194, C128 UPS contract).
+
+Reads an ISA capture that already exists on disk (identity CURRENT, SPV sha ffde3c3d).
+No GPU, no capture.
+"""
+import re, sys, json, collections
+from pathlib import Path
+
+W = Path('@NR_WORKSPACE@')
+ISA_DEFAULT = (W / 'work/codex-astra-fp16-int8-audit-20261024/fullnet-mechanism-transfer-20261026'
+               / 'f05-a-return-phase1-20261027/captures/boundary/ISA'
+               / 'CS_asm4e6ba3ddc1931535_simd32_0000000000000022_33_orig.asm')
+
+MSG = re.compile(r'//\s*wr:(\d+)\+(\d+),\s*rd:(\d+);\s*(.+?)\s*$')
+MASK = re.compile(r'\((\d+)\|M0\)')
+PRED = re.compile(r'^\(([^)]*)\)$')
+
+
+def parse(path):
+    inst = []
+    label = None
+    for raw in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+        if re.match(r'^L\d+:', raw):
+            label = raw.rstrip(':')
+            inst.append(dict(label=label, op='LABEL', pred='', mask=None, text=raw))
+            continue
+        if '/*' not in raw or '*/' not in raw:
+            continue
+        addr = re.search(r'/\*\s*\[([0-9A-Fa-f]+)\]', raw)
+        body = raw.split('*/', 1)[1]
+        toks = body.split()
+        pred = ''
+        while toks and PRED.match(toks[0]):
+            pred += toks.pop(0)
+        if not toks:
+            continue
+        op = toks[0]
+        m = MASK.search(body)
+        d = dict(label=None, addr=addr.group(1) if addr else None, pred=pred, op=op,
+                 mask=int(m.group(1)) if m else None, text=raw.strip(), tail=' '.join(toks[1:]))
+        g = MSG.search(raw)
+        if g:
+            d.update(wr=int(g.group(1)), wr2=int(g.group(2)), rd=int(g.group(3)), kind=g.group(4))
+        inst.append(d)
+    return inst
+
+
+def main():
+    p = Path(sys.argv[1]) if len(sys.argv) > 1 else ISA_DEFAULT
+    inst = parse(p)
+    sends = [i for i in inst if i.get('kind')]
+    dpas = [i for i in inst if i['op'].startswith('dpas')]
+    sync = [i for i in inst if i['op'].startswith('sync')]
+    jmps = [i for i in inst if i['op'].startswith('jmpi')]
+
+    print('== totals ==')
+    print('instructions %d   dpas %d   send %d   sync %d   jmpi %d   labels %d'
+          % (len([i for i in inst if i['op'] != 'LABEL']), len(dpas), len(sends), len(sync),
+             len(jmps), len([i for i in inst if i['op'] == 'LABEL'])))
+
+    print('\n== sync kinds ==')
+    for k, v in collections.Counter(i['op'] for i in sync).most_common():
+        print('  %-12s %d' % (k, v))
+
+    # mask distribution per opcode family
+    print('\n== mask distribution (all instructions) ==')
+    mm = collections.Counter((i.get('mask'), i['op'].split('.')[0]) for i in inst if i['op'] != 'LABEL')
+    masks = collections.Counter(i.get('mask') for i in inst if i['op'] != 'LABEL')
+    print('  ', dict(sorted(masks.items(), key=lambda x: (x[0] is None, x[0]))))
+
+    print('\n== send messages: kind x mask x rd/wr ==')
+    tab = collections.Counter((i['kind'], i.get('mask'), i.get('rd'), i.get('wr'), i.get('wr2')) for i in sends)
+    hdr = '%-46s %4s %5s %4s %4s %6s' % ('kind', 'mask', 'rd', 'wr', 'wr2', 'count')
+    print(hdr)
+    for (k, mk, rd, wr, wr2), v in sorted(tab.items(), key=lambda x: (-x[1], x[0][0])):
+        print('%-46s %4s %5s %4s %4s %6d' % (k, mk, rd, wr, wr2, v))
+
+    print('\n== send messages: kind only ==')
+    for k, v in collections.Counter(i['kind'] for i in sends).most_common():
+        print('  %-48s %4d' % (k, v))
+
+    print('\n== dpas by mask ==')
+    print(' ', dict(collections.Counter(i.get('mask') for i in dpas)))
+    print('  sample:', dpas[0]['text'][:160] if dpas else None)
+    print('  sample:', dpas[-1]['text'][:160] if dpas else None)
+
+    # basic blocks: label -> (first addr, last addr, n inst, op histogram, terminates with jmpi?)
+    print('\n== basic blocks (label order as in file) ==')
+    blocks = []
+    cur = None
+    for i in inst:
+        if i['op'] == 'LABEL':
+            cur = dict(label=i['label'], n=0, first=None, last=None, ops=collections.Counter(),
+                       sends=collections.Counter(), dpas=0, jmp=None, addr_first=None)
+            blocks.append(cur)
+            continue
+        if cur is None:
+            continue
+        cur['n'] += 1
+        cur['ops'][i['op'].split('.')[0]] += 1
+        if i.get('kind'):
+            cur['sends'][i['kind']] += 1
+        if i['op'].startswith('dpas'):
+            cur['dpas'] += 1
+        if i['op'].startswith('jmpi'):
+            cur['jmp'] = i['tail'].split()[-1] if i['tail'] else None
+        if i.get('addr'):
+            cur['addr_first'] = cur['addr_first'] or i['addr']
+            cur['last'] = i['addr']
+    for b in blocks:
+        print('  %-8s n=%4d dpas=%3d sends=%3d addr=%s..%s jmp=%s  %s'
+              % (b['label'], b['n'], b['dpas'], sum(b['sends'].values()),
+                 b['addr_first'], b['last'], b['jmp'], dict(b['ops'].most_common(6))))
+
+    # where are dpas / sends located relative to blocks
+    print('\n== dpas/send distribution over labels ==')
+    lab = None
+    dl = collections.Counter()
+    sl = collections.Counter()
+    for i in inst:
+        if i['op'] == 'LABEL':
+            lab = i['label']
+        elif i['op'].startswith('dpas'):
+            dl[lab] += 1
+        elif i.get('kind'):
+            sl[lab] += 1
+    print('  dpas per label:', dict(dl))
+    print('  send per label:', dict(sl))
+
+
+if __name__ == '__main__':
+    main()

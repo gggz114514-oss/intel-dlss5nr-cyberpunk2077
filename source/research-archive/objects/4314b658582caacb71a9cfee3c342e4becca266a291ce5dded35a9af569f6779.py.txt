@@ -1,0 +1,178 @@
+"""n18b-f01-gather: exhaustive lane -> pixel enumeration for ordinal 0 (f1c32_image_pre).
+
+Parent source: cards/n18-f01-entry/candidate.comp (chain head, SPV ecc9dd39...).
+
+The whole card rests on one question: which (subgroup, lane) slots actually need a
+*private* pixel read at runtime.  This tool enumerates the source formula
+
+    xl = 4*(q&1) + lane%4          yl = 4*(q>>1) + lane/4
+    px = WGID.x*8 + xl             py = WGID.y*8 + yl
+
+over every (WGID, q, lane) in the dispatch (168x96x1, 128 threads, 4 subgroups),
+separately for the *mask-disabled* slots lane>=16, and reports:
+  - the active slot -> pixel map (must be a bijection onto the WG's own 8x8 tile),
+  - the static duplicate structure that the n18 cost breakdown describes,
+  - the dedup factor that structure implies *if* the disabled slots were executed.
+
+W/H-independent: px,py do not depend on the image size.  The mirror fold
+(sx,sy) is evaluated in a second section with W,H = grid*8 (the bound-pass
+invariant of a pass whose outputs are indexed by gl_GlobalInvocationID.x),
+only to show that the disabled slots could never address anything useful.
+
+Writes tools/lane-map.json.
+"""
+import json
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parents[1]
+GRID = (168, 96)
+TILE = 8
+W_IMG, H_IMG = GRID[0] * TILE, GRID[1] * TILE
+
+
+def xl_yl(q, lane):
+    return 4 * (q & 1) + (lane % 4), 4 * (q >> 1) + (lane // 4)
+
+
+def mirror(i, size):
+    period = 2 * size
+    j = i % period
+    if j < 0:
+        j += period
+    return j if j < size else period - 1 - j
+
+
+def main():
+    out = {"grid": list(GRID), "tile": TILE, "W": W_IMG, "H": H_IMG,
+           "groups": 4, "threads": 128, "lanes": 32}
+
+    # ---- 1. active slots (lane<16): must be a bijection onto the WG's own tile
+    active = {}
+    per_sg = {}
+    for q in range(4):
+        rows = {}
+        for lane in range(16):
+            xl, yl = xl_yl(q, lane)
+            rows[lane] = [xl, yl]
+            active[(q, lane)] = (xl, yl)
+        per_sg[q] = rows
+    wg_tile = sorted(set(active.values()))
+    assert len(wg_tile) == 64 and all(0 <= x < 8 and 0 <= y < 8 for x, y in wg_tile), 'active slots are not the 8x8 tile'
+    out['active'] = {
+        "slots": len(active),
+        "distinct_pixels_per_wg": len(wg_tile),
+        "bijective_onto_8x8_tile": len(wg_tile) == 64,
+        "per_sg_lane_to_xl_yl": {str(q): {str(l): v for l, v in per_sg[q].items()} for q in range(4)},
+        "per_sg_pixel_sets": {
+            str(q): sorted({tuple(active[(q, l)]) for l in range(16)}) for q in range(4)},
+        "per_sg_sets_pairwise_disjoint": None,
+    }
+    sg_sets = [set(active[(q, l)] for l in range(16)) for q in range(4)]
+    disj = all(not (sg_sets[i] & sg_sets[j]) for i in range(4) for j in range(i + 1, 4))
+    out['active']['per_sg_sets_pairwise_disjoint'] = disj
+    out['active']['union_is_8x8_tile'] = set().union(*sg_sets) == set(wg_tile)
+
+    # ---- 2. the disabled slots (lane 16..31) evaluated as if they executed
+    #        (they are the source of the "602.9 MB / 301.5 MB duplicate" figure)
+    ext = {}
+    for wg_y in (0, 40, 95):        # interior row, plus the last WG row (mirror fold)
+        for q in range(4):
+            for lane in range(32):
+                xl, yl = xl_yl(q, lane)
+                px = 0 * 8 + xl      # WGID.x only shifts; use WGID.x=0
+                py = wg_y * 8 + yl
+                ext[(wg_y, q, lane)] = (px, py)
+
+    # duplicate structure at an interior WG (wg_y=40) and x-interior
+    own = {(xl, yl) for (xl, yl) in active.values()}
+    rows_equal = {}
+    for q_from, q_to in ((0, 2), (1, 3)):
+        same = all(
+            ((ext[(40, q_from, l)][0] - 0), (ext[(40, q_from, l)][1] - 40 * 8))
+            in {tuple(v) for v in [active[(q_to, k)] for k in range(16)]}
+            for l in range(16, 32))
+        rows_equal["q%d_upper_equals_q%d_lower" % (q_from, q_to)] = same
+    next_wg = all(ext[(40, q, l)][1] >= 41 * 8 for q in (2, 3) for l in range(16, 32))
+    rows_equal['q2_q3_upper_points_at_next_wg_row'] = next_wg
+
+    slots_if_unmasked = 128
+    distinct_if_unmasked = len({ext[(40, q, l)] for q in range(4) for l in range(32)})
+    duplicated_slots = sum(
+        1 for q in range(4) for l in range(16, 32)
+        if (ext[(40, q, l)][0], ext[(40, q, l)][1] - 40 * 8) in own)
+    out['disabled_slots'] = {
+        "slots_per_wg": slots_if_unmasked,
+        "needed_pixels_per_wg": 64,
+        "static_dedup_factor": slots_if_unmasked / 64.0,
+        "duplicate_slots_per_wg": duplicated_slots,
+        "same_wg_duplicate_slots": duplicated_slots,
+        "next_wg_slots": 64 - duplicated_slots,
+        "distinct_addresses_if_unmasked": distinct_if_unmasked,
+        "checks": rows_equal,
+        "note": "identical to n18 COST-BREAKDOWN 4.2: q0 upper == q2 lower, q1 upper == q3 lower, "
+                "q2/q3 upper == next WG rows 8..11. This is a *formula* fact; ISA shows the slots "
+                "are mask-disabled, so none of these addresses is ever issued (see isa-mask-proof.json).",
+    }
+
+    # ---- 3. mirror fold of the next-WG rows at the last WG row
+    fold = []
+    for q in (2, 3):
+        for lane in (16, 31):
+            py = 95 * 8 + xl_yl(q, lane)[1]
+            fold.append({"q": q, "lane": lane, "py_raw": py, "py_after_mirror": mirror(py, H_IMG),
+                         "folded_into_rows": mirror(py, H_IMG) < 768})
+    out['last_wg_row_fold'] = fold
+
+    # ---- 3b. the 21 pixel reads one active lane performs (1 source + 5 taps x 4 corners)
+    #         symbolic: x-slot / y-slot names, so distinctness is a static property
+    taps = {
+        "T1": (("p0x", "p0x1"), ("pmy", "pmy1")),
+        "T2": (("pmx", "pmx1"), ("p0y", "p0y1")),
+        "T3": (("pmx", "pmx1"), ("pmy", "pmy1")),
+        "T4": (("pmx", "pmx1"), ("p2y", "p2y1")),
+        "T5": (("p2x", "p2x1"), ("pmy", "pmy1")),
+    }
+    corners = []
+    for t, (xs, ys) in taps.items():
+        for i in (0, 1):
+            for j in (0, 1):
+                corners.append({"tap": t, "corner": "%d%d" % (i, j),
+                                "x_slot": xs[i], "y_slot": ys[j]})
+    keys = [(c['x_slot'], c['y_slot']) for c in corners]
+    out['per_lane_reads'] = {
+        "source_pixel": 1,
+        "source_pixel_channel_reads": 3,
+        "bilinear_corners": len(corners),
+        "corner_channel_reads": len(corners) * 3,
+        "depth": 5,
+        "motion": 2,
+        "cold_noise": 3,
+        "total_scalar_gather_messages": 1 * 3 + len(corners) * 3 + 5 + 2 + 3,
+        "corners": corners,
+        "corner_slot_pairs_distinct": len(set(keys)) == len(keys),
+        "distinct_corner_slot_pairs": len(set(keys)),
+        "note": "all 20 corner reads are distinct (x-slot, y-slot) expressions; sharing an axis "
+                "does not make two corners the same address. There is no static CSE left inside a lane.",
+    }
+
+    # ---- 4. request-byte ledger under both lane widths
+    msgs = 73
+    per_wg_sg = 4
+    wgs = GRID[0] * GRID[1]
+    led = {}
+    for lanes in (32, 16):
+        req = msgs * lanes * 4
+        led[str(lanes)] = {"bytes_per_lane_program": req,
+                           "bytes_per_wg": req * per_wg_sg,
+                           "bytes_per_dispatch": req * per_wg_sg * wgs,
+                           "MB": req * per_wg_sg * wgs / 1e6}
+    out['request_bytes'] = led
+    (CARD / 'tools' / 'lane-map.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print(json.dumps({k: out[k] for k in ('active', 'disabled_slots')}, indent=1)[:1200])
+    print('per-lane reads:', json.dumps(out['per_lane_reads'])[:400])
+    print('request bytes (32 lanes):', led['32']['MB'], 'MB')
+    print('request bytes (16 lanes):', led['16']['MB'], 'MB')
+
+
+if __name__ == '__main__':
+    main()

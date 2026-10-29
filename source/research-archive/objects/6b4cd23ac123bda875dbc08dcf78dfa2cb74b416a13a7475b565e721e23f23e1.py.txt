@@ -1,0 +1,76 @@
+"""F2 CPU reference arm sweep.
+
+All arms use the *same* boundary input (the FP16 teacher block65_out and skip4 dumps) so that
+every difference is attributable to F2's own arithmetic.  The same-run INT8 pair
+(chain-block65_out -> chain-block66_out) is used only for the CPU-vs-GPU closure check.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+
+import f2model as M
+
+OUT = Path(__file__).with_name("EVIDENCE") / "arms.json"
+
+
+def stats(a):
+    a = np.asarray(a, np.float32)
+    return {"rms": float(np.sqrt((a ** 2).mean())), "maxabs": float(np.abs(a).max())}
+
+
+def cmp(tag, st, ref):
+    got = M.to_io(st["O"])
+    r = ref.astype(np.float32)
+    return {"arm": tag, "relL2": M.rel(got, r),
+            "corr": float(np.corrcoef(got, r)[0, 1]),
+            "rms_out": float(np.sqrt((got ** 2).mean())), "rms_ref": float(np.sqrt((r ** 2).mean())),
+            "stages": {k: stats(st[k]) for k in ("X", "E", "Y", "q", "k", "v", "P", "ctx", "O")}}
+
+
+ARMS = [
+    # (tag, weights, quant, proj, scale_dim, seed_mode)
+    ("fp16_parent_weights+parent_addr", "fp16", False, "parent", "col", "channel"),
+    ("i8_source_as_written", "i8", True, "source", "row", "token"),
+    ("i8_fix_scale_dim", "i8", True, "source", "col", "token"),
+    ("i8_fix_proj_addr", "i8", True, "parent", "row", "token"),
+    ("i8_fix_proj_addr+scale", "i8", True, "parent", "col", "token"),
+    ("i8_fix_all", "i8", True, "parent", "col", "channel"),
+    ("i8_fix_all_noquant", "i8", False, "parent", "col", "channel"),
+    ("i8_source_noquant", "i8", False, "source", "col", "token"),
+]
+
+
+def main():
+    out = {"teacher_io": [], "chain_io": []}
+    for tag, wsel, quant, proj, sd, seed in ARMS:
+        st = M.run("teacher", wsel, quant, proj, sd, True, seed)
+        out["teacher_io"].append(cmp(tag, st, M.R["t_out"]))
+    # cross-arm divergence of the F2 output (teacher input, teacher skip)
+    st_src = M.run("teacher", "i8", True, "source", "row", True, "token")
+    st_fix = M.run("teacher", "i8", True, "parent", "col", True, "channel")
+    st_nq = M.run("teacher", "i8", False, "parent", "col", True, "channel")
+    out["divergence"] = {
+        "src_vs_fix_relL2": M.rel(st_src["O"], st_fix["O"]),
+        "src_vs_fix_corr": float(np.corrcoef(st_src["O"].ravel(), st_fix["O"].ravel())[0, 1]),
+        "src_vs_fix_X_relL2": M.rel(st_src["X"], st_fix["X"]),
+        "fix_quant_vs_noquant_relL2": M.rel(st_fix["O"], st_nq["O"]),
+        "src_quant_vs_noquant_relL2": M.rel(st_src["O"], M.run("teacher", "i8", False, "source", "col", True, "token")["O"]),
+    }
+    # same-run closure check (GPU output available)
+    for tag, wsel, quant, proj, sd, seed in ARMS:
+        st = M.run("chain", wsel, quant, proj, sd, True, seed)
+        out["chain_io"].append(cmp("chain/" + tag, st, M.R["c_out"]))
+    OUT.write_text(json.dumps(out, indent=1), encoding="utf-8")
+    for grp in ("teacher_io", "chain_io"):
+        print("==", grp)
+        for r in out[grp]:
+            print("  %-34s relL2=%7.4f corr=%7.4f rms=%7.3f/%7.3f" %
+                  (r["arm"], r["relL2"], r["corr"], r["rms_out"], r["rms_ref"]))
+    print("== divergence", {k: round(v, 4) for k, v in out["divergence"].items()})
+
+
+if __name__ == "__main__":
+    main()

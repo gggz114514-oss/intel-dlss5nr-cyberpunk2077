@@ -1,0 +1,197 @@
+"""build_candidate.py - fold the fitted residual-space matrix into the exit weights and
+produce the deliverables of S03-tail v2 (XE arm).
+
+Steps
+  1. rebuild the 24-frame pixel cache (needs post.bin + the arm's replayed-network.bin)
+  2. pooled leave-one-sequence-out fits of the clamped foldable family (full 3x3)
+  3. ship matrix A = mean of the three LOO fits
+  4. write the new exit weight block into a copy of ioport_70_ioport_pack (rows 0..2 only,
+     row 3 bit-identical, fp16 round-trip on the new weights)
+  5. write three self-contained candidate plans (only the pack BUFFER path changes)
+  6. score the fold on all 24 frames and write the predicted 2-plane output for the three
+     job frames, so a GPU run can be diffed plane-by-plane against this model
+
+Writes only inside work/dsh-fullnet-static-20261029/S03-tail/.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+
+import numpy as np
+
+import fold_analysis as fa
+import fold_fit as ff
+
+OUT = fa.OUT
+CAND = OUT / "candidates"
+JOB_FRAMES = (34189, 41444, 43654)
+PACK_OUT = CAND / "packs" / "ioport_70_ioport_pack.fold-xe-v2.fp16.bin"
+
+
+def sha256(p: Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--arm", default="xe", choices=sorted(fa.ARMS))
+    args = ap.parse_args()
+    arm = fa.ARMS[args.arm]
+    jobs = [j for j in json.loads((fa.Q / "real-int8-24/JOBS.json").read_text()) if not j["dump"]]
+    rev = json.loads((OUT / f"REVIEW-LOO-{args.arm.upper()}.json").read_text())
+    C = np.asarray(rev["models"]["m3b_3x3_plus_bias"]["fixed_mean_transform"]["coefficient_matrix"])
+    m_eff, b_eff = C[:3].T.copy(), C[3].copy()
+    frames = [{"frame": j["frame"], "seq": j["sequence"],
+               "post": Path(j["reference"]).parent / "post.bin",
+               "cand": arm["dir"] / f"run-{j['frame']}/replayed-network.bin",
+               "ref": Path(j["reference"]), "plan": fa.BASE / "S02-f01" / f"candidate-xe-{j['frame']}.txt"}
+              for j in jobs]
+    seqs = sorted({r["seq"] for r in frames})
+
+    cache = ff.build_cache(frames)
+    free = [(i, j) for i in range(3) for j in range(3)]
+    loo = []
+    for held in seqs:
+        tr = [r for r in cache if r["seq"] != held]
+        te = [r for r in cache if r["seq"] == held]
+        A = ff.gn_fit(tr, m_eff, free=free, iters=40)
+        b0, c0 = ff.psnr_of(np.eye(3), te), ff.psnr_of(A, te)
+        loo.append({"held_out": held, "base_db": b0, "corrected_db": c0, "gain_db": c0 - b0,
+                    "A": A.tolist()})
+        print(f"  pooled LOO {held:<28} {b0:.4f} -> {c0:.4f}  {c0 - b0:+.4f}", flush=True)
+    A = np.mean([np.asarray(v["A"]) for v in loo], axis=0)
+    loo_mean = float(np.mean([v["gain_db"] for v in loo]))
+    A_full = ff.gn_fit(cache, m_eff, free=free, iters=40)
+    print(f"  pooled LOO mean {loo_mean:+.4f} dB; A=\n{np.round(A, 5)}", flush=True)
+
+    # ---------------------------------------------------------------- exit weight block
+    raw = bytearray(fa.PACK.read_bytes())
+    w = np.frombuffer(bytes(raw), dtype="<f2").astype(np.float64)
+    block = w[fa.W_HALF_OFF:fa.W_HALF_OFF + 128].reshape(4, 32).copy()
+    exact = block.copy()
+    exact[:3, :] = A @ block[:3, :]
+    new_block = exact.astype(np.float16)
+    assert (new_block[3] == block[3].astype(np.float16)).all(), "row 3 must stay bit-identical"
+    PACK_OUT.parent.mkdir(parents=True, exist_ok=True)
+    off = fa.W_HALF_OFF * 2
+    raw[off:off + 256] = new_block.astype("<f2").tobytes()
+    PACK_OUT.write_bytes(bytes(raw))
+    back = np.frombuffer(PACK_OUT.read_bytes(), dtype="<f2").astype(np.float64)
+    assert np.array_equal(back[fa.W_HALF_OFF:fa.W_HALF_OFF + 128].reshape(4, 32)[3], block[3])
+    assert back.size == w.size
+    unchanged = np.ones(w.size, dtype=bool)
+    unchanged[fa.W_HALF_OFF:fa.W_HALF_OFF + 96] = False
+    assert np.array_equal(back[unchanged], w[unchanged]), "only rows 0..2 may change"
+    fp16 = {"max_abs_weight_change": float(np.abs(exact[:3] - block[:3]).max()),
+            "rms_weight_before": float(np.sqrt((block[:3] ** 2).mean())),
+            "rms_fp16_error": float(np.sqrt(((new_block[:3] - exact[:3]) ** 2).mean())),
+            "max_abs_fp16_error": float(np.abs(new_block[:3] - exact[:3]).max()),
+            "row3_bit_identical": True, "byte_identical_outside_rows_012": True}
+
+    # ---------------------------------------------------------------- candidate plans
+    CAND.mkdir(parents=True, exist_ok=True)
+    plans = []
+    for r in frames:
+        f = r["frame"]
+        src = r["plan"]
+        if not src.exists():
+            raise SystemExit(f"missing source plan {src}")
+        lines = src.read_text(encoding="utf-8").splitlines()
+        hits = [i for i, l in enumerate(lines)
+                if l.startswith('BUFFER "ioport_70_ioport_pack"')]
+        assert len(hits) == 1, (src, hits)
+        i = hits[0]
+        assert '35456' in lines[i]
+        lines[i] = f'BUFFER "ioport_70_ioport_pack" 35456 "{PACK_OUT.as_posix()}"'
+        dst = CAND / f"candidate-fold-xe-{f}.txt"
+        dst.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        plans.append({"frame": f, "plan": str(dst), "plan_sha256": sha256(dst),
+                      "base_plan": str(src), "base_plan_sha256": sha256(src),
+                      "changed_line": i + 1, "old_line": src.read_text(
+                          encoding="utf-8").splitlines()[i],
+                      "new_line": lines[i], "buffer_bytes": 35456})
+
+    # ---------------------------------------------------------------- full-resolution scoring
+    per_frame = []
+    for r in frames:
+        a = fa.frame_arrays(r["post"], r["cand"], r["ref"])
+        zz = np.clip(a["base"] + (a["z"] - a["base"]) @ A.T, 0.0, 1.0)
+        y_pre_new = (1.0 - a["blend"])[:, :, None] * zz + a["blend"][:, :, None] * a["hist_s"]
+        y_new = np.clip(y_pre_new, 0.0, 1.0)
+        p_base = fa.psnr(a["ref"], a["y_disp"])
+        p_new = fa.psnr(a["ref"], y_new)
+        p_post = fa.psnr(a["ref"], np.clip(a["y_disp"] @ m_eff.T + b_eff, 0.0, 1.0))
+        per_frame.append({"frame": r["frame"], "seq": r["seq"], "base_db": p_base,
+                          "fold_db": p_new, "gain_db": p_new - p_base,
+                          "postpass_db": p_post, "postpass_gain_db": p_post - p_base})
+        if r["frame"] in JOB_FRAMES:
+            out = np.empty((2, fa.IH, fa.IW, 4), dtype="<f4")
+            out[0, :, :, :3] = y_new
+            out[0, :, :, 3] = 1.0
+            out[1, :, :, :3] = y_pre_new
+            out[1, :, :, 3] = a["blend"]
+            p = CAND / f"cpu-fold-xe-{r['frame']}.bin"
+            out.tofile(p)
+            r["cpu_bin"] = str(p)
+            r["cpu_bin_sha256"] = sha256(p)
+        del a, zz, y_pre_new, y_new
+    per_seq = {}
+    for s in seqs:
+        rows = [x for x in per_frame if x["seq"] == s]
+        per_seq[s] = {k: float(np.mean([x[k] for x in rows]))
+                      for k in ("base_db", "fold_db", "gain_db", "postpass_gain_db")}
+    mean = {k: float(np.mean([x[k] for x in per_frame]))
+            for k in ("base_db", "fold_db", "gain_db", "postpass_gain_db")}
+    rms_w = float(np.sqrt((block[:3] ** 2).mean()))
+    rms_round = fp16["rms_fp16_error"]
+    report = {
+        "schema": "dsh-s03-tail-candidate-fold/1",
+        "arm": args.arm, "arm_label": arm["label"],
+        "decision": {
+            "exact_fold_of_M_y_plus_b": False,
+            "reason": "base is a per-pixel input the projection is added to, and the history mix "
+                      "plus clamps follow the projection, so a weight change can only scale "
+                      "(z-base).  The kernel also has no bias term, so b has no implementation.",
+            "what_was_shipped": "the best member of the implementable family: 9 numbers, rows 0..2 "
+                                "of the 4x32 projection, fitted directly against the clamped "
+                                "display error.  Row 3 (blend logit) and alpha are untouched.",
+            "implementable_gain_db": mean["gain_db"],
+            "postpass_gain_db_same_frames": mean["postpass_gain_db"],
+        },
+        "matrix_A": A.tolist(), "matrix_A_full_fit_insample": A_full.tolist(),
+        "loo_pooled": loo, "loo_pooled_mean_gain_db": loo_mean,
+        "per_frame": per_frame, "per_sequence": per_seq, "mean": mean,
+        "pack": {"path": str(PACK_OUT), "sha256": sha256(PACK_OUT),
+                 "bytes": PACK_OUT.stat().st_size,
+                 "base_pack": str(fa.PACK), "base_pack_sha256": sha256(fa.PACK),
+                 "changed_byte_range": [fa.W_HALF_OFF * 2, fa.W_HALF_OFF * 2 + 96],
+                 "layout": "4x32 fp16 at half offset 17024; only rows 0..2 written"},
+        "fp16": fp16,
+        "plans": plans,
+        "caveats": [
+            "A was fitted on the same 24 development frames; the LOO numbers hold out a sequence, "
+            "not a scene, so they are optimistic for new content",
+            "the fitted B row carries a negative diagonal (-0.56): the residual branch is partly "
+            "inverted in blue.  That is what lowers the squared error, but a negative gain on a "
+            "residual is not a colour correction - it is more consistent with an upstream scale "
+            "or sign error, and handbook 7 forbids shipping it as a quality fix before that is "
+            "identified.  Treat this candidate as a measurement, not as a fix.",
+            "the predicted outputs use a Python re-implementation of history5; the folded "
+            "candidate's GPU run (JOBS F1) is the closure test for that model",
+        ],
+    }
+    (OUT / f"CANDIDATE-FOLD-{args.arm.upper()}.json").write_text(json.dumps(report, indent=2),
+                                                                encoding="utf-8")
+    print(f"\npack {PACK_OUT.name} {report['pack']['bytes']} B sha {report['pack']['sha256'][:16]}")
+    print(f"mean 24 frames: base {mean['base_db']:.4f}  fold {mean['fold_db']:.4f} "
+          f"({mean['gain_db']:+.4f})  post-pass {mean['postpass_gain_db']:+.4f}")
+    for s, v in per_seq.items():
+        print(f"   {s:<28} {v['base_db']:.4f} -> {v['fold_db']:.4f}  {v['gain_db']:+.4f} "
+              f"(post {v['postpass_gain_db']:+.4f})")
+
+
+if __name__ == "__main__":
+    main()

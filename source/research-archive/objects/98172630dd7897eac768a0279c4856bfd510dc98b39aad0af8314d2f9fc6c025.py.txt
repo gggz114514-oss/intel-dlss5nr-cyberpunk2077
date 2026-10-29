@@ -1,0 +1,79 @@
+"""Fresh same-batch measurement: small network (76-row plan) vs our optimised head (152 rows).
+
+The campaign runner refuses any plan that is not 152 rows, so this uses the private runner built in
+small-current-paired-20261026 (b2505169), the one that parses both 76 and 152 rows and was already
+used for the 2026-10-26 baseline comparison. Execution is unchanged; only row parsing differs.
+small is a different model, so only timing is compared; our arm keeps its own gold proofs.
+"""
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import COMMON as K
+import STAGE
+
+RUNNER = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+              'small-current-paired-20261026/runner-build/Release/clock_runner.exe')
+SMALL = Path('@NR_WORKSPACE@/work/vk102-small-310-9-16-20261019/'
+             'package/manifest/port_network_runtime.txt')
+cur = K.read_json(K.C / 'CURRENT.json')
+head = Path(cur['best_plan']['path'])
+arms = {'S': (SMALL, K.sha(SMALL)), 'C': (head, cur['best_plan']['sha256'])}
+SMALL_GOLD = 'f807a6d176497a63991665a9e0d914e2a3cdf8bbca30103a8471c0c331feece6'
+out = K.C / 'queue' / 'small-measure3'
+out.mkdir(parents=True, exist_ok=True)
+
+
+def job(jid, plan, psha, root, arm, pair):
+    argv = [str(RUNNER), '--plan', str(plan), '--out', str(root), '--pool',
+            '--warm', '1', '--reps', '30', '--feedback']
+    return dict(id=jid, pair=pair, candidate=arm, plan=dict(path=str(plan), sha256=psha),
+                runner_output=str(root), argv=argv,
+                expected_frame_out=(SMALL_GOLD if arm == 'S' else K.FB2_LAST_GOLD))
+
+
+PERM = [('S', 'C'), ('C', 'S'), ('S', 'C'), ('C', 'S'), ('S', 'C'), ('C', 'S')]
+jobs = []
+for pi, order in enumerate(PERM):
+    for aid in order:
+        p, s = arms[aid]
+        jobs.append(job('pair-%d-%s' % (pi, aid), p, s, out / 'run' / ('pair-%d-%s' % (pi, aid)), aid, pi))
+spec = dict(stage='ordinary', owner='LUNA-CONTINUOUS-SMALL2',
+            authorization='Main authorized a fresh balanced batch of the small network plan against '
+                          'the current head. small is a different model: timing only.',
+            output_root=str(out), identities=[str(v[0]) for v in arms.values()] + [str(RUNNER)],
+            jobs=jobs, rules='six balanced pairs; all samples retained')
+K.write_json(out / 'spec-ordinary.json', spec)
+manifest, ps1 = STAGE.prepare(spec)
+STAGE.run(manifest, ps1)
+s = STAGE.summarize(spec['output_root'])
+K.write_json(out / 'STAGE-SUMMARY.json', s)
+print('ordinary', s['status'])
+bad = [(j['id'], j['status']) for j in s['jobs'] if j['status'] != 'COMPLETED']
+if bad:
+    print('failed:', bad[:4])
+
+means = {}
+for run in sorted((out / 'run').glob('pair-*')):
+    rc = K.read_json(run / 'port_network_receipt.json')
+    arm = run.name.split('-')[-1]
+    means.setdefault(arm, []).append((int(run.name.split('-')[1]), rc['gpu_mean_ms'], rc.get('gpu_passes')))
+T = 2.570581835636305
+for a in sorted(means):
+    v = sorted(means[a])
+    print('%s: %d runs, passes %s, mean %.3f ms, per-run %s' % (
+        a, len(v), {x[2] for x in v}, sum(x[1] for x in v) / len(v), ['%.2f' % x[1] for x in v]))
+if 'S' in means and 'C' in means:
+    s_, c_ = sorted(means['S']), sorted(means['C'])
+    n = min(len(s_), len(c_))
+    d = [c_[i][1] - s_[i][1] for i in range(n)]
+    m = sum(d) / n
+    sd = (sum((x - m) ** 2 for x in d) / (n - 1)) ** 0.5
+    half = T * sd / (n ** 0.5)
+    sm = sum(x[1] for x in s_[:n]) / n
+    cm = sum(x[1] for x in c_[:n]) / n
+    print('\nhead %.3f ms  small %.3f ms  gap %+.4f CI95[%+.4f, %+.4f]  (head is %.2f%% slower)'
+          % (cm, sm, m, m - half, m + half, 100 * m / sm))
+    K.write_json(K.C / 'evidence' / 'SMALL-NETWORK-TIMING.json',
+                 dict(arms={k: sorted(v) for k, v in means.items()}, head_ms=cm, small_ms=sm,
+                      gap_ms=m, CI95_ms=[m - half, m + half], groups=n,
+                      runner=dict(path=str(RUNNER), sha256=K.sha(RUNNER))))

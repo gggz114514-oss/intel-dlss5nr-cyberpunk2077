@@ -1,0 +1,281 @@
+"""n06c-f06-c256-sht: source diff, barrier accounting, ledger, GPU request.
+
+Adds the barrier/publish checks to BUILD.json and writes SOURCE-DIFF.patch,
+COST-LEDGER.json and GPU-REQUEST.json from computed values.
+"""
+import json, sys, difflib, re
+from pathlib import Path
+from collections import Counter
+
+CARD = Path(__file__).resolve().parent.parent
+CAMP = CARD.parent.parent
+sys.path.insert(0, str(CAMP))
+sys.path.insert(0, str(CARD / 'scratch'))
+import COMMON as K
+import spvstat
+
+PARENT_SRC = K.D / 'f06-scale-fragments/family/c256/candidate.comp'
+CAND_SRC = CARD / 'candidate.comp'
+PARENT_SPV = K.D / 'f06-scale-fragments/family/c256/candidate.spv'
+CAND_SPV = CARD / 'candidate.spv'
+TARGET_SPV_SHA = '881dff8c51454f79181a567d6b976ea21ec7c81174bf075ca7be723b09c4a3f0'
+
+# ---------------------------------------------------------------- source diff
+a = PARENT_SRC.read_text(encoding='utf-8').splitlines(keepends=True)
+b = CAND_SRC.read_text(encoding='utf-8').splitlines(keepends=True)
+diff = list(difflib.unified_diff(a, b, fromfile='parent/c256/candidate.comp',
+                                 tofile='candidate.comp', n=3))
+(CARD / 'SOURCE-DIFF.patch').write_text(''.join(diff), encoding='utf-8')
+added = [l for l in diff if l.startswith('+') and not l.startswith('+++')]
+removed = [l for l in diff if l.startswith('-') and not l.startswith('---')]
+
+# ---------------------------------------------------------------- barrier accounting
+pb, cb = spvstat.Mod(PARENT_SPV), spvstat.Mod(CAND_SPV)
+BARRIER = 224          # OpControlBarrier
+MEMBAR = 225           # OpMemoryBarrier
+build = K.read_json(CARD / 'BUILD.json')
+build['barriers'] = dict(
+    op_control_barrier_static=dict(parent=pb.hist.get(BARRIER, 0), candidate=cb.hist.get(BARRIER, 0)),
+    op_memory_barrier=dict(parent=pb.hist.get(MEMBAR, 0), candidate=cb.hist.get(MEMBAR, 0)),
+    dynamic_barriers_per_dispatch=dict(
+        parent=1, candidate=4,
+        basis='parent: one barrier after the whole-tile staging copy (the second static barrier'
+              ' sits inside the uniform debug branch, which is off for the fixed/ordinary arms).'
+              ' candidate: one prologue barrier plus one in-loop barrier executed at j=1,3,5'
+              ' (static 2, dynamic 4)'),
+    parent_note='1 copy barrier + 1 inside the debug block (static 2, dynamic 1 with debug=0)',
+    candidate_note='1 prologue barrier + 1 loop barrier executed 3 times (static 2, dynamic 4);'
+                   ' the debug block needs no barrier because the last publish barrier already'
+                   ' orders every segment before the debug read',
+    op_store=dict(parent=pb.hist.get(62, 0), candidate=cb.hist.get(62, 0),
+                  note='candidate unrolls the 16-half publish chunk, emitted twice (prologue and'
+                       ' in-loop site)'),
+    op_load=dict(parent=pb.hist.get(61, 0), candidate=cb.hist.get(61, 0)),
+    op_access_chain=dict(parent=pb.hist.get(65, 0) + pb.hist.get(66, 0),
+                         candidate=cb.hist.get(65, 0) + cb.hist.get(66, 0)),
+    op_function_call=dict(parent=pb.hist.get(56, 0), candidate=cb.hist.get(56, 0)),
+)
+build['source_diff'] = dict(
+    path=str(CARD / 'SOURCE-DIFF.patch'),
+    sha256=K.sha(CARD / 'SOURCE-DIFF.patch'),
+    added_lines=len(added), removed_lines=len(removed),
+    parent_source_sha256=K.sha(PARENT_SRC), candidate_source_sha256=K.sha(CAND_SRC),
+    compute_body_touched=False,
+    compute_body_evidence='every removed line is one of: the stride-256 staging loop, its'
+                          ' barrier(), the old debug block, or the old j-loop header; no line'
+                          ' containing coopMat/acc/seed/scale/store appears in the removed set',
+)
+
+# prove the projection body is untouched: the removed lines may only be the staging loop,
+# the barrier, the old debug block and the old loop header.
+removed_txt = [l[1:].rstrip() for l in removed]
+FORBIDDEN = ('coopMat', 'MAT_', 'narrowed', 'imgout', 'acc0', 'acc1', 'seed', 'gain_scale')
+bad = [l for l in removed_txt
+       if not l.strip().startswith('//') and any(f in l for f in FORBIDDEN)]
+build['source_diff']['removed_lines_touching_compute_body'] = bad
+build['source_diff']['removed_lines'] = removed_txt
+build['source_diff']['added_lines_text'] = [l[1:].rstrip() for l in added]
+build['source_diff']['compute_body_untouched'] = len(bad) == 0
+K.write_json(CARD / 'BUILD.json', build)
+
+# ---------------------------------------------------------------- cost ledger
+ledger = {
+    "card": CARD.name,
+    "units": "per workgroup unless stated; 8 subgroups, 256 threads; 15 PASS",
+    "mechanism": "shT stays (32 KiB, row-major, stride 256). The single 'publish all, then read"
+                 " all' phase becomes 4 publish/consume windows of 16 tokens (8 KiB each);"
+                 " the publish of window s+1 is issued before the consumption of window s.",
+    "removed": [
+        {"item": "serial exposure of the staging read before the first DPAS",
+         "parent": "all 32 KiB (16384 halves) must be published and barrier-confirmed before any"
+                   " consumer starts",
+         "candidate": "4 KiB first window must be published (8 KiB per segment in this build: the"
+                      " first barrier covers 8 KiB)",
+         "delta": "exposed prologue copy 32 KiB -> 8 KiB (-75%)",
+         "basis": "source structure; the remaining 3 segments are published inside the DPAS stream",
+         "caveat": "the exposure is partly hidden already by the second resident workgroup"
+                   " (register limit 128 GRF/thread -> 2 WGs/core), so the realised saving is"
+                   " smaller than 75% of the copy time"},
+        {"item": "staging messages per workgroup (load + SLM store)",
+         "parent": 1024,
+         "parent_basis": "native capture of kernel 6b7176820f28c8ca: the copy loop is rolled and"
+                         " moves 64 B per message (load.ugm.d16u32 16 static, store.slm.d16u32 16"
+                         " static, 4 iterations), i.e. 32 KiB / 64 B = 512 load messages plus 512"
+                         " SLM-store messages per workgroup",
+         "candidate": 64,
+         "candidate_basis": "4 publish sites x 1 message per warp: 256 threads x 32 B = 8 KiB per"
+                            " segment, i.e. 1024 B per warp = one 32 B-per-lane message, 4 loads +"
+                            " 4 stores per warp = 64 messages per workgroup",
+         "delta": -960,
+         "delta_pct": "-94% of the staging messages, -7.6% of all data-port messages of the kernel",
+         "basis": "16 contiguous halves per thread per segment (contiguous in gT and in shT)",
+         "note": "logical bytes unchanged (32 KiB read, 32 KiB SLM store); this is a message-count"
+                 " change, not a DRAM change"},
+        {"item": "barrier inside the debug block",
+         "parent": 1,
+         "candidate": 0,
+         "delta": -1,
+         "basis": "the debug read of shT moved after the last publish barrier and needs no barrier",
+         "scope": "debug=0 on the fixed/ordinary arms, so this only affects the debug path"},
+    ],
+    "added": [
+        {"item": "workgroup barriers on the main path",
+         "parent": 1,
+         "candidate": 4,
+         "delta": 3,
+         "basis": "one publish barrier per segment; a barrier between compute(s) and publish(s+1)"
+                  " is NOT needed because the write domains are disjoint (PROOF.domains)",
+         "cost_estimate": "3 extra full-workgroup barriers per dispatch; at 8 warps and 2 resident"
+                          " WGs the exposed cost is one warp-skew window each, i.e. tens of cycles,"
+                          " not a serialisation of the whole workgroup"},
+        {"item": "SPIR-V integer address additions",
+         "parent": 56,
+         "candidate": 93,
+         "delta": 37,
+         "basis": "4 segment bases instead of 1 loop counter; IAdd 56 -> 93, IMul 34 -> 37",
+         "note": "F10/campaign lesson L1: source-level address folding does not change ISA work,"
+                 " so this is recorded as neutral, not as a cost that must be repaid"},
+        {"item": "SPIR-V static instructions / bytes",
+         "parent": {"instructions": 860, "words": 3466, "bytes": 13864},
+         "candidate": {"instructions": 1042, "words": 4278, "bytes": 17112},
+         "delta": {"instructions": 182, "words": 812, "bytes": 3248},
+         "basis": "the 16-half publish chunk is unrolled (16 stores + 16 loads per stub x 4)",
+         "note": "static size, not dynamic work: the parent's copy loop executes 2 iterations of"
+                 " the same work"},
+        {"item": "loop nest",
+         "parent": "1 j loop (8)",
+         "candidate": "1 segment loop (4) x 1 window loop (2)",
+         "delta": "one extra loop level, both constant-bounded",
+         "risk": "if IGC keeps the segment loop rolled instead of unrolling it, the DPAS stream"
+                 " loses its software-pipelined shape; the native criterion is dpas.8x8 = 256 and"
+                 " loop count = 4 (see NATIVE-PREDICTION.md)"},
+    ],
+    "unchanged": [
+        "shT size 32768 B, row-major layout, stride 256 (OpCooperativeMatrixLoadKHR stride operand"
+        " is 256 in both arms; PROOF.requests)",
+        "A read path: 8 messages per 8x16 tile, 1024 per SG, 8192 per workgroup, 32 KiB per SG of"
+        " SLM reads - identical index expression, identical owner count (item 4 of the card)",
+        "DPAS 256 per SG, K order 0..112 per accumulator (ki ascending), seed-before-K",
+        "weight loads 256 per SG (512 B tiles, LCOL) - weight reuse form untouched",
+        "seed loads 16 per SG, stores 16 per SG, grid and bindings and push constants",
+        "FP point set: OpFMul 2, OpFConvert 4, no OpFAdd/OpFSub, no OpQuantizeToF16,"
+        " NoContraction 0 in both arms",
+        "workgroup memory 32768 B and 0 B scratch (unchanged resource footprint)",
+    ],
+    "unknown": [
+        "whether IGC keeps the per-segment publish interleaved with the DPAS stream or sinks each"
+        " publish to just before its barrier (that would keep the message saving and lose the"
+        " overlap); observable: address position of the 4 publish blocks relative to first DPAS",
+        "the real cost of 3 extra workgroup barriers on this kernel (no GPU here)",
+        "whether the copy's 32 B-per-lane chunk is emitted as one d32x8 message or split",
+        "DRAM effect: gT is read once per workgroup either way (32 KiB), so no DRAM change is"
+        " expected; cache-line grouping of the publish is unchanged because the layout is unchanged",
+        "real timing (no GPU in this card)",
+    ],
+    "ceiling": {
+        "group_measured_us": 484.94,
+        "group_share_of_frame_pct": 2.76,
+        "frame_ms": 17.577,
+        "source": "queue/n06-f06-output/resources/run/resources-base/hardware-counters.json"
+                  " (GpuTime per PASS, single sample, base arm of the C128 card; the C256 PASSes"
+                  " are untouched there, so this is the current-identity size of the group)",
+        "staging_bytes_per_wg": 65536,
+        "estimated_data_port_bytes_per_wg": 1415576,
+        "staging_share_of_bytes_pct": 4.6,
+        "staging_messages_per_wg": {"parent": 1024, "candidate": 64},
+        "estimated_messages_per_wg": 13536,
+        "staging_share_of_messages_pct": {"parent": 7.6, "candidate": 0.5},
+        "message_budget_basis": "native static counts per warp x 8 warps: A read 1024 -> 8192,"
+                                " weights 256 -> 2048, seeds 128 -> 1024, stores 128 -> 1024,"
+                                " staging 128 -> 1024, misc ~160",
+        "reading": "the residency this card attacks is 7.6% of the data-port message slots and 4.6%"
+                   " of the bytes of the kernel, and part of it is already hidden by the second"
+                   " resident workgroup, so the honest expected effect is a few percent of the"
+                   " group (order 10-20 us/frame), i.e. at or below the ordinary resolution of"
+                   " ~0.03 ms. The A read (8192 messages per workgroup, 60% of the message slots)"
+                   " is what shT actually costs the kernel, and it can only be reduced by changing"
+                   " the layout the publish produces - a different mechanism, see RESUME 5.1",
+    },
+}
+K.write_json(CARD / 'COST-LEDGER.json', ledger)
+
+# ---------------------------------------------------------------- gpu request
+base_rows = [r for r in K.rows() if r['spv_sha256'] == TARGET_SPV_SHA]
+req = {
+    "card": CARD.name,
+    "shader_group": {"spv_sha256_baseline": [TARGET_SPV_SHA],
+                     "pass_ordinals": sorted(r['ordinal'] for r in base_rows)},
+    "plan": {"path": str(CARD / 'plan.txt'), "sha256": K.sha(CARD / 'plan.txt')},
+    "arms": [
+        {"id": "base", "plan": "baseline", "role": "baseline"},
+        {"id": "cand", "plan": "candidate", "role": "candidate"},
+    ],
+    "gates": ["fixed", "fb2"],
+    "native": True,
+    "resources": True,
+    "ordinary": {"design": "two-arm-6-alternating", "reps": 30, "warm": 1, "feedback": True},
+    "hypothesis": "If the native capture shows send.slm/ugm staging messages collapsed to ~1 per"
+                  " publish stub with dpas.8x8=256 unchanged and the 4 publish blocks interleaved"
+                  " before their barriers, then the segmented publish landed; the load.ugm"
+                  " message count and the dpas count must both keep their values, otherwise the"
+                  " change is mis-implemented rather than the mechanism being无效.",
+    "native_observables": [
+        "dpas.8x8 = 256 (unchanged; if not, IGC rolled the segment loop and the mechanism did not land)",
+        "sync.bar 2 -> 5 (4 publish barriers + 1 in the prologue path; debug barrier gone)",
+        "staging global loads: load.ugm.d16u32 family shrinks and is replaced by wider d32x8/d32x4"
+        " messages; total send.ugm drops by the staging share only",
+        "send.slm 1042 must stay 1042 (A read unchanged) - any change here means the read path moved",
+        "workgroup memory 32768 B unchanged, scratch 0 unchanged (no register-pressure regression)",
+        "instruction count changes only by the staging/unroll delta, not by the DPAS body",
+    ],
+    "notes": [
+        "the plan replaces ONLY the 15 F06-C256 PASS lines (asserted == 15); every other PASS path"
+        " is byte-identical to the handoff F10 baseline",
+        "no deployment, no pointer/COMMON.py edit, no GPU work from this card",
+    ],
+}
+K.write_json(CARD / 'GPU-REQUEST.json', req)
+
+# ---------------------------------------------------------------- shT footprint check
+def workgroup_arrays(mod):
+    """[(var_id, array_len, elem_bits)] for every Workgroup OpVariable of an array type."""
+    out = []
+    types, ptr, arr, cons = {}, {}, {}, {}
+    for op, o in mod.instr:
+        if op == 32:                     # OpTypePointer (result, storage, type)
+            ptr[o[0]] = (o[1], o[2])
+        elif op == 28:                   # OpTypeArray (result, elem, length_id)
+            arr[o[0]] = (o[1], o[2])
+        elif op == 43:                   # OpConstant
+            cons[o[1]] = o[2:]
+        elif op == 22:                   # OpTypeFloat (result, bits)
+            types[o[0]] = o[1]
+        elif op == 59 and len(o) >= 3 and o[2] == 4:   # Workgroup variable
+            pt = ptr.get(o[0])
+            if pt and pt[1] in arr:
+                elem, ln = arr[pt[1]]
+                bits = types.get(elem)
+                out.append((o[1], cons.get(ln, [None])[0], bits))
+    return out
+
+
+shT_parent = workgroup_arrays(pb)
+shT_cand = workgroup_arrays(cb)
+build['workgroup_memory'] = dict(
+    parent=shT_parent, candidate=shT_cand,
+    shT_halves=16384, shT_bytes=32768,
+    identical=([(ln, b) for _, ln, b in shT_parent] == [(ln, b) for _, ln, b in shT_cand]
+               and bool(shT_cand) and shT_cand[0][1] == 16384 and shT_cand[0][2] == 16),
+    note='shT is not deleted, resized or re-typed: one half array of 16384 elements in both arms',
+)
+K.write_json(CARD / 'BUILD.json', build)
+
+print('WORKGROUP', shT_parent, shT_cand, build['workgroup_memory']['identical'])
+print('SOURCE-DIFF added %d removed %d; compute body untouched %s' % (
+    len(added), len(removed), build['source_diff']['compute_body_untouched']))
+print('barriers static', build['barriers']['op_control_barrier_static'],
+      'dynamic', build['barriers']['dynamic_barriers_per_dispatch'],
+      'store', build['barriers']['op_store'], 'load', build['barriers']['op_load'])
+print('removed lines:', build['source_diff']['removed_lines'])
+print('bad:', build['source_diff']['removed_lines_touching_compute_body'])
+print('ledger+request written; plan sha', req['plan']['sha256'])

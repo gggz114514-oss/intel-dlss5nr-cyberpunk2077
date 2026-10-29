@@ -1,0 +1,237 @@
+"""n18b-f01-gather: ISA proof that the lane>=16 half of the entry gather never issues.
+
+Input (read-only):
+  A. current chain head / this card's parent, ordinal 0:
+     queue/n17-f20-body/native/captures/native-native-base/ISA/
+       CS_asm54249010bf7e593b_simd32_..._orig.asm        (SPV ecc9dd39.., n18 candidate)
+  B. pre-n18 base, for continuity:
+     queue/n18-f01-entry/native/captures/native-native-base/ISA/
+       CS_asm5bd64f2b0906027c_simd32_..._orig.asm        (SPV 31c2fd9a.., f01-direct-a)
+
+What is proved, per file:
+  1. the lane index sequence (0x76543210 + 8 + 16) is materialised into a register;
+  2. a 32-wide unsigned compare of that sequence against 0x10 sets the per-lane
+     predicate fX.0 = (lane < 16);
+  3. the very next instructions open a *divergent region* with
+     `(~fX.0) goto Lend` -- lanes 16..31 skip straight to Lend, so every
+     instruction in (entry, Lend) executes with an execution mask limited to
+     lanes 0..15 on the hardware; the static `(32|M0)` encoding is the exec
+     size, not the active mask;
+  4. all 73 `load.ugm.d32` channel gathers of the entry block sit inside that
+     region and carry no per-instruction predicate, i.e. the region mask is
+     their only guard;
+  5. an independent structural argument: the shK feature store address is built
+     as (q<<8) + (lane<<4) + flat, byte-doubled, with no clamp of `lane` to
+     0..15.  A 32-lane store at that address would write the *next* subgroup's
+     16-token block, so the shader can only produce the gold frames if the
+     region mask is really applied.
+
+Writes tools/isa-mask-proof.json.
+"""
+import json, re, sys
+from pathlib import Path
+
+CARD = Path(__file__).resolve().parents[1]
+CAMPAIGN = CARD.parents[1]
+FILES = {
+    "current_head_54249010bf7e593b": CAMPAIGN / 'queue/n17-f20-body/native/captures/native-native-base/ISA/'
+        'CS_asm54249010bf7e593b_simd32_0000000000000001_0_orig.asm',
+    "pre_n18_base_5bd64f2b0906027c": CAMPAIGN / 'queue/n18-f01-entry/native/captures/native-native-base/ISA/'
+        'CS_asm5bd64f2b0906027c_simd32_0000000000000001_0_orig.asm',
+}
+
+OFF_RE = re.compile(r'/\* \[([0-9A-F]{4,})\]\s+\*/')
+LABEL_RE = re.compile(r'^(L\d+):')
+PRED_RE = re.compile(r'^\(([^)]*)\)\s*([A-Za-z0-9_.]+)')
+
+
+def parse(path):
+    """-> list of dict(offset, label, pred, op, text) in file order."""
+    out = []
+    for raw in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+        line = raw.rstrip()
+        lm = LABEL_RE.match(line)
+        if lm:
+            out.append(dict(offset=int(lm.group(1)[1:]), label=lm.group(1), pred=None,
+                            op='LABEL', text=line.strip()))
+            continue
+        om = OFF_RE.search(line)
+        if not om:
+            continue
+        rest = line[om.end():].strip()
+        pred = None
+        pm = PRED_RE.match(rest)
+        if pm:
+            pred, op = pm.group(1), pm.group(2)
+        else:
+            op = rest.split()[0] if rest else ''
+        out.append(dict(offset=int(om.group(1), 16), label=None, pred=pred,
+                        op=op, text=line.strip()))
+    return out
+
+
+def analyse(name, path):
+    ins = parse(path)
+    res = dict(file=str(path), instructions=len([i for i in ins if i['op'] != 'LABEL']),
+               sends=0, gathers=0)
+
+    # 1. lane sequence register
+    lane_regs = []
+    for i in ins:
+        if '0x76543210' in i['text'] and re.search(r'mov \(8\|M0\)', i['text']):
+            m = re.search(r'mov \(8\|M0\)\s+r(\d+)\.0', i['text'])
+            if m:
+                lane_regs.append(dict(offset=i['offset'], reg='r' + m.group(1), text=i['text']))
+    res['lane_sequence'] = lane_regs
+
+    # 2. lane<16 compare
+    cmps = []
+    for i in ins:
+        if i['op'] != 'cmp':
+            continue
+        if '0x10:uw' not in i['text']:
+            continue
+        m = re.search(r'\((lt|ge)\)f(\d+)\.(\d)\s+null<2>:uw\s+r(\d+)', i['text'])
+        if m and m.group(1) == 'lt':
+            cmps.append(dict(offset=i['offset'], predicate_slot='f%s.%s' % (m.group(2), m.group(3)),
+                             source_reg='r' + m.group(4), text=i['text']))
+    res['lane_lt_16_compare'] = cmps
+    assert len(cmps) == 1, 'expected exactly one lane<16 compare, got %d' % len(cmps)
+    pred = cmps[0]['predicate_slot']            # e.g. f3.0 / f0.0
+    pred_base = pred.split('.')[0]
+    # lane-sequence register must be the compare source
+    assert any(c['source_reg'] == r['reg'] for c in cmps for r in lane_regs), \
+        'lane<16 compare does not use the lane sequence register'
+
+    # 3. divergent region entry / end
+    entries = []
+    for i in ins:
+        if i['op'] != 'goto' or not i['pred']:
+            continue
+        if i['pred'].replace('~', '').strip() != pred:
+            continue
+        m = re.search(r'goto \(32\|M0\)\s+L(\d+)\s+L(\d+)', i['text'])
+        if m and m.group(1) == m.group(2):
+            entries.append(dict(offset=i['offset'], end=int(m.group(1)), text=i['text']))
+    res['region_entries'] = entries
+    assert entries, 'no `(~%s) goto Lend` region entry found' % pred
+    ent = entries[0]
+    start, end = ent['offset'], ent['end']
+
+    # matching reconvergence point
+    joins = [i for i in ins if i['op'] == 'join' and ('L%d' % end) in i['text']]
+    res['region'] = dict(predicate=pred, entry_offset=start, end_offset=end,
+                         end_label='L%d' % end,
+                         entry_text=ent['text'],
+                         join_offsets=[j['offset'] for j in joins],
+                         instructions=len([i for i in ins if start < i['offset'] < end and i['op'] != 'LABEL']),
+                         sends=len([i for i in ins if start < i['offset'] < end and i['op'].startswith('send')]))
+
+    # 4. gathers inside / outside the region
+    inside, outside = [], []
+    for i in ins:
+        if i['op'] != 'send.ugm':
+            continue
+        m = re.search(r'//.*?(load\.ugm\.[a-z0-9]+)\.a(?:32|64)\.[a-z.]+', i['text'])
+        if not m or m.group(1) != 'load.ugm.d32':
+            continue
+        rec = dict(offset=i['offset'], offset_hex='%04X' % i['offset'], message=m.group(1),
+                   channel=(re.search(r'\[a0\.0\](\[A\+0x[0-9A-F]+\])?$', i['text']) or
+                            [None, '?'])[1] if re.search(r'\[a0\.0\](\[A\+0x[0-9A-F]+\])?$', i['text']) else '?',
+                   pred=i['pred'], text=i['text'])
+        (inside if start < i['offset'] < end else outside).append(rec)
+    res['gathers_total'] = len(inside) + len(outside)
+    res['gathers_inside_region'] = len(inside)
+    res['gathers_outside_region'] = len(outside)
+    res['gathers_unpredicated'] = len([g for g in inside if g['pred'] is None])
+    res['gathers_offsets'] = [g['offset_hex'] for g in inside]
+    res['gather_check'] = dict(
+        all_inside=(len(outside) == 0),
+        all_unpredicated=(res['gathers_unpredicated'] == len(inside)),
+        offset_range=[min(g['offset'] for g in inside), max(g['offset'] for g in inside)],
+    )
+    res['sends_total'] = len([i for i in ins if i['op'].startswith('send')])
+
+    # 5. shK feature-store address chain: find the flat[A+0x400] stores in the region
+    stores = []
+    for i in ins:
+        if i['op'] != 'send.slm':
+            continue
+        if 'store.slm.d32x4.a32.flat[A+0x4' not in i['text']:
+            continue
+        stores.append(dict(offset=i['offset'], text=i['text'],
+                           in_region=(start < i['offset'] < end)))
+    res['feature_store_sends'] = stores
+
+    # the chain: q<<8, lane<<4, sum, <<1  (no clamp of lane)
+    chain = []
+    for i in ins:
+        t = i['text']
+        if re.search(r'shl \(32\|M0\)\s+r\d+\.0<1>:d\s+r68\.0<1;1,0>:d\s+8:w', t):
+            chain.append(dict(offset=i['offset'], role='q<<8 (subgroup id)', text=t))
+        if re.search(r'shl \(32\|M0\)\s+r\d+\.0<1>:d\s+r98\.0<1;1,0>:d\s+4:w', t):
+            chain.append(dict(offset=i['offset'], role='lane<<4', text=t))
+        if re.search(r'shl \(32\|M0\)\s+r\d+\.0<1>:d\s+r\d+\.0<1;1,0>:d\s+1:w', t) and start < i['offset'] < end:
+            chain.append(dict(offset=i['offset'], role='halves->bytes (*2)', text=t))
+    res['store_address_chain'] = chain
+    # no clamp of the lane value anywhere in the region:
+    clamps = [i['text'] for i in ins
+              if start < i['offset'] < end
+              and re.search(r'\b(and|min|max|sel)\b.*\b(r98|r92|r90)\b', i['text'])
+              and re.search(r'(0x0?F|15|16|0x10)\b', i['text'])]
+    res['lane_clamp_in_region'] = clamps
+    # 6. synchronisation facts: which fence/barrier kinds exist, and whether any
+    #    workgroup barrier sits inside the entry region
+    sync = []
+    for i in ins:
+        t = i['text']
+        if 'fence.slm' in t:
+            sync.append(dict(offset=i['offset'], kind='fence.slm(group scope)',
+                             in_region=(start < i['offset'] < end), text=t))
+        elif 'fence.ugm' in t:
+            sync.append(dict(offset=i['offset'], kind='fence.ugm(local)', in_region=(start < i['offset'] < end), text=t))
+        elif 'signal barrier' in t:
+            sync.append(dict(offset=i['offset'], kind='signal barrier(workgroup)', in_region=(start < i['offset'] < end), text=t))
+        elif i['op'] == 'sync.bar':
+            sync.append(dict(offset=i['offset'], kind='sync.bar(workgroup)', in_region=(start < i['offset'] < end), text=t))
+    res['sync_points'] = sync
+    res['workgroup_barriers'] = [s for s in sync if 'workgroup' in s['kind']]
+    res['workgroup_barriers_inside_region'] = [s for s in res['workgroup_barriers'] if s['in_region']]
+    return res
+
+
+def main():
+    out = dict(card='n18b-f01-gather', purpose='prove lanes 16..31 issue no gather requests',
+               files={})
+    ok = True
+    for name, p in FILES.items():
+        r = analyse(name, p)
+        out['files'][name] = r
+        ok = ok and r['gather_check']['all_inside'] and r['gathers_inside_region'] == 73
+    out['verdict'] = {
+        'pass': bool(ok),
+        'statement': 'In both captures the 73 entry `load.ugm.d32` gathers execute inside a '
+                     'divergent region entered by `(~f.0) goto Lend` after `cmp (lt) lane,16`; '
+                     'the region mask is lanes 0..15, so at runtime each gather carries 16 lane '
+                     'addresses (64 B), not 32 (128 B). The 301.4 MB "duplicate" address half of '
+                     'the 602.8 MB request-byte figure is never issued.',
+    }
+    (CARD / 'tools' / 'isa-mask-proof.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    print(json.dumps(out['verdict'], indent=1))
+    for name, r in out['files'].items():
+        print('---', name)
+        print(' instructions', r['instructions'], 'sends', r['sends_total'])
+        print(' lane_pred', r['lane_lt_16_compare'][0]['predicate_slot'],
+              'region', hex(r['region']['entry_offset']), '->', hex(r['region']['end_offset']),
+              'instr', r['region']['instructions'], 'sends', r['region']['sends'])
+        print(' gathers inside/outside', r['gathers_inside_region'], r['gathers_outside_region'],
+              'unpredicated', r['gathers_unpredicated'], 'range', [hex(x) for x in r['gather_check']['offset_range']])
+        print(' feature stores', [(hex(s['offset']), s['in_region']) for s in r['feature_store_sends']])
+        print(' lane clamp in region:', r['lane_clamp_in_region'])
+        print(' workgroup barriers:', [(hex(s['offset']), s['in_region']) for s in r['workgroup_barriers']])
+        print(' fences:', [(hex(s['offset']), s['kind']) for s in r['sync_points'] if 'fence' in s['kind']][:6])
+    print('PASS=', out['verdict']['pass'])
+
+
+if __name__ == '__main__':
+    main()

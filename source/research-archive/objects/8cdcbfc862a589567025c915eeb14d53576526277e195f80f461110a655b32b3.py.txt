@@ -1,0 +1,247 @@
+"""n34-f19-latency, redundancy proof: are the 24 expensive ops (16 math.rsqt +
+8 math.inv) duplicate computations?
+
+The census `evidence/REDUNDANT-LATENCY-OPS.json` groups these ops by *text-equal
+source operand* (e.g. "r18.0<1;1,0>:f") and calls the extra copies "redundant".
+That is only a hypothesis: the operand text is a physical GRF number, and IGC
+re-uses GRF numbers for different values.  This script decides the question on
+the *value* level:
+
+  1. reaching definition of every expensive op's source operand (dword exact),
+  2. canonical expression signature of that value: recursive (opcode, operand
+     signatures, immediates) over the reaching-def graph, with memory reads
+     carrying their address expression, register-indirect reads carrying the
+     a0 signature, and a depth cap,
+  3. groups = sites whose value signatures are identical -> same value computed
+     more than once (true redundancy),
+  4. for every text-equal group, a per-site table: producer addr/op, whether the
+     register is rewritten between consecutive sites, and the consumer list.
+
+CPU only, read-only on the ISA.  Writes REDUNDANCY.json next to itself.
+"""
+import json
+import re
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE))
+import _a_audit as A  # noqa: E402
+import ISA  # noqa: E402
+
+OUT = HERE / 'REDUNDANCY.json'
+LL = ('math.rsqt', 'math.inv')
+DEPTH_CAP = 80
+
+
+def main():
+    rows = A.load()
+    guarded, spans = A.guarded_spans(rows)
+    ins = [r['i'] for r in rows]
+    for k, it in enumerate(ins):
+        it['live'] = k not in guarded
+        it['w'], it['r'] = A.classify(it)
+        # a0 (indirect-addressing base) writes/reads are not covered by
+        # A.classify's r/acc patterns but they carry the shuffle address
+        if it['ops']:
+            m = re.match(r'^a0\.(\d+)', it['ops'][0])
+            if m:
+                it['w'].append(('a0', 0, int(m.group(1)), 1))
+        for o in it['ops'][1:]:
+            if re.match(r'^a0\.\d+', o) and not any(x[0] == 'a0' for x in it['r']):
+                it['r'].append(('a0', 0, 0, 1))
+    live_idx = {i['idx'] for i in ins if i['live']}
+    by_dw = defaultdict(list)
+    for it in ins:
+        for f, no, dw, n in it['w']:
+            for d in range(dw, dw + n):
+                by_dw[(f, no, d)].append(it['idx'])
+    for v in by_dw.values():
+        v.sort()
+
+    def reaching(key, idx):
+        lst = by_dw.get(key)
+        hit = None
+        for w in lst or ():
+            if w < idx:
+                hit = w
+            else:
+                break
+        return hit
+
+    def par(k):
+        out = []
+        for f, no, dw, cnt in ins[k]['r']:
+            for d in range(dw, dw + cnt):
+                p = reaching((f, no, d), k)
+                if p is not None and p in live_idx:
+                    out.append((f, no, d, p))
+        return out
+
+    parents = {k: par(k) for k in live_idx}
+    children = defaultdict(list)
+    for k, ps in parents.items():
+        for _, _, _, p in ps:
+            children[p].append(k)
+
+    # ------------------------------------------------ value signature
+    memo = {}
+
+    def a0_sig(k, depth):
+        """value signature of a0.0 at instruction k (register-indirect address)"""
+        p = reaching(('a0', 0, 0), k)
+        return ('a0-undef',) if p is None else sig(p, depth + 1)
+
+    def sig(k, depth=0):
+        if k in memo:
+            return memo[k]
+        it = ins[k]
+        op = it['op']
+        if depth > DEPTH_CAP:
+            return ('deep', hex(it['addr']))
+        kids = [(f, no, d, sig(p, depth + 1)) for f, no, d, p in parents[k]]
+        # register-indirect reads (IGC lowers subgroupShuffle to them) read GRF
+        # at an address held in a0; the address is part of the value
+        ind = [('indirect', a0_sig(k, depth)) for o in it['ops']
+               if re.match(r'^r\[a0\.\d+\]', o.lstrip('-'))]
+        kids = tuple(sorted(kids + ind))
+        imm = tuple(o for o in it['ops'][1:]
+                    if A.reg_base(o) is None and 'r[a0' not in o and o != '(')
+        out = (op, kids, imm)
+        memo[k] = out
+        return out
+
+    def sig_size(s, cap=400):
+        n = 0
+        stack = [s]
+        while stack and n < cap:
+            x = stack.pop()
+            n += 1
+            if isinstance(x, tuple):
+                for y in x:
+                    if isinstance(y, tuple):
+                        stack.append(y)
+        return n
+
+    def short(s, n=110):
+        t = str(s)
+        return t if len(t) <= n else t[:n] + '...'
+
+    sites = []
+    for k in sorted(live_idx):
+        it = ins[k]
+        if it['op'] not in LL:
+            continue
+        src = it['r']
+        prod = parents[k]
+        prod_main = prod[0][3] if prod else None
+        sites.append(dict(
+            idx=k, addr=hex(it['addr']), op=it['op'],
+            dst=it['ops'][0] if it['ops'] else None,
+            src_text=[o for o in it['ops'][1:2]],
+            producer_idx=prod_main,
+            producer_addr=hex(ins[prod_main]['addr']) if prod_main is not None else None,
+            producer_op=ins[prod_main]['op'] if prod_main is not None else None,
+            producer_text=ins[prod_main]['raw'].strip()[:120] if prod_main is not None else None,
+            value_sig=sig(k),
+            value_sig_size=sig_size(sig(k)),
+            consumers=sorted(children.get(k, [])),
+            consumer_addrs=[hex(ins[c]['addr']) for c in sorted(children.get(k, []))],
+            consumer_ops=[ins[c]['op'] for c in sorted(children.get(k, []))],
+            in_chain=None,
+        ))
+
+    # groups by true producer
+    by_prod = defaultdict(list)
+    for s in sites:
+        by_prod[s['producer_idx']].append(s['idx'])
+    # groups by value signature (true redundancy = identical expression tree)
+    by_val = defaultdict(list)
+    for s in sites:
+        by_val[s['value_sig']].append(s['idx'])
+
+    # text-equal groups of the census
+    by_text = defaultdict(list)
+    for s in sites:
+        by_text[s['src_text'][0] if s['src_text'] else None].append(s['idx'])
+
+    # is the register rewritten between two sites of the same text group?
+    def rewrites_between(k1, k2, reg_key):
+        return [i for i in range(k1 + 1, k2)
+                if any((f, no, dw) == reg_key or (f, no, dw) <= reg_key <= (f, no, dw + n - 1)
+                       for f, no, dw, n in ins[i]['w'])]
+
+    text_groups = []
+    for txt, idxs in sorted(by_text.items(), key=lambda kv: -len(kv[1])):
+        if txt is None:
+            continue
+        m = re.search(r'^r(\d+)\.(\d+)', txt)
+        key = ('r', int(m.group(1)), int(m.group(2))) if m else None
+        rec = dict(source_text=txt, sites=[], n=len(idxs),
+                   distinct_producers=len({ins[i]['addr'] and par(i) and par(i)[0][3] for i in idxs}))
+        for i in sorted(idxs):
+            rw = []
+            for j in sorted(idxs):
+                if j > i:
+                    rw.append(dict(to=hex(ins[j]['addr']),
+                                   writes=len(rewrites_between(i, j, key))) if key else dict(to=hex(ins[j]['addr']), writes=None))
+            rec['sites'].append(dict(idx=i, addr=hex(ins[i]['addr']),
+                                     producer=hex(ins[par(i)[0][3]]['addr']) if par(i) else None,
+                                     producer_op=ins[par(i)[0][3]]['op'] if par(i) else None,
+                                     rewrites_before_next=[r['writes'] for r in rw],
+                                     consumers=[hex(ins[c]['addr']) for c in children.get(i, ())]))
+        text_groups.append(rec)
+
+    val_groups = []
+    for s, idxs in sorted(by_val.items(), key=lambda kv: -len(kv[1])):
+        if len(idxs) < 2:
+            continue
+        val_groups.append(dict(n=len(idxs), op=[ins[i]['op'] for i in idxs],
+                               addrs=[hex(ins[i]['addr']) for i in sorted(idxs)],
+                               sig=short(s, 200)))
+
+    # ---------------------------------------------------------------- output
+    out = dict(
+        isa=str(A.ASM), isa_sha256=A.hashlib.sha256(A.ASM.read_bytes()).hexdigest(),
+        op_counts={op: sum(1 for s in sites if s['op'] == op) for op in LL},
+        sites=[{k: v for k, v in s.items() if k != 'value_sig'} for s in sites],
+        text_groups=text_groups,
+        distinct_producer_groups={str(p): [hex(ins[i]['addr']) for i in v]
+                                  for p, v in by_prod.items() if len(v) > 1},
+        true_redundant_groups=val_groups,
+        true_redundant_count=sum(len(v) - 1 for v in by_val.values() if len(v) > 1),
+        census_claim=dict(op='math.rsqt', copies=16, distinct_sources=7, redundant=9),
+        verdict=None,
+    )
+    # verdict
+    tr = out['true_redundant_count']
+    out['verdict'] = dict(
+        redundant_pairs=tr,
+        keep_minimum=len(sites) - tr,
+        rsqt_keep=len({s['value_sig'] for s in sites if s['op'] == 'math.rsqt'}),
+        inv_keep=len({s['value_sig'] for s in sites if s['op'] == 'math.inv'}),
+    )
+    OUT.write_text(json.dumps(out, indent=1, default=str), encoding='utf-8')
+
+    print('expensive sites: %s' % out['op_counts'])
+    print('%-6s %-10s %-8s %-10s %-12s %s' % ('idx', 'addr', 'op', 'producer', 'prod_op', 'consumers'))
+    for s in sites:
+        print('%-6d %-10s %-8s %-10s %-12s %s'
+              % (s['idx'], s['addr'], s['op'][5:], s['producer_addr'], s['producer_op'],
+                 ','.join(s['consumer_ops'])))
+    print('\ntext-equal groups (census view):')
+    for g in text_groups:
+        print('  %-18s n=%d distinct_producers=%d' % (g['source_text'], g['n'], g['distinct_producers']))
+        for s in g['sites']:
+            print('      %-10s producer %-10s %-8s rewrites_before_next=%s'
+                  % (s['addr'], s['producer'], s['producer_op'], s['rewrites_before_next']))
+    print('\nsame-producer groups:', out['distinct_producer_groups'])
+    print('same-value (true redundant) groups:', json.dumps(val_groups, indent=1)[:2000])
+    print('\nverdict:', out['verdict'])
+    print('wrote', OUT)
+
+
+if __name__ == '__main__':
+    main()
+

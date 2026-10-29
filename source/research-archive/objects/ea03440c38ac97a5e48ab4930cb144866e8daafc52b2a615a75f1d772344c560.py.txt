@@ -1,0 +1,196 @@
+"""SPIR-V level evidence for n32-f05-aluwr (CPU only).
+
+1. NoContraction count (float_NC) for parent and candidate.
+2. Function inventory + sizes.
+3. Post-inline def-use graph of the entry point, with the same four chain metrics used
+   on the ISA in _a_audit.py:
+       chain   union of backward slices from the memory-store terminals
+       depth   longest dependent path
+       chains  greedy disjoint path cover
+       N       max number of covering chains alive at one program point
+               == "per lane independent chains" analogue at SSA level
+   Function calls are expanded recursively (unique renaming per call site), so the
+   metric sees the code after inlining, which is what IGC schedules.
+"""
+import json, sys, hashlib
+from collections import Counter, defaultdict
+from pathlib import Path
+
+HERE = Path(__file__).parent
+CAMP = HERE.parent.parent
+sys.path.insert(0, str(CAMP))
+import COMMON as K
+sys.path.insert(0, str(K.SPV_TOOLS))
+import spv_tools_local as ST  # noqa: E402
+
+PARENT = {
+    "c64": K.D / "f05-kv-consumer-layout/family/c64/candidate.spv",
+    "c128": K.D / "f05-kv-consumer-layout/family/c128/candidate.spv",
+    "c256": CAMP / "cards/n05a-f05-c256-mreuse/candidate.spv",
+}
+CAND = {g: HERE / ("candidate-%s.spv" % g) for g in ("c64", "c128", "c256")}
+
+SKIP = {0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26,
+        27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 71, 72, 73, 74, 75, 77,
+        248, 249, 250, 251, 252, 253, 254, 255, 56, 54, 55, 331}   # types/deco/cf
+STORE = 62
+EXT_INST = 12
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def parse_functions(m):
+    """{func_id: dict(params=[ids], body=[(op, ops)], ret=None)} + entry id."""
+    funcs, cur, entry = {}, None, None
+    for op, ops, _, _ in m.instructions:
+        if op == 54:
+            cur = dict(id=ops[1], params=[], body=[], ret=None)
+            funcs[ops[1]] = cur
+            if entry is None:
+                entry = ops[1]
+            continue
+        if cur is None:
+            continue
+        if op == 55:
+            cur["params"].append(ops[1])
+        elif op == 56:
+            cur = None
+        else:
+            cur["body"].append((op, ops))
+            if op == 254:
+                cur["ret"] = ops[0]
+    return funcs, entry
+
+
+def expand(funcs, fid, ns, argmap, out, depth=0):
+    """Inline `fid` into `out` (flat list of dicts).  Returns the renamed return id."""
+    f = funcs[fid]
+    ren = dict(argmap)
+    for p in f["params"]:
+        assert p in ren, ("missing arg", fid, p)
+
+    def r(x):
+        return ren.get(x, ("c", ns, x))
+
+    ret = None
+    for op, ops in f["body"]:
+        if op in (253, 254):
+            ret = r(ops[0]) if op == 254 else None
+            break
+        if op == 57:
+            callee, args = ops[2], [r(x) for x in ops[3:]]
+            cns = (ns, len(out))
+            expand(funcs, callee, cns, dict(zip(funcs[callee]["params"], args)), out, depth + 1)
+            # result of the call == renamed return value of the callee
+            retid = ("c", cns, funcs[callee]["ret"])
+            ren[ops[1]] = retid
+            continue
+        if op in SKIP:
+            continue
+        ops2 = []
+        for k, x in enumerate(ops):
+            if k == 0 and op != STORE:            # operand 0 is the result type
+                ops2.append(("type", x))
+                continue
+            if op == EXT_INST and k <= 3:         # set id + instruction number
+                ops2.append(("lit", x))
+                continue
+            ops2.append(r(x))
+        out.append(dict(op=op, ops=ops2, idx=len(out), res=r(ops[1]) if len(ops) > 1 else None))
+    return ret
+
+
+_LITERAL_OPS = defaultdict(set)
+
+
+def metrics(path):
+    m = ST.Module(Path(path))
+    funcs, entry = parse_functions(m)
+    flat = []
+    expand(funcs, entry, ("root",), dict(zip(funcs[entry]["params"],
+                                             [("arg", k) for k in range(len(funcs[entry]["params"]))])), flat)
+    res_of = {}
+    for n in flat:
+        res_of[n["res"]] = n
+    deps = {}
+    for n in flat:
+        s = set()
+        for k, x in enumerate(n["ops"]):
+            if k == 0:
+                continue
+            if isinstance(x, tuple) and x in res_of:
+                s.add(res_of[x]["idx"])
+        deps[n["idx"]] = s
+    sinks = [n["idx"] for n in flat
+             if n["op"] == STORE or (n["op"] == EXT_INST and n["ops"][0] == ("type", 1))]
+    # OpExtInst store: result type is void (type id 1 in a fresh module? no) -> use the
+    # fact that cooperative-matrix stores pass a pointer as the 5th operand.
+    sinks = sorted(set(sinks) | {n["idx"] for n in flat
+                                  if n["op"] == EXT_INST and len(n["ops"]) >= 6
+                                  and isinstance(n["ops"][4], tuple)})
+    chain, stack = set(), list(sinks)
+    while stack:
+        k = stack.pop()
+        if k in chain or k not in deps:
+            continue
+        chain.add(k)
+        stack.extend(deps[k])
+    memo = {}
+    for k in sorted(chain):
+        memo[k] = 1 + max((memo.get(p, 0) for p in deps[k]), default=0)
+    order = sorted(chain)
+    owner, chains = {}, []
+    for k in order:
+        cand = None
+        for p in sorted(deps[k], reverse=True):
+            if p in owner:
+                cand = owner[p]
+                break
+        if cand is None:
+            cand = len(chains)
+            chains.append(dict(lo=k, hi=k, n=0))
+        owner[k] = cand
+        c = chains[cand]
+        c["n"] += 1
+        c["lo"] = min(c["lo"], k)
+        c["hi"] = max(c["hi"], k)
+    ev = []
+    for c in chains:
+        ev.append((c["lo"], 1))
+        ev.append((c["hi"] + 1, -1))
+    ev.sort()
+    cur = best = 0
+    best_at = 0
+    for a, d in ev:
+        cur += d
+        if cur > best:
+            best, best_at = cur, a
+    nc = ST.no_contraction_ids(m)
+    return dict(spv=str(path), sha256=sha(path), bytes=Path(path).stat().st_size,
+                functions=len(funcs), instructions=len(m.instructions),
+                expanded_instructions=len(flat), sinks=len(sinks),
+                chain=len(chain), depth=int(max(memo.values())) if memo else 0,
+                chains=len(chains), max_concurrent=best, max_concurrent_at=best_at,
+                float_NC=len(nc),
+                op_hist=dict(Counter(n["op"] for n in flat).most_common(12)))
+
+
+if __name__ == "__main__":
+    out = {}
+    for g in ("c64", "c128", "c256"):
+        p = metrics(PARENT[g])
+        c = metrics(CAND[g])
+        out[g] = dict(parent=p, candidate=c,
+                      d_chain=c["chain"] - p["chain"], d_depth=c["depth"] - p["depth"],
+                      d_chains=c["chains"] - p["chains"],
+                      d_max_concurrent=c["max_concurrent"] - p["max_concurrent"],
+                      d_float_NC=c["float_NC"] - p["float_NC"])
+        print("=" * 78)
+        print("%-5s %-28s %10s %10s" % ("", "", "parent", "candidate"))
+        for k in ("instructions", "expanded_instructions", "functions", "sinks", "chain",
+                  "depth", "chains", "max_concurrent", "float_NC", "bytes"):
+            print("      %-24s %10s %10s" % (k, p[k], c[k]))
+    (HERE / "build" / "spv-metrics.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
+    print("\nwrote", HERE / "build" / "spv-metrics.json")

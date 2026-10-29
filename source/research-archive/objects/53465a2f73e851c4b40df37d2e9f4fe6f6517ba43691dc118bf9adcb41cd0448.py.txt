@@ -1,0 +1,158 @@
+"""S09: ViT block31..38 attention CPU model + dynamic/static scale study.
+
+Read-only on the FP16 teacher dumps. Writes only into this card's directory.
+
+Contract reproduced (r12r15_vit_attention_qk8_pv8 / parent vit_attention_pden_register_int8):
+  QKV layout          qkv[t*3072 + 0..1023] Q, +1024 K, +2048 V ; head h owns [h*32, h*32+32)
+  live tokens p0.x=288, padded keys p0.y=320 (5 chunks of 64)
+  score               f32 accumulate of f16 products over the 32 head dims -> narrowed to f16
+  P                   vit_exp(score_h)  (half bit trick, f16 elementwise)
+  den                 half tree over the 64 keys of each chunk, added per chunk, f16
+  padding             keys >= p0.x keep exp(0) inside den, then pad=(p0.y-p0.x)*exp(0) is
+                      subtracted and the P values are zeroed before PV
+  inv                 f16(1/max(den, 6.198883056640625e-05)) once per query after all chunks
+  context             f32 accumulate of P*V, narrowed f16 at the end, then * inv
+"""
+import json
+import os
+import sys
+
+import numpy as np
+
+DUMPS = r"@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/int8-quality-first-20261029/real-int8-24/dump-fp16"
+OUT = r"@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S09-qkv-attn"
+TOK = 288
+PADK = 320
+HD = 32
+HEADS = 32
+EPS_INV = np.float16(6.198883056640625e-05)
+
+
+def f16(x):
+    return np.asarray(x, dtype=np.float16)
+
+
+def vit_exp(z):  # z: f16 array -> f16 array, exact bit reproduction
+    zf = z.astype(np.float32)
+    v = np.float32(0.08953857421875) * zf + np.float32(1.708984375)
+    v = np.clip(v, np.float32(1.439453125), np.float32(1.9775390625))
+    vh = v.astype(np.float16)
+    bits = vh.view(np.uint16)
+    shifted = ((bits & np.uint16(0x3FF)) << np.uint16(4)).astype(np.uint16)
+    return shifted.view(np.float16).astype(np.float16)
+
+
+def load_qkv(block):
+    p = os.path.join(DUMPS, "dump_vit_block%d_QKV.bin" % block)
+    a = np.fromfile(p, dtype=np.float16)
+    assert a.size == TOK * 3072, (p, a.size)
+    a = a.reshape(TOK, 3072)
+    Q = a[:, :1024].reshape(TOK, HEADS, HD)
+    K = a[:, 1024:2048].reshape(TOK, HEADS, HD)
+    V = a[:, 2048:3072].reshape(TOK, HEADS, HD)
+    return Q, K, V
+
+
+def load_T(block):
+    p = os.path.join(DUMPS, "dump_vit_block%d_T.bin" % block)
+    a = np.fromfile(p, dtype=np.float16)
+    assert a.size == TOK * 1024, (p, a.size)
+    return a.reshape(TOK, HEADS, HD)
+
+
+def den_tree(p):
+    """p: (Q, width) f16 probability rows, width a multiple of 64 -> den per query, f16.
+
+    Parent tree order, applied per 64-key chunk and accumulated in f16.
+    """
+    n = p.shape[0]
+    total = np.zeros(n, dtype=np.float16)
+    for j0 in range(0, p.shape[1], 64):
+        ch = p[:, j0:j0 + 64]
+        part = [np.zeros(n, dtype=np.float16) for _ in range(8)]
+        for c in range(8):
+            acc = None
+            for j in range(4):
+                pair = (ch[:, j * 16 + c].astype(np.float32) +
+                        ch[:, j * 16 + c + 8].astype(np.float32)).astype(np.float16)
+                acc = pair if acc is None else (acc.astype(np.float32) +
+                                                pair.astype(np.float32)).astype(np.float16)
+            part[c] = acc
+        e0 = (part[0].astype(np.float32) + part[2].astype(np.float32)).astype(np.float16)
+        e1 = (part[4].astype(np.float32) + part[6].astype(np.float32)).astype(np.float16)
+        o0 = (part[1].astype(np.float32) + part[3].astype(np.float32)).astype(np.float16)
+        o1 = (part[5].astype(np.float32) + part[7].astype(np.float32)).astype(np.float16)
+        ev = (e0.astype(np.float32) + e1.astype(np.float32)).astype(np.float16)
+        od = (o0.astype(np.float32) + o1.astype(np.float32)).astype(np.float16)
+        tot = (ev.astype(np.float32) + od.astype(np.float32)).astype(np.float16)
+        total = (total.astype(np.float32) + tot.astype(np.float32)).astype(np.float16)
+    return total
+
+
+def q_code(x, scale):
+    """code = roundEven(x/scale) clamp[-127,127]; dequant = code*scale (float32)."""
+    c = np.clip(np.round(x.astype(np.float32) / np.float32(scale)), -127, 127)
+    return c.astype(np.int16), (c * np.float32(scale)).astype(np.float32)
+
+
+def attention_head(Qh, Kh, Vh, qd=None, kd=None, vd=None,
+                   sp_static=None, return_detail=False):
+    """Qh/Kh/Vh: (288,32) f16. qd/kd/vd: optional already-dequantised f32 operands."""
+    Qd = Qh.astype(np.float32) if qd is None else qd
+    Kd = Kh.astype(np.float32) if kd is None else kd
+    Vd = Vh.astype(np.float32) if vd is None else vd
+    sc = (Qd @ Kd.T).astype(np.float16).astype(np.float32)  # f32 acc -> f16 narrow
+    # score for the 32 padding keys is exp(0) (their K rows read as 0), kept inside den
+    P = vit_exp(sc.astype(np.float16)).astype(np.float16)   # (288,288)
+    exp0 = vit_exp(np.float16(0.0))
+    Pp = np.full((TOK, PADK), exp0, dtype=np.float16)
+    Pp[:, :TOK] = P
+    den = den_tree(Pp)
+    pad = np.float16(np.float32(PADK - TOK) * np.float32(exp0))
+    den = (den.astype(np.float32) - np.float32(pad)).astype(np.float16)
+    inv = (np.float32(1.0) / np.maximum(den.astype(np.float32),
+                                        np.float32(EPS_INV))).astype(np.float16)
+    Pz = np.zeros((TOK, PADK), dtype=np.float16)
+    Pz[:, :TOK] = P
+    if sp_static is not None:
+        Pz = (np.clip(np.round(Pz.astype(np.float32) * np.float32(sp_static)),
+                      -127, 127) / np.float32(sp_static)).astype(np.float16)
+    Vp = np.zeros((PADK, HD), dtype=np.float32)
+    Vp[:TOK] = Vd
+    ctx = Pz.astype(np.float32) @ Vp                                  # f32 accumulate
+    ctx_h = ctx.astype(np.float16).astype(np.float32)
+    out = (ctx_h * inv.astype(np.float32)[:, None]).astype(np.float16)
+    if return_detail:
+        return out, dict(P=P, den=den, inv=inv, ctx=ctx)
+    return out
+
+
+def rel_l2(a, b):
+    a = a.astype(np.float64)
+    b = b.astype(np.float64)
+    return float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-30))
+
+
+def main():
+    blocks = list(range(31, 39))
+    rep = {"blocks": blocks, "validation": {}, "amax": {}, "static_sim": {},
+           "p_stats": {}, "sp_granularity": {}}
+    for b in blocks:
+        Q, K, V = load_qkv(b)
+        T = load_T(b)
+        # ---- validation: exact f16 reference against the teacher T dump
+        ref = np.zeros((TOK, HEADS, HD), dtype=np.float16)
+        for h in range(HEADS):
+            ref[:, h, :] = attention_head(Q[:, h, :], K[:, h, :], V[:, h, :])
+        rep["validation"]["block%d" % b] = {
+            "rel_l2_all_heads": rel_l2(ref, T),
+            "per_head_rel_l2": [rel_l2(ref[:, h, :], T[:, h, :]) for h in range(HEADS)],
+        }
+        print("block", b, "validation rel_l2 =", rep["validation"]["block%d" % b]["rel_l2_all_heads"])
+    with open(os.path.join(OUT, "tools", "vit-validation.json"), "w", encoding="utf-8") as f:
+        json.dump(rep, f, indent=1)
+    print("wrote tools/vit-validation.json")
+
+
+if __name__ == "__main__":
+    main()

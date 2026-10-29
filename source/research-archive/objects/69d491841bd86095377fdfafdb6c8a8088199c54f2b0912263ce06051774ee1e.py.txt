@@ -1,0 +1,207 @@
+"""Build NARROW-READ-CENSUS.json from _scan/*.json + this file's site table.
+
+Only writes inside cards/n15-narrow-read/.  No GPU, no build.
+
+Each family entry carries:
+  ordinal / name / kernel hash / baseline SPV + sha256
+  ISA file + sha256 + the capture dir
+  the cited site: line number L#, address, and the verbatim instruction text
+  message + half-idiom counts for the representative kernel and for the whole family
+  the verdict (worth a card or not), the deletable count, the widening option, risks
+"""
+import json, os, re, hashlib, glob
+from collections import Counter
+
+CARD = os.path.dirname(os.path.abspath(__file__))
+EVID = os.path.join(os.path.dirname(os.path.dirname(CARD)), "evidence")
+IDX = json.load(open(os.path.join(EVID, "NATIVE-INDEX.json"), encoding="utf-8"))
+COV = {r["ordinal"]: r for r in IDX["coverage"]}
+H2F = json.load(open(os.path.join(CARD, "_hash2asm.json"), encoding="utf-8"))
+LINE_RE = re.compile(r"^/\* \[([0-9A-Fa-f]+)\]\s+\*/\s*(.*)$")
+
+# representative ordinal + cited site address per family (chosen from _scan results)
+REP = {"F01": 0, "F02": 1, "F03": 5, "F04": 6, "F05": 7, "F06": 8, "F07": 17,
+       "F08": 60, "F09": 61, "F10": 62, "F11": 63, "F12": 91, "F13": 93,
+       "F14": 95, "F15": 96, "F16": 97, "F17": 133, "F18": 166, "F19": 226,
+       "F20": 230, "F21": 231}
+
+# cited site per family: (address, what the site proves)
+SITE = {
+    "F01": ("0B90", "load.ugm.d32 scatter gather, 4B/lane element"),
+    "F02": ("1520", "mov(32|M0) 16+16 word interleave into every other slot (VNNI/paired-half packing)"),
+    "F03": ("0800", "load.ugm.d16u32, 2B/lane element block read"),
+    "F04": ("03F0", "wide block load.ugm.d32x8 (32B/lane) is the read form; the family has zero half-width idioms and zero narrow messages"),
+    "F05": ("0380", "mov(32|M0) r16.0<1>:ud r22.0<2;1,0>:uw feeding store.ugm.d16u32"),
+    "F06": ("0330", "mov(32|M0) ...:ud from <2;1,0>:uw (half extraction) feeding d16u32 store"),
+    "F07": ("0320", "mov(32|M0) ...:ud from <2;1,0>:uw (half extraction)"),
+    "F08": ("0880", "store.ugm.d32 of hf->f converted value, per-lane address GRF"),
+    "F09": ("0380", "mov(32|M0) ...:ud from <2;1,0>:uw (half extraction)"),
+    "F10": ("0250", "mov(32|M0) r6.0<1>:b r176.0<4;1,0>:b (byte de-interleave, stride 4)"),
+    "F11": ("0460", "mov(32|M0) ...:uw from <2;1,0>:uw (half compaction)"),
+    "F12": ("04A0", "mov(32|M0) ...:uw from <2;1,0>:uw (half compaction)"),
+    "F13": ("02A0", "wide block load.ugm.d32x8t (32B/lane) is the read form; the family has zero half-width idioms"),
+    "F14": ("16870", "mov(32|M0) ...:uw from <2;1,0>:uw (half compaction)"),
+    "F15": ("1958", "store.ugm.d16u32, 2B/lane element store"),
+    "F16": ("12250", "mov(32|M0) ...:uw from <2;1,0>:uw (half compaction)"),
+    "F17": ("0A98", "mov(32|M0) ...:uw from <2;1,0>:uw (half compaction)"),
+    "F18": ("0508", "mov(32|M0) ...:ud from <2;1,0>:uw (half extraction)"),
+    "F19": ("08F0", "mov(32|M0) ...:uw from <2;1,0>:uw (half compaction)"),
+    "F20": ("100F0", "4x store.ugm.d32 over one 16B per-lane record (+0/+4/+8/+0xC)"),
+    "F21": ("4458", "4x store.ugm.d32 over one 16B per-lane record (+0/+4/+8/+0xC)"),
+}
+
+# dominant wide read per family (for the "already wide" evidence) - first site address
+WIDE = {
+    "F01": "loadugm.d32x16t", "F02": "loadugm.d32x16t", "F03": "loadugm.d32x16t",
+    "F04": "loadugm.d32x8", "F05": "loadugm.d32x8t", "F06": "loadugm.d32x8t",
+    "F07": "loadugm.d32x8t", "F08": "loadugm.d32x8", "F09": "loadugm.d32x8",
+    "F10": "loadugm.d32x8", "F11": "loadugm.d32x64t", "F12": "loadugm.d32x8",
+    "F13": "loadugm.d32x8t", "F14": "loadugm.d32x8t", "F15": "loadugm.d32x1t",
+    "F16": "loadugm.d32x8t", "F17": "loadugm.d16u32", "F18": "loadugm.d32x8t",
+    "F19": "loadugm.d32x16t", "F20": "loadugm.d32x8", "F21": "loadugm.d32x3",
+}
+
+
+def sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def resolve(o):
+    for c in (H2F.get(str(o)) or []):
+        if os.path.exists(c):
+            return c
+
+
+def line_of(path, addr):
+    n = 0
+    for n, raw in enumerate(open(path, encoding="utf-8", errors="replace"), 1):
+        m = LINE_RE.match(raw)
+        if m and m.group(1).upper() == addr.upper():
+            return n, m.group(2).strip()
+    return None, None
+
+
+def fam_agg(fam):
+    tot = {"narrow_kernel_total": 0, "messages": Counter(), "narrow": Counter(),
+           "half_idioms": Counter(), "instr": [], "ordinals": [],
+           "narrow_pk": [], "idioms_pk": []}
+    for f in sorted(glob.glob(os.path.join(CARD, "_scan", "*.json"))):
+        s = json.load(open(f))
+        if s["family"] != fam:
+            continue
+        tot["ordinals"].append(s["ordinal"])
+        tot["instr"].append(s["n_instr"])
+        tot["narrow_pk"].append(sum(s["narrow_messages"].values()))
+        tot["idioms_pk"].append(sum(s["stride_ops"].values()))
+        tot["messages"].update(s["messages"])
+        tot["narrow"].update(s["narrow_messages"])
+        tot["half_idioms"].update(s["stride_ops"])
+    return tot
+
+
+def idiom_split(isa_path):
+    """Exact split of the half-width register idioms (classify_idioms.py)."""
+    try:
+        import classify_idioms as CI
+        c, _ = CI.classify(isa_path)
+        return dict(c)
+    except Exception as e:               # never fail the census on the optional split
+        return {"error": str(e)}
+
+
+def fam_addr(fam):
+    tot = Counter()
+    for f in sorted(glob.glob(os.path.join(CARD, "_addr", "*.json"))):
+        d = json.load(open(f))
+        if d.get("family") != fam:
+            continue
+        for k, v in d.items():
+            if isinstance(v, int):
+                tot[k] += v
+    return {"sends": tot["sends"], "with_immediate": tot["with_immediate"],
+            "same_addr_reg_as_prev": tot["same_addr_reg_as_prev"],
+            "narrow": tot["narrow"], "narrow_with_immediate": tot["narrow_with_immediate"],
+            "narrow_same_addr_reg": tot["narrow_same_addr_reg"]}
+
+
+def main():
+    verdicts = json.load(open(os.path.join(CARD, "_verdicts.json"), encoding="utf-8"))
+    out = {"schema": "n15-narrow-read-census/v1",
+           "generated": "2026-10-27",
+           "card": "n15-narrow-read",
+           "scope": "per-family census of narrow reads / per-half-byte assembly in the CURRENT native ISA; no GPU, no new capture, no candidate",
+           "baseline": {"plan": IDX["baseline"]["plan"], "plan_sha256": IDX["baseline"]["plan_sha256"]},
+           "method": {
+               "isa_resolution": "evidence/NATIVE-INDEX.json baseline_kernel_hash per ordinal -> .asm file on disk with the same kernel hash (CURRENT identity)",
+               "counts": "message mix and half-width register idioms counted from the disassembler text; line numbers are 1-based file lines, addresses are the ISA [hex] column",
+               "not_claimed": ["bytes per message", "lane stride", "DRAM sector count"]},
+           "families": []}
+
+    for fam in sorted(REP):
+        o = REP[fam]
+        isa = resolve(o)
+        sites, itxt = {}, None
+        addr = SITE[fam][0]
+        if addr:
+            ln, itxt = line_of(isa, addr)
+            sites["cited"] = {"addr": addr, "line": ln, "text": itxt, "proves": SITE[fam][1]}
+        wkey = WIDE.get(fam)
+        sc = json.load(open(os.path.join(CARD, "_scan", "%03d.json" % o)))
+        if wkey and wkey in sc["message_sites"]:
+            wa = sc["message_sites"][wkey][0]
+            ln, txt = line_of(isa, wa)
+            sites["wide_reference"] = {"message": wkey.replace("ugm.", ".ugm."), "addr": wa,
+                                       "line": ln, "text": txt,
+                                       "count_kernel": sc["messages"].get(wkey, 0)}
+        agg = fam_agg(fam)
+        v = verdicts[fam]
+        out["families"].append({
+            "family": fam,
+            "pass_count": len(agg["ordinals"]),
+            "ordinals": agg["ordinals"],
+            "representative_ordinal": o,
+            "name": sc["name"],
+            "kernel_hash": sc["kernel_hash"],
+            "baseline_spv": {"path": sc["baseline_spv"], "sha256": sc["baseline_spv_sha256"]},
+            "isa": {"path": isa, "sha256": sha(isa),
+                    "capture_dir": os.path.dirname(os.path.dirname(isa))},
+            "site": sites,
+            "profile_representative_kernel": {
+                "instructions": sc["n_instr"],
+                "messages": sc["messages"],
+                "narrow_messages": sc["narrow_messages"],
+                "narrow_total": sum(sc["narrow_messages"].values()),
+                "half_idioms": sc["stride_ops"],
+                "half_idiom_total": sum(sc["stride_ops"].values()),
+                "half_idiom_split": idiom_split(isa),
+            },
+            "profile_family": {
+                "narrow_total_all_pass": sum(agg["narrow"].values()),
+                "narrow_by_kind": dict(agg["narrow"]),
+                "half_idioms_all_pass": sum(agg["half_idioms"].values()),
+                "instructions_min": min(agg["instr"]), "instructions_max": max(agg["instr"]),
+                "narrow_per_kernel_min": min(agg["narrow_pk"]), "narrow_per_kernel_max": max(agg["narrow_pk"]),
+                "idioms_per_kernel_min": min(agg["idioms_pk"]), "idioms_per_kernel_max": max(agg["idioms_pk"]),
+                "kernels_with_narrow": sum(1 for x in agg["narrow_pk"] if x > 0),
+            },
+            "address_layer": fam_addr(fam),
+            "verdict": v["verdict"],
+            "worth_card": v["worth_card"],
+            "deletable": v["deletable"],
+            "widening_option": v["widening"],
+            "risk": v["risk"],
+            "prior_evidence": v["prior"],
+            "notes": v.get("notes", ""),
+        })
+    with open(os.path.join(CARD, "NARROW-READ-CENSUS.json"), "w", encoding="utf-8") as fh:
+        json.dump(out, fh, indent=2, ensure_ascii=False)
+    print("wrote NARROW-READ-CENSUS.json with %d families" % len(out["families"]))
+    print("worth_card:", sum(1 for f in out["families"] if f["worth_card"]))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,75 @@
+from pathlib import Path
+import json,hashlib,shlex,subprocess,sys,collections,shutil
+D=Path(__file__).resolve().parent;A=D.parent;B=A.parent.parent;P=A/'f20-coarse-owner-20261026';S=D/'s22-covered-clear';S.mkdir(exist_ok=True)
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'));import spv_tools_local as ST
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+def ident(p):return dict(path=str(p),sha256=sha(p))
+def save(p,x):p.write_text(json.dumps(x,indent=2,ensure_ascii=False),encoding='utf-8')
+def run(a):
+ r=subprocess.run(list(map(str,a)),capture_output=True,text=True);assert r.returncode==0,r.stdout+r.stderr;return r.stdout
+rows=[];buf=[];pol=[]
+for l in (P/'plan.txt').read_text().splitlines():
+ t=shlex.split(l)
+ if not t:continue
+ if t[0]=='PASS':rows.append(dict(t=t,bind=[]))
+ elif t[0]=='BIND':rows[-1]['bind'].append(list(map(int,t[1:])))
+ elif t[0]=='PUSH':rows[-1]['push']=list(map(int,t[1:]))
+ elif t[0]=='BUFFER':buf.append(t)
+ elif t[0]=='POLICY':pol.append(list(map(int,t[1:])))
+selected=[t for t in pol if t[4] and buf[t[0]][1].endswith('_T')];assert len(selected)==15
+# Reproduce the actual producer and consumer before relying on these source address equations.
+rebuild=[]
+for label,ordinal,src,flags in [
+ ('producer',62,B/'work/zcode-fp16-fullnet-handoff-20261024/candidates/f10p-s22-pblock/source/s22_register_p.comp',[]),
+ ('consumer',63,B/'candidates/amd-netorg-full-scope-workbuddy-20261017/c2-layout/layout0-unify-l2-v4/source/projection-swap-family-24/split_projection_swap.comp',['-DKIND=1'])]:
+ parent=Path(rows[ordinal]['t'][3]);out=S/(label+'-rebuild.spv')
+ run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',*flags,'-I'+str(src.parent),src,'-o',out]);pm,cm=ST.Module(parent),ST.Module(out);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,set());ST.set_no_contraction(cm,keep,out);assert sha(out)==sha(parent),(label,'rebuild mismatch');rebuild.append(dict(role=label,source=ident(src),module=ident(parent),rebuilt=ident(out)))
+# Verify all binding5 references. Two earlier passes bind T for ABI only, must not access it.
+def accesses(spv):
+ m=ST.Module(spv);ids={o[0] for op,o,*_ in m.instructions if op==71 and len(o)==3 and o[1]==33 and o[2]==5}
+ refs=[(op,o) for op,o,*_ in m.instructions if op not in [5,15,71,59] and any(v in ids for v in o)]
+ return dict(ids=list(ids),references=len(refs),ops=[op for op,o in refs])
+proof=[]
+for rid,resident,first,last,clear in selected:
+ pro,con=rows[first],rows[last];p=pro['push'];c=con['push'];assert last==first+1 and pro['t'][3]==rows[62]['t'][3] and con['t'][3]==rows[63]['t'][3];assert p[20]==0 and c[20]==0
+ uses=[(i,bd) for i,r in enumerate(rows) for bd in r['bind'] if bd[1]==rid];assert all(bd[0]==5 and bd[2]==0 for i,bd in uses)
+ unused=[]
+ for i,bd in uses:
+  if i not in [first,last]:
+   ac=accesses(Path(rows[i]['t'][3]));assert ac['references']==0,(i,ac);unused.append(dict(ordinal=i,**ac))
+ written=collections.Counter();gx,gy,gz=map(int,pro['t'][-3:]);sx=p[6] if p[6]<2**31 else p[6]-2**32;sy=p[7] if p[7]<2**31 else p[7]-2**32
+ # Each valid16query tile/head writes two complete16x16 half tiles via four8x16 COL stores.
+ for wy in range(gy):
+  for wx in range(gx):
+   for q in range(4):
+    tx,ty=2*wx+sx+(q&1),2*wy+sy+(q>>1)
+    if 0<=tx<p[0]//4 and 0<=ty<p[1]//4:
+     tile=ty*(p[0]//4)+tx
+     for h in range(gz):
+      for side in range(2):written[tile*32+2*h+side]+=1
+ read=set();rx,ry,rz=map(int,con['t'][-3:]);assert rz==1
+ for wx in range(rx):
+  for wy in range(ry):
+   for sg in range(4):
+    # Each WG uses both16token blocks and every K16 block; four accumulators share these reads.
+    for tokenblock in [2*wx,2*wx+1]:
+     for kblock in range(32):read.add(tokenblock*32+kblock)
+ missing=read-set(written);assert not missing,(rid,len(missing));assert set(written.values())=={1}
+ assert max(read)*512+512<=int(buf[rid][2]);assert gz==16 and p[0]==c[0] and p[1]==c[1]
+ proof.append(dict(resource=rid,name=buf[rid][1],producer=first,consumer=last,producer_grid=[gx,gy,gz],consumer_grid=[rx,ry,rz],tiles_written=len(written),tiles_read=len(read),missing_tiles=0,tile_bytes=512,written_bytes=len(written)*512,read_bytes=len(read)*512,buffer_bytes=int(buf[rid][2]),unused_descriptor_passes=unused,clear_bytes_removed=int(buf[rid][2])))
+# retain per-dispatch compute->compute barrier; removal only fill and its surrounding transfer barriers.
+lines=(P/'plan.txt').read_text().splitlines();target={x[0] for x in selected};changes=[]
+for i,l in enumerate(lines):
+ t=shlex.split(l)
+ if t and t[0]=='POLICY' and int(t[1]) in target:
+  assert t[-1]=='1';t[-1]='0';lines[i]=' '.join(t);changes.append(dict(old=l,new=lines[i]))
+plan=S/'plan.txt';plan.write_text('\n'.join(lines)+'\n',encoding='utf-8');cpu=run([A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe','--plan',plan,'--cpu-check'])
+save(S/'PROOF.json',dict(parent=ident(P/'plan.txt'),plan=ident(plan),rebuilds=rebuild,rows=proof,changes=changes,removed_fills=15,removed_logical_fill_bytes=sum(x['clear_bytes_removed'] for x in proof),unchanged='All SPV, dispatches, BIND/PUSH, pool residency/lifetimes and HISTORY unchanged. Only15clear_first bits. Remaining b30_pool clear preserved.',sync='clock_runner executes compute READ|WRITE -> compute READ|WRITE memory barrier after every dispatch; retained even when first-use fill/transfer barriers are removed. Across-frame leading compute barrier retained.',legacy='Old 009 readerproof applies to old producer/consumer identities; not retroactively invalidated. Current source pair reproduced bitexact then actualgrid coverage independently proved. No output/History role for these T buffers.',cpu=cpu))
+(S/'run').mkdir(exist_ok=True)
+for kind in ['GATES','ORDINARY']:
+ t=json.loads((P/f'LUNA-{kind}.json').read_text());ex=S/(kind.lower()+'-execution');ex.mkdir(exist_ok=True);t['output_root']=str(ex)
+ for j in t['jobs']:
+  jp=P/'plan.txt' if kind=='ORDINARY' and j['candidate']=='parent' else plan;j['plan']=ident(jp);j['runner_output']=str(S/'run'/j['id']);ar=j['argv'];ar[ar.index('--plan')+1]=str(jp);ar[ar.index('--out')+1]=j['runner_output']
+ save(S/f'LUNA-{kind}.json',t)
+s=(P/'execute.ps1').read_text().replace('LUNA-F20-NORMALIZED-Q-20261026','LUNA-S22-COVERED-CLEAR-20261026').replace('exact normalized-Q','S22 covered clear');(S/'execute.ps1').write_text(s);shutil.copyfile(P/'review_timing.py',S/'review_timing.py');print(cpu);print('clear removed',sum(x['clear_bytes_removed'] for x in proof))
+

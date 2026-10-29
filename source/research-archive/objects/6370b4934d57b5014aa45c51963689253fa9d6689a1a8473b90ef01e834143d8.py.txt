@@ -1,0 +1,175 @@
+"""n19-f19-root build recipe: glslang compile + F19 NoContraction reconstruction.
+
+The F19 PASS is the one family whose parent-byte reproduction is **not** a plain
+`transfer_decoration_pattern_aligned` (see evidence/RECIPES.json key
+7f1ad115…: `nc_recipe.drop_region = "full_norm"`).  `full_norm` was re-authored
+between the decoration parent (`c32-entry-chain-20261025/f2-direct/candidate.spv`)
+and the current baseline (`c32-rest-20261026/root-f2/candidate.spv`): the parent's
+`bool lower` mirrored adds became `q=q+peer.x`, so parent fn#9 (378 instrs, 16 NC)
+has no child function that satisfies the "every decorated position inside a
+matching block" requirement.  The recipe therefore
+
+  * maps the parent's *other* decorated functions (fn#12 3 NC, fn#13 234 NC)
+    with the standard aligned transfer;
+  * maps the parent's full_norm decorations onto the child's full_norm by the
+    same ID-free skeleton alignment, but *without* requiring full coverage —
+    positions that align are taken, the rest are dropped;
+  * unions in the child's own (raw-compiled) full_norm decorations.
+
+CPU only.  Writes only under cards/n19-f19-root/.
+"""
+import difflib
+import json
+import sys
+from pathlib import Path
+
+CAMP = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+CARD = CAMP / 'cards/n19-f19-root'
+sys.path.insert(0, str(CAMP))
+sys.path.insert(0, '@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+import COMMON as K            # noqa: E402
+import spv_tools_local as ST  # noqa: E402
+
+PARENT = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+              'c32-entry-chain-20261025/f2-direct/candidate.spv')
+PIN = CARD / 'cards'  # placeholder, replaced below
+HEADER = CAMP / 'cards/idt-identity-recipe/evidence/headers/7f1ad115cb46'
+BASE_SPV = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                'c32-rest-20261026/root-f2/candidate.spv')
+BASE_SRC = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/'
+                'c32-rest-20261026/root-f2/candidate.comp')
+
+
+def fn_nc(module):
+    """[(region_index, len(region), set of NC result ids)] per defined function."""
+    regs = ST.function_regions(module)
+    nc = set(ST.no_contraction_ids(module))
+    out = []
+    for i, r in enumerate(regs):
+        ids = {ST.result_id_of(module.instructions[x][0], module.instructions[x][1]) for x in r}
+        out.append((i, len(r), nc & ids))
+    return out
+
+
+def align_partial(parent, child, pi, ci):
+    """child positions for every parent position that lands in a matching block."""
+    preg = ST.function_regions(parent)
+    creg = ST.function_regions(child)
+    want = ST._skeleton_of(parent, preg)[pi]
+    have = ST._skeleton_of(child, creg)[ci]
+    pos = {}
+    for b in difflib.SequenceMatcher(None, want, have, autojunk=False).get_matching_blocks():
+        for k in range(b.size):
+            pos[b.a + k] = b.b + k
+    return pos
+
+
+def f19_recipe(child_raw_path, out_path, drop_region=True, verbose=True):
+    """Reconstruct the F19 NoContraction set on `child_raw_path` -> `out_path`."""
+    pm = ST.Module(PARENT)
+    rm = ST.Module(child_raw_path)
+    pret = fn_nc(pm)
+    cret = fn_nc(rm)
+    # the parent functions that take part in the standard transfer: those whose
+    # decorations align into some child function
+    keep, info = None, None
+    try:
+        keep, info = ST.transfer_decoration_pattern_aligned(pm, rm, set())
+        dropped = None
+    except AssertionError as e:
+        if not drop_region:
+            raise
+        dropped = e.args[0][1] if isinstance(e.args[0], tuple) else None
+        keep, dropped = _transfer_with_drop(pm, rm, dropped)
+    own_drop = set()
+    if dropped is not None:
+        # the child's counterpart: same function index in this build (glslang emits
+        # the helper functions in the same source order in both modules)
+        ci = dropped
+        child_ids = cret[ci][2]
+        own_drop = set(child_ids)
+        pat = ST.decoration_pattern(pm, ST.function_regions(pm)[dropped])
+        pos = align_partial(pm, rm, dropped, ci)
+        mapped = set()
+        preg = ST.function_regions(pm)[dropped]
+        creg = ST.function_regions(rm)[ci]
+        for p in pat:
+            if p in pos:
+                cidx = creg[pos[p]]
+                rid = ST.result_id_of(rm.instructions[cidx][0], rm.instructions[cidx][1])
+                if rid is not None:
+                    mapped.add(rid)
+        keep = set(keep) | mapped | own_drop
+        if verbose:
+            print('drop_region fn#%d: parent %d instrs / %d NC, child %d instrs / %d NC'
+                  % (dropped, pret[dropped][1], len(pret[dropped][2]),
+                     cret[ci][1], len(child_ids)))
+            print('  parent pattern positions aligned: %d / %d -> mapped child ids %d, own %d'
+                  % (len([p for p in pat if p in pos]), len(pat), len(mapped), len(own_drop)))
+    ST.set_no_contraction(rm, sorted(set(keep)), out_path)
+    got = ST.no_contraction_ids(ST.Module(out_path))
+    return dict(keep=len(set(keep)), nc=len(got), dropped_fn=dropped,
+                own_region_ids=len(own_drop), parent_nc=len(ST.no_contraction_ids(pm)),
+                out=str(out_path), out_sha256=K.sha(out_path))
+
+
+def _transfer_with_drop(pm, rm, forced=None):
+    """ST.transfer_decoration_pattern_aligned, but skipping undecoratable parents."""
+    preg = ST.function_regions(pm)
+    creg = ST.function_regions(rm)
+    psk = ST._skeleton_of(pm, preg)
+    csk = ST._skeleton_of(rm, creg)
+    keep, used, dropped = set(), set(), []
+    for pi, pregion in enumerate(preg):
+        pattern = ST.decoration_pattern(pm, pregion)
+        if not pattern:
+            continue
+        want, best = psk[pi], None
+        for ci, have in csk.items():
+            if ci in used or len(have) < 1:
+                continue
+            pos = {}
+            for b in difflib.SequenceMatcher(None, want, have, autojunk=False).get_matching_blocks():
+                for k in range(b.size):
+                    pos[b.a + k] = b.b + k
+            if any(p not in pos for p in pattern):
+                continue
+            matched = len(pos)
+            if best is None or matched > best[0]:
+                best = (matched, ci, pos)
+        if best is None:
+            dropped.append(pi)
+            continue
+        _, ci, pos = best
+        used.add(ci)
+        for p in sorted(pattern):
+            cidx = creg[ci][pos[p]]
+            rid = ST.result_id_of(rm.instructions[cidx][0], rm.instructions[cidx][1])
+            if rid is not None:
+                keep.add(rid)
+    return keep, (dropped[0] if dropped else None)
+
+
+def main():
+    what = sys.argv[1] if len(sys.argv) > 1 else 'parent'
+    out = CARD / 'build'
+    out.mkdir(parents=True, exist_ok=True)
+    if what == 'parent':
+        raw = out / 'parent-raw.spv'
+        K.compile_glsl(BASE_SRC, raw, [HEADER])
+        res = f19_recipe(raw, out / 'parent-rebuild.spv')
+        res['raw_sha256'] = K.sha(raw)
+        res['raw_match'] = res['raw_sha256'] == K.sha(BASE_SPV)
+        res['rebuilt_matches_baseline'] = res['out_sha256'] == K.sha(BASE_SPV)
+        res['baseline_sha256'] = K.sha(BASE_SPV)
+    else:
+        raw = out / 'candidate-raw.spv'
+        K.compile_glsl(CARD / 'candidate.comp', raw, [HEADER])
+        res = f19_recipe(raw, CARD / 'candidate.spv')
+        res['raw_sha256'] = K.sha(raw)
+    K.write_json(CARD / ('build-%s.json' % what), res)
+    print(json.dumps(res, indent=2))
+
+
+if __name__ == '__main__':
+    main()

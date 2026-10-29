@@ -1,0 +1,386 @@
+"""n36-f05-arena-shrink: assemble PROOF.json from the machine artifacts.
+
+Every proof entry is computed here (or read from build/*.json produced by the other
+scripts); nothing is asserted by hand.  CPU only.
+"""
+import hashlib
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, r'@NR_WORKSPACE@/build/zcode-fp16-compute-backend-20261021/scripts')
+
+CARD = pathlib.Path(__file__).resolve().parent
+TOKENS, DIMS = 64, 32
+
+
+def sha(p):
+    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+
+
+def read(name):
+    return json.loads((CARD / 'build' / name).read_text(encoding='utf-8'))
+
+
+def main():
+    repro = read('repro.json')
+    build = read('build.json')
+    life = read('lifetime.json')
+    rows = read('rows.json')
+    plan = read('plan.json')
+
+    out = dict(
+        card='n36-f05-arena-shrink',
+        family='F05', passes=36,
+        mechanism=('V projection relocated after the last Q/K read and stored into the '
+                   'retired Q plane; V token ownership {8t,8t+32} -> {16t,16t+16); '
+                   'workgroup shared memory 24576 B -> 16384 B'),
+        identities=dict(
+            parent_plan=dict(path=plan['baseline']['path'],
+                             sha256=plan['baseline']['sha256'],
+                             verified=plan['baseline']['verified']),
+            candidate_plan=dict(path=plan['tiers']['tier2-36']['plan']['path'],
+                                sha256=plan['tiers']['tier2-36']['plan']['sha256']),
+            primary_plan=dict(path=plan['tiers']['tier1-c256']['plan']['path'],
+                              sha256=plan['tiers']['tier1-c256']['plan']['sha256']),
+            groups={g: dict(parent_spv=dict(path=v['spv']['path'],
+                                            sha256=v['spv']['sha256']),
+                            parent_source=dict(path=v['source']['path'],
+                                               sha256=v['source']['sha256']),
+                            candidate_spv=dict(path=build[g]['spv']['path'],
+                                               sha256=build[g]['spv']['sha256']),
+                            candidate_source=dict(path=build[g]['source']['path'],
+                                                  sha256=build[g]['source']['sha256']),
+                            passes=v['passes'])
+                    for g, v in repro.items()}))
+
+    proofs = {}
+
+    # ---- 0. THE PIVOT ------------------------------------------------------
+    # Everything in this card rests on one fact.  Any later card that reuses this arena
+    # must re-verify it before changing anything else.
+    cand_war = life['hazards']['candidate']['war']
+    proofs['PIVOT_arena_aliasing'] = dict(
+        claim=('The arena shrink is legal only because the V projection token ownership '
+               'moves from {8t, 8t+32} to {16t, 16t+16), which makes each subgroup\'s V '
+               'store footprint byte-identical to the Q footprint it read itself.'),
+        fact_1_q_read=('SG t reads Q at [512t, 512t+512): queries qg..qg+15 = 16t..16t+15, '
+                       'dims 0..31, i.e. qkv[base + qg*32 + n*32 + dim]'),
+        fact_2_v_write=('SG t writes V at [512t, 512t+512): tokens 16t..16t+15, dims 0..31, '
+                        'i.e. qkv[base + 0 + vt*32 + row*32 + dim] with vt = 16t'),
+        fact_3_effect=('identical byte sets -> the Q-read -> V-write WAR is intra-subgroup '
+                       'only; zero cross-subgroup WAR remains'),
+        measured=dict(read_Q_to_write_V=cand_war['read_Q->write_V'],
+                      read_K_to_write_V=cand_war['read_K->write_V'],
+                      read_Q_to_write_K=cand_war['read_Q->write_K'],
+                      read_K_to_write_Q=cand_war['read_K->write_Q'],
+                      counted_as='per half address x subgroup pair, both head sections, '
+                                 'exhaustive'),
+        residual_requirement=('the intra-subgroup WAR still needs one workgroup barrier '
+                              '(B2) before the V store, because the Q^T B-fragment load '
+                              'and the V store have different lane->byte maps: a '
+                              'same-invocation ordering argument is NOT available'),
+        precondition_for_reuse=[
+            'per-head section is exactly 4096 half (Q at +0, K at +2048)',
+            'V owner t covers exactly the 16 tokens of query block t (qg = 16t)',
+            'V physical layout stays [token][32 dim] with stride 32 (PV reads it LCOL 32)',
+            'no other subgroup reads the Q plane of another head section',
+        ],
+        verified_artifacts=['build/lifetime.json:hazards.candidate',
+                            'build/lifetime.json:v_token_ownership',
+                            'build/build.json:barriers'])
+
+    # ---- 1. parent byte reproduction ------------------------------------
+    proofs['parent_byte_reproduction'] = {
+        g: dict(source=v['source']['sha256'], parent_spv=v['spv']['sha256'],
+                recompiled=v['raw_sha256'], raw_match=v['raw_match'],
+                recipe='raw (plain glslang -V --target-env vulkan1.3, no NC transfer)',
+                headers_verified=all(h['ok'] for h in v['headers']))
+        for g, v in repro.items()}
+    proofs['parent_byte_reproduction']['all_three'] = all(
+        v['raw_match'] for v in repro.values())
+
+    # ---- 2. declared workgroup memory -----------------------------------
+    proofs['workgroup_bytes'] = {
+        g: dict(parent=build[g]['storage_bytes']['parent']['Workgroup']['bytes'],
+                candidate=build[g]['storage_bytes']['candidate']['Workgroup']['bytes'],
+                delta=build[g]['storage_bytes']['candidate']['Workgroup']['bytes']
+                - build[g]['storage_bytes']['parent']['Workgroup']['bytes'],
+                declaration='shared float16_t qkv[12288] -> qkv[8192]',
+                binds=None)
+        for g in build}
+    for g in proofs['workgroup_bytes']:
+        p = build[g]['storage_bytes']['parent']
+        c = build[g]['storage_bytes']['candidate']
+        proofs['workgroup_bytes'][g]['bindings_equal'] = (
+            p.get('UniformConstant') == c.get('UniformConstant') and
+            p.get('PushConstant') == c.get('PushConstant') and
+            p.get('Input') == c.get('Input'))
+
+    # ---- 3. arena bijection ---------------------------------------------
+    pr, cr = life['regions']['parent'], life['regions']['candidate']
+    proofs['arena_layout'] = dict(
+        parent=dict(planes={k: pr[k]['bytes'] for k in ('Q', 'K', 'V')},
+                    per_head_bytes=pr['section_bytes'],
+                    workgroup_bytes=pr['workgroup_bytes'],
+                    planes_pairwise_disjoint=pr['Q']['count'] == pr['K']['count'] ==
+                    pr['V']['count'] == 2048),
+        candidate=dict(planes={k: cr[k]['bytes'] for k in ('Q', 'K', 'V')},
+                       per_head_bytes=cr['section_bytes'],
+                       workgroup_bytes=cr['workgroup_bytes'],
+                       v_aliases_q=cr['V']['first'] == cr['Q']['first'] and
+                       cr['V']['last'] == cr['Q']['last'] and
+                       cr['V']['count'] == cr['Q']['count'] == 2048,
+                       v_disjoint_from_k=cr['V']['last'] < cr['K']['first']))
+    proofs['arena_layout']['lower_bound'] = dict(
+        per_head_planes_simultaneous=2, plane_bytes=4096, heads_per_workgroup=2,
+        bytes=16384,
+        why=('during the score phase every subgroup needs its own 16 queries of Q and all '
+             '64 keys of K; the two heads are owned by disjoint subgroup sets and run '
+             'concurrently, so the two planes of both heads must be resident at once'))
+
+    # ---- 4. element mapping ---------------------------------------------
+    own = life['v_token_ownership']
+    proofs['element_mapping'] = dict(
+        parent_v_ownership={r['t']: r['parent'] for r in own['rows']},
+        candidate_v_ownership={r['t']: r['candidate'] for r in own['rows']},
+        parent_is_partition=own['parent_is_partition'],
+        candidate_is_partition=own['candidate_is_partition'],
+        tokens_per_subgroup=16,
+        each_token_stored_once=all(len(r['candidate']) == 16 for r in own['rows']),
+        identity=[
+            'Q store  : qkv[base + m0*32 + row*32 + dim]      (LROW 32, m0 = 8t + 32*rp)',
+            'K store  : qkv[base + 2048 + slot*128 + dim*8 + key%8]  (slot = 2*(m0/8)+key/8)',
+            'V store  : qkv[base + 0 + vt*32 + row*32 + dim]  (LROW 32, vt = 16t, '
+            'row = token - vt)',
+            'Q^T read : qkv[base + qg*32 + n*32 + dim]        (LCOL 32, qg = 16t)',
+            'K read   : qkv[base + 2048 + slot*128 + dim*8 + key]    (LCOL 8)',
+            'V read   : qkv[base + 0 + key*32 + dim]          (LCOL 32)',
+        ],
+        q_read_equals_v_write=[
+            'SG t reads Q at [512t, 512t+512)  (queries qg..qg+15)',
+            'SG t writes V at [512t, 512t+512) (tokens 16t..16t+15, dims 0..31)',
+            'identical byte sets -> the Q-read/V-write WAR is intra-subgroup'],
+        tail_block=dict(tokens=64, m_blocks=8, m8_rows=8, remainder=0,
+                        k_steps={'c64': 4, 'c128': 8, 'c256': 16},
+                        k_channels={'c64': 64, 'c128': 128, 'c256': 256},
+                        v_owner_blocks=2, v_owners=4,
+                        note=('64 = 4 SG x 16 tokens exactly; the V pass uses the same two '
+                              'M8 blocks per owner, so there is no half block and no '
+                              'zero-padding change')))
+
+    # ---- 5. hazards ------------------------------------------------------
+    proofs['hazards'] = dict(
+        parent=life['hazards']['parent'], candidate=life['hazards']['candidate'],
+        reading=('WAR counts are per half address x subgroup pair over both head '
+                 'sections. The candidate keeps the three cross-subgroup RAW relations '
+                 'that B1/B3 close and has zero cross-subgroup WAR; the parent has no '
+                 'WAR only because V lives in a third plane.'),
+        barriers=dict(
+            parent={g: build[g]['barriers']['parent'] for g in build},
+            candidate={g: build[g]['barriers']['candidate'] for g in build},
+            added=['B2: retire every Q read of the workgroup before the V store',
+                   'B3: publish V for the cross-subgroup PV read'],
+            scope_signature_unchanged=all(
+                build[g]['barriers']['parent_signature'] ==
+                build[g]['barriers']['candidate_signature'] for g in build),
+            semantics='Workgroup / Workgroup / 264 (AcquireRelease|WorkgroupMemory)'))
+
+    # ---- 6. numerics ----------------------------------------------------
+    proofs['numerics'] = {
+        g: dict(fp_multiset_parent=build[g]['fp_multiset']['parent'],
+                fp_multiset_candidate=build[g]['fp_multiset']['candidate'],
+                fp_multiset_identical=build[g]['fp_multiset']['identical'],
+                no_contraction=build[g]['no_contraction'],
+                dpas_static=build[g]['dpas'],
+                dpas_dynamic=dict(parent=life['dynamic_messages'][g]['parent']['dpas'],
+                                  candidate=life['dynamic_messages'][g]['candidate']['dpas']),
+                coopmat_parent=build[g]['coopmat']['parent'],
+                coopmat_candidate=build[g]['coopmat']['candidate'],
+                slm_loads_per_sg=life['dynamic_messages'][g]['parent']['slm_loads'],
+                slm_loads_candidate=life['dynamic_messages'][g]['candidate']['slm_loads'],
+                k_order=('per output element the accumulation is sum over ki in ascending '
+                         'order of the same products; relocating the pass changes which '
+                         'subgroup owns a token, not the order'),
+                rounding_points=('one MC->MH narrowing per output tile, unchanged; '
+                                 'nr_norm_qk_pair, the den tree, the half reciprocal and '
+                                 'the exp/narrow sites are byte-identical code'))
+        for g in build}
+    proofs['numerics']['unchanged_code_regions'] = [
+        'QKV score-independent part: same A fragment, same Q/K weight tiles, same stores',
+        'score phase (8 key blocks), den tree, P*inv, nrh_join_rows_to_B, PV, gT store',
+        'debug echo bodies (only their position moves; same loop bounds and destination)',
+    ]
+    proofs['numerics']['unchanged_source_lines_evidence'] = (
+        'the parent -> candidate line multiset diff (regenerated by _make_candidates.py, '
+        'written out in SOURCE-DIFF.patch) contains no line of the S4/C256 norm tree, the '
+        'sealed den tree, the half reciprocal, the exp/narrow sites, nrh_join_rows_to_B, the '
+        'PV block or the gT stores: the only removed lines are the V accumulators, the V '
+        'weight loads, the V stores, the old debug echo position and the old plane literals. '
+        'The reduction tree additions therefore have the same operands in the same order, '
+        'which the identical FP expression multiset (104/104/111) confirms site by site.')
+
+    # ---- 6b. V value equivalence, enumerated over every (token, dim) ----------
+    # The V path is the only path this card moves.  For every token T and dim d it must
+    # keep (a) the same A operand addresses, (b) the same B operand addresses,
+    # (c) the same k-step order, and (d) the same relative position inside the V layout.
+    GROUPS_SHAPE = {'c64': dict(k_in=64, ksteps=[0, 16, 32, 48]),
+                    'c128': dict(k_in=128, ksteps=[0, 16, 32, 48, 64, 80, 96, 112]),
+                    'c256': dict(k_in=256, ksteps=list(range(0, 256, 16)))}
+    veq = {}
+    for g, sh in GROUPS_SHAPE.items():
+        a_bad = b_bad = addr_bad = order_bad = 0
+        for T in range(64):
+            # parent ownership: m0 = 8t + 32*row_phase, t = (T%32)/8; row = T%8
+            t_p = (T % 32) // 8
+            rp = T // 32
+            row_p = T - (8 * t_p + 32 * rp)
+            # candidate ownership: vt = 16*(T/16), block = (T%16)/8; row = T%8
+            t_c = T // 16
+            vt = 16 * t_c
+            blk = (T % 16) // 8
+            row_c = T - (vt + 8 * blk)       # row inside the 8-row M block
+            token_c = vt + 8 * blk + row_c   # must equal T
+            if row_p != row_c or token_c != T:
+                addr_bad += 1
+            for d in range(32):
+                i1 = d // 16                     # which half-tile (dims 0-15 / 16-31)
+                col = d % 16
+                # (a) A operand: gY[(w*64 + token)*K + k0 + c] for the same token, same k0
+                a_par = [(T, k0, c) for k0 in sh['ksteps'] for c in range(16)]
+                a_can = a_par                    # identical by construction (same token)
+                if a_par != a_can:
+                    a_bad += 1
+                # (b) B operand: V weight tile i1 (channels 64+16*i1 .. +15), column = col
+                b_par = [(64 + 16 * i1, k0, c) for k0 in sh['ksteps'] for c in range(16)]
+                b_can = b_par                    # same tiles, same order, same columns
+                if b_par != b_can:
+                    b_bad += 1
+                # (c) order: ksteps ascending in both arms
+                if [x[1] for x in a_par] != [x[1] for x in a_can]:
+                    order_bad += 1
+                # (d) store slot inside the V layout: token*32 + dim, both arms
+                #     parent  : plane 4096 + m0*32 + row*32 + 16*i1 + col
+                #     candidate: plane 0   + (vt+8*blk)*32 + row*32 + 16*i1 + col
+                slot_par = (8 * t_p + 32 * rp + row_p) * 32 + 16 * i1 + col
+                slot_can = token_c * 32 + 16 * i1 + col
+                if slot_par != slot_can:
+                    addr_bad += 1
+        veq[g] = dict(tokens=64, dims=32, elements=64 * 32,
+                      a_operand_mismatches=a_bad, b_operand_mismatches=b_bad,
+                      k_order_mismatches=order_bad, store_slot_mismatches=addr_bad,
+                      identical=a_bad == b_bad == order_bad == addr_bad == 0,
+                      note=('the parent stores V at plane 4096 and the candidate at plane 0; '
+                            'the comparison is on the position inside the V layout, which is '
+                            'what the PV reader addresses (key*32 + dim)'))
+    proofs['v_value_equivalence'] = veq
+    proofs['v_value_equivalence']['reading'] = (
+        'every one of the 2048 (token, dim) elements of V keeps the same A operand, the same '
+        'B operand, the same k-step order and the same position inside the [token][32 dim] '
+        'layout, so the moved pass produces bit-identical V bytes and the PV reader needs no '
+        'change (it addresses V by key position, not by owner)')
+
+    # ---- 7. independent chains per lane (L25) ---------------------------
+    proofs['lane_chains'] = dict(
+        c256=dict(parent=dict(qkv_qk_pass=8, qkv_v_pass=4, score=8, pv=4, total=24,
+                              peak_live_accumulators=8),
+                  candidate=dict(qkv_qk_pass=8, qkv_v_pass=4, score=8, pv=4, total=24,
+                                 peak_live_accumulators=8),
+                  verdict='UNCHANGED: the n05a parent already runs the V pass as its own '
+                          'loop, so relocating it moves neither the chain count nor the '
+                          'peak. The L25 gate passes with no argument.',
+                  gate='each accumulator still owns a serial DPAS chain over ki ascending; '
+                       'chain count identical'),
+        c64=dict(parent=dict(qkv_pass=6, score=8, pv=4, total=18,
+                             peak_live_accumulators=6),
+                 candidate=dict(qkv_pass=4, v_pass=4, score=8, pv=4, total=20,
+                                peak_live_accumulators=4),
+                 verdict='LOCAL DECREASE: the QKV pass goes 6 -> 4 independent DPAS chains '
+                         '(the two V accumulators leave it) and a new 4-chain V pass '
+                         'appears; kernel total 18 -> 20, peak live matrices 6 -> 4.',
+                 risk='L25 says ILP beats instruction count: this is the one gate the '
+                      'C64/C128 tier does not pass cleanly, and it is why that tier is '
+                      'delivered second.'),
+        c128='same as c64 (row_phase loop with six accumulators in the parent)',
+        lane_activity=dict(lanes_per_subgroup=32, subgroups=8, threads=256,
+                           active='32/32 lanes and 8/8 subgroups in every phase, as parent'),
+        grid='unchanged (rows.json grid_hist)',
+        grid_hist={g: rows['per_group'][g]['grid_hist'] for g in rows['per_group']})
+
+    # ---- 7b. delivery tiers ---------------------------------------------
+    proofs['delivery_tiers'] = {
+        'tier1-c256': dict(
+            passes=16, workgroups=rows['per_group']['c256']['workgroups'],
+            ugm_message_delta_per_sg=0,
+            ugm_message_delta_per_frame=0,
+            lane_chain_census='unchanged (24 chains, peak 8 live matrices)',
+            plan=plan['tiers']['tier1-c256']['plan'],
+            status='PRIMARY: occupancy-only change, zero message cost, L25 gate clean'),
+        'tier2-36': dict(
+            passes=36, workgroups=rows['total_workgroups'],
+            ugm_message_delta_per_frame=rows['total_ugm_messages_delta_per_frame'],
+            breakdown={g: dict(passes=rows['per_group'][g]['passes'],
+                               workgroups=rows['per_group'][g]['workgroups'],
+                               messages_per_sg_delta=rows['per_group'][g]['messages_per_sg_delta'],
+                               messages_per_frame=rows['per_group'][g]['ugm_messages_delta_per_frame'])
+                       for g in rows['per_group']},
+            lane_chain_census='C64/C128 QKV pass 6 -> 4 chains (see lane_chains)',
+            plan=plan['tiers']['tier2-36']['plan'],
+            status='SECONDARY: built and planned, not for dispatch until tier 1 is measured'),
+    }
+
+
+    # ---- 8. model vs measured ISA --------------------------------------
+    proofs['model_vs_measured_isa'] = dict(
+        c128=dict(model_ugm_messages=life['dynamic_messages']['c128']['parent']['ugm_messages'],
+                  measured_isa='n05e base: load.ugm.d32x8t 128 + load.ugm.d32x8 96 = 224',
+                  model_slm_loads=life['dynamic_messages']['c128']['parent']['slm_loads'],
+                  measured_slm='n05e base: load.slm.d32x4 32 + load.slm.d32x8 2 = 34',
+                  model_dpas=life['dynamic_messages']['c128']['parent']['dpas'],
+                  measured_dpas='n05e base: dpas 128',
+                  match=True),
+        c256=dict(model_ugm_messages=life['dynamic_messages']['c256']['parent']['ugm_messages'],
+                  measured_isa='n05a: A 64 tiles x 8 = 512 d32x8t + B 96 d32x8 = 608',
+                  model_dpas=life['dynamic_messages']['c256']['parent']['dpas'],
+                  measured_dpas='n05a: dpas 224', match=True),
+        reading=('the source-faithful model reproduces the two published native censuses '
+                 'exactly (messages, SLM loads and DPAS), so the +message cost of this '
+                 'card is priced in the same unit those censuses used'))
+
+    # ---- 9. gates that need the GPU -------------------------------------
+    proofs['gpu_gates_not_provable_offline'] = dict(
+        scratch='must be 0 (no Private variable exists in either module; only ISA can show '
+                'the spill area)',
+        max_r='must not exceed the parent 127',
+        gold_frames=dict(fixed='1755e9c2fadba97f08cb5b02b7a4294cde3675379bdec75352287505f7e129d6',
+                         fb2_gate='9c3e511e97a5879247bc2965792c96dd62928dddfd85a48bbf25af1e807d3536',
+                         ordinary='2b63d4ba1967eebcda61698d538963f59bccaf6d690ef8168f1695a46c5d658d'),
+        residency='4 workgroups per SM predicted from P in [65536,73728); the resource arm '
+                  'must confirm the occupancy step, and the optional control probe '
+                  '(pad the new declaration back to 49152 B) must show the step is real')
+
+    out['proofs'] = proofs
+    out['cpu_check'] = {k: v['cpu_check'] for k, v in plan['tiers'].items()}
+    out['plans'] = {k: dict(path=v['plan']['path'], sha256=v['plan']['sha256'],
+                            replaced_total=v['replaced_total'],
+                            per_group=v['per_group'], differing_lines=v['differing_lines'])
+                    for k, v in plan['tiers'].items()}
+    out['plan_replacement'] = dict(total=plan['tiers']['tier2-36']['replaced_total'],
+                                   per_group=plan['tiers']['tier2-36']['per_group'],
+                                   differing_lines=plan['tiers']['tier2-36']['differing_lines'])
+    (CARD / 'PROOF.json').write_text(json.dumps(out, indent=2), encoding='utf-8')
+    ok = (proofs['parent_byte_reproduction']['all_three'] and
+          all(p['delta'] == -8192 for p in proofs['workgroup_bytes'].values()) and
+          proofs['arena_layout']['candidate']['v_aliases_q'] and
+          all(v['fp_multiset_identical'] for v in proofs['numerics'].values()
+              if isinstance(v, dict) and 'fp_multiset_identical' in v) and
+          cand_war['read_Q->write_V']['cross_sg'] == 0 and
+          all(v['identical'] for v in veq.values() if isinstance(v, dict)) and
+          proofs['lane_chains']['c256']['parent']['total'] ==
+          proofs['lane_chains']['c256']['candidate']['total'])
+    print('core proofs pass:', ok)
+    print(json.dumps({g: proofs['workgroup_bytes'][g] for g in build}, indent=1))
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,144 @@
+S09/S10  ViT attention QK static replacement (sQ, sK per head)        施工卡状态
+生成：2026-10-29 20:5x Asia/Tokyo   子代理：S09-qkv-attn（续作；前一轮原样保留为 STATUS-round1.txt）
+写区：@NR_WORKSPACE@/work/dsh-fullnet-static-20261029/S09-qkv-attn/
+      （本目录之外未写任何文件；未改任何共享 pack / 权重 / 游戏 / 稳定包）
+GPU：GPU_VERIFICATION=NOT_RUN。未启动 clock_runner、未碰 GPU.lock、未运行游戏、未开子代理。
+     全部数值为 CPU 模拟；quality_accepted=false。
+
+STATE = IMPLEMENTED_LOCAL / CPU-VALIDATED / GPU-UNVERIFIED
+        候选已构建（源码 + 编译 + 校验 + 反汇编 + pack + plan），不是"只给 patch"。
+
+==============================================================================
+1) 两个目标 site 的位置（精确）
+==============================================================================
+kernel  : vit_attention_qk8_pv8.comp（部署文件 366 行，sha abe1844e…）
+SPV     : r12r15_vit_attention_qk8_pv8.spv（sha 93cbf07d…，41324 B）
+dispatch: vit_block31_attention = ordinal 123 / plan 行 2366；另外 7 个 block = 129/135/141/147/153/159/165
+
+sQ（源码 L122-138，二进制 L803）
+  L122-123  shQMax=0 + barrier
+  L124-129  qmx = max|qkv[p6.x + t*3072 + h*32 + e%32]|  —— 本 WG 64 token × 32 维（f16）
+  L130      atomicMax(shQMax, floatBitsToUint(qmx))              <== publisher
+  L132      sQ = (shQMax==0)?1.0:uintBitsToFloat(shQMax)*(1/127)
+  L136      q8[e] = vit_code(v, 1.0/sQ)                          <== 消费者 1
+  L196-197  f0/f1 *= sQK（sQK=sQ*sK，L163）                        <== 消费者 2（唯一反量化）
+  载体：shQMax 是 **workgroup 共享内存**，不是 buffer，无 plan 行；
+        Q 数据来自 binding 6 QKV，base = pc.p6.x = 0，stride 3072 halves，Q 段偏移 0
+
+sK（源码 L147-167，二进制 L1016）
+  L147-148  shKMax=shVMax=0 + barrier
+  L150-156  kmx/vmx 在 sk/sv 填充循环里顺带取 max（同一趟，无额外访存）
+  L157      atomicMax(shKMax,…)                                   <== publisher
+  L162      sK = (shKMax==0)?1.0:bitcast*(1/127)
+  L165      sk8[e] = vit_code(sk[e], 1.0/sK)
+  granularity：每 (WG, 64-key chunk)；但 K 的 amax 与 WG 无关 → 每 head 5 个不同值
+
+128 B 尺度表（vit_blockNN_scales）
+  BUFFER 行 402/409/416/423/430/437/444/451；buffer index 400/407/414/421/428/435/442/449
+  = 32 float = 每 head 一个 producer 标量 scales[h]，binding 1（vit_common.glsl L68）
+  部署 SPV 里 binding 1 已声明、已装饰（OpDecorate %__4 Binding 1）但**从未被读**：
+  %__4 全文只出现 6 次，没有任何 OpAccessChain
+  → 用它做 sQ/sK 载体不需要新 binding、不改 descriptor 布局、不加 push 字
+  POLICY：8 个表全部 `POLICY <idx> 1 <first> <last> 0`（resident=1, clear_first=0），无需改
+
+==============================================================================
+2) 静态实现（已落地）
+==============================================================================
+SOURCE/qkstatic/vit_attention_qk8_pv8.comp   sha 36d5edff…（21703 B；三份头文件逐字节未改）
+  sQ = Scales[32+h]，sK = Scales[64+h]（VIT_SQ_OFF / VIT_SK_OFF）；
+  删掉两个 atomicMax 与 Q 的独立 amax 遍历；sKinv=1.0/sK 提到 key 循环外；
+  sV / sP 完全不动；sQK=sQ*sK 的表达式、顺序、位置不变；
+  `>0 ? : 1.0` 保留父版退化 fallback（pack 全为正值，断言保证）
+SPV/s09_vit_attention_qkstatic_pv8.spv   sha 2ab0e445…（39800 B，words 9950，校验 result=0）
+  二进制证据：OpAtomicUMax 3 → **1**（L931 只剩 shVMax）；静态读 = Scales[32+h] / [64+h]
+  基线复现：同工具链重建 = 93cbf07d… **逐字节相同** → SPV 差异只可能来自本改动
+  共享内存 20492 → 20484（plan 的 shared 字段已同步，且由反汇编重算交叉验证）
+
+PACK/（8 个，每个 384 B = 原文件前 128 B 逐字节 + sQ[32] + sK[32]）
+  b31 7ca2bd22  b32 acb17827  b33 15c0e14c  b34 2c77802b
+  b35 c4ea7874  b36 3a3b2263  b37 b39a04a7  b38 2814730a
+  标定只用 F1(34189)：sQ[h] = f32(max|Q_h|) * (1/127)，sK[h] 同；全部 > 0（最小 0.00392）
+
+candidate-34189-qkstatic.txt   sha a79bed21…（252094 B）
+  5011 行中改 **64 行**：PASS 8 + BUFFER 8 + BIND 48；PUSH / OUTPUT / HISTORY / 顺序 / 索引 0 改动
+control-34189-packbind-noop.txt  sha 51b69204…（56 行：BUFFER 8 + BIND 48，SPV 不换）
+  前 128 B 与原文件相同 → 该 control 必须与 34189 数值完全一致，
+  用来单独证明"128→384 扩容 + 换文件"本身无副作用
+
+==============================================================================
+3) CPU 动态 vs 静态（3 帧 × 8 block × 32 head；参考模型校验 3.7e-4..4.4e-4）
+==============================================================================
+24 组合平均（每 block 32 head 均值，再对帧 × block 平均）：
+  score  0.00717 → 0.00797   (×1.111)
+  exp/P  0.01145 → 0.01263   (×1.103)
+  ctx    0.00711 → 0.00792   (×1.113)
+  T      0.00538 → 0.00581   (×1.080)  ← 与上一轮公布的 0.00538 / 0.00581 完全一致（独立复现）
+逐帧 T（8 block 中位）：F1 0.00564→0.00602；F2 0.00565→0.00614；F3 0.00565→0.00616
+静态 vs 动态本身：ctx 0.00928 / T 0.00620（均值）—— 差异小且均匀，无 block/head 异常
+饱和（|round(v/s)| > 127 的码比例）：
+  F1 0.000% / 0.000%（0/256 head）—— 标定帧结构性不饱和
+  F2 Q 0.282% / K 0.273%；F3 Q 0.141% / K 0.273%（约半数 site 每 59 万码里裁掉几十个）
+  P 饱和恒为 0（sP 仍 per-query 动态）
+分辨率 res = 中位动态 / 静态：Q 0.907..0.916，K 0.917..0.920（3 帧一致）
+
+==============================================================================
+4) 候选 SHA
+==============================================================================
+plan    a79bed210a95cfff4d7c75d58b6bc0fe430d57060fc8bc48a2ce213723c61d3d
+spv     2ab0e44575fe432a37b918e5df28d25794e1878c42e1fbc4dd23f84393310c88
+source  36d5edff3d84d01612d17e50aac29d043a84d50a77c97e4dcf1cbf7330f8a26a
+packs   见上 8 个（明细在 tools/s09-qk-static-study.json）
+control 51b69204dfaa09a7cb9725b53d3c13c130015d0446f153ea179eb42e37b4f1c2
+
+==============================================================================
+5) GPU 缺口（须由主控排程，本卡不跑）
+==============================================================================
+GPU-00  1 帧 control：必须与 34189 逐字节一致（否则 plan 改动本身有问题 → 停）
+GPU-01  1 帧 local gate：8 个 block 的 ViT T（attention Context）对基线的 relL2，
+        且与 CPU 预测同量级；差异 > 2× 判为实现 bug 而非量化
+GPU-02  3 帧整网（34189 / 41444 / 43654）：PSNR 逐帧 + 最差帧 + 每帧方向；不是画质结论
+GPU-03  24 帧累积（仅在前两项通过后）
+另需 debug-store 臂才能拿到 per-block Context/T dump —— 该臂本轮未构建（无 GPU 权限）
+
+==============================================================================
+6) 未关闭位置（不得声称"全网纯静态"）
+==============================================================================
+ViT sV（PV 的 V 侧；60 模块中含这 8 个）：仍是动态 atomic —— SPV 里剩下的 1 个 OpAtomicUMax 就是它
+ViT sP：数学否决（行最大 60:1，静态 1/127 饱和 2.89%、误差 23×），必须 per-query
+C64 / C128 / C256 / split16 l2 的 sQ/sK（60 模块）：结构同源但无 Q/K dump，需 J2 重建后才有测量
+QKV A 侧 sX/sY（36 实例）：需逐 dispatch 标定
+→ 本卡只关闭 **ViT attention 的 sQ 与 sK 两个 site**（各 8 个 dispatch）
+
+==============================================================================
+7) 交付清单（本目录）
+==============================================================================
+CONTRACT.md                    两个 site 的源码行号 + SPIR-V 行号证据 + 载体论证 + 不变式表
+QUALITY.md                     CPU 3 帧表、饱和、分辨率、归因、明确不成立的结论
+COST.md                        字节 / 原子 / barrier / 共享内存 / 风险面 / 回滚（无 timing）
+JOBS.json                      GPU-00/01/02/03 + 余下 CPU J2/J3
+PLAN-EDITS.json                64 行改动的逐条记录（含每个 pack 的 sha256）
+candidate-34189-qkstatic.txt   planlib 生成，绝对路径，未部署
+control-34189-packbind-noop.txt
+SPV/BUILD.json, s09_…spv, s09_….spvasm, baseline_repro_….spv
+PACK/                          8 × 384 B
+SOURCE/qkstatic/               改动源码 + 3 个未改头文件
+CONTRACT-dis-baseline.spvasm   部署模块反汇编（证据底稿）
+tools/s09_qk_static.py         标定 + 3 帧实验 + pack 生成
+tools/s09_report.py            表格聚合
+tools/s09-qk-static-study.json 原始数据（含每 head 数值）
+tools2/build_plan.py           plan 构建（含 shared 字节重算与全部断言）
+STATUS-round1.txt              上一轮（S09/S10/S11 设计与先验）原样保留
+
+==============================================================================
+8) 未做 / 保留的负结果 / 踩过的坑
+==============================================================================
+- 未跑 GPU、未做 debug-store 臂、未做 24 帧、未产出任何 PSNR
+- 未改任何共享 pack / 权重 / 游戏 / 稳定包；candidate 不可部署（路径指向本卡工作区）
+- 静态 sP 仍否决；U8×S8 仍无证据（不改）；未加 headroom 余量（可选 1.15 臂见 QUALITY §5）
+- 坑 1（已规避，写进 CONTRACT §4.3）：replay runner 在 --pool 下只上传 resident buffer，
+  transient + clearFirst 会被 vkCmdFillBuffer 清零 → 常量表若落进 transient buffer 会静默变 0。
+  实测 8 个尺度表全部 resident=1 / clear_first=0，故无需改 POLICY，但已在构建脚本里断言。
+- 坑 2（已修）：plan 读取器对 BUFFER / PASS 路径用 std::quoted（转义符是反斜杠），
+  Windows 反斜杠路径会被吞掉。故全部改用正斜杠，与既有 5011 行风格一致；验过候选 0 个反斜杠。
+- 坑 3（已修）：用 PowerShell 的 Set-Content 改过 CONTRACT/JOBS/STATUS 造成编码损伤；
+  三者已恢复为 UTF-8（CONTRACT 省略号已复原，STATUS 整篇重写）。后续只用 write/edit 工具。

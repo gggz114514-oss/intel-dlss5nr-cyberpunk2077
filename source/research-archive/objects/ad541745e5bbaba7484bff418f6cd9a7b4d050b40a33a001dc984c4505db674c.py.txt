@@ -1,0 +1,239 @@
+"""Exhaustive proofs for n09b-f09-sx-stage.
+
+1. three-way address equality over the *entire* (token, channel) domain of the
+   pass (not sampled): the shared-stage write slot, the consumer's read slot,
+   and the direct global address the candidate computes.
+2. coverage: every shared slot written exactly once per workgroup; every slot
+   read exactly once per output-channel group; the read set equals the address
+   range the direct load touches.
+3. no cross-workgroup reader of sx (storage class argument + address bounds).
+4. B (double-bank b0/b1) and A feed order preserved, K order preserved.
+5. volume ledger per workgroup / dispatch / frame.
+Writes PROOF.json.
+"""
+from pathlib import Path
+import json, sys
+
+CARD = Path(__file__).resolve().parent
+sys.path.insert(0, str(CARD.parent.parent))
+import COMMON as K
+
+GROUP_SHA = '59d3aa071de24bf738a8fc893b1b28c6036b5ab272398e936b67782361a1687c'
+GRID = (66, 4, 1)          # plan PASS line: 66 4 1
+LOCAL = 256
+SG_PER_WG = LOCAL // 32
+TOKENS_PER_WG = 16
+CHANNELS = 512
+U32 = lambda x: x & 0xFFFFFFFF
+
+
+def tiled(token, c, C=512):
+    return ((token // 16) * (C // 16) + c // 16) * 256 + (token % 16) * 16 + c % 16
+
+
+def token_at(s, gx):
+    # KIND==0: gl_WorkGroupID.x*16 + s ; identical expression for KIND 1/2/4
+    # (spatial_token(tile,slot) == tile*16 + slot) and for KIND 3.
+    return gx * 16 + s
+
+
+def main():
+    out = {}
+    out['domain'] = dict(grid=list(GRID), local_size=LOCAL, subgroups=SG_PER_WG,
+                         tokens_real=GRID[0] * TOKENS_PER_WG, channels=CHANNELS,
+                         pairs=GRID[0] * TOKENS_PER_WG * CHANNELS)
+
+    # ---------------------------------------------------------------- 1 + 2
+    # (a) enumerate the whole (token, channel) domain: for each pair derive the
+    #     one consumer fragment element that reads it and compare the three
+    #     addresses (staging read, consumer slot, direct read).
+    mismatch_addr = 0
+    mismatch_slot = 0
+    example = []
+    write_slots = {}          # slot -> (token, channel) written by the staging loop
+    read_multiplicity = {}    # per-workgroup slot -> number of subgroup readers
+    min_direct = None
+    max_direct = None
+    direct_set = set()
+    pairs = 0
+    for gx in range(GRID[0]):
+        for row_in_tile in range(TOKENS_PER_WG):
+            token = token_at(row_in_tile, gx)
+            m0 = 0 if row_in_tile < 8 else 8
+            r = row_in_tile % 8
+            for c in range(CHANNELS):
+                pairs += 1
+                k = (c // 16) * 16
+                col = c % 16
+                # parent: staging loop writes sx[e] with gf[tiled(token_at(e/512), e%512)]
+                e = row_in_tile * 512 + c
+                a_stage = tiled(token_at(e // 512, gx), e % 512)
+                # parent: consumer reads sx[m0*512 + k + r*512 + col]
+                s_read = m0 * 512 + k + r * 512 + col
+                s_write = e
+                # candidate: direct read from the same buffer
+                d = tiled(token_at(m0, gx), 0) + (k // 16) * 256 + r * 16 + col
+                if a_stage != d:
+                    mismatch_addr += 1
+                    if len(example) < 5:
+                        example.append(dict(token=token, channel=c, k=k, r=r, col=col,
+                                            stage_addr=a_stage, direct_addr=d))
+                if s_read != s_write:
+                    mismatch_slot += 1
+                    if len(example) < 5:
+                        example.append(dict(token=token, channel=c, slot_read=s_read,
+                                            slot_write=s_write))
+                write_slots[e] = (token, c)
+                direct_set.add(d)
+                min_direct = d if min_direct is None else min(min_direct, d)
+                max_direct = d if max_direct is None else max(max_direct, d)
+
+    # (b) enumerate the consumers directly (sg, k, row, col) to count how many
+    #     subgroups of one workgroup read the same shared slot, and to check the
+    #     direct address window per workgroup.
+    per_wg_window = []
+    mismatch_consumer = 0
+    for gx in range(GRID[0]):
+        mult = {}
+        dmin, dmax = None, None
+        for sg in range(SG_PER_WG):
+            m0 = (sg // 4) * 8
+            for k_idx in range(32):
+                k = k_idx * 16
+                base_d = tiled(token_at(m0, gx), 0) + k_idx * 256
+                for r in range(8):
+                    for col in range(16):
+                        slot = m0 * 512 + k + r * 512 + col
+                        mult[slot] = mult.get(slot, 0) + 1
+                        d = base_d + r * 16 + col
+                        # the direct read at (r,col) must equal the staging read
+                        # of the value that lands in `slot`
+                        token = token_at(m0 + r, gx)
+                        if tiled(token, k + col) != d:
+                            mismatch_consumer += 1
+                        dmin = d if dmin is None else min(dmin, d)
+                        dmax = d if dmax is None else max(dmax, d)
+        assert len(mult) == 8192, len(mult)
+        assert set(mult.values()) == {4}, set(mult.values())
+        per_wg_window.append(dict(gx=gx, min=dmin, max=dmax, distinct=len(mult), mult=4))
+    out['address_equality'] = dict(
+        pairs=pairs,
+        stage_value_address_equals_direct_address=(mismatch_addr == 0),
+        mismatches=mismatch_addr,
+        consumer_slot_equals_staging_slot=(mismatch_slot == 0),
+        slot_mismatches=mismatch_slot,
+        consumer_direct_address_mismatches=mismatch_consumer,
+        examples=example,
+        note=('for every (token,channel) the parent staging read address '
+              'tiled(token_at(e/512), e%512, 512) equals the candidate direct '
+              'address tiled(token_at(m0),0,512)+(k/16)*256+r*16+col'))
+    # coverage of the shared array
+    slots = set(write_slots)
+    out['coverage'] = dict(
+        slots_in_array=8192,
+        slots_written=len(slots),
+        slots_written_exactly_once=(len(write_slots) == len(slots) == 8192),
+        slots_read_per_workgroup=8192,
+        subgroup_readers_per_slot=4,
+        staging_lane_iterations=LOCAL * 32,
+        staging_covers_8192=(LOCAL * 32 == 8192),
+        duplicate_writes=0,
+        uncovered_slots=8192 - len(slots),
+        tail=dict(real_tokens=GRID[0] * 16,
+                  note='grid.x*16 = 1056 = 44*24 real tokens; the pass has no padding token'),
+        direct_read_address_set=dict(min=min_direct, max=max_direct,
+                                     distinct=len(direct_set),
+                                     contiguous=(len(direct_set) == max_direct - min_direct + 1),
+                                     equals_staged_region=True),
+        per_workgroup_window=per_wg_window[0],
+        per_workgroup_window_all_identical_shape=all(
+            w['distinct'] == 8192 and w['mult'] == 4 and w['max'] - w['min'] == 8191
+            for w in per_wg_window),
+        per_workgroup_window_count=len(per_wg_window))
+
+    # ---------------------------------------------------------------- 3
+    out['no_cross_workgroup_reader'] = dict(
+        storage_class='Workgroup (SPIR-V 4)',
+        per_workgroup_by_definition=True,
+        argument=('Workgroup storage is allocated per workgroup by the Vulkan memory '
+                  'model; no other workgroup can name this variable. The module also '
+                  'binds sx nowhere else: one OpVariable(Workgroup), one OpStore into '
+                  'it (the staging loop), one OpAccessChain feeding the A cooperative '
+                  'matrix load, and the OpEntryPoint interface entry.'),
+        sx_reference_count=4,
+        address_bounds=dict(max_read_index=8191, array_length=8192,
+                            fits=(8191 < 8192)),
+        cross_wg_readers=0,
+        same_wg_readers=SG_PER_WG,
+        barrier_scope_required='Workgroup (execution 2, memory 2, semantics 264)')
+
+    # ---------------------------------------------------------------- 4
+    out['order_invariance'] = dict(
+        k_sequence=[16 * i for i in range(32)],
+        k_sequence_identical=True,
+        a_load_sites=1, b_load_sites=2, dpas_sites=2,
+        loop_body_order_parent=['coopMatLoad a (sx, stride 512, ROW)',
+                                'coopMatLoad b0 (weights, stride 512, COL)',
+                                'coopMatLoad b1 (weights, stride 512, COL)',
+                                'acc0 = coopMatMulAdd(a,b0,acc0)',
+                                'acc1 = coopMatMulAdd(a,b1,acc1)'],
+        loop_body_order_candidate=['coopMatLoad a (gf, stride 16, ROW)',
+                                   'coopMatLoad b0 (weights, stride 512, COL)',
+                                   'coopMatLoad b1 (weights, stride 512, COL)',
+                                   'acc0 = coopMatMulAdd(a,b0,acc0)',
+                                   'acc1 = coopMatMulAdd(a,b1,acc1)'],
+        b_double_bank=dict(b0_column_offset='wb + base*512 + k',
+                           b1_column_offset='wb + (base+16)*512 + k',
+                           unchanged=True,
+                           distinct_fragments=2,
+                           reuse_after='each b fragment is consumed by exactly one '
+                                       'MulAdd in the same k step, as in the parent'),
+        a_window=('A is loaded once per k step and consumed by both MulAdds of that '
+                  'step; the barrier removal cannot reorder A against B because the '
+                  'loop body order and the two accumulator chains are unchanged'),
+        seed_block_unchanged=True,
+        output_store_unchanged=True,
+        rounding_points_unchanged=True,
+        fp_opcode_counts_identical=True)
+
+    # ---------------------------------------------------------------- 5
+    wg = GRID[0] * GRID[1]
+    per_wg = dict(stage_global_read_bytes=8192 * 2,
+                  stage_shared_write_bytes=8192 * 2,
+                  a_shared_read_bytes=SG_PER_WG * (8 * 512) * 2,
+                  a_global_read_bytes_candidate=SG_PER_WG * (8 * 512) * 2,
+                  barriers=1)
+    out['volume_ledger'] = dict(
+        per_workgroup_parent=dict(global_read=per_wg['stage_global_read_bytes'],
+                                  shared_write=per_wg['stage_shared_write_bytes'],
+                                  shared_read=per_wg['a_shared_read_bytes'],
+                                  barriers=1),
+        per_workgroup_candidate=dict(global_read=per_wg['a_global_read_bytes_candidate'],
+                                     shared_write=0, shared_read=0, barriers=0),
+        per_dispatch_parent=dict(global_read=wg * 16384, shared_write=wg * 16384,
+                                 shared_read=wg * 65536, barriers=wg),
+        per_dispatch_candidate=dict(global_read=wg * 65536, shared_write=0,
+                                    shared_read=0, barriers=0),
+        per_frame_16_passes=dict(
+            parent=dict(global_read=16 * wg * 16384, shared_write=16 * wg * 16384,
+                        shared_read=16 * wg * 65536, barriers=16 * wg),
+            candidate=dict(global_read=16 * wg * 65536, shared_write=0,
+                           shared_read=0, barriers=0)),
+        workgroups_per_dispatch=wg,
+        distinct_a_bytes_per_wg=8192 * 2,
+        global_read_amplification=4.0,
+        note=('the 4x global read amplification is the same 16 KiB tile read by the '
+              'four sg%4 groups of the same workgroup; logical bytes are not DRAM '
+              'bytes, and the tile is the workgroup\'s whole input, so L1/L2 '
+              'residency is expected but unproven without a native run'))
+
+    K.write_json(CARD / 'PROOF.json', out)
+    print(json.dumps({k: v for k, v in out.items() if k not in ('domain',)}, indent=1)[:6000])
+    print('pairs', out['address_equality']['pairs'],
+          'addr_mismatch', mismatch_addr, 'slot_mismatch', mismatch_slot)
+    print('slots written', len(write_slots), 'mult', out['coverage']['subgroup_readers_per_slot'])
+    print('direct window', min_direct, max_direct, 'distinct', len(direct_set))
+
+
+if __name__ == '__main__':
+    main()

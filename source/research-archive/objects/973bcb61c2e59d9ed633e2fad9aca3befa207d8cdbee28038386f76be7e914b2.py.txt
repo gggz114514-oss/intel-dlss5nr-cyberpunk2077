@@ -1,0 +1,76 @@
+import json, hashlib, subprocess, sys, shlex
+from pathlib import Path
+B=Path('@NR_WORKSPACE@')
+A=B/'work/codex-astra-fp16-int8-audit-20261024'
+D=Path(__file__).resolve().parent/'chain-windows';D.mkdir(exist_ok=True)
+sys.path.insert(0,str(B/'build/zcode-fp16-compute-backend-20261021/scripts'))
+import spv_tools_local as ST
+exe=A/'phase-diagnosis-20261025/direct-clock-build/Release/clock_runner.exe'
+def ident(p):return dict(path=str(p),sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+def run(args):
+ r=subprocess.run(list(map(str,args)),capture_output=True,text=True)
+ assert r.returncode==0,r.stdout+r.stderr
+ return r.stdout
+roots={'parent':A/'c32-norm-owner-20261025/f20-den-pv-owner','single':D.parents[1]/'f20-peer8-single'}
+meta={};jobs=[]
+for arm,P in roots.items():
+ src=(P/'candidate.comp').read_text(encoding='utf-8-sig');pm=ST.Module(P/'candidate.spv')
+ # Measure source phase arrival intervals, NOT async completion or exclusive stalls.
+ if arm=='parent':
+  begin=src.index('    // ============ stage 1:')
+  pub=src.index('    barrier(); // Original publication to contract.')
+  cbegin=src.index('    MAT_A handoff0, handoff1;')
+ else:
+  begin=src.index('    // One publication:')
+  pub=src.index('        barrier(); // All peer tiles published;')
+  cbegin=src.index('        MAT_C c0;')
+ end=src.index('    // ============ stage 4:')
+ # Contract includes seed, Y writes and original retirement barrier; explicit in report.
+ for mode,(lo,hi) in {'expand':(begin,pub),'contract':(cbegin,end),'null':(begin,begin)}.items():
+  out=D/(arm+'-'+mode);out.mkdir(exist_ok=True)
+  s=src[:hi]+'nrClockEnd=clock2x32ARB();\n'+src[hi:]
+  s=s[:lo]+'nrClockStart=clock2x32ARB();\n'+s[lo:]
+  s=s.replace('#version 450','#version 450\n#extension GL_ARB_shader_clock : require')
+  assert s.count('void main() {')==1
+  s=s.replace('void main() {','uvec2 nrClockStart,nrClockEnd;\nvoid nr_original_main() {')
+  s+='''
+layout(set=0,binding=15,std430) buffer ClockProbe { uint clockWords[]; };
+void main() {
+ nr_original_main();
+ if((gl_WorkGroupID.x&15u)==8u && (gl_WorkGroupID.y&15u)==8u && gl_SubgroupInvocationID==0u) {
+  uint rec=((gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*8u+gl_SubgroupID)*4u;
+  clockWords[rec]=nrClockStart.x; clockWords[rec+1u]=nrClockStart.y;
+  clockWords[rec+2u]=nrClockEnd.x; clockWords[rec+3u]=nrClockEnd.y;
+ }
+}
+'''
+  spv=out/'probe.spv';source=out/'probe.comp';source.write_text(s,encoding='utf-8')
+  run([B/'src/project/tools/glslang-16.5.0/bin/glslang.exe','-V','--target-env','vulkan1.3',source,'-o',spv])
+  cm=ST.Module(spv);keep,info=ST.transfer_decoration_pattern_aligned(pm,cm,[])
+  assert len(keep)==len(ST.no_contraction_ids(pm))==7
+  ST.set_no_contraction(cm,set(keep),spv)
+  run([B/'candidates/amd-map-20261015/s4-final-output-fusion-fix/production-repair/spv_validate_cpu.exe',spv])
+  lines=(P/'plan.txt').read_text(encoding='utf-8-sig').splitlines();header=lines[0].split();nb=int(header[2]);no=int(header[4])
+  starts=[i for i,l in enumerate(lines) if l.startswith('PASS ')];assert len(starts)==232
+  ix=starts[230];tokens=shlex.split(lines[ix]);gx,gy,gz=map(int,tokens[-3:]);assert (gx,gy,gz)==(169,97,1)
+  size=gx*gy*8*16;header[2]=str(nb+1);header[4]=str(no+1);lines[0]=' '.join(header)
+  tokens[3]=spv.as_posix();tokens[6]=str(int(tokens[6])+1)
+  lines[ix]=' '.join(tokens[:2]+[json.dumps(tokens[2]),json.dumps(tokens[3])]+tokens[4:])
+  lines.insert(ix+1,f'BIND 15 {nb} 0 {size}')
+  pi=next(i for i,l in enumerate(lines) if l.startswith('POLICY '))
+  lines.insert(pi,f'OUTPUT {nb} raw "clock.bin"');lines.append(f'POLICY {nb} 1 230 232 1')
+  lines.insert(nb+1,f'BUFFER "chain_clock" {size} "-"')
+  plan=out/'plan.txt';plan.write_text('\n'.join(lines)+'\n',encoding='utf-8')
+  check=run([exe,'--plan',plan,'--cpu-check'])
+  key=arm+'-'+mode;meta[key]=dict(plan=ident(plan),spv=ident(spv),source=ident(source),cpu=check,no_contraction=info)
+  template=json.loads((roots['single']/'LUNA-NATIVE.json').read_text())['jobs'][0]
+  capture=D/'captures'/key;dest=D/'run'/('native-'+key)
+  argv=template['argv'][:]
+  for opt,value in [('--profile_dir',key),('--output_dir',D/'captures'),('--msg_file',D/(key+'.log')),('--plan',plan),('--out',dest)]:argv[argv.index(opt)+1]=str(value)
+  jobs.append(dict(id='native-'+key,plan=ident(plan),argv=argv,runner_output=str(dest),capture_output=str(capture),expected_fixed_frame_out=template['expected_fixed_frame_out']))
+(D/'PREPARATION.json').write_text(json.dumps(meta,indent=2),encoding='utf-8')
+task=json.loads((roots['single']/'LUNA-NATIVE.json').read_text());task.update(output_root=str(D),jobs=jobs)
+task['identities']=task['identities'][:3]+[v['spv'] for v in meta.values()]
+task['rules']=['Six exact serial native/gold diagnostic jobs only. Unique lock and no game. Stop any nongold/error. No retry. No performance or new experiments authorized.','These are diagnostic clock shaders, NOT optimization candidates. Main audits perturbation before authorizing timing.']
+(D/'LUNA-PILOT.json').write_text(json.dumps(task,indent=2),encoding='utf-8')
+print('Six diagnostic probes compiled, validated and CPU-plan checked.')

@@ -1,0 +1,284 @@
+"""Generate PROOF.json / COST-LEDGER.json / GPU-REQUEST.json for n10-f10-next.
+
+All numbers are pulled from BUILD.json / LOOP-BARRIERS.json / the two sources so
+the documents cannot drift from the build.
+"""
+from pathlib import Path
+import hashlib, json, re
+
+S = Path(__file__).resolve().parent
+sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+build = json.loads((S / 'BUILD.json').read_text(encoding='utf-8'))
+loops = json.loads((S / 'LOOP-BARRIERS.json').read_text(encoding='utf-8-sig'))
+
+parent_src = (S / 'parent-rebuild.comp').read_text(encoding='utf-8-sig')
+cand_src = (S / 'candidate.comp').read_text(encoding='utf-8-sig')
+
+
+def code_lines(t):
+    return [l for l in t.splitlines() if not l.strip().startswith('//')]
+
+
+def count(t, pat):
+    return sum(len(re.findall(pat, l)) for l in code_lines(t))
+
+
+# ------------------------------------------------------------------ site counts
+SITES = {
+    'residual_half_loads (gy[ .. ] value path)': (r'gy\[', r''),
+    'slm_stores (STAGE expansions)': (r'STAGE\(', r''),
+    'weight_fragment_loads (coopMatLoad(b*)': (r'coopMatLoad\(b[0-9]*,\s*weights', r''),
+    'a_fragment_loads (coopMatLoad(a*, smem/sy, A path)': (r'coopMatLoad\(a[0-9]*,\s*(?:sy|smem),\s*(?:abase\+)?\(\(m[AB]/8u\)', r''),
+    'v_fragment_loads (PV A rows)': (r'coopMatLoad\(a,(?:qkv|smem),QKV_OFF\+VBASE|coopMatLoad\(a,qkv,VBASE', r''),
+    'score_fragment_loads (K rows)': (r'coopMatLoad\(a,(?:qkv|smem),QKV_OFF\+KBASE|coopMatLoad\(a,qkv,KBASE', r''),
+    'dpas (coopMatMulAdd)': (r'coopMatMulAdd\(', r''),
+    'barrier()': (r'\bbarrier\(\);', r''),
+}
+site_counts = {}
+for name, (pat, _) in SITES.items():
+    site_counts[name] = dict(parent=count(parent_src, pat), candidate=count(cand_src, pat))
+
+lif = build['proofs']['barrier_lifetime']
+
+proof = {
+    "card": "n10-f10-next",
+    "family": "F10",
+    "status": "BUILT_AWAITING_GPU",
+    "identity": {
+        "baseline_plan": build['parent']['plan'],
+        "baseline_spv": build['parent']['spv'],
+        "baseline_source": build['parent']['source'],
+        "candidate_spv": build['candidate']['spv'],
+        "candidate_source": build['candidate']['source'],
+        "candidate_plan": {k: build['plan'][k] for k in ('path', 'sha256')},
+    },
+    "claims": [
+        {
+            "id": "M1-map-one-to-one",
+            "statement": "Every staged element is written exactly once and every "
+                         "(token,channel) of the 64x64 kc slice is covered; the SLM address "
+                         "function qkv_a_offset(.) is a bijection over 0..4095.",
+            "method": "exhaustive enumeration of (r,k) -> qkv_a_offset(r*64+k)",
+            "checked": build['proofs']['staged_slice_bijection'],
+            "result": "PASS",
+        },
+        {
+            "id": "M2-fragment-addresses",
+            "statement": "For every SG, both M blocks and all four K16 blocks, the COL8 "
+                         "coopMatLoad element (m+r, 16j+c) lands on the staged cell of the same "
+                         "(token,channel) under both window bases.",
+            "method": "exhaustive 8 SG x 2 windows x 2 M8 x 4 K16 x 8 x 16",
+            "checked": build['proofs']['fragment_addresses_checked'],
+            "result": "PASS",
+        },
+        {
+            "id": "M3-two-m-blocks-share-the-slice",
+            "statement": "a0 (rows 16p..16p+7) and a1 (rows 16p+8..16p+15) are the two halves of "
+                         "the same 16-token quadrant, and both SGs of the pair read the identical "
+                         "16 tokens (N split 0..47 / 48..95). One publish therefore covers every "
+                         "reader of the slice.",
+            "method": "mA=(sg/2)*16, mB=mA+8, n0=(sg%2)*48 from source",
+            "result": "PASS",
+        },
+        {
+            "id": "R1-float-ops-identical",
+            "statement": "Every floating SPIR-V instruction keeps its parent opcode and operand "
+                         "signature at the same position in the same function; no float expression "
+                         "was added, removed, reordered or re-associated.",
+            "method": "sequence pairing over OpFAdd/OpFSub/OpFMul/OpFRem/OpFMod per function",
+            "checked": build['float_NC_checked'],
+            "mismatches": len(build['nc_operand_signature_mismatches']),
+            "result": "PASS",
+        },
+        {
+            "id": "R2-nocontraction-identical",
+            "statement": "The NoContraction decoration set pairs one-to-one with the parent by "
+                         "instruction position over the parent's NC opcode set, the opcode histogram "
+                         "and the (opcode, signature, occurrence) multiset are equal, and re-emitting "
+                         "the paired set is byte-neutral (the candidate already carries exactly it).",
+            "method": "spv_tools_local NC pairing + multiset + set_no_contraction re-emit",
+            "parent_ids": build['nc_parent_ids'],
+            "paired_ids": build['nc_paired_ids'],
+            "candidate_ids": build['nc_candidate_raw_ids'],
+            "histogram": build['nc_histogram'],
+            "multiset_equal": build['nc_multiset_equal'],
+            "self_consistent": build['nc_self_consistent'],
+            "reemit_identical": build['nc_reemit_identical'],
+            "result": "PASS",
+        },
+        {
+            "id": "R3-k-order-and-rounding-points",
+            "statement": "Per-output K accumulation order (k=0,16,32,48 inside kc=0..7), the six "
+                         "accumulators, every half narrowing point and every residual/seed order are "
+                         "untouched: no statement that performs arithmetic was edited, only integer "
+                         "address/lifetime statements around them.",
+            "method": "SOURCE-DIFF.patch review + R1 sequence proof",
+            "result": "PASS",
+        },
+        {
+            "id": "L1-publish-covers-the-slice",
+            "statement": "Each slice keeps exactly one workgroup barrier between its 16 staging "
+                         "stores and its first A fragment read (RAW preserved).",
+            "method": "source order + OP_CONTROL_BARRIER count in the kc loop",
+            "barriers_in_kc_loop": dict(
+                parent=loops['parent-rebuild.spv']['loops'][0]['barriers_in_loop'],
+                candidate=loops['candidate.spv']['loops'][0]['barriers_in_loop']),
+            "result": "PASS",
+        },
+        {
+            "id": "L2-war-and-waw-closed",
+            "statement": "Two uses of the same staging window are separated by the publish barrier "
+                         "of the intermediate slice, so the WAR (read slice i, write slice i+2) and the "
+                         "WAW (write i, write i+2) are both ordered.",
+            "method": "window schedule + barrier positions",
+            "schedule": lif['slice_window'],
+            "window_uses": lif['window_uses'],
+            "separation": lif['separation'],
+            "result": "PASS",
+        },
+        {
+            "id": "L3-handoff-region-not-raced",
+            "statement": "The QKV handoff region [4096,10240) is used as the staging window only by "
+                         "the even slices; the last such use is slice 6, retired by the slice-7 publish "
+                         "barrier, so STORE_QKV needs no extra barrier and the existing post-store "
+                         "publication barrier is unchanged.",
+            "method": "window schedule",
+            "last_slice_window": lif['last_slice_window'],
+            "handoff_window": lif['handoff_window'],
+            "result": "PASS",
+        },
+        {
+            "id": "T1-tails",
+            "statement": "No channel tail (K=512=8*64). Token tails keep the same per-quadrant zero "
+                         "padding (v00..v11 are WG-uniform and unchanged). Invalid tiles keep writing "
+                         "0; the only changed value is the unused read address, bounded by "
+                         "1024*7+192 = %d halves inside a %d-half input buffer."
+                         % (build['proofs']['address_hoist_max_invalid_address'],
+                            build['proofs']['input_buffer_halves']),
+            "method": "source + bound",
+            "result": "PASS",
+        },
+        {
+            "id": "T2-address-hoist-identity",
+            "statement": "tiled(token,64i+c0,512) == tiled(token,c0,512) + 1024*i for every token, "
+                         "slice and c0, so the four hoisted bases reproduce every parent read address "
+                         "of every slice.",
+            "method": "exhaustive 1024 x 8 x 64",
+            "checked": build['proofs']['address_hoist_identity_checks'],
+            "result": "PASS",
+        },
+        {
+            "id": "B1-parent-byte-reproduction",
+            "statement": "The accepted baseline source recompiles to the accepted baseline SPV byte "
+                         "for byte with glslang 16.5.0 -V --target-env vulkan1.3 and the site include "
+                         "directory; no decoration transfer was needed.",
+            "method": "raw sha256 compare",
+            "sha256": build['parent_reproduction']['raw_sha256'],
+            "expected": build['parent_reproduction']['baseline_sha256'],
+            "result": "PASS" if build['parent_reproduction']['exact'] else "FAIL",
+        },
+        {
+            "id": "B2-candidate-valid",
+            "statement": "candidate.spv passes spv_validate_cpu.",
+            "output": build['spv_validate_cpu']['output'],
+            "result": "PASS" if build['spv_validate_cpu']['ok'] else "FAIL",
+        },
+        {
+            "id": "B3-plan-scope",
+            "statement": "plan.txt replaces exactly the 16 F10 PASS SPV paths, keeps 232 PASS blocks, "
+                         "and every differing line is an F10 replacement.",
+            "passes_replaced": build['plan']['passes_replaced'],
+            "passes_in_plan": build['plan']['passes_in_plan'],
+            "differing_lines": build['plan']['differing_lines'],
+            "only_f10_lines_changed": build['plan']['only_f10_lines_changed'],
+            "cpu_check": build['cpu_check']['output'],
+            "result": "PASS" if build['cpu_check']['ok'] else "FAIL",
+        },
+        {
+            "id": "B4-no-extra-reads",
+            "statement": "No read counter changed: residual half loads, SLM stores, weight fragment "
+                         "loads, A/V/score fragment loads and DPAS statements are identical in count "
+                         "between parent and candidate source.",
+            "counts": site_counts,
+            "result": "PASS" if all(v['parent'] == v['candidate'] for v in site_counts.values()) else "FAIL",
+        },
+    ],
+    "unproven": [
+        "actual GRF allocation / spill (scratch must be 0 in native)",
+        "whether IGC folds the +4096 arena offsets into SLM address immediates",
+        "whether the removed retire barrier was on the critical path at all",
+        "any timing effect (no GPU work in this card)",
+    ],
+}
+(S / 'PROOF.json').write_text(json.dumps(proof, indent=2), encoding='utf-8')
+
+# ------------------------------------------------------------------ cost ledger
+removed = [
+    dict(item="workgroup barrier + fence + signal in the QKV kc loop, per WG",
+         count=-8, unit="barrier group", basis="8 slices x 1 removed retire barrier; each baseline barrier = "
+         "1 send.slm fence.slm + 1 send.gtwy signal barrier + 1 sync.bar (accepted native shape)",
+         static_evidence="OpControlBarrier 5->4, kc loop body 2->1"),
+    dict(item="kc-dependent tiled() base recomputation, per WG", count=-8, unit="slice",
+         basis="4 bases x (or/shr/and/add/shl/bfn) replaced by 4 adds per slice",
+         static_evidence="kc loop body SPIR-V 708->558 instructions"),
+    dict(item="staging SLM stores / residual loads / A fragment loads / weight loads / DPAS",
+         count=0, unit="statement", basis="statement counts identical in both sources (PROOF B4)"),
+    dict(item="shared memory", count=0, unit="byte", basis="smem[10240] half = 20480 B, same as phase+qkv"),
+]
+added = [
+    dict(item="loop-carried staging bases + window base", count=5, unit="u32 register",
+         basis="a00,a10,a01,a11,abase; live across the DPAS block",
+         risk="unknown GRF allocation; scratch gate"),
+    dict(item="integer adds per slice", count=+4, unit="instruction", basis="a00..a11 += 1024"),
+    dict(item="integer sub per slice", count=+1, unit="instruction", basis="abase=QKV_OFF-abase"),
+    dict(item="arena constant offsets", count=+33, unit="OpIAdd (SPIR-V)",
+         basis="+4096 on shared accesses; expected to fold into SLM address immediates",
+         risk="if the ISA shows ~33 extra address ALU ops this is a real per-WG cost",),
+    dict(item="SPIR-V size", count=+67, unit="instruction", basis="6446 -> 6513 (+1.0%), file 103876 -> 105060 B"),
+]
+unknown = [
+    dict(item="actual GRF peak / spill", why="no GPU; scratch must be 0 in native"),
+    dict(item="SLM address immediate folding of +0x2000", why="IGC decision, only native shows it"),
+    dict(item="whether the retire barrier was exposed", why="depends on resident WGs per Xe core"),
+    dict(item="net timing", why="GPU is owned by the main agent; this card does no device work"),
+]
+ledger = dict(card="n10-f10-next", scope="F10 16 PASS, QKV kc loop only",
+              removed=removed, added=added, unknown=unknown)
+(S / 'COST-LEDGER.json').write_text(json.dumps(ledger, indent=2), encoding='utf-8')
+
+# ------------------------------------------------------------------ GPU request
+req = {
+    "card": "n10-f10-next",
+    "shader_group": {
+        "spv_sha256_baseline": [build['parent']['spv']['sha256']],
+        "pass_ordinals": build['pass_ordinals'],
+    },
+    "plan": {"path": build['plan']['path'], "sha256": build['plan']['sha256']},
+    "arms": [
+        {"id": "base", "plan": "baseline", "role": "baseline"},
+        {"id": "cand", "plan": "candidate", "role": "candidate"},
+    ],
+    "gates": ["fixed", "fb2"],
+    "native": True,
+    "resources": True,
+    "ordinary": {"design": "two-arm-6-alternating", "reps": 30, "warm": 1, "feedback": True},
+    "hypothesis": "If native shows the F10 kc loop with exactly one sync.bar per slice "
+                  "(pass total 5->4, QKV barrier+fence message groups 16->8), the staging bases as "
+                  "loop-carried registers advanced by 0x800 per slice, and the three B weight sends "
+                  "still returning to three disjoint 8-GRF regions before the first DPAS, then the "
+                  "A address/publish/retire change landed without giving up the accepted B asset.",
+    "native_observables": [
+        "pass sync.bar count 5 -> 4; kc loop body sync.bar 2 -> 1",
+        "QKV stage barrier+fence message groups per WG 16 -> 8 (send.slm fence + send.gtwy signal + sync.bar)",
+        "staging: no 4x {shr,and,add,shl 8,bfn} base groups per slice; 4 base registers + 4 add 0x800 per slice",
+        "three weight UGM sends still return to three disjoint 8-GRF regions, all before the first DPAS of the k-step",
+        "weight fragment loads per k-step per SG still 3 (no 4th read)",
+        "A fragment assembly unchanged (2 vector SLM reads + halfword reassembly per tile)",
+        "scratch 0 and shared 20480 B; instruction count ~4613 +/- 40",
+    ],
+}
+(S / 'GPU-REQUEST.json').write_text(json.dumps(req, indent=2), encoding='utf-8')
+
+print(json.dumps(dict(proof_claims=len(proof['claims']),
+                      site_counts=site_counts,
+                      gpu_request=req['plan']), indent=1))

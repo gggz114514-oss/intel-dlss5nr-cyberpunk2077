@@ -1,0 +1,149 @@
+n39-f06-c256-slack - F06 C256 的 32768 B 里有多少是结构性 slack？
+状态: BUILT / AWAITING-GPU（父字节复现、候选编译+验证、地址审计+负控、PROOF 36/36、三份 plan 的
+      --cpu-check 全过；金帧与 native 未跑 —— 本卡没有 GPU、没取锁、没部署）
+日期: 2026-10-28
+
+================================================================================
+0. 给主代理的两条硬结论（优先看这两条）
+================================================================================
+(1) 「32768 B 里有多少 slack」的答案是 **0 B**：A 步穷举证明同时活值峰值 = 16384 half = 32768 B
+    **等于**声明值。F06 C256 的 shT 是**一次写满、一道 barrier 发布、8 个 SG 各读整块**的结构
+    （1024 个 8x16 片段，16384 个 half 每个读 8 次，未读 = 0），没有 n37 那种"已死窗口"。
+    ⇒ 卡片 C 分支成立；**不重做 n06c 的分段**（也不做 2 段/8 段，段越细越差）。
+
+(2) 但这块是**可删**而不是可回收：shT 是只读 gT 瓦片的**逐字节副本**（恒等映射），
+    消费者只有 A 读与 debug echo ⇒ A 操作数直读 gT（偏移加瓦片基址 w*16384），
+    **Workgroup 32768 -> 0 B**（模块里 0 个 Workgroup 变量），值逐位不变。
+    链内先例：**F05 C256 的 A 操作数本来就是直读全局 gY**（n05a，+0.521 ms，已采纳；
+    native 里 512 条 load.ugm.d32x8t、0 条 load.slm.d32x8t）。本卡只是把 F06 C256 对齐到同一形态。
+
+(3) 卡片写的「17 行成包」实际只有 **16 行**：第 17 行 ordinal 193（c3x_body_c128）的 plan 字段
+    写 32768，但它模块里是 **16384 B**（L35 / evidence/TRUE-SLM.json），已经是 4 驻留、没有东西可删。
+    本卡按 16 行（15 F06 + 1 F18 168）出包，193 一行**不动**。
+
+================================================================================
+1. A 步：活的时间线、峰值、可回收字节（机器产物 build/lifetime.json）
+================================================================================
+几何: tile w 的 gT = [64 token][256 channel] = 16384 half = 32768 B，addr = token*256 + channel。
+
+| phase | 内容 | shT 活值 |
+|---|---|---|
+| P1 | 全 256 线程拷贝 64 轮（线程 t 写第 t 列 64 个 half，逐地址分区、写一次） | 0 -> 16384 |
+| P2 | barrier() 发布 | **16384 half = 32768 B ← 峰值点** |
+| P3.0..7 | j=0..7：每 j 有 8x16 片段 128 个（全 8 SG 读同一片段），k0 = 16ki | 单调下降（块 j 在迭代 j 后死） |
+| P4 | debug echo（debug=1 才走）+ barrier | 0 |
+
+* 峰值 16384 half，声明 16384 half，**slack = 0 half / 0 B**（`liveness.slack_halves = 0`）。
+* 生产者: 16384 次写、每地址 1 次、每线程 64 half（`write_is_partition_of_tile = true`）。
+* 消费者: 1024 片段、并集 = 全 tile、未读 0、每地址 8 次（`read_multiplicity = {"8": 16384}`）。
+* RAW: 同 owner 512 对 / 跨 owner 130560 对，全部由那**一道** publish barrier 关闭；WAR/WAW = 0。
+
+卡片的 B 分支条件（峰值 ≤8192 half）**不成立**，所以没有"窗口轮转/退役复用"可做；
+下面 §3 的候选是**另一条路**（删生产者），不是 slack 回收，请按这个口径看待它的收益归属。
+
+================================================================================
+2. B 步候选：删掉 32 KiB 拷贝，A 操作数直读全局瓦片
+================================================================================
+源码改动 4 处（SOURCE-DIFF.patch，行级最小）：
+  1. 删 `shared float16_t shT[16384];`（F06）/ `shM[16384]`（F18）
+  2. 删拷贝循环 + `barrier()`（F18 同样）
+  3. debug echo 从 `shT[e]` 改成 `gT[w*16384u + e]`（同一批字节；F18 无 echo）
+  4. A 读 `coopMatLoad(a, shT, m0*256+k0, 256u, LROW)`
+     -> `coopMatLoad(a, gT, w*16384u + m0*256u + k0, 256u, LROW)`
+     （F18 两处：abaseA / abaseB，都加 `w*16384u`）
+
+| 项 | 父 | 候选 | 依据 |
+|---|---|---|---|
+| 模块 Workgroup | 32768 B / 1 var | **0 B / 0 var** | build/build.json storage_bytes |
+| SPIR-V 指令 | 860 | 832 | 同上 |
+| OpControlBarrier | 2 | **0** | 同上 |
+| coopmat load/store 站点 | 5 / 4 | 5 / 4 | 同上（数目、stride 直方图全同） |
+| FP 表达式多重集（带 operand signature） | — | **逐条相等** | build.json fp_multiset.identical |
+| NoContraction | 0 | 0 | recipe 是 raw 模式，两侧都没有 NC 装饰 |
+| dpas | 256 | 256 | 静态清单 |
+| A 操作数指针 | Workgroup | **StorageBuffer** | build.json cm_load_pointer_roots |
+| 每 lane 独立 FP 链根 | 2 | 2 | build.json chain_roots（INT 根 46->47，是删掉整数拷贝的后果） |
+
+产物: candidate.comp/.spv（F06，8f592cf9…）、candidate-f18.comp/.spv（F18，47b20f2f…）、
+candidate-padback.comp/.spv（控制臂，d7c82151…，把 32768 B 声明加回去、拷贝仍删掉）。
+全部 spv_validate PASS。
+
+================================================================================
+3. 硬门与已过/未过
+================================================================================
+已过（离线，可复核）:
+  - 父字节复现: F06 881dff8c… / F18 9057283f… 都由父源码逐字节复现（build/repro.json，raw 配方）。
+  - 候选 SPV 验证: spv_validate_cpu.exe 三份全 PASS。
+  - 地址审计 A1..A7（_addr_audit.py，build/addr-audit.json）：F06/F18/控制臂 3/3 PASS，
+    含"每个 gT 访问必须恰好带一次瓦片基址 w*16384u""最大下标仍等于父的 16383""模块 Workgroup
+    与源码 2*halves 一致""删了数组就不许留 barrier"。
+  - 负控 6/6 全部被抓（build/audit-negcontrol.json）：漏瓦片基址 / 只删一半 / 瓦片步长写错 /
+    echo 漏基址 / barrier 留下 / 声明留着但没人读。
+  - PROOF.json 36/36 PASS（映射双射、算术不变、寿命、hazard、尾块、审计、plan）。
+  - plan: plan.txt bc34404c…（16 行）、plan-f06only.txt beb44408…（15 行）、
+    plan-padback.txt 90df6e76…（16 行）；三份 `--cpu-check` = CPU_PLAN_OK 152 rows, 232 passes,
+    502 buffers；与链头的差异行数分别 16 / 15 / 16，正好是本卡的 PASS 行。
+  - plan 台账字段同步: 16 行的第 6 列 32768 -> 0（runner 只用它做范围检查，clock_runner.cpp:93）。
+
+未过（需要 GPU）:
+  - 金帧 fixed / fb2 逐字节（父 1755e9c2… / 9c3e511e…）。
+  - native 观察点 O1..O19（NATIVE-PREDICTION.md）。
+  - 每 lane 独立链数"不下降"、max_r"不高于父 127"、scratch 0 —— 这三条只能由 native 证。
+  - 动态消息数"不增加"：本卡预测**减少 37 条**（1024 条 A 读不变，删 16 store.slm + 18 宽 ugm load
+    + 1 fence + 2 gtwy 屏障信号；总 send 1597 -> ~1560），但只有 native 能确认。
+
+================================================================================
+4. 分诊（预期）
+================================================================================
+* A 类（实现未落地）: ISA 里 Workgroup Memory 仍是 32768 B，或 `load.slm.d32x8t` 仍 1024 条，
+  或 A 读没有变成 `load.ugm.d32x8t`。此时**禁止**用毫秒倒推机制。
+* B 类（有副作用）: max_r > 127 / scratch > 0 / O1-O6 全中但驻留仍是 2 / L2 读放大 ~8x。
+  价格已记在 COST-LEDGER.unknown-*，修法见 §5。
+* C/D 类: H0、O1-O10、双金帧、驻留 >=4 全中，ordinary 仍不到 0.03 ms 且 6/6 同向
+  -> 按 L13 记 D，两批后再判方向。
+* E 类（数值）: 先跑 _addr_audit.py 与它的 6 个负控，再查每个 A 读与 echo 的 w*16384；
+  **不要**怀疑舍入/K 序/归约树（FP 多重集逐条相等、NC 0=0、dpas 256=256）。
+
+================================================================================
+5. 恢复点 / 下一处具体改动（若 GPU 判 B 类）
+================================================================================
+**半 staging 变体**（保留 16384 B，4 驻留，一半 A 读仍在 SLM）：
+  - `shared float16_t shT[8192];`
+  - 只拷 rows 32..63：`for (e=t_local; e<8192u; e+=256u) shT[e] = gT[w*16384u + 8192u + e];` + 1 道 barrier
+  - j 循环拆两段：`for j=0..3`（rows 0..31）A 从 `gT` 直读；`for j=4..7`（rows 32..63）A 从
+    `shT` 读 `(m0-32u)*256u + k0`
+  - 预期: 模块 Workgroup = 16384 B、0 道新屏障、A 读 512 条留在 SLM、512 条去全局
+  - 为什么现在不做: 它**严格被全删支配**（同样的 4 驻留档，却多付一半拷贝与两套偏移），
+    只有在全删被证明"全局 A 读太贵"（B 类）时才有意义。
+
+另一条备选（更保守，不推荐先做）: 保留整块 staging 但把 `gT` 换成 `imgin` 之类已经在 L1 的源
+—— 不成立，父已经是最省的一次拷贝。
+
+================================================================================
+6. 未决项
+================================================================================
+1. 主代理若坚持"17 行成包"，只能把 ordinal 193 一起放进 plan（它一行不用改）：
+   那样 replaced 仍是 16，但 plan 的 16 行等价物不变 —— 已写清，不擅自改别的族。
+2. F18 那一行（168）是否入包：本卡按卡片"15 + F18x1"入包，另给 plan-f06only.txt 供 15 行归因。
+   若主代理只想要 F06，用 plan-f06only.txt（beb44408…）。
+3. pad-back 控制臂（padback，90df6e76…）会多花一条臂的 GPU 时间；L38 要求"声称机制前必须自带
+   控制"，建议保留；若预算紧可先只跑 base/cand，把 padback 留到第二批。
+4. `float_NC_checked = 0`：本 shader 的配方是 raw 模式，模块里本来没有 NoContraction 装饰，
+   父子都是 0，无法用 NC 计数做"逐条对齐"证据 —— 用 FP 表达式多重集（99 条带 operand signature）
+   代替，已逐条相等。
+
+================================================================================
+7. 产物与脚本
+================================================================================
+SLM-LIFETIME.md（A/B/C 判定 + 字节预算 + 驻留表）、ANALYSIS.md（六问）、PROOF.json（36 条检查）、
+SOURCE-DIFF.patch（父 -> 候选，3 份）、candidate.comp/.spv、candidate-f18.comp/.spv、
+candidate-padback.comp/.spv、parent-rebuild.spv、parent-f18-rebuild.spv、plan.txt（16 行）、
+plan-f06only.txt（15 行）、plan-padback.txt（控制）、BUILD.json、COST-LEDGER.json、
+NATIVE-PREDICTION.md（O0..O19 + 判据）、GPU-REQUEST.json、RESUME.txt（本文件）。
+脚本（全部只读输入、CPU）：_repro.py、_source.py、_build.py、_addr_audit.py、
+_audit_negcontrol.py、_plan.py、_proof.py、_lifetime.py、_isa_base.py、_final.py。
+机器产物：build/{repro,lifetime,build,addr-audit,audit-negcontrol,plan,isa-parent}.json。
+
+复现顺序：_repro.py -> _source.py -> _build.py（内含候选编译+验证）-> _lifetime.py ->
+_addr_audit.py -> _audit_negcontrol.py -> _plan.py -> _proof.py -> _isa_base.py -> _final.py。
+未跑 GPU、未取锁、未部署、未改基线 plan/指针/COMMON.py/其它卡目录。

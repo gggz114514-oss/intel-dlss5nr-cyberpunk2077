@@ -1,0 +1,222 @@
+"""n25-f04-c64 — F04 C64 cost breakdown (read-only, CPU only, no GPU).
+
+Emits the per-width message / byte / DPAS / accumulator / GRF census for the three
+F04 widths (C64 7 PASS, C128 11 PASS, C256 15 PASS) from the current-identity
+baseline ISA resolved by evidence/NATIVE-INDEX.json.
+
+Identity is taken from CURRENT-232-ROWS (K.rows()) -- never from card-face text.
+
+Byte model (S2 of COST-BREAKDOWN.md), derived from the captured message itself:
+    bytes(message) = exec_lanes x element_count(name) x 4
+where element_count is the N in "d32xN" and exec_lanes is the (N|M0) prefix.
+It is cross-checked against the source fragment each site loads; every site
+matches its source fragment size exactly (see `verify` below).
+
+Writes: cards/n25-f04-c64/COST-BREAKDOWN.json
+"""
+import json, re, sys
+from pathlib import Path
+from collections import Counter, OrderedDict
+
+C = Path(__file__).resolve().parent.parent.parent      # campaign root
+sys.path.insert(0, str(C))
+import COMMON as K
+import ISA
+
+CARD = Path(__file__).resolve().parent
+
+# ---------------------------------------------------------------- identity
+ROWS = K.rows()
+F04 = [r for r in ROWS if r['family'] == 'F04']
+
+WIDTHS = OrderedDict()
+for r in F04:
+    key = r['source'].split('\\')[-2].lower()          # c64 / c128 / c256
+    WIDTHS.setdefault(key, dict(width=key.upper(), spv=r['spv'],
+                                spv_sha256=r['spv_sha256'], source=r['source'],
+                                source_sha256=r['source_sha256'], ordinals=[],
+                                grids=[]))
+    WIDTHS[key]['ordinals'].append(r['ordinal'])
+    WIDTHS[key]['grids'].append([int(x) for x in r['grid']])
+for k in WIDTHS:
+    WIDTHS[k]['ordinals'].sort()
+
+INDEX = json.loads((C / 'evidence/NATIVE-INDEX.json').read_text(encoding='utf-8-sig'))
+COV = {c['ordinal']: c for c in INDEX['coverage']}
+
+# surviving byte-identical copies of the pruned queue captures
+SEARCH_ROOTS = [C / 'queue', C.parent / 'fullnet-mechanism-transfer-20261026']
+
+def find_isa(fname, want_sha):
+    hits = []
+    for root in SEARCH_ROOTS:
+        if root.exists():
+            hits += [p for p in root.rglob(fname) if p.is_file()]
+    for p in hits:
+        if K.sha(p) == want_sha:
+            return p, len(hits)
+    return (hits[0] if hits else None), len(hits)
+
+# ---------------------------------------------------------------- byte model
+ELEM = re.compile(r'd(\d+)x(\d+)')
+
+def msg_bytes(op, flags):
+    lanes = 1
+    m = re.search(r'\((\d+)\|M0\)', flags)
+    if m:
+        lanes = int(m.group(1))
+    e = ELEM.search(op)
+    if not e:
+        return 0                                        # fence/barrier/EOT: control
+    return lanes * int(e.group(2)) * 4
+
+def mname(i):
+    cm = i['comment'] or ''
+    return cm.split(';', 1)[1].strip() if ';' in cm else cm
+
+# ---------------------------------------------------------------- census
+def census(path):
+    isa = ISA.parse(path)
+    bar = next((i['addr'] for i in isa if i['op'].startswith('sync') and 'bar' in i['op']), None)
+
+    sends = []
+    for i in isa:
+        if not i['op'].startswith('send'):
+            continue
+        sends.append(dict(addr=i['addr'], op=i['op'], flags=i['flags'],
+                          msg=mname(i), bytes=msg_bytes(i['op'], i['flags'])))
+
+    def hist(sel):
+        c = Counter(s['msg'] or s['op'] for s in sel)
+        return OrderedDict(sorted(c.items()))
+
+    def bhist(sel):
+        c = Counter()
+        for s in sel:
+            c[s['msg'] or s['op']] += s['bytes']
+        return OrderedDict(sorted(c.items()))
+
+    pre = [s for s in sends if bar is None or s['addr'] < bar]
+    post = [s for s in sends if bar is not None and s['addr'] >= bar]
+    dpas = [i for i in isa if i['op'].startswith('dpas')]
+
+    regs = set()
+    for i in isa:
+        for o in i['ops']:
+            regs.update(int(x) for x in re.findall(r'r(\d+)', o))
+    data_r = 0
+    for i in isa:
+        if i['op'].startswith(('send', 'sync', 'jmpi', 'ret', 'nop')):
+            continue
+        rr = [int(x) for o in i['ops'] for x in re.findall(r'r(\d+)', o)]
+        if rr:
+            data_r = max(data_r, max(rr))
+    win_end = 0
+    for i in isa:
+        if i['op'].startswith('send') and i['ops']:
+            m = re.match(r'r(\d+)', i['ops'][0])
+            if m:
+                rd = 1
+                mm = re.search(r'rd:(\d+)', i['comment'] or '')
+                if mm:
+                    rd = int(mm.group(1))
+                win_end = max(win_end, int(m.group(1)) + rd - 1)
+
+    return dict(
+        isa=str(path), isa_sha256=K.sha(path),
+        instructions=len(isa), sends=len(sends),
+        send_bytes=sum(s['bytes'] for s in sends),
+        barrier_addr=bar,
+        sends_pre=len(pre), sends_post=len(post),
+        bytes_pre=sum(s['bytes'] for s in pre), bytes_post=sum(s['bytes'] for s in post),
+        messages_all=hist(sends), bytes_by_message=bhist(sends),
+        messages_pre=hist(pre), messages_post=hist(post),
+        dpas=len(dpas), first_dpas=dpas[0]['addr'] if dpas else None,
+        syncs=Counter(i['op'] for i in isa if i['op'].startswith('sync')),
+        allwr=sum(1 for i in isa if 'allwr' in i['op']),
+        max_r=max(regs), data_r_peak=data_r, send_window_end=win_end,
+        ops=OrderedDict(sorted(Counter(i['op'] for i in isa).items())),
+    )
+
+# ---------------------------------------------------------------- per-width geometry
+GEOM = {
+    #  width:  g_unique, pairs, Ki, weight_stride
+    'C64':  dict(g=2, pairs=4, Ki=4,  weight_stride=1024, C=64),
+    'C128': dict(g=4, pairs=2, Ki=8,  weight_stride=2048, C=128),
+    'C256': dict(g=8, pairs=1, Ki=16, weight_stride=4096, C=256),
+}
+
+def geom_table(w):
+    g = GEOM[w]
+    Ki, C_ = g['Ki'], g['C']
+    # message counts, per subgroup per dispatch, straight from the .comp text
+    m = OrderedDict()
+    m['announce (d32x16t + 4x d32x1t)']      = dict(n=5,                     b=64 + 16)
+    m['expand A  load.ugm.d32x64t 256B']     = dict(n=4 * Ki * 2,            b=4 * Ki * 2 * 256)
+    m['expand W  load.ugm.d32x8   512B']     = dict(n=4 * Ki * 2,            b=4 * Ki * 2 * 512)
+    m['middle W  load.ugm.d32x8   512B']     = dict(n=4 * 2 * 2,             b=4 * 2 * 2 * 512)
+    m['contract W load.ugm.d32x8  512B']     = dict(n=Ki * 2,                b=Ki * 2 * 512)
+    m['seed      load.ugm.d32x64t 256B']     = dict(n=4,                     b=4 * 256)
+    m['scale     load.ugm.d32x8t  32B']      = dict(n=16,                    b=16 * 32)
+    m['publish   store.slm.d32x8t 32B']      = dict(n=4 * 8,                 b=4 * 8 * 32)
+    m['contract A load.slm.d32x8t 32B']      = dict(n=Ki * 2 * 8,            b=Ki * 2 * 8 * 32)
+    m['gY        store.ugm.d32x8t 32B']      = dict(n=4 * 8,                 b=4 * 8 * 32)
+    prod = sum(v['n'] for v in m.values())
+    prod_b = sum(v['b'] for v in m.values())
+    dbg = 24 * 8                                              # 24 MAT_H x 8 rows
+    return dict(per_sg_messages=m, production_messages=prod, production_bytes=prod_b,
+                debug_store_messages=dbg, debug_store_bytes=dbg * 32,
+                slm_write_bytes=4 * 8 * 32, slm_read_bytes=Ki * 2 * 8 * 32,
+                weight_messages=4 * Ki * 2 + 4 * 2 * 2 + Ki * 2,
+                weight_bytes=4 * Ki * 2 * 512 + 4 * 2 * 2 * 512 + Ki * 2 * 512,
+                a_messages=4 * Ki * 2, a_bytes=4 * Ki * 2 * 256,
+                cross_sg_weight_duplication=8 // g['g'],
+                intra_sg_a_duplication=4,
+                slm_consumption_multiplicity=(8 * Ki * 2 * 128) // 4096,
+                dpas=20 * Ki + 32,
+                accumulators=12, acc_live_peak=8)
+
+def main():
+    widths = OrderedDict()
+    for key, rec in WIDTHS.items():
+        cov = COV[rec['ordinals'][0]]
+        kh = cov['baseline_kernel_hash']
+        isa_rec = next(c for c in cov['current'] if c['native_hash'] == kh)
+        p, ncopies = find_isa(Path(isa_rec['isa']).name, isa_rec['sha256'])
+        if p is None:
+            raise SystemExit('ISA not found: %s' % isa_rec['isa'])
+        cs = census(p)
+        gt = geom_table(rec['width'])
+        assert cs['sends'] == gt['production_messages'] + gt['debug_store_messages'] + 3, \
+            (rec['width'], cs['sends'], gt['production_messages'])
+        assert cs['dpas'] == gt['dpas'], (rec['width'], cs['dpas'], gt['dpas'])
+        widths[rec['width']] = dict(
+            width=rec['width'], passes=len(rec['ordinals']), ordinals=rec['ordinals'],
+            grids=rec['grids'],
+            wgs_per_pass=rec['grids'][0][0] * rec['grids'][0][1] * rec['grids'][0][2],
+            spv=rec['spv'], spv_sha256=rec['spv_sha256'],
+            source=rec['source'], source_sha256=rec['source_sha256'],
+            kernel_hash=kh, isa_index_path=isa_rec['isa'],
+            isa_used=str(p), isa_sha256_index=isa_rec['sha256'],
+            isa_sha256_used=cs['isa_sha256'],
+            isa_sha_match=isa_rec['sha256'] == cs['isa_sha256'],
+            isa_copies_found=ncopies, geometry=GEOM[rec['width']],
+            geometry_counts=gt, census=cs)
+    OUT = CARD / 'COST-BREAKDOWN.json'
+    K.write_json(OUT, dict(
+        card='n25-f04-c64', family='F04',
+        rows_file=str(K.HANDOFF / 'CURRENT-232-ROWS.json'),
+        baseline_plan=dict(path=str(K.BASELINE), sha256=K.BASELINE_SHA),
+        byte_model='bytes = (N|M0) lanes x N in "d32xN" x 4',
+        widths=widths))
+    print('wrote', OUT)
+    hdr = '%-5s %3s %4s %8s %6s %6s %6s %6s %6s %6s'
+    print(hdr % ('W', 'PASS', 'WGs', 'instr', 'sends', 'prod', 'dpas', 'KBprod', 'maxr', 'win'))
+    for w, d in widths.items():
+        c, g = d['census'], d['geometry_counts']
+        print(hdr % (w, d['passes'], d['wgs_per_pass'], c['instructions'], c['sends'],
+                     g['production_messages'], c['dpas'],
+                     '%d' % (g['production_bytes'] // 1024), c['max_r'], c['send_window_end']))
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,16 @@
+
+第三轮FP16 attention链：F10-N / F10-P / F15-L（ATTENTION-CHAIN-CPU-PROOF.json）
+F10-N：split QKV完整norm owner，M16×N48→M8×N96
+当前S22六个FP32累加器/SG，但QKV输出分割让每行K的32维跨SG。改为每SG8token全部96列，六累加器数不变（96B/lane逻辑payload），A每K2load→1，B3load→6，逐输出K16顺序不变。完整Q/K32 norm在原half窄化之后直接在两片段上完成，原norm32 half树与owner广播；Q=H(H(Q*nq)*scale)、K=H(K*nk)，V不norm。CPU逐行树一致但仍待新shader gate。
+删raw Q/K的共享往返（写/读各8192B/WG），只写最终normalized Q/K及half V，最终发布保留。不能删除qkv容量：后继仍跨SG读取。诊断raw QKV直接从片段写同坐标，原raw读取退休barrier只有在诊断桥也移除后才可取消。phase仍供前端sy，不能删除。
+六half48B与逐对narrow后保留宽值的两种epilogue安排先看native峰值，不自动多排计时臂；增加B读取代价明确计入。新M8 producer与当前M16-query score owner仍不一致，所以本卡消除norm桥，不宣称Q→QK全寄存器直连。四SG M16N96需要十二累加器192B/lane且半数SG闲置，不默认采用。
+
+F10-P：split register-P按消费块归一化，缩短normalized P与PV重叠
+当前S22已无P共享桥，不重复认领。64key的8个half P必须先保留以完成原den树，不能改成ViT式未归一化PV。den/inv完成后，不先归一化全部8片再生成ctx；按(p00,p01)、(p10,p11)、(p20,p21)、(p30,p31)依次原half multiply→当前片段debug→Bjoin→四ctx K16 MMA。每组原P消费后立即退休，inverse标量广播保持，不增加归约或重复score。
+源码峰值需要辨别：8片P逻辑64B/lane，四ctx又64B/lane，Q片段在score结束后应死亡。调序并不自动降低所有P的物理驻留（未处理P仍须保留），目标是避免normalized副本与debug widen同时拉长活区。若native已相同则封存无变化，不能把作用域调整算性能提升。原half归约树、K16顺序、debug最终内容全部保留。
+
+F15-L：ViT PV operand、context epilogue和末chunk退休
+当前chunk-split full/tail两个宏均先load四个vf再消费。改为一个具名MA逐一load→对应ctx MMA；四个A同时活逻辑32B/lane→8B/lane，仍保留pf及四ctx、Q与den，实际GRF看编译器是否已调度。full和tail必须都改，不只改一个宏。
+最终num0..3、out0..3改成逐个ctx→half num→原debug→half乘inverse→coopstore；绝不把ctx*inverse搬到FP32窄化前。保留必要half点，避免为所有输出保留两套half片段。未消费ctx的宽活区仍存在，native报告峰值阶段。
+两个chunk宏末尾WAR改成统一条件j0+64<pc.p0.y才执行，或在下一轮fill前做等价退休；条件对WG所有SG一致。5次发布+4次跨chunk退休=9，父为10。最后iteration之后无sk/sv读者或写者，epilogue只有寄存器/全局输出，故末次不保护后继。不能把中间4次也删，fill helper SG可能先覆盖下一chunk而score SG仍在读上一chunk。8个位置共1280 WG源级barrier执行减少，native/收益未知。
+保持S32=288token、padded320、每head32dim、5个64keychunk与原pad-exp0/den顺序。half输入路径不能顺便改INT8接口。

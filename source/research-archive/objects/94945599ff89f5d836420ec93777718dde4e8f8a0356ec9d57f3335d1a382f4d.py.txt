@@ -1,0 +1,64 @@
+"""Cross-match: the dbg regions are a workgroup race, so pair every dumped Y against
+every dumped X.  Any bit-exact (X -> Y) pair is a proof of the whole FFN model
+(expand, half SiLU, E codes, contract, tap, residual) on real GPU data.
+"""
+import sys, json
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import c32lib as L
+
+HERE = Path(__file__).resolve().parent.parent
+dbg = np.fromfile(HERE / "runs/S01-B4-ORACLE/swin_4_debug.bin", dtype="<f2")
+info = L.block_bindings(L.D / "c32-minmax/local-b4.txt", ordinal=4)
+we, wc = L.load_w8(info["w8"])
+fsc = L.load_fsc(info["fsc"])
+rs = L.load_rs(info["wb"], info["rs_base"])
+invx = np.full(32, np.float32(fsc[L.FSC_INV_X]))
+inve = np.full(128, np.float32(fsc[L.FSC_INV_E]))
+tap_e = fsc[L.FSC_TAP_E:L.FSC_TAP_E + 128]
+tap_c = fsc[L.FSC_TAP_C:L.FSC_TAP_C + 32]
+
+pos, Xc, Ec, Yc = [], [], [], []
+for sg in (0, 1):
+    for col in range(16):
+        pos.append((sg, col))
+        Xc.append(dbg[22528 + sg * 512 + col * 32: 22528 + sg * 512 + col * 32 + 32])
+        Ec.append(dbg[sg * 2048 + col * 128: sg * 2048 + col * 128 + 128])
+        Yc.append(dbg[8192 + sg * 512 + col * 32: 8192 + sg * 512 + col * 32 + 32])
+X = np.stack(Xc, axis=1).astype(np.float16)          # 32 x 32
+E = np.stack(Ec, axis=1).astype(np.float32)          # 128 x 32
+Y = np.stack(Yc, axis=1).astype(np.float32)          # 32 x 32
+got = L.forward(X, we, wc, rs, invx, inve, tap_e, tap_c)
+Yp = got["y_half"].astype(np.float32)
+Ep = got["a_h"].astype(np.float32)
+
+y_pairs, e_pairs = [], []
+for j in range(32):                       # dumped column
+    for i in range(32):                   # CPU column
+        if np.array_equal(Yp[:, i], Y[:, j]):
+            y_pairs.append(dict(dumped=pos[j], cpu_source=pos[i],
+                                y_absmax=float(np.abs(Y[:, j]).max())))
+        if np.array_equal(Ep[:, i], E[:, j]):
+            e_pairs.append(dict(dumped=pos[j], cpu_source=pos[i],
+                                e_absmax=float(np.abs(E[:, j]).max())))
+print(f"bit-exact (X->Y) column pairs: {len(y_pairs)}")
+for p in y_pairs:
+    print("   ", p)
+print(f"bit-exact (X->E) column pairs: {len(e_pairs)}")
+for p in e_pairs[:8]:
+    print("   ", p)
+
+# aggregate over every pair: how good is the best match per dumped column
+best_y = []
+for j in range(32):
+    r = [L.rel_l2(Yp[:, i], Y[:, j]) for i in range(32)]
+    k = int(np.argmin(r))
+    best_y.append(dict(dumped=pos[j], best_cpu=pos[k], rel_l2=r[k]))
+print("\nbest-match relL2 per dumped Y column:",
+      f"min={min(b['rel_l2'] for b in best_y):.3e}",
+      f"median={sorted(b['rel_l2'] for b in best_y)[16]:.4f}",
+      f"n_below_1e-3={sum(1 for b in best_y if b['rel_l2'] < 1e-3)}")
+(HERE / "CPU" / "oracle_crossmatch.json").write_text(json.dumps(
+    dict(y_pairs=y_pairs, e_pairs=e_pairs, best_y=best_y), indent=2))

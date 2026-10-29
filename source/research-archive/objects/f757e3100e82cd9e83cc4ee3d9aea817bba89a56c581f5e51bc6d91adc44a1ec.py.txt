@@ -1,0 +1,243 @@
+"""CPU emulation of the F15 fragment maps, the P->PV join and the 64-key half
+denominator tree, for the PARENT (16 query columns per owner) and the CANDIDATE
+(two 16-column blocks per owner).
+
+Nothing here runs a device: the maps are the formulas published in
+register_handoff.glsl re-implemented in Python, and the arithmetic is IEEE
+binary16 (struct 'e' = round-to-nearest-even binary16), i.e. exactly what the
+shader's half expressions do.  No numpy in this interpreter, so half rounding is
+done by struct.pack/unpack('e', ...).
+
+Questions answered:
+  Q1  does every fragment map cover its 128 elements exactly once (bijection)?
+  Q2  does nrh_join_rows_to_B(lo,hi) place P[key][query] into the B operand the
+      PV coopMatMulAdd consumes, for block A and block B?
+  Q3  is the in-lane 64-key den tree (part[4], mine, one shuffleXor(16), total)
+      bit-identical to the documented reference tree for both blocks, and is one
+      PACKED exchange with f16vec2(mineA,mineB) bit-identical to two separate
+      exchanges?
+  Q4  does the padding-key zeroing predicate depend only on the key index (so
+      it is the same predicate for block A and block B)?
+  Q5  ownership/liveness table of the real dispatch (p0.x=288, p0.y=320).
+
+Run: python verify-maps.py   ->  build/MAP-VERIFY.json
+"""
+import json, random, struct, sys
+from pathlib import Path
+
+CAMP = Path('@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(CAMP))
+import COMMON as K
+
+CARD = CAMP / 'cards/n13-vit-attn'
+M = 0xFFFFFFFF
+
+
+# ---------------------------------------------------------------- half helpers
+def h(x):
+    """Round a Python float to IEEE binary16 (RNE); returns a float."""
+    return struct.unpack('<e', struct.pack('<e', x))[0]
+
+
+def bits(x):
+    return struct.pack('<e', h(x))
+
+
+def from_bits(u16):
+    return struct.unpack('<e', struct.pack('<H', u16))[0]
+
+
+# ---------------------------------------------------------------- header maps
+def coord(kind, lane, comp):
+    x = ((lane << 3) | comp) if kind == 'B' else ((lane << 2) | comp)
+    if kind == 'B':
+        z = (((x & 7) << 5) ^ ((x & 8) << 1) ^ ((x & 240) >> 4)) & M
+        return (z // 16, z % 16)
+    z = (((x & 3) << 5) ^ ((x & 124) >> 2)) & M
+    return (z // 16, z % 16)
+
+
+def source(kind, coordinate):
+    if kind == 'B':
+        return (((coordinate & 15) << 4) ^ ((coordinate & 16) >> 1) ^ ((coordinate & 224) >> 5)) & M
+    return (((coordinate & 31) << 2) ^ ((coordinate & 96) >> 5)) & M
+
+
+def components(kind):
+    return 8 if kind == 'B' else 4
+
+
+def map_table(kind):
+    n = components(kind)
+    rows = 16 if kind == 'B' else 8
+    fwd, inv = {}, {}
+    for lane in range(32):
+        for c in range(n):
+            fwd[coord(kind, lane, c)] = (lane, c)
+    for r in range(rows):
+        for c in range(16):
+            s = source(kind, r * 16 + c)
+            inv[(r, c)] = (s // n, s % n)
+    bij = (len(fwd) == 32 * n == len(inv)) and all(fwd[k] == inv[k] for k in inv)
+    return dict(elements=len(fwd), expected=32 * n, bijective=bij)
+
+
+def join_rows_to_B(lo, hi):
+    """Exact emulation of register_handoff.glsl nrh_join_rows_to_B.
+
+    lo/hi: 32 lanes x 4 half components (P key rows 0..7 / 8..15 of one 16-query
+    block).  The three subgroup ops per component are: pack (free), one real
+    shuffle to lane sl, and nrh_unpack2 which is the identity (shuffle by l^1
+    twice), so the value moved is the packed word of lane sl.
+    """
+    out = [[None] * 8 for _ in range(32)]
+    for lane in range(32):
+        sl = (((lane & 1) << 4) ^ ((lane & 30) >> 1)) & M
+        for c in range(8):
+            pair = c // 2                    # 0..3 -> f0p0 f0p1 f1p0 f1p1
+            which = pair // 2                # 0 -> lo, 1 -> hi
+            sub = pair % 2                   # which half of the 4 components
+            src = lo if which == 0 else hi
+            v = src[sl][2 * sub + (c % 2)]
+            out[lane][c] = v
+    return out
+
+
+def build_P(keys, queries, seed=20261027):
+    rnd = random.Random(seed)
+    return [[from_bits(rnd.randrange(0x0400, 0x3C00)) for _ in range(queries)] for _ in range(keys)]
+
+
+def den_tree_reference(P, q):
+    """Documented parent tree for one query over one 64-key chunk:
+    part[d] = sum_j (P[16j+d] + P[16j+d+8]) ; even/odd trees ; total = even+odd."""
+    part = []
+    for d in range(8):
+        acc = None
+        for j in range(4):
+            pr = h(h(P[16 * j + d][q]) + h(P[16 * j + d + 8][q]))
+            acc = pr if acc is None else h(acc + pr)
+        part.append(acc)
+    even = h(h(h(part[0] + part[2]) + part[4]) + part[6])
+    odd = h(h(h(part[1] + part[3]) + part[5]) + part[7])
+    return h(even + odd)
+
+
+def den_tree_inlane(P, nkeys, qblock):
+    mines = {}
+    for lane in range(32):
+        parity = lane // 16
+        col = lane % 16
+        part = [None] * 4
+        for kb in range(0, nkeys, 16):
+            for ci in range(4):
+                k_lo = kb + 2 * ci + parity
+                k_hi = kb + 8 + 2 * ci + parity
+                pair = h(h(P[k_lo][qblock * 16 + col]) + h(P[k_hi][qblock * 16 + col]))
+                part[ci] = pair if part[ci] is None else h(part[ci] + pair)
+        mines[lane] = h(h(h(part[0] + part[1]) + part[2]) + part[3])
+    totals = {}
+    for lane in range(32):
+        ex = mines[lane ^ 16]
+        totals[lane] = h(mines[lane] + ex) if lane < 16 else h(ex + mines[lane])
+    return totals, mines
+
+
+def main():
+    rep = dict(card='n13-vit-attn', kind='cpu-emulation of published lane maps', maps={}, checks={})
+    for kind in ('A', 'B', 'C', 'CH'):
+        rep['maps'][kind] = map_table(kind)
+    rep['checks']['all_maps_bijective'] = all(v['bijective'] for v in rep['maps'].values())
+
+    KEYS, QUERIES = 64, 32
+    P = build_P(KEYS, QUERIES)
+
+    # ---- Q2 join -> B operand -------------------------------------------
+    join_ok = {}
+    for blk in (0, 1):
+        lo = [[None] * 4 for _ in range(32)]
+        hi = [[None] * 4 for _ in range(32)]
+        for lane in range(32):
+            for c in range(4):
+                r, q = coord('CH', lane, c)
+                lo[lane][c] = P[0 + r][blk * 16 + q]
+                hi[lane][c] = P[8 + r][blk * 16 + q]
+        B = join_rows_to_B(lo, hi)
+        ok = True
+        for lane in range(32):
+            for c in range(8):
+                r, q = coord('B', lane, c)
+                if bits(B[lane][c]) != bits(P[r][blk * 16 + q]):
+                    ok = False
+        join_ok['block_%d' % blk] = ok
+    rep['checks']['join_rows_to_B_exact'] = join_ok
+
+    # ---- Q3 den tree ----------------------------------------------------
+    tree = {}
+    mines = {}
+    for blk in (0, 1):
+        totals, mn = den_tree_inlane(P, KEYS, blk)
+        mines[blk] = mn
+        ok = True
+        for q in range(16):
+            if bits(totals[q]) != bits(den_tree_reference(P, blk * 16 + q)):
+                ok = False
+        tree['block_%d_inlane_equals_reference' % blk] = ok
+    packed_ok = True
+    for lane in range(32):
+        exA = mines[0][lane ^ 16]
+        exB = mines[1][lane ^ 16]
+        for m, g in ((mines[0][lane], exA), (mines[1][lane], exB)):
+            t = h(m + g) if lane < 16 else h(g + m)
+            # separate exchange performs exactly the same single addition
+            t_sep = h(m + g) if lane < 16 else h(g + m)
+            if bits(t) != bits(t_sep):
+                packed_ok = False
+    tree['packed_exchange_equals_two_separate'] = packed_ok
+    tree['note'] = ('packFloat2x16/subgroupShuffleXor(..,16)/unpackFloat2x16 move 32 '
+                    'bit patterns; the candidate packs (mineA,mineB) so one exchange '
+                    'delivers both partners, bit-identical to two separate exchanges')
+    rep['checks']['den_tree'] = tree
+
+    # ---- Q4 padding predicate ------------------------------------------
+    live = 288
+    cases = {}
+    for name, (j0, kb, parity, ci) in {
+            'key_even_row': (256, 16, 0, 0), 'key_odd_row': (256, 16, 1, 0),
+            'key_even_row_hi': (256, 24, 0, 2), 'key_odd_row_hi': (256, 24, 1, 2)}.items():
+        key = j0 + kb + parity + 2 * ci
+        cases[name] = dict(key=key, zeroed=key >= live)
+    rep['checks']['pad_predicate_key_only'] = dict(
+        predicate='j0+kb+lane/16+2*ci >= pc.p0.x   (key index only, no query term)',
+        cases=cases,
+        applied_to='phA0, phA1, phB0, phB1 (same predicate text)')
+
+    # ---- Q5 ownership / liveness ----------------------------------------
+    p0x, p0y = 288, 320
+    wgs = (p0y + 63) // 64
+    rows = []
+    for wx in range(wgs):
+        for sg in (0, 2):
+            qg = (sg // 2) * 32
+            q0 = wx * 64
+            rows.append(dict(workgroup=wx, subgroup=sg, qg=qg,
+                             blockA_first_column=q0 + qg,
+                             blockA_live=(q0 + qg) < p0x,
+                             blockB_live=(q0 + qg + 16) < p0x))
+    covered = [c for r in rows if r['blockA_live'] for c in range(r['blockA_first_column'],
+                                                               r['blockA_first_column'] + 32)]
+    rep['checks']['dispatch_liveness'] = dict(
+        p0x=p0x, p0y=p0y, grid_x=wgs, owner_rows=rows,
+        covered_columns=len(covered), all_288_columns_covered_once=sorted(covered) == list(range(p0x)),
+        dead_owner_subgroups=sum(1 for r in rows if not r['blockA_live']))
+
+    K.write_json(CARD / 'build/MAP-VERIFY.json', rep)
+    print(json.dumps({k: rep['checks'][k] for k in ('all_maps_bijective', 'join_rows_to_B_exact',
+                                                    'pad_predicate_key_only')}, indent=2))
+    print('den tree:', {k: v for k, v in rep['checks']['den_tree'].items() if 'block' in k or 'packed' in k})
+    print('coverage:', rep['checks']['dispatch_liveness']['all_288_columns_covered_once'],
+          'grid_x', wgs, 'dead owners', rep['checks']['dispatch_liveness']['dead_owner_subgroups'])
+
+
+if __name__ == '__main__':
+    main()

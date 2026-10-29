@@ -1,0 +1,101 @@
+"""n27-f07 build: parent-byte reproduction + D0 candidate (C256 SLM A-block reblock).
+
+CPU only: glslang + spv_validate_cpu. No GPU, no lock.
+"""
+import json, sys, shutil
+from pathlib import Path
+
+C = Path(r'@NR_WORKSPACE@/work/codex-astra-fp16-int8-audit-20261024/fullnet-continuous-20261027')
+sys.path.insert(0, str(C))
+import COMMON as K
+
+CARD = C / 'cards/n27-f07'
+RECIPE = json.loads((C / 'evidence/RECIPES.json').read_text(encoding='utf-8-sig'))
+SHA256 = 'c853148407be055e7e2fc71ef87614f7ec003468baeb8954ed2e998ff89047fd'
+
+ROW = K.row_by_ordinal(59)
+SRC = Path(ROW['source'])
+INC = [Path(p) for p in RECIPE[SHA256]['compile']['include_dirs']]
+PIN = Path(RECIPE[SHA256]['compile']['pinned_include_dir'])
+
+# ---------------------------------------------------------------- 1. parent bytes
+def reproduce():
+    out = CARD / 'rebuild'
+    out.mkdir(exist_ok=True)
+    raw = out / 'parent-raw.spv'
+    K.compile_glsl(SRC, raw, [PIN] + INC)
+    got = K.sha(raw)
+    res = dict(source=str(SRC), source_sha256=K.sha(SRC), target=str(ROW['spv']),
+               target_sha256=ROW['spv_sha256'], raw_sha256=got,
+               raw_match=(got == ROW['spv_sha256']), include_dirs=[str(PIN)] + [str(p) for p in INC],
+               defines=[], recipe='RECIPES.json/' + SHA256[:12])
+    if res['raw_match']:
+        shutil.copyfile(raw, CARD / 'parent-rebuild.spv')
+    return res
+
+
+# ---------------------------------------------------------------- 2. candidate source
+FILL_OLD = """    for (uint e = t_local; e < 16384u; e += 256u)
+        shT[e] = gT[w * 16384u + e];
+    barrier();
+"""
+FILL_NEW = """    // n27-f07 D0: stage T *fragment-contiguous*.  The DPAS A operand of this kernel is
+    // an 8x16 half fragment (8 token rows x 16 k) read with row stride 256 halfs, so the
+    // parent ISA has to fetch it as eight separate 32 B uniform messages (load.slm.d32x8t
+    // @exec1, 1040 static sites).  Storing each fragment's eight rows contiguously
+    // (row stride 16 halfs = 32 B) makes the fragment one contiguous 256 B block.
+    // Mapping is a pure permutation of the staging array:
+    //   logical (row, k) with jb = row/8, r = row%8, kb = k/16, c = k%16
+    //   -> shT[((jb*16 + kb)*8 + r)*16 + c]
+    // Chunk (row, kb) is 16 contiguous halfs on both sides, so the copy stays 32 B wide
+    // and the global read stays coalesced across consecutive kb.
+    for (uint c16 = t_local; c16 < 1024u; c16 += 256u) {
+        const uint row = c16 >> 4u;              // 0..63  (jb*8 + r)
+        const uint kb  = c16 & 15u;              // 0..15
+        const uint jb  = row >> 3u;
+        const uint r   = row & 7u;
+        const uint src = w * 16384u + row * 256u + kb * 16u;
+        const uint dst = ((jb * 16u + kb) * 8u + r) * 16u;
+        for (uint c = 0u; c < 16u; ++c)
+            shT[dst + c] = gT[src + c];
+    }
+    barrier();
+"""
+DBG_OLD = """        for (uint e = t_local; e < 16384u; e += 256u) {
+            dbg[425984u + e] = shT[e];
+        }
+"""
+DBG_NEW = """        for (uint e = t_local; e < 16384u; e += 256u) {
+            const uint row = e >> 8u, k = e & 255u;
+            const uint jb = row >> 3u, r = row & 7u, kb = k >> 4u, c = k & 15u;
+            dbg[425984u + e] = shT[((jb * 16u + kb) * 8u + r) * 16u + c];
+        }
+"""
+ALOAD_OLD = "            MAT_A a;  coopMatLoad(a, shT, m0 * 256u + k0, 256u, LROW);\n"
+ALOAD_NEW = ("            // n27-f07 D0: fragment jb = m0/8, kb = ki is now a contiguous 256 B block\n"
+             "            MAT_A a;  coopMatLoad(a, shT, ((m0 >> 3u) * 16u + ki) * 128u, 16u, LROW);\n")
+
+
+def make_candidate():
+    text = SRC.read_text(encoding='utf-8-sig')
+    for old, new in ((FILL_OLD, FILL_NEW), (DBG_OLD, DBG_NEW), (ALOAD_OLD, ALOAD_NEW)):
+        assert text.count(old) == 1, ('anchor not unique', old[:60], text.count(old))
+        text = text.replace(old, new)
+    (CARD / 'candidate.comp').write_text(text, encoding='utf-8')
+    return CARD / 'candidate.comp'
+
+
+def build_candidate():
+    comp = make_candidate()
+    spv = CARD / 'candidate.spv'
+    K.compile_glsl(comp, spv, [CARD, PIN] + INC)
+    K.validate_spv(spv)
+    return comp, spv
+
+
+if __name__ == '__main__':
+    res = reproduce()
+    print('parent reproduce:', json.dumps(res, indent=1))
+    comp, spv = build_candidate()
+    print('candidate:', comp, K.sha(comp))
+    print('candidate spv:', spv, K.sha(spv), spv.stat().st_size, 'B')
