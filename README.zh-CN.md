@@ -11,6 +11,8 @@
 
 NR 负责神经图像处理与风格控制；FSR XMX 负责超分；XeSS FG / XeFG 负责帧生成。这里不是把 XeSS 超分叫作帧生成，也不是宣称整套 NVIDIA DLSS 功能都在本仓库内。OptiScaler 负责相应路由，超分和帧生成的第三方组件由用户另行准备。
 
+**详细文档：** [完整安装与使用教程](docs/USER-GUIDE.zh-CN.md) · [50 ms→17 ms 完整时间线](docs/optimization/FULL-HISTORY.md) · [逐项代码与性能复盘](docs/optimization/TECHNICAL-RETROSPECTIVE.md) · [其他游戏接入](PORTING.md)
+
 ## 两种模型都能从本地 DLL 开始构建
 
 **不再要求用户已经拥有 VK102 包。** 只需提供对应版本的本地 `nvngx_dlssnr.dll` 作为模型输入，再准备下文列出的开发依赖。提取器把 DLL 当数据解析，不加载或执行 DLL。

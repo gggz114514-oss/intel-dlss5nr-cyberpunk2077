@@ -7,6 +7,8 @@
 
 Experimental **NR + FSR XMX upscaling + XeSS Frame Generation** on Intel Arc B580 / Windows x64. This repository supplies the Vulkan **NR backend, game bridge, model extraction/build tools and control panel**. The FSR XMX upscaler and XeSS FG components are installed separately; XeSS FG here means frame generation, not XeSS Super Resolution.
 
+**Detailed guides:** [Installation walkthrough (中文)](docs/USER-GUIDE.zh-CN.md) · [Full development history](docs/optimization/FULL-HISTORY.md) · [Technical retrospective](docs/optimization/TECHNICAL-RETROSPECTIVE.md) · [Other-game integration](PORTING.md)
+
 ## What you need to supply
 
 Provide the appropriate **local `nvngx_dlssnr.dll`**. Both backends can now be extracted and built from source; **an existing VK102 package is not required**. DLLs are read as data and never executed. No model DLL, weights, extracted tensors, compiled shaders or third-party game DLLs are distributed.

@@ -1,5 +1,7 @@
 # Build and install
 
+[中文完整操作教程](docs/USER-GUIDE.zh-CN.md)：从下载源码到双后端挂载，附常见问题与恢复步骤。
+
 ## Download the current source / 下载当前源码
 
 ```powershell
