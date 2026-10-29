@@ -1,5 +1,8 @@
 # Source-package verification
 
+> 2026-10-29 optimized update: current Full/Small build identities, streaming changes and validation are documented in [docs/optimization](docs/optimization/README.md). Older entries below describe the earlier release.
+
+
 Verified locally on Windows x64, 2026-10-24, with MSVC 14.44.35207, Windows SDK 10.0.26100.0, CMake, Python 3.12 / NumPy and glslang 16.5.0.
 
 Two separate clean directories started with the Git source allowlist, the matching supported user DLL and declared external development dependencies. Neither had **previous model blobs, compiled network shaders or game samples**. VK102 did not consume an existing VK102 package; it reconstructed model assets from the full-model DLL. Comparisons to prior assets were performed afterward, outside the build.

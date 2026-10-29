@@ -1,5 +1,8 @@
 # v0.2.0 Experimental — Small + VK102
 
+> 2026-10-29 optimized update: current Full/Small build identities, streaming changes and validation are documented in [docs/optimization](docs/optimization/README.md). Older entries below describe the earlier release.
+
+
 Source release for **NR + FSR XMX upscaling + XeSS Frame Generation**, Intel Arc B580 / Windows x64 / Cyberpunk 2077. FSR XMX and XeSS FG components are separate dependencies.
 
 ## New in this release

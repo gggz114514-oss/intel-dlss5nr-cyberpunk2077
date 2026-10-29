@@ -7,7 +7,8 @@ param(
     [string]$CMake = "cmake",
     [ValidateSet("small", "vk102")][string]$Profile = "small",
     [string]$Output = "",
-    [string]$PackageOutput = ""
+    [string]$PackageOutput = "",
+    [string]$FullModel = ""
 )
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -19,7 +20,12 @@ try {
     if (!$Output) { $Output = "local/$Profile" }
     if (!$PackageOutput) { $PackageOutput = if ($Profile -eq "small") { "local/game-package" } else { "local/game-package-vk102" } }
     $modelPath = [IO.Path]::GetFullPath((Join-Path $repoRoot $Output))
-    & $Python -B tools/extract_model.py --profile $Profile --dll $Dll --out $modelPath
+    $modelArgs = @()
+    if ($Profile -eq "small") {
+        if (!$FullModel) { throw "Optimized Small requires -FullModel pointing to the optimized vk102 model output (for its shared blend scalar). Build vk102 first." }
+        $modelArgs = @("--full-model", [IO.Path]::GetFullPath($FullModel))
+    }
+    & $Python -B tools/extract_model.py --profile $Profile --dll $Dll --out $modelPath @modelArgs
     if ($LASTEXITCODE) { throw "Model extraction failed" }
     & $Python -B tools/build_assets.py --model $modelPath --glslang $Glslang
     if ($LASTEXITCODE) { throw "Shader/plan preparation failed" }

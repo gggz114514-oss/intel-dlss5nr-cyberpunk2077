@@ -213,6 +213,7 @@ void write_state() {
     std::string event;
     uint64_t event_ms=0;
     {std::lock_guard guard(event_mutex); event=last_event; event_ms=last_event_ms;}
+    NRB_GpuHandoffStats handoff{};handoff.abi_size=sizeof(handoff);NRB_GetGpuHandoffStats(&handoff);
     const double total=stage.prep_average_ms+stage.host_average_ms+
         stage.composite_submit_average_ms+stage.tail_average_ms;
     const double last=stage.prep_last_ms+stage.host_last_ms+
@@ -226,7 +227,7 @@ void write_state() {
             "\"structure\":%.4f,\"tone\":%.4f,\"skin\":%.4f,\"mask\":%u,"
             "\"display\":%.4f},\"stage\":{\"frames\":%llu,\"prep\":%.3f,"
             "\"host\":%.3f,\"composite\":%.3f,\"tail\":%.3f,\"total\":%.3f,"
-            "\"last\":%.3f}}\n",
+            "\"last\":%.3f},\"handoff\":{\"bypasses\":%llu,\"cpu_waits\":%llu,\"motion_waits\":%llu}}\n",
             backend_key.c_str(),int(nrvk_bridge_mounted.load(std::memory_order_relaxed)),
             int(processor.process!=nullptr),int(probe_state.load(std::memory_order_relaxed)),
             (unsigned long long)NRB_ProcessedCount(),event.c_str(),
@@ -235,7 +236,8 @@ void write_state() {
             c.skin_structure,c.auto_mask,c.display_strength,
             (unsigned long long)stage.frames,stage.prep_average_ms,
             stage.host_average_ms,stage.composite_submit_average_ms,
-            stage.tail_average_ms,total,last);
+            stage.tail_average_ms,total,last,
+            (unsigned long long)handoff.prepared_bypasses,(unsigned long long)handoff.prepared_cpu_waits,(unsigned long long)handoff.motion_readback_waits);
         fclose(file);
     }
 }
@@ -310,7 +312,7 @@ bool parse(Values& v,std::string& text) {
     v.skin_structure=number("skin_structure",v.skin_structure);
     v.display_strength=number("display_strength",v.display_strength);
     const std::string backend=lookup(text,"NR","backend");
-    v.backend=backend.empty()?boot_key:(backend=="102"?"102":"small");
+    v.backend=backend=="102"?"102":"small";
     return true;
 }
 void log_values(const char* what,const Values& v) {
@@ -629,6 +631,9 @@ DWORD WINAPI worker(void*) {
     for(;;) {
         apply_once();
         if((++ticks%2)==0) write_state();
+#ifdef NRB_DEFERRED_IDENTITY_TEST
+        if((ticks%4)==0) nrb::deferred_diag_poll();
+#endif
         Sleep(250);
     }
     return 0;
@@ -1167,12 +1172,6 @@ static void load_bridge_config() {
                     value=panel::lookup(text,"bridge","panel_state");
                     if(!value.empty()) strcpy_s(g_panel_state,value.c_str());
                     panel::backend_manifest=g_manifest_dir;
-                    value=panel::lookup(text,"bridge","backend");
-                    if(value=="small"||value=="102") {
-                        panel::boot_key=value;
-                        panel::backend_key=value;
-                        panel::applied.backend=value;
-                    }
                     value=panel::lookup(text,"bridge","tail_profile");
                     if(!value.empty()) g_tail_profile=atoi(value.c_str());
                 }
@@ -1237,7 +1236,11 @@ static void nrvk_try_mount() {
     if(arc==0) {
         nrvk_bridge_mounted.store(true,std::memory_order_release);
         panel::set_event("boot mount ok");
-        std::atexit([]{ if(nrvk_bridge_module) {
+        std::atexit([]{
+#ifdef NRB_DEFERRED_IDENTITY_TEST
+            nrb::deferred_diag_shutdown();
+#endif
+            if(nrvk_bridge_module) {
             auto shutdown=(ShutdownFn)GetProcAddress(nrvk_bridge_module,"NRVK_Shutdown");
             if(shutdown) shutdown();
         }});

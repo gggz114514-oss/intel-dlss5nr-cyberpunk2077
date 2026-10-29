@@ -1,11 +1,11 @@
-﻿// nrb_vulkan_processor.cpp — 独立 Vulkan FP16 NR 后端处理器（v3：接入版完整提交路径）
+// nrb_vulkan_processor.cpp — 独立 Vulkan FP16 NR 后端处理器（v3：接入版完整提交路径）
 // 契约：include/nr_bridge.h v1（冻结）；设计：INTERFACE-CONTRACT.md v3。
 //
 // 逐帧时序（[GPU 路径 1-4] 对齐 T5 已验证配方，native720 真实两帧票同款）：
 //   [桥] sync_queue()：CPU 等待游戏 queue 完成（asi.cpp:1093-1106）→ 输入 GPU 完备
 //   [组件 D3D12] 自建 allocator/list：CopyTextureRegion 游戏→shared staging（格式原样）
 //                游戏 queue ExecuteCommandList(拷贝) → 同队 Signal(f_cp, v)
-//                → **CPU 等待 f_cp 完成**（输入方向：真实生产者 fence CPU 等待）
+//                → D3D12 copy_fence 经 copy_ready timeline 导入 Vulkan，vkQueueSubmit 端等待（无 f_cp CPU 等待）
 //   [组件 Vulkan] submit{ [acquire EXTERNAL→family] → [gather+网络+scatter]
 //                → [release family→EXTERNAL] }，signal(槽导出 timeline, sv),
 //                fence=槽 cb_fence —— 输入无 wait 信号量；同步在 submit 组装（S2）
@@ -35,7 +35,34 @@
 // 固定包：102 expand-mid-direct-store（plan SHA 1ba536a5…，266 发/487 buffers）。
 // 组件 DLL 与独立包内 backend LIB 精确链接；四占位 stub 已移除，强符号由 LIB 提供。
 
+struct NrvkDiagFrameRecord {
+    uint64_t frame_id;
+    uint64_t returned_seq;
+    uint32_t window_id;
+    uint32_t arm_reuse;
+    uint32_t slot_index;
+    uint32_t copy_slot;
+    uint32_t had_network_fence_pending;
+    uint32_t d3d_valid;
+    uint32_t vk_valid;
+    uint32_t vk_valid_bits;
+    uint64_t wait_fences_start_qpc;
+    uint64_t wait_fences_end_qpc;
+    uint64_t d3d_freq_hz;
+    double   vk_timestamp_period_ns;
+    uint64_t d4_tick;
+    uint64_t d5_tick;
+    uint64_t v_ticks[7];
+};
+
 namespace {
+
+struct NrvkDiagPendingSlot {
+    bool active = false;
+    uint64_t copy_fence_val = 0;
+    VkFence cb_fence = VK_NULL_HANDLE;
+    NrvkDiagFrameRecord rec {};
+};
 
 struct ImportedImg {
     ID3D12Resource* res = nullptr;
@@ -92,6 +119,7 @@ struct Ctx {
     ID3D12Fence* copy_fence = nullptr;         // 拷贝完成 fence（CPU 等待，[GPU 路径 3]）
     HANDLE copy_fence_nt = nullptr;
     uint64_t copy_fence_value = 0;
+    VkSemaphore copy_ready = VK_NULL_HANDLE; // persistent imported D3D12 copy timeline
     HANDLE copy_event = nullptr;               // copy_fence 完成事件（输入 CPU fence 等待）
 
     std::map<std::string, StagingGroup> staging;
@@ -117,6 +145,24 @@ struct Ctx {
     uint32_t last_reset = 0, last_history = 0;
     bool history_committed = false;
     uint64_t history_frame = 0, history_epoch = 0;
+    VkQueryPool vk_query_pool = VK_NULL_HANDLE;
+    double vk_timestamp_period_ns = 0.0;
+    uint32_t vk_timestamp_valid_bits = 0;
+    ID3D12QueryHeap* d3d_ts_heap = nullptr;
+    ID3D12Resource* d3d_ts_readback = nullptr;
+    uint64_t d3d_freq_hz = 0;
+    uint32_t diag_mode = 0;
+    uint32_t diag_window_id = 0;
+    uint32_t diag_arm_reuse = 0;
+    uint64_t last_cpu_frame_id = 0;
+    uint32_t last_cpu_had_fence = 0;
+    uint64_t last_cpu_wait_start_qpc = 0;
+    uint64_t last_cpu_wait_end_qpc = 0;
+    NrvkDiagPendingSlot diag_pending[16] {};
+    std::vector<NrvkDiagFrameRecord> diag_records;
+    uint64_t diag_d3d_unavail = 0;
+    uint64_t diag_vk_unavail = 0;
+    uint64_t diag_overflow = 0;
 };
 Ctx* g_ctx = nullptr;
 HMODULE g_vulkan_mod = nullptr;
@@ -252,7 +298,11 @@ int create_vulkan(Ctx* c, ID3D12Device* d3d) {
         VkPhysicalDeviceIDProperties idp { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
         VkPhysicalDeviceProperties2 pp { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &idp };
         vkGetPDProps2(p, &pp);
-        if (idp.deviceLUIDValid && !memcmp(idp.deviceLUID, &want, sizeof(LUID)) && idp.deviceNodeMask) { c->phy = p; break; }
+        if (idp.deviceLUIDValid && !memcmp(idp.deviceLUID, &want, sizeof(LUID)) && idp.deviceNodeMask) {
+            c->phy = p;
+            c->vk_timestamp_period_ns = (double)pp.properties.limits.timestampPeriod;
+            break;
+        }
     }
     if (!c->phy) { NRVK_LOG("no LUID match\n"); return -3; }
     auto vkEnumExt = (PFN_vkEnumerateDeviceExtensionProperties)gipa(c->instance, "vkEnumerateDeviceExtensionProperties");
@@ -278,6 +328,7 @@ int create_vulkan(Ctx* c, ID3D12Device* d3d) {
     while (qfam < nqf && !(qfps[qfam].queueFlags & VK_QUEUE_COMPUTE_BIT)) ++qfam;
     if (qfam == nqf) return -4;
     c->queue_family = qfam;
+    c->vk_timestamp_valid_bits = qfps[qfam].timestampValidBits;
     VkDeviceQueueCreateInfo qci { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
     qci.queueFamilyIndex = qfam; qci.queueCount = 1; qci.pQueuePriorities = &prio;
     // [T5 契约] feature 链全 TRUE；DeviceScope/AvailabilityVisibilityChains=false
@@ -328,6 +379,16 @@ int create_vulkan(Ctx* c, ID3D12Device* d3d) {
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = c->queue_family;
     if (pfn_CreateCommandPool(c->device, &pci, nullptr, &c->pool) != VK_SUCCESS) return -4;
+    if (c->vk_timestamp_valid_bits > 0 && c->vk_timestamp_period_ns > 0.0) {
+        auto pfn_CreateQueryPool = (PFN_vkCreateQueryPool)g_gdpa(c->device, "vkCreateQueryPool");
+        if (pfn_CreateQueryPool) {
+            VkQueryPoolCreateInfo qpci { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+            qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qpci.queryCount = 128;
+            if (pfn_CreateQueryPool(c->device, &qpci, nullptr, &c->vk_query_pool) != VK_SUCCESS)
+                c->vk_query_pool = VK_NULL_HANDLE;
+        }
+    }
     return 0;
 }
 
@@ -478,6 +539,72 @@ int create_output_slots(Ctx* c, uint32_t w, uint32_t h) {
 }
 
 // ------------------------------------------------------------- D3D12 拷贝（F2/F3）
+static void harvest_diag_slot(Ctx* c, uint32_t qslot, bool force_retire) {
+    if (!c || qslot >= 16) return;
+    NrvkDiagPendingSlot& p = c->diag_pending[qslot];
+    if (!p.active) return;
+    const bool copy_done = c->copy_fence && (c->copy_fence->GetCompletedValue() >= p.copy_fence_val);
+    if (!copy_done && !force_retire) return;
+    uint64_t vk_raw[14] {};
+    VkResult qres = VK_ERROR_UNKNOWN;
+    if (c->device != VK_NULL_HANDLE && c->vk_query_pool != VK_NULL_HANDLE && g_gdpa) {
+        auto pfn_GetQueryPoolResults = (PFN_vkGetQueryPoolResults)g_gdpa(c->device, "vkGetQueryPoolResults");
+        if (pfn_GetQueryPoolResults) {
+            qres = pfn_GetQueryPoolResults(
+                c->device, c->vk_query_pool, qslot * 8, 7,
+                sizeof(vk_raw), vk_raw, sizeof(uint64_t) * 2,
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        }
+    }
+    if (qres == VK_NOT_READY && !force_retire) return;
+    bool all_vk_avail = (qres == VK_SUCCESS);
+    for (int i = 0; i < 7; ++i) {
+        p.rec.v_ticks[i] = vk_raw[i * 2];
+        if (vk_raw[i * 2 + 1] == 0) all_vk_avail = false;
+    }
+    p.rec.vk_valid = all_vk_avail ? 1u : 0u;
+    if (!all_vk_avail) ++c->diag_vk_unavail;
+    p.rec.d3d_valid = 0;
+    if (copy_done && c->d3d_ts_readback && c->d3d_freq_hz != 0) {
+        const SIZE_T byte_off = (SIZE_T)(qslot * 2) * sizeof(uint64_t);
+        D3D12_RANGE rr { byte_off, byte_off + 2 * sizeof(uint64_t) };
+        void* mapped = nullptr;
+        if (SUCCEEDED(c->d3d_ts_readback->Map(0, &rr, &mapped)) && mapped) {
+            const uint64_t* ticks = (const uint64_t*)((const uint8_t*)mapped + byte_off);
+            p.rec.d4_tick = ticks[0];
+            p.rec.d5_tick = ticks[1];
+            D3D12_RANGE wr { 0, 0 };
+            c->d3d_ts_readback->Unmap(0, &wr);
+            if (p.rec.d4_tick != 0 && p.rec.d5_tick >= p.rec.d4_tick)
+                p.rec.d3d_valid = 1u;
+        }
+    }
+    if (!p.rec.d3d_valid) ++c->diag_d3d_unavail;
+    if (c->diag_records.size() < 32768) {
+        c->diag_records.push_back(p.rec);
+    } else {
+        ++c->diag_overflow;
+    }
+    p.active = false;
+}
+
+static void harvest_all_retired_diag(Ctx* c, bool force_all) {
+    if (!c) return;
+    for (uint32_t step = 0; step < 16; ++step) {
+        uint32_t best = 16;
+        uint64_t best_seq = UINT64_MAX;
+        for (uint32_t i = 0; i < 16; ++i) {
+            if (c->diag_pending[i].active && c->diag_pending[i].rec.returned_seq < best_seq) {
+                best_seq = c->diag_pending[i].rec.returned_seq;
+                best = i;
+            }
+        }
+        if (best >= 16) break;
+        harvest_diag_slot(c, best, force_all);
+        if (c->diag_pending[best].active) break;
+    }
+}
+
 int record_and_submit_copies(Ctx* c, ID3D12CommandQueue* game_q,
                              const NRB_Frame* f, StagingGroup& st) {
     auto do_copy = [](ID3D12GraphicsCommandList* cl, ID3D12Resource* src, ImportedImg& dst) {
@@ -501,10 +628,22 @@ int record_and_submit_copies(Ctx* c, ID3D12CommandQueue* game_q,
         for (auto& b : before) std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
         cl->ResourceBarrier(2, before);
     };
+    const bool record_d3d_ts = (c->diag_mode == 2 && c->d3d_ts_heap && c->d3d_ts_readback);
+    const uint32_t qslot = (uint32_t)(c->frame_seq % 16);
+    if (record_d3d_ts) {
+        if (c->d3d_freq_hz == 0 && game_q) game_q->GetTimestampFrequency(&c->d3d_freq_hz);
+        c->copy_list->EndQuery(c->d3d_ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, qslot * 2 + 0);
+    }
     do_copy(c->copy_list, f->color, st.color);
     do_copy(c->copy_list, f->motion, st.motion);
     do_copy(c->copy_list, f->depth, st.depth);
     do_copy(c->copy_list, f->exposure, st.exposure);
+    if (record_d3d_ts) {
+        c->copy_list->EndQuery(c->d3d_ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, qslot * 2 + 1);
+        c->copy_list->ResolveQueryData(
+            c->d3d_ts_heap, D3D12_QUERY_TYPE_TIMESTAMP,
+            qslot * 2, 2, c->d3d_ts_readback, (UINT64)(qslot * 2) * sizeof(uint64_t));
+    }
     if (FAILED(c->copy_list->Close())) return -1;
     ID3D12CommandList* lists[] = { c->copy_list };
     game_q->ExecuteCommandLists(1, lists);               // 游戏队列：拷贝先于 XeSS 消费
@@ -578,10 +717,31 @@ int nrvk_process(void* context, const NRB_Frame* f, NRB_Result* out) {
         }
         fprintf(stderr, "[nrvk] stage=backend_init rc=0\n");
     }
+    if (!c->copy_ready) {
+        NRVK_DEV_FN(CreateSemaphore); NRVK_DEV_FN(ImportSemaphoreWin32HandleKHR);
+        VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        type.semaphoreType=VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo create{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,&type};
+        if(pfn_CreateSemaphore(c->device,&create,nullptr,&c->copy_ready)!=VK_SUCCESS) return NRB_PROCESS_ERROR;
+        VkImportSemaphoreWin32HandleInfoKHR import{VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR};
+        import.semaphore=c->copy_ready;import.handleType=VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;import.handle=c->copy_fence_nt;
+        if(pfn_ImportSemaphoreWin32HandleKHR(c->device,&import)!=VK_SUCCESS) {
+            NRVK_DEV_FN(DestroySemaphore);pfn_DestroySemaphore(c->device,c->copy_ready,nullptr);c->copy_ready=VK_NULL_HANDLE;
+            return NRB_PROCESS_ERROR;
+        }
+    }
     c->init_ok = true; // Device/pool and actual backend both initialized.
 
     // [单上下文] 上一帧网络完成前不得覆写共享 staging / 更新描述符 /
     // 录制下一帧——CPU 等待上一网络 fence（= 上一提交的槽 cb_fence）。
+    c->last_cpu_frame_id = f->frame_id;
+    c->last_cpu_had_fence = (c->network_fence_pending != VK_NULL_HANDLE) ? 1u : 0u;
+    c->last_cpu_wait_start_qpc = 0;
+    c->last_cpu_wait_end_qpc = 0;
+    if (c->diag_mode >= 1) {
+        LARGE_INTEGER q0 {}; QueryPerformanceCounter(&q0);
+        c->last_cpu_wait_start_qpc = (uint64_t)q0.QuadPart;
+    }
     if (c->network_fence_pending) {
         NRVK_DEV_FN(WaitForFences);
         if (pfn_WaitForFences(c->device, 1, &c->network_fence_pending, VK_TRUE,
@@ -591,6 +751,14 @@ int nrvk_process(void* context, const NRB_Frame* f, NRB_Result* out) {
             return NRB_BYPASS_UNSYNCED;
         }
         c->network_fence_pending = VK_NULL_HANDLE;
+    }
+    if (c->diag_mode >= 1) {
+        LARGE_INTEGER q1 {}; QueryPerformanceCounter(&q1);
+        c->last_cpu_wait_end_qpc = (uint64_t)q1.QuadPart;
+    }
+    const uint32_t diag_qslot = (uint32_t)(c->frame_seq % 16);
+    if (c->diag_pending[diag_qslot].active) {
+        harvest_diag_slot(c, diag_qslot, true);
     }
 
     // 惰性初始化：输出槽（尺寸=首帧 render 尺寸）+ 槽私有 cb/fence（[S1]/[T4]）
@@ -666,9 +834,9 @@ int nrvk_process(void* context, const NRB_Frame* f, NRB_Result* out) {
         f->frame_id==c->history_frame+1)?1u:0u;
 
     // [F2] 拷贝在游戏 queue 上执行 + 同队 Signal(f_cp)（列表先入队、Signal 后入队；
-    // 且 process() 前 sync_queue() 已 CPU 等待队列完成——asi.cpp:1093-1106）
+    // 实际运行于 deferred submit 路径：上一帧 copy_fence 完成已由上一帧 network_fence_pending 保证）
     // [单上下文] Reset copy allocator 前：确认上一帧拷贝已完成（sync_queue 已
-    // CPU 等待队列，此处为显式校验）
+    // 上一帧 network_fence_pending 已完成，此处为显式非阻塞校验）
     if (c->copy_fence->GetCompletedValue() < c->copy_fence_value) {
         ++c->frames_bypass; ++c->gpu_timeout; c->last_status = NRB_BYPASS_UNSYNCED;
         write_status(c);
@@ -678,15 +846,8 @@ int nrvk_process(void* context, const NRB_Frame* f, NRB_Result* out) {
     if (record_and_submit_copies(c, f->queue, f, st) != 0) {
         c->last_status = 2; write_status(c); return NRB_PROCESS_ERROR;
     }
-    // [GPU 路径 3] 输入方向（T5 已验证）：真实生产者 fence **CPU 等待**——
-    // D3D12 拷贝+Signal 入队后 WaitForSingleObject(copy_event) 确认完成才提交
-    // Vulkan。输入方向不再走旧 import-fence submit（该路径从未实际接通）。
-    if (FAILED(c->copy_fence->SetEventOnCompletion(c->copy_fence_value, c->copy_event)) ||
-        WaitForSingleObject(c->copy_event, 10000) != WAIT_OBJECT_0) {
-        ++c->frames_bypass; ++c->gpu_timeout; c->last_status = NRB_BYPASS_UNSYNCED;
-        write_status(c);
-        return NRB_BYPASS_UNSYNCED;
-    }
+    // The copy queue signals copy_fence_value after all input copies. Vulkan
+    // waits for that exact value in its submit; no CPU input wait is needed.
 
     // [S1 v4] 槽可用性检查：vkGetFenceStatus **0 等待**——上一轮 Vulkan 未完成时
     // 该槽直接视为不可用（旁路并单列 gpu_timeout 计数），**热路径不等满 1s**。
@@ -730,6 +891,13 @@ int nrvk_process(void* context, const NRB_Frame* f, NRB_Result* out) {
         VkCommandBufferBeginInfo bi { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (pfn_BeginCommandBuffer(slot.cb, &bi) != VK_SUCCESS) return NRB_PROCESS_ERROR;
+        const bool record_vk_ts = (c->diag_mode == 2 && c->vk_query_pool != VK_NULL_HANDLE);
+        auto pfn_CmdResetQueryPool = record_vk_ts ? (PFN_vkCmdResetQueryPool)g_gdpa(c->device, "vkCmdResetQueryPool") : nullptr;
+        auto pfn_CmdWriteTimestamp = record_vk_ts ? (PFN_vkCmdWriteTimestamp)g_gdpa(c->device, "vkCmdWriteTimestamp") : nullptr;
+        if (record_vk_ts && pfn_CmdResetQueryPool && pfn_CmdWriteTimestamp) {
+            pfn_CmdResetQueryPool(slot.cb, c->vk_query_pool, diag_qslot * 8, 8);
+            pfn_CmdWriteTimestamp(slot.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->vk_query_pool, diag_qslot * 8 + 0);
+        }
         // [GPU 路径 4] 真实 ownership 屏障（T5 已验证）：每帧 EXTERNAL→family acquire。
         // 数据保持 GENERAL（GENERAL→GENERAL）——UNDEFINED 转换会丢弃 D3D12 生产者
         // 内容，禁用；metadata 标 GENERAL 不构成屏障。
@@ -787,7 +955,13 @@ int nrvk_process(void* context, const NRB_Frame* f, NRB_Result* out) {
             om.layout = VK_IMAGE_LAYOUT_GENERAL;
             om.queue_family = c->queue_family;
             ext.images[4] = om; }
+        if (record_vk_ts && pfn_CmdResetQueryPool && pfn_CmdWriteTimestamp) {
+            nrvk_backend_set_timestamp_query(c->backend, c->vk_query_pool, diag_qslot * 8);
+        } else {
+            nrvk_backend_set_timestamp_query(c->backend, VK_NULL_HANDLE, 0);
+        }
         int brc = nrvk_backend_frame(c->backend, slot.cb, &ext.v3);
+        nrvk_backend_set_timestamp_query(c->backend, VK_NULL_HANDLE, 0);
         fprintf(stderr, "[nrvk] stage=backend_frame frame=%llu rc=%d\n", (unsigned long long)f->frame_id, brc);
         if (brc != 0) {
             // 录制失败：弃录（Reset/discard cb），绝不提交
@@ -818,11 +992,14 @@ int nrvk_process(void* context, const NRB_Frame* f, NRB_Result* out) {
         pfn_CmdPipelineBarrier(slot.cb,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
             0, 0, nullptr, 0, nullptr, nr, rel);
+        if (record_vk_ts && pfn_CmdResetQueryPool && pfn_CmdWriteTimestamp) {
+            pfn_CmdWriteTimestamp(slot.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->vk_query_pool, diag_qslot * 8 + 6);
+        }
         if (pfn_EndCommandBuffer(slot.cb) != VK_SUCCESS) return NRB_PROCESS_ERROR;
     }
 
-    // [S2] submit 组装（[GPU 路径 3] T5 已验证）：无 wait 信号量（输入方向已由
-    // copy fence CPU 等待保证）；signal(槽导出 timeline, sv) + fence=槽 cb_fence
+    // [S2] submit 组装（[GPU 路径 3] T5 已验证）：waitSemaphore=copy_ready(copy_fence_value)（
+    // GPU timeline 门控输入拷贝完成）；signal(槽导出 timeline, sv) + fence=槽 cb_fence
     // （[S1] 完成证据）。D3D12 消费者经 ready fence（导出句柄 OpenSharedHandle）
     // queue->Wait(sv)。
     {
@@ -830,8 +1007,11 @@ int nrvk_process(void* context, const NRB_Frame* f, NRB_Result* out) {
         VkTimelineSemaphoreSubmitInfo tsi { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
         uint64_t sv = slot.fence_value + 1;
         tsi.signalSemaphoreValueCount = 1; tsi.pSignalSemaphoreValues = &sv;
+        tsi.waitSemaphoreValueCount=1;tsi.pWaitSemaphoreValues=&c->copy_fence_value;
         VkSubmitInfo si { VK_STRUCTURE_TYPE_SUBMIT_INFO, &tsi };
         si.commandBufferCount = 1; si.pCommandBuffers = &slot.cb;
+        VkPipelineStageFlags input_stage=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        si.waitSemaphoreCount=1;si.pWaitSemaphores=&c->copy_ready;si.pWaitDstStageMask=&input_stage;
         si.signalSemaphoreCount = 1; si.pSignalSemaphores = &slot.sem;
         pfn_ResetFences(c->device, 1, &slot.cb_fence);
         VkResult sub_rc = pfn_QueueSubmit(c->queue, 1, &si, slot.cb_fence);
@@ -858,6 +1038,25 @@ int nrvk_process(void* context, const NRB_Frame* f, NRB_Result* out) {
         out->ready_value = sv;                               // 与 signal 值一致
         slot.fence_value = sv;
         slot.returned_seq = ++c->frame_seq;
+        if (c->diag_mode == 2 && c->vk_query_pool != VK_NULL_HANDLE && c->d3d_ts_heap && c->d3d_ts_readback) {
+            NrvkDiagPendingSlot& p = c->diag_pending[diag_qslot];
+            p = NrvkDiagPendingSlot {};
+            p.active = true;
+            p.copy_fence_val = c->copy_fence_value;
+            p.cb_fence = slot.cb_fence;
+            p.rec.frame_id = f->frame_id;
+            p.rec.returned_seq = slot.returned_seq;
+            p.rec.window_id = c->diag_window_id;
+            p.rec.arm_reuse = c->diag_arm_reuse;
+            p.rec.slot_index = c->slot_next;
+            p.rec.copy_slot = diag_qslot;
+            p.rec.had_network_fence_pending = c->last_cpu_had_fence;
+            p.rec.vk_valid_bits = c->vk_timestamp_valid_bits;
+            p.rec.wait_fences_start_qpc = c->last_cpu_wait_start_qpc;
+            p.rec.wait_fences_end_qpc = c->last_cpu_wait_end_qpc;
+            p.rec.d3d_freq_hz = c->d3d_freq_hz;
+            p.rec.vk_timestamp_period_ns = c->vk_timestamp_period_ns;
+        }
         slot.in_flight = true;
         c->slot_next = (c->slot_next + 1) % (uint32_t)c->slots.size();
         ++c->frames_ok; c->last_status = NRB_OK;
@@ -911,6 +1110,29 @@ int nrvk_register(ID3D12Device* d3d, const NRVK_Config* cfg, NRB_RegisterFn host
     // [GPU 路径 3] 输入方向 CPU 等待用完成事件
     c->copy_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!c->copy_event) { delete c; return -2; }
+    c->diag_records.reserve(32768);
+    {
+        D3D12_QUERY_HEAP_DESC qhd {};
+        qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qhd.Count = 32;
+        qhd.NodeMask = 0;
+        if (SUCCEEDED(d3d->CreateQueryHeap(&qhd, IID_PPV_ARGS(&c->d3d_ts_heap)))) {
+            D3D12_HEAP_PROPERTIES hp_rb { D3D12_HEAP_TYPE_READBACK };
+            D3D12_RESOURCE_DESC rd {};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = 32 * sizeof(uint64_t);
+            rd.Height = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(d3d->CreateCommittedResource(&hp_rb, D3D12_HEAP_FLAG_NONE, &rd,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&c->d3d_ts_readback)))) {
+                c->d3d_ts_heap->Release();
+                c->d3d_ts_heap = nullptr;
+            }
+        }
+    }
     g_ctx = c;
     // [任务1] 宿主显式传入注册回调——不再从游戏 EXE 查找 ASI 导出
     NRB_Processor p { sizeof(NRB_Processor), g_ctx, &nrvk_process, &nrvk_retire };
@@ -960,6 +1182,7 @@ int NRVK_Shutdown(void) {
             NRVK_DEV_FN(DestroyImageView); NRVK_DEV_FN(DestroyImage); NRVK_DEV_FN(FreeMemory);
             NRVK_DEV_FN(DestroySemaphore); NRVK_DEV_FN(DestroyFence); NRVK_DEV_FN(DestroyCommandPool);
             NRVK_DEV_FN(DestroyDevice);
+            if(c->copy_ready){pfn_DestroySemaphore(c->device,c->copy_ready,nullptr);c->copy_ready=VK_NULL_HANDLE;}
             for (auto& sl : c->slots) {
                 if (sl.view) pfn_DestroyImageView(c->device, sl.view, nullptr);
                 if (sl.image) pfn_DestroyImage(c->device, sl.image, nullptr);
@@ -973,6 +1196,12 @@ int NRVK_Shutdown(void) {
             c->staging.clear();
             c->staging_bytes = 0;
             if (c->pool) { pfn_DestroyCommandPool(c->device, c->pool, nullptr); c->pool = VK_NULL_HANDLE; }
+            harvest_all_retired_diag(c, true);
+            if (c->vk_query_pool != VK_NULL_HANDLE) {
+                auto pfn_DestroyQueryPool = (PFN_vkDestroyQueryPool)g_gdpa(c->device, "vkDestroyQueryPool");
+                if (pfn_DestroyQueryPool) pfn_DestroyQueryPool(c->device, c->vk_query_pool, nullptr);
+                c->vk_query_pool = VK_NULL_HANDLE;
+            }
             pfn_DestroyDevice(c->device, nullptr);
             if (g_gipa) {
                 auto vkDestroyInstance = (PFN_vkDestroyInstance)g_gipa(c->instance, "vkDestroyInstance");
@@ -986,6 +1215,8 @@ int NRVK_Shutdown(void) {
         }
         if (c->copy_fence_nt) { CloseHandle(c->copy_fence_nt); c->copy_fence_nt = nullptr; }
         if (c->copy_event) { CloseHandle(c->copy_event); c->copy_event = nullptr; }
+        if (c->d3d_ts_readback) { c->d3d_ts_readback->Release(); c->d3d_ts_readback = nullptr; }
+        if (c->d3d_ts_heap) { c->d3d_ts_heap->Release(); c->d3d_ts_heap = nullptr; }
         c->init_ok = 0;
         write_status(c);
     }                                        // 锁作用域结束
@@ -1010,6 +1241,67 @@ int NRVK_ComponentSelfTest(const NRVK_Config* cfg, ID3D12Device* /*d3d*/) {
 extern "C" __declspec(dllexport)
 int NRVK_AttachToBridge(ID3D12Device* d3d, const NRVK_Config* cfg, NRB_RegisterFn host_register) {
     return nrvk_register(d3d, cfg, host_register);
+}
+
+extern "C" __declspec(dllexport)
+int NRVK_PreparedGpuOrderedV1(void* context,ID3D12Device* device,ID3D12CommandQueue* queue) {
+    Ctx* c=static_cast<Ctx*>(context);
+    if(!c || c!=g_ctx || !device || !queue) return 0;
+    std::lock_guard<std::mutex> lock(c->mu);
+    // On every call process() enqueues copies on frame.queue, which is the
+    // same producer queue. The imported timeline gates every Vulkan command.
+    return c->d3d==device && c->init_ok && c->copy_ready!=VK_NULL_HANDLE;
+}
+
+extern "C" __declspec(dllexport)
+void NRVK_DiagSetState(uint32_t mode, uint32_t window_id, uint32_t arm_reuse) {
+    if (!g_ctx) return;
+    std::lock_guard<std::mutex> lock(g_ctx->mu);
+    g_ctx->diag_mode = mode;
+    g_ctx->diag_window_id = window_id;
+    g_ctx->diag_arm_reuse = arm_reuse;
+}
+
+extern "C" __declspec(dllexport)
+void NRVK_DiagGetLastCpuSubstage(uint64_t* frame_id, uint32_t* had_fence, uint64_t* wait_start_qpc, uint64_t* wait_end_qpc) {
+    if (!g_ctx) return;
+    std::lock_guard<std::mutex> lock(g_ctx->mu);
+    if (frame_id) *frame_id = g_ctx->last_cpu_frame_id;
+    if (had_fence) *had_fence = g_ctx->last_cpu_had_fence;
+    if (wait_start_qpc) *wait_start_qpc = g_ctx->last_cpu_wait_start_qpc;
+    if (wait_end_qpc) *wait_end_qpc = g_ctx->last_cpu_wait_end_qpc;
+}
+
+extern "C" __declspec(dllexport)
+void NRVK_DiagHarvestRetired(void) {
+    if (!g_ctx) return;
+    std::lock_guard<std::mutex> lock(g_ctx->mu);
+    harvest_all_retired_diag(g_ctx, false);
+}
+
+extern "C" __declspec(dllexport)
+void NRVK_DiagGetRecords(const void** out_data, uint32_t* out_count, uint64_t* out_d3d_unavail, uint64_t* out_vk_unavail, uint64_t* out_overflow) {
+    if (!g_ctx) {
+        if (out_data) *out_data = nullptr;
+        if (out_count) *out_count = 0;
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_ctx->mu);
+    harvest_all_retired_diag(g_ctx, false);
+    if (out_data) *out_data = g_ctx->diag_records.empty() ? nullptr : g_ctx->diag_records.data();
+    if (out_count) *out_count = (uint32_t)g_ctx->diag_records.size();
+    if (out_d3d_unavail) *out_d3d_unavail = g_ctx->diag_d3d_unavail;
+    if (out_vk_unavail) *out_vk_unavail = g_ctx->diag_vk_unavail;
+    if (out_overflow) *out_overflow = g_ctx->diag_overflow;
+}
+
+extern "C" __declspec(dllexport)
+void NRVK_DiagGetDeviceInfo(uint64_t* out_d3d_freq_hz, double* out_vk_period_ns, uint32_t* out_vk_valid_bits) {
+    if (!g_ctx) return;
+    std::lock_guard<std::mutex> lock(g_ctx->mu);
+    if (out_d3d_freq_hz) *out_d3d_freq_hz = g_ctx->d3d_freq_hz;
+    if (out_vk_period_ns) *out_vk_period_ns = g_ctx->vk_timestamp_period_ns;
+    if (out_vk_valid_bits) *out_vk_valid_bits = g_ctx->vk_timestamp_valid_bits;
 }
 
 int NRVK_InteropSelfTestD3D12(ID3D12Device* d3d, const char* receipt_path) {

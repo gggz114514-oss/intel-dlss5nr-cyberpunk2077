@@ -30,6 +30,7 @@ struct PortNetworkBridgeFrameIO {
 // cancels the record and leaves the committed history generation unchanged.
 extern "C" int port_network_bridge_backend_submit_result(NRVK_Backend*, VkFence, VkResult);
 extern "C" const char* port_network_bridge_backend_last_error();
+extern "C" void nrvk_backend_set_timestamp_query(NRVK_Backend*, VkQueryPool, uint32_t);
 
 // Required at VkDevice creation: Vulkan1.3, cooperativeMatrix,
 // shaderFloat16, storageBuffer16BitAccess, subgroupSizeControl,

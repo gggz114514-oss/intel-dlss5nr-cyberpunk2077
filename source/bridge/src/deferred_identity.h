@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <d3d12.h>
 #include <nvsdk_ngx.h>
@@ -63,4 +63,6 @@ void deferred_identity_clear_failure();
 void deferred_identity_set_suspended(bool suspended);
 unsigned deferred_identity_pending();
 bool deferred_identity_tail_verified(NRB_Route route);
+void deferred_diag_poll();
+void deferred_diag_shutdown();
 }

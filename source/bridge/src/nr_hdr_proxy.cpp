@@ -1,4 +1,5 @@
 #include "nr_hdr_proxy.h"
+#include <atomic>
 #include <d3dcompiler.h>
 #include <array>
 #include <bit>
@@ -9,6 +10,24 @@
 #pragma comment(lib,"bcrypt.lib")
 
 namespace nrb {
+#ifndef NRB_DEFAULT_COMPOSITE_REUSE
+#define NRB_DEFAULT_COMPOSITE_REUSE 1
+#endif
+namespace {
+std::atomic<bool> g_composite_heap_reuse{NRB_DEFAULT_COMPOSITE_REUSE != 0};
+std::atomic<uint64_t> g_pooled_private_composite_count{0};
+std::atomic<uint64_t> g_unique_composite_heap_creates{0};
+}
+void hdr_set_composite_heap_reuse(bool enabled) {
+    g_composite_heap_reuse.store(enabled,std::memory_order_relaxed);
+}
+bool hdr_composite_heap_reuse_enabled() {
+    return g_composite_heap_reuse.load(std::memory_order_relaxed);
+}
+HdrCompositeHeapDiagStats hdr_composite_heap_diag_stats() {
+    return {g_pooled_private_composite_count.load(std::memory_order_relaxed),
+            g_unique_composite_heap_creates.load(std::memory_order_relaxed)};
+}
 namespace {
 using Microsoft::WRL::ComPtr;
 constexpr UINT hdr_compile_flags=D3DCOMPILE_OPTIMIZATION_LEVEL3|D3DCOMPILE_IEEE_STRICTNESS;
@@ -435,6 +454,7 @@ bool HdrProxy::initialize(ID3D12Device* device,ID3D12Resource* source,
     }
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    bool pool_factory_called=false;
     hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=5;
     hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if(pool && pool->enabled()) {
@@ -462,6 +482,7 @@ bool HdrProxy::initialize(ID3D12Device* device,ID3D12Resource* source,
             key.proxy.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
             key.nr_motion=key.proxy;key.nr_motion.Format=DXGI_FORMAT_R16G16_FLOAT;
             resource_lease_=pool->acquire(key,[&]() -> std::unique_ptr<HdrResourceBundle> {
+                pool_factory_called=true;
                 auto bundle=std::make_unique<HdrResourceBundle>();
                 bundle->identity=identity;bundle->device=device;
                 const auto p=device->GetResourceAllocationInfo(0,1,&key.proxy);
@@ -473,9 +494,10 @@ bool HdrProxy::initialize(ID3D12Device* device,ID3D12Resource* source,
                 bundle->proxy=texture(device,width_,height_,DXGI_FORMAT_R32G32B32A32_FLOAT);
                 bundle->motion=texture(device,width_,height_,DXGI_FORMAT_R16G16_FLOAT);
                 if(!bundle->proxy || !bundle->motion ||
-                   FAILED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(bundle->heap.GetAddressOf())))) return {};
+                   FAILED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(bundle->heap.GetAddressOf()))) ||
+                   FAILED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(bundle->composite_heap.GetAddressOf())))) return {};
                 bundle->stride=device->GetDescriptorHandleIncrementSize(hd.Type);
-                bundle->descriptor_bytes_estimate=uint64_t(bundle->stride)*5;
+                bundle->descriptor_bytes_estimate=uint64_t(bundle->stride)*10;
                 return bundle;
             });
         }
@@ -486,6 +508,7 @@ bool HdrProxy::initialize(ID3D12Device* device,ID3D12Resource* source,
         resource_initial_=resource_lease_->initial_state();
         bundle.bound_source=source;bundle.bound_motion=game_motion_available_?motion:nullptr;
         bundle.bound_xess=xess_input;bundle.bound_nr_result.Reset();
+        diag_pool_alloc_kind_=pool_factory_called?2u:1u;
     } else {
         // Pool disabled, busy, incompatible or failed: original unique allocation.
         proxy_=texture(device,width_,height_,DXGI_FORMAT_R32G32B32A32_FLOAT);
@@ -493,6 +516,7 @@ bool HdrProxy::initialize(ID3D12Device* device,ID3D12Resource* source,
         if(!proxy_ || !nr_motion_ ||
            FAILED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(heap_.GetAddressOf())))) return false;
         stride_=device->GetDescriptorHandleIncrementSize(hd.Type);
+        diag_pool_alloc_kind_=3u;
     }
     // Refresh all five slots on every exclusive rebind. Composite overwrites
     // slot 1 with NR output; next prepare must restore the motion/null SRV.
@@ -524,7 +548,7 @@ void HdrProxy::bind(ID3D12GraphicsCommandList* list,ID3D12PipelineState* pipelin
     auto uav_table=srv_table;uav_table.ptr+=2*stride_;
     list->SetComputeRootDescriptorTable(0,srv_table);
     list->SetComputeRootDescriptorTable(1,uav_table);
-    UINT constants[26]={};
+    UINT constants[27]={};
     for(int i=0;i<16;++i) constants[i]=std::bit_cast<UINT>(style_curve_[i]);
     constants[16]=width_;constants[17]=height_;constants[18]=UINT(use_game_motion);
     constants[19]=std::bit_cast<UINT>(scale_x);constants[20]=std::bit_cast<UINT>(scale_y);
@@ -541,6 +565,7 @@ void HdrProxy::record_prepare(ID3D12GraphicsCommandList* list,
                               ID3D12Resource* source,bool use_game_motion,
                               float scale_x,float scale_y,
                               D3D12_RESOURCE_STATES source_state) {
+    if(ts_heap_ && ts_readback_) list->EndQuery(ts_heap_,D3D12_QUERY_TYPE_TIMESTAMP,2);
     if(resource_lease_) {
         resource_lease_->proof().prepare_recorded();
         const auto reuse=hdr_reuse_transitions(proxy_.Get(),nr_motion_.Get(),resource_initial_);
@@ -558,6 +583,10 @@ void HdrProxy::record_prepare(ID3D12GraphicsCommandList* list,
         transition(nr_motion_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
     list->ResourceBarrier(3,done);
+    if(ts_heap_ && ts_readback_) {
+        list->EndQuery(ts_heap_,D3D12_QUERY_TYPE_TIMESTAMP,3);
+        list->ResolveQueryData(ts_heap_,D3D12_QUERY_TYPE_TIMESTAMP,0,4,ts_readback_,0);
+    }
 }
 bool HdrProxy::record_composite(ID3D12GraphicsCommandList* list,
     ID3D12Resource* source,ID3D12Resource* nr_result,
@@ -590,9 +619,20 @@ bool HdrProxy::record_composite(ID3D12GraphicsCommandList* list,
     }
     if(private_descriptors) {
         if(composite_heap_) return false;
-        D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,5,
-            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
-        if(FAILED(device_->CreateDescriptorHeap(&desc,IID_PPV_ARGS(composite_heap_.GetAddressOf())))) return false;
+        // The exclusive lease is acquired only after the previous frame retires.
+        // Keep this heap separate: prepare may still be reading its own heap.
+        if(resource_lease_ && g_composite_heap_reuse.load(std::memory_order_relaxed)) {
+            composite_heap_=resource_lease_->bundle().composite_heap;
+            diag_composite_heap_kind_=1u;
+            g_pooled_private_composite_count.fetch_add(1,std::memory_order_relaxed);
+        }
+        else {
+            D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,5,
+                D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+            if(FAILED(device_->CreateDescriptorHeap(&desc,IID_PPV_ARGS(composite_heap_.GetAddressOf())))) return false;
+            diag_composite_heap_kind_=2u;
+            g_unique_composite_heap_creates.fetch_add(1,std::memory_order_relaxed);
+        }
         const auto handle=[&](UINT slot) {auto h=composite_heap_->GetCPUDescriptorHandleForHeapStart();
             h.ptr+=SIZE_T(slot)*stride_;return h;};
         srv(device_.Get(),source,source_format_,handle(0));
@@ -606,6 +646,7 @@ bool HdrProxy::record_composite(ID3D12GraphicsCommandList* list,
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
         transition(xess_input,xess_input_state,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS)};
+    if(ts_heap_ && ts_readback_) list->EndQuery(ts_heap_,D3D12_QUERY_TYPE_TIMESTAMP,4);
     list->ResourceBarrier(2,ready);
     bind(list,composite_.Get(),false,1,1,private_descriptors?composite_heap_.Get():nullptr);
     D3D12_RESOURCE_BARRIER done[2]={
@@ -614,6 +655,10 @@ bool HdrProxy::record_composite(ID3D12GraphicsCommandList* list,
         transition(xess_input,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                    xess_input_state)};
     list->ResourceBarrier(2,done);
+    if(ts_heap_ && ts_readback_) {
+        list->EndQuery(ts_heap_,D3D12_QUERY_TYPE_TIMESTAMP,5);
+        list->ResolveQueryData(ts_heap_,D3D12_QUERY_TYPE_TIMESTAMP,4,2,ts_readback_,4*sizeof(uint64_t));
+    }
     return true;
 }
 }

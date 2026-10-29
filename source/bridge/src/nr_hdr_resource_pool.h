@@ -308,7 +308,7 @@ struct HdrResourceBundle {
     Microsoft::WRL::ComPtr<IUnknown> identity;
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     Microsoft::WRL::ComPtr<ID3D12Resource> proxy,motion;
-    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap,composite_heap;
     // Pending also owns these originals. Retain descriptor references inside
     // quarantine even if a standalone caller mistakenly drops its HdrProxy.
     Microsoft::WRL::ComPtr<ID3D12Resource> bound_source,bound_motion,bound_xess,bound_nr_result;

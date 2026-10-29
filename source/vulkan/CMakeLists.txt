@@ -17,10 +17,10 @@ target_link_libraries(port_network_bridge_backend PRIVATE bcrypt)
 target_link_options(port_network_bridge_backend PRIVATE
   /EXPORT:nrvk_backend_probe /EXPORT:nrvk_backend_init /EXPORT:nrvk_backend_frame
   /EXPORT:nrvk_backend_release /EXPORT:port_network_bridge_backend_submit_result
-  /EXPORT:port_network_bridge_backend_last_error)
+  /EXPORT:port_network_bridge_backend_last_error /EXPORT:nrvk_backend_set_timestamp_query)
 add_library(nrvk_bridge SHARED nrb_vulkan_processor.cpp)
 target_link_libraries(nrvk_bridge PRIVATE port_backend bcrypt d3d12 dxgi)
-target_link_options(nrvk_bridge PRIVATE /EXPORT:NRVK_AttachToBridge /EXPORT:NRVK_Shutdown /EXPORT:NRVK_InteropSelfTestD3D12)
+target_link_options(nrvk_bridge PRIVATE /EXPORT:NRVK_AttachToBridge /EXPORT:NRVK_Shutdown /EXPORT:NRVK_InteropSelfTestD3D12 /EXPORT:NRVK_DiagSetState /EXPORT:NRVK_DiagGetLastCpuSubstage /EXPORT:NRVK_DiagHarvestRetired /EXPORT:NRVK_DiagGetRecords /EXPORT:NRVK_DiagGetDeviceInfo)
 add_executable(port_queue_backend_cpu port_queue_backend_cpu.cpp)
 target_link_libraries(port_queue_backend_cpu PRIVATE bcrypt)
 add_executable(nrvk_bridge_cpu_abi nrvk_bridge_cpu_abi.cpp)

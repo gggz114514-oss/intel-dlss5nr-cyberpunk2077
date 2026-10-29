@@ -132,6 +132,7 @@ def main() -> int:
                         help="New/empty local output directory; generated files must not be committed")
     parser.add_argument("--raw-only", action="store_true",
                         help="Only verified raw tensors/NRMODEL1; skip NumPy-based B580 packing")
+    parser.add_argument("--full-model", type=Path, help="Optimized Full model directory for the Small shared blend scalar")
     args = parser.parse_args()
     output = args.out.resolve()
     if not args.raw_only and importlib.util.find_spec("numpy") is None:
@@ -147,6 +148,7 @@ def main() -> int:
                 "--extracted", str(output / "model" / "extracted"),
                 "--out", str(output / "assets" / "cold"),
                 "--manifest", str(output / "manifest"),
+                *(["--full-model", str(args.full_model.resolve())] if args.full_model else []),
             ], check=True)
             cold = json.loads((output / "manifest" / "cold_resources_index.json").read_text(encoding="utf-8"))
             summary = {

@@ -485,6 +485,7 @@ def main():
     parser.add_argument("--extracted", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--full-model", type=Path, help="Built Full model directory; supplies the accepted Small blend scalar")
     args = parser.parse_args()
     PROFILE = json.loads((Path(__file__).with_name("model_profiles.json")).read_text(encoding="utf-8"))[args.profile]
     EXTRACTED = args.extracted.resolve()
@@ -526,6 +527,43 @@ def main():
     blend = (EXTRACTED / "inventory" / "weights" / f"block{post}.layer0.blend_scale.bin").read_bytes()
     assert len(blend) == 2
     save_cold(f"ioport_{post}_ioport_blend_scale", "ioport_blend_scale.fp16.bin", blend + bytes(2), index)
+
+    # Accepted FP16 layouts: permute half words, never requantize model values.
+    network = Path(__file__).resolve().parents[1] / PROFILE['network_dir']
+    transforms = json.loads((network / 'weight-transforms.json').read_text(encoding='utf-8'))
+    originals = dict(index)
+    for recipe in transforms:
+        source = originals[recipe['input']]
+        if source['sha256'] != recipe['input_sha256']:
+            raise ValueError('Weight transform input identity: ' + recipe['name'])
+        data = Path(source['path']).read_bytes()
+        values = np.frombuffer(data, dtype='<u2')
+        result = values.copy()
+        for offset, count, kind in recipe['regions']:
+            part = values[offset:offset + count]
+            if kind == 'transpose16':
+                mapped = part.reshape(-1, 16, 16).transpose(0, 2, 1).reshape(-1)
+            elif kind == 'tile256':
+                mapped = part.reshape(16, 16, 16, 16).transpose(0, 2, 1, 3).reshape(-1)
+            else:
+                raise ValueError('Unknown weight permutation: ' + kind)
+            result[offset:offset + count] = mapped
+        packed = result.tobytes()
+        if hashlib.sha256(packed).hexdigest() != recipe['output_sha256']:
+            raise ValueError('Weight transform output identity: ' + recipe['name'])
+        save_cold(recipe['name'], recipe['name'] + '.fp16.bin', packed, index)
+    expected = json.loads((network / 'cold-hashes.json').read_text(encoding='utf-8'))
+    if args.profile == 'small':
+        if args.full_model is None:
+            raise ValueError('Optimized Small requires --full-model from the optimized vk102 build')
+        full = json.loads((args.full_model / 'manifest/cold_resources_index.json').read_text(encoding='utf-8'))
+        resource = full['ioport_70_ioport_blend_scale']
+        data = Path(resource['path']).read_bytes()
+        save_cold('ioport_30_ioport_blend_scale', 'ioport_blend_scale.fp16.bin', data, index)
+    index = {name: index[name] for name in expected}
+    for name, record in index.items():
+        if (record['sha256'], record['bytes']) != (expected[name]['sha256'], expected[name]['bytes']):
+            raise ValueError('Accepted cold resource mismatch: ' + name)
 
     manifest_dir = args.manifest.resolve()
     manifest_dir.mkdir(parents=True, exist_ok=True)

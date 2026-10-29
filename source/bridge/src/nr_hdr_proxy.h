@@ -8,6 +8,13 @@
 #include "nr_hdr_resource_pool.h"
 
 namespace nrb {
+struct HdrCompositeHeapDiagStats {
+    uint64_t pooled_private_composite_count=0;
+    uint64_t unique_composite_heap_creates=0;
+};
+void hdr_set_composite_heap_reuse(bool enabled);
+bool hdr_composite_heap_reuse_enabled();
+HdrCompositeHeapDiagStats hdr_composite_heap_diag_stats();
 struct HdrProxyCacheStats {
     // Lifetime monotonic counters. Take deltas; stats() does not reset them.
     uint64_t bytecode_hits=0,source_reads=0,source_hashes=0;
@@ -103,6 +110,9 @@ public:
     ID3D12Resource* proxy_color() const {return proxy_.Get();}
     ID3D12Resource* nr_motion() const {return nr_motion_.Get();}
     bool game_motion_available() const {return game_motion_available_;}
+    void set_timestamp_query_target(ID3D12QueryHeap* heap,ID3D12Resource* readback) {ts_heap_=heap;ts_readback_=readback;}
+    uint32_t diag_pool_alloc_kind() const {return diag_pool_alloc_kind_;}
+    uint32_t diag_composite_heap_kind() const {return diag_composite_heap_kind_;}
     // Developer verification accessors (gpu check harness only).
     DXGI_FORMAT source_format_for_test() const {return source_format_;}
     bool source_fp16_for_test() const {return source_fp16_;}
@@ -129,6 +139,10 @@ private:
     UINT style_mode_=0;
     D3D12_RESOURCE_STATES resource_initial_=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     std::unique_ptr<HdrProxyResourcePool::Lease> resource_lease_;
+    ID3D12QueryHeap* ts_heap_=nullptr;
+    ID3D12Resource* ts_readback_=nullptr;
+    uint32_t diag_pool_alloc_kind_=0;
+    uint32_t diag_composite_heap_kind_=0;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu(UINT index) const;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu(UINT index) const;
     void bind(ID3D12GraphicsCommandList* list,ID3D12PipelineState* pipeline,

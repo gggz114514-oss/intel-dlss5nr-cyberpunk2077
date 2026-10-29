@@ -8,3 +8,7 @@
 - NVIDIA's DLL/weights/SDK redistributables, Intel/AMD upscaler libraries and game files are excluded. Users obtain them separately under their applicable terms.
 
 No vendor endorsement or model redistribution right is asserted. The seven user-supplied screenshots in `docs/images/` are published as documentation illustrations, with game and third-party visual rights retained by their respective owners. Runtime fixtures, test outputs, model data, native binaries and compiled shaders are excluded.
+
+## Optimized Vulkan backend attribution (2026-10-29)
+
+The current Vulkan backend substantially references mochizuki0323 / DLSSNR-AMD (望月), including network organization and producer/consumer layouts, beyond extraction tools. See [attribution and migration boundaries](docs/optimization/AMD-ATTRIBUTION.md). Both new shader directories retain the upstream MIT notice.

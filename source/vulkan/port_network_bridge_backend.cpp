@@ -50,7 +50,7 @@ struct NRVK_Backend {
     size_t pre=0,post=0,output=0;
     bool record_pending=false,history_committed=false;
     uint64_t pending_frame=0,pending_epoch=0,committed_frame=0,committed_epoch=0;
-    VkFence last_network_fence=VK_NULL_HANDLE;
+    VkFence last_network_fence=VK_NULL_HANDLE; VkQueryPool ts_query_pool=VK_NULL_HANDLE; uint32_t ts_base_query=0; PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp=nullptr;
 #define FN(f) PFN_##f f=nullptr;
     DEVICE_FUNCTIONS(FN)
 #undef FN
@@ -222,7 +222,7 @@ extern "C" int nrvk_backend_init(VkInstance instance,VkDevice device,VkPhysicalD
         auto gipa=reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(b->loader,"vkGetInstanceProcAddr"));
         auto gdpa=reinterpret_cast<PFN_vkGetDeviceProcAddr>(gipa(instance,"vkGetDeviceProcAddr"));
 #define LOAD(f) b->f=reinterpret_cast<PFN_##f>(gdpa(device,#f));if(!b->f)throw std::runtime_error("missing device function " #f);
-        DEVICE_FUNCTIONS(LOAD)
+        DEVICE_FUNCTIONS(LOAD) b->vkCmdWriteTimestamp=reinterpret_cast<PFN_vkCmdWriteTimestamp>(gdpa(device,"vkCmdWriteTimestamp"));
 #undef LOAD
         failure=-3;auto props=reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(gipa(instance,"vkGetPhysicalDeviceProperties2"));
         VkPhysicalDeviceProperties2 physical{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};props(phy,&physical);
@@ -267,6 +267,7 @@ static bool frame_supported(NRVK_Backend* b,const PortNetworkBridgeFrameIO& io) 
         (io.images[4].format==VK_FORMAT_R16G16B16A16_SFLOAT||io.images[4].format==VK_FORMAT_R32G32B32A32_SFLOAT)&&io.nrb_controls.abi_size==sizeof(NRB_Controls)&&io.nrb_controls.input_height==720&&
         io.model_controls[9]==1280.0f&&io.model_controls[10]==720.0f;
 }
+extern "C" void nrvk_backend_set_timestamp_query(NRVK_Backend* b,VkQueryPool pool,uint32_t base_query) { if(!b)return; b->ts_query_pool=pool; b->ts_base_query=base_query; }
 extern "C" int nrvk_backend_frame(NRVK_Backend* b,VkCommandBuffer cb,const NRVK_BackendFrameIO* base) {
     if(!b||!cb||!base||!base->params){last_error="frame context/cb/params missing";return -1;}
     if(base->abi_size!=sizeof(PortNetworkBridgeFrameIO)){last_error="v3 lacks actual image metadata/frame_id/control_epoch/controls20: use independent PortNetworkBridgeFrameIO tail";return -6;}
@@ -285,6 +286,8 @@ extern "C" int nrvk_backend_frame(NRVK_Backend* b,VkCommandBuffer cb,const NRVK_
         else if(i==5){w.dstSet=b->scatter_set;w.dstBinding=0;w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;w.pBufferInfo=&buffers[2];}
         else{w.dstSet=b->scatter_set;w.dstBinding=1;w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;w.pImageInfo=&images[3];}}
     b->vkUpdateDescriptorSets(b->device,7,writes,0,nullptr);
+    auto write_ts=[&](VkPipelineStageFlagBits stage,uint32_t offset){ if(b->ts_query_pool!=VK_NULL_HANDLE&&b->vkCmdWriteTimestamp) b->vkCmdWriteTimestamp(cb,stage,b->ts_query_pool,b->ts_base_query+offset); };
+    write_ts(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,1);
     // Global compute execution dependency preserves pool alias WAR ordering
     // across submissions. WB's producer wait/acquire precedes this segment.
     barrier(b,cb,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT|VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -302,6 +305,7 @@ extern "C" int nrvk_backend_frame(NRVK_Backend* b,VkCommandBuffer cb,const NRVK_
     for(auto& h:b->plan.history){if(history){VkBufferCopy copy{h.sourceOffset,h.destinationOffset,h.bytes};b->vkCmdCopyBuffer(cb,b->plan.buffers[h.source].handle,b->plan.buffers[h.destination].handle,1,&copy);}
         b->vkCmdUpdateBuffer(cb,b->plan.buffers[h.destination].handle,h.controlsOffset,sizeof(controls),controls);}
     barrier(b,cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);
+    write_ts(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,2);
     auto& pre=b->plan.passes.front().push;auto& post=b->plan.passes.back().push;
     // Frozen IO-buffer offsets from the ioport contract. These are layout
     // constants, not indices into the unrelated first-pass push constants:
@@ -314,6 +318,7 @@ extern "C" int nrvk_backend_frame(NRVK_Backend* b,VkCommandBuffer cb,const NRVK_
     b->vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,b->gather.handle);b->vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,b->gather.layout,0,1,&b->gather_set,0,nullptr);
     b->vkCmdPushConstants(cb,b->gather.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(gather_push),gather_push);b->vkCmdDispatch(cb,3600,1,1);
     barrier(b,cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);
+    write_ts(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,3);
     for(size_t i=0;i<b->plan.passes.size();++i){auto& pass=b->plan.passes[i];bool clearing=false;
         for(auto& x:b->plan.buffers)if(!x.resident&&x.firstPass==i&&x.clearFirst){if(!clearing)barrier(b,cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);clearing=true;b->vkCmdFillBuffer(cb,x.handle,0,VK_WHOLE_SIZE,0);}
         if(clearing)barrier(b,cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);
@@ -322,10 +327,12 @@ extern "C" int nrvk_backend_frame(NRVK_Backend* b,VkCommandBuffer cb,const NRVK_
         if(!push.empty())b->vkCmdPushConstants(cb,pipe.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,uint32_t(push.size()*4),push.data());b->vkCmdDispatch(cb,pass.gx,pass.gy,pass.gz);
         barrier(b,cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);
     }
+    write_ts(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,4);
     const Pipeline& scatter=io.images[4].format==VK_FORMAT_R32G32B32A32_SFLOAT?b->scatter32:b->scatter;
     uint32_t scatter_push[]={p.output_base_x,p.output_base_y,1280,720};b->vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,scatter.handle);b->vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,scatter.layout,0,1,&b->scatter_set,0,nullptr);
     b->vkCmdPushConstants(cb,scatter.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(scatter_push),scatter_push);b->vkCmdDispatch(cb,3600,1,1);
     barrier(b,cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT);
+    write_ts(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,5);
     b->record_pending=true;b->pending_frame=io.frame_id;b->pending_epoch=io.control_epoch;last_error.clear();return 0;
 }
 extern "C" int port_network_bridge_backend_submit_result(NRVK_Backend* b,VkFence fence,VkResult result) {

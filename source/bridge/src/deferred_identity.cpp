@@ -1,4 +1,6 @@
 #include "deferred_identity.h"
+#include <cstdio>
+#include <unordered_map>
 #include <wrl/client.h>
 #include <atomic>
 #include <mutex>
@@ -35,6 +37,8 @@ struct FrameCommands {
     ComPtr<ID3D12CommandAllocator> prep_allocator, deferred_allocator, composite_allocator;
     ComPtr<ID3D12GraphicsCommandList> prep_list, deferred_list, composite_list;
     ComPtr<ID3D12Resource> color_copy;
+    ComPtr<ID3D12QueryHeap> ts_heap;
+    ComPtr<ID3D12Resource> ts_readback;
     D3D12_RESOURCE_DESC color_desc{};
     D3D12_RESOURCE_STATES color_state = D3D12_RESOURCE_STATE_COPY_DEST;
     bool color_state_known = true;
@@ -81,6 +85,8 @@ FrameCommands* acquire_frame_commands(ID3D12Device* device,
         fc->deferred_list.Reset(); fc->deferred_allocator.Reset();
         fc->composite_list.Reset(); fc->composite_allocator.Reset();
         fc->color_copy.Reset();
+        fc->ts_heap.Reset();
+        fc->ts_readback.Reset();
         fc->device = device;
     }
     const auto ensure = [&](ComPtr<ID3D12CommandAllocator>& allocator,
@@ -131,6 +137,31 @@ FrameCommands* acquire_frame_commands(ID3D12Device* device,
         fc->color_state = D3D12_RESOURCE_STATE_COPY_DEST;
         fc->color_state_known = true;
     }
+    if (!fc->ts_heap || !fc->ts_readback) {
+        fc->ts_heap.Reset();
+        fc->ts_readback.Reset();
+        D3D12_QUERY_HEAP_DESC qhd{};
+        qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qhd.Count = 8;
+        qhd.NodeMask = 0;
+        if (SUCCEEDED(device->CreateQueryHeap(&qhd, IID_PPV_ARGS(fc->ts_heap.GetAddressOf())))) {
+            D3D12_HEAP_PROPERTIES hp_rb{};
+            hp_rb.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = 8 * sizeof(uint64_t);
+            rd.Height = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(device->CreateCommittedResource(&hp_rb, D3D12_HEAP_FLAG_NONE,
+                    &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    IID_PPV_ARGS(fc->ts_readback.GetAddressOf())))) {
+                fc->ts_heap.Reset();
+            }
+        }
+    }
     return fc;
 }
 void release_frame_commands(FrameCommands* fc) {
@@ -153,6 +184,8 @@ struct Pending {
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> deferred_list;
     ComPtr<ID3D12Resource> color_copy;
+    ComPtr<ID3D12QueryHeap> ts_heap;
+    ComPtr<ID3D12Resource> ts_readback;
     ComPtr<ID3D12Resource> original_color,output,motion,depth,exposure;
     ComPtr<ID3D12Fence> completion;
     FrameCommands* frame_commands=nullptr;
@@ -188,10 +221,34 @@ struct Pending {
     std::chrono::steady_clock::time_point nr_prepared{};
     std::chrono::steady_clock::time_point nr_modeled{};
     std::chrono::steady_clock::time_point nr_pre_sr{};
+    std::chrono::steady_clock::time_point submit_entry_tp{};
+    std::chrono::steady_clock::time_point submit_return_tp{};
+    uint64_t pending_seq=0;
+    uint32_t diag_record_mode=0;
+    uint32_t diag_window_id=0;
+    uint32_t diag_arm_reuse=0;
+    uint32_t diag_late_latch=1;
+    uint64_t retire_prev_start_qpc=0;
+    uint64_t retire_prev_end_qpc=0;
+    uint32_t had_prev_proc=0;
+    uint32_t had_net_fence=0;
+    uint64_t nr_started_qpc=0;
+    uint64_t nr_prepared_qpc=0;
+    uint64_t vk_wait_start_qpc=0;
+    uint64_t vk_wait_end_qpc=0;
+    uint64_t nr_modeled_qpc=0;
+    uint64_t nr_pre_sr_qpc=0;
+    uint64_t deferred_exec_end_qpc=0;
+    uint64_t tail_submit_end_qpc=0;
+    uint64_t submit_return_qpc=0;
+    uint64_t tail_wait_start_qpc=0;
+    uint64_t tail_wait_end_qpc=0;
+    uint64_t ended_qpc=0;
 #endif
     bool submitted=false;
+    bool retired_done=false;
+    void release_retired_resources() {
 #ifdef NRB_LIVE_NR_TEST
-    ~Pending() {
         if(hdr && hdr->resource_proof()) {
             // Remove every private record before a pristine/terminal lease can
             // become free. No private list is exported outside this Pending.
@@ -200,10 +257,17 @@ struct Pending {
                 prep_list.Reset();deferred_list.Reset();composite_list.Reset();
                 hdr->finish_resource_lease();
             } else hdr->quarantine_resource_lease();
+            hdr.reset();
         }
-        if(frame_commands) release_frame_commands(frame_commands);
-    }
 #endif
+        if(frame_commands) {
+            release_frame_commands(frame_commands);
+            frame_commands=nullptr;
+        }
+    }
+    ~Pending() {
+        release_retired_resources();
+    }
 };
 std::recursive_mutex pending_mutex;
 std::vector<std::unique_ptr<Pending>> pending;
@@ -274,6 +338,190 @@ std::atomic<bool> nr_failed{false};
 std::atomic<uint64_t> frame_serial{0};
 std::atomic<unsigned> hdr_ready{0};
 std::atomic<unsigned> motion_probe_claimed{0};
+
+struct NrvkDiagFrameRecordMirror {
+    uint64_t frame_id;
+    uint64_t returned_seq;
+    uint32_t window_id;
+    uint32_t arm_reuse;
+    uint32_t slot_index;
+    uint32_t copy_slot;
+    uint32_t had_network_fence_pending;
+    uint32_t d3d_valid;
+    uint32_t vk_valid;
+    uint32_t vk_valid_bits;
+    uint64_t wait_fences_start_qpc;
+    uint64_t wait_fences_end_qpc;
+    uint64_t d3d_freq_hz;
+    double   vk_timestamp_period_ns;
+    uint64_t d4_tick;
+    uint64_t d5_tick;
+    uint64_t v_ticks[7];
+};
+
+struct BridgeDiagFrameRecord {
+    uint64_t frame_id = 0;
+    uint64_t pending_seq = 0;
+    uint64_t completed_index = 0;
+    uint32_t window_id = 0;
+    uint32_t diag_mode = 0;
+    uint32_t arm_reuse = 0;
+    uint32_t late_latch = 1;
+    uint32_t prepared_bypassed = 0;
+    uint32_t private_descriptors = 0;
+    uint32_t pool_alloc_kind = 0;
+    uint32_t composite_heap_kind = 0;
+    uint32_t had_previous_processor = 0;
+    uint32_t had_network_fence_pending = 0;
+    uint32_t d3d_valid = 0;
+    uint64_t qpc_freq_hz = 0;
+    uint64_t d3d_freq_hz = 0;
+    double prep_ms = 0.0;
+    double host_ms = 0.0;
+    double composite_submit_ms = 0.0;
+    double tail_ms = 0.0;
+    double total_ms = 0.0;
+    double record_total_ms = 0.0;
+    double record_resources_ms = 0.0;
+    double record_hdr_ms = 0.0;
+    double record_xess_ms = 0.0;
+    double submit_gap_ms = 0.0;
+    double end_to_end_ms = 0.0;
+    double retire_prev_cpu_ms = 0.0;
+    double prep_wait_cpu_ms = 0.0;
+    double vk_wait_fences_cpu_ms = 0.0;
+    double vk_record_submit_cpu_ms = 0.0;
+    double composite_submit_cpu_ms = 0.0;
+    double tail_sr_exec_cpu_ms = 0.0;
+    double tail_post_sr_submit_cpu_ms = 0.0;
+    double tail_submit_cpu_ms = 0.0;
+    double tail_wait_cpu_ms = 0.0;
+    double tail_retire_cpu_ms = 0.0;
+    uint64_t d_ticks[8] {};
+};
+
+std::atomic<bool> g_diag_active{false};
+std::atomic<uint32_t> g_diag_mode{0};
+std::atomic<uint32_t> g_diag_window_id{0};
+std::atomic<uint32_t> g_diag_arm_reuse{1};
+std::atomic<uint32_t> g_diag_late_latch{1};
+std::atomic<uint64_t> g_diag_pending_seq{0};
+uint32_t g_last_flush_seq = 0;
+uint32_t g_last_reset_seq = 0;
+uint64_t g_qpc_freq_hz = 0;
+uint64_t g_d3d_freq_hz = 0;
+uint64_t g_bridge_d3d_unavail = 0;
+uint64_t g_bridge_diag_overflow = 0;
+std::wstring g_diag_out_dir;
+
+std::vector<BridgeDiagFrameRecord>& bridge_diag_records() {
+    static auto* vec = [] {
+        auto* v = new std::vector<BridgeDiagFrameRecord>();
+        v->reserve(32768);
+        return v;
+    }();
+    return *vec;
+}
+
+uint64_t qpc_now() {
+    LARGE_INTEGER li{};
+    QueryPerformanceCounter(&li);
+    return (uint64_t)li.QuadPart;
+}
+
+uint64_t ensure_qpc_freq() {
+    if (!g_qpc_freq_hz) {
+        LARGE_INTEGER lf{};
+        if (QueryPerformanceFrequency(&lf) && lf.QuadPart > 0)
+            g_qpc_freq_hz = (uint64_t)lf.QuadPart;
+    }
+    return g_qpc_freq_hz;
+}
+
+double qpc_diff_ms(uint64_t t0, uint64_t t1, uint64_t freq) {
+    if (!freq || !t0 || t1 < t0) return 0.0;
+    return (double)(t1 - t0) * 1000.0 / (double)freq;
+}
+
+void nrvk_set_diag_state(uint32_t mode, uint32_t window_id, uint32_t arm_reuse) {
+    HMODULE mod = GetModuleHandleW(L"nrvk_bridge.dll");
+    if (!mod) return;
+    using Fn = void (*)(uint32_t, uint32_t, uint32_t);
+    static Fn fn = nullptr;
+    static HMODULE cached_mod = nullptr;
+    if (cached_mod != mod || !fn) {
+        cached_mod = mod;
+        fn = reinterpret_cast<Fn>(GetProcAddress(mod, "NRVK_DiagSetState"));
+    }
+    if (fn) fn(mode, window_id, arm_reuse);
+}
+
+void nrvk_get_last_cpu_substage(uint32_t* had_fence, uint64_t* wait_start_qpc, uint64_t* wait_end_qpc) {
+    if (had_fence) *had_fence = 0;
+    if (wait_start_qpc) *wait_start_qpc = 0;
+    if (wait_end_qpc) *wait_end_qpc = 0;
+    HMODULE mod = GetModuleHandleW(L"nrvk_bridge.dll");
+    if (!mod) return;
+    using Fn = void (*)(uint64_t*, uint32_t*, uint64_t*, uint64_t*);
+    static Fn fn = nullptr;
+    static HMODULE cached_mod = nullptr;
+    if (cached_mod != mod || !fn) {
+        cached_mod = mod;
+        fn = reinterpret_cast<Fn>(GetProcAddress(mod, "NRVK_DiagGetLastCpuSubstage"));
+    }
+    uint64_t fid = 0;
+    if (fn) fn(&fid, had_fence, wait_start_qpc, wait_end_qpc);
+}
+
+void nrvk_harvest_retired() {
+    HMODULE mod = GetModuleHandleW(L"nrvk_bridge.dll");
+    if (!mod) return;
+    using Fn = void (*)(void);
+    static Fn fn = nullptr;
+    static HMODULE cached_mod = nullptr;
+    if (cached_mod != mod || !fn) {
+        cached_mod = mod;
+        fn = reinterpret_cast<Fn>(GetProcAddress(mod, "NRVK_DiagHarvestRetired"));
+    }
+    if (fn) fn();
+}
+
+void nrvk_get_records(const NrvkDiagFrameRecordMirror** out_data, uint32_t* out_count,
+                      uint64_t* out_d3d_unavail, uint64_t* out_vk_unavail, uint64_t* out_overflow) {
+    if (out_data) *out_data = nullptr;
+    if (out_count) *out_count = 0;
+    if (out_d3d_unavail) *out_d3d_unavail = 0;
+    if (out_vk_unavail) *out_vk_unavail = 0;
+    if (out_overflow) *out_overflow = 0;
+    HMODULE mod = GetModuleHandleW(L"nrvk_bridge.dll");
+    if (!mod) return;
+    using Fn = void (*)(const void**, uint32_t*, uint64_t*, uint64_t*, uint64_t*);
+    static Fn fn = nullptr;
+    static HMODULE cached_mod = nullptr;
+    if (cached_mod != mod || !fn) {
+        cached_mod = mod;
+        fn = reinterpret_cast<Fn>(GetProcAddress(mod, "NRVK_DiagGetRecords"));
+    }
+    const void* raw = nullptr;
+    if (fn) fn(&raw, out_count, out_d3d_unavail, out_vk_unavail, out_overflow);
+    if (out_data) *out_data = static_cast<const NrvkDiagFrameRecordMirror*>(raw);
+}
+
+void nrvk_get_device_info(uint64_t* out_d3d_freq, double* out_vk_period, uint32_t* out_vk_bits) {
+    if (out_d3d_freq) *out_d3d_freq = 0;
+    if (out_vk_period) *out_vk_period = 0.0;
+    if (out_vk_bits) *out_vk_bits = 0;
+    HMODULE mod = GetModuleHandleW(L"nrvk_bridge.dll");
+    if (!mod) return;
+    using Fn = void (*)(uint64_t*, double*, uint32_t*);
+    static Fn fn = nullptr;
+    static HMODULE cached_mod = nullptr;
+    if (cached_mod != mod || !fn) {
+        cached_mod = mod;
+        fn = reinterpret_cast<Fn>(GetProcAddress(mod, "NRVK_DiagGetDeviceInfo"));
+    }
+    if (fn) fn(out_d3d_freq, out_vk_period, out_vk_bits);
+}
 #endif
 std::once_flag trigger_path_once;
 std::wstring trigger_path;
@@ -365,27 +613,231 @@ bool retire_previous_for_reuse(Pending& previous,ID3D12CommandQueue* queue) {
     return ok;
 }
 #endif
-void reap_locked() {
-    for(size_t i=0;i<pending.size();) {
-        const uint64_t done=pending[i]->submitted?
-            pending[i]->completion->GetCompletedValue():0;
-        if(done>=1 && done!=UINT64_MAX) {
+bool retire_submitted_pending(Pending& item, ID3D12CommandQueue* queue, bool wait_if_incomplete, void (*log)(const char*)) {
+    if (item.retired_done) return true;
+    if (!item.submitted) return false;
 #ifdef NRB_LIVE_NR_TEST
-            if(pending[i]->hdr && pending[i]->hdr->resource_proof()) {
-                if(!pool_terminal_proof(*pending[i],done)) {++i;continue;}
-            } else {
-                auto& item=*pending[i];
-                if(item.nr_processor_called && !item.nr_helper_retired) {
-                    bool ok=false;
-                    try {ok=item.nr_submitted && item.nr_processor.retire &&
-                        SUCCEEDED(item.device->GetDeviceRemovedReason()) &&
-                        item.nr_processor.retire(item.nr_processor.context,item.completion.Get(),1)==0;}
-                    catch(...) {}
-                    if(!ok) {nr_failed.store(true);gpuhandoff::process_failed();++i;continue;}
-                    item.nr_helper_retired=true;item.nr_submitted=false;
+    if (!g_d3d_freq_hz && queue) queue->GetTimestampFrequency(&g_d3d_freq_hz);
+    if (!item.nr_submitted) {
+        const uint64_t done = item.completion ? item.completion->GetCompletedValue() : 0;
+        if (done >= 1 && done != UINT64_MAX) {
+            if (item.hdr && item.hdr->resource_proof()) {
+                if (!pool_terminal_proof(item, done)) return false;
+            } else if (item.nr_processor_called && !item.nr_helper_retired) {
+                bool ok = false;
+                try {
+                    ok = item.nr_processor.retire &&
+                         SUCCEEDED(item.device->GetDeviceRemovedReason()) &&
+                         item.nr_processor.retire(item.nr_processor.context, item.completion.Get(), 1) == 0;
+                } catch (...) {}
+                if (!ok) { nr_failed.store(true); gpuhandoff::process_failed(); return false; }
+                item.nr_helper_retired = true;
+            }
+            item.release_retired_resources();
+            item.retired_done = true;
+            flashdiag::recorder.finish(item.diagnostic, item.diagnostic_reason);
+            return true;
+        }
+        return false;
+    }
+
+    if (!wait_if_incomplete) {
+        const uint64_t pre_done = item.completion ? item.completion->GetCompletedValue() : 0;
+        if (pre_done < 1 || pre_done == UINT64_MAX) return false;
+    }
+
+    const uint32_t tail_diag_mode = g_diag_mode.load(std::memory_order_relaxed);
+    const auto wait_started_tp = item.nr_timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (tail_diag_mode >= 1) item.tail_wait_start_qpc = qpc_now();
+    uint64_t completed_value = item.completion ? item.completion->GetCompletedValue() : 0;
+    HANDLE event = nullptr;
+    HRESULT registered = S_OK;
+    DWORD waited = WAIT_OBJECT_0;
+    if (completed_value < 1) {
+        event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        registered = event ? item.completion->SetEventOnCompletion(1, event) : E_FAIL;
+        waited = (event && SUCCEEDED(registered)) ? WaitForSingleObject(event, 10000) : WAIT_FAILED;
+        completed_value = item.completion->GetCompletedValue();
+        if (event) CloseHandle(event);
+    }
+    const bool done = (completed_value >= 1 && completed_value != UINT64_MAX) &&
+        (!event || (SUCCEEDED(registered) && waited == WAIT_OBJECT_0)) &&
+        SUCCEEDED(item.device->GetDeviceRemovedReason());
+    if (tail_diag_mode >= 1) item.tail_wait_end_qpc = qpc_now();
+    bool retired_ok = false;
+    if (item.hdr && item.hdr->resource_proof()) {
+        retired_ok = done && pool_terminal_proof(item, completed_value);
+        if (!retired_ok) item.hdr->quarantine_resource_lease();
+    } else {
+        try {
+            retired_ok = done && (item.nr_helper_retired ||
+                item.nr_processor.retire(item.nr_processor.context, item.completion.Get(), 1) == 0);
+        } catch (...) { retired_ok = false; }
+    }
+    if (retired_ok) {
+        item.nr_submitted = false;
+        item.nr_helper_retired = true;
+        item.diagnostic.stage_bits |= flashdiag::bit(flashdiag::Stage::retired);
+        flashdiag::recorder.count(flashdiag::Counter::nr_retired);
+        const auto ended = item.nr_timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (tail_diag_mode >= 1) item.ended_qpc = qpc_now();
+        const uint64_t completed = nr_completed.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (item.nr_timed && nr_timing_enabled.load(std::memory_order_acquire) &&
+            item.nr_timing_epoch == nr_timing_epoch.load(std::memory_order_acquire)) {
+            std::lock_guard timing_guard(nr_timing_mutex);
+            if (item.nr_timed && nr_timing_enabled.load(std::memory_order_relaxed) &&
+                item.nr_timing_epoch == nr_timing_epoch.load(std::memory_order_relaxed)) {
+                const auto millis = [](auto begin, auto end) {
+                    return std::chrono::duration<double, std::milli>(end - begin).count();
+                };
+                const double prep = millis(item.nr_started, item.nr_prepared);
+                const double host = millis(item.nr_prepared, item.nr_modeled);
+                const double composite = millis(item.nr_modeled, item.nr_pre_sr);
+                const bool has_split_tail = (item.submit_return_qpc != 0);
+                const double tail = has_split_tail
+                    ? std::max(0.0, millis(item.nr_pre_sr, item.submit_return_tp)) +
+                      std::max(0.0, millis(wait_started_tp, ended))
+                    : millis(item.nr_pre_sr, ended);
+                const double ms = has_split_tail
+                    ? (prep + host + composite + tail)
+                    : millis(item.nr_started, ended);
+                const auto gap_end_tp = (item.submit_entry_tp != std::chrono::steady_clock::time_point{})
+                    ? item.submit_entry_tp
+                    : item.nr_started;
+                const double rec_tot_ms = millis(item.record_started, item.record_finished);
+                const double sub_gap_ms = std::max(0.0, millis(item.record_finished, gap_end_tp));
+                const double e2e_ms = has_split_tail
+                    ? (rec_tot_ms + sub_gap_ms + ms)
+                    : millis(item.record_started, ended);
+                if (item.record_timed && item.record_timing_epoch == item.nr_timing_epoch) {
+                    record_timing_window.append(item.diagnostic.nr_frame_id, {
+                        rec_tot_ms,
+                        item.record_resources_ms, item.record_hdr_ms, item.record_xess_ms,
+                        sub_gap_ms,
+                        e2e_ms});
+                }
+                const unsigned count = ++nr_timing_count;
+                const unsigned samples = std::min(32u, count);
+                const size_t slot = (count - 1) % nr_timing_samples[0].size();
+                const auto update_stage = [&](size_t channel, std::atomic<double>& last,
+                    std::atomic<double>& average, double value) {
+                    if (count > nr_timing_samples[channel].size())
+                        nr_timing_sums[channel] -= nr_timing_samples[channel][slot];
+                    nr_timing_samples[channel][slot] = value;
+                    nr_timing_sums[channel] += value;
+                    last.store(value, std::memory_order_relaxed);
+                    average.store(nr_timing_sums[channel] / samples,
+                        std::memory_order_relaxed);
+                };
+                update_stage(0, nr_last_ms, nr_average_ms, ms);
+                update_stage(1, prep_last_ms, prep_average_ms, prep);
+                update_stage(2, host_last_ms, host_average_ms, host);
+                update_stage(3, composite_submit_last_ms, composite_submit_average_ms, composite);
+                update_stage(4, tail_last_ms, tail_average_ms, tail);
+                nr_sample_count.store(count, std::memory_order_release);
+                if (g_diag_active.load(std::memory_order_relaxed)) {
+                    BridgeDiagFrameRecord drec{};
+                    drec.frame_id = item.diagnostic.nr_frame_id;
+                    drec.pending_seq = item.pending_seq;
+                    drec.completed_index = completed;
+                    drec.window_id = item.diag_window_id;
+                    drec.diag_mode = tail_diag_mode;
+                    drec.arm_reuse = item.diag_arm_reuse;
+                    drec.late_latch = item.diag_late_latch;
+                    drec.prepared_bypassed = item.nr_prepared_bypassed ? 1u : 0u;
+                    drec.private_descriptors = item.nr_prepared_bypassed ? 1u : 0u;
+                    drec.pool_alloc_kind = item.hdr ? item.hdr->diag_pool_alloc_kind() : 0u;
+                    drec.composite_heap_kind = item.hdr ? item.hdr->diag_composite_heap_kind() : 0u;
+                    drec.had_previous_processor = item.had_prev_proc;
+                    drec.had_network_fence_pending = item.had_net_fence;
+                    drec.prep_ms = prep;
+                    drec.host_ms = host;
+                    drec.composite_submit_ms = composite;
+                    drec.tail_ms = tail;
+                    drec.total_ms = ms;
+                    if (item.record_timed && item.record_timing_epoch == item.nr_timing_epoch) {
+                        drec.record_total_ms = rec_tot_ms;
+                        drec.record_resources_ms = item.record_resources_ms;
+                        drec.record_hdr_ms = item.record_hdr_ms;
+                        drec.record_xess_ms = item.record_xess_ms;
+                        drec.submit_gap_ms = sub_gap_ms;
+                        drec.end_to_end_ms = e2e_ms;
+                    }
+                    if (tail_diag_mode >= 1) {
+                        const uint64_t qf = ensure_qpc_freq();
+                        drec.qpc_freq_hz = qf;
+                        drec.retire_prev_cpu_ms = qpc_diff_ms(item.retire_prev_start_qpc, item.retire_prev_end_qpc, qf);
+                        drec.prep_wait_cpu_ms = qpc_diff_ms(item.nr_started_qpc, item.nr_prepared_qpc, qf);
+                        drec.vk_wait_fences_cpu_ms = qpc_diff_ms(item.vk_wait_start_qpc, item.vk_wait_end_qpc, qf);
+                        const double host_qpc_ms = qpc_diff_ms(item.nr_prepared_qpc, item.nr_modeled_qpc, qf);
+                        drec.vk_record_submit_cpu_ms = std::max(0.0, host_qpc_ms - drec.vk_wait_fences_cpu_ms);
+                        drec.composite_submit_cpu_ms = qpc_diff_ms(item.nr_modeled_qpc, item.nr_pre_sr_qpc, qf);
+                        drec.tail_sr_exec_cpu_ms = qpc_diff_ms(item.nr_pre_sr_qpc, item.deferred_exec_end_qpc, qf);
+                        drec.tail_post_sr_submit_cpu_ms = qpc_diff_ms(item.deferred_exec_end_qpc, item.tail_submit_end_qpc, qf);
+                        drec.tail_submit_cpu_ms = qpc_diff_ms(item.nr_pre_sr_qpc, item.tail_submit_end_qpc, qf);
+                        drec.tail_wait_cpu_ms = qpc_diff_ms(item.tail_wait_start_qpc, item.tail_wait_end_qpc, qf);
+                        drec.tail_retire_cpu_ms = qpc_diff_ms(item.tail_wait_end_qpc, item.ended_qpc, qf);
+                    }
+                    if (tail_diag_mode == 2 && item.diag_record_mode == 2 &&
+                        item.frame_commands && item.frame_commands->ts_readback) {
+                        drec.d3d_freq_hz = g_d3d_freq_hz;
+                        D3D12_RANGE rr{0, 8 * sizeof(uint64_t)};
+                        void* mapped = nullptr;
+                        if (SUCCEEDED(item.frame_commands->ts_readback->Map(0, &rr, &mapped)) && mapped) {
+                            const auto* ticks = static_cast<const uint64_t*>(mapped);
+                            for (int qi = 0; qi < 8; ++qi) drec.d_ticks[qi] = ticks[qi];
+                            D3D12_RANGE wr{0, 0};
+                            item.frame_commands->ts_readback->Unmap(0, &wr);
+                            if (drec.d_ticks[0] != 0 && drec.d_ticks[7] >= drec.d_ticks[0] && g_d3d_freq_hz != 0)
+                                drec.d3d_valid = 1u;
+                        }
+                        if (!drec.d3d_valid) ++g_bridge_d3d_unavail;
+                        nrvk_harvest_retired();
+                    }
+                    auto& vec = bridge_diag_records();
+                    if (vec.size() < 32768) vec.push_back(drec);
+                    else ++g_bridge_diag_overflow;
+                }
+                if (log && (completed <= 4 || completed % 120 == 0)) {
+                    char line[280];
+                    sprintf_s(line, "nr_stage_timing frame=%llu input=%u history=%u prep_ms=%.3f host_ms=%.3f composite_submit_ms=%.3f tail_ms=%.3f total_ms=%.3f\r\n",
+                        static_cast<unsigned long long>(completed), item.frame_controls.input_height,
+                        unsigned(item.frame_controls.history), prep, host, composite, tail, ms);
+                    log(line);
                 }
             }
+        }
+    } else {
+        nr_failed.store(true);
+        gpuhandoff::process_failed();
+        flashdiag::recorder.count(flashdiag::Counter::failure);
+        item.diagnostic_reason = !event ? flashdiag::Reason::completion_event :
+            FAILED(registered) ? flashdiag::Reason::completion_registration :
+            !done ? flashdiag::Reason::completion_timeout : flashdiag::Reason::retire_callback;
+        flashdiag::recorder.event(flashdiag::EventKind::failure,
+            item.diagnostic, item.diagnostic_reason, uint64_t(uint32_t(registered)), waited);
+    }
+    item.release_retired_resources();
+    item.retired_done = true;
+    flashdiag::recorder.finish(item.diagnostic, item.diagnostic_reason);
+    return retired_ok;
+#else
+    (void)queue; (void)wait_if_incomplete; (void)log;
+    const uint64_t done = item.completion ? item.completion->GetCompletedValue() : 0;
+    if (done >= 1 && done != UINT64_MAX) {
+        item.release_retired_resources();
+        item.retired_done = true;
+        flashdiag::recorder.finish(item.diagnostic, item.diagnostic_reason);
+        return true;
+    }
+    return false;
 #endif
+}
+void reap_locked() {
+    for(size_t i=0;i<pending.size();) {
+        if(pending[i]->submitted &&
+           (pending[i]->retired_done ||
+            retire_submitted_pending(*pending[i],nullptr,false,g_deferred_log))) {
             pending.erase(pending.begin()+i);
             retired.fetch_add(1,std::memory_order_relaxed);
         } else ++i;
@@ -601,6 +1053,15 @@ bool record_deferred_identity(ID3D12GraphicsCommandList* game_list,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE):
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     const int lvl = prep_level();
+#ifdef NRB_LIVE_NR_TEST
+    entry.pending_seq = g_diag_pending_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    entry.diag_record_mode = g_diag_mode.load(std::memory_order_relaxed);
+    entry.diag_window_id = g_diag_window_id.load(std::memory_order_relaxed);
+    entry.diag_arm_reuse = g_diag_arm_reuse.load(std::memory_order_relaxed);
+    entry.diag_late_latch = g_diag_late_latch.load(std::memory_order_relaxed);
+    const bool record_gpu_ts = (entry.diag_record_mode == 2 && frame_commands->ts_heap && frame_commands->ts_readback);
+    if (record_gpu_ts) prep->EndQuery(frame_commands->ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+#endif
     if(lvl>=1 && frame_commands->color_state!=D3D12_RESOURCE_STATE_COPY_DEST) {
         auto to_copy_dest=transition(entry.color_copy.Get(),
             frame_commands->color_state,D3D12_RESOURCE_STATE_COPY_DEST);
@@ -627,6 +1088,7 @@ bool record_deferred_identity(ID3D12GraphicsCommandList* game_list,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE):
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 #ifdef NRB_LIVE_NR_TEST
+    if (record_gpu_ts) prep->EndQuery(frame_commands->ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
     const auto hdr_started=record_timed?std::chrono::steady_clock::now():
         std::chrono::steady_clock::time_point{};
     wchar_t module_path[MAX_PATH]{};
@@ -648,6 +1110,7 @@ bool record_deferred_identity(ID3D12GraphicsCommandList* game_list,
     if(entry.hdr) {
         if(entry.game_motion && !entry.hdr->game_motion_available()) return reject(flashdiag::Reason::motion_proxy);
         hdr_ready.fetch_add(1,std::memory_order_relaxed);
+        if (record_gpu_ts) entry.hdr->set_timestamp_query_target(frame_commands->ts_heap.Get(), frame_commands->ts_readback.Get());
         if(!tail_generic_profile()) entry.hdr->record_prepare(prep,color,entry.game_motion,
             entry.motion_scale_x,entry.motion_scale_y,color_tail_state);
         // Sample a few later frames too: the first frames after switching
@@ -716,6 +1179,9 @@ bool record_deferred_identity(ID3D12GraphicsCommandList* game_list,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+#ifdef NRB_LIVE_NR_TEST
+    if (record_gpu_ts) list->EndQuery(frame_commands->ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6);
+#endif
     list->ResourceBarrier(1,&output_write);
     params->Set(NVSDK_NGX_Parameter_Color,entry.color_copy.Get());
 #ifdef NRB_LIVE_NR_TEST
@@ -735,6 +1201,12 @@ bool record_deferred_identity(ID3D12GraphicsCommandList* game_list,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
     list->ResourceBarrier(1,&output_read);
+#ifdef NRB_LIVE_NR_TEST
+    if (record_gpu_ts) {
+        list->EndQuery(frame_commands->ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 7);
+        list->ResolveQueryData(frame_commands->ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6, 2, frame_commands->ts_readback.Get(), 6 * sizeof(uint64_t));
+    }
+#endif
     if(FAILED(list->Close())) return reject(flashdiag::Reason::record_close);
 #ifdef NRB_LIVE_NR_TEST
     if(entry.hdr && entry.hdr->resource_proof()) entry.hdr->resource_proof()->private_records_closed();
@@ -761,6 +1233,9 @@ unsigned submit_deferred_identity(ID3D12CommandQueue* queue,UINT count,
     const NRB_Controls* controls,void (*log)(const char*)) {
     if(!queue || !count || !lists || !original_execute) return 0;
     std::lock_guard guard(pending_mutex);
+#ifdef NRB_LIVE_NR_TEST
+    if (!g_d3d_freq_hz) queue->GetTimestampFrequency(&g_d3d_freq_hz);
+#endif
     reap_locked();
     if(pending.empty()) return 0;
     struct Match {UINT batch_index;Pending* item;};
@@ -811,12 +1286,26 @@ unsigned submit_deferred_identity(ID3D12CommandQueue* queue,UINT count,
 #ifdef NRB_LIVE_NR_TEST
         auto& item=*matches[m].item;
         item.nr_queue_exposed=true;
+        item.submit_entry_tp = nr_timing_enabled.load(std::memory_order_acquire)
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         // Keep the single helper's previous output alive through real completion.
         // Failure latches NR; never ignore busy or reset the helper's live frame.
-        if(previous_processor && !retire_previous_for_reuse(*previous_processor,queue)) {
+        const uint32_t sub_diag_mode = g_diag_mode.load(std::memory_order_relaxed);
+        item.diag_late_latch = g_diag_late_latch.load(std::memory_order_relaxed);
+        item.had_prev_proc = previous_processor ? 1u : 0u;
+        for (auto& prev_ptr : pending) {
+            if (prev_ptr && prev_ptr.get() != &item && prev_ptr->submitted && !prev_ptr->retired_done) {
+                item.had_prev_proc = 1u;
+                retire_submitted_pending(*prev_ptr, queue, true, log);
+            }
+        }
+        if (sub_diag_mode >= 1) item.retire_prev_start_qpc = qpc_now();
+        if(previous_processor && !previous_processor->retired_done && !retire_previous_for_reuse(*previous_processor,queue)) {
             if(log) log("deferred_nr_retire_previous_failed\r\n");
             gpuhandoff::process_failed();
         }
+        if (sub_diag_mode >= 1) item.retire_prev_end_qpc = qpc_now();
         previous_processor=nullptr;
         auto fallback_reason=flashdiag::Reason::prepared_wait;
         if(!item.hdr) fallback_reason=flashdiag::Reason::hdr_missing;
@@ -828,6 +1317,7 @@ unsigned submit_deferred_identity(ID3D12CommandQueue* queue,UINT count,
            controls && controls->enabled && !nr_failed.load()) {
             item.nr_timing_epoch=nr_timing_epoch.load(std::memory_order_acquire);
             item.nr_timed=nr_timing_enabled.load(std::memory_order_acquire);
+            if (sub_diag_mode >= 1) item.nr_started_qpc = qpc_now();
             const auto started=item.nr_timed?std::chrono::steady_clock::now():
                 std::chrono::steady_clock::time_point{};
             bool valid=false;
@@ -878,6 +1368,7 @@ unsigned submit_deferred_identity(ID3D12CommandQueue* queue,UINT count,
                             }
                         }
                         if(item.nr_timed) item.nr_prepared=std::chrono::steady_clock::now();
+                        if (sub_diag_mode >= 1) item.nr_prepared_qpc = qpc_now();
                         NRB_Frame frame{};
                         frame.abi_size=sizeof(frame);frame.route=item.route;
                         frame.route_evidence=item.evidence;
@@ -930,6 +1421,10 @@ unsigned submit_deferred_identity(ID3D12CommandQueue* queue,UINT count,
                         } else flashdiag::recorder.event(flashdiag::EventKind::failure,item.diagnostic,
                             fallback_reason,uint64_t(int64_t(processor_result)));
                         if(item.nr_timed) item.nr_modeled=std::chrono::steady_clock::now();
+                        if (sub_diag_mode >= 1) {
+                            item.nr_modeled_qpc = qpc_now();
+                            nrvk_get_last_cpu_substage(&item.had_net_fence, &item.vk_wait_start_qpc, &item.vk_wait_end_qpc);
+                        }
                     }
                     else {
                         fallback_reason=FAILED(registered)?flashdiag::Reason::prepare_registration:
@@ -979,6 +1474,7 @@ unsigned submit_deferred_identity(ID3D12CommandQueue* queue,UINT count,
                     flashdiag::recorder.count(flashdiag::Counter::nr_composited);
                     item.diagnostic.stage_bits|=flashdiag::bit(flashdiag::Stage::composite_submitted);
                     if(item.nr_timed) item.nr_pre_sr=std::chrono::steady_clock::now();
+                    if (sub_diag_mode >= 1) item.nr_pre_sr_qpc = qpc_now();
                     item.nr_processor=*processor;
                     item.nr_submitted=true;
                     item.nr_started=started;
@@ -1017,6 +1513,9 @@ unsigned submit_deferred_identity(ID3D12CommandQueue* queue,UINT count,
             matches[m].item->hdr->resource_proof()->deferred_submitted();
 #endif
         original_execute(queue,1,&deferred);
+#ifdef NRB_LIVE_NR_TEST
+        if (g_diag_mode.load(std::memory_order_relaxed) >= 1) matches[m].item->deferred_exec_end_qpc = qpc_now();
+#endif
         matches[m].item->diagnostic.stage_bits|=flashdiag::bit(flashdiag::Stage::sr_submitted);
         flashdiag::recorder.progress(matches[m].item->diagnostic);
     }
@@ -1025,6 +1524,9 @@ unsigned submit_deferred_identity(ID3D12CommandQueue* queue,UINT count,
         auto& item=*matches[m].item;
         item.submitted=true;
         const HRESULT completion_signal=queue->Signal(item.completion.Get(),1);
+#ifdef NRB_LIVE_NR_TEST
+        if (g_diag_mode.load(std::memory_order_relaxed) >= 1) item.tail_submit_end_qpc = qpc_now();
+#endif
 #ifdef NRB_LIVE_NR_TEST
         if(item.hdr && item.hdr->resource_proof()) {
             item.hdr->resource_proof()->completion_signal(SUCCEEDED(completion_signal));
@@ -1037,96 +1539,30 @@ unsigned submit_deferred_identity(ID3D12CommandQueue* queue,UINT count,
             flashdiag::recorder.count(flashdiag::Counter::failure);
             flashdiag::recorder.event(flashdiag::EventKind::failure,
                 item.diagnostic,flashdiag::Reason::completion_signal);
+            item.retired_done=true;
+            flashdiag::recorder.finish(item.diagnostic,item.diagnostic_reason);
         }
 #ifdef NRB_LIVE_NR_TEST
         else if(item.nr_submitted) {
-            HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
-            const HRESULT registered=event?item.completion->SetEventOnCompletion(1,event):E_FAIL;
-            const DWORD waited=event && SUCCEEDED(registered)?WaitForSingleObject(event,10000):WAIT_FAILED;
-            const auto completed_value=item.completion->GetCompletedValue();
-            const bool done=event && SUCCEEDED(registered) && waited==WAIT_OBJECT_0 &&
-                completed_value>=1 && completed_value!=UINT64_MAX && SUCCEEDED(item.device->GetDeviceRemovedReason());
-            if(event) CloseHandle(event);
-            bool retired_ok=false;
-            if(item.hdr && item.hdr->resource_proof()) {
-                retired_ok=done && pool_terminal_proof(item,item.completion->GetCompletedValue());
-                if(!retired_ok) item.hdr->quarantine_resource_lease();
+            const bool use_late_latch = (g_diag_late_latch.load(std::memory_order_relaxed) != 0);
+            item.diag_late_latch = use_late_latch ? 1u : 0u;
+            if (use_late_latch) {
+                if (item.nr_timed) item.submit_return_tp = std::chrono::steady_clock::now();
+                item.submit_return_qpc = qpc_now();
             } else {
-                try {retired_ok=done && (item.nr_helper_retired ||
-                    item.nr_processor.retire(item.nr_processor.context,item.completion.Get(),1)==0);}
-                catch(...) {retired_ok=false;}
+                retire_submitted_pending(item, queue, true, log);
             }
-            if(retired_ok) {
-                item.nr_submitted=false;item.nr_helper_retired=true;
-                item.diagnostic.stage_bits|=flashdiag::bit(flashdiag::Stage::retired);
-                flashdiag::recorder.count(flashdiag::Counter::nr_retired);
-                const auto ended=item.nr_timed?std::chrono::steady_clock::now():
-                    std::chrono::steady_clock::time_point{};
-                const uint64_t completed=nr_completed.fetch_add(1,std::memory_order_relaxed)+1;
-                if(!item.nr_timed || !nr_timing_enabled.load(std::memory_order_acquire) ||
-                   item.nr_timing_epoch!=nr_timing_epoch.load(std::memory_order_acquire))
-                    continue;
-                std::lock_guard timing_guard(nr_timing_mutex);
-                if(!item.nr_timed || !nr_timing_enabled.load(std::memory_order_relaxed) ||
-                   item.nr_timing_epoch!=nr_timing_epoch.load(std::memory_order_relaxed))
-                    continue;
-                const auto millis=[](auto begin,auto end) {
-                    return std::chrono::duration<double,std::milli>(end-begin).count();
-                };
-                const double ms=millis(item.nr_started,ended);
-                const double prep=millis(item.nr_started,item.nr_prepared);
-                const double host=millis(item.nr_prepared,item.nr_modeled);
-                const double composite=millis(item.nr_modeled,item.nr_pre_sr);
-                const double tail=millis(item.nr_pre_sr,ended);
-                if(item.record_timed && item.record_timing_epoch==item.nr_timing_epoch) {
-                    record_timing_window.append(item.diagnostic.nr_frame_id,{
-                        millis(item.record_started,item.record_finished),
-                        item.record_resources_ms,item.record_hdr_ms,item.record_xess_ms,
-                        millis(item.record_finished,item.nr_started),
-                        millis(item.record_started,ended)});
-                }
-                const unsigned count=++nr_timing_count;
-                const unsigned samples=std::min(32u,count);
-                const size_t slot=(count-1)%nr_timing_samples[0].size();
-                const auto update_stage=[&](size_t channel,std::atomic<double>& last,
-                    std::atomic<double>& average,double value) {
-                    if(count>nr_timing_samples[channel].size())
-                        nr_timing_sums[channel]-=nr_timing_samples[channel][slot];
-                    nr_timing_samples[channel][slot]=value;
-                    nr_timing_sums[channel]+=value;
-                    last.store(value,std::memory_order_relaxed);
-                    average.store(nr_timing_sums[channel]/samples,
-                        std::memory_order_relaxed);
-                };
-                update_stage(0,nr_last_ms,nr_average_ms,ms);
-                update_stage(1,prep_last_ms,prep_average_ms,prep);
-                update_stage(2,host_last_ms,host_average_ms,host);
-                update_stage(3,composite_submit_last_ms,composite_submit_average_ms,composite);
-                update_stage(4,tail_last_ms,tail_average_ms,tail);
-                nr_sample_count.store(count,std::memory_order_release);
-                if(log && (completed<=4 || completed%120==0)) {
-                    char line[280];
-                    sprintf_s(line,"nr_stage_timing frame=%llu input=%u history=%u prep_ms=%.3f host_ms=%.3f composite_submit_ms=%.3f tail_ms=%.3f total_ms=%.3f\r\n",
-                        static_cast<unsigned long long>(completed),item.frame_controls.input_height,
-                        unsigned(item.frame_controls.history),prep,host,composite,tail,ms);
-                    log(line);
-                }
-            }
-            else {
-                nr_failed.store(true);
-                gpuhandoff::process_failed();
-                flashdiag::recorder.count(flashdiag::Counter::failure);
-                item.diagnostic_reason=!event?flashdiag::Reason::completion_event:
-                    FAILED(registered)?flashdiag::Reason::completion_registration:
-                    !done?flashdiag::Reason::completion_timeout:flashdiag::Reason::retire_callback;
-                flashdiag::recorder.event(flashdiag::EventKind::failure,
-                    item.diagnostic,item.diagnostic_reason,uint64_t(uint32_t(registered)),waited);
-            }
+        }
+        else {
+            retire_submitted_pending(item, queue, false, log);
+        }
+#else
+        else {
+            retire_submitted_pending(item, queue, false, log);
         }
 #endif
     }
-    for(unsigned m=0;m<matched;m++)
-        flashdiag::recorder.finish(matches[m].item->diagnostic,matches[m].item->diagnostic_reason);
+    reap_locked();
     // A failed Signal retains the submitted objects until process exit; never
     // recycle an allocator or texture that might still be used by the GPU.
     return matched;
@@ -1354,6 +1790,241 @@ bool deferred_identity_tail_verified(NRB_Route route) {
     return route!=NRB_ROUTE_UNKNOWN && route<=NRB_ROUTE_XESS &&
            tail_samples[route].load(std::memory_order_acquire)>=8 &&
            tail_valid_samples[route].load(std::memory_order_relaxed)>=8;
+}
+
+#ifdef NRB_LIVE_NR_TEST
+static void flush_diag_files_locked(const std::wstring& out_dir) {
+    if (out_dir.empty()) return;
+    const auto& brecs = bridge_diag_records();
+    const NrvkDiagFrameRecordMirror* nrecs = nullptr;
+    uint32_t ncount = 0;
+    uint64_t nd3d_unavail = 0, nvk_unavail = 0, noverflow = 0;
+    nrvk_get_records(&nrecs, &ncount, &nd3d_unavail, &nvk_unavail, &noverflow);
+
+    std::unordered_map<uint64_t, const NrvkDiagFrameRecordMirror*> nmap;
+    nmap.reserve(ncount);
+    for (uint32_t i = 0; i < ncount; ++i) {
+        nmap[nrecs[i].frame_id] = &nrecs[i];
+    }
+
+    const std::wstring cpu_path = out_dir + L"\\CPU-FRAMES.jsonl";
+    FILE* fc = nullptr;
+    if (_wfopen_s(&fc, cpu_path.c_str(), L"wb") == 0 && fc) {
+        for (const auto& r : brecs) {
+            uint32_t slot_idx = 0;
+            auto it = nmap.find(r.frame_id);
+            if (it != nmap.end()) slot_idx = it->second->slot_index;
+            std::fprintf(fc,
+                "{\"frame_id\":%llu,\"pending_seq\":%llu,\"completed_index\":%llu,"
+                "\"window_id\":%u,\"diag_mode\":%u,\"arm_reuse\":%u,\"late_latch\":%u,"
+                "\"slot_index\":%u,\"prepared_bypassed\":%u,\"private_descriptors\":%u,"
+                "\"pool_alloc_kind\":%u,\"composite_heap_kind\":%u,"
+                "\"had_previous_processor\":%u,\"had_network_fence_pending\":%u,"
+                "\"prep_ms\":%.6f,\"host_ms\":%.6f,\"composite_submit_ms\":%.6f,"
+                "\"tail_ms\":%.6f,\"total_ms\":%.6f,"
+                "\"record_total_ms\":%.6f,\"record_resources_ms\":%.6f,"
+                "\"record_hdr_ms\":%.6f,\"record_xess_ms\":%.6f,"
+                "\"submit_gap_ms\":%.6f,\"end_to_end_ms\":%.6f,"
+                "\"qpc_freq_hz\":%llu,"
+                "\"retire_prev_cpu_ms\":%.6f,\"prep_wait_cpu_ms\":%.6f,"
+                "\"vk_wait_fences_cpu_ms\":%.6f,\"vk_record_submit_cpu_ms\":%.6f,"
+                "\"composite_submit_cpu_ms\":%.6f,\"tail_sr_exec_cpu_ms\":%.6f,"
+                "\"tail_post_sr_submit_cpu_ms\":%.6f,\"tail_submit_cpu_ms\":%.6f,"
+                "\"tail_wait_cpu_ms\":%.6f,\"tail_retire_cpu_ms\":%.6f}\n",
+                (unsigned long long)r.frame_id,
+                (unsigned long long)r.pending_seq,
+                (unsigned long long)r.completed_index,
+                r.window_id, r.diag_mode, r.arm_reuse, r.late_latch,
+                slot_idx, r.prepared_bypassed, r.private_descriptors,
+                r.pool_alloc_kind, r.composite_heap_kind,
+                r.had_previous_processor, r.had_network_fence_pending,
+                r.prep_ms, r.host_ms, r.composite_submit_ms,
+                r.tail_ms, r.total_ms,
+                r.record_total_ms, r.record_resources_ms,
+                r.record_hdr_ms, r.record_xess_ms,
+                r.submit_gap_ms, r.end_to_end_ms,
+                (unsigned long long)r.qpc_freq_hz,
+                r.retire_prev_cpu_ms, r.prep_wait_cpu_ms,
+                r.vk_wait_fences_cpu_ms, r.vk_record_submit_cpu_ms,
+                r.composite_submit_cpu_ms, r.tail_sr_exec_cpu_ms,
+                r.tail_post_sr_submit_cpu_ms, r.tail_submit_cpu_ms,
+                r.tail_wait_cpu_ms, r.tail_retire_cpu_ms);
+        }
+        std::fclose(fc);
+    }
+
+    const std::wstring gpu_path = out_dir + L"\\GPU-STAGES.jsonl";
+    FILE* fg = nullptr;
+    if (_wfopen_s(&fg, gpu_path.c_str(), L"wb") == 0 && fg) {
+        for (const auto& r : brecs) {
+            if (r.diag_mode != 2) continue;
+            const NrvkDiagFrameRecordMirror* nr = nullptr;
+            auto it = nmap.find(r.frame_id);
+            if (it != nmap.end()) nr = it->second;
+
+            const uint64_t dfreq = r.d3d_freq_hz ? r.d3d_freq_hz : (nr ? nr->d3d_freq_hz : 0);
+            const double vperiod = nr ? nr->vk_timestamp_period_ns : 0.0;
+            const uint32_t vbits = nr ? nr->vk_valid_bits : 0;
+            const uint32_t nd3d_ok = nr ? nr->d3d_valid : 0;
+            const uint32_t nvk_ok = nr ? nr->vk_valid : 0;
+            const uint64_t d0 = r.d_ticks[0], d1 = r.d_ticks[1], d2 = r.d_ticks[2], d3 = r.d_ticks[3];
+            const uint64_t d4 = nr ? nr->d4_tick : 0, d5 = nr ? nr->d5_tick : 0;
+            const uint64_t d6 = r.d_ticks[4], d7 = r.d_ticks[5], d8 = r.d_ticks[6], d9 = r.d_ticks[7];
+            uint64_t v[7] {};
+            if (nr) for (int k = 0; k < 7; ++k) v[k] = nr->v_ticks[k];
+
+            auto d_ms = [&](uint64_t a, uint64_t b) -> double {
+                if (!dfreq || !a || b < a) return 0.0;
+                return (double)(b - a) * 1000.0 / (double)dfreq;
+            };
+            auto v_ms = [&](uint64_t a, uint64_t b) -> double {
+                if (vperiod <= 0.0 || !a || b < a) return 0.0;
+                return (double)(b - a) * vperiod / 1000000.0;
+            };
+
+            std::fprintf(fg,
+                "{\"frame_id\":%llu,\"pending_seq\":%llu,\"returned_seq\":%llu,"
+                "\"window_id\":%u,\"arm_reuse\":%u,\"slot_index\":%u,\"copy_slot\":%u,"
+                "\"bridge_d3d_valid\":%u,\"nrvk_d3d_valid\":%u,\"vk_valid\":%u,"
+                "\"d3d_freq_hz\":%llu,\"vk_timestamp_period_ns\":%.6f,\"vk_valid_bits\":%u,"
+                "\"d0_tick\":%llu,\"d1_tick\":%llu,\"d2_tick\":%llu,\"d3_tick\":%llu,"
+                "\"d4_tick\":%llu,\"d5_tick\":%llu,\"d6_tick\":%llu,\"d7_tick\":%llu,"
+                "\"d8_tick\":%llu,\"d9_tick\":%llu,"
+                "\"v0_tick\":%llu,\"v1_tick\":%llu,\"v2_tick\":%llu,\"v3_tick\":%llu,"
+                "\"v4_tick\":%llu,\"v5_tick\":%llu,\"v6_tick\":%llu,"
+                "\"d3d_color_copy_gpu_ms\":%.6f,\"d3d_prepare_gpu_ms\":%.6f,"
+                "\"d3d_prep_list_gpu_ms\":%.6f,\"d3d_prep_to_nrvk_copy_gap_gpu_ms\":%.6f,"
+                "\"d3d_nrvk_copy_gpu_ms\":%.6f,\"d3d_nrvk_copy_to_composite_gap_gpu_ms\":%.6f,"
+                "\"d3d_composite_gpu_ms\":%.6f,\"d3d_composite_to_sr_gap_gpu_ms\":%.6f,"
+                "\"d3d_deferred_sr_gpu_ms\":%.6f,\"d3d_total_span_gpu_ms\":%.6f,"
+                "\"vk_acquire_gpu_ms\":%.6f,\"vk_history_controls_gpu_ms\":%.6f,"
+                "\"vk_gather_gpu_ms\":%.6f,\"vk_network_266_gpu_ms\":%.6f,"
+                "\"vk_scatter_gpu_ms\":%.6f,\"vk_release_gpu_ms\":%.6f,"
+                "\"vk_total_cb_gpu_ms\":%.6f}\n",
+                (unsigned long long)r.frame_id,
+                (unsigned long long)r.pending_seq,
+                (unsigned long long)(nr ? nr->returned_seq : 0),
+                r.window_id, r.arm_reuse,
+                nr ? nr->slot_index : 0u, nr ? nr->copy_slot : 0u,
+                r.d3d_valid, nd3d_ok, nvk_ok,
+                (unsigned long long)dfreq, vperiod, vbits,
+                (unsigned long long)d0, (unsigned long long)d1, (unsigned long long)d2, (unsigned long long)d3,
+                (unsigned long long)d4, (unsigned long long)d5, (unsigned long long)d6, (unsigned long long)d7,
+                (unsigned long long)d8, (unsigned long long)d9,
+                (unsigned long long)v[0], (unsigned long long)v[1], (unsigned long long)v[2], (unsigned long long)v[3],
+                (unsigned long long)v[4], (unsigned long long)v[5], (unsigned long long)v[6],
+                d_ms(d0, d1), d_ms(d2, d3),
+                d_ms(d0, d3), d_ms(d3, d4),
+                d_ms(d4, d5), d_ms(d5, d6),
+                d_ms(d6, d7), d_ms(d7, d8),
+                d_ms(d8, d9), d_ms(d0, d9),
+                v_ms(v[0], v[1]), v_ms(v[1], v[2]),
+                v_ms(v[2], v[3]), v_ms(v[3], v[4]),
+                v_ms(v[4], v[5]), v_ms(v[5], v[6]),
+                v_ms(v[0], v[6]));
+        }
+        std::fclose(fg);
+    }
+}
+#endif
+
+void deferred_diag_poll() {
+#ifdef NRB_LIVE_NR_TEST
+    HMODULE module = nullptr;
+    wchar_t mod_path[MAX_PATH]{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&record_deferred_identity), &module) ||
+        !GetModuleFileNameW(module, mod_path, MAX_PATH)) return;
+    std::wstring base_dir = mod_path;
+    const auto slash = base_dir.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return;
+    base_dir.resize(slash);
+    const std::wstring ctl_path = base_dir + L"\\dsh_diag_control.ini";
+    const DWORD attr = GetFileAttributesW(ctl_path.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) return;
+
+    const uint32_t want_mode = (uint32_t)GetPrivateProfileIntW(L"diag", L"mode", 0, ctl_path.c_str());
+    const uint32_t want_win = (uint32_t)GetPrivateProfileIntW(L"diag", L"window_id", 0, ctl_path.c_str());
+    const uint32_t want_arm = (uint32_t)GetPrivateProfileIntW(L"diag", L"arm_reuse", 1, ctl_path.c_str());
+    const uint32_t want_late_latch = (uint32_t)GetPrivateProfileIntW(L"diag", L"late_latch", 1, ctl_path.c_str());
+    const uint32_t want_flush = (uint32_t)GetPrivateProfileIntW(L"diag", L"flush_seq", 0, ctl_path.c_str());
+    wchar_t out_buf[MAX_PATH]{};
+    GetPrivateProfileStringW(L"diag", L"out_dir", L"", out_buf, MAX_PATH, ctl_path.c_str());
+    std::wstring out_dir = out_buf[0] ? std::wstring(out_buf) : base_dir;
+
+    g_diag_active.store(true, std::memory_order_relaxed);
+    hdr_set_composite_heap_reuse(want_arm != 0);
+    g_diag_arm_reuse.store(want_arm, std::memory_order_relaxed);
+    g_diag_late_latch.store(want_late_latch, std::memory_order_relaxed);
+    g_diag_window_id.store(want_win, std::memory_order_relaxed);
+    g_diag_mode.store(want_mode, std::memory_order_relaxed);
+    nrvk_set_diag_state(want_mode, want_win, want_arm);
+
+    std::lock_guard guard(nr_timing_mutex);
+    g_diag_out_dir = out_dir;
+    if (want_flush > g_last_flush_seq) {
+        flush_diag_files_locked(out_dir);
+        g_last_flush_seq = want_flush;
+    }
+
+    const NrvkDiagFrameRecordMirror* nrecs = nullptr;
+    uint32_t ncount = 0;
+    uint64_t nd3d_unavail = 0, nvk_unavail = 0, noverflow = 0;
+    nrvk_get_records(&nrecs, &ncount, &nd3d_unavail, &nvk_unavail, &noverflow);
+    uint64_t nrvk_d3d_freq = 0;
+    double vk_period = 0.0;
+    uint32_t vk_bits = 0;
+    nrvk_get_device_info(&nrvk_d3d_freq, &vk_period, &vk_bits);
+    const auto comp_stats = hdr_composite_heap_diag_stats();
+    const auto pool_stats = hdr_resource_pool_session().stats();
+    const uint64_t qf = ensure_qpc_freq();
+    const uint64_t df = g_d3d_freq_hz ? g_d3d_freq_hz : nrvk_d3d_freq;
+
+    const std::wstring status_path = out_dir + L"\\DIAG-LIVE-STATUS.json";
+    FILE* fs = nullptr;
+    if (_wfopen_s(&fs, status_path.c_str(), L"wb") == 0 && fs) {
+        std::fprintf(fs,
+            "{\"active\":true,\"mode\":%u,\"window_id\":%u,\"arm_reuse\":%u,\"late_latch\":%u,"
+            "\"last_flush_seq\":%u,\"nr_completed\":%llu,"
+            "\"bridge_records\":%u,\"nrvk_records\":%u,"
+            "\"pooled_private_composite_count\":%llu,\"unique_composite_heap_creates\":%llu,"
+            "\"pool_acquires\":%llu,\"pool_hits\":%llu,\"pool_creates\":%llu,"
+            "\"pool_busy_fallbacks\":%llu,\"pool_quarantines\":%llu,"
+            "\"bridge_d3d_unavail\":%llu,\"nrvk_d3d_unavail\":%llu,\"nrvk_vk_unavail\":%llu,"
+            "\"bridge_overflow\":%llu,\"nrvk_overflow\":%llu,"
+            "\"qpc_freq_hz\":%llu,\"d3d_freq_hz\":%llu,"
+            "\"vk_timestamp_period_ns\":%.6f,\"vk_valid_bits\":%u}\n",
+            want_mode, want_win, want_arm, want_late_latch,
+            g_last_flush_seq, (unsigned long long)nr_completed.load(std::memory_order_relaxed),
+            (unsigned)bridge_diag_records().size(), ncount,
+            (unsigned long long)comp_stats.pooled_private_composite_count,
+            (unsigned long long)comp_stats.unique_composite_heap_creates,
+            (unsigned long long)pool_stats.acquires,
+            (unsigned long long)pool_stats.hits,
+            (unsigned long long)pool_stats.creates,
+            (unsigned long long)pool_stats.busy_fallbacks,
+            (unsigned long long)pool_stats.quarantines,
+            (unsigned long long)g_bridge_d3d_unavail,
+            (unsigned long long)nd3d_unavail,
+            (unsigned long long)nvk_unavail,
+            (unsigned long long)g_bridge_diag_overflow,
+            (unsigned long long)noverflow,
+            (unsigned long long)qf, (unsigned long long)df,
+            vk_period, vk_bits);
+        std::fclose(fs);
+    }
+#endif
+}
+
+void deferred_diag_shutdown() {
+#ifdef NRB_LIVE_NR_TEST
+    if (!g_diag_active.load(std::memory_order_relaxed)) return;
+    std::lock_guard guard(nr_timing_mutex);
+    if (!g_diag_out_dir.empty()) {
+        flush_diag_files_locked(g_diag_out_dir);
+    }
+#endif
 }
 }
 

@@ -8,6 +8,11 @@
 
 using namespace nrb::gpuhandoff;
 unsigned checks=0;
+static bool test_vulkan_ready=false;
+extern "C" __declspec(dllexport) int NRVK_PreparedGpuOrderedV1(void* context,ID3D12Device* device,ID3D12CommandQueue* queue) {
+ return test_vulkan_ready && context==reinterpret_cast<void*>(0x9000) && device==reinterpret_cast<ID3D12Device*>(0x1000) && queue;
+}
+
 void require(bool ok,const char* label) {
     ++checks;if(!ok) {std::fprintf(stderr,"FAIL %u: %s\n",checks,label);std::exit(1);}
 }
@@ -115,5 +120,14 @@ int main() {
     proof.completion_signal(true);proof.consumer_completed(1,true);proof.processor_retirement(true);
     require(proof.terminal_safe(),"exact final consume + retire proof still required");
     NRB_SetGpuHandoffRequested(0);
+    processor_changed(&p);
+    require(!prepared_bypass(p,f.device,f.queue,false),"Vulkan not initialized retains prepared CPU wait");
+    test_vulkan_ready=true;
+    require(prepared_bypass(p,f.device,f.queue,false),"Vulkan module-owned capability permits prepared GPU order");
+    require(!prepared_bypass(p,f.device,f.queue,true),"Vulkan motion readback still requires CPU prepared wait");
+    require(!prepared_bypass(p,ptr<ID3D12Device>(0x1008),f.queue,false),"Vulkan wrong device denied");
+    processor_changed(&replacement);
+    require(!prepared_bypass(p,f.device,f.queue,false),"Vulkan stale processor denied");
+    test_vulkan_ready=false;
     std::printf("PASS: %u CPU protocol checks; frozen ABI; no GPU/ASI load\n",checks);
 }

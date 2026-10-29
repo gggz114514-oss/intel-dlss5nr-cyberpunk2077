@@ -18,7 +18,7 @@ Use a short, writable ASCII path: the existing Windows bridge uses ANSI file API
 
 ## Build
 
-Run the commands in [README.md](README.md) or [README.zh-CN.md](README.zh-CN.md) from the repository root. Choose `-Profile small` for the supported 310.9.16.0 Small DLL, or `-Profile vk102` for the supported 310.8.0.0 full-model DLL. Both start from the local DLL; no existing model package is needed. Use new/empty model and package directories. The script stops on any extraction, shader identity, compile or CPU-check failure.
+Run the commands in [README.md](README.md) or [README.zh-CN.md](README.zh-CN.md) from the repository root. Choose `-Profile small` for the supported 310.9.16.0 Small DLL, or `-Profile vk102` for the supported 310.8.0.0 full-model DLL. Build optimized vk102 first. Optimized Small additionally requires `-FullModel local/vk102` to reproduce the shared final blend scalar of the accepted game build. Both extract their own model tensors from the corresponding local DLL. Use new/empty model and package directories. The script stops on any extraction, shader identity, compile or CPU-check failure.
 
 The two native targets can also be configured after asset preparation:
 

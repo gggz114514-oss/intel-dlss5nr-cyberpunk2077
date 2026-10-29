@@ -1,5 +1,8 @@
 # Intel DLSS5 NR — Cyberpunk 2077
 
+**2026-10-29: Default builds now use optimized Full (232 dispatches, ~17.45 ms) and optimized Small (108 dispatches, ~9.98 ms), plus late-latch streaming (~5.43 ms game frame-period improvement in the recorded scene).** See [optimization history and evidence](docs/optimization/README.md). The Vulkan backend substantially references the community **mochizuki0323 / DLSSNR-AMD** project; see [attribution](docs/optimization/AMD-ATTRIBUTION.md). Build Full first, then pass `-FullModel local/vk102` when building Small. Older performance tables below are historical.
+
+
 [中文说明](README.zh-CN.md) · [Build dependencies and installation](INSTALL.md)
 
 Experimental **NR + FSR XMX upscaling + XeSS Frame Generation** on Intel Arc B580 / Windows x64. This repository supplies the Vulkan **NR backend, game bridge, model extraction/build tools and control panel**. The FSR XMX upscaler and XeSS FG components are installed separately; XeSS FG here means frame generation, not XeSS Super Resolution.
@@ -10,10 +13,10 @@ Provide the appropriate **local `nvngx_dlssnr.dll`**. Both backends can now be e
 
 | Build profile | Model DLL | Resource | Frozen network | DLL SHA-256 |
 |---|---|---|---|---|
-| `small` | 310.9.16.0 Small | `WEIGHTS_CC_SMALL_FP8` | 76 rows / 118 dispatches | `2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f` |
-| `vk102` | 310.8.0.0 full model | `WEIGHTS_HT` | 152 rows / 266 dispatches | `8270b350cd82de5ce89806872cdd6b6a9249b80836b91bbeb3573470744cc206` |
+| `small` | 310.9.16.0 Small | `WEIGHTS_CC_SMALL_FP8` | 76 rows / 108 dispatches | `2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f` |
+| `vk102` | 310.8.0.0 full model | `WEIGHTS_HT` | 152 rows / 232 dispatches | `8270b350cd82de5ce89806872cdd6b6a9249b80836b91bbeb3573470744cc206` |
 
-Use separate folders for the two DLLs. Other DLL identities are rejected. A ZIP containing one supported DLL is accepted too. These are the existing game backends; ongoing 232-pass FP16 and INT8 research candidates are not included.
+Use separate folders for the two DLLs. Other DLL identities are rejected. A ZIP containing one supported DLL is accepted too. These are the existing game backends; the accepted 232-pass FP16 chain is now included; INT8 experiments are not included.
 
 ## The tested combination and performance
 
@@ -52,7 +55,7 @@ $glslang = "C:\Tools\glslang\bin\glslang.exe"
 $vk = "C:\VulkanSDK\Include"
 
 # Small: local/small -> local/game-package
-.\tools\Build.ps1 -Profile small -Dll "C:\Models\Small\nvngx_dlssnr.dll" `
+.\tools\Build.ps1 -Profile small -FullModel "local/vk102" -Dll "C:\Models\Small\nvngx_dlssnr.dll" `
   -OptiScalerSource $opti -Glslang $glslang -VulkanInclude $vk -Python $py
 
 # VK102: local/vk102 -> local/game-package-vk102

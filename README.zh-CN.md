@@ -1,5 +1,8 @@
 # Intel DLSS5 NR — 赛博朋克 2077
 
+**2026-10-29 更新：Full 232 派发（约 17.45 ms）与新版 Small 108 派发（约 9.98 ms）已接入默认构建；同时发布约 5.43 ms 实机帧周期收益的流式桥接。** 详见 [优化过程、方法与验证](docs/optimization/README.md)。当前 Vulkan 大量参考望月 **mochizuki0323 / DLSSNR-AMD** 社区项目，见 [致谢](docs/optimization/AMD-ATTRIBUTION.md)。Small 构建现在需 `-FullModel local/vk102`，先构建 Full。以下旧版本测试表属于历史记录。
+
+
 [English](README.md) · [开发依赖和安装说明（英文）](INSTALL.md)
 
 本项目在 **Intel Arc B580 / Windows x64** 上提供 Vulkan NR 后端、游戏桥、DLL 模型提取与构建工具、控制面板。实机使用的组合是：
@@ -14,10 +17,10 @@ NR 负责神经图像处理与风格控制；FSR XMX 负责超分；XeSS FG / Xe
 
 | 参数 | 模型 | DLL 内资源 | 固定网络 | DLL SHA-256 |
 |---|---|---|---|---|
-| `-Profile small` | 310.9.16.0 Small | `WEIGHTS_CC_SMALL_FP8` | 76 行 / 118 发 | `2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f` |
-| `-Profile vk102` | 310.8.0.0 完整模型 | `WEIGHTS_HT` | 152 行 / 266 发 | `8270b350cd82de5ce89806872cdd6b6a9249b80836b91bbeb3573470744cc206` |
+| `-Profile small` | 310.9.16.0 Small | `WEIGHTS_CC_SMALL_FP8` | 76 行 / 108 发 | `2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f` |
+| `-Profile vk102` | 310.8.0.0 完整模型 | `WEIGHTS_HT` | 152 行 / 232 发 | `8270b350cd82de5ce89806872cdd6b6a9249b80836b91bbeb3573470744cc206` |
 
-两个 DLL 请分别放在不同目录。身份不匹配的版本会被拒绝；也支持包含一个对应 DLL 的 ZIP。这里发布的是现有游戏基线，不包括进行中的 232 发 FP16 或 INT8 研究候选。
+两个 DLL 请分别放在不同目录。身份不匹配的版本会被拒绝；也支持包含一个对应 DLL 的 ZIP。这里发布已采纳的优化 FP16 Full 与新版 Small；INT8 实验不在此包内。
 
 仓库不提供模型 DLL、权重、提取后的张量、预编译 SPIR-V、自有二进制安装包或第三方游戏 DLL。所有模型资产和本机二进制均由用户在本地生成。
 
@@ -62,7 +65,7 @@ $glslang = "C:\Tools\glslang\bin\glslang.exe"
 $vk = "C:\VulkanSDK\Include"
 
 # Small：生成 local/small 与 local/game-package。
-.\tools\Build.ps1 -Profile small -Dll "C:\Models\Small\nvngx_dlssnr.dll" `
+.\tools\Build.ps1 -Profile small -FullModel "local/vk102" -Dll "C:\Models\Small\nvngx_dlssnr.dll" `
   -OptiScalerSource $opti -Glslang $glslang -VulkanInclude $vk -Python $py
 
 # VK102：生成 local/vk102 与 local/game-package-vk102。

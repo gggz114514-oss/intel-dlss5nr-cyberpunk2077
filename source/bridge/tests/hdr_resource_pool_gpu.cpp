@@ -129,13 +129,15 @@ GpuResult run(ID3D12Device* device,ID3D12CommandQueue* queue,const std::wstring&
         hr(f.lists[0]->Close(),"Close prepare");hr(f.lists[2]->Close(),"Close private capture/deferred");
         if(proof) {proof->private_records_closed();proof->prepare_submitted();}
         ID3D12CommandList* list=f.lists[0].Get();f.exposed=true;queue->ExecuteCommandLists(1,&list);
-        hr(queue->Signal(f.prepared.Get(),1),"Prepare signal");wait(device,f.prepared.Get());
-        if(proof) {proof->prepare_completed(true);proof->processor_begin();}
+        hr(queue->Signal(f.prepared.Get(),1),"Prepare signal");
+        if(pool_on) {proof->prepare_gpu_ordered(true);proof->processor_begin();}
+        else wait(device,f.prepared.Get());
         // The synthetic consumer is already prepared by the clear above. This
         // ready fence and terminal proof must not be called real XPU evidence.
         hr(queue->Signal(f.ready.Get(),1),"Synthetic ready signal");hr(queue->Wait(f.ready.Get(),1),"Synthetic ready wait");
         if(proof) proof->processor_ready(true);
-        check(f.hdr.record_composite(f.lists[1].Get(),f.source.Get(),f.nr.Get(),f.xess.Get()),"Record composite");
+        check(f.hdr.record_composite(f.lists[1].Get(),f.source.Get(),f.nr.Get(),f.xess.Get(),0,1.0f,1.0f,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,pool_on),"Record composite");
         hr(f.lists[1]->Close(),"Close composite");
         if(proof) {proof->composite_closed();proof->composite_submitted();}
         list=f.lists[1].Get();queue->ExecuteCommandLists(1,&list);
@@ -169,6 +171,7 @@ std::string sha256(const std::vector<uint8_t>& bytes) {
     for(auto value:digest) {text+=hex[value>>4];text+=hex[value&15];}return text;
 }
 void debug_clean(ID3D12InfoQueue* info) {
+    if(!info) return;
     for(UINT64 i=0;i<info->GetNumStoredMessagesAllowedByRetrievalFilter();++i) {
         SIZE_T size=0;hr(info->GetMessage(i,nullptr,&size),"Debug message size");std::vector<uint8_t> storage(size);
         auto* m=reinterpret_cast<D3D12_MESSAGE*>(storage.data());hr(info->GetMessage(i,m,&size),"Debug message");
@@ -179,21 +182,24 @@ void debug_clean(ID3D12InfoQueue* info) {
 }
 }
 int wmain(int argc,wchar_t** argv) {
-    if(argc!=3) {std::fwprintf(stderr,L"usage: nr_hdr_resource_pool_gpu_probe.exe <shader.hlsl> <new-output-dir-on-D>\n");return 2;}
+    if(argc!=3 && !(argc==4 && std::wstring(argv[3])==L"--allow-no-debug")) {std::fwprintf(stderr,L"usage: nr_hdr_resource_pool_gpu_probe.exe <shader.hlsl> <new-output-dir-on-D>\n");return 2;}
     try {
         const std::filesystem::path out=argv[2];
         check(!std::filesystem::exists(out),"Output directory must be fresh");
         check(out.is_absolute() && (out.root_name()==L"D:" || out.root_name()==L"d:"),"GPU receipt data belongs on D:");
         ComPtr<ID3D12Debug> debug;
-        if(FAILED(D3D12GetDebugInterface(IID_PPV_ARGS(debug.GetAddressOf())))) {std::puts("SKIP: D3D12 debug layer unavailable; no verified GPU run");return 77;}
-        debug->EnableDebugLayer();ComPtr<IDXGIFactory6> factory;hr(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())),"DXGI factory");
+        if(FAILED(D3D12GetDebugInterface(IID_PPV_ARGS(debug.GetAddressOf())))) {
+            if(argc!=4) {std::puts("SKIP: D3D12 debug layer unavailable; no verified GPU run");return 77;}
+            std::puts("LIMITATION: no D3D12 debug layer; byte comparisons only, debug validation unavailable");
+        }
+        if(debug) debug->EnableDebugLayer();ComPtr<IDXGIFactory6> factory;hr(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())),"DXGI factory");
         ComPtr<IDXGIAdapter1> adapter;
         for(UINT i=0;;++i) {ComPtr<IDXGIAdapter1> candidate;auto result=factory->EnumAdapters1(i,candidate.GetAddressOf());
             if(result==DXGI_ERROR_NOT_FOUND) break;hr(result,"Enumerate adapter");DXGI_ADAPTER_DESC1 d{};hr(candidate->GetDesc1(&d),"Adapter desc");
             if(!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE) && std::wstring(d.Description).find(L"B580")!=std::wstring::npos) {adapter=candidate;break;}}
         if(!adapter) {std::puts("SKIP: Intel Arc B580 unavailable");return 77;}
         ComPtr<ID3D12Device> device;hr(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(device.GetAddressOf())),"B580 device");
-        ComPtr<ID3D12InfoQueue> info;hr(device.As(&info),"Debug info queue");
+        ComPtr<ID3D12InfoQueue> info;if(debug) hr(device.As(&info),"Debug info queue");
         D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;ComPtr<ID3D12CommandQueue> queue;
         hr(device->CreateCommandQueue(&q,IID_PPV_ARGS(queue.GetAddressOf())),"Queue");
         nrb::HdrProxyCache cache;nrb::HdrProxyResourcePool pool;std::string records;
@@ -245,9 +251,9 @@ int wmain(int argc,wchar_t** argv) {
             <<",\n  \"pool_creates\":"<<stats.creates<<",\"pool_hits\":"<<stats.hits<<",\"pool_texture_bytes\":"<<stats.texture_bytes
             <<",\n  \"same_canonical_resource_reuses\":"<<same_resource_reuses<<",\"changed_binding_cases\":"<<changed_bindings
             <<",\"off_on_off_cases\":16,\"final_pool_enabled\":false"
-            <<",\n  \"debug_errors\":0,\n  \"samples\":[\n"<<records<<"\n  ]\n}\n";
+            <<",\n  \"debug_errors\":"<<(debug?"0":"null")<<",\n  \"debug_validation_available\":"<<(debug?"true":"false")<<",\n  \"samples\":[\n"<<records<<"\n  ]\n}\n";
         check(bool(receipt),"Write GPU receipt");
-        std::printf("PASS: %u exact byte comparisons; two slots, %llu hits; debug errors=0; synthetic consumer only\n",comparisons,stats.hits);
+        std::printf("PASS: %u exact byte comparisons; two slots, %llu hits; debug validation see startup log; synthetic consumer only\n",comparisons,stats.hits);
         return 0;
     } catch(const std::exception& e) {std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
 }

@@ -69,7 +69,19 @@ bool prepared_bypass(const NRB_Processor& p,ID3D12Device* device,
         gate.stats.device==reinterpret_cast<uint64_t>(device) &&
         gate.stats.queue==reinterpret_cast<uint64_t>(queue);
     if(gate.stats.armed && !identity) {++gate.stats.identity_mismatch_waits;gate.clear(3);}
-    const bool bypass=gate.stats.requested && identity && gate.stats.cap_healthy && !motion;
+    bool vulkan_ordered=false;
+#ifdef _WIN32
+    if(!motion && same_processor(p,gate.processor) && device && queue) {
+        HMODULE module=nullptr;
+        if(GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(p.process),&module)) {
+            using Query=int(*)(void*,ID3D12Device*,ID3D12CommandQueue*);
+            auto query=reinterpret_cast<Query>(GetProcAddress(module,"NRVK_PreparedGpuOrderedV1"));
+            vulkan_ordered=query && query(p.context,device,queue)==1;
+        }
+    }
+#endif
+    const bool bypass=vulkan_ordered || (gate.stats.requested && identity && gate.stats.cap_healthy && !motion);
     if(bypass) ++gate.stats.prepared_bypasses;
     else {++gate.stats.prepared_cpu_waits;if(motion) ++gate.stats.motion_readback_waits;}
     return bypass;
