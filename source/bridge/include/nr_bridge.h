@@ -40,7 +40,7 @@ enum NRB_MotionScaleOrigin : uint32_t {
 struct NRB_Controls {
     uint32_t abi_size;
     uint32_t enabled;
-    uint32_t input_height; // 360, 480, or 540; source size remains unchanged
+    uint32_t input_height; // 0=native R, or 360/480/540/720; source remains R
     uint32_t style;        // standard, natural, film
     NRB_History history;
     uint32_t graph_replay;

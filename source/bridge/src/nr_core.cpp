@@ -7,7 +7,7 @@ bool validate_controls(const NRB_Controls& c) {
     auto unit = [](float x) { return std::isfinite(x) && x >= 0 && x <= 1; };
     auto model = [](float x) { return std::isfinite(x) && x >= 0 && x <= 2; };
     return c.abi_size == sizeof(NRB_Controls) && c.enabled <= 1 &&
-        (c.input_height == 360 || c.input_height == 480 ||
+        (c.input_height == 0 || c.input_height == 360 || c.input_height == 480 ||
          c.input_height == 540 || c.input_height == 720) &&
         c.style <= 2 && c.history <= NRB_HISTORY_FUSED &&
         c.graph_replay <= 1 && c.auto_mask <= 1 && c.skin_structure_enabled <= 1 &&

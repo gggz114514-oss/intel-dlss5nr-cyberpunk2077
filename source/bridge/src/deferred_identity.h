@@ -21,7 +21,7 @@ void deferred_identity_set_log(DeferredLog log);
 bool record_deferred_identity(ID3D12GraphicsCommandList* game_list,
     const NVSDK_NGX_Handle* handle,NVSDK_NGX_Parameter* params,
     PFN_NVSDK_NGX_ProgressCallback callback,NgxEvaluate original,
-    uint64_t game_list_generation,const NRB_Controls& frame_controls,
+    uint64_t game_list_generation,const NRB_Controls& frame_controls,uint64_t control_epoch,
     NRB_Route route,NRB_RouteEvidence evidence,
     NVSDK_NGX_Result& result,flashdiag::Context* diagnostic=nullptr);
 

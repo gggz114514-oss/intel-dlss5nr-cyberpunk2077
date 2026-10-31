@@ -35,7 +35,7 @@ OPTI_PRESETS = {
 }
 
 DEFAULTS = {
-    "backend": PRIMARY, "enabled": 1, "style": 0,
+    "backend": PRIMARY, "enabled": 1, "style": 0, "input_height": 0,
     "intensity": 1.0, "local_structure": 1.0, "local_tone": 0.0,
     "skin_structure": 0.0, "auto_mask": 1, "display_strength": 1.0,
 }
@@ -51,7 +51,7 @@ def load():
                 raw = cfg.get("NR", key)
                 if key == "backend":
                     out[key] = raw
-                elif key in ("enabled", "style", "auto_mask"):
+                elif key in ("enabled", "style", "auto_mask", "input_height"):
                     out[key] = int(raw)
                 else:
                     out[key] = float(raw)
@@ -63,6 +63,7 @@ def save(values):
     cfg = configparser.ConfigParser()
     cfg["NR"] = {
         "backend": values["backend"], "enabled": str(int(values["enabled"])),
+        "input_height": str(int(values["input_height"])),
         "style": str(int(values["style"])), "intensity": f"{values['intensity']:.4f}",
         "local_structure": f"{values['local_structure']:.4f}",
         "local_tone": f"{values['local_tone']:.4f}",
@@ -88,6 +89,12 @@ def live_status():
         out["state"] = json.loads(STATE.read_text(encoding="utf-8"))
     except Exception as exc:  # missing file or a half-written frame
         out["error"] = str(exc)
+    component = Path(settings.get("component_state", str(STATE.with_name("component_status.json"))))
+    if component.is_file():
+        try:
+            out["component"] = json.loads(component.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
     return out
 
 
@@ -151,14 +158,19 @@ PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=
 body{font:16px system-ui;background:#101827;color:#eaf2ff;max-width:680px;margin:28px auto;padding:0 16px}
 label{display:block;margin:14px 0}select,input{margin-left:10px;background:#26344b;color:#fff;padding:6px}
 button{padding:10px 18px;background:#26344b;color:#fff;border:1px solid #537096;border-radius:6px;cursor:pointer}
-#live{background:#16233a;border:1px solid #2c3f5c;border-radius:6px;padding:10px 12px;margin:14px 0;font:14px ui-monospace,SFMono-Regular,Consolas,monospace;line-height:1.7}#live span{color:#9fb3cc}#opti{background:#1b2a1f;border:1px solid #35543f;border-radius:6px;padding:10px 12px;margin:14px 0;font:13px ui-monospace,Consolas,monospace;line-height:1.8}#opti .row{margin:6px 0}#opti input{background:#26344b;color:#fff;border:1px solid #3c5270;border-radius:4px;padding:2px 6px;margin-right:8px}#opti small{color:#9fb3cc}.style button{padding:7px 12px;margin-right:6px}.active{background:#2475c7}small{color:#aebed2}
+#live{background:#16233a;border:1px solid #2c3f5c;border-radius:6px;padding:10px 12px;margin:14px 0;font:14px ui-monospace,SFMono-Regular,Consolas,monospace;line-height:1.7}#live span{color:#9fb3cc}#opti{background:#1b2a1f;border:1px solid #35543f;border-radius:6px;padding:10px 12px;margin:14px 0;font:13px ui-monospace,Consolas,monospace;line-height:1.8}#opti .row{margin:6px 0}#opti input{background:#26344b;color:#fff;border:1px solid #3c5270;border-radius:4px;padding:2px 6px;margin-right:8px}#opti small{color:#9fb3cc}.style button{padding:7px 12px;margin-right:6px}.active{background:#2475c7}.resolution button{margin:0 4px 8px 0}.resolution button[aria-pressed=true]{background:#2475c7;border-color:#90c6ff}small{color:#aebed2}
 </style><h1>NR 后端控制</h1>
 <div id=live>
 <div>后端 <b id=lvBackend>—</b> <span id=lvSwitch></span></div>
 <div>桥内区间 <b id=lvTotal>—</b> ms <span id=lvStage></span></div>
 <div>参数 <span id=lvParams></span></div>
+<div>尺寸 <span id=lvGeometry>—</span></div>
+<div>GPU <span id=lvGpu>—</span></div>
 </div><small>桥内区间含跨帧重叠等待，不是游戏帧时。风格/强度/遮罩为逐帧控制；后端切换在帧边界生效。</small>
 <label>后端 <select id=backend>__BACKEND_OPTIONS__</select></label>
+<div class=resolution><p>NR 处理分辨率</p><input type=hidden id=input_height value=0><div id=resolution role=group aria-label="NR 处理分辨率">
+<button type=button data-height=0>原生 · 自动</button><button type=button data-height=720>720p</button><button type=button data-height=540>540p</button><button type=button data-height=480>480p</button><button type=button data-height=360>360p</button>
+</div><small>点击即保存。原生按游戏实际渲染输入自动匹配；固定档保持宽高比，输入小于所选档位时不放大。超分输出分辨率不变。</small></div>
 <label>启用 <input id=enabled type=checkbox></label>
 <div class=style>风格：<span id=style><button data-v=0>经典</button><button data-v=1>自然</button><button data-v=2>电影</button></span></div>
 <label>强度 <input id=intensity type=range min=0 max=2 step=.05><output></output></label>
@@ -183,6 +195,8 @@ button{padding:10px 18px;background:#26344b;color:#fff;border:1px solid #537096;
 const fields=['enabled','style','intensity','local_structure','local_tone','skin_structure','auto_mask','display_strength'];
 let state=null;const token='__TOKEN__';
 function set(v){state=v;document.getElementById('backend').value=v.backend;document.getElementById('enabled').checked=!!v.enabled;
+ document.getElementById('input_height').value=v.input_height;
+ for(const b of document.querySelectorAll('#resolution button')){const on=+b.dataset.height===v.input_height;b.classList.toggle('active',on);b.setAttribute('aria-pressed',String(on))}
  document.getElementById('auto_mask').checked=!!v.auto_mask;
  for(const b of document.querySelectorAll('#style button'))b.classList.toggle('active',+b.dataset.v===v.style);
  for(const k of fields)if(k!=='enabled'&&k!=='style'&&k!=='auto_mask'){const e=document.getElementById(k);e.value=v[k];e.nextElementSibling.value=v[k]}}
@@ -190,7 +204,9 @@ async function load(){set(await (await fetch('/api')).json())}
 const STYLE_TONE={0:1.0,1:1.0,2:1.0};for(const b of document.querySelectorAll('#style button'))b.onclick=()=>{state.style=+b.dataset.v;state.local_tone=STYLE_TONE[state.style];set(state);document.getElementById('save').click()};
 for(const k of ['intensity','local_structure','local_tone','skin_structure','display_strength'])document.getElementById(k).oninput=e=>{state[k]=+e.target.value;e.target.nextElementSibling.value=e.target.value};
 document.getElementById('save').onclick=async()=>{state.backend=document.getElementById('backend').value;state.enabled=+document.getElementById('enabled').checked;state.auto_mask=+document.getElementById('auto_mask').checked;
+ state.input_height=+document.getElementById('input_height').value;
  const r=await fetch('/api',{method:'POST',headers:{'Content-Type':'application/json','X-NR-Token':token},body:JSON.stringify(state)});document.getElementById('status').textContent=r.ok?(poll(),'已保存'):('保存失败: '+((await r.json().catch(()=>({}))).error||'未知'))};
+for(const b of document.querySelectorAll('#resolution button'))b.onclick=()=>{if(!state)return;state.input_height=+b.dataset.height;set(state);document.getElementById('save').click()};
 load();
 const STYLE_NAME=['经典','自然','电影'];
 async function poll(){try{
@@ -198,14 +214,17 @@ async function poll(){try{
  const el=id=>document.getElementById(id);
  if(!s){el('lvBackend').textContent='未连接（bridge 未写状态）';el('lvSwitch').textContent='';
   el('lvTotal').textContent='—';el('lvStage').textContent='';el('lvParams').textContent='';return}
- el('lvBackend').textContent=s.backend+(s.mounted?'（已挂载）':'（未挂载）');
+ el('lvBackend').textContent=(s.backend==='102'?'Full 310.8':'Small 310.9.16')+(s.mounted?'（已挂载）':'（未挂载）');
+ const c=d.component||{},g=c.geometry||{},dim=v=>v?v.join('×'):'—';
+ el('lvGeometry').textContent='游戏输入 R '+dim(g.render)+' · NR N '+dim(g.network)+' · 超分输出 O '+dim(g.output)+' · 补边 P '+dim(g.padded);
+ const t=c.gpu_ms;el('lvGpu').textContent=t?'降采样 '+t.prepare.toFixed(2)+' / 网络 '+t.network.toFixed(2)+' / 残差恢复 '+t.recover.toFixed(2)+' / NR GPU段 '+t.chain.toFixed(2)+' ms':'待 GPU 时间戳（诊断模式 2）';
  el('lvSwitch').textContent=s.event?('· '+s.event):'';
  const st=s.stage||{};el('lvTotal').textContent=(st.total||0).toFixed(2);
  el('lvStage').textContent='prep '+(st.prep||0).toFixed(2)+' / host '+(st.host||0).toFixed(2)+
   ' / 合成 '+(st.composite||0).toFixed(2)+' / tail '+(st.tail||0).toFixed(2)+
   ' · 帧 '+(st.frames||0)+' · 计数 '+(s.processed||0);
  const a=s.applied||{};
- el('lvParams').textContent='风格 '+(STYLE_NAME[a.style]||a.style)+' · 强度 '+a.intensity+
+ el('lvParams').textContent='NR '+(a.input_height===0?'原生自动':(a.input_height===undefined?'—':a.input_height+'p'))+' · 风格 '+(STYLE_NAME[a.style]||a.style)+' · 强度 '+a.intensity+
   ' · 结构 '+a.structure+' · 色调 '+a.tone+' · 皮肤 '+a.skin+' · 显示 '+a.display+
   ' · 遮罩 '+(a.mask?'开':'关')+' · 启用 '+(a.enabled?'是':'否');
 }catch(e){}}
@@ -270,7 +289,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
             options = ''.join(f'<option value={key}>{label}</option>' for key, label in
-                              (("small", "Small 310.9.16"), ("102", "VK102 310.8")) if key in BACKENDS)
+                              (("small", "Small 310.9.16"), ("102", "Full 310.8")) if key in BACKENDS)
             page = PAGE.replace("__BACKEND_OPTIONS__", options)
             self._send(200, page.replace("__TOKEN__", TOKEN), "text/html; charset=utf-8")
         elif self.path == "/api":
@@ -318,7 +337,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     if key == "backend":
                         merged[key] = str(value)
-                    elif key in ("enabled", "style", "auto_mask"):
+                    elif key in ("enabled", "style", "auto_mask", "input_height"):
                         merged[key] = int(value)
                     else:
                         merged[key] = float(value)

@@ -190,10 +190,13 @@ struct Pending {
     ComPtr<ID3D12Fence> completion;
     FrameCommands* frame_commands=nullptr;
     NRB_Controls frame_controls{};
+    uint64_t control_epoch=0;
+    uint32_t render_width=0,render_height=0,output_width=0,output_height=0;
     NRB_Route route=NRB_ROUTE_UNKNOWN;
     NRB_RouteEvidence evidence=NRB_EVIDENCE_NONE;
     float motion_scale_x=1,motion_scale_y=1;
     bool game_motion=false,game_reset=false;
+    bool low_resolution_motion=true;
     flashdiag::Context diagnostic{};
     flashdiag::Reason diagnostic_reason=flashdiag::Reason::none;
 #ifdef NRB_LIVE_NR_TEST
@@ -853,7 +856,7 @@ bool matching_device(ID3D12Device* device,ID3D12Resource* resource) {
 bool record_deferred_identity(ID3D12GraphicsCommandList* game_list,
     const NVSDK_NGX_Handle* handle,NVSDK_NGX_Parameter* params,
     PFN_NVSDK_NGX_ProgressCallback callback,NgxEvaluate original,
-    uint64_t game_list_generation,const NRB_Controls& frame_controls,
+    uint64_t game_list_generation,const NRB_Controls& frame_controls,uint64_t control_epoch,
     NRB_Route route,NRB_RouteEvidence evidence,
     NVSDK_NGX_Result& result,flashdiag::Context* diagnostic) {
     // While a swap is draining no new record may enter: the component it
@@ -904,19 +907,29 @@ bool record_deferred_identity(ID3D12GraphicsCommandList* game_list,
         !color || !output) return reject(flashdiag::Reason::textures);
     const auto source_desc=color->GetDesc();
     const auto output_desc=output->GetDesc();
+    unsigned render_width=unsigned(source_desc.Width),render_height=source_desc.Height;
+    unsigned output_width=unsigned(output_desc.Width),output_height=output_desc.Height;
+    params->Get(NVSDK_NGX_Parameter_Width,&render_width);params->Get(NVSDK_NGX_Parameter_Height,&render_height);
+    params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,&render_width);
+    params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,&render_height);
+    params->Get(NVSDK_NGX_Parameter_OutWidth,&output_width);params->Get(NVSDK_NGX_Parameter_OutHeight,&output_height);
+    unsigned color_base_x=0,color_base_y=0;
+    params->Get(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X,&color_base_x);
+    params->Get(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y,&color_base_y);
     // The game may deliver the SR color as R11G11B10_FLOAT (historical) or
     // R16G16B16A16_FLOAT. The copy, proxy and composite are format-agnostic
     // (copy_desc=source_desc); only the extent contract is fixed here.
     if(source_desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
        (source_desc.Format!=DXGI_FORMAT_R11G11B10_FLOAT &&
         source_desc.Format!=DXGI_FORMAT_R16G16B16A16_FLOAT) ||
-       source_desc.Width!=1280 || source_desc.Height!=720 ||
+       !render_width || !render_height || color_base_x || color_base_y ||
+       source_desc.Width<render_width || source_desc.Height<render_height ||
        source_desc.DepthOrArraySize!=1 || source_desc.MipLevels!=1 ||
        source_desc.SampleDesc.Count!=1 ||
        output_desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
         // Any 2D SR output at least as large as the render target is allowed;
         // only the render extent is fixed by the model domain.
-        output_desc.Width<1280 || output_desc.Height<720 ||
+        output_width<render_width || output_height<render_height || output_desc.Width<output_width || output_desc.Height<output_height ||
        output_desc.DepthOrArraySize!=1 || output_desc.MipLevels!=1 ||
         output_desc.SampleDesc.Count!=1)
         return reject(flashdiag::Reason::textures,
@@ -945,6 +958,8 @@ bool record_deferred_identity(ID3D12GraphicsCommandList* game_list,
     entry.original_color=color;
     entry.output=output;
     entry.frame_controls=frame_controls;
+    entry.control_epoch=control_epoch;
+    entry.render_width=render_width;entry.render_height=render_height;entry.output_width=output_width;entry.output_height=output_height;
     entry.route=route;
     entry.evidence=evidence;
     ID3D12Resource* optional=nullptr;
@@ -961,7 +976,8 @@ bool record_deferred_identity(ID3D12GraphicsCommandList* game_list,
     params->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X,&motion_base_x);
     params->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y,&motion_base_y);
     int feature_flags=0;
-    params->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,&feature_flags);
+    const bool have_feature_flags=params->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,&feature_flags)==NVSDK_NGX_Result_Success;
+    if(have_feature_flags)entry.low_resolution_motion=(feature_flags&NVSDK_NGX_DLSS_Feature_Flags_MVLowRes)!=0;
     if(entry.game_motion && (!entry.motion ||
        motion_base_x || motion_base_y ||
        (feature_flags & NVSDK_NGX_DLSS_Feature_Flags_MVJittered) ||
@@ -986,6 +1002,7 @@ bool record_deferred_identity(ID3D12GraphicsCommandList* game_list,
         std::chrono::steady_clock::time_point{};
 #endif
     auto copy_desc=source_desc;
+    copy_desc.Width=render_width;copy_desc.Height=render_height;
     copy_desc.Flags=
 #ifdef NRB_LIVE_NR_TEST
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -1072,7 +1089,11 @@ bool record_deferred_identity(ID3D12GraphicsCommandList* game_list,
         D3D12_RESOURCE_STATE_COPY_SOURCE);
     prep->ResourceBarrier(1,&color_to_copy);
     }
-    if(lvl>=3) prep->CopyResource(entry.color_copy.Get(),color);
+    if(lvl>=3){
+        if(source_desc.Width==render_width&&source_desc.Height==render_height)prep->CopyResource(entry.color_copy.Get(),color);
+        else {D3D12_TEXTURE_COPY_LOCATION dst{},src{};dst.pResource=entry.color_copy.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;src.pResource=color;src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            D3D12_BOX box{0,0,0,render_width,render_height,1};prep->CopyTextureRegion(&dst,0,0,0,&src,&box);}
+    }
     if(lvl>=2) {
     D3D12_RESOURCE_BARRIER ready[2]={
         transition(color,D3D12_RESOURCE_STATE_COPY_SOURCE,color_tail_state),
@@ -1109,6 +1130,7 @@ bool record_deferred_identity(ID3D12GraphicsCommandList* game_list,
     if(entry.game_motion && !entry.hdr) return reject(flashdiag::Reason::hdr_missing);
     if(entry.hdr) {
         if(entry.game_motion && !entry.hdr->game_motion_available()) return reject(flashdiag::Reason::motion_proxy);
+        if(entry.game_motion&&!entry.hdr->set_motion_extent(entry.low_resolution_motion?render_width:output_width,entry.low_resolution_motion?render_height:output_height))return reject(flashdiag::Reason::motion_proxy);
         hdr_ready.fetch_add(1,std::memory_order_relaxed);
         if (record_gpu_ts) entry.hdr->set_timestamp_query_target(frame_commands->ts_heap.Get(), frame_commands->ts_readback.Get());
         if(!tail_generic_profile()) entry.hdr->record_prepare(prep,color,entry.game_motion,
@@ -1348,10 +1370,10 @@ unsigned submit_deferred_identity(ID3D12CommandQueue* queue,UINT count,
                                 &mapped)) && mapped) {
                                 unsigned tested=0,nonzero=0,max_half=0;
                                 const auto* data=static_cast<const uint8_t*>(mapped);
-                                for(unsigned y=0;y<720;y+=16) {
+                                for(unsigned y=0;y<item.render_height;y+=16) {
                                     const auto* row=reinterpret_cast<const uint16_t*>(
                                         data+y*item.motion_probe_layout.Footprint.RowPitch);
-                                    for(unsigned x=0;x<1280;x+=16) {
+                                    for(unsigned x=0;x<item.render_width;x+=16) {
                                         const unsigned u=row[2*x]&0x7fff;
                                         const unsigned v=row[2*x+1]&0x7fff;
                                         ++tested;
@@ -1377,9 +1399,8 @@ unsigned submit_deferred_identity(ID3D12CommandQueue* queue,UINT count,
                         frame.color=item.hdr->proxy_color();
                         frame.motion=item.hdr->nr_motion();
                         frame.output=item.output.Get();
-                        frame.render_width=1280;frame.render_height=720;
-    {const auto od=item.output?item.output->GetDesc():D3D12_RESOURCE_DESC{};
-     frame.output_width=uint32_t(od.Width);frame.output_height=od.Height;}
+                        frame.render_width=item.render_width;frame.render_height=item.render_height;
+                        frame.output_width=item.output_width;frame.output_height=item.output_height;
                         frame.motion_scale_x=1;frame.motion_scale_y=1;
                         frame.motion_scale_origin=item.route==NRB_ROUTE_FSR?
                             NRB_MV_FSR_TO_NGX:item.route==NRB_ROUTE_XESS?
@@ -1389,6 +1410,7 @@ unsigned submit_deferred_identity(ID3D12CommandQueue* queue,UINT count,
                         frame.frame_id=frame_serial.fetch_add(1)+1;
                         frame.reset_history=frame.frame_id==1 || item.game_reset;
                         frame.controls=item.frame_controls;
+                        frame.control_epoch=item.control_epoch;
                         result.abi_size=sizeof(result);
                         fallback_reason=flashdiag::Reason::processor_result;
                         item.diagnostic.nr_frame_id=frame.frame_id;
@@ -1409,7 +1431,7 @@ unsigned submit_deferred_identity(ID3D12CommandQueue* queue,UINT count,
                             }
                             valid=processor_result==0 && result.color && result.ready_fence && result.ready_value &&
                                 result.color->GetDesc().Format==DXGI_FORMAT_R32G32B32A32_FLOAT &&
-                                result.color->GetDesc().Width==1280 && result.color->GetDesc().Height==720;
+                                result.color->GetDesc().Width==item.render_width && result.color->GetDesc().Height==item.render_height;
                         } catch(...) {valid=false;fallback_reason=flashdiag::Reason::cpp_exception;}
                         // Returned references, even malformed ones, stay with
                         // Pending when processor use is unproven (pool ON/OFF).

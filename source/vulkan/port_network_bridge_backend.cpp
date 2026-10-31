@@ -17,6 +17,9 @@
 #include <vector>
 #include "port_network_bridge_backend_model_identity.inc"
 #include "port_network_bridge_backend_plan.inc"
+#include "nr_geometry.h"
+#include "nr_resample.h"
+#include "nr_network_shape.inc"
 #include "port_network_bridge_backend_frozen.inc"
 
 static thread_local std::string last_error;
@@ -40,9 +43,13 @@ struct NRVK_Backend {
     HMODULE loader=nullptr;
     VkDevice device=VK_NULL_HANDLE; VkQueue queue=VK_NULL_HANDLE; uint32_t family=0;
     Plan plan; VkPhysicalDeviceMemoryProperties memory{};
+    NRGeometry geometry=nr_geometry({1280,720},{1280,720},{1280,720});
     std::vector<VkDeviceMemory> pool_memory; std::vector<Pipeline> pipelines;
     VkDescriptorPool descriptors=VK_NULL_HANDLE;
     Pipeline gather{},scatter{},scatter32{}; VkDescriptorSet gather_set=VK_NULL_HANDLE,scatter_set=VK_NULL_HANDLE;
+    Pipeline low_gather{},low_scatter{},low_scatter32{};VkDescriptorSet low_gather_set=VK_NULL_HANDLE,low_scatter_set=VK_NULL_HANDLE;
+    Buffer resample,filter_tables;
+    NRFilterAxis filter_axes[6]{};std::vector<uint32_t> filter_words;
     VkSampler sampler=VK_NULL_HANDLE;
     VkCommandPool startup_pool=VK_NULL_HANDLE; VkCommandBuffer startup_cb=VK_NULL_HANDLE;
     VkFence startup_fence=VK_NULL_HANDLE;
@@ -127,7 +134,7 @@ static void pool_buffers(NRVK_Backend* b) {
         for(auto id:ids){auto& x=b->plan.buffers[id];x.memory=mem;CHECK(b->vkBindBufferMemory(b->device,x.handle,mem,x.memoryOffset));}
     }
 }
-static Pipeline pipeline(NRVK_Backend* b,const std::string& spv,const std::vector<VkDescriptorSetLayoutBinding>& bindings,uint32_t push_bytes,uint32_t subgroup) {
+static Pipeline pipeline(NRVK_Backend* b,const std::string& spv,const std::vector<VkDescriptorSetLayoutBinding>& bindings,uint32_t push_bytes,uint32_t subgroup,bool spatial_tail=false,bool scalar_post=false) {
     Pipeline p{};
     try {
     VkDescriptorSetLayoutCreateInfo di{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};di.bindingCount=uint32_t(bindings.size());di.pBindings=bindings.data();
@@ -136,6 +143,12 @@ static Pipeline pipeline(NRVK_Backend* b,const std::string& spv,const std::vecto
     VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};li.setLayoutCount=1;li.pSetLayouts=&p.descriptors;li.pushConstantRangeCount=push_bytes?1:0;li.pPushConstantRanges=&range;
     CHECK(b->vkCreatePipelineLayout(b->device,&li,nullptr,&p.layout));
     auto bytes=read_bytes(spv);std::vector<uint32_t> words(bytes.size()/4);memcpy(words.data(),bytes.data(),bytes.size());
+    // The accepted fused post-body has exactly three references to the source
+    // dimensions (x bound, y bound, raster stride). Change only its OpConstant
+    // literals after the frozen file has been checked. IDs and NoContraction
+    // decorations stay untouched. Native720 uses the unmodified frozen module.
+    if(spatial_tail)reshape_tail_spirv(words,b->geometry.network);
+    if(scalar_post)reshape_post_local_size(words,b->geometry.network);
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};mi.codeSize=bytes.size();mi.pCode=words.data();VkShaderModule module;
     CHECK(b->vkCreateShaderModule(b->device,&mi,nullptr,&module));
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sg{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};sg.requiredSubgroupSize=subgroup;
@@ -156,15 +169,32 @@ static VkDescriptorSet allocate_set(NRVK_Backend* b,VkDescriptorSetLayout layout
 static void init_resources(NRVK_Backend* b) {
     for(auto& x:b->plan.buffers){make_buffer(b,x,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);b->staging.bytes=std::max(b->staging.bytes,x.bytes);}
     pool_buffers(b);
+    if(b->geometry.render!=b->geometry.network){
+        b->resample.name="resample_separable";b->resample.bytes=uint64_t(b->geometry.render.w)*b->geometry.network.h*24;
+        make_buffer(b,b->resample,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        // Scratch is intentionally outside the network alias pool: both resize
+        // phases and residual recovery consume it on opposite sides of NR.
+        if(!b->resample.memory){VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=b->resample.allocated;ai.memoryTypeIndex=b->resample.memoryType;CHECK(b->vkAllocateMemory(b->device,&ai,nullptr,&b->resample.memory));CHECK(b->vkBindBufferMemory(b->device,b->resample.handle,b->resample.memory,0));}
+        auto& g=b->geometry;auto& words=b->filter_words;
+        b->filter_axes[0]=nr_filter_axis(words,g.render.h,g.network.h,0);b->filter_axes[1]=nr_filter_axis(words,g.render.w,g.network.w,0);
+        b->filter_axes[2]=nr_filter_axis(words,g.render.h,g.network.h,1);b->filter_axes[3]=nr_filter_axis(words,g.render.w,g.network.w,1);
+        b->filter_axes[4]=nr_filter_axis(words,g.network.w,g.render.w,2);b->filter_axes[5]=nr_filter_axis(words,g.network.h,g.render.h,2);
+        auto& t=b->filter_tables;t.name="resample_filter_tables";t.bytes=words.size()*4;
+        make_buffer(b,t,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if(!t.memory){VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=t.allocated;ai.memoryTypeIndex=t.memoryType;CHECK(b->vkAllocateMemory(b->device,&ai,nullptr,&t.memory));CHECK(b->vkBindBufferMemory(b->device,t.handle,t.memory,0));}
+        b->staging.bytes=std::max(b->staging.bytes,t.bytes);
+    }
     b->staging.name="startup_staging";make_buffer(b,b->staging,VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     CHECK(b->vkMapMemory(b->device,b->staging.memory,0,VK_WHOLE_SIZE,0,&b->mapped));
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=b->family;cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     CHECK(b->vkCreateCommandPool(b->device,&cp,nullptr,&b->startup_pool));
     VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};ca.commandPool=b->startup_pool;ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ca.commandBufferCount=1;
     CHECK(b->vkAllocateCommandBuffers(b->device,&ca,&b->startup_cb));VkFenceCreateInfo fc{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};CHECK(b->vkCreateFence(b->device,&fc,nullptr,&b->startup_fence));
-    for(auto& x:b->plan.buffers) {
+    std::vector<Buffer*> startup;for(auto& x:b->plan.buffers)startup.push_back(&x);if(b->filter_tables.handle)startup.push_back(&b->filter_tables);
+    for(auto* ptr:startup) {auto& x=*ptr;
         if(!x.resident&&!x.dedicatedRequired)continue;
-        if(x.path=="-")memset(b->mapped,0,size_t(x.bytes));
+        if(ptr==&b->filter_tables)memcpy(b->mapped,b->filter_words.data(),size_t(x.bytes));
+        else if(x.path=="-")memset(b->mapped,0,size_t(x.bytes));
         else{auto data=read_bytes(x.path);if(data.size()!=x.bytes)throw std::runtime_error("cold size: "+x.name);memcpy(b->mapped,data.data(),data.size());}
         CHECK(b->vkResetCommandBuffer(b->startup_cb,0));VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         CHECK(b->vkBeginCommandBuffer(b->startup_cb,&bi));VkBufferCopy copy{0,0,x.bytes};b->vkCmdCopyBuffer(b->startup_cb,b->staging.handle,x.handle,1,&copy);
@@ -178,25 +208,33 @@ static void init_resources(NRVK_Backend* b) {
     b->vkFreeMemory(b->device,b->staging.memory,nullptr);b->staging.memory=VK_NULL_HANDLE;
     b->vkDestroyFence(b->device,b->startup_fence,nullptr);b->startup_fence=VK_NULL_HANDLE;
     b->vkDestroyCommandPool(b->device,b->startup_pool,nullptr);b->startup_pool=VK_NULL_HANDLE;b->startup_cb=VK_NULL_HANDLE;
-    std::map<std::string,size_t> cache;uint32_t count=3;
+    std::map<std::string,size_t> cache;uint32_t count=11;
     for(auto& pass:b->plan.passes) {
         count+=uint32_t(pass.bindings.size());std::string key=pass.spv+":"+std::to_string(pass.push.size())+":"+std::to_string(pass.subgroup);
         for(auto& bind:pass.bindings)key+=":"+std::to_string(bind.binding);
         if(cache.count(key)){pass.pipeline=cache[key];continue;}
         std::vector<VkDescriptorSetLayoutBinding> bindings;for(auto& bind:pass.bindings)bindings.push_back({bind.binding,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr});
-        pass.pipeline=b->pipelines.size();cache[key]=pass.pipeline;b->pipelines.push_back(pipeline(b,pass.spv,bindings,uint32_t(pass.push.size()*4),pass.subgroup));
+        pass.pipeline=b->pipelines.size();cache[key]=pass.pipeline;b->pipelines.push_back(pipeline(b,pass.spv,bindings,uint32_t(pass.push.size()*4),pass.subgroup,pass.name.find("s37_")!=std::string::npos,&pass==&b->plan.passes.back()));
     }
     b->gather=pipeline(b,(std::filesystem::path(b->manifest_dir)/gather_spv).string(),{{0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{2,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{3,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{4,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}},64,32);
     b->scatter=pipeline(b,(std::filesystem::path(b->manifest_dir)/scatter_spv).string(),{{0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}},16,32);
     b->scatter32=pipeline(b,(std::filesystem::path(b->manifest_dir)/scatter32_spv).string(),{{0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}},16,32);
-    VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,count},{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,3},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1}};
-    VkDescriptorPoolCreateInfo di{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};di.maxSets=uint32_t(b->plan.passes.size()+2);di.poolSizeCount=3;di.pPoolSizes=sizes;CHECK(b->vkCreateDescriptorPool(b->device,&di,nullptr,&b->descriptors));
+    if(b->resample.handle){
+        b->low_gather=pipeline(b,(std::filesystem::path(b->manifest_dir)/low_gather_spv).string(),{{0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{2,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{3,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{4,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{6,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}},112,32);
+        std::vector<VkDescriptorSetLayoutBinding> bindings={{0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{2,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{3,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{4,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}};
+        bindings.push_back({5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr});
+        b->low_scatter=pipeline(b,(std::filesystem::path(b->manifest_dir)/low_scatter_spv).string(),bindings,64,32);
+        b->low_scatter32=pipeline(b,(std::filesystem::path(b->manifest_dir)/low_scatter32_spv).string(),bindings,64,32);
+    }
+    VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,count},{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,7},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,2}};
+    VkDescriptorPoolCreateInfo di{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};di.maxSets=uint32_t(b->plan.passes.size()+4);di.poolSizeCount=3;di.pPoolSizes=sizes;CHECK(b->vkCreateDescriptorPool(b->device,&di,nullptr,&b->descriptors));
     for(auto& pass:b->plan.passes) {
         pass.set=allocate_set(b,b->pipelines[pass.pipeline].descriptors);std::vector<VkDescriptorBufferInfo> info(pass.bindings.size());std::vector<VkWriteDescriptorSet> writes(pass.bindings.size());
         for(size_t i=0;i<pass.bindings.size();++i){auto& x=pass.bindings[i];info[i]={b->plan.buffers[x.resource].handle,x.offset,x.bytes};writes[i]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};writes[i].dstSet=pass.set;writes[i].dstBinding=x.binding;writes[i].descriptorCount=1;writes[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;writes[i].pBufferInfo=&info[i];}
         b->vkUpdateDescriptorSets(b->device,uint32_t(writes.size()),writes.data(),0,nullptr);
     }
     b->gather_set=allocate_set(b,b->gather.descriptors);b->scatter_set=allocate_set(b,b->scatter.descriptors);
+    if(b->resample.handle){b->low_gather_set=allocate_set(b,b->low_gather.descriptors);b->low_scatter_set=allocate_set(b,b->low_scatter.descriptors);}
     VkSamplerCreateInfo sc{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};sc.magFilter=VK_FILTER_NEAREST;sc.minFilter=VK_FILTER_NEAREST;sc.mipmapMode=VK_SAMPLER_MIPMAP_MODE_NEAREST;sc.addressModeU=sc.addressModeV=sc.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;sc.maxLod=0;
     CHECK(b->vkCreateSampler(b->device,&sc,nullptr,&b->sampler));
     // 102's first pass is the F1 transport. Binding 1 is its aux pack, not the
@@ -207,17 +245,17 @@ static void init_resources(NRVK_Backend* b) {
         if(b->plan.buffers[i].name==kPostImageName){b->post=i;found_post=true;}
     }
     if(!found_pre||!found_post)throw std::runtime_error("Small ioport image bundles missing");
-    if(b->plan.buffers[b->pre].bytes!=52936784 || b->plan.buffers[b->post].bytes!=40550480)
+    if(b->plan.buffers[b->pre].bytes!=b->geometry.pre_bytes || b->plan.buffers[b->post].bytes!=b->geometry.post_bytes)
         throw std::runtime_error("102 ioport bundle size mismatch");
     b->output=b->plan.outputs.front().resource;
-    if(b->plan.buffers[b->output].bytes!=29491200)throw std::runtime_error("102 frame_out size mismatch");
+    if(b->plan.buffers[b->output].bytes!=b->geometry.frame_bytes)throw std::runtime_error("frame_out geometry size mismatch");
 }
 
-extern "C" int nrvk_backend_init(VkInstance instance,VkDevice device,VkPhysicalDevice phy,VkQueue queue,uint32_t family,const NRVK_Config* cfg,NRVK_Backend** out) {
+int nrvk_backend_init_geometry(VkInstance instance,VkDevice device,VkPhysicalDevice phy,VkQueue queue,uint32_t family,const NRVK_Config* cfg,NRSize render,NRSize network,NRVK_Backend** out) {
     if(!out||!cfg||cfg->abi_size!=sizeof(*cfg)||!instance||!device||!phy||!queue){last_error="init external device/config missing";return -1;}*out=nullptr;
     NRVK_Backend* b=nullptr;int failure=-2;
     try {
-        auto plan=checked_plan(cfg->manifest_dir);b=new NRVK_Backend();b->manifest_dir=cfg->manifest_dir;b->plan=std::move(plan);b->device=device;b->queue=queue;b->family=family;
+        auto plan=checked_plan(cfg->manifest_dir);b=new NRVK_Backend();b->geometry=nr_geometry(render,network,render);reshape_plan(plan,b->geometry);b->manifest_dir=cfg->manifest_dir;b->plan=std::move(plan);b->device=device;b->queue=queue;b->family=family;
         failure=-4;b->loader=LoadLibraryA("vulkan-1.dll");if(!b->loader)throw std::runtime_error("vulkan-1.dll missing");
         auto gipa=reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(b->loader,"vkGetInstanceProcAddr"));
         auto gdpa=reinterpret_cast<PFN_vkGetDeviceProcAddr>(gipa(instance,"vkGetDeviceProcAddr"));
@@ -227,6 +265,11 @@ extern "C" int nrvk_backend_init(VkInstance instance,VkDevice device,VkPhysicalD
         failure=-3;auto props=reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(gipa(instance,"vkGetPhysicalDeviceProperties2"));
         VkPhysicalDeviceProperties2 physical{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};props(phy,&physical);
         if(physical.properties.vendorID!=0x8086||physical.properties.deviceID!=0xe20b||physical.properties.limits.maxComputeSharedMemorySize<49152)throw std::runtime_error("expected B580/shared48KiB");
+        const auto& limits=physical.properties.limits;
+        for(const auto& pass:b->plan.passes)if(pass.gx>limits.maxComputeWorkGroupCount[0]||pass.gy>limits.maxComputeWorkGroupCount[1]||pass.gz>limits.maxComputeWorkGroupCount[2])throw std::runtime_error("geometry dispatch exceeds device limits: "+pass.name);
+        for(const auto& buffer:b->plan.buffers)if(buffer.bytes>limits.maxStorageBufferRange)throw std::runtime_error("geometry storage range exceeds device limit: "+buffer.name);
+        uint64_t bridge_pixels=std::max(render.pixels(),std::max(network.pixels(),uint64_t(render.w)*network.h));
+        if((bridge_pixels+255)/256>limits.maxComputeWorkGroupCount[0])throw std::runtime_error("geometry bridge dispatch exceeds device limit");
         failure=-4;auto features_fn=reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(gipa(instance,"vkGetPhysicalDeviceFeatures2"));
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
         VkPhysicalDeviceShaderFloat16Int8Features half{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
@@ -240,12 +283,13 @@ extern "C" int nrvk_backend_init(VkInstance instance,VkDevice device,VkPhysicalD
         failure=-8;init_resources(b);last_error.clear();*out=b;return 0;
     } catch(const std::exception& e) {last_error=e.what();nrvk_backend_release(b);return failure;}
 }
+extern "C" int nrvk_backend_init(VkInstance instance,VkDevice device,VkPhysicalDevice phy,VkQueue queue,uint32_t family,const NRVK_Config* cfg,NRVK_Backend** out){return nrvk_backend_init_geometry(instance,device,phy,queue,family,cfg,{1280,720},{1280,720},out);}
 
-static bool crop_valid(const PortNetworkBridgeImage& x,uint32_t bx,uint32_t by) {
+static bool crop_valid(const PortNetworkBridgeImage& x,uint32_t bx,uint32_t by,NRSize size) {
     return x.image && x.layout==VK_IMAGE_LAYOUT_GENERAL && x.valid_rect.offset.x>=0 && x.valid_rect.offset.y>=0 &&
         bx>=uint32_t(x.valid_rect.offset.x)&&by>=uint32_t(x.valid_rect.offset.y)&&
-        uint64_t(bx)+1280<=uint64_t(x.valid_rect.offset.x)+x.valid_rect.extent.width&&
-        uint64_t(by)+720<=uint64_t(x.valid_rect.offset.y)+x.valid_rect.extent.height&&
+        uint64_t(bx)+size.w<=uint64_t(x.valid_rect.offset.x)+x.valid_rect.extent.width&&
+        uint64_t(by)+size.h<=uint64_t(x.valid_rect.offset.y)+x.valid_rect.extent.height&&
         uint64_t(x.valid_rect.offset.x)+x.valid_rect.extent.width<=x.extent.width&&
         uint64_t(x.valid_rect.offset.y)+x.valid_rect.extent.height<=x.extent.height;
 }
@@ -253,19 +297,22 @@ static bool frame_supported(NRVK_Backend* b,const PortNetworkBridgeFrameIO& io) 
     const auto& p=*io.v3.params;
     // output_width/height describe the later SR target, not the NR replacement.
     // MVLowRes is native render resolution relative to that SR target.
-    if(p.abi_size!=sizeof(p)||p.render_width!=1280||p.render_height!=720||p.output_width<1280||p.output_height<720||
-       (!p.low_resolution_motion&&(p.output_width!=1280||p.output_height!=720))||
+    NRSize render{p.render_width,p.render_height};
+    const uint32_t height=io.nrb_controls.input_height;
+    if(height!=0&&height!=360&&height!=480&&height!=540&&height!=720)return false;
+    if(p.abi_size!=sizeof(p)||!render.w||!render.h||render!=b->geometry.render||nr_network_size(render,io.nrb_controls.input_height)!=b->geometry.network||p.output_width<render.w||p.output_height<render.h||
+       (!p.low_resolution_motion&&(p.output_width!=render.w||p.output_height!=render.h))||
        p.hdr_input||p.auto_exposure||p.pre_exposure!=1.0f||p.exposure_scale!=1.0f||p.motion_jittered||p.jitter_x!=0.0f||p.jitter_y!=0.0f||
        p.motion_scale_origin<NRB_MV_DLSS_NGX||p.motion_scale_origin>NRB_MV_XESS_TO_NGX)return false;
     uint32_t bx[]={p.color_base_x,p.motion_base_x,p.depth_base_x,p.output_base_x};uint32_t by[]={p.color_base_y,p.motion_base_y,p.depth_base_y,p.output_base_y};
     for(unsigned i=0;i<4;++i){unsigned index=i==3?4:i;const auto& x=io.images[index];
         if(i==2&&!x.image)continue; // No depth: original have_depth=false branch.
-        if(!crop_valid(x,bx[i],by[i])||x.queue_family!=b->family||!(x.usage&(i==3?VK_IMAGE_USAGE_STORAGE_BIT:VK_IMAGE_USAGE_SAMPLED_BIT)))return false;}
+        if(!crop_valid(x,bx[i],by[i],render)||x.queue_family!=b->family||!(x.usage&(i==3?VK_IMAGE_USAGE_STORAGE_BIT:VK_IMAGE_USAGE_SAMPLED_BIT)))return false;}
     auto c=io.images[0].format,m=io.images[1].format,d=io.images[2].format;
     return (c==VK_FORMAT_R16G16B16A16_SFLOAT||c==VK_FORMAT_R32G32B32A32_SFLOAT)&&
         (m==VK_FORMAT_R16G16_SFLOAT||m==VK_FORMAT_R32G32_SFLOAT)&&(!io.images[2].image||d==VK_FORMAT_R32_SFLOAT||d==VK_FORMAT_D32_SFLOAT)&&
-        (io.images[4].format==VK_FORMAT_R16G16B16A16_SFLOAT||io.images[4].format==VK_FORMAT_R32G32B32A32_SFLOAT)&&io.nrb_controls.abi_size==sizeof(NRB_Controls)&&io.nrb_controls.input_height==720&&
-        io.model_controls[9]==1280.0f&&io.model_controls[10]==720.0f;
+        (io.images[4].format==VK_FORMAT_R16G16B16A16_SFLOAT||io.images[4].format==VK_FORMAT_R32G32B32A32_SFLOAT)&&io.nrb_controls.abi_size==sizeof(NRB_Controls)&&
+        io.model_controls[9]==float(b->geometry.network.w)&&io.model_controls[10]==float(b->geometry.network.h);
 }
 extern "C" void nrvk_backend_set_timestamp_query(NRVK_Backend* b,VkQueryPool pool,uint32_t base_query) { if(!b)return; b->ts_query_pool=pool; b->ts_base_query=base_query; }
 extern "C" int nrvk_backend_frame(NRVK_Backend* b,VkCommandBuffer cb,const NRVK_BackendFrameIO* base) {
@@ -273,10 +320,11 @@ extern "C" int nrvk_backend_frame(NRVK_Backend* b,VkCommandBuffer cb,const NRVK_
     if(base->abi_size!=sizeof(PortNetworkBridgeFrameIO)){last_error="v3 lacks actual image metadata/frame_id/control_epoch/controls20: use independent PortNetworkBridgeFrameIO tail";return -6;}
     if(base->io_view_count!=4||!base->io_views||!base->io_views[0]||!base->io_views[1]||!base->out_view){last_error="color/motion/output views missing";return -1;}
     const auto& io=*reinterpret_cast<const PortNetworkBridgeFrameIO*>(base);
-    if(!frame_supported(b,io)){last_error="requires native1280x720/input_height720 NR, float inputs/RGBA16F or32F output, GENERAL crops, normalized LDR proxy(exposure1,jitter0,non-jittered native MV), known NGX motion origin";return -6;}
+    if(!frame_supported(b,io)){last_error="requires matching R/N geometry, float inputs/RGBA16F or32F output, GENERAL crops, normalized LDR proxy(exposure1,jitter0,non-jittered native MV), known NGX motion origin";return -6;}
     if(io.images[2].image&&!base->io_views[2]){last_error="actual depth image requires its sampled view";return -1;}
     if(b->record_pending || (b->last_network_fence && b->vkGetFenceStatus(b->device,b->last_network_fence)!=VK_SUCCESS)){last_error="prior single-context network not completed or record not submitted";return -7;}
     const bool have_depth=io.images[2].image!=VK_NULL_HANDLE;
+    const auto& g=b->geometry;const bool low=g.render!=g.network;
     VkDescriptorImageInfo images[4]={{b->sampler,base->io_views[0],VK_IMAGE_LAYOUT_GENERAL},{b->sampler,base->io_views[1],VK_IMAGE_LAYOUT_GENERAL},{b->sampler,have_depth?base->io_views[2]:base->io_views[0],VK_IMAGE_LAYOUT_GENERAL},{VK_NULL_HANDLE,base->out_view,VK_IMAGE_LAYOUT_GENERAL}};
     VkDescriptorBufferInfo buffers[3]={{b->plan.buffers[b->pre].handle,0,b->plan.buffers[b->pre].bytes},{b->plan.buffers[b->post].handle,0,b->plan.buffers[b->post].bytes},{b->plan.buffers[b->output].handle,0,b->plan.buffers[b->output].bytes}};
     VkWriteDescriptorSet writes[7]{};
@@ -286,6 +334,19 @@ extern "C" int nrvk_backend_frame(NRVK_Backend* b,VkCommandBuffer cb,const NRVK_
         else if(i==5){w.dstSet=b->scatter_set;w.dstBinding=0;w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;w.pBufferInfo=&buffers[2];}
         else{w.dstSet=b->scatter_set;w.dstBinding=1;w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;w.pImageInfo=&images[3];}}
     b->vkUpdateDescriptorSets(b->device,7,writes,0,nullptr);
+    if(low){
+        VkDescriptorBufferInfo scratch{b->resample.handle,0,b->resample.bytes},tables{b->filter_tables.handle,0,b->filter_tables.bytes};VkWriteDescriptorSet extra[13]{};
+        for(unsigned i=0;i<13;++i){auto& w=extra[i];w.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w.descriptorCount=1;
+            if(i<7){w.dstSet=b->low_gather_set;w.dstBinding=i;
+                if(i<3){w.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;w.pImageInfo=&images[i];}
+                else{w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;w.pBufferInfo=i==6?&tables:i==5?&scratch:&buffers[i-3];}}
+            else{w.dstSet=b->low_scatter_set;w.dstBinding=i-7;
+                if(i==8){w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;w.pImageInfo=&images[3];}
+                else if(i==9){w.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;w.pImageInfo=&images[0];}
+                else{w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;w.pBufferInfo=i==7?&buffers[2]:i==10?&buffers[0]:i==12?&tables:&scratch;}}
+        }
+        b->vkUpdateDescriptorSets(b->device,13,extra,0,nullptr);
+    }
     auto write_ts=[&](VkPipelineStageFlagBits stage,uint32_t offset){ if(b->ts_query_pool!=VK_NULL_HANDLE&&b->vkCmdWriteTimestamp) b->vkCmdWriteTimestamp(cb,stage,b->ts_query_pool,b->ts_base_query+offset); };
     write_ts(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,1);
     // Global compute execution dependency preserves pool alias WAR ordering
@@ -297,8 +358,8 @@ extern "C" int nrvk_backend_frame(NRVK_Backend* b,VkCommandBuffer cb,const NRVK_
     // NRB scales are already current->previous source pixels, including route
     // sign/unit normalization. Apply them once; origin is provenance, no flip.
     controls[11]=have_depth?1.0f:0.0f;controls[12]=p.depth_inverted?1.0f:0.0f;
-    controls[13]=io.nrb_controls.history==NRB_HISTORY_ZERO_MOTION?0.0f:p.motion_scale_x/1280.0f;
-    controls[14]=io.nrb_controls.history==NRB_HISTORY_ZERO_MOTION?0.0f:p.motion_scale_y/720.0f;
+    controls[13]=io.nrb_controls.history==NRB_HISTORY_ZERO_MOTION?0.0f:p.motion_scale_x/float(g.network.w);
+    controls[14]=io.nrb_controls.history==NRB_HISTORY_ZERO_MOTION?0.0f:p.motion_scale_y/float(g.network.h);
     controls[15]=controls[16]=1.0f;controls[17]=controls[18]=0.0f;
     const bool history=b->history_committed&&!p.reset_history&&io.nrb_controls.history!=NRB_HISTORY_RESET&&io.control_epoch==b->committed_epoch&&io.frame_id==b->committed_frame+1;
     if(!history)controls[8]=0.0f;
@@ -306,17 +367,19 @@ extern "C" int nrvk_backend_frame(NRVK_Backend* b,VkCommandBuffer cb,const NRVK_
         b->vkCmdUpdateBuffer(cb,b->plan.buffers[h.destination].handle,h.controlsOffset,sizeof(controls),controls);}
     barrier(b,cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);
     write_ts(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,2);
-    auto& pre=b->plan.passes.front().push;auto& post=b->plan.passes.back().push;
     // Frozen IO-buffer offsets from the ioport contract. These are layout
     // constants, not indices into the unrelated first-pass push constants:
     // color 0, motion 7,372,820 floats, depth 9,216,020 floats; each writes
     // 921,600 pixels of RGBA32F / RG16F / R32F. Post uses the same offsets.
-    constexpr uint32_t ioport_color_float_offset=0;
-    constexpr uint32_t ioport_motion_float_offset=7372820;
-    constexpr uint32_t ioport_depth_float_offset=9216020;
-    uint32_t gather_push[]={p.color_base_x,p.color_base_y,p.motion_base_x,p.motion_base_y,p.depth_base_x,p.depth_base_y,1280,720,ioport_color_float_offset,ioport_motion_float_offset,ioport_depth_float_offset,have_depth?1u:0u,ioport_color_float_offset,ioport_motion_float_offset,ioport_depth_float_offset,0};
-    b->vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,b->gather.handle);b->vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,b->gather.layout,0,1,&b->gather_set,0,nullptr);
-    b->vkCmdPushConstants(cb,b->gather.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(gather_push),gather_push);b->vkCmdDispatch(cb,3600,1,1);
+    const auto* f=b->filter_axes;
+    uint32_t gather_push[]={p.color_base_x,p.color_base_y,p.motion_base_x,p.motion_base_y,p.depth_base_x,p.depth_base_y,g.network.w,g.network.h,0,g.motion,g.depth,have_depth?1u:0u,0,g.motion,g.depth,0,g.render.w,g.render.h,0,0,f[0].offset,f[0].taps,f[1].offset,f[1].taps,f[2].offset,f[2].taps,f[3].offset,f[3].taps};
+    const auto& gather=low?b->low_gather:b->gather;const auto gather_set=low?b->low_gather_set:b->gather_set;
+    b->vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,gather.handle);b->vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,gather.layout,0,1,&gather_set,0,nullptr);
+    if(low){
+        b->vkCmdPushConstants(cb,gather.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(gather_push),gather_push);b->vkCmdDispatch(cb,(g.render.w*g.network.h+255)/256,1,1);
+        barrier(b,cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);gather_push[15]=1;
+    }
+    b->vkCmdPushConstants(cb,gather.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,low?sizeof(gather_push):64,gather_push);b->vkCmdDispatch(cb,uint32_t((g.network.pixels()+255)/256),1,1);
     barrier(b,cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);
     write_ts(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,3);
     for(size_t i=0;i<b->plan.passes.size();++i){auto& pass=b->plan.passes[i];bool clearing=false;
@@ -328,9 +391,18 @@ extern "C" int nrvk_backend_frame(NRVK_Backend* b,VkCommandBuffer cb,const NRVK_
         barrier(b,cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);
     }
     write_ts(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,4);
-    const Pipeline& scatter=io.images[4].format==VK_FORMAT_R32G32B32A32_SFLOAT?b->scatter32:b->scatter;
-    uint32_t scatter_push[]={p.output_base_x,p.output_base_y,1280,720};b->vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,scatter.handle);b->vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,scatter.layout,0,1,&b->scatter_set,0,nullptr);
-    b->vkCmdPushConstants(cb,scatter.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(scatter_push),scatter_push);b->vkCmdDispatch(cb,3600,1,1);
+    if(low){
+        const Pipeline& scatter=io.images[4].format==VK_FORMAT_R32G32B32A32_SFLOAT?b->low_scatter32:b->low_scatter;
+        uint32_t push[]={g.network.w,g.network.h,g.render.w,g.render.h,p.color_base_x,p.color_base_y,p.output_base_x,p.output_base_y,0,0,0,0,f[4].offset,f[4].taps,f[5].offset,f[5].taps};
+        b->vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,scatter.handle);b->vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,scatter.layout,0,1,&b->low_scatter_set,0,nullptr);
+        b->vkCmdPushConstants(cb,scatter.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(push),push);b->vkCmdDispatch(cb,(g.render.w*g.network.h+255)/256,1,1);
+        barrier(b,cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);push[8]=1;
+        b->vkCmdPushConstants(cb,scatter.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(push),push);b->vkCmdDispatch(cb,uint32_t((g.render.pixels()+255)/256),1,1);
+    }else{
+        const Pipeline& scatter=io.images[4].format==VK_FORMAT_R32G32B32A32_SFLOAT?b->scatter32:b->scatter;
+        uint32_t scatter_push[]={p.output_base_x,p.output_base_y,g.network.w,g.network.h};b->vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,scatter.handle);b->vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,scatter.layout,0,1,&b->scatter_set,0,nullptr);
+        b->vkCmdPushConstants(cb,scatter.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(scatter_push),scatter_push);b->vkCmdDispatch(cb,uint32_t((g.network.pixels()+255)/256),1,1);
+    }
     barrier(b,cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT);
     write_ts(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,5);
     b->record_pending=true;b->pending_frame=io.frame_id;b->pending_epoch=io.control_epoch;last_error.clear();return 0;
@@ -352,6 +424,9 @@ extern "C" void nrvk_backend_release(NRVK_Backend* b) {
     if(b->descriptors)b->vkDestroyDescriptorPool(b->device,b->descriptors,nullptr);
     auto free_pipe=[&](Pipeline& p){if(p.handle)b->vkDestroyPipeline(b->device,p.handle,nullptr);if(p.layout)b->vkDestroyPipelineLayout(b->device,p.layout,nullptr);if(p.descriptors)b->vkDestroyDescriptorSetLayout(b->device,p.descriptors,nullptr);};
     for(auto& p:b->pipelines)free_pipe(p);free_pipe(b->gather);free_pipe(b->scatter);free_pipe(b->scatter32);
+    free_pipe(b->low_gather);free_pipe(b->low_scatter);free_pipe(b->low_scatter32);
+    if(b->resample.handle)b->vkDestroyBuffer(b->device,b->resample.handle,nullptr);if(b->resample.memory)b->vkFreeMemory(b->device,b->resample.memory,nullptr);
+    if(b->filter_tables.handle)b->vkDestroyBuffer(b->device,b->filter_tables.handle,nullptr);if(b->filter_tables.memory)b->vkFreeMemory(b->device,b->filter_tables.memory,nullptr);
     if(b->sampler)b->vkDestroySampler(b->device,b->sampler,nullptr);
     if(b->mapped)b->vkUnmapMemory(b->device,b->staging.memory);
     if(b->staging.handle)b->vkDestroyBuffer(b->device,b->staging.handle,nullptr);if(b->staging.memory)b->vkFreeMemory(b->device,b->staging.memory,nullptr);

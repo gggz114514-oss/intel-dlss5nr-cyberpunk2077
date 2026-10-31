@@ -1,6 +1,8 @@
 #pragma once
 #include "nrb_vulkan_processor.h"
 #include "nr_bridge.h"
+#include "nr_geometry.h"
+int nrvk_backend_init_geometry(VkInstance,VkDevice,VkPhysicalDevice,VkQueue,uint32_t,const NRVK_Config*,NRSize render,NRSize network,NRVK_Backend**);
 
 // Independent extension: WB's frozen v3 structs are not modified.
 // Set v3.abi_size=sizeof(PortNetworkBridgeFrameIO), not sizeof(v3).
@@ -38,7 +40,8 @@ extern "C" void nrvk_backend_set_timestamp_query(NRVK_Backend*, VkQueryPool, uin
 // vulkanMemoryModelDeviceScope/AvailabilityVisibilityChains=false.
 // init() checks physical support; it cannot inspect which logical-device
 // features WB enabled. WB must supply this exact enabled-feature contract.
-// Single sequential context, fixed1280x720 NR input/replacement, no resize.
+// Single sequential context. The processor rebuilds its model geometry only
+// after the prior network and all R-domain consumer leases have retired.
 // params.output_width/height describe the later SR target. MVLowRes=1 means
 // render-resolution motion relative to SR and is supported. Known NGX origins
 // already carry current->previous pixel scale; no second route sign conversion.
@@ -46,7 +49,7 @@ extern "C" void nrvk_backend_set_timestamp_query(NRVK_Backend*, VkQueryPool, uin
 // First game route is the existing normalized LDR proxy: exposure1/auto0/HDR0,
 // jitter0, non-jittered native MV. Raw HDR, non-unit exposure and nonzero jitter
 // require a separately defined front conversion and remain explicit -6.
-// input_height must explicitly be720; current NRB UI's360/480/540 modes are
-// unsupported. WB needs a declared native720 mode, not a silently ignored knob.
+// input_height: 0=native R, or 360/480/540/720 (capped at R). Low NR uses
+// Lanczos2 color / area motion, then signed-half Catmull residual recovery to R.
 // -6=missing extended fields/unsupported first-path domain,
 // -7=record pending or previous network fence not complete, -8=init GPU resource error.

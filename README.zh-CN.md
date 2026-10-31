@@ -1,5 +1,7 @@
 # Intel DLSS5 NR — 赛博朋克 2077
 
+**2026-11-01 可变分辨率新版：** Full / Small 支持游戏实际输入自动匹配，提供原生、720/540/480/360p处理档位，保留已有模型优化与默认流式处理。新增 [一键构建安装](docs/ONE-CLICK-INSTALL.zh-CN.md)（自动下载模型与缺失的官方OptiScaler；FSR XMX不自动部署）、逐文件备份和恢复。已修复原生控制覆盖与模型切换设备生命周期崩溃。[新版验证与成本](docs/MULTIRES-20261101.md)。
+
 **2026-10-29 更新：Full 232 派发（约 17.45 ms）与新版 Small 108 派发（约 9.98 ms）已接入默认构建；同时发布约 5.43 ms 实机帧周期收益的流式桥接。** 详见 [优化过程、方法与验证](docs/optimization/README.md)。当前 Vulkan 大量参考望月 **mochizuki0323 / DLSSNR-AMD** 社区项目，见 [致谢](docs/optimization/AMD-ATTRIBUTION.md)。Small 构建现在需 `-FullModel local/vk102`，先构建 Full。
 
 
@@ -17,14 +19,16 @@ NR 负责神经图像处理与风格控制；FSR XMX 负责超分；XeSS FG / Xe
 
 [实验工具与用法](tools/experiments/README.md) · [项目恢复与私人备份清单](docs/RECOVERY.md) · [研究源码档案](source/research-archive/README.md)
 
-## 两种模型都能从本地 DLL 开始构建
+## 自动下载或使用本地模型 DLL
 
-**不再要求用户已经拥有 VK102 包。** 只需提供对应版本的本地 `nvngx_dlssnr.dll` 作为模型输入，再准备下文列出的开发依赖。提取器把 DLL 当数据解析，不加载或执行 DLL。
+**不再要求用户已经拥有 VK102 包。** 安装器可下载固定版本的模型容器，也支持提供对应版本的本地 `nvngx_dlssnr.dll`。首次构建需准备下文列出的开发依赖。提取器把 DLL 当数据解析，不加载或执行 DLL。
 
 | 参数 | 模型 | DLL 内资源 | 固定网络 | DLL SHA-256 |
 |---|---|---|---|---|
 | `-Profile small` | 310.9.16.0 Small | `WEIGHTS_CC_SMALL_FP8` | 76 行 / 108 发 | `2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f` |
 | `-Profile vk102` | 310.8.0.0 完整模型 | `WEIGHTS_HT` | 152 行 / 232 发 | `8270b350cd82de5ce89806872cdd6b6a9249b80836b91bbeb3573470744cc206` |
+
+Full还接受原版SHA `e16bcf15e16e13f527491cdf7845b2fe6521a738d8f7c9c721866a8496e1fc8e`：599个张量与165个B580冷资源均已逐项证实与上表Full完全相同。
 
 两个 DLL 请分别放在不同目录。身份不匹配的版本会被拒绝；也支持包含一个对应 DLL 的 ZIP。这里发布已采纳的优化 FP16 Full 与新版 Small；INT8 实验不在此包内。
 

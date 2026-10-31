@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Extract and verify the supported NR model from a user-supplied DLL.
 
-Offline only. The DLL is parsed as data, never loaded or executed. No DLL,
-CUDA kernels or model bytes are downloaded or distributed by this repository.
+Offline only. The DLL is parsed as data, never loaded or executed. This extractor never downloads or executes code. The separate installer
+fetches model containers; no model bytes are distributed in the repository.
 """
 from __future__ import annotations
 
@@ -40,7 +40,8 @@ def extract(dll: Path, output: Path, requested_profile: str = "auto") -> dict:
 
     data = load_input(dll)
     digest = hashlib.sha256(data).hexdigest()
-    matching = [key for key, value in PROFILES.items() if value["dll_sha256"] == digest]
+    matching = [key for key, value in PROFILES.items()
+                if value["dll_sha256"] == digest or digest in value.get("equivalent_dll_sha256", [])]
     if not matching or requested_profile not in ("auto", matching[0]):
         raise ValueError(f"Unsupported model DLL/profile: SHA256 {digest}; supported: Small 310.9.16.0, VK102 310.8.0.0")
     profile_key = matching[0]

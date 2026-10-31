@@ -1,5 +1,9 @@
 # Build and install
 
+## New recommended entry: variable-resolution installer
+
+Run `Install-Cyberpunk.cmd` after preparing the build prerequisites below. It downloads pinned model containers, builds Full then Small, installs native-auto controls with streaming enabled, and records backups for restore. With existing packages, pass `-FullPackage` and `-SmallPackage` to skip building. FSR XMX is excluded and existing SR/FG libraries are preserved. See [complete installer instructions](docs/ONE-CLICK-INSTALL.zh-CN.md). The following sections remain the manual build route.
+
 [中文完整操作教程](docs/USER-GUIDE.zh-CN.md)：从下载源码到双后端挂载，附常见问题与恢复步骤。
 
 下载入口统一使用当前 **main** 分支。旧 v0.2.0 Release 是历史源码包；当前 Full 232 / Small 108 派发及流式默认开启版本均在 main。

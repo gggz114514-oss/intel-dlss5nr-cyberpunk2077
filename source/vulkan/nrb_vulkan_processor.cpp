@@ -101,6 +101,7 @@ struct Ctx {
     NRVK_Config cfg {};
     ID3D12Device* d3d = nullptr;
     NRVK_Backend* backend = nullptr;          // T5 适配层上下文
+    NRGeometry geometry{};
     VkFence network_fence_pending = VK_NULL_HANDLE;  // 上一帧网络完成 fence（单上下文门控）
     uint64_t frame_seq = 0;
     NRB_RegisterFn host_register = nullptr;   // 宿主显式传入的注册回调（[任务1]）
@@ -133,6 +134,8 @@ struct Ctx {
     uint64_t frames_ok = 0, frames_bypass = 0, ring_full = 0, converted = 0;
     uint64_t gpu_timeout = 0;              // [S1 v4] 单列：槽 cb_fence 未完成旁路
     double   last_ms = 0, avg_ms = 0;
+    double prepare_gpu_ms=0,network_gpu_ms=0,recover_gpu_ms=0,chain_gpu_ms=0;
+    bool geometry_gpu_timing=false;
     uint32_t last_status = 0;
     // Minimal observed contract fields for the existing status JSON. These are
     // measurements of the actual imported/copied resources, not expected values.
@@ -170,8 +173,10 @@ NRVK_Config g_cfg {};
 static PFN_vkGetInstanceProcAddr g_gipa = nullptr;   // 实例级查询用（能力预检/内存属性）
 
 static PFN_vkGetDeviceProcAddr g_gdpa = nullptr;
+// Layer/device dispatch pointers can die with the old Vulkan context. A model
+// reattach must query the current device rather than reuse function statics.
 #define NRVK_DEV_FN(name) \
-    static PFN_vk##name pfn_##name = nullptr; \
+    PFN_vk##name pfn_##name = nullptr; \
     if (!g_gdpa) g_gdpa = (PFN_vkGetDeviceProcAddr)GetProcAddress(g_vulkan_mod, "vkGetDeviceProcAddr"); \
     if (!g_gdpa) return -4; \
     if (!pfn_##name) pfn_##name = (PFN_vk##name)g_gdpa(c->device, "vk" #name); \
@@ -244,7 +249,7 @@ void write_status(Ctx* c) {
             "\"output_contract\":{\"dxgi\":%u,\"extent\":[%u,%u]},"
             "\"dispatch_contract\":{\"gather\":[%u,%u,%u],\"scatter\":[%u,%u,%u]},"
             "\"history\":{\"committed_before\":%u,\"used\":%u,\"reset_requested\":%u,"
-            "\"frame_id\":%llu,\"control_epoch\":%llu}}\n",
+            "\"frame_id\":%llu,\"control_epoch\":%llu},",
             c->init_ok ? 2 : 1,
             (unsigned long long)c->frames_ok, c->last_ms, c->avg_ms, c->last_status,
             (unsigned long long)c->frames_bypass, (unsigned long long)c->ring_full,
@@ -261,6 +266,11 @@ void write_status(Ctx* c) {
             c->scatter_x,c->scatter_y,c->scatter_z,
             c->history_committed?1u:0u,c->last_history,c->last_reset,
             (unsigned long long)c->last_frame_id,(unsigned long long)c->last_control_epoch);
+        const auto& g=c->geometry;
+        fprintf(f,"\"geometry\":{\"render\":[%u,%u],\"network\":[%u,%u],\"padded\":[%u,%u],\"output\":[%u,%u]},\"gpu_ms\":",g.render.w,g.render.h,g.network.w,g.network.h,g.padded.w,g.padded.h,g.output.w,g.output.h);
+        if(c->geometry_gpu_timing)fprintf(f,"{\"prepare\":%.4f,\"network\":%.4f,\"recover\":%.4f,\"chain\":%.4f}",c->prepare_gpu_ms,c->network_gpu_ms,c->recover_gpu_ms,c->chain_gpu_ms);
+        else fputs("null",f);
+        fputs("}\n",f);
         fclose(f);
     }
 }
@@ -563,6 +573,11 @@ static void harvest_diag_slot(Ctx* c, uint32_t qslot, bool force_retire) {
         if (vk_raw[i * 2 + 1] == 0) all_vk_avail = false;
     }
     p.rec.vk_valid = all_vk_avail ? 1u : 0u;
+    if(all_vk_avail){
+        const uint32_t bits=c->vk_timestamp_valid_bits;const uint64_t mask=bits>=64?UINT64_MAX:((uint64_t(1)<<bits)-1);
+        auto ms=[&](unsigned a,unsigned z){return double((p.rec.v_ticks[z]-p.rec.v_ticks[a])&mask)*c->vk_timestamp_period_ns*1e-6;};
+        c->prepare_gpu_ms=ms(2,3);c->network_gpu_ms=ms(3,4);c->recover_gpu_ms=ms(4,5);c->chain_gpu_ms=ms(0,6);c->geometry_gpu_timing=true;
+    }
     if (!all_vk_avail) ++c->diag_vk_unavail;
     p.rec.d3d_valid = 0;
     if (copy_done && c->d3d_ts_readback && c->d3d_freq_hz != 0) {
@@ -672,12 +687,13 @@ static void resolve_model_controls(float c20[20], const NRB_Frame* f) {
     c20[6]  = 1.0f;                                    // :2026 --img-const 现役默认 1
     c20[7]  = n.model_intensity;                       // surface: min(ctl7,1) 强度，>1 走特殊路径
     c20[8]  = f->reset_history ? 0.0f : 1.0f;          // temporal 开关（首帧/reset/epoch 变化由后端再压 0）
-    c20[9]  = 1280.0f;                                 // history W（模型域，后端校验）
-    c20[10] = 720.0f;                                  // history H
+    const NRSize network=nr_network_size({f->render_width,f->render_height},n.input_height);
+    c20[9]  = float(network.w);                        // history stays in N
+    c20[10] = float(network.h);
     c20[11] = 0.0f;                                    // depth-neighborhood（现役默认关）
     c20[12] = f->depth_inverted ? 1.0f : 0.0f;         // inverted selection（帧参数直传）
-    c20[13] = f->motion_scale_x / 1280.0f;             // 接线清单：current-to-previous 源像素 → UV 因子
-    c20[14] = f->motion_scale_y / 720.0f;
+    c20[13] = f->motion_scale_x / float(network.w);    // gathered motion is N pixels
+    c20[14] = f->motion_scale_y / float(network.h);
     c20[15] = 1.0f;                                    // motion UV scale（native 采样，恒等）
     c20[16] = 1.0f;
     c20[17] = 0.0f;                                    // motion UV bias（native 恒等）
@@ -705,18 +721,6 @@ int nrvk_process(void* context, const NRB_Frame* f, NRB_Result* out) {
         fprintf(stderr, "[nrvk] stage=active_vulkan_create rc=0\n");
     }
 
-    // [T5] 后端 init：Vulkan 设备在首次 process 前创建完成；init 只允许成功一次
-    if (!c->backend) {
-        int irc = nrvk_backend_init(c->instance, c->device, c->phy, c->queue,
-                                    c->queue_family, &c->cfg, &c->backend);
-        if (irc != 0) {
-            NRVK_LOG("backend init failed rc=%d (%s)\n", irc,
-                     port_network_bridge_backend_last_error());
-            c->last_status = 2; write_status(c);
-            return NRB_PROCESS_ERROR;
-        }
-        fprintf(stderr, "[nrvk] stage=backend_init rc=0\n");
-    }
     if (!c->copy_ready) {
         NRVK_DEV_FN(CreateSemaphore); NRVK_DEV_FN(ImportSemaphoreWin32HandleKHR);
         VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
@@ -730,7 +734,6 @@ int nrvk_process(void* context, const NRB_Frame* f, NRB_Result* out) {
             return NRB_PROCESS_ERROR;
         }
     }
-    c->init_ok = true; // Device/pool and actual backend both initialized.
 
     // [单上下文] 上一帧网络完成前不得覆写共享 staging / 更新描述符 /
     // 录制下一帧——CPU 等待上一网络 fence（= 上一提交的槽 cb_fence）。
@@ -761,7 +764,36 @@ int nrvk_process(void* context, const NRB_Frame* f, NRB_Result* out) {
         harvest_diag_slot(c, diag_qslot, true);
     }
 
-    // 惰性初始化：输出槽（尺寸=首帧 render 尺寸）+ 槽私有 cb/fence（[S1]/[T4]）
+    const NRSize render{f->render_width,f->render_height};
+    const NRSize network=nr_network_size(render,f->controls.input_height);
+    if(c->backend&&(c->geometry.render!=render||c->geometry.network!=network)){
+        // Reconfigure only after both the network fence and all returned
+        // R-domain consumer leases retire. No cross-frame async path is added.
+        if(std::any_of(c->slots.begin(),c->slots.end(),[](const OutputSlot& s){return s.in_flight;})){
+            ++c->frames_bypass;c->last_status=NRB_BYPASS_UNSYNCED;write_status(c);return NRB_BYPASS_UNSYNCED;
+        }
+        harvest_all_retired_diag(c,true);
+        nrvk_backend_release(c->backend);c->backend=nullptr;c->init_ok=false;c->history_committed=false;c->geometry_gpu_timing=false;
+        if(c->geometry.render!=render){
+            NRVK_DEV_FN(DestroyImageView);NRVK_DEV_FN(DestroyImage);NRVK_DEV_FN(FreeMemory);
+            NRVK_DEV_FN(DestroySemaphore);NRVK_DEV_FN(DestroyFence);NRVK_DEV_FN(FreeCommandBuffers);
+            for(auto& s:c->slots){
+                if(s.view)pfn_DestroyImageView(c->device,s.view,nullptr);if(s.image)pfn_DestroyImage(c->device,s.image,nullptr);
+                if(s.mem)pfn_FreeMemory(c->device,s.mem,nullptr);if(s.sem)pfn_DestroySemaphore(c->device,s.sem,nullptr);
+                if(s.cb_fence)pfn_DestroyFence(c->device,s.cb_fence,nullptr);if(s.cb)pfn_FreeCommandBuffers(c->device,c->pool,1,&s.cb);
+                if(s.fence)s.fence->Release();if(s.res)s.res->Release();
+            }
+            c->slots.clear();c->slot_next=0;
+        }
+    }
+    if(!c->backend){
+        int irc=nrvk_backend_init_geometry(c->instance,c->device,c->phy,c->queue,c->queue_family,&c->cfg,render,network,&c->backend);
+        if(irc){NRVK_LOG("backend geometry init failed rc=%d (%s)\n",irc,port_network_bridge_backend_last_error());c->last_status=2;write_status(c);return NRB_PROCESS_ERROR;}
+        c->geometry=nr_geometry(render,network,{f->output_width,f->output_height});
+        fprintf(stderr,"[nrvk] geometry R=%ux%u N=%ux%u P=%ux%u O=%ux%u history_reset=1\n",render.w,render.h,network.w,network.h,c->geometry.padded.w,c->geometry.padded.h,f->output_width,f->output_height);
+    }
+    c->geometry.output={f->output_width,f->output_height};c->init_ok=true;
+    // Output slots remain R, including when the actual network uses N<R.
     if (c->slots.empty() || !c->slots[0].res) {
         c->slots.resize(c->cfg.output_ring_slots ? c->cfg.output_ring_slots : 3);
         int rc = create_output_slots(c, f->render_width, f->render_height);
@@ -827,7 +859,7 @@ int nrvk_process(void* context, const NRB_Frame* f, NRB_Result* out) {
     c->in_motion_fmt=(uint32_t)st.motion.dxgi_format;c->in_motion_w=st.motion.width;c->in_motion_h=st.motion.height;
     c->in_depth_fmt=(uint32_t)st.depth.dxgi_format;c->in_depth_w=st.depth.width;c->in_depth_h=st.depth.height;
     c->out_fmt=(uint32_t)slot.dxgi_format;c->out_w=slot.width;c->out_h=slot.height;
-    c->gather_x=3600;c->gather_y=1;c->gather_z=1;c->scatter_x=3600;c->scatter_y=1;c->scatter_z=1;
+    c->gather_x=uint32_t((network.pixels()+255)/256);c->gather_y=1;c->gather_z=1;c->scatter_x=uint32_t((render.pixels()+255)/256);c->scatter_y=1;c->scatter_z=1;
     c->last_frame_id=f->frame_id;c->last_control_epoch=f->control_epoch;c->last_reset=f->reset_history?1u:0u;
     c->last_history=(c->history_committed && !f->reset_history &&
         f->controls.history!=NRB_HISTORY_RESET && f->control_epoch==c->history_epoch &&

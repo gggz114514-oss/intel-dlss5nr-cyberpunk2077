@@ -31,7 +31,7 @@ HdrCompositeHeapDiagStats hdr_composite_heap_diag_stats() {
 namespace {
 using Microsoft::WRL::ComPtr;
 constexpr UINT hdr_compile_flags=D3DCOMPILE_OPTIMIZATION_LEVEL3|D3DCOMPILE_IEEE_STRICTNESS;
-constexpr uint32_t hdr_root_abi_version=1;
+constexpr uint32_t hdr_root_abi_version=2;
 bool serialize_root(ComPtr<ID3DBlob>& blob,HdrProxyCacheStats* stats) {
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0]={D3D12_DESCRIPTOR_RANGE_TYPE_SRV,2,0,0,0};
@@ -42,7 +42,7 @@ bool serialize_root(ComPtr<ID3DBlob>& blob,HdrProxyCacheStats* stats) {
         params[i].DescriptorTable={1,&ranges[i]};
     }
     params[2].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[2].Constants={0,0,27};
+    params[2].Constants={0,0,29};
     D3D12_ROOT_SIGNATURE_DESC rs{};
     rs.NumParameters=3;rs.pParameters=params;
     ComPtr<ID3DBlob> errors;
@@ -424,10 +424,10 @@ bool HdrProxy::initialize(ID3D12Device* device,ID3D12Resource* source,
     // selection always use the resource's own format, never a stale one.
     const bool fp16=s.Format==DXGI_FORMAT_R16G16B16A16_FLOAT;
     if(s.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-       s.Width!=1280 || s.Height!=720 ||
+       !s.Width || !s.Height ||
        (s.Format!=DXGI_FORMAT_R11G11B10_FLOAT && !fp16) ||
        d.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-       d.Width!=s.Width || d.Height!=s.Height ||
+       !d.Width || !d.Height || d.Width>s.Width || d.Height>s.Height ||
        d.Format!=s.Format ||
        !(d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return false;
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
@@ -435,10 +435,11 @@ bool HdrProxy::initialize(ID3D12Device* device,ID3D12Resource* source,
     if(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
         &support,sizeof(support))) ||
        !(support.Support2&D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) return false;
-    device_=device;width_=UINT(s.Width);height_=s.Height;
+    device_=device;width_=UINT(d.Width);height_=d.Height;
     source_format_=s.Format;source_fp16_=fp16;
     if(motion) {
         const auto m=motion->GetDesc();
+        motion_width_=motion_resource_width_=UINT(m.Width);motion_height_=motion_resource_height_=m.Height;
         ComPtr<ID3D12Device> motion_device;
         // UE5 engines can hand the SR pass motion vectors at output resolution
         // while the colour texture is the render target (Wukong: 2560x1440 vs
@@ -446,7 +447,7 @@ bool HdrProxy::initialize(ID3D12Device* device,ID3D12Resource* source,
         // a UV and converts with MotionScaleX/Y, so equal sizes are not needed;
         // only the format and the resource kind matter.
         game_motion_available_=m.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-            m.Width>=s.Width && m.Height>=s.Height &&
+            m.Width>=width_ && m.Height>=height_ &&
             m.DepthOrArraySize==1 && m.MipLevels==1 && m.SampleDesc.Count==1 &&
             m.Format==DXGI_FORMAT_R16G16_FLOAT &&
             SUCCEEDED(motion->GetDevice(IID_PPV_ARGS(motion_device.GetAddressOf()))) &&
@@ -548,7 +549,7 @@ void HdrProxy::bind(ID3D12GraphicsCommandList* list,ID3D12PipelineState* pipelin
     auto uav_table=srv_table;uav_table.ptr+=2*stride_;
     list->SetComputeRootDescriptorTable(0,srv_table);
     list->SetComputeRootDescriptorTable(1,uav_table);
-    UINT constants[27]={};
+    UINT constants[29]={};
     for(int i=0;i<16;++i) constants[i]=std::bit_cast<UINT>(style_curve_[i]);
     constants[16]=width_;constants[17]=height_;constants[18]=UINT(use_game_motion);
     constants[19]=std::bit_cast<UINT>(scale_x);constants[20]=std::bit_cast<UINT>(scale_y);
@@ -557,9 +558,14 @@ void HdrProxy::bind(ID3D12GraphicsCommandList* list,ID3D12PipelineState* pipelin
     constants[24]=std::bit_cast<UINT>(style_exposure_);
     constants[25]=std::bit_cast<UINT>(style_contrast_);
     constants[26]=std::bit_cast<UINT>(style_gain_);
-    list->SetComputeRoot32BitConstants(2,27,constants,0);
+    constants[27]=motion_width_;constants[28]=motion_height_;
+    list->SetComputeRoot32BitConstants(2,29,constants,0);
     list->SetPipelineState(pipeline);
     list->Dispatch((width_+7)/8,(height_+7)/8,1);
+}
+bool HdrProxy::set_motion_extent(uint32_t width,uint32_t height){
+    if(!width||!height||width>motion_resource_width_||height>motion_resource_height_)return false;
+    motion_width_=width;motion_height_=height;return true;
 }
 void HdrProxy::record_prepare(ID3D12GraphicsCommandList* list,
                               ID3D12Resource* source,bool use_game_motion,

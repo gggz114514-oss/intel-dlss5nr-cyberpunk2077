@@ -110,6 +110,7 @@ public:
     ID3D12Resource* proxy_color() const {return proxy_.Get();}
     ID3D12Resource* nr_motion() const {return nr_motion_.Get();}
     bool game_motion_available() const {return game_motion_available_;}
+    bool set_motion_extent(uint32_t width,uint32_t height);
     void set_timestamp_query_target(ID3D12QueryHeap* heap,ID3D12Resource* readback) {ts_heap_=heap;ts_readback_=readback;}
     uint32_t diag_pool_alloc_kind() const {return diag_pool_alloc_kind_;}
     uint32_t diag_composite_heap_kind() const {return diag_composite_heap_kind_;}
@@ -127,6 +128,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> prepare_,composite_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> prepare_f16_,composite_f16_;
     UINT stride_=0,width_=0,height_=0;
+    UINT motion_width_=0,motion_height_=0,motion_resource_width_=0,motion_resource_height_=0;
     bool game_motion_available_=false;
     // The source (and the same-format XeSS input copy) may be R11G11B10_FLOAT
     // or R16G16B16A16_FLOAT. Typed views and PSO selection follow this format.

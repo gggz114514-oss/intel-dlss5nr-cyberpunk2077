@@ -71,10 +71,13 @@ def prepare(model, compiler):
         record['path'] = '../assets/spv/' + output.name
         shaders[name] = record
     bridge = {}
-    for name in ('gather', 'scatter', 'scatter32'):
+    for name in ('gather', 'scatter', 'scatter32', 'low_gather', 'low_scatter', 'low_scatter32'):
         filename = 'port_network_bridge_' + name + '.spv'
         output = spv / filename
-        record = compile_shader(compiler, {'source': 'source/vulkan/' + filename.replace('.spv', '.comp')}, output)
+        recipe = {'source': 'source/vulkan/' + filename.replace('.spv', '.comp')}
+        if name == 'low_scatter32':
+            recipe = {'source': 'source/vulkan/port_network_bridge_low_scatter.comp', 'defines': ['-DOUTPUT32=1']}
+        record = compile_shader(compiler, recipe, output)
         record['path'] = '../assets/spv/' + filename
         bridge[name] = record
     template = (network / 'runtime.template.txt').read_text(encoding='utf-8')
@@ -106,7 +109,11 @@ def prepare(model, compiler):
     generated.joinpath('port_network_bridge_backend_model_identity.inc').write_text(
         f'static constexpr size_t kPlanRows={profile["rows"]},kPlanBuffers={profile["buffers"]},kPlanPasses={profile["passes"]},kPlanOutputs=1,kPlanHistory=2;\n'
         'static constexpr const char* kPreImageName="ioport_0_ioport_images";\n'
-        f'static constexpr const char* kPostImageName="ioport_{profile["post_block"]}_ioport_images";\n', encoding='utf-8')
+        f'static constexpr const char* kPostImageName="ioport_{profile["post_block"]}_ioport_images";\n'
+        f'static constexpr unsigned kPostBlock={profile["post_block"]},kSplitLast={profile["split_last"]},kDecoderBlock={profile["dec_block"]};\n'
+        'struct NRSwinBlock {unsigned block,channels;};\n'
+        'static constexpr NRSwinBlock kSwinBlocks[]={' + ','.join('{'+str(k)+','+str(v)+'}' for k,v in profile['swin_blocks'].items()) + '};\n'
+        + ''.join('static constexpr unsigned '+name+'[]={'+','.join(map(str,profile[key]))+'};\n' for name,key in [('kDownsampleBlocks','downsample_blocks'),('kUpsampleBlocks','upsample_blocks'),('kVitBlocks','vit_blocks')]), encoding='utf-8')
     manifest_sha = digest((manifest / 'port_network_manifest.json').read_bytes())
     runtime_sha = digest(runtime.read_bytes())
     lines = ['struct FrozenFile { const char* path; const char* sha; };',

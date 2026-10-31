@@ -134,7 +134,7 @@ std::atomic<bool> nrvk_mount_failed{false};
 #define NR_PANEL_INI_PATH g_panel_ini
 namespace panel {
 struct Values {
-    int enabled=1, style=0, auto_mask=1;
+    int enabled=1, style=0, auto_mask=1, input_height=720;
     float intensity=1.0f, local_structure=1.0f, local_tone=0.0f,
           skin_structure=0.0f, display_strength=1.0f;
     std::string backend="small";
@@ -160,8 +160,25 @@ bool applied_valid=false;
 // never take that mutex again.
 std::atomic<bool> live_valid{false};
 std::atomic<uint32_t> live_enabled{1}, live_style{0}, live_auto_mask{1};
+std::atomic<uint32_t> live_input_height{720};
 std::atomic<float> live_display{1.0f}, live_intensity{1.0f}, live_local_tone{0.0f},
     live_local_structure{1.0f}, live_skin{0.0f};
+// The panel owns these per-frame values after its first accepted read. Legacy
+// NRB_SetControls callers may still update the base controls independently.
+NRB_Controls effective_controls(NRB_Controls c) {
+    if(live_valid.load(std::memory_order_acquire)) {
+        c.enabled=live_enabled.load(std::memory_order_relaxed);
+        c.style=live_style.load(std::memory_order_relaxed);
+        c.input_height=live_input_height.load(std::memory_order_relaxed);
+        c.auto_mask=live_auto_mask.load(std::memory_order_relaxed);
+        c.display_strength=live_display.load(std::memory_order_relaxed);
+        c.model_intensity=live_intensity.load(std::memory_order_relaxed);
+        c.local_tone=live_local_tone.load(std::memory_order_relaxed);
+        c.local_structure=live_local_structure.load(std::memory_order_relaxed);
+        c.skin_structure=live_skin.load(std::memory_order_relaxed);
+    }
+    return c;
+}
 // The component mounted from the game directory is authoritative for the boot
 // plan: switching back to it must re-attach that exact DLL, never a copy from
 // a package bin directory.
@@ -204,7 +221,9 @@ void set_event(const char* fmt,...) {
 }
 void write_state() {
     NRB_Controls c{};
-    {std::lock_guard guard(state_mutex); c=controls;}
+    uint32_t controls_input_height=0;
+    {std::lock_guard guard(state_mutex);
+        controls_input_height=controls.input_height;c=effective_controls(controls);}
     NRB_StageTimes stage{};
     stage.abi_size=sizeof(stage);
 #ifdef NRB_DEFERRED_IDENTITY_TEST
@@ -223,7 +242,7 @@ void write_state() {
         fprintf(file,
             "{\"backend\":\"%s\",\"mounted\":%d,\"processor\":%d,\"switch\":%d,"
             "\"processed\":%llu,\"event\":\"%s\",\"event_ms\":%llu,"
-            "\"applied\":{\"enabled\":%u,\"style\":%u,\"intensity\":%.4f,"
+            "\"controls_input_height\":%u,\"applied\":{\"enabled\":%u,\"input_height\":%u,\"style\":%u,\"intensity\":%.4f,"
             "\"structure\":%.4f,\"tone\":%.4f,\"skin\":%.4f,\"mask\":%u,"
             "\"display\":%.4f},\"stage\":{\"frames\":%llu,\"prep\":%.3f,"
             "\"host\":%.3f,\"composite\":%.3f,\"tail\":%.3f,\"total\":%.3f,"
@@ -232,7 +251,7 @@ void write_state() {
             int(processor.process!=nullptr),int(probe_state.load(std::memory_order_relaxed)),
             (unsigned long long)NRB_ProcessedCount(),event.c_str(),
             (unsigned long long)event_ms,
-            c.enabled,c.style,c.model_intensity,c.local_structure,c.local_tone,
+            controls_input_height,c.enabled,c.input_height,c.style,c.model_intensity,c.local_structure,c.local_tone,
             c.skin_structure,c.auto_mask,c.display_strength,
             (unsigned long long)stage.frames,stage.prep_average_ms,
             stage.host_average_ms,stage.composite_submit_average_ms,
@@ -242,7 +261,7 @@ void write_state() {
     }
 }
 bool same_controls(const Values& a,const Values& b) {
-    return a.enabled==b.enabled && a.style==b.style && a.auto_mask==b.auto_mask &&
+    return a.enabled==b.enabled && a.style==b.style && a.auto_mask==b.auto_mask && a.input_height==b.input_height &&
         a.intensity==b.intensity && a.local_structure==b.local_structure &&
         a.local_tone==b.local_tone && a.skin_structure==b.skin_structure &&
         a.display_strength==b.display_strength;
@@ -305,6 +324,7 @@ bool parse(Values& v,std::string& text) {
     };
     v.enabled=integer("enabled",v.enabled)?1:0;
     v.style=integer("style",v.style);
+    v.input_height=integer("input_height",v.input_height);
     v.auto_mask=integer("auto_mask",v.auto_mask)?1:0;
     v.intensity=number("intensity",v.intensity);
     v.local_structure=number("local_structure",v.local_structure);
@@ -317,9 +337,9 @@ bool parse(Values& v,std::string& text) {
 }
 void log_values(const char* what,const Values& v) {
     char line[320];
-    sprintf_s(line,"[panel] %s enabled=%d style=%d auto_mask=%d intensity=%.3f "
+    sprintf_s(line,"[panel] %s enabled=%d input_height=%d style=%d auto_mask=%d intensity=%.3f "
         "local_structure=%.3f local_tone=%.3f skin=%.3f display=%.3f backend=%s\r\n",
-        what,v.enabled,v.style,v.auto_mask,v.intensity,v.local_structure,
+        what,v.enabled,v.input_height,v.style,v.auto_mask,v.intensity,v.local_structure,
         v.local_tone,v.skin_structure,v.display_strength,v.backend.c_str());
     log_line(line);
 }
@@ -333,6 +353,7 @@ bool apply_controls(const Values& v) {
         NRB_Controls c=controls;
         c.enabled=v.enabled?1u:0u;
         c.style=static_cast<uint32_t>(v.style);
+        c.input_height=static_cast<uint32_t>(v.input_height);
         c.auto_mask=v.auto_mask?1u:0u;
         c.display_strength=v.display_strength;
         c.model_intensity=v.intensity;
@@ -340,10 +361,11 @@ bool apply_controls(const Values& v) {
         c.local_structure=v.local_structure;
         c.skin_structure=v.skin_structure;
         if(nrb::validate_controls(c)) {
-            if(c.enabled!=controls.enabled) ++control_epoch;
+            if(c.enabled!=controls.enabled||c.input_height!=controls.input_height) ++control_epoch;
             controls=c;
             live_enabled.store(c.enabled,std::memory_order_relaxed);
             live_style.store(c.style,std::memory_order_relaxed);
+            live_input_height.store(c.input_height,std::memory_order_relaxed);
             live_auto_mask.store(c.auto_mask,std::memory_order_relaxed);
             live_display.store(c.display_strength,std::memory_order_relaxed);
             live_intensity.store(c.model_intensity,std::memory_order_relaxed);
@@ -639,6 +661,7 @@ DWORD WINAPI worker(void*) {
     return 0;
 }
 void start() {
+    apply_once();
     if(HANDLE thread=CreateThread(nullptr,0,worker,nullptr,0,nullptr)) CloseHandle(thread);
 }
 } // namespace panel
@@ -900,7 +923,7 @@ void STDMETHODCALLTYPE observed_execute(ID3D12CommandQueue* q,UINT count,ID3D12C
     NRB_Controls deferred_controls{};
     NRB_Processor deferred_processor{};
     {std::lock_guard guard(state_mutex);
-        deferred_controls=controls;deferred_processor=processor;}
+        deferred_controls=panel::effective_controls(controls);deferred_processor=processor;}
     const unsigned deferred=nrb::submit_deferred_identity(q,count,lists,
         count<=correlated.size()?correlated.data():nullptr,original_execute,
         &deferred_processor,&deferred_controls,log_line);
@@ -1172,6 +1195,11 @@ static void load_bridge_config() {
                     value=panel::lookup(text,"bridge","panel_state");
                     if(!value.empty()) strcpy_s(g_panel_state,value.c_str());
                     panel::backend_manifest=g_manifest_dir;
+                    value=panel::lookup(text,"bridge","backend");
+                    if(value=="102" || value=="small") {
+                        panel::boot_key=value;
+                        panel::backend_key=value;
+                    }
                     value=panel::lookup(text,"bridge","tail_profile");
                     if(!value.empty()) g_tail_profile=atoi(value.c_str());
                 }
@@ -1556,7 +1584,7 @@ NVSDK_NGX_Result __cdecl intercept(ID3D12GraphicsCommandList* list,
         }
         if(diagnostic_sr_scope && deferred_allowed &&
            nrb::record_deferred_identity(list,handle,params,callback,original,
-                                         identity_source_generation,controls,
+                                         identity_source_generation,panel::effective_controls(controls),control_epoch,
                                          diagnostic_dlss_scope?NRB_ROUTE_DLSS:route,
                                          diagnostic_dlss_scope?NRB_EVIDENCE_STREAMLINE_NGX:
                                              decision.evidence,
@@ -1769,17 +1797,7 @@ NVSDK_NGX_Result __cdecl intercept(ID3D12GraphicsCommandList* list,
     frame.frame_id = ++frame_id;
     // The outer Evaluate path holds state_mutex here, so the panel values
     // are read from lock-free atomics instead of taking the mutex again.
-    NRB_Controls frame_controls=controls;
-    if(panel::live_valid.load(std::memory_order_acquire)) {
-        frame_controls.enabled=panel::live_enabled.load(std::memory_order_relaxed);
-        frame_controls.style=panel::live_style.load(std::memory_order_relaxed);
-        frame_controls.auto_mask=panel::live_auto_mask.load(std::memory_order_relaxed);
-        frame_controls.display_strength=panel::live_display.load(std::memory_order_relaxed);
-        frame_controls.model_intensity=panel::live_intensity.load(std::memory_order_relaxed);
-        frame_controls.local_tone=panel::live_local_tone.load(std::memory_order_relaxed);
-        frame_controls.local_structure=panel::live_local_structure.load(std::memory_order_relaxed);
-        frame_controls.skin_structure=panel::live_skin.load(std::memory_order_relaxed);
-    }
+    const NRB_Controls frame_controls=panel::effective_controls(controls);
     frame.controls = frame_controls;
     frame.control_epoch = control_epoch;
     frame.reset_history |= frame_controls.history == NRB_HISTORY_RESET ||
@@ -2011,7 +2029,7 @@ NRB_API int NRB_SetControls(const NRB_Controls* c) {
 NRB_API int NRB_GetControls(NRB_Controls* c) {
     if (!c || c->abi_size != sizeof(NRB_Controls)) return 0;
     std::lock_guard guard(state_mutex);
-    *c = controls;
+    *c = panel::effective_controls(controls);
     return 1;
 }
 // Read-only, fixed-size CPU snapshot. No file write or GPU synchronization.

@@ -70,6 +70,8 @@ int main() {
     CHECK(nrb::validate_controls(controls));
     controls.input_height=720;
     CHECK(nrb::validate_controls(controls));
+    controls.input_height=0;
+    CHECK(nrb::validate_controls(controls));
     controls.input_height=721;
     CHECK(!nrb::validate_controls(controls));
     controls.input_height=720;

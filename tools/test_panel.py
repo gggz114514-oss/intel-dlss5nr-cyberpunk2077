@@ -35,11 +35,15 @@ def run(output, backend):
             page = response.read().decode()
             assert f'<option value={other}>' not in page
             assert f'<option value={backend}>' in page
+            assert '<select id=input_height>' not in page
+            for height in (0, 720, 540, 480, 360):
+                assert f'data-height={height}>' in page
+            assert '原生 · 自动' in page
         assert panel.load()['backend'] == backend
         panel.BACKENDS[other] = str(output/'other/manifest')
         with urllib.request.urlopen(base+'/') as response:
             page = response.read().decode()
-            assert '<option value=102>VK102 310.8</option>' in page
+            assert '<option value=102>Full 310.8</option>' in page
             assert '<option value=small>Small 310.9.16</option>' in page
         with urllib.request.urlopen(base+'/status') as response:
             status = json.load(response)
@@ -55,6 +59,12 @@ def run(output, backend):
         with urllib.request.urlopen(request) as response:
             assert json.load(response)['style'] == 2
         assert panel.load()['intensity'] == 0.7
+        for height in (0, 360, 480, 540, 720):
+            request = urllib.request.Request(base+'/api', json.dumps({'input_height': height}).encode(),
+                {'Content-Type': 'application/json', 'X-NR-Token': panel.TOKEN})
+            with urllib.request.urlopen(request) as response:
+                assert json.load(response)['input_height'] == height
+            assert panel.load()['input_height'] == height
         for backend in ('102', 'small'):
             request = urllib.request.Request(base+'/api', json.dumps({'backend': backend}).encode(),
                 {'Content-Type': 'application/json', 'X-NR-Token': panel.TOKEN})

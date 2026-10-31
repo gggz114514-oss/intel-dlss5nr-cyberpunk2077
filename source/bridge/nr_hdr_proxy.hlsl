@@ -16,13 +16,14 @@ RWTexture2D<float3> XeSSInput : register(u2);
 RWTexture2D<float4> XeSSInputF16 : register(u2);
 cbuffer Constants : register(b0) {
     // The four float4 blocks come first so they stay 16-byte aligned; every
-    // remaining scalar then packs tightly. The host fills 27 dwords in this
+    // remaining scalar then packs tightly. The host fills 29 dwords in this
     // exact order (root 32-bit constants, b0).
     float4 Curve0; float4 Curve1; float4 Curve2; float4 Curve3;
     uint Width; uint Height; uint UseGameMotion;
     float MotionScaleX; float MotionScaleY;
     float StyleSat; uint StyleMode; float StyleTone;
     float StyleExposure; float StyleContrast; float StyleGain;
+    uint MotionWidth; uint MotionHeight;
 };
 
 
@@ -98,7 +99,8 @@ void prepare(uint3 thread : SV_DispatchThreadID) {
     Proxy[xy] = float4(saturate(scene), 1.0f);
     float2 pixels = float2(0.0f, 0.0f);
     if (UseGameMotion != 0) {
-        pixels = MotionOrNR.Load(int3(xy, 0)).xy *
+        uint2 motion_xy=uint2((float2(xy)+0.5)*float2(MotionWidth,MotionHeight)/float2(Width,Height));
+        pixels = MotionOrNR.Load(int3(motion_xy, 0)).xy *
             float2(MotionScaleX, MotionScaleY);
         // The shared bridge consumes RG16F. Reject invalid values rather
         // than writing NaNs or infinities into its temporal reprojection.
@@ -136,7 +138,8 @@ void prepare_f16(uint3 thread : SV_DispatchThreadID) {
     Proxy[xy] = float4(saturate(scene), scene4.a);
     float2 pixels = float2(0.0f, 0.0f);
     if (UseGameMotion != 0) {
-        pixels = MotionOrNR.Load(int3(xy, 0)).xy *
+        uint2 motion_xy=uint2((float2(xy)+0.5)*float2(MotionWidth,MotionHeight)/float2(Width,Height));
+        pixels = MotionOrNR.Load(int3(motion_xy, 0)).xy *
             float2(MotionScaleX, MotionScaleY);
         // The shared bridge consumes RG16F. Reject invalid values rather
         // than writing NaNs or infinities into its temporal reprojection.

@@ -1,5 +1,7 @@
 # Intel DLSS5 NR — Cyberpunk 2077
 
+**2026-11-01 variable-resolution update:** Full and Small now follow the actual game render input, with native/720/540/480/360p NR controls and streaming enabled. Use `Install-Cyberpunk.cmd` after installing the build prerequisites: it fetches pinned model containers, builds both models, backs up game files and installs the panel. Existing SR/FG files are preserved; FSR XMX is installed separately. See the [installer guide](docs/ONE-CLICK-INSTALL.zh-CN.md) and [release validation](docs/MULTIRES-20261101.md). Native-control and device-recreation fixes are included.
+
 **2026-10-29: Default builds now use optimized Full (232 dispatches, ~17.45 ms) and optimized Small (108 dispatches, ~9.98 ms), plus late-latch streaming (~5.43 ms game frame-period improvement in the recorded scene).** See [optimization history and evidence](docs/optimization/README.md). The Vulkan backend substantially references the community **mochizuki0323 / DLSSNR-AMD** project; see [attribution](docs/optimization/AMD-ATTRIBUTION.md). Build Full first, then pass `-FullModel local/vk102` when building Small.
 
 
@@ -22,7 +24,7 @@ Provide the appropriate **local `nvngx_dlssnr.dll`**. Both backends can now be e
 | `small` | 310.9.16.0 Small | `WEIGHTS_CC_SMALL_FP8` | 76 rows / 108 dispatches | `2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f` |
 | `vk102` | 310.8.0.0 full model | `WEIGHTS_HT` | 152 rows / 232 dispatches | `8270b350cd82de5ce89806872cdd6b6a9249b80836b91bbeb3573470744cc206` |
 
-Use separate folders for the two DLLs. Other DLL identities are rejected. A ZIP containing one supported DLL is accepted too. The profiles select the current optimized FP16 backends. INT8 remains a separate development branch.
+Use separate folders for the two DLLs. Full also accepts the original `e16bcf15e16e13f527491cdf7845b2fe6521a738d8f7c9c721866a8496e1fc8e` container: all 599 tensors and 165 packed cold resources match the existing Full profile. Other DLL identities are rejected. A ZIP containing one supported DLL is accepted too. The profiles select the current optimized FP16 backends. INT8 remains a separate development branch.
 
 ## The tested combination and performance
 
